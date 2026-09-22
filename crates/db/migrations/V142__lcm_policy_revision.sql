@@ -1,0 +1,16 @@
+-- Records which Forge LCM policy revision last wrote a session's runtime
+-- snapshot.
+--
+-- The runtime folds Forge's sizer, pressure policy, and summary policy into
+-- one LCM component revision and refuses to decode component state written
+-- under a different one ("LCM component revision changed"). Before this
+-- column there was no way to tell a stale component state from a current
+-- one, so any change to those policies failed every turn on every existing
+-- session with no recovery path. The protected session store now compares
+-- this marker against the running binary's `FORGE_LCM_POLICY_REVISION` and
+-- drops stale component state, which the coordinator rebuilds from the
+-- durable timeline in `agent_lcm_entry` / `agent_lcm_node`.
+--
+-- NULL means "written before this column existed", which is treated as stale
+-- exactly once.
+ALTER TABLE protected_agent_session_state ADD COLUMN lcm_policy_revision TEXT;

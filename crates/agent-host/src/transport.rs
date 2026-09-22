@@ -193,7 +193,9 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
     Ok((client, url.to_owned()))
 }
 
-fn restricted_provider_hostname(host: &str) -> bool {
+/// Hostnames that never belong to a public endpoint. Shared with the web
+/// fetch transport so both outbound paths refuse the same names.
+pub(crate) fn restricted_provider_hostname(host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     host == "localhost"
         || host.ends_with(".localhost")
@@ -202,7 +204,10 @@ fn restricted_provider_hostname(host: &str) -> bool {
         || host.ends_with(".home.arpa")
 }
 
-fn restricted_provider_ip(ip: IpAddr) -> bool {
+/// Addresses that never belong to a public endpoint: RFC 1918, loopback,
+/// link-local, CGNAT, documentation ranges, and multicast. Shared with the
+/// web fetch transport.
+pub(crate) fn restricted_provider_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(address) => {
             let octets = address.octets();

@@ -342,6 +342,54 @@ Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
 
+### Commands an Agent may run in its workspace
+
+A Task worker runs commands in its worktree; a Project Agent runs them in its
+disposable verification checkout; the Main Agent runs them in its account
+scratch directory. All three draw on one allowlist of bare program names.
+
+Forge ships a built-in list covering building and testing software. Widen or
+replace it in `forge.yaml`:
+
+```yaml
+commands:
+  allow: [uv, poetry, terraform]   # added to the built-in list
+  # only: [cargo, git]             # or replace it outright
+```
+
+A Project can layer its own list over that through its settings, with the same
+two keys:
+
+```json
+{ "settings": { "command_allowlist": { "only": ["python3", "pytest", "uv"] } } }
+```
+
+`docker`, `podman`, `curl`, `wget`, `ssh`, `xargs`, and `env` are not built in —
+each either mounts the host filesystem, opens an outbound session, or runs a
+program chosen at runtime — so adding them is an explicit decision. Bear in
+mind the list bounds the blast radius rather than sandboxing it: `bash` is on
+it, and a shell reaches whatever the workspace does.
+
+### Fetching a web page
+
+Main Agent Chat, Project Agent Chat, and Task workers can fetch a public page
+directly with the runtime's `fetch` tool, which returns it as Markdown, text,
+or raw content behind an untrusted-content notice. It needs no configuration.
+
+Forge's transport bounds it: `https` only, no credentials in the URL, the
+connection pinned to addresses Forge resolved and checked so a public hostname
+cannot resolve into this machine's network, redirects followed only inside the
+authorized origin, a 2 MiB body cap, and the turn's own deadline. A Task worker
+needs its Task read permission; a chat needs the same permission that gates the
+search tool below.
+
+Forge also owns the request headers, because ordinary sites answer a bare
+client badly. It identifies itself as
+`Mozilla/5.0 (compatible; ForgeAgent/<version>; +https://github.com/ForgeAILab/forge)`,
+sends a documents-first `Accept`, and negotiates compression — a CDN
+compresses whether or not a client asks, and a compressed body read as UTF-8
+arrives as an empty or garbled page. A header the caller sets itself is kept.
+
 ### Optional bounded public web search
 
 Main and Project Agent Chats can use a direct `forge_public_web_search` tool

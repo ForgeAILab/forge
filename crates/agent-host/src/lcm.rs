@@ -147,6 +147,94 @@ impl TaskLcmProjectionPolicy {
     }
 }
 
+/// The revision of Forge's LCM entry sizer. It is part of the runtime's LCM
+/// component descriptor, so changing it invalidates persisted component state
+/// — see [`FORGE_LCM_POLICY_REVISION`].
+pub const FORGE_LCM_SIZER_REVISION: &str = "forge-lcm-sizer-1";
+
+/// The revision of everything Forge feeds into the runtime's LCM component
+/// descriptor: the sizer above, the pressure policy in
+/// `native::forge_lcm_pressure_policy`, and the summary model's policy.
+///
+/// The runtime folds all of them into one component revision and refuses to
+/// decode state written under a different one ("LCM component revision
+/// changed"), which would fail every turn on every existing session. The
+/// protected session store therefore records this marker beside each
+/// snapshot and drops stale LCM component state so the coordinator rebuilds
+/// it from the durable timeline instead.
+///
+/// **Bump this whenever any of those three change.**
+pub const FORGE_LCM_POLICY_REVISION: &str = "forge-lcm-policy-2";
+
+/// Characters charged as one token by the host sizers.
+const LCM_CHARS_PER_TOKEN: u64 = 4;
+
+/// Per-entry and per-summary framing, matching the runtime's own
+/// `CharRatioSizer` defaults so node metadata stays comparable.
+const LCM_FRAMING_TOKENS: u64 = 4;
+
+/// Sizes an LCM entry by everything it carries, not only its plain text.
+///
+/// The runtime's default `CharRatioSizer` charges `Message::joined_text()`
+/// plus one token per tool part. A tool call's `arguments` and a tool
+/// result's body live *inside* their content part, so `joined_text()` cannot
+/// see them: on a worker or Project Agent timeline — mostly
+/// `[assistant tool call, tool result]` pairs — the estimate ran ~41% under
+/// what the context planner charges for the same history. Pressure then read
+/// Soft, which never compacts, while the planner refused the turn with
+/// `budget_exceeded`; because canonical history is durable, every retry
+/// replayed it and the session could not recover.
+///
+/// Sizing the entry's serialized canonical form tracks the wire cost of every
+/// part, so pressure trips before the planner's wall. Summaries keep the
+/// runtime's formula: they are plain text, and inflating them would weaken
+/// the coordinator's strict-shrinkage check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForgeLcmSizer;
+
+impl ForgeLcmSizer {
+    /// Creates the sizer at [`FORGE_LCM_SIZER_REVISION`].
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn charge(chars: u64) -> u64 {
+        LCM_FRAMING_TOKENS.saturating_add(chars.div_ceil(LCM_CHARS_PER_TOKEN))
+    }
+}
+
+impl agent_runtime::lcm::LcmSizer for ForgeLcmSizer {
+    fn entry_tokens(&self, entry: &LcmEntry) -> u64 {
+        // Serialization is the faithful measure of what the provider is sent.
+        // A message that cannot serialize is charged for its visible text plus
+        // one token per tool part, exactly as the runtime's sizer would, so
+        // this never reads *lower* than the default it replaces.
+        match serde_json::to_string(&entry.content) {
+            Ok(serialized) => Self::charge(serialized.len() as u64),
+            Err(_) => {
+                let text = entry.content.joined_text().len() as u64;
+                let tool_parts = entry
+                    .content
+                    .content
+                    .iter()
+                    .filter(|part| {
+                        matches!(part, ContentPart::ToolCall(_) | ContentPart::ToolResult(_))
+                    })
+                    .count() as u64;
+                Self::charge(text).saturating_add(tool_parts)
+            }
+        }
+    }
+
+    fn summary_tokens(&self, summary: &str) -> u64 {
+        Self::charge(summary.len() as u64)
+    }
+
+    fn revision(&self) -> RegistryRevision {
+        RegistryRevision::from_content(FORGE_LCM_SIZER_REVISION)
+    }
+}
+
 /// The deterministic summary model's own output ceiling, mirroring the
 /// coordinator's `deterministic_token_cap`. The coordinator's leaf target
 /// (2048 source tokens) is a *source* sizing goal; a summary model that

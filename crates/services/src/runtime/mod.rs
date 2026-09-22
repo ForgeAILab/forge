@@ -250,6 +250,8 @@ impl ForgeRuntime {
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service
+            .set_command_policy(&config.commands);
+        self.embedded_agent_service
             .set_media_root(config.forge.data_dir.join("media"));
         self.embedded_agent_service.set_workspace_root(
             config.workspace.root.clone(),
@@ -515,6 +517,7 @@ impl ForgeRuntimeBuilder {
         ));
         embedded_agent_service
             .set_public_search_config(Some(effective_config.public_search.clone()));
+        embedded_agent_service.set_command_policy(&effective_config.commands);
         let agent_chat_service = Arc::new(crate::AgentChatService::new(Arc::clone(&self.db)));
         let main_chat_topic_service = Arc::new(MainChatTopicService::new(
             Arc::clone(&self.db),

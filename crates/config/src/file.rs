@@ -12,6 +12,13 @@ pub(crate) struct FileConfig {
     pub scaffold: Option<FileScaffoldConfig>,
     pub project: Option<BTreeMap<String, String>>,
     pub providers: Option<BTreeMap<String, FileProviderDeclaration>>,
+    pub commands: Option<FileCommandPolicyConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileCommandPolicyConfig {
+    pub allow: Option<Vec<String>>,
+    pub only: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

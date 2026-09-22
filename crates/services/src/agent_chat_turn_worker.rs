@@ -2876,6 +2876,13 @@ impl FederatedAgentChatTurnRunner {
                     None => (None, WorkspaceAccess::Deny),
                 },
             };
+        // A Project Agent's commands run in that Project's checkout, so the
+        // Project's own settings layer over the configured baseline; the Main
+        // Agent's scratch belongs to the account and takes the baseline.
+        let command_allowlist = self
+            .embedded_agents
+            .effective_command_allowlist(chat.as_ref().and_then(|chat| chat.project_id.as_deref()))
+            .await;
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
         let output = match self
@@ -2922,6 +2929,7 @@ impl FederatedAgentChatTurnRunner {
                     ),
                     history: runtime_history(&history),
                     input: input.content,
+                    command_allowlist: Some(command_allowlist),
                     cancellation,
                 },
                 turn_log,

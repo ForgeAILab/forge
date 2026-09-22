@@ -35,9 +35,9 @@ use futures_util::StreamExt;
 use crate::{
     AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnOutput, AgentTurnRequest,
     AgentTurnTelemetryState, AgentTurnUsageReport, BackendCapabilities, CanonicalScope,
-    CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, ForgeToolProvider,
-    InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
-    ScopeToolComposition, TurnEventSink, WorkspaceAccess,
+    CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, ForgeLcmSizer,
+    ForgeToolProvider, InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
+    ScopeToolComposition, ScopeToolRuntime, TurnEventSink, WorkspaceAccess,
     protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
 };
 
@@ -47,6 +47,10 @@ pub struct NativeAgentRuntimeBackend {
     interaction_broker: InteractionBrokerHandle,
     active: Arc<Mutex<HashMap<String, ActiveNativeSession>>>,
     forge_tool_provider: Option<Arc<dyn ForgeToolProvider>>,
+    /// The outbound transport behind the runtime's web fetch tool. One client
+    /// factory for every turn: the tool is stateless and the transport pins a
+    /// freshly resolved address per request.
+    fetch_transport: Arc<dyn agent_runtime::harness::FetchTransport>,
     provider_override: Option<Arc<dyn Provider>>,
 }
 
@@ -113,6 +117,7 @@ impl NativeAgentRuntimeBackend {
             protected_store,
             active: Arc::new(Mutex::new(HashMap::new())),
             forge_tool_provider: None,
+            fetch_transport: Arc::new(crate::ForgeFetchTransport::new()),
             provider_override: None,
         }
     }
@@ -381,6 +386,10 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 charter_setup_required: binding.project_charter_setup_required,
             },
             self.forge_tool_provider.clone(),
+            ScopeToolRuntime {
+                command_allowlist: request.command_allowlist.clone(),
+                fetch_transport: Some(Arc::clone(&self.fetch_transport)),
+            },
         )?;
         // `RuntimeEvent::ToolCallCompleted` only carries `is_error`; observe
         // each tool's exact result here, keyed by call id, so the bounded
@@ -429,6 +438,11 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 LcmCoordinatorPolicy {
                     input_budget_tokens: conversation_budget_tokens(&request, &composition),
                     pressure: forge_lcm_pressure_policy(&request),
+                    // The stock sizer cannot see a tool call's arguments or a
+                    // tool result's body, so a tool-exchange timeline read
+                    // Soft — which never compacts — right up to the planner's
+                    // `budget_exceeded` wall. See `ForgeLcmSizer`.
+                    sizer: Arc::new(ForgeLcmSizer::new()),
                     ..LcmCoordinatorPolicy::default()
                 },
             )

@@ -1338,12 +1338,39 @@ The Project Agent route is an Agent Workspace: one durable conversation beside
 a typed Project-record rail on desktop and a Conversation/Project segmented
 view on compact screens. The rail calls the existing Project, Task, artifact,
 Decision, and milestone services and surfaces saved/conflict/error receipts.
-It does not widen authority. Main and Project Agent sessions still use
-`WorkspaceAccess::Deny`, receive no repository path or shell, and can cause
-repository work only by creating/admitting a Task through the workflow.
+It does not widen authority: neither Agent can cause repository work except by
+creating or admitting a Task through the workflow.
 
-`forge-agent-host` composes Agent Runtime directly at immutable revision
-`a7075b1d2dd1cee05db63bc480ff46b0f97ec239`. It owns provider construction,
+Each does hold a workspace of its own, and neither is the repository. A Project
+Agent Chat gets `WorkspaceAccess::ProjectVerify` — a disposable checkout it may
+read, write beside, and run commands in, so it can exercise the delivered
+software itself — with no commit or push route out of it. A Main Chat, and every
+ephemeral inquiry sub-agent it dispatches, gets `WorkspaceAccess::AccountScratch`:
+a plain directory holding no repository at all, where "cannot write to a
+repository" holds structurally rather than by policy. A chat scope with neither
+provisioned stays at `WorkspaceAccess::Deny`.
+
+Commands in any of those three workspaces — and in a Task worktree — are bounded
+by one allowlist of bare program names, resolved per turn from the built-in set,
+the owner's `commands` config, and the owning Project's `command_allowlist`
+settings, and carried on the turn request so model input cannot reach it. The
+list bounds the blast radius rather than sandboxing it: `bash` is on it, and a
+shell reaches whatever the workspace does. What it bounds is which tools exist
+at all, as the owner's decision rather than whatever `PATH` offers.
+
+Both chat scopes and a Task worker may also fetch a public page through the
+runtime's built-in `fetch` tool, gated on the same permission as the search
+tool (a Task worker on its read permission) and on the host supplying a
+transport. Forge's transport pins each request to addresses it resolved and
+accepted, refuses anything but `https` without credentials, follows redirects
+only inside the origin the runtime authorized, and caps the body — so a public
+hostname that resolves into this machine's network is refused before a socket
+opens, and a cross-origin redirect costs another authorized tool call instead
+of arriving under the first one's permission. The authorization gate refuses a
+network resource that is not a public https `GET`.
+
+`forge-agent-host` composes Agent Runtime directly at the revision pinned in
+the workspace `Cargo.toml`. It owns provider construction,
 protected credential/checkpoint/session stores, interaction handling, runtime
 events, content guards, usage mapping, cancellation/steering capabilities,
 typed tools, and scope-derived workspaces. Forge does not depend on the sibling
@@ -1371,6 +1398,26 @@ operation, immutable admitted entries, transactional DAG compare-and-swap,
 operation fingerprints, and restart recovery. Session rotation follows the
 same authorized timeline; histories from different canonical scopes cannot be
 opened or merged by possessing a timeline/node ID.
+
+Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
+serialized canonical form, because the runtime's default sizer scans an
+entry's plain text plus one token per tool part and a tool call's arguments
+and a tool result's body sit inside their content part, invisible to that
+scan. A worker or Project Agent timeline is mostly
+`[assistant tool call, tool result]` pairs, so the default read ~41% under
+what the context planner charges: pressure stayed Soft, which never compacts,
+while the planner refused the turn with `budget_exceeded` — and because
+canonical history is durable, every retry replayed it.
+
+The runtime folds Forge's sizer, pressure policy, and summary policy into one
+LCM component revision and refuses to decode component state written under a
+different one, so changing any of them would fail every turn of every live
+session. `protected_agent_session_state.lcm_policy_revision` records the
+`FORGE_LCM_POLICY_REVISION` that last wrote a session, and the protected store
+drops superseded LCM component state on load — from the session snapshot and
+from the checkpoint's copy, which the resume overlay would otherwise reinstate
+— leaving the coordinator to rebuild it from `agent_lcm_entry` /
+`agent_lcm_node`. Bump that constant with any change to those three policies.
 
 Forge selects and authorizes domain context; Agent Runtime alone budgets and
 serializes final model context. `context_manifest` records the offered source

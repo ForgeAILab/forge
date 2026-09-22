@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod command_allowlist;
+mod fetch;
 mod interaction;
 mod lcm;
 mod manifest;
@@ -31,12 +33,15 @@ pub use agent_runtime::core::interaction::{
 pub use agent_runtime::core::store::Secret;
 pub use agent_runtime::lcm::{LcmClassification, LcmSourceMetadata};
 pub use agent_runtime::registry::{RegistryRevision, TrustClass};
+pub use command_allowlist::{BUILTIN_COMMAND_ALLOWLIST, CommandAllowlist};
+pub use fetch::ForgeFetchTransport;
 pub use interaction::{
     InteractionAnswer, InteractionAnswerValue, InteractionBrokerHandle, ProtectedInteractionSummary,
 };
 pub use lcm::{
-    DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION,
-    SqliteLcmStore, TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
+    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_SIZER_REVISION,
+    FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION, ForgeLcmSizer, SqliteLcmStore,
+    TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
 };
 pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
@@ -76,7 +81,7 @@ pub use typed_tools::{
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
     FORGE_PUBLIC_WEB_SEARCH_TOOL, FORGE_SCOPE_PROPOSE_PERMISSION, FORGE_SCOPE_READ_PERMISSION,
     ForgeToolProvider, ProjectChatToolContext, PublicSearchScope, ScopeToolComposition,
-    TaskToolRole,
+    ScopeToolRuntime, TaskToolRole,
 };
 
 /// The concrete Agent Runtime guard that ended a provider-backed turn.
@@ -276,6 +281,10 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
     pub input: String,
+    /// Programs this turn's workspace commands may spawn, resolved by the
+    /// caller from owner configuration and the owning Project. `None` uses
+    /// the built-in set; the composition never takes this from model input.
+    pub command_allowlist: Option<Arc<CommandAllowlist>>,
     pub cancellation: CancellationToken,
 }
 

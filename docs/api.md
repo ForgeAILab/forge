@@ -2624,6 +2624,34 @@ Terminal configuration lives under the `terminal` config section:
 `terminal.max_sessions_per_user`; invalid terminal configuration is rejected
 when Forge loads config.
 
+Workspace command policy lives under `commands`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `commands.allow` | `[]` | Programs added to the built-in allowlist |
+| `commands.only` | unset | Replaces the built-in allowlist outright; `[]` denies every command |
+
+Entries must be bare program names — a path, an argument, or anything with a
+separator is dropped and logged at startup, so a malformed entry can never
+widen the set. The built-in list covers building and testing software
+(`cargo`, `go`, `pnpm`, `uv`, `gradle`, `swift`, `make`, `git`, core file and
+text utilities, and their peers). Programs that can mount the host filesystem
+(`docker`, `podman`), open an outbound session (`curl`, `wget`, `ssh`), or run
+a program chosen at runtime (`xargs`, `env`) are deliberately absent and must
+be added here.
+
+A Project layers its own policy over that result through the `command_allowlist`
+key in its settings (`PATCH /api/v1/projects/{id}` with
+`{"settings": {"command_allowlist": {"allow": ["terraform"]}}}`), using the same
+two keys and the same rules: `only` replaces the inherited set, `allow` adds to
+it. A Project that declares nothing inherits the server's list unchanged, and a
+Project's additions never reach another Project or the account scratch scope.
+
+The allowlist is a blast-radius bound, not a sandbox: `bash` and `sh` are on it
+because real build tooling needs them, and a shell can reach anything the
+workspace itself can. What it does buy is that the reachable tool surface is
+the owner's decision rather than whatever is on `PATH`.
+
 Public search configuration lives under `public_search`:
 
 | Key | Default | Description |

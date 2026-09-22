@@ -21,7 +21,7 @@ use db::{
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
 use forge_agent_host::{
-    AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
+    AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
     CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
     OAuthCredentialBundle, Secret, SqliteProtectedRuntimeStore, WorkspaceAccess,
 };
@@ -57,6 +57,9 @@ pub struct EmbeddedAgentService {
     /// provisioned. Absent until the server wires it, in which case a Project
     /// Agent keeps its filesystem-denied scope.
     workspace_root: Arc<std::sync::RwLock<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
+    /// The owner-configured command allowlist every workspace turn starts
+    /// from, before a Project layers its own settings over it.
+    command_allowlist: Arc<std::sync::RwLock<Arc<CommandAllowlist>>>,
 }
 
 /// Create a direct (embedded-runtime) agent referencing an existing provider
@@ -234,6 +237,14 @@ impl ProviderUsageOutcome {
     }
 }
 
+/// The string members of a JSON array, ignoring anything else in it.
+fn string_list(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
 impl EmbeddedAgentService {
     pub fn new(db: Arc<SqliteDb>, protected_key_material: &[u8]) -> Self {
         let digest = Sha256::digest(protected_key_material);
@@ -254,8 +265,80 @@ impl EmbeddedAgentService {
             protected_store,
             native_backend,
             workspace_root: Arc::new(std::sync::RwLock::new(None)),
+            command_allowlist: Arc::new(std::sync::RwLock::new(Arc::new(
+                CommandAllowlist::builtin(),
+            ))),
             tool_provider,
         }
+    }
+
+    /// Apply the owner's configured command policy. Entries that are not bare
+    /// program names are dropped and logged here, once at startup, rather
+    /// than silently narrowing nothing at every turn.
+    pub fn set_command_policy(&self, policy: &config::CommandPolicyConfig) {
+        let (allowlist, rejected) =
+            CommandAllowlist::resolve(policy.only.as_deref(), &policy.allow);
+        if !rejected.is_empty() {
+            tracing::warn!(
+                rejected = ?rejected,
+                "ignored command allowlist entries that are not bare program names"
+            );
+        }
+        tracing::info!(
+            programs = allowlist.len(),
+            replaced_builtin = policy.only.is_some(),
+            "resolved the workspace command allowlist"
+        );
+        if let Ok(mut slot) = self.command_allowlist.write() {
+            *slot = Arc::new(allowlist);
+        }
+    }
+
+    /// The allowlist a turn in `project_id`'s workspace may spawn from.
+    ///
+    /// A Project layers its own `command_allowlist` in Project settings over
+    /// the configured baseline, by the same rules: `only` replaces the
+    /// inherited set, `allow` adds to it. A Project that says nothing
+    /// inherits the baseline unchanged.
+    pub async fn effective_command_allowlist(
+        &self,
+        project_id: Option<&str>,
+    ) -> Arc<CommandAllowlist> {
+        let baseline = self
+            .command_allowlist
+            .read()
+            .map(|slot| Arc::clone(&slot))
+            .unwrap_or_else(|_| Arc::new(CommandAllowlist::builtin()));
+        let Some(project_id) = project_id else {
+            return baseline;
+        };
+        let Ok(Some(project)) = ProjectRepo::get_by_id(&*self.db, project_id).await else {
+            return baseline;
+        };
+        let Ok(settings) = serde_json::from_str::<Value>(&project.settings) else {
+            return baseline;
+        };
+        let Some(declared) = settings.get("command_allowlist") else {
+            return baseline;
+        };
+        let only = declared
+            .get("only")
+            .and_then(Value::as_array)
+            .map(|values| string_list(values));
+        let allow = declared
+            .get("allow")
+            .and_then(Value::as_array)
+            .map(|values| string_list(values))
+            .unwrap_or_default();
+        let (layered, rejected) = baseline.layer(only.as_deref(), &allow);
+        if !rejected.is_empty() {
+            tracing::warn!(
+                project_id,
+                rejected = ?rejected,
+                "ignored Project command allowlist entries that are not bare program names"
+            );
+        }
+        Arc::new(layered)
     }
 
     /// Apply the server's optional public-search configuration to the shared
@@ -299,6 +382,12 @@ impl EmbeddedAgentService {
                 charter_setup_required: binding.project_charter_setup_required,
             },
             Some(self.tool_provider.clone()),
+            // Inspection must report the catalog a turn would actually get,
+            // so it carries the same transport the backend composes with.
+            forge_agent_host::ScopeToolRuntime {
+                command_allowlist: None,
+                fetch_transport: Some(Arc::new(forge_agent_host::ForgeFetchTransport::new())),
+            },
         )
         .map_err(redacted_host_error)
     }

@@ -95,6 +95,15 @@ impl ForgeConfig {
             }
         }
 
+        if let Some(commands) = file.commands {
+            if let Some(allow) = commands.allow {
+                self.commands.allow = allow;
+            }
+            if let Some(only) = commands.only {
+                self.commands.only = Some(only);
+            }
+        }
+
         if let Some(terminal) = file.terminal {
             if let Some(enabled) = terminal.enabled {
                 self.terminal.enabled = enabled;

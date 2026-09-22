@@ -162,6 +162,39 @@ impl SqliteProtectedRuntimeStore {
             })
     }
 
+    /// Drops LCM component state this binary can no longer decode.
+    ///
+    /// The runtime folds Forge's sizer, pressure policy, and summary policy
+    /// into one LCM component revision, and `decode_state` rejects state
+    /// written under a different one — a conflict that fails the turn and is
+    /// replayed on every attempt, so a Forge-side LCM policy change would
+    /// otherwise wedge every existing session permanently. The component's
+    /// state is a cache over the durable timeline (`agent_lcm_entry` /
+    /// `agent_lcm_node`), so dropping it loses nothing: the coordinator
+    /// synchronizes it back from the timeline on the next turn. Canonical
+    /// history, usage, and manifests in the snapshot are untouched.
+    ///
+    /// `None` is state written before the marker column existed, and is
+    /// treated as stale once.
+    fn drop_stale_lcm_state(snapshot: &mut SessionSnapshot, stored_revision: Option<&str>) {
+        if stored_revision == Some(crate::FORGE_LCM_POLICY_REVISION) {
+            return;
+        }
+        if snapshot
+            .extension_state
+            .remove(agent_runtime::harness::LCM_COMPONENT_ID)
+            .is_some()
+        {
+            tracing::info!(
+                session_id = %snapshot.id.as_str(),
+                stored_revision = stored_revision.unwrap_or("none"),
+                current_revision = crate::FORGE_LCM_POLICY_REVISION,
+                "dropped LCM component state written under a superseded Forge LCM policy; \
+                 it will be rebuilt from the durable timeline"
+            );
+        }
+    }
+
     /// Internal protected-payload seam used by the interaction broker.  The
     /// bytes never cross into public profile/session/domain projections.
     pub(crate) fn seal_protected(
@@ -1470,7 +1503,7 @@ impl SessionStore for SqliteProtectedRuntimeStore {
             Err(error) => return Err(error),
         };
         let row = sqlx::query(
-            "SELECT snapshot_ciphertext, snapshot_nonce
+            "SELECT snapshot_ciphertext, snapshot_nonce, lcm_policy_revision
              FROM protected_agent_session_state WHERE session_id = ?",
         )
         .bind(forge_session_id)
@@ -1486,10 +1519,15 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("snapshot_nonce")
             .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
+        let lcm_policy_revision: Option<String> = row
+            .try_get("lcm_policy_revision")
+            .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open(&ciphertext, &nonce)?;
-                serde_json::from_slice(&bytes).map(Some).map_err(Into::into)
+                let mut snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
+                Self::drop_stale_lcm_state(&mut snapshot, lcm_policy_revision.as_deref());
+                Ok(Some(snapshot))
             }
             _ => Ok(None),
         }
@@ -1502,12 +1540,13 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         sqlx::query(
             "INSERT INTO protected_agent_session_state (
                 session_id, snapshot_ciphertext, snapshot_nonce,
-                key_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, 1, ?)
+                key_revision, lcm_policy_revision, state_revision, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 1, ?)
              ON CONFLICT(session_id) DO UPDATE SET
                 snapshot_ciphertext = excluded.snapshot_ciphertext,
                 snapshot_nonce = excluded.snapshot_nonce,
                 key_revision = excluded.key_revision,
+                lcm_policy_revision = excluded.lcm_policy_revision,
                 state_revision = protected_agent_session_state.state_revision + 1,
                 updated_at = excluded.updated_at",
         )
@@ -1515,6 +1554,7 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         .bind(ciphertext)
         .bind(nonce)
         .bind(self.key_revision)
+        .bind(crate::FORGE_LCM_POLICY_REVISION)
         .bind(db::now_rfc3339())
         .execute(self.db.pool())
         .await
@@ -1535,7 +1575,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
             Err(error) => return Err(error),
         };
         let row = sqlx::query(
-            "SELECT checkpoint_ciphertext, checkpoint_nonce
+            "SELECT checkpoint_ciphertext, checkpoint_nonce, lcm_policy_revision
              FROM protected_agent_session_state WHERE session_id = ?",
         )
         .bind(forge_session_id)
@@ -1551,10 +1591,22 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("checkpoint_nonce")
             .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
+        let lcm_policy_revision: Option<String> = row
+            .try_get("lcm_policy_revision")
+            .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open(&ciphertext, &nonce)?;
-                serde_json::from_slice(&bytes).map(Some).map_err(Into::into)
+                let mut checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes)?;
+                // The checkpoint carries its own copy of every extension
+                // namespace, and the resume overlay reinstates a namespace the
+                // session snapshot no longer has. Stale LCM state has to leave
+                // by both doors or it comes straight back.
+                Self::drop_stale_lcm_state(
+                    &mut checkpoint.snapshot,
+                    lcm_policy_revision.as_deref(),
+                );
+                Ok(Some(checkpoint))
             }
             _ => Ok(None),
         }
@@ -1569,8 +1621,8 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
             "INSERT INTO protected_agent_session_state (
                 session_id, checkpoint_ciphertext, checkpoint_nonce,
                 checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint,
-                key_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                key_revision, lcm_policy_revision, state_revision, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
              ON CONFLICT(session_id) DO UPDATE SET
                 checkpoint_ciphertext = excluded.checkpoint_ciphertext,
                 checkpoint_nonce = excluded.checkpoint_nonce,
@@ -1595,6 +1647,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         .bind(i64::try_from(checkpoint.state_revision).unwrap_or(i64::MAX))
         .bind(fingerprint)
         .bind(self.key_revision)
+        .bind(crate::FORGE_LCM_POLICY_REVISION)
         .bind(db::now_rfc3339())
         .execute(self.db.pool())
         .await
