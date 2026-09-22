@@ -76,6 +76,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   before each execution like `config.toml` and `skills`. `AGENTS.md` and
   `hooks.json`, which Codex never writes, stay fail-closed — a repository or a
   user planting one is the case that guard exists for.
+- A Project's default Worker and reviewer prefer an agent Forge drives itself.
+  The candidate list was ordered by age alone, so on a host with CLI harnesses
+  registered the role went to whichever identity was created first — a Smith
+  agent, whose every execution died with `requires_authorization: true … tool:
+  shell`, six times on one Task before a human reassigned the role. Health does
+  not catch this: a harness reports healthy because its binary is present, not
+  because it can answer an approval prompt no one is watching. Embedded
+  identities now sort first, harnesses remain eligible as fallbacks, and an
+  explicit assignment still wins outright.
 - A fetched web page is no longer returned empty (agent-runtime `65a3970`).
   `meta` and `link` are content-skipping tags and also HTML void elements, so
   the converter counted each `<meta charset="utf-8">` as an opening tag and

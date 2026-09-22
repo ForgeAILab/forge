@@ -367,12 +367,43 @@ pub async fn eligible_project_execution_agents(
         }
         eligible.push(agent);
     }
+    // Order the candidates by how well they suit an *unattended* role, then
+    // deterministically.
+    //
+    // This list also picks a Project's default Worker and reviewer when the
+    // owner has configured none, and ordering by age alone chose whichever
+    // identity happened to be created first. On a host with CLI harnesses
+    // registered that was a Smith agent, and every execution it was handed
+    // died the same way: `smith execution halted … requires_authorization:
+    // true … tool: shell`. Six identical failures on one Task before a human
+    // reassigned the role.
+    //
+    // Health does not catch this. A CLI harness reports Active because its
+    // binary is present and logged in; whether its tools need an interactive
+    // approval a headless Task execution cannot answer is not something the
+    // health probe asks. An embedded identity runs in-process against Forge's
+    // own interaction broker, so it has an approval channel by construction.
+    // Prefer embedded for a default, and fall back to a harness only when
+    // there is no embedded candidate — an explicit assignment still wins over
+    // this ordering entirely.
     eligible.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
+        prefers_unattended_role(left)
+            .cmp(&prefers_unattended_role(right))
+            .then_with(|| left.created_at.cmp(&right.created_at))
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(eligible)
+}
+
+/// Sort rank for holding an unattended execution role: 0 for an identity
+/// Forge itself drives, 1 for a CLI harness that brings its own approval
+/// channel. Lower sorts first.
+fn prefers_unattended_role(agent: &Agent) -> u8 {
+    if agent.executor_type.trim() == "embedded" {
+        0
+    } else {
+        1
+    }
 }
 
 fn project_default_assignments(project: &Project) -> Result<HashMap<String, String>> {
@@ -484,6 +515,79 @@ mod tests {
     use super::*;
     use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
     use serde_json::json;
+
+    fn agent(id: &str, executor_type: &str, created_at: &str) -> Agent {
+        Agent {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            description: None,
+            profile_id: format!("{id}-profile"),
+            backend_kind: if executor_type == "embedded" {
+                "native".to_owned()
+            } else {
+                "cli".to_owned()
+            },
+            executor_type: executor_type.to_owned(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            version: 1,
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_unattended_default_prefers_an_agent_forge_drives_itself() {
+        // A Project's default Worker is taken from the front of this list.
+        // Ordering by age alone handed the role to whichever identity existed
+        // first, and on a host with CLI harnesses registered that was a Smith
+        // agent: every execution it received died identically with
+        // `requires_authorization: true … tool: shell`, six times on one Task
+        // before a human reassigned the role. Health does not catch it — a
+        // harness reports healthy because its binary is present, not because
+        // it can answer an approval prompt no one is watching.
+        let mut candidates = [
+            agent("smith-harness", "smith", "2000-01-01T00:00:00.000Z"),
+            agent("codex-harness", "codex", "2001-01-01T00:00:00.000Z"),
+            agent("embedded-new", "embedded", "2026-01-01T00:00:00.000Z"),
+            agent("embedded-old", "embedded", "2025-01-01T00:00:00.000Z"),
+        ];
+        candidates.sort_by(|left, right| {
+            prefers_unattended_role(left)
+                .cmp(&prefers_unattended_role(right))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let order: Vec<&str> = candidates.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "embedded-old",
+                "embedded-new",
+                "smith-harness",
+                "codex-harness"
+            ],
+            "embedded identities lead, oldest first; harnesses stay as fallbacks in age order"
+        );
+    }
 
     fn state(
         name: &str,
