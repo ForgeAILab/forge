@@ -934,6 +934,22 @@ remains the command for stopped work that should run again. This is a native
 operation only; the existing `POST /api/v1/tasks/{id}/cancel` endpoint remains
 the human/API surface.
 
+The ReadyOnly native `task.dependency` operation adds or removes one
+prerequisite edge between two Tasks in the bound Project. Its closed payload is
+`action: "add" | "remove"`, `task_id` (the Task that waits),
+`depends_on_task_id` (the Task it waits for), and a non-empty `rationale`.
+Forge derives the Project from the authenticated binding and rejects a Task
+from another Project in either position. Adding refuses a cancelled
+prerequisite and a self-edge; removing the last cancelled prerequisite clears
+the dependency block it caused.
+
+Without this, `depends_on_task_ids` was settable only at `task.propose` and an
+Agent re-planning a graph had to cancel and recreate every downstream Task —
+each with a new id — because a dependent of a cancelled Task is blocked with
+`cancel_task` as its only advertised recovery, and a cancelled Task cannot be
+recovered at all. The existing `POST`/`DELETE /api/v1/tasks/{id}/dependencies`
+endpoints remain the human/API surface and are unchanged.
+
 Main Charter drafts execute directly through the shared Genesis command, while
 Charter reads/readiness/diffs/approval targets use the query boundary and do
 not create Actions. Approval-backed Main orchestration uses the dedicated

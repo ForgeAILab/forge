@@ -1,5 +1,14 @@
 use super::*;
 
+/// Which way one prerequisite edge is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDependencyAction {
+    /// `task_id` waits for `depends_on_task_id`.
+    Add,
+    /// `task_id` no longer waits for it.
+    Remove,
+}
+
 impl TaskService {
     pub async fn add_task_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
         validate_required("task_id", task_id)?;
@@ -35,6 +44,52 @@ impl TaskService {
         validate_required("depends_on_id", depends_on_id)?;
         TaskDependencyRepo::remove_dependency(&*self.db, task_id, depends_on_id).await?;
         self.clear_resolved_dependency_block(task_id).await
+    }
+
+    /// Adds or removes one prerequisite edge on behalf of a Project Agent.
+    ///
+    /// The Project comes from the server-derived binding, never from the
+    /// payload, and both Tasks must belong to it — otherwise an Agent bound to
+    /// one Project could rewire another Project's graph by id. Everything
+    /// below this is the same path the REST endpoints use, including clearing
+    /// a dependency block when the edge that caused it goes away.
+    pub async fn perform_project_agent_dependency(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        depends_on_task_id: &str,
+        action: TaskDependencyAction,
+    ) -> Result<Task> {
+        validate_required("task_id", task_id)?;
+        validate_required("depends_on_task_id", depends_on_task_id)?;
+        if task_id == depends_on_task_id {
+            return Err(ServiceError::invalid_operation(
+                "a Task cannot depend on itself",
+            ));
+        }
+        for id in [task_id, depends_on_task_id] {
+            let task = TaskRepo::get_by_id(&*self.db, id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", id.to_owned()))?;
+            if task.project_id != project_id {
+                return Err(ServiceError::invalid_operation(
+                    "both Tasks must belong to the bound Project",
+                ));
+            }
+        }
+        match action {
+            TaskDependencyAction::Add => {
+                self.add_task_dependency(task_id, depends_on_task_id)
+                    .await?
+            }
+            TaskDependencyAction::Remove => {
+                self.remove_task_dependency(task_id, depends_on_task_id)
+                    .await?
+            }
+        }
+        TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))
     }
 
     pub(super) async fn cancelled_dependency_ids(

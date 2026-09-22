@@ -19,8 +19,9 @@ use crate::operation_catalog::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -575,6 +576,16 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             &["action", "task_id", "expected_task_version", "reason"],
             "Cancel one non-terminal Task in the bound Project at an exact version. This is valid for healthy queued or running work and uses the normal Task cancellation lifecycle, including stopping active executions. Use task.recover only when stopped work should continue.",
         ),
+        TASK_DEPENDENCY_OPERATION => described_object_schema(
+            json!({
+                "action":{"type":"string","enum":["add","remove"]},
+                "task_id":{"type":"string","minLength":1,"description":"The dependent Task: the one that waits."},
+                "depends_on_task_id":{"type":"string","minLength":1,"description":"The prerequisite Task it waits for."},
+                "rationale":{"type":"string","minLength":1,"description":"Why the graph is changing shape."}
+            }),
+            &["action", "task_id", "depends_on_task_id", "rationale"],
+            "Add or remove one prerequisite edge between two Tasks in the bound Project. This is a DAG edge only: it creates no parent/child hierarchy and no shared workspace. Adding an edge refuses a cancelled prerequisite and a cycle; removing the last cancelled prerequisite clears the dependency block it caused. Use this to re-plan an existing graph instead of cancelling and recreating Tasks, which changes their ids.",
+        ),
         TASK_ADAPTIVE_OPERATION => {
             let child = object_schema(
                 json!({
@@ -913,6 +924,25 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "normal Task cancellation transition. Refresh and retry on a version conflict."
         ));
     }
+    if operations.contains(TASK_REVIEW_OPERATION) {
+        lines.push(concat!(
+            "task.review — record a human-required review verdict on one Task in the bound ",
+            "Project. Fields: task_id, decision (required: \"accept\" or \"reject\"), and ",
+            "expected_task_version (all required); reason is an optional note. This uses the ",
+            "normal review workflow, CI, and evidence checks."
+        ));
+    }
+    if operations.contains(TASK_DEPENDENCY_OPERATION) {
+        lines.push(concat!(
+            "task.dependency — add or remove one prerequisite edge between two Tasks in the ",
+            "bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task ",
+            "that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale ",
+            "(all required). This is a DAG edge only: no parent/child hierarchy and no shared ",
+            "workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the ",
+            "last cancelled prerequisite clears the dependency block it caused. Prefer this over ",
+            "cancelling and recreating Tasks, which changes their ids and orphans dependents."
+        ));
+    }
     if lines.is_empty() {
         String::new()
     } else {
@@ -931,10 +961,13 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
 /// `additionalProperties` open because every admitted operation shares this
 /// one envelope; each description names its owning operation.
 pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
-    if !operations.contains("task.propose")
-        && !operations.contains(TASK_ADAPTIVE_OPERATION)
-        && !operations.contains(TASK_CANCEL_OPERATION)
-        && !operations.contains(TASK_RECOVER_OPERATION)
+    // Derived: any operation on the generic coordination envelope needs this
+    // surface. Listing the names here meant a new operation silently got a
+    // payload surface with none of its fields declared, which is invisible
+    // until a provider that only surfaces declared properties strips them.
+    if !operations
+        .iter()
+        .any(|operation| crate::operation_catalog::is_coordination_generic_proposal(operation))
     {
         return None;
     }
@@ -970,11 +1003,15 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         },
         "task_id": {
             "type": ["string", "null"],
-            "description": "task.recover/task.cancel: required Task id in this Project."
+            "description": "task.recover/task.cancel/task.review/task.dependency: required Task id in this Project."
         },
         "reason": {
             "type": ["string", "null"],
-            "description": "task.recover/task.cancel: required explanation."
+            "description": "task.recover/task.cancel: required explanation. task.review: optional note on the decision."
+        },
+        "decision": {
+            "type": ["string", "null"],
+            "description": "task.review: required, either \"accept\" or \"reject\". This is the whole review verdict; without it the Task cannot be reviewed through this surface."
         },
         "action": {
             "type": ["string", "null"],
@@ -982,7 +1019,8 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
                 "task.recover: required, one of \"resume_session\", \"reexecute\", ",
                 "\"reset_to_initial\", \"reset_retry_window\", or \"cancel_task\". ",
                 "task.adaptive: \"split\", \"sequence\", or \"replace\". ",
-                "task.cancel: \"cancel\"."
+                "task.cancel: \"cancel\". ",
+                "task.dependency: \"add\" or \"remove\"."
             )
         },
         "capability_class": {
@@ -1010,10 +1048,27 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "description": "task.propose: optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
         }
     });
-    if operations.contains(TASK_ADAPTIVE_OPERATION) || operations.contains(TASK_CANCEL_OPERATION) {
+    if operations.contains(TASK_ADAPTIVE_OPERATION)
+        || operations.contains(TASK_DEPENDENCY_OPERATION)
+    {
+        properties["rationale"] = json!({
+            "type": ["string", "null"],
+            "description": "task.adaptive/task.dependency: required. Why the command is being issued — for task.dependency, why the graph is changing shape."
+        });
+    }
+    if operations.contains(TASK_DEPENDENCY_OPERATION) {
+        properties["depends_on_task_id"] = json!({
+            "type": ["string", "null"],
+            "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream."
+        });
+    }
+    if operations.contains(TASK_ADAPTIVE_OPERATION)
+        || operations.contains(TASK_CANCEL_OPERATION)
+        || operations.contains(TASK_REVIEW_OPERATION)
+    {
         properties["expected_task_version"] = json!({
             "type": ["integer", "null"],
-            "description": "task.adaptive/task.cancel: Task version precondition."
+            "description": "task.adaptive/task.cancel/task.review: Task version precondition."
         });
     }
     if operations.contains(TASK_ADAPTIVE_OPERATION) {
@@ -1025,10 +1080,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "type": ["integer", "null"],
             "description": "task.adaptive: Project board revision precondition."
         });
-        properties["rationale"] = json!({
-            "type": ["string", "null"],
-            "description": "task.adaptive: bounded command rationale."
-        });
+
         properties["items"] = json!({
             "type": ["array", "null"],
             "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
@@ -1573,10 +1625,71 @@ mod tests {
     /// asserts distinct operations keep distinct schemas, which a wildcard
     /// cannot satisfy.
     #[test]
+    fn every_coordination_operation_declares_its_required_fields_on_the_flat_surface() {
+        // The failure this prevents has happened twice. A field the server
+        // requires but the flat envelope never declares cannot be sent at all
+        // by a provider that surfaces only declared properties — Gemini and
+        // z.ai both strip the rest — so the operation is unusable however the
+        // model writes the call, and nothing in the error says which field is
+        // missing. Checking one operation by hand is what let the second case
+        // through, so this walks the catalog.
+        let coordination: Vec<&str> = MIGRATED_OPERATION_CONTRACTS
+            .iter()
+            .map(|contract| contract.operation)
+            .filter(|operation| {
+                crate::operation_catalog::is_coordination_generic_proposal(operation)
+            })
+            .collect();
+        assert!(
+            coordination.len() >= 6,
+            "the coordination envelope should carry the task command family: {coordination:?}"
+        );
+
+        for operation in coordination {
+            let alone: BTreeSet<String> = [operation.to_owned()].into_iter().collect();
+            let properties = coordination_payload_properties(&alone).unwrap_or_else(|| {
+                panic!("{operation} rides the flat envelope, so it must have a payload surface")
+            });
+            for required in required_payload_fields(operation) {
+                assert!(
+                    properties.get(&required).is_some(),
+                    "{operation} requires `{required}`, so the flat payload surface must \
+                     declare it — otherwise a declared-properties-only provider cannot send it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_flat_surface_serves_task_dependency_even_when_it_is_the_only_operation() {
+        // The flat/legacy coordination surface returns early unless it
+        // recognizes at least one operation. `task.dependency` reaching a
+        // scope without `task.propose` beside it would otherwise get a
+        // payload surface with none of its fields declared — the same shape
+        // that made a required field invisible to Gemini and z.ai before.
+        let only_dependency: BTreeSet<String> =
+            [TASK_DEPENDENCY_OPERATION.to_owned()].into_iter().collect();
+        let properties = coordination_payload_properties(&only_dependency)
+            .expect("the flat surface must serve this operation on its own");
+        for field in ["action", "task_id", "depends_on_task_id"] {
+            assert!(
+                properties.get(field).is_some(),
+                "{field} must be declared on the flat surface: {properties}"
+            );
+        }
+        let guidance = coordination_payload_guidance(&only_dependency);
+        assert!(
+            guidance.contains("task.dependency"),
+            "the flat surface must explain the operation it serves: {guidance}"
+        );
+    }
+
+    #[test]
     fn every_operation_resolves_its_own_payload_schema() {
         let cases = [
             (TASK_ADAPTIVE_OPERATION, "split"),
             (TASK_CANCEL_OPERATION, "cancel"),
+            (TASK_DEPENDENCY_OPERATION, "add"),
             (TASK_RECOVER_OPERATION, "resume_session"),
             (TASK_WORKLOG_OPERATION, "append"),
             (TASK_EVIDENCE_OPERATION, "capture"),

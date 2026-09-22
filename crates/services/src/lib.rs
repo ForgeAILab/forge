@@ -72,6 +72,7 @@ pub mod project_orchestration;
 pub mod project_provisioning;
 pub mod project_reconciliation;
 pub mod project_runtime;
+pub mod project_settings;
 pub mod prompt_preview;
 pub mod provider_authorization;
 pub mod recovery;
@@ -322,7 +323,7 @@ pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{
     AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, NewSubtaskInput,
-    TaskProposalCommandResult, TaskService,
+    TaskDependencyAction, TaskProposalCommandResult, TaskService,
 };
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;

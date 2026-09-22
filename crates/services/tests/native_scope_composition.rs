@@ -36,7 +36,8 @@ use forge_agent_host::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -570,6 +571,20 @@ fn adaptive_task_arguments(
     })
 }
 
+fn task_dependency_arguments(key: &str, action: &str, task_id: &str, depends_on: &str) -> Value {
+    json!({
+        "operation": TASK_DEPENDENCY_OPERATION,
+        "payload": {
+            "action": action,
+            "task_id": task_id,
+            "depends_on_task_id": depends_on,
+            "rationale": "The graph is re-planned without changing either Task id."
+        },
+        "dedupe_key": key,
+        "correlation_id": format!("correlation-{key}")
+    })
+}
+
 fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -> Value {
     json!({
         "operation": TASK_CANCEL_OPERATION,
@@ -983,6 +998,49 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .fetch_one(fixture.db.pool())
         .await
         .expect("cancellable Task version");
+    // The graph command: point the cancellable Task at the Task proposed
+    // earlier, then take the edge away again. Neither id changes, which is the
+    // whole reason this operation exists.
+    let edge_added = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_dependency_arguments(
+            "matrix-task-dependency-add",
+            "add",
+            cancellable_task_id,
+            source_task_id,
+        ),
+        TASK_DEPENDENCY_OPERATION,
+    )
+    .await
+    .expect("task.dependency add composition call");
+    assert_outcome_operation(&edge_added, TASK_DEPENDENCY_OPERATION);
+    assert!(
+        !edge_added.is_error,
+        "adding a prerequisite edge should commit: {}",
+        edge_added.value
+    );
+    let edge_removed = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_dependency_arguments(
+            "matrix-task-dependency-remove",
+            "remove",
+            cancellable_task_id,
+            source_task_id,
+        ),
+        TASK_DEPENDENCY_OPERATION,
+    )
+    .await
+    .expect("task.dependency remove composition call");
+    assert_outcome_operation(&edge_removed, TASK_DEPENDENCY_OPERATION);
+    assert!(
+        !edge_removed.is_error,
+        "removing a prerequisite edge should commit: {}",
+        edge_removed.value
+    );
+    covered_operations.insert(TASK_DEPENDENCY_OPERATION.to_owned());
+
     let cancelled = invoke_tool(
         &project,
         "forge_scope_propose",

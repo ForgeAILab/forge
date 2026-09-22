@@ -132,7 +132,7 @@ pub struct ListParams {
 pub fn page_request(params: &ListParams) -> ApiResult<PageRequest> {
     Ok(PageRequest {
         cursor: params.cursor.clone(),
-        limit: params.limit.unwrap_or(20).clamp(1, 100),
+        limit: db::clamp_page_limit(params.limit),
         include_total: params.include_total.unwrap_or(false),
         sort_by: parse_sort_by(params.sort_by.as_deref())?,
         sort_order: parse_sort_order(params.sort_order.as_deref())?,
@@ -141,18 +141,19 @@ pub fn page_request(params: &ListParams) -> ApiResult<PageRequest> {
 
 pub fn task_page_request(params: &ListParams) -> ApiResult<PageRequest> {
     if params.sort_by.is_none() {
+        let (sort_by, sort_order) = db::task_sort_defaults();
         return Ok(PageRequest {
             cursor: params.cursor.clone(),
-            limit: params.limit.unwrap_or(20).clamp(1, 100),
+            limit: db::clamp_page_limit(params.limit),
             include_total: params.include_total.unwrap_or(false),
-            sort_by: SortBy::BoardPosition,
-            sort_order: SortOrder::Asc,
+            sort_by,
+            sort_order,
         });
     }
 
     Ok(PageRequest {
         cursor: params.cursor.clone(),
-        limit: params.limit.unwrap_or(20).clamp(1, 100),
+        limit: db::clamp_page_limit(params.limit),
         include_total: params.include_total.unwrap_or(false),
         sort_by: parse_task_sort_by(params.sort_by.as_deref())?,
         sort_order: parse_sort_order(params.sort_order.as_deref())?,
@@ -1419,29 +1420,11 @@ pub(crate) fn redact_sensitive_config(value: Value) -> Value {
 }
 
 fn parse_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
-    match value.unwrap_or("created_at") {
-        "created_at" => Ok(SortBy::CreatedAt),
-        "updated_at" => Ok(SortBy::UpdatedAt),
-        "priority" => Ok(SortBy::Priority),
-        "board_position" => Ok(SortBy::BoardPosition),
-        "id" => Ok(SortBy::Id),
-        value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
-    }
+    db::sort_by_from_name(value).map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 fn parse_task_sort_by(value: Option<&str>) -> ApiResult<SortBy> {
-    match value.unwrap_or("board_position") {
-        "created_at" => Ok(SortBy::CreatedAt),
-        "updated_at" => Ok(SortBy::UpdatedAt),
-        "priority" => Ok(SortBy::Priority),
-        "board_position" => Ok(SortBy::BoardPosition),
-        "title" => Ok(SortBy::Title),
-        "status" => Ok(SortBy::Status),
-        "agent" => Ok(SortBy::Agent),
-        "task_type" => Ok(SortBy::TaskType),
-        "id" => Ok(SortBy::Id),
-        value => Err(ApiError::bad_request(format!("invalid sort_by: {value}"))),
-    }
+    db::task_sort_by_from_name(value).map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 fn parse_sort_order(value: Option<&str>) -> ApiResult<SortOrder> {

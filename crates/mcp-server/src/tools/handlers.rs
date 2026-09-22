@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use api_types::{Actor, LifecycleEvent, LifecycleHookDef, ProjectSettings, SystemComponent};
+use api_types::{Actor, SystemComponent};
 use api_types::{
     AgentBindingState, AgentChatDetailResponse, AgentChatKind, AgentChatListResponse,
     AgentChatMessageAuthorType, AgentChatMessageListResponse, AgentChatMessageResponse,
@@ -904,6 +904,18 @@ pub(super) async fn forge_follow_up_execution(
     }))
 }
 
+/// Validates a settings document through the one shared implementation.
+///
+/// This used to be an MCP-local copy of the REST rules, and the two had
+/// drifted: REST checked an assigned agent is usable in the Project and an
+/// assigned user is a member, which this copy did not, while this copy
+/// checked a script hook's timeout, which REST did not. Both surfaces now ask
+/// `services::project_settings`.
+///
+/// The agent-usability check needs the acting user, and MCP tool handlers do
+/// not receive `McpContext` — only the Project reaches them — so that one
+/// check still does not run here. Everything else, membership included, now
+/// does.
 async fn validate_project_settings(
     state: &AppState,
     project_id: &str,
@@ -912,89 +924,16 @@ async fn validate_project_settings(
     let project = ProjectRepo::get_by_id(&*state.db, project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    let settings: ProjectSettings = serde_json::from_value(settings.clone())
-        .map_err(|error| McpToolError::new(-32602, format!("invalid settings: {error}")))?;
     let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    let role_names: HashSet<&str> = workflow
-        .roles
-        .iter()
-        .map(|role| role.name.as_str())
-        .collect();
-
-    for assignment in &settings.default_role_assignments {
-        if !role_names.contains(assignment.role_name.as_str()) {
-            return Err(McpToolError::new(
-                -32602,
-                format!("unknown role: {}", assignment.role_name),
-            ));
-        }
-
-        match assignment.assignee_type.as_str() {
-            "agent" | "user" => {
-                let assignee_is_blank = assignment
-                    .assignee_id
-                    .as_ref()
-                    .map(|value| value.trim().is_empty())
-                    .unwrap_or(true);
-                if assignee_is_blank {
-                    return Err(McpToolError::new(
-                        -32602,
-                        format!(
-                            "default role assignment for role '{}' requires assignee_id",
-                            assignment.role_name
-                        ),
-                    ));
-                }
-            }
-            _ => {
-                return Err(McpToolError::new(
-                    -32602,
-                    format!(
-                        "default role assignment for role '{}' must use assignee_type 'agent' or 'user'",
-                        assignment.role_name
-                    ),
-                ));
-            }
-        }
-    }
-
-    for (name, value) in [
-        ("review", settings.retry_budgets.review),
-        ("merge_fix", settings.retry_budgets.merge_fix),
-    ] {
-        if value.is_some_and(|value| value < 0) {
-            return Err(McpToolError::new(
-                -32602,
-                format!("retry_budgets.{name} must be 0 or greater"),
-            ));
-        }
-    }
-
-    for (event, hooks) in &settings.lifecycle_hooks {
-        for hook in hooks {
-            if let LifecycleHookDef::Script {
-                blocking,
-                timeout_seconds,
-                ..
-            } = hook
-            {
-                if *blocking && *event != LifecycleEvent::BeforeWork {
-                    return Err(McpToolError::new(
-                        -32602,
-                        "blocking lifecycle hooks are only supported for before_work",
-                    ));
-                }
-                if *timeout_seconds < 1 {
-                    return Err(McpToolError::new(
-                        -32602,
-                        "script lifecycle hooks require timeout_seconds to be at least 1",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
+    services::project_settings::validate_project_settings(
+        &state.db,
+        settings,
+        &workflow,
+        Some(project_id),
+        None,
+    )
+    .await
+    .map_err(McpToolError::from)
 }
 
 fn serialize_settings(settings: &Value) -> Result<String, McpToolError> {

@@ -8,6 +8,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- A Project Agent can change an existing Task graph. The new `task.dependency`
+  operation adds or removes one prerequisite edge (`action`, `task_id`,
+  `depends_on_task_id`, `rationale`), with the Project taken from the
+  authenticated binding and both Tasks required to belong to it. Until now
+  `depends_on_task_ids` could only be set at `task.propose`, so re-planning
+  meant cancelling and recreating every downstream Task under a new id: a
+  dependent of a cancelled Task is blocked with `cancel_task` as its only
+  advertised recovery, and `task.recover` refuses a cancelled Task outright
+  ("cannot recover task … in terminal status cancelled"). The capability was
+  already reachable over REST — `POST`/`DELETE /api/v1/tasks/{id}/dependencies`
+  — and removing an edge already cleared the dependency block; only the Agent's
+  vocabulary was missing it.
 - Workspace commands are bounded by an allowlist the owner controls, instead of
   a fixed list compiled into Forge. `commands.allow` adds to the built-in set
   and `commands.only` replaces it in `forge.yaml`; a Project layers the same two
@@ -35,6 +47,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   gzip/brotli body was read as UTF-8 text and arrived empty (docs.rs returned
   nothing before this; it now returns the page).
 
+### Changed
+
+- REST and MCP validate a Project's settings document through one
+  implementation instead of a copy each. The copies had drifted in both
+  directions, so a document one surface accepted was one the other would have
+  refused on the same Project: REST checked that an assigned agent is usable
+  in the Project and that an assigned user is a member, and MCP checked
+  neither; MCP checked that a script lifecycle hook declares a timeout of at
+  least one second, and REST did not. Both surfaces now apply the union, which
+  means **MCP now rejects a default assignment naming a non-member, and REST
+  now rejects a script hook with `timeout_seconds: 0`** — each previously
+  accepted. The legacy `"human"` assignee still skips the membership check,
+  since it names no account.
+
 ### Fixed
 
 - A fetched web page is no longer returned empty (agent-runtime `65a3970`).
@@ -46,6 +72,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   perfectly: a live capture of docs.rs went from 22,254 bytes of HTML to 0
   characters of Markdown before the fix and 4,509 after, so `fetch` answered
   with its untrusted-content banner and nothing else.
+- A Project Agent can record a review verdict through the generic
+  coordination surface again. `task.review` requires `decision` and
+  `expected_task_version`, and neither was declared on the flat payload
+  envelope, so a provider that surfaces only declared properties — Gemini and
+  z.ai both do — could not send them at all: the verdict was unsendable
+  however the model wrote the call. `task.dependency` had the same hole in its
+  required `rationale`. Both are declared now, and a new contract test walks
+  every coordination operation instead of checking one by hand, which is how
+  the second and third instances of this bug went unnoticed.
+- REST and MCP bound a page size and resolve a sort name through one
+  implementation in `db`, rather than a copy each. The copies agreed today,
+  but a page-size bound exists to keep one query from pulling an unbounded
+  result set out of SQLite and is not something two surfaces should be free to
+  drift on. A Task listing still accepts more sort names over REST than over
+  MCP; that difference is now documented where the names are resolved.
+- Registering a native agent operation no longer depends on two hand-written
+  lists that fail silently when missed. Direct-command admission and the
+  target derivation are now read from the operation's own catalog row, which
+  already carried every fact both decisions needed. Omitting an operation from
+  either list previously refused it at runtime as `policy_denied: the
+  operation is not admitted for the current Forge scope` or `direct command
+  has no canonical target derivation` — messages naming neither the operation
+  nor the list. `task.recover` and `task.dependency` each shipped with that
+  bug.
 - An Agent Chat or Task session whose history is mostly tool exchanges now
   reaches hard LCM pressure and compacts, instead of dying at the context
   planner. The runtime's default sizer charges an entry for its plain text
@@ -76,6 +126,109 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   including the worker shape where the colliding call arrives in a later
   process and the earlier id is only knowable from the protected session
   store.
+- A reviewer's verdict is no longer discarded for having a sentence in front of
+  it. The review contract asks for exactly one bare JSON object and the parser
+  took that literally — `serde_json::from_str` over the whole final message — so
+  a reviewer that led with "Evidence gathering is complete." had its entire
+  assessment thrown away as `expected value at line 1 column 1`, the Review
+  never settled, and another full reviewer run was dispatched. Observed live:
+  three reviewer runs on one Task, same commit, same findings, differing only
+  in whether the model's first character was `{`; two runs and roughly half a
+  dollar were spent to reach the verdict the first run had already produced.
+  The assessment is now recovered from the message. Two whole assessments in
+  one message stay ambiguous and are still rejected.
+- A completed reviewer execution no longer refunds the Task retry budget it
+  has spent. The reviewer process exiting cleanly says nothing about whether
+  its verdict was usable, but the completion path cleared
+  `execution_retry_count` regardless, so the counter was reset to zero and set
+  back to one on every attempt: `attempt > budget` could never trip and a
+  reviewer whose assessment would not parse was re-dispatched without bound.
+  A verdict that does settle leaves `review`, and that state change clears the
+  budget as before. The existing bounded-retry tests seed the counter directly
+  and drive the cascade, so none of them covered this reset.
+- A merge conflict no longer wedges a Task silently. The conflict path took
+  two compare-and-sets from one Task snapshot, so the second always failed as
+  a version conflict — and `run_merge` is not a blocking hook, so that failure
+  was swallowed: the Task sat in `merging` with no blocker, no annotation and
+  no follow-up, forever. Integration now carries the version each write left
+  behind, and a conflict parks the worktree visibly, with
+  `manual_workspace_repair` and the `retry_hook` recovery action the design
+  intended.
+- `POST /api/v1/tasks` returns the Task as its default role assignments left
+  it. Creation committed those assignments after snapshotting the response,
+  so the version a client got back was already stale and its next optimistic
+  write failed with `409 version_conflict`.
+- Interactive executions can start again. Admission required every execution
+  to pin the Project's workflow definition, but an interactive execution is
+  the user reaching into the workspace directly and the workflow never chose
+  its role, so it pins nothing — and the mismatch rejected `Launch` in every
+  Project that has a workflow definition, which is every Project, as an
+  opaque `version conflict`. A pin an admission does carry is still compared.
+- A Task sitting in `review` can be recovered. A reviewer execution binds to
+  its Review attempt inside the admitting transaction, and the dispatcher's
+  recovery path never created that attempt, so the bind failed as a bare
+  version conflict that the scan logged as a lost race and retried forever.
+  Recovery now establishes the attempt the way a transition into review does.
+  A Task in review with no implementation execution to review is refused
+  explicitly instead of retried: it parks with that reason.
+- Reassigning or removing a non-coder role no longer discards a passed
+  review. `review_passed_at` is authority over the implementation that was
+  reviewed, so only a change to who owns that implementation clears it;
+  swapping the reviewer used to send the Task back through a review it had
+  already earned.
+- A repository whose local source directory is gone now fails with
+  `repo source path does not exist` instead of the raw `git clone` error.
+  The git error is classified as potentially transient, so the dispatcher
+  retried a permanently missing repository on every scan instead of parking
+  the Task with the reason.
+- The api integration suite is green again. Its fixtures pinned
+  `forge.project.orchestration/v1@15` while migration V137 published `@16`,
+  so every Charter approval failed as `project_agent_selection_conflict`;
+  they now read the revision the server offers. The three cases that asserted
+  the managed merge-fix follow-up for a real conflict are removed: that flow
+  was deliberately replaced by manual-repair parking, which
+  `follow_up_merge_conflict` now covers. The merge-fix retry budget, which is
+  still live for non-conflict integration failures, has no end-to-end
+  coverage as a result.
+- `frozen pricing selection violates semantic invariants` now names the
+  invariant it violated. Eleven distinct checks shared one opaque message,
+  which said nothing about which provenance field was wrong.
+- Creating an auditor execution without an admission no longer fails as a
+  version conflict. The reviewer-derived principal is resolved where it is
+  actually compared against the reviewer assignment, and an auditor that
+  needs that principal and has no admission is told so.
+- An embedded execution on a provider whose Forge label differs from its
+  models.dev catalog id can dispatch again. Admission froze the runtime
+  provider (`gemini`) beside the catalog provider its rate came from
+  (`google`) and a pricing invariant required the two to be equal, so every
+  dispatch died with `frozen pricing selection violates semantic invariants`
+  before the worker started. The two are separate namespaces, and admission
+  never intended to compare them; whether an execution really ran on its
+  admitted provider is still settled against reported evidence.
+- The typed proposal surface now declares `review_requirement_ids`, the one
+  field `task.propose` requires. It was described in prose but never declared
+  as a property, and providers that expose only declared properties to the
+  model (Gemini, and the OpenAI-compatible function calling z.ai serves)
+  dropped it from every call — so a Project Agent on such a provider could
+  not create a single Task, whatever it wrote. A contract test now fails if
+  any operation requires a payload field the flat surface does not declare.
+- Direct (embedded) Agents on an OpenAI-compatible provider survive past
+  their first turn. `agent-runtime` shed a prior turn's unsigned reasoning by
+  rewriting canonical history, which then no longer matched the protected LCM
+  checkpoint that fingerprinted it, so the second turn of every such chat
+  failed with `Conflict: LCM canonical history no longer matches its
+  protected checkpoint` and the session stayed wedged. The OpenAI-compatible
+  wire carries no reasoning signature at all, so this hit every thinking
+  model reached that way — z.ai GLM among them — as Main Agent, Project
+  Agent, or in any chat. Runtime pin moved to `28c772c`.
+- Test fixtures now create their git repositories with
+  `git init --initial-branch=main`, matching the branch the repository
+  readiness check requires. Hosts whose git default branch is not `main`
+  (GitHub-hosted CI runners default to `master`) made every
+  repository-dependent suite fail with `execution_setup_required`.
+- `services` is warning-free under Rust 1.98 clippy: the planning-review
+  metadata helper's late-initialized binding is now a plain `if`
+  expression.
 
 ## [0.12.0] - 2026-09-14
 

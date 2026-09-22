@@ -1429,6 +1429,29 @@ canonical Charter, Document, milestone, Project, and binding
 revisions and reports stale references as a read-time overlay; it never rewrites
 the immutable manifest or LCM history.
 
+### One capability, one declaration
+
+A native agent operation is declared once, as an `OperationContract` row in
+`crates/agent-host/src/operation_catalog.rs`. Two decisions that used to be
+re-listed by hand are now read off that row: whether the operation may execute
+as a direct command (`is_coordination_direct_command`, replacing an allowlist
+in the policy layer) and whether a Project target is derived for it before
+dispatch. Both previously failed silently when a new operation was missed —
+`policy_denied: the operation is not admitted for the current Forge scope`, or
+`direct command has no canonical target derivation` — messages that name
+neither the operation nor the list; `task.recover` and `task.dependency` each
+shipped with that bug. What the row still cannot supply is the payload schema
+and the dispatch body, so those remain per-operation code, guarded by
+`scope_composition_drives_every_migrated_main_project_and_task_operation`,
+which asserts the set of operations actually driven end to end equals the
+catalog.
+
+Rules that more than one surface enforces live in `services`, not in each
+surface. A Project's settings document is the worked example: REST and MCP
+each had a copy and they drifted, so a document one accepted was one the other
+would refuse on the same Project. `services::project_settings` is now the
+single implementation, and each surface maps its error into its own shape.
+
 ### HTTP shell and web assets
 
 The API router also serves the built React application with an SPA fallback.
