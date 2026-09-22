@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-ability",
  "agent-runtime-context",
@@ -47,7 +47,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-ability"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -59,7 +59,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-context"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-core"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-registry",
  "async-trait",
@@ -88,7 +88,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-lcm"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-context",
  "agent-runtime-core",
@@ -102,7 +102,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-provider"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -118,7 +118,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-registry"
 version = "0.1.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=d250964#d250964a306d3bdf1eebd1df9d0bca663f208ff6"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708b4c1f881cb3d0424025c92a18781ffea"
 dependencies = [
  "serde",
 ]
@@ -766,6 +766,8 @@ dependencies = [
  "compression-core",
  "flate2",
  "memchr",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -4931,3 +4933,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.0+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
