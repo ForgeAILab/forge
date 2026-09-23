@@ -60,6 +60,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   now rejects a script hook with `timeout_seconds: 0`** — each previously
   accepted. The legacy `"human"` assignee still skips the membership check,
   since it names no account.
+- The reviewer's Task comment is rendered from the admitted review
+  assessment in a fixed structure: the `Review <outcome> (attempt N)`
+  headline, a `**Verdict:**` line, then one list item per requirement
+  (`**<disposition>** \`<id>\` — <rationale> · <evidence>`) and per finding
+  (`**blocking|non-blocking** Expected …; actual … · <evidence>`). It
+  previously listed findings only, and only when the reviewer's whole
+  message was bare JSON, so a narrated or fenced assessment — accepted by
+  review admission — produced a headline with no detail.
 
 ### Fixed
 
