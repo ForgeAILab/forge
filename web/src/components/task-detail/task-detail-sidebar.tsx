@@ -1,12 +1,16 @@
 import { Copy, Trash, Warning } from '@phosphor-icons/react'
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import { apiFetch } from '@/api/client'
 import {
   useCancelTask,
   useDuplicateTask,
   useMembersQuery,
   useProjectAgentsQuery,
+  useTaskRelationsQuery,
   useUpdateTask,
 } from '@/api/hooks'
+import { qk } from '@/api/query-keys'
 import {
   type AssigneeSelection,
   AgentAssigneeDropdown,
@@ -14,7 +18,6 @@ import {
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
-import { useProjectTasksForSubtasks } from '@/components/task-detail/task-subtasks-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { productTerm } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
@@ -33,10 +36,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { getHumanGateActions } from '@/lib/gate-actions'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import type {
   Agent,
   Execution,
+  PaginatedResponse,
   Task,
   TaskRoleAssignmentResponse,
   WorkflowDefinition,
@@ -91,7 +95,6 @@ export function TaskDetailSidebar({
   const projectId = task?.project_id ?? ''
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
-  const projectTasksQuery = useProjectTasksForSubtasks(projectId, Boolean(task))
   const [pendingSelection, setPendingSelection] = useState<{
     roleName: string
     selection: AssigneeSelection
@@ -289,11 +292,7 @@ export function TaskDetailSidebar({
 
             {task.parent_task_id ? (
               <SidebarField label="Subtask">
-                <SubtaskParentField
-                  task={task}
-                  allProjectTasks={projectTasksQuery.data ?? []}
-                  disabled={terminal}
-                />
+                <SubtaskParentField task={task} disabled={terminal} />
               </SidebarField>
             ) : null}
 
@@ -552,24 +551,86 @@ function sameSelection(
   return false
 }
 
-function SubtaskParentField({
-  task,
-  allProjectTasks,
-  disabled,
-}: {
-  task: Task
-  allProjectTasks: Task[]
-  disabled: boolean
-}) {
+const PARENT_TASK_PAGE_SIZE = 30
+const PARENT_TASK_SEARCH_DEBOUNCE_MS = 250
+
+export function useParentTaskCandidatesQuery(projectId: string, search: string, enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: [...qk.projectTasks(projectId), 'parent-picker', search, PARENT_TASK_PAGE_SIZE],
+    queryFn: ({ signal, pageParam }) =>
+      apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
+        search: {
+          q: search || undefined,
+          cursor: pageParam,
+          limit: PARENT_TASK_PAGE_SIZE,
+        },
+        signal,
+      }),
+    enabled: enabled && Boolean(projectId),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
+    retry: false,
+    staleTime: 30_000,
+  })
+}
+
+export function filterParentTaskCandidates(candidates: Task[], taskId: string): Task[] {
+  return candidates.filter(
+    (candidate) => candidate.parent_task_id == null && candidate.id !== taskId,
+  )
+}
+
+function SubtaskParentField({ task, disabled }: { task: Task; disabled: boolean }) {
+  const queryClient = useQueryClient()
   const updateTask = useUpdateTask()
-  const rootTasks = allProjectTasks.filter((t) => t.parent_task_id == null && t.id !== task.id)
-  const currentParent = allProjectTasks.find((t) => t.id === task.parent_task_id)
+  const relationsQuery = useTaskRelationsQuery(task.id, task.project_id)
+  const [showParentPicker, setShowParentPicker] = useState(false)
+  const [parentSearch, setParentSearch] = useState('')
+  const [debouncedParentSearch, setDebouncedParentSearch] = useState('')
+
+  useEffect(() => {
+    if (!showParentPicker) {
+      setDebouncedParentSearch('')
+      return
+    }
+
+    const timeout = window.setTimeout(
+      () => setDebouncedParentSearch(parentSearch.trim()),
+      PARENT_TASK_SEARCH_DEBOUNCE_MS,
+    )
+    return () => window.clearTimeout(timeout)
+  }, [parentSearch, showParentPicker])
+
+  const projectTasksQuery = useParentTaskCandidatesQuery(
+    task.project_id,
+    debouncedParentSearch,
+    showParentPicker,
+  )
+  const allProjectTasks = projectTasksQuery.data?.pages.flatMap((page) => page.items) ?? []
+  const rootTasks = filterParentTaskCandidates(allProjectTasks, task.id)
+  const currentParent = relationsQuery.data?.parent
+  const isSearchPending = parentSearch.trim() !== debouncedParentSearch
+
+  const closePicker = () => {
+    setShowParentPicker(false)
+    setParentSearch('')
+  }
 
   const handleParentChange = (newParentId: string) => {
     if (newParentId === task.parent_task_id) return
     updateTask.mutate(
       { taskId: task.id, body: { parent_task_id: newParentId, version: task.version } },
-      { onError: (err) => toast.error(getApiErrorMessage(err, 'Failed to update parent')) },
+      {
+        onSuccess: () => {
+          closePicker()
+          void queryClient.invalidateQueries({ queryKey: qk.taskRelations(task.id) })
+          if (task.parent_task_id) {
+            void queryClient.invalidateQueries({ queryKey: qk.taskRelations(task.parent_task_id) })
+          }
+          void queryClient.invalidateQueries({ queryKey: qk.taskRelations(newParentId) })
+        },
+        onError: (err) => toast.error(getApiErrorMessage(err, 'Failed to update parent')),
+      },
     )
   }
 
@@ -580,19 +641,122 @@ function SubtaskParentField({
         <span>{task.subtask_order ?? '-'}</span>
       </div>
       <div>
-        <p className="mb-1 text-xs text-muted-foreground">Parent task</p>
-        <Select
-          className="h-8 text-xs"
-          disabled={disabled || updateTask.isPending || rootTasks.length === 0}
-          value={task.parent_task_id ?? ''}
-          options={[
-            ...(currentParent && !rootTasks.find((t) => t.id === currentParent.id)
-              ? [{ value: currentParent.id, label: currentParent.title }]
-              : []),
-            ...rootTasks.map((t) => ({ value: t.id, label: t.title })),
-          ]}
-          onChange={(v) => v && handleParentChange(v)}
-        />
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <p className="text-xs text-muted-foreground">Parent task</p>
+          {showParentPicker ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-xs"
+              disabled={updateTask.isPending}
+              onClick={closePicker}
+            >
+              Cancel
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-xs"
+              disabled={disabled}
+              onClick={() => {
+                setParentSearch('')
+                setDebouncedParentSearch('')
+                setShowParentPicker(true)
+              }}
+            >
+              Change
+            </Button>
+          )}
+        </div>
+        {showParentPicker ? (
+          <div className="space-y-1.5">
+            <Input
+              aria-label="Search parent tasks"
+              className="h-8 text-xs"
+              placeholder="Search parent tasks…"
+              value={parentSearch}
+              onChange={(event) => setParentSearch(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') closePicker()
+              }}
+            />
+            {isSearchPending || (projectTasksQuery.isLoading && !projectTasksQuery.data) ? (
+              <Skeleton className="h-8 w-full" />
+            ) : projectTasksQuery.isError && !projectTasksQuery.data ? (
+              <div className="flex items-center justify-between gap-2">
+                <p role="status" className="text-xs text-muted-foreground">
+                  Couldn&apos;t load parent tasks
+                </p>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => void projectTasksQuery.refetch()}
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : (
+              <>
+                {rootTasks.length > 0 ? (
+                  <Select
+                    className="h-8 text-xs"
+                    disabled={disabled || updateTask.isPending}
+                    value={task.parent_task_id ?? ''}
+                    options={[
+                      ...(currentParent &&
+                      !rootTasks.some((candidate) => candidate.id === currentParent.id)
+                        ? [{ value: currentParent.id, label: currentParent.title }]
+                        : task.parent_task_id
+                          ? [{ value: task.parent_task_id, label: task.parent_task_id }]
+                          : []),
+                      ...rootTasks.map((candidate) => ({
+                        value: candidate.id,
+                        label: candidate.title,
+                      })),
+                    ]}
+                    onChange={(value) => value && handleParentChange(value)}
+                  />
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    No parent tasks found on this page.
+                  </p>
+                )}
+                {projectTasksQuery.isFetchNextPageError && (
+                  <div className="flex items-center justify-between gap-2">
+                    <p role="status" className="text-xs text-muted-foreground">
+                      Couldn&apos;t load more parent tasks
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 px-2 text-xs"
+                      onClick={() => void projectTasksQuery.fetchNextPage()}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                )}
+                {projectTasksQuery.hasNextPage && !projectTasksQuery.isFetchNextPageError && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 w-full text-xs"
+                    disabled={projectTasksQuery.isFetchingNextPage}
+                    onClick={() => void projectTasksQuery.fetchNextPage()}
+                  >
+                    {projectTasksQuery.isFetchingNextPage ? 'Loading…' : 'Load more parent tasks'}
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {currentParent?.title ?? task.parent_task_id}
+          </p>
+        )}
       </div>
     </div>
   )

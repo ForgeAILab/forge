@@ -243,6 +243,56 @@ async fn test_open_interactive_target_ignores_newer_unrelated_role() {
 }
 
 #[tokio::test]
+async fn test_list_execution_action_authority_loads_unique_rows_in_stable_order() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    let agent_id = seed_agent(&db).await;
+    let coder_execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Completed,
+        Some("coder-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let reviewer_execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        crate::workflow::default_roles::REVIEWER,
+        ExecutionStatus::Completed,
+        Some("reviewer-session"),
+        "2026-05-02T10:05:00Z",
+    )
+    .await;
+
+    let executions = crate::task_service::action_resolver::list_execution_action_authority(
+        &db,
+        &task.id,
+        Some(crate::workflow::default_roles::CODER),
+        Some(&coder_execution.id),
+    )
+    .await
+    .expect("execution authority loads");
+
+    let ids = executions
+        .iter()
+        .map(|execution| execution.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&coder_execution.id.as_str()));
+    assert!(ids.contains(&reviewer_execution.id.as_str()));
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+#[tokio::test]
 async fn test_resolve_execution_actions_disables_resume_for_terminal_bound_review() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;

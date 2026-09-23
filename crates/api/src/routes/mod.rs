@@ -231,13 +231,49 @@ fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
 }
 
 pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
+    Ok(task_response_and_workflow(db, task).await?.0)
+}
+
+pub async fn task_response_and_workflow(
+    db: &db::SqliteDb,
+    task: Task,
+) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
+    task_response_and_workflow_with_awaiting_human(db, task, false).await
+}
+
+pub async fn task_response_and_workflow_with_awaiting_human(
+    db: &db::SqliteDb,
+    task: Task,
+    awaiting_human: bool,
+) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
     let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(db, task, true, false, latest_review, latest_execution).await
+    let workflow = task_workflow_for_response(db, &task).await?;
+    let response = task_response_inner(
+        db,
+        task,
+        true,
+        awaiting_human,
+        latest_review,
+        latest_execution,
+        &workflow,
+    )
+    .await?;
+    Ok((response, workflow))
 }
 
 pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
     let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+    let workflow = task_workflow_for_response(db, &task).await?;
+    task_response_inner(
+        db,
+        task,
+        false,
+        false,
+        latest_review,
+        latest_execution,
+        &workflow,
+    )
+    .await
 }
 
 pub async fn task_response_with_awaiting_human(
@@ -245,25 +281,44 @@ pub async fn task_response_with_awaiting_human(
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<TaskResponse> {
-    let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
-    task_response_inner(
-        db,
-        task,
-        true,
-        awaiting_human,
-        latest_review,
-        latest_execution,
+    Ok(
+        task_response_and_workflow_with_awaiting_human(db, task, awaiting_human)
+            .await?
+            .0,
     )
-    .await
 }
 
-pub(crate) async fn task_response_light_with_latest(
+pub(crate) async fn task_response_light_with_latest_and_workflow(
     db: &db::SqliteDb,
     task: Task,
     latest_review: Option<Review>,
     latest_execution: Option<Execution>,
+    workflow: &api_types::WorkflowDefinition,
 ) -> ApiResult<TaskResponse> {
-    task_response_inner(db, task, false, false, latest_review, latest_execution).await
+    task_response_inner(
+        db,
+        task,
+        false,
+        false,
+        latest_review,
+        latest_execution,
+        workflow,
+    )
+    .await
+}
+
+async fn task_workflow_for_response(
+    db: &db::SqliteDb,
+    task: &Task,
+) -> ApiResult<api_types::WorkflowDefinition> {
+    let project = ProjectRepo::get_by_id(db, &task.project_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
+    Ok(WorkflowEngine::resolve_workflow_for_task(
+        task,
+        &project.workflow_definition,
+        &api_types::Actor::system(api_types::SystemComponent::General),
+    ))
 }
 
 async fn latest_diagnostic_rows(
@@ -283,6 +338,7 @@ async fn task_response_inner(
     awaiting_human: bool,
     latest_review: Option<Review>,
     latest_execution: Option<Execution>,
+    workflow: &api_types::WorkflowDefinition,
 ) -> ApiResult<TaskResponse> {
     let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
     let role_assignments = task_role_assignments
@@ -291,14 +347,6 @@ async fn task_response_inner(
         .map(task_role_assignment_response)
         .collect();
 
-    let project = ProjectRepo::get_by_id(db, &task.project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for_task(
-        &task,
-        &project.workflow_definition,
-        &api_types::Actor::system(api_types::SystemComponent::General),
-    );
     let error_annotation = task.error_annotation.as_deref().map(|s| {
         serde_json::from_str::<TaskAnnotation>(s)
             .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
@@ -390,7 +438,7 @@ async fn task_response_inner(
     let execution_actions = if include_actions {
         resolve_execution_actions(
             &task,
-            &workflow,
+            workflow,
             &execution_authority,
             blocking_annotation,
             latest_review.as_ref(),
@@ -435,7 +483,7 @@ async fn task_response_inner(
         .or_else(|| latest_execution.clone());
     let workflow_exception = derive_workflow_exception_with_running_interactive(
         &task,
-        &workflow,
+        workflow,
         &task_role_assignments,
         latest_review.as_ref(),
         latest_execution.as_ref(),
@@ -446,7 +494,7 @@ async fn task_response_inner(
     );
     let workflow_health = Some(derive_workflow_health(
         &task,
-        &workflow,
+        workflow,
         &task_role_assignments,
         latest_review.as_ref(),
         health_execution.as_ref(),

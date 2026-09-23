@@ -33,8 +33,10 @@ use uuid::Uuid;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, paginated, parse_csv, serialize_json, task_page_request, task_response,
-        task_response_light_with_latest, task_response_with_awaiting_human,
+        execution_response, execution_response_with_usage, page_request, paginated, parse_csv,
+        serialize_json, task_page_request, task_response,
+        task_response_and_workflow_with_awaiting_human,
+        task_response_light_with_latest_and_workflow, task_response_with_awaiting_human,
         task_role_assignment_response, workspace_response, ListParams,
     },
     state::AppState,
@@ -44,6 +46,7 @@ mod actions;
 mod comments;
 mod crud;
 mod dependencies;
+mod detail;
 mod execution;
 mod gates;
 mod media;
@@ -63,6 +66,7 @@ pub use crud::{
     move_task, recover_task, reorder_subtasks, update_task,
 };
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
+pub use detail::{get_task_detail, get_task_relations};
 pub use execution::{claim_task, launch_task};
 pub use gates::{approve_gate, reject_gate};
 pub use media::{delete_media, get_media, list_media, upload_media};

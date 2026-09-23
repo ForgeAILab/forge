@@ -63,3 +63,9 @@ export function toastApiError(error: unknown, fallback?: string): void {
 export function isApiStatus(error: unknown, status: number): boolean {
   return error instanceof ApiError && error.status === status
 }
+
+/** Network errors and server failures may recover on retry; client errors and cancellations do not. */
+export function isTransientApiError(error: unknown): boolean {
+  if (error instanceof Error && error.name === 'AbortError') return false
+  return (error instanceof ApiError && error.status >= 500) || error instanceof TypeError
+}

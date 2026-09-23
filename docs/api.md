@@ -107,6 +107,8 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
+| GET    | `/api/v1/tasks/{id}/detail` | Load the Task detail bootstrap in one request: task, effective workflow, and a page of executions |
+| GET    | `/api/v1/tasks/{id}/relations` | Read direct subtask, dependency, and dependent summaries without scanning the Project task list |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
@@ -2418,6 +2420,28 @@ resolution events. Human `task.blocked` and `task.failed` notifications are
 emitted only from the committed Task outcome after disposition, never from an
 individual attempt failure.
 
+## Task detail bootstrap
+
+`GET /api/v1/tasks/{id}/detail` returns a `TaskDetailResponse` with `task`
+(`TaskResponse`), `workflow` (the effective `WorkflowDefinition` for that
+Task), and `executions` (one `PaginatedResponse<ExecutionResponse>` shaped
+page). The execution page accepts the same `cursor`, `limit`, `include_total`,
+`sort_by`, and `sort_order` parameters as
+`GET /api/v1/tasks/{id}/executions`. Its `next_cursor` can be passed to the
+execution-list endpoint for subsequent pages. Reviews, comments, diffs, and
+logs are loaded from their existing endpoints when needed.
+
+`GET /api/v1/tasks/{id}/relations` returns `parent` (or `null`) and three arrays: `subtasks` in
+subtask order, `dependencies` (Tasks this Task depends on), and `dependents`
+(Tasks that depend on this Task). Each `TaskRelationSummary` contains its
+`id`, `title`, `status`, `parent_task_id`, `subtask_order`, and `created_at`.
+`missing_dependency_ids` lists retained edges whose target Task was soft-deleted,
+so clients can still offer removal without exposing the deleted Task's title.
+The `subtasks` array omits archived children, matching the default Project Task
+list used by the modal.
+These arrays include only direct relations and do not scan all Project Tasks.
+Task pickers can use the paginated Project task list with `q` search instead.
+
 ## Pagination
 
 Paginated list endpoints return `items` (not `data`) and opaque cursors.
@@ -2441,6 +2465,7 @@ subset and defaults.
 |-------|-------------|
 | `cursor` | Opaque pagination cursor returned from the previous page |
 | `limit` | Page size (default 20, max 100) |
+| `q` | Search Task titles and descriptions within the Project before pagination |
 | `sort_by` | `created_at`, `updated_at`, `priority`, `board_position`, `title`, `status`, `agent`, `task_type`, `id` |
 | `sort_order` | `asc`, `desc` |
 | `status` | Comma-separated status filter |

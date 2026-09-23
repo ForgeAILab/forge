@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- `GET /api/v1/tasks/{id}/detail` loads a Task's detail view in one request:
+  the Task, its effective workflow, and a page of executions (same paging
+  parameters as `GET /tasks/{id}/executions`). `GET /api/v1/tasks/{id}/relations`
+  returns the direct parent, subtasks, dependencies, dependents, and
+  `missing_dependency_ids` without scanning the Project's Task list. The Task
+  detail page and modal use them instead of four separate queries, and a failed
+  background refresh keeps the loaded view instead of replacing it with an
+  error.
+
 - A Project Agent can change an existing Task graph. The new `task.dependency`
   operation adds or removes one prerequisite edge (`action`, `task_id`,
   `depends_on_task_id`, `rationale`), with the Project taken from the

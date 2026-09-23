@@ -13,10 +13,12 @@ import {
   useUploadTaskMedia,
 } from '@/api/hooks'
 import { apiFetchBlob } from '@/api/client'
+import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { Avatar } from '@/components/ui/avatar'
-import { getApiErrorMessage } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import {
   useEffect,
@@ -307,6 +309,10 @@ function createMarkdownComponents(
 interface TaskCommentsPanelProps {
   task: Task
   comments: Comment[]
+  commentsLoading?: boolean
+  commentsIsError?: boolean
+  commentsError?: unknown
+  onRetryComments?: () => void
   commentDraft: string
   setCommentDraft: Dispatch<SetStateAction<string>>
   createComment: ReturnType<typeof useCreateComment>
@@ -318,6 +324,10 @@ interface TaskCommentsPanelProps {
 export function TaskCommentsPanel({
   task,
   comments,
+  commentsLoading = false,
+  commentsIsError = false,
+  commentsError,
+  onRetryComments,
   commentDraft,
   setCommentDraft,
   createComment,
@@ -363,7 +373,17 @@ export function TaskCommentsPanel({
   return (
     <>
       <div className="space-y-2 rounded-lg border p-4">
-        {comments.length > 0 ? (
+        {commentsIsError ? (
+          <ErrorBanner
+            error={commentsError}
+            fallback="Comments failed to load"
+            onRetry={() => void onRetryComments?.()}
+            showRetry={isTransientApiError(commentsError)}
+          />
+        ) : null}
+        {commentsLoading ? (
+          <Skeleton className="h-24 w-full" />
+        ) : comments.length > 0 ? (
           comments.map((comment) => (
             <div key={comment.id} className="rounded-md border p-3">
               <div className="flex items-center justify-between gap-2">
@@ -418,9 +438,9 @@ export function TaskCommentsPanel({
               </div>
             </div>
           ))
-        ) : (
+        ) : !commentsIsError ? (
           <p className="text-sm text-muted-foreground">No comments yet.</p>
-        )}
+        ) : null}
       </div>
       <div className="space-y-2 rounded-lg border p-4">
         <Textarea

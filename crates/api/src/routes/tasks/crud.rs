@@ -1,4 +1,5 @@
 use super::*;
+use futures_util::stream::{StreamExt, TryStreamExt};
 
 pub async fn create_task(
     State(state): State<AppState>,
@@ -48,10 +49,12 @@ pub async fn list_tasks(
     let canonical_phases =
         parse_csv::<CanonicalPhase>(params.canonical_phase.as_ref(), "canonical_phase")?;
     let mut statuses = parse_csv::<String>(params.status.as_ref(), "status")?;
+    let mut project_workflow_definition = None;
     if !canonical_phases.is_empty() {
         let project = ProjectRepo::get_by_id(&*state.db, &project_id)
             .await?
             .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
+        project_workflow_definition = Some(project.workflow_definition.clone());
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
         let requested_phases: std::collections::HashSet<CanonicalPhase> =
             canonical_phases.iter().copied().collect();
@@ -110,6 +113,12 @@ pub async fn list_tasks(
         )
         .await?;
         let has_more = page.next_cursor.is_some();
+        if !page.items.is_empty() && project_workflow_definition.is_none() {
+            let project = ProjectRepo::get_by_id(&*state.db, &project_id)
+                .await?
+                .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
+            project_workflow_definition = Some(project.workflow_definition);
+        }
         let task_ids = page
             .items
             .iter()
@@ -126,15 +135,33 @@ pub async fn list_tasks(
                 .into_iter()
                 .map(|execution| (execution.task_id.clone(), execution))
                 .collect::<std::collections::HashMap<_, _>>();
-        let mut items = Vec::with_capacity(page.items.len());
-        for task in page.items {
+        let project_workflow_definition = project_workflow_definition
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned();
+        let db = &*state.db;
+        let items = futures_util::stream::iter(page.items.into_iter().map(|task| {
             let latest_review = latest_reviews.get(&task.id).cloned();
             let latest_execution = latest_executions.get(&task.id).cloned();
-            items.push(
-                task_response_light_with_latest(&state.db, task, latest_review, latest_execution)
-                    .await?,
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project_workflow_definition,
+                &Actor::system(SystemComponent::General),
             );
-        }
+            async move {
+                task_response_light_with_latest_and_workflow(
+                    db,
+                    task,
+                    latest_review,
+                    latest_execution,
+                    &workflow,
+                )
+                .await
+            }
+        }))
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
         let current_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
         if current_revision == board_revision {
             return Ok(Json(TasksResponse {

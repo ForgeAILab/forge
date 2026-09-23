@@ -4,6 +4,7 @@ import { FastForwardIcon as FastForward } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
+import { isTransientApiError } from '@/lib/api-error'
 import { PlanChecklist } from '@/components/plan-checklist'
 import {
   type AssigneeSelection,
@@ -369,8 +370,13 @@ export function TaskOverviewPanel({
             <Skeleton className="h-8 w-3/4" />
             <Skeleton className="h-24 w-full" />
           </div>
-        ) : isError ? (
-          <ErrorBanner error={error} fallback="Task failed to load" onRetry={onRetryLoad} />
+        ) : isError && !task ? (
+          <ErrorBanner
+            error={error}
+            fallback="Task failed to load"
+            onRetry={onRetryLoad}
+            showRetry={isTransientApiError(error)}
+          />
         ) : task ? (
           <>
             {editingTitle ? (

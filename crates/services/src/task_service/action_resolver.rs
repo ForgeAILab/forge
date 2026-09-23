@@ -175,14 +175,12 @@ pub async fn list_execution_action_authority(
     // different merely because SQLite chose another UNION scan order.
     query.push(") candidates ORDER BY id");
     let rows = query.build().fetch_all(db.pool()).await?;
-    let mut executions = Vec::with_capacity(rows.len());
-    for row in rows {
-        let execution_id: String = row.try_get("id")?;
-        if let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? {
-            executions.push(execution);
-        }
-    }
-    Ok(executions)
+    let execution_ids = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>("id"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let execution_ids = execution_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    Ok(ExecutionRepo::get_by_ids(db, &execution_ids).await?)
 }
 
 /// Select the newest resumable execution for the Task's effective role.

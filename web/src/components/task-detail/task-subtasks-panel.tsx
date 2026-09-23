@@ -1,36 +1,22 @@
 import { ArrowDown, ArrowUp, Plus } from '@phosphor-icons/react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { apiFetch, reorderSubtasks } from '@/api/client'
-import { useCreateTask, useExecutionsQuery } from '@/api/hooks'
+import { reorderSubtasks } from '@/api/client'
+import { useCreateTask, useTaskRelationsQuery } from '@/api/hooks'
 import { qk } from '@/api/query-keys'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type { PaginatedResponse, Task } from '@/types/generated'
+import type { Execution, Task, TaskRelationSummary } from '@/types/generated'
 
-const allProjectTasksKey = 'all-for-subtasks'
+type SubtaskSummary = Pick<
+  TaskRelationSummary,
+  'id' | 'title' | 'status' | 'parent_task_id' | 'subtask_order' | 'created_at'
+>
 
-type ProjectTasksForSubtasksOptions = {
-  includeCancelled?: boolean
-}
-
-export function useProjectTasksForSubtasks(
-  projectId: string,
-  enabled = true,
-  options: ProjectTasksForSubtasksOptions = {},
-) {
-  const includeCancelled = options.includeCancelled ?? false
-  return useQuery({
-    queryKey: [...qk.projectTasks(projectId), allProjectTasksKey, { includeCancelled }] as const,
-    queryFn: () => fetchAllProjectTasks(projectId, includeCancelled),
-    enabled: enabled && Boolean(projectId),
-  })
-}
-
-export function getRootSubtasks(tasks: Task[], taskId: string): Task[] {
+export function getRootSubtasks<T extends SubtaskSummary>(tasks: T[], taskId: string): T[] {
   return tasks
     .filter((candidate) => candidate.parent_task_id === taskId)
     .sort((a, b) => {
@@ -41,37 +27,25 @@ export function getRootSubtasks(tasks: Task[], taskId: string): Task[] {
     })
 }
 
-export function hasIncompleteSubtasks(subtasks: Task[]): boolean {
+export function hasIncompleteSubtasks(
+  subtasks: Array<Pick<TaskRelationSummary, 'status'>>,
+): boolean {
   return subtasks.length > 0 && subtasks.some((subtask) => subtask.status !== 'done')
 }
 
-async function fetchAllProjectTasks(
-  projectId: string,
-  includeCancelled: boolean,
-): Promise<Task[]> {
-  const tasks: Task[] = []
-  let cursor: string | undefined
-
-  do {
-    const response = await apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
-      search: { cursor, include_cancelled: includeCancelled },
-    })
-    tasks.push(...response.items)
-    cursor = response.next_cursor ?? undefined
-  } while (cursor)
-
-  return tasks
-}
-
-export function TaskSubtasksPanel({ task }: { task: Task }) {
+export function TaskSubtasksPanel({ task, executions }: { task: Task; executions: Execution[] }) {
   const queryClient = useQueryClient()
-  const tasksQuery = useProjectTasksForSubtasks(task.project_id)
-  const executionsQuery = useExecutionsQuery(task.id)
-  const createTask = useCreateTask(task.project_id)
-  const subtasks = getRootSubtasks(tasksQuery.data ?? [], task.id)
-  const hasWorkspace = (executionsQuery.data?.items ?? []).some(
-    (execution) => execution.workspace_id,
+  const relationsQuery = useTaskRelationsQuery(
+    task.id,
+    task.project_id,
+    task.parent_task_id == null,
   )
+  const createTask = useCreateTask(task.project_id)
+  const subtasks = getRootSubtasks(
+    (relationsQuery.data?.subtasks ?? []).filter((subtask) => subtask.status !== 'cancelled'),
+    task.id,
+  )
+  const hasWorkspace = executions.some((execution) => execution.workspace_id)
   const reorderDisabledReason = hasWorkspace
     ? 'Task already has a workspace.'
     : subtasks.some((subtask) => subtask.status !== 'todo')
@@ -81,8 +55,8 @@ export function TaskSubtasksPanel({ task }: { task: Task }) {
     mutationFn: (orderedIds: string[]) => reorderSubtasks(task.id, { ordered_ids: orderedIds }),
     onSuccess: (updatedTask) => {
       void queryClient.invalidateQueries({ queryKey: qk.task(updatedTask.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskRelations(task.id) })
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(updatedTask.project_id) })
-      void tasksQuery.refetch()
     },
     onError: (error) => toast.error(getApiErrorMessage(error, 'Subtask reorder failed')),
   })
@@ -112,7 +86,8 @@ export function TaskSubtasksPanel({ task }: { task: Task }) {
         onSuccess: () => {
           setNewTitle('')
           setShowCreate(false)
-          void tasksQuery.refetch()
+          void queryClient.invalidateQueries({ queryKey: qk.taskDetail(task.id) })
+          void queryClient.invalidateQueries({ queryKey: qk.taskRelations(task.id) })
         },
         onError: (error) => toast.error(getApiErrorMessage(error, 'Failed to create subtask')),
       },
@@ -149,7 +124,11 @@ export function TaskSubtasksPanel({ task }: { task: Task }) {
             }}
           />
           <div className="flex gap-2">
-            <Button size="sm" disabled={!newTitle.trim() || createTask.isPending} onClick={submitCreate}>
+            <Button
+              size="sm"
+              disabled={!newTitle.trim() || createTask.isPending}
+              onClick={submitCreate}
+            >
               Add
             </Button>
             <Button size="sm" variant="outline" onClick={() => setShowCreate(false)}>
@@ -159,10 +138,19 @@ export function TaskSubtasksPanel({ task }: { task: Task }) {
         </div>
       ) : null}
 
-      {tasksQuery.isLoading ? (
+      {relationsQuery.isLoading ? (
         <div className="space-y-2">
           <Skeleton className="h-9 w-full" />
           <Skeleton className="h-9 w-full" />
+        </div>
+      ) : relationsQuery.isError && !relationsQuery.data ? (
+        <div className="flex items-center justify-between gap-2 rounded-md border px-3 py-2">
+          <p role="status" className="text-sm text-muted-foreground">
+            Couldn&apos;t load task relationships
+          </p>
+          <Button size="sm" variant="ghost" onClick={() => void relationsQuery.refetch()}>
+            Retry
+          </Button>
         </div>
       ) : subtasks.length === 0 ? (
         <p className="text-sm text-muted-foreground">No subtasks</p>

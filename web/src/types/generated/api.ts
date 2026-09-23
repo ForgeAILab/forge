@@ -12,6 +12,7 @@ import type { CostSummary } from './bindings/CostSummary'
 import type { TokenCounters } from './bindings/TokenCounters'
 import type { UsageAggregate } from './bindings/UsageAggregate'
 import type { UsageBreakdown } from './bindings/UsageBreakdown'
+import type { WorkflowDefinition as GeneratedWorkflowDefinition } from './bindings/WorkflowDefinition'
 
 export type TaskStatus = string
 
@@ -641,6 +642,37 @@ export interface RecoverTaskRequest {
 }
 
 export type ExecutionResponse = Execution
+
+/** The first execution page embedded in a Task detail bootstrap response. */
+export interface TaskDetailExecutionsPage {
+  items: Execution[]
+  next_cursor: string | null
+  has_more: boolean
+  total_count: number | null
+}
+
+export interface TaskDetailResponse {
+  task: Task
+  workflow: GeneratedWorkflowDefinition
+  executions: TaskDetailExecutionsPage
+}
+
+export interface TaskRelationSummary {
+  id: string
+  title: string
+  status: TaskStatus
+  parent_task_id: string | null
+  subtask_order: number | null
+  created_at: string
+}
+
+export interface TaskRelationsResponse {
+  parent: TaskRelationSummary | null
+  subtasks: TaskRelationSummary[]
+  dependencies: TaskRelationSummary[]
+  missing_dependency_ids: string[]
+  dependents: TaskRelationSummary[]
+}
 
 // --- Agent (matches api_types::AgentResponse) ---
 
