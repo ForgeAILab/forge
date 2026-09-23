@@ -2,15 +2,15 @@ import { describe, expect, it } from 'vitest'
 import { navigationItemsForSection } from './app-shell-navigation'
 
 describe('application shell navigation contract', () => {
-  it('keeps exactly Kanban and Main Chat in primary navigation', () => {
-    expect(navigationItemsForSection('primary').map(({ key, to }) => [key, to])).toEqual([
-      ['board', '/projects/$projectId/board'],
+  it('separates the account Main Agent from the selected Project Agent', () => {
+    expect(navigationItemsForSection('account').map(({ key, to }) => [key, to])).toEqual([
       ['mainChat', '/chat'],
     ])
     expect(navigationItemsForSection('project').map(({ key, to }) => [key, to])).toEqual([
-      ['overview', '/projects/$projectId/overview'],
-      ['tasks', '/projects/$projectId/tasks'],
+      ['board', '/projects/$projectId/board'],
       ['agentWorkspace', '/projects/$projectId/chat'],
+      ['tasks', '/projects/$projectId/tasks'],
+      ['overview', '/projects/$projectId/overview'],
       ['settings', '/projects/$projectId/settings'],
     ])
   })

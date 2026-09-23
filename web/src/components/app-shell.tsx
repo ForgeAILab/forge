@@ -2,8 +2,6 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import {
-  ChatCircleDots,
-  Kanban,
   Key,
   Sun,
   Moon,
@@ -11,9 +9,10 @@ import {
   Plus,
   Pause,
   Check,
-  DotsThree,
+  List,
   SignOut,
   UserCircle,
+  X,
 } from '@phosphor-icons/react'
 import { useTranslation } from 'react-i18next'
 import { useAgentsQuery, useCreateProject, useProjectsInfiniteQuery } from '@/api/hooks'
@@ -42,7 +41,7 @@ import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { Agent } from '@/types/generated/api'
-import { navigationItemsForSection, type AppShellNavItem } from '@/components/app-shell-navigation'
+import { AppShellSidebar } from '@/components/app-shell-sidebar'
 
 const PROJECTS_PAGE_SIZE = 20
 
@@ -345,90 +344,6 @@ function UserMenu() {
   )
 }
 
-function MoreNavigation({ projectId, isAdmin }: { projectId?: string; isAdmin: boolean }) {
-  const { t } = useTranslation()
-  const navigate = useNavigate()
-  const projectItems = navigationItemsForSection('project')
-  const workspaceItems = navigationItemsForSection('workspace').filter((item) => {
-    if (item.key === 'daemons' || item.key === 'operations' || item.key === 'forgeSettings') {
-      return isAdmin
-    }
-    return true
-  })
-
-  const goTo = (item: AppShellNavItem) => {
-    switch (item.key) {
-      case 'overview':
-        if (projectId) void navigate({ to: '/projects/$projectId/overview', params: { projectId } })
-        break
-      case 'tasks':
-        if (projectId)
-          void navigate({
-            to: '/projects/$projectId/tasks',
-            params: { projectId },
-            search: { sort_by: 'updated_at', sort_order: 'desc' },
-          })
-        break
-      case 'agentWorkspace':
-        if (projectId) void navigate({ to: '/projects/$projectId/chat', params: { projectId } })
-        break
-      case 'settings':
-        if (projectId) void navigate({ to: '/projects/$projectId/settings', params: { projectId } })
-        break
-      case 'agentSettings':
-        void navigate({ to: '/agents' })
-        break
-      case 'missionControl':
-        void navigate({ to: '/mission-control' })
-        break
-      case 'daemons':
-        void navigate({ to: '/daemons' })
-        break
-      case 'operations':
-        void navigate({ to: '/operations' })
-        break
-      case 'forgeSettings':
-        void navigate({ to: '/settings' })
-        break
-      default:
-        break
-    }
-  }
-
-  const renderMenuItem = (item: AppShellNavItem) => {
-    const Icon = item.icon
-    const unavailable = item.section === 'project' && !projectId
-    return (
-      <DropdownMenuItem key={item.key} disabled={unavailable} onClick={() => goTo(item)}>
-        <Icon size={15} className="mr-2 shrink-0 text-muted-foreground" />
-        <span>{t(`appShell.navigation.${item.key}`)}</span>
-      </DropdownMenuItem>
-    )
-  }
-
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        aria-label="More navigation"
-        className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-input bg-card text-muted-foreground shadow-xs transition-[background-color,color,transform] hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
-      >
-        <DotsThree size={17} weight="bold" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-60">
-        <p className="px-2 pb-1 pt-1.5 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
-          {t('appShell.navigation.project', 'Project')}
-        </p>
-        {projectItems.map(renderMenuItem)}
-        <DropdownMenuSeparator />
-        <p className="px-2 pb-1 pt-1.5 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
-          {t('appShell.navigation.workspace', 'Workspace')}
-        </p>
-        {workspaceItems.map(renderMenuItem)}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
 function ForgeBrand() {
   return (
     <>
@@ -447,6 +362,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
   const theme = useLayoutStore((s) => s.theme)
   const setTheme = useLayoutStore((s) => s.setTheme)
+  const [navigationOpen, setNavigationOpen] = useState(false)
   const params = useRouterState({
     select: (state) => state.matches.at(-1)?.params as { projectId?: string } | undefined,
   })
@@ -460,6 +376,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const isChatRoute = pathname === '/chat' || /^\/projects\/[^/]+\/chat$/.test(pathname)
   const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
   const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
+
+  useEffect(() => setNavigationOpen(false), [pathname])
 
   useEffect(() => {
     if (routeProjectId && routeProjectId !== storedProjectId) {
@@ -492,15 +410,10 @@ export function AppShell({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('forge:project-deleted', handleProjectDeleted)
   }, [queryClient, navigate, routeProjectId])
 
-  const primaryTabClass =
-    'relative inline-flex h-9 min-w-0 flex-1 items-center justify-center gap-2 rounded-md px-4 text-ui font-medium text-muted-foreground transition-[background-color,color,box-shadow,transform] hover:bg-card/70 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 active:scale-[0.98] md:flex-none'
-  const primaryTabActiveClass =
-    'bg-card text-foreground shadow-xs ring-1 ring-inset ring-ember-border'
-
   return (
     <div
       className="flex h-[100dvh] min-h-[100svh] flex-col overflow-hidden bg-background"
-      data-shell-mode="topbar"
+      data-shell-mode="sidebar"
     >
       <a
         href="#main-content"
@@ -511,6 +424,15 @@ export function AppShell({ children }: { children: ReactNode }) {
       <header className="shrink-0 border-b border-border-subtle bg-background">
         <div className="flex min-h-14 flex-wrap items-center gap-2 px-3 py-2 sm:px-4 lg:px-5">
           <div className="flex min-w-0 flex-1 items-center gap-2 md:flex-none">
+            <button
+              type="button"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-input bg-card text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring lg:hidden"
+              aria-label="Open navigation"
+              aria-expanded={navigationOpen}
+              onClick={() => setNavigationOpen(true)}
+            >
+              <List size={19} aria-hidden />
+            </button>
             {projectId ? (
               <Link
                 to="/projects/$projectId/board"
@@ -523,7 +445,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             ) : (
               <Link
                 to="/chat"
-                aria-label="Open Main Chat"
+                aria-label="Open Main Agent chat"
                 className="flex shrink-0 items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <ForgeBrand />
@@ -534,49 +456,8 @@ export function AppShell({ children }: { children: ReactNode }) {
             </div>
           </div>
 
-          <nav
-            className="order-3 flex w-full items-center gap-1 rounded-lg border border-border-subtle bg-muted/40 p-1 md:order-none md:w-auto"
-            aria-label="Primary navigation"
-            data-primary-navigation
-          >
-            {projectId ? (
-              <Link
-                to="/projects/$projectId/board"
-                params={{ projectId }}
-                activeOptions={{ exact: true }}
-                className={primaryTabClass}
-                activeProps={{ className: primaryTabActiveClass }}
-                aria-label="Kanban"
-              >
-                <Kanban size={16} />
-                <span>{t('appShell.navigation.board')}</span>
-              </Link>
-            ) : (
-              <button
-                type="button"
-                disabled
-                title="Select or create a Project to open Kanban"
-                className={cn(primaryTabClass, 'cursor-not-allowed opacity-50')}
-              >
-                <Kanban size={16} />
-                <span>{t('appShell.navigation.board')}</span>
-              </button>
-            )}
-            <Link
-              to="/chat"
-              activeOptions={{ exact: true }}
-              className={primaryTabClass}
-              activeProps={{ className: primaryTabActiveClass }}
-              aria-label="Main Chat"
-            >
-              <ChatCircleDots size={16} />
-              <span>{t('appShell.navigation.mainChat')}</span>
-            </Link>
-          </nav>
-
           <div className="ml-auto flex shrink-0 items-center gap-2">
             <NotificationCenter projectId={projectId} />
-            <MoreNavigation projectId={projectId} isAdmin={isAdmin} />
             <button
               type="button"
               className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-input bg-card text-muted-foreground shadow-xs transition-[background-color,color,transform] hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-95"
@@ -589,16 +470,43 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </div>
       </header>
-
-      <main
-        id="main-content"
-        className={cn(
-          'min-h-0 flex-1 bg-background p-3 sm:p-4 lg:p-5',
-          isBoardRoute || isChatRoute ? 'overflow-hidden' : 'overflow-auto',
-        )}
+      <div className="flex min-h-0 flex-1">
+        <aside className="hidden w-56 shrink-0 border-r border-border-subtle bg-sidebar lg:block">
+          <AppShellSidebar projectId={projectId} isAdmin={isAdmin} />
+        </aside>
+        <main
+          id="main-content"
+          className={cn(
+            'min-h-0 min-w-0 flex-1 bg-background p-3 sm:p-4 lg:p-5',
+            isBoardRoute || isChatRoute ? 'overflow-hidden' : 'overflow-auto',
+          )}
+        >
+          {children}
+        </main>
+      </div>
+      <Dialog
+        open={navigationOpen}
+        onOpenChange={setNavigationOpen}
+        ariaLabel="Navigation"
+        className="absolute left-0 top-0 flex h-[100dvh] max-h-none w-72 max-w-[85vw] flex-col overflow-hidden rounded-none border-r border-border-subtle bg-sidebar p-0 shadow-float"
       >
-        {children}
-      </main>
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-border-subtle px-5">
+          <span className="text-sm font-semibold text-foreground">Navigation</span>
+          <button
+            type="button"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-sidebar-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label="Close navigation"
+            onClick={() => setNavigationOpen(false)}
+          >
+            <X size={17} aria-hidden />
+          </button>
+        </div>
+        <AppShellSidebar
+          projectId={projectId}
+          isAdmin={isAdmin}
+          onNavigate={() => setNavigationOpen(false)}
+        />
+      </Dialog>
     </div>
   )
 }

@@ -58,6 +58,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- The app shell has a navigation sidebar instead of the `Kanban` / `Main Chat`
+  tabs and `More` menu: **Main Agent** under Account, **Project Agent**,
+  Kanban, Tasks, Overview and Project settings under the selected Project, and
+  Workspace destinations below. Below 1024px it opens as a dialog from the top
+  bar. `Main Chat` is now labelled **Main Agent**.
+
 - REST and MCP validate a Project's settings document through one
   implementation instead of a copy each. The copies had drifted in both
   directions, so a document one surface accepted was one the other would have

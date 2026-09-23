@@ -725,10 +725,12 @@ new preview.
 ## Main Chat and the Project Agent Workspace
 
 The approved product model has one global Main Agent binding/chat per account
-and exactly one Project Agent binding/chat per operational Project. The application
-keeps **Kanban** and **Main Chat** as its only two primary tabs; Project Agent and
-other Project/Workspace destinations remain reachable from the contextual `More`
-menu. There is no second floating Main Chat launcher. Each Project's **Project
+and exactly one Project Agent binding/chat per operational Project. The navigation
+sidebar puts **Main Agent** under Account and **Project Agent** under the selected
+Project. Main Agent opens the account's Main Chat at `/chat` for discovery and
+Project handoffs; Project Agent opens that Project's chat for planning and Task
+management. On small screens, open the same navigation from the top-bar menu.
+Each Project's **Project
 Agent** workspace keeps its durable conversation beside Project-record editing
 controls; on small screens, use the Conversation/Project segments without losing
 either draft. A connected but unbound identity stays available for later selection
