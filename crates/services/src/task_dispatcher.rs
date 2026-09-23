@@ -108,11 +108,16 @@ impl TaskDispatcher {
                 continue;
             }
             let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
+            // Work already in flight goes first. Scheduling new Tasks first
+            // let every fresh `todo` claim a single-slot agent before an
+            // interrupted Task — one whose execution a restart stopped with
+            // an automatic resume — was even considered, so it waited behind
+            // the whole ready queue while holding its worktree.
+            dispatched += self.recover_active_tasks(&project, &workflow).await?;
             if self.is_stopped() {
                 break;
             }
-            dispatched += self.recover_active_tasks(&project, &workflow).await?;
+            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
         }
 
         tracing::info!(

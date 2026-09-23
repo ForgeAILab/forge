@@ -63,6 +63,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Task interrupted by a restart resumes before new Tasks start. The
+  dispatcher scheduled `todo` Tasks before it recovered in-flight ones, so on a
+  single-slot agent every fresh Task claimed the slot first and a Task whose
+  coder a restart had stopped (with an automatic resume) sat in `in_progress`,
+  holding its worktree, until nothing else in the Project was ready. Observed
+  on a 12-Task Project where the interrupted Task was passed over three times.
 - Recovering a Task parked in `review` opens a new review attempt instead of
   failing forever. A reviewer execution durably binds the current Review row
   and that binding only accepts an attempt still in `running`; entering
