@@ -26,6 +26,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   visibility for every Task in one request. Execution lists and Task detail
   bound their per-execution usage lookups to eight at a time.
 
+- A milestone definition now binds the Project's current Charter when its
+  author omits the reference, and a revision of an unbound definition repairs
+  it. Readiness checks every validation against the definition's Charter while
+  validations are always recorded under the Project's Charter, so a definition
+  created without one (typically during the Project Agent's first turn) could
+  never become ready: every result read back as
+  `immutable validation result is stale for the active authority`.
+
 - `GET /api/v1/agents` and the agent detail routes no longer slow down as
   usage history grows. Each agent's lifetime cost aggregate issued several
   queries per usage event (8.8s for 23 agents on a real install); it now reads

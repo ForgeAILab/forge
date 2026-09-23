@@ -437,6 +437,14 @@ impl ProjectMilestoneCommandService {
             return Ok(revision);
         }
         authorize_project_principal(&self.db, &command.project_id, &command.authorization).await?;
+        // The approved Charter is the governing authority readiness checks
+        // every validation against, and validations are always recorded under
+        // the Project's current Charter. A first definition that omits the
+        // binding could therefore never become ready, so bind it here.
+        if command.content.charter_revision.is_none() {
+            command.content.charter_revision =
+                current_charter_reference(&self.db, &command.project_id).await?;
+        }
         validate_definition_references(&self.db, &command.project_id, &command.content).await?;
         if command.expected_project_version <= 0 {
             command.expected_project_version =
@@ -536,6 +544,12 @@ impl ProjectMilestoneCommandService {
         if command.content.charter_revision.is_none() {
             command.content.charter_revision =
                 inherited_charter_reference(&self.db, &command.project_id, &milestone_id).await?;
+        }
+        // A definition created before first definitions were bound has no
+        // binding to inherit; its next revision repairs it.
+        if command.content.charter_revision.is_none() {
+            command.content.charter_revision =
+                current_charter_reference(&self.db, &command.project_id).await?;
         }
         validate_definition_references(&self.db, &command.project_id, &command.content).await?;
         if command.expected_milestone_version <= 0 {
@@ -1692,6 +1706,34 @@ async fn inherited_charter_reference(
          LIMIT 1",
     )
     .bind(milestone_id)
+    .bind(project_id)
+    .fetch_optional(db.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(api_types::ArtifactRef {
+        artifact_id: row.try_get("artifact_id")?,
+        revision_id: row.try_get("revision_id")?,
+        content_digest: row.try_get("content_digest")?,
+        render_version: row.try_get("render_version")?,
+        render_digest: row.try_get("rendered_digest")?,
+    }))
+}
+
+/// The Project's current approved Charter revision, if it is Charter-backed.
+async fn current_charter_reference(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<Option<api_types::ArtifactRef>> {
+    let row = sqlx::query(
+        "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project p
+         JOIN project_charter_revision r ON r.id = p.current_charter_revision_id
+         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = p.id
+         WHERE p.id = ?",
+    )
     .bind(project_id)
     .fetch_optional(db.pool())
     .await?;

@@ -2268,3 +2268,95 @@ async fn verbatim_revise_returns_current_revision_and_keeps_approval_standing() 
     .expect("final revision count");
     assert_eq!(final_count, 2);
 }
+
+async fn charter_binding(db: &SqliteDb, revision_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT charter_revision_id FROM project_milestone_revision WHERE id = ?")
+        .bind(revision_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("revision charter binding reads")
+}
+
+#[tokio::test]
+async fn definitions_bind_the_current_charter_when_the_author_omits_it() {
+    let db = fixture().await;
+    let service = ProjectMilestoneCommandService::new(Arc::clone(&db));
+
+    // Before the Project is Charter-backed there is nothing to bind: this is
+    // the shape of a definition authored while Charter setup was pending.
+    let legacy = service
+        .define_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 1,
+                milestone_id: None,
+                milestone_version: 1,
+                base_revision_id: None,
+                lifecycle: MilestoneDefinitionLifecycle::Draft,
+                key: "unbound-define",
+                name: "Unbound milestone",
+                check_id: Some("unbound-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("define without a Charter");
+    assert_eq!(charter_binding(&db, &legacy.id).await, None);
+
+    sqlx::query(
+        "UPDATE project SET current_charter_id = ?, current_charter_revision_id = ?,
+                current_charter_version = 1 WHERE id = ?",
+    )
+    .bind(CHARTER_ID)
+    .bind(CHARTER_REVISION_ID)
+    .bind(PROJECT_ID)
+    .execute(db.pool())
+    .await
+    .expect("Project becomes Charter-backed");
+
+    // Readiness checks every validation against the definition's Charter and
+    // validations are recorded under the Project's Charter, so an omitted
+    // binding is filled rather than left to make the milestone unreleasable.
+    let bound = service
+        .define_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 0,
+                milestone_id: None,
+                milestone_version: 1,
+                base_revision_id: None,
+                lifecycle: MilestoneDefinitionLifecycle::Draft,
+                key: "bound-define",
+                name: "Bound milestone",
+                check_id: Some("bound-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("define binds the current Charter");
+    assert_eq!(
+        charter_binding(&db, &bound.id).await.as_deref(),
+        Some(CHARTER_REVISION_ID)
+    );
+
+    // An unbound definition has nothing to inherit; its next revision repairs it.
+    let repaired = service
+        .revise_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 0,
+                milestone_id: Some(&legacy.milestone_id),
+                milestone_version: 2,
+                base_revision_id: Some(&legacy.id),
+                lifecycle: MilestoneDefinitionLifecycle::Proposed,
+                key: "unbound-revise",
+                name: "Unbound milestone, revised",
+                check_id: Some("unbound-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("revise binds the current Charter");
+    assert_ne!(repaired.id, legacy.id);
+    assert_eq!(
+        charter_binding(&db, &repaired.id).await.as_deref(),
+        Some(CHARTER_REVISION_ID)
+    );
+}
