@@ -39,12 +39,37 @@ jobs:
           python /tmp/apply_perf_patch.py
           python - <<'PY'
           from pathlib import Path
+
           path = Path('crates/agent-host/src/typed_tools.rs')
           text = path.read_text()
-          needle = '\nstruct ExecutedCommand {\n'
-          if text.count(needle) != 1:
+
+          derive_target = '\nstruct ExecutedCommand {\n'
+          if text.count(derive_target) != 1:
               raise SystemExit('ExecutedCommand derive insertion target drifted')
-          path.write_text(text.replace(needle, '\n#[derive(Debug)]\nstruct ExecutedCommand {\n', 1))
+          text = text.replace(
+              derive_target,
+              '\n#[derive(Debug)]\nstruct ExecutedCommand {\n',
+              1,
+          )
+
+          temporary_args = '''        let command = execute_workspace_command(
+              "python3",
+              &["-c".to_owned(), "import time; time.sleep(30)".to_owned()],
+              None,
+              &ctx,
+          );
+          '''
+          bound_args = '''        let args = [
+              "-c".to_owned(),
+              "import time; time.sleep(30)".to_owned(),
+          ];
+          let command = execute_workspace_command("python3", &args, None, &ctx);
+          '''
+          if text.count(temporary_args) != 1:
+              raise SystemExit('command cancellation test target drifted')
+          text = text.replace(temporary_args, bound_args, 1)
+
+          path.write_text(text)
           PY
           cargo fmt --all
 
