@@ -6,64 +6,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-### Changed
-
-- A personal access token's `last_used_at` now advances at most once per five
-  minutes instead of on every request, so API and MCP traffic no longer writes
-  to SQLite per call.
-
-- `GET /api/v1/executions/{id}/hook-logs` is bounded: it returns at most
-  `limit` entries (default 500, max 5000) from at most `max_bytes` of hook log
-  (default 1 MiB, max 8 MiB). When a Task has more, the newest hook entries are
-  kept, still returned oldest first. It previously read every hook file in the
-  Task's log directory whole.
-
-### Fixed
-
-- Password hashing and verification run on the blocking pool (at most four at
-  once) instead of stalling async workers, PAT authentication reads the token
-  and its user in one query, and MCP tool calls stop re-checking Project
-  visibility for every Task in one request. Execution lists and Task detail
-  bound their per-execution usage lookups to eight at a time.
-
-- An embedded reviewer whose report Forge cannot parse (a garbled key, a missing
-  field) now fixes it in the same run: up to two short follow-up turns carry the
-  exact parse error and the rejected report. It used to lose the whole review
-  and start a fresh full-cost reviewer run against the retry budget.
-
-- A milestone definition now binds the Project's current Charter when its
-  author omits the reference, and a revision of an unbound definition repairs
-  it. Readiness checks every validation against the definition's Charter while
-  validations are always recorded under the Project's Charter, so a definition
-  created without one (typically during the Project Agent's first turn) could
-  never become ready: every result read back as
-  `immutable validation result is stale for the active authority`.
-
-- The Task and run views no longer show a reviewer run as a later turn of the
-  coder's session. A reviewer links to the candidate run it reviewed, and any
-  such link was read as a session continuation, so the review appeared as a
-  "Re-execution" inside the Coder Session and its timeline included the coder's
-  transcript. A run now continues its parent's session only when it has the
-  same role and agent.
-
-- `GET /api/v1/agents` and the agent detail routes no longer slow down as
-  usage history grows. Each agent's lifetime cost aggregate issued several
-  queries per usage event (8.8s for 23 agents on a real install); it now reads
-  cost revisions and pricing provenance once per invocation and is memoized
-  until the agent's ledger changes.
-
-- A review whose setup steps or checks rewrite tracked files in Forge's clean
-  checkout (for example `npm install` regenerating a stale `package-lock.json`)
-  now fails the candidate and tells the coder which files changed. It was
-  classified as an unverified reviewer result, so the reviewer was retried
-  until the Task blocked and the coder was never told.
-
-- A reviewer execution's completion is settled once. The inline completion path
-  and the dispatcher's reconciliation of terminal reviewer executions could both
-  run it while the clean-checkout checks were still going, which charged the
-  retry budget twice and hard-blocked the Task with
-  `check constraint failed: assessment is already frozen`.
-
 ## [0.13.0] - 2026-09-23
 
 ### Added
@@ -143,6 +85,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   previously listed findings only, and only when the reviewer's whole
   message was bare JSON, so a narrated or fenced assessment — accepted by
   review admission — produced a headline with no detail.
+
+- A personal access token's `last_used_at` now advances at most once per five
+  minutes instead of on every request, so API and MCP traffic no longer writes
+  to SQLite per call.
+
+- `GET /api/v1/executions/{id}/hook-logs` is bounded: it returns at most
+  `limit` entries (default 500, max 5000) from at most `max_bytes` of hook log
+  (default 1 MiB, max 8 MiB). When a Task has more, the newest hook entries are
+  kept, still returned oldest first. It previously read every hook file in the
+  Task's log directory whole.
 
 ### Fixed
 
@@ -394,6 +346,50 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - `services` is warning-free under Rust 1.98 clippy: the planning-review
   metadata helper's late-initialized binding is now a plain `if`
   expression.
+
+- Password hashing and verification run on the blocking pool (at most four at
+  once) instead of stalling async workers, PAT authentication reads the token
+  and its user in one query, and MCP tool calls stop re-checking Project
+  visibility for every Task in one request. Execution lists and Task detail
+  bound their per-execution usage lookups to eight at a time.
+
+- An embedded reviewer whose report Forge cannot parse (a garbled key, a missing
+  field) now fixes it in the same run: up to two short follow-up turns carry the
+  exact parse error and the rejected report. It used to lose the whole review
+  and start a fresh full-cost reviewer run against the retry budget.
+
+- A milestone definition now binds the Project's current Charter when its
+  author omits the reference, and a revision of an unbound definition repairs
+  it. Readiness checks every validation against the definition's Charter while
+  validations are always recorded under the Project's Charter, so a definition
+  created without one (typically during the Project Agent's first turn) could
+  never become ready: every result read back as
+  `immutable validation result is stale for the active authority`.
+
+- The Task and run views no longer show a reviewer run as a later turn of the
+  coder's session. A reviewer links to the candidate run it reviewed, and any
+  such link was read as a session continuation, so the review appeared as a
+  "Re-execution" inside the Coder Session and its timeline included the coder's
+  transcript. A run now continues its parent's session only when it has the
+  same role and agent.
+
+- `GET /api/v1/agents` and the agent detail routes no longer slow down as
+  usage history grows. Each agent's lifetime cost aggregate issued several
+  queries per usage event (8.8s for 23 agents on a real install); it now reads
+  cost revisions and pricing provenance once per invocation and is memoized
+  until the agent's ledger changes.
+
+- A review whose setup steps or checks rewrite tracked files in Forge's clean
+  checkout (for example `npm install` regenerating a stale `package-lock.json`)
+  now fails the candidate and tells the coder which files changed. It was
+  classified as an unverified reviewer result, so the reviewer was retried
+  until the Task blocked and the coder was never told.
+
+- A reviewer execution's completion is settled once. The inline completion path
+  and the dispatcher's reconciliation of terminal reviewer executions could both
+  run it while the clean-checkout checks were still going, which charged the
+  retry budget twice and hard-blocked the Task with
+  `check constraint failed: assessment is already frozen`.
 
 ## [0.12.0] - 2026-09-14
 
