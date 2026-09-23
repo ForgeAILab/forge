@@ -2600,10 +2600,13 @@ candidate, followed by required checks, with a 120-second timeout and bounded
 output per command. Setup prepares dependencies but never satisfies a requirement;
 failure is recorded separately and stops the checks. Forge records actual exit
 codes independently of model output and reruns required checks before accepting
-the assessment, even when the reviewer cited a frozen pre-review result. Changed
-tracked content, a citation whose
-start line does not exist, and stale Charter/Task/check inputs make conformance
-unverified while retaining a structurally valid assessment. A citation end line
+the assessment, even when the reviewer cited a frozen pre-review result. If
+setup or the checks modify tracked files (or move HEAD) in that clean checkout,
+the candidate does not reproduce from its own commit — a stale lockfile is the
+usual cause — so the review fails and the coder is told which files changed.
+Tracked changes in the reviewer's own worktree, a citation whose start line does
+not exist, and stale Charter/Task/check inputs make conformance unverified while
+retaining a structurally valid assessment. A citation end line
 may overshoot EOF because its existing start line still identifies real content.
 A real file citation is not proof that the reviewer interpreted its contents
 correctly. Natural-language Charter text never becomes an executable command;

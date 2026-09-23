@@ -1358,19 +1358,39 @@ async fn evaluate_inner(
             }
         }
     }
-    if (!contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty())
-        && (git_read(&checkout, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha
-            || !git_read(&checkout, &["diff", "--name-only", "HEAD"])
-                .await?
-                .trim()
-                .is_empty())
-    {
-        return Err("checks changed reviewed tracked content".into());
-    }
     if setup_failed {
         result.status = ConformanceStatus::Failed;
         result.reason = Some("clean review checkout setup failed".into());
         return Ok(());
+    }
+    if !contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty() {
+        // The checkout is Forge's own clean copy of the candidate, so a
+        // change here comes from the setup steps or checks, not the reviewer.
+        // It means the candidate does not reproduce from its own commit (a
+        // stale lockfile is the usual cause), which is the coder's to fix.
+        // Treating it as a reviewer protocol failure retried a reviewer who
+        // could never pass until the Task blocked, and the coder never heard.
+        let head_moved =
+            git_read(&checkout, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha;
+        let changed = git_read(&checkout, &["diff", "--name-only", "HEAD"]).await?;
+        let changed: Vec<&str> = changed.lines().filter(|line| !line.is_empty()).collect();
+        if head_moved || !changed.is_empty() {
+            result.status = ConformanceStatus::Failed;
+            result.reason = Some(if head_moved {
+                "the review setup steps or checks moved HEAD in a clean checkout of the \
+                 candidate; they must not commit"
+                    .to_owned()
+            } else {
+                format!(
+                    "running the review setup steps and checks in a clean checkout of the \
+                     candidate modified tracked files: {}. Commit the regenerated files \
+                     (for example an updated lockfile) so the candidate reproduces from its \
+                     own commit",
+                    changed.join(", ")
+                )
+            });
+            return Ok(());
+        }
     }
     if git_read(path, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha
         || !git_read(path, &["diff", "--name-only", "HEAD"])

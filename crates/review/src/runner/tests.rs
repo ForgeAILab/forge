@@ -826,6 +826,61 @@ async fn clean_review_checkout_runs_setup_before_required_checks() {
     assert_eq!(details.conformance.checks[1].exit_code, 0);
 }
 
+#[tokio::test]
+async fn setup_that_rewrites_a_tracked_file_fails_the_candidate() {
+    let seed = seeded_review(vec!["true"]).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(
+            json!({
+                "review": {
+                    "setup_steps": ["echo regenerated > README.md"],
+                    "ci_steps": ["true"]
+                }
+            })
+            .to_string(),
+        )
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .expect("review setup config updates");
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(PassingAuditor),
+    );
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    // A candidate that does not reproduce from its own commit is the coder's
+    // defect, reported with the file, not a reviewer protocol failure.
+    assert!(
+        matches!(outcome, ReviewOutcome::AuditorFailed { .. }),
+        "{outcome:?}"
+    );
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Failed
+    );
+    let reason = details.conformance.reason.unwrap_or_default();
+    assert!(
+        reason.contains("modified tracked files: README.md"),
+        "{reason}"
+    );
+}
+
 // The check is explicit Project policy, never inferred/executed from Charter prose.
 const RUST_PRODUCT_CHECK: &str = r#"set -eu
 cargo metadata --offline --no-deps --format-version 1 > metadata.json

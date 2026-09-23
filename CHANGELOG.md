@@ -14,6 +14,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   cost revisions and pricing provenance once per invocation and is memoized
   until the agent's ledger changes.
 
+- A review whose setup steps or checks rewrite tracked files in Forge's clean
+  checkout (for example `npm install` regenerating a stale `package-lock.json`)
+  now fails the candidate and tells the coder which files changed. It was
+  classified as an unverified reviewer result, so the reviewer was retried
+  until the Task blocked and the coder was never told.
+
 ## [0.13.0] - 2026-09-23
 
 ### Added
