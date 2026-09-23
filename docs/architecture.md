@@ -1859,11 +1859,21 @@ Entering review runs the before-work hooks and CI steps as blocking guards.
 Review rejection and merge repair resume the latest worker thread. The worker
 plans internally, implements, self-tests, repairs ordinary unfinished-worktree
 failures, and reports verification evidence, so the preset has no planning
-state or plan-checklist gate. A real branch conflict is not dispatched into
-`merge_failed`: Forge parks it for manual Task-worktree repair because managed
-agents cannot rebase or write linked Git metadata. The recovery action creates
-a marked review-refresh transition, clears the old approval, and runs the
-repaired result through fresh checks and human review before merge.
+state or plan-checklist gate. A real branch conflict goes back to the
+worker, but Forge does the Git part: managed agents cannot rebase or write
+linked Git metadata, so when the rebase onto a moved target conflicts Forge
+commits each text-content conflict step with its conflict markers, finishes the
+rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
+the affected paths. The worker reconciles those files by editing and committing them, and the
+result goes through fresh checks and review like any other repair. A handoff
+does not spend the merge-fix retry budget. Integration checks for remaining
+markers only in paths handed off in the current retry window and parks
+unresolved files for manual Task-worktree repair. Modify/delete and binary
+conflicts also require manual repair, as do more than five handoffs in one
+retry window and conflicts on coordination roots, whose aggregate branch stays
+on the manual path. There, the recovery action creates a
+marked review-refresh transition, clears the old approval, and runs the
+repaired result through fresh checks and review before merge.
 
 ### Root Tasks and ordered subtasks
 

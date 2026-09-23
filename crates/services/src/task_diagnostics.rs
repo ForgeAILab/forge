@@ -996,8 +996,8 @@ pub fn entries_since_retry_window_boundary<'a>(
 
 /// Count gate rejections in the current retry window.
 ///
-/// Merge-refresh rejection rows written by older engine versions are
-/// mechanical contention, not merge-fix attempts.  Excluding them here keeps
+/// Merge-refresh and conflict-handoff rows are mechanical bridges, not
+/// merge-fix attempts. Excluding them here keeps
 /// recovery, runtime admission, and API diagnostics on the same policy even
 /// while the current engine normalizes new bridge rows to `rejection = false`.
 pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_state: &str) -> i64 {
@@ -1010,9 +1010,12 @@ pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_stat
                 && entry.rejection
                 && !(gate_state == crate::workflow::default_states::MERGING
                     && entry.to_state == crate::workflow::default_states::MERGE_FAILED
-                    && entry
+                    && (entry
                         .trigger_reason
                         .contains(crate::workflow::REVIEW_REFRESH_MARKER)
+                        || entry
+                            .trigger_reason
+                            .contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
                     && entry.triggered_by == workflow_actor)
         })
         .count() as i64
@@ -1864,6 +1867,22 @@ mod tests {
         let entries = vec![log("merging", "merge_failed", Some("reject"), true), bridge];
 
         assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
+    }
+
+    #[test]
+    fn rejected_conflict_handoff_does_not_spend_merge_fix_budget() {
+        let workflow_actor =
+            api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+        let mut handoff = log("merging", "merge_failed", Some("retry"), true);
+        handoff.triggered_by = workflow_actor;
+        handoff.trigger_reason = format!(
+            "{} rebased onto main; paths_json=[\"exports.py\"]",
+            crate::workflow::CONFLICT_HANDOFF_MARKER
+        );
+        assert_eq!(
+            count_gate_rejections_since_boundary(&[handoff], "merging"),
+            0
+        );
     }
 
     #[test]

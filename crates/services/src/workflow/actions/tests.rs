@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
-use super::merge::merge_failure_result;
+use super::merge::{merge_failure_result, target_moved_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
     RequireUpstreamRolesCompleted, RunCiSteps,
@@ -2281,6 +2281,400 @@ async fn ordinary_merge_conflict_parks_for_manual_repair_and_invalidates_review(
             api_types::RecoveryAction::RetryHook,
             api_types::RecoveryAction::CancelTask
         ]
+    );
+}
+
+/// Two sibling Tasks each add an entry to the same export list; the first
+/// merges and the second's rebase conflicts. Built as a linked worktree on a
+/// real repository so the rebase meets the same Git metadata layout as a
+/// managed Task.
+async fn seed_sibling_conflict_workspace(ctx: &HookContext) -> (TempDir, PathBuf) {
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let repo_id = ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .primary_repo_id
+        .expect("project has a primary repository");
+    let dir = TempDir::new().expect("temp dir creates");
+    let repo_path = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("repo dir creates");
+    setup_git_repo(&repo_path);
+    std::fs::write(repo_path.join("exports.py"), "core = 1\n").expect("exports write");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-m", "exports"]);
+
+    let branch = ::workspace::task_branch_name(&ctx.task_id);
+    let worktree_path = dir.path().join("worktree");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            worktree_path.to_str().expect("worktree path is UTF-8"),
+            "main",
+        ],
+    );
+    std::fs::write(worktree_path.join("exports.py"), "core = 1\napi = 1\n")
+        .expect("task export writes");
+    std::fs::write(worktree_path.join("api.py"), "API = True\n").expect("task module writes");
+    run_git(&worktree_path, &["add", "-A"]);
+    run_git(&worktree_path, &["commit", "-m", "add api"]);
+    let before_sha = run_git(&worktree_path, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo_path.join("exports.py"), "core = 1\ncli = 1\n")
+        .expect("sibling export writes");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-m", "sibling adds cli"]);
+
+    let now = now_rfc3339();
+    WorkspaceRepo::create(
+        &*ctx.db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            repo_id,
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch,
+            status: WorkspaceStatus::Ready,
+            before_sha: Some(before_sha),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("workspace creates");
+    sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+        .bind(repo_path.to_string_lossy().as_ref())
+        .bind(
+            ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+                .await
+                .expect("project loads")
+                .expect("project exists")
+                .primary_repo_id
+                .expect("primary repo exists"),
+        )
+        .execute(ctx.db.pool())
+        .await
+        .expect("fixture repository path updates");
+    let workspace = WorkspaceRepo::get_by_task_id(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("executor execution creates");
+    (dir, worktree_path)
+}
+
+#[tokio::test]
+async fn rebase_conflict_is_handed_back_to_the_worker_with_committed_markers() {
+    let ctx = build_test_ctx(
+        "task-conflict-handoff",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (_dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
+
+    let HookResult::Cascade { to, reason } = result else {
+        panic!("a sibling conflict goes back to the Worker, got {result:?}");
+    };
+    assert_eq!(to, default_states::MERGE_FAILED);
+    assert!(
+        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains(crate::workflow::REVIEW_REFRESH_MARKER),
+        "a conflict needs the Worker, not a bare re-review: {reason}"
+    );
+    assert!(reason.contains("exports.py"), "{reason}");
+
+    // The branch sits on the new target, fully rebased, with the conflict
+    // committed for the Worker to reconcile by editing files.
+    let status = run_git(&worktree_path, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "worktree is clean: {status}");
+    assert!(!git::detect_rebase_in_progress(&worktree_path)
+        .await
+        .expect("rebase state reads"));
+    let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
+    assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
+    assert!(worktree_path.join("api.py").exists());
+    assert_eq!(
+        run_git(&worktree_path, &["merge-base", "HEAD", "main"]),
+        run_git(&worktree_path, &["rev-parse", "main"]),
+    );
+
+    let current = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert!(current.blocked_json.is_none(), "nothing parks for a human");
+    let annotation: serde_json::Value = serde_json::from_str(
+        current
+            .error_annotation
+            .as_deref()
+            .expect("the conflict is annotated for the Worker prompt"),
+    )
+    .expect("annotation parses");
+    assert_eq!(annotation["type"], json!("merge_conflict"));
+}
+
+async fn record_conflict_handoff(ctx: &HookContext, reason: String, rejection: bool) {
+    db::TransitionLogRepo::insert(
+        &*ctx.db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            from_state: default_states::MERGING.to_owned(),
+            to_state: default_states::MERGE_FAILED.to_owned(),
+            trigger_name: None,
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            trigger_reason: reason,
+            hook_results_json: None,
+            rejection,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("handoff transition records");
+}
+
+#[tokio::test]
+async fn conflict_handoff_preserves_later_merge_fix_follow_up() {
+    let ctx = build_test_ctx(
+        "task-handoff-then-dirty",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    record_conflict_handoff(
+        &ctx,
+        format!(
+            "{} rebased onto main{}[\"exports.py\"]",
+            crate::workflow::CONFLICT_HANDOFF_MARKER,
+            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
+        ),
+        true,
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let result = merge_failure_result(
+        &ctx,
+        &task,
+        "worktree has uncommitted changes".to_owned(),
+        api_types::FailureKind::DirtyWorktree,
+    )
+    .await;
+    assert!(matches!(result, HookResult::Cascade { to, .. } if to == default_states::MERGE_FAILED));
+    let current = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert!(
+        current.blocked_json.is_none(),
+        "later merge failure gets its follow-up"
+    );
+    seed_transition_log(
+        &ctx.db,
+        &ctx.task_id,
+        default_states::MERGING,
+        default_states::MERGE_FAILED,
+        true,
+    )
+    .await;
+    let budget_result = super::merge::CheckMergeFixBudget.execute(&ctx).await;
+    assert!(matches!(budget_result, HookResult::Ok), "{budget_result:?}");
+}
+
+#[tokio::test]
+async fn run_merge_blocks_unresolved_handed_off_markers() {
+    let mut ctx = build_test_ctx(
+        "task-handoff-marker-block",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, _worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let HookResult::Cascade { reason, .. } =
+        target_moved_result(&ctx, &task, "main advanced", "main").await
+    else {
+        panic!("conflict should hand off");
+    };
+    record_conflict_handoff(&ctx, reason, false).await;
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+
+    let result = RunMerge.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert!(blocked
+        .blocked_json
+        .as_deref()
+        .is_some_and(|value| value.contains("unresolved Git conflict markers")));
+}
+
+#[tokio::test]
+async fn handed_off_conflict_resolves_and_run_merge_integrates() {
+    let mut ctx = build_test_ctx(
+        "task-handoff-resolved",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let HookResult::Cascade { reason, .. } =
+        target_moved_result(&ctx, &task, "main advanced", "main").await
+    else {
+        panic!("conflict should hand off");
+    };
+    record_conflict_handoff(&ctx, reason, false).await;
+    std::fs::write(
+        worktree_path.join("exports.py"),
+        "core = 1\ncli = 1\napi = 1\n",
+    )
+    .expect("Worker resolves both sides");
+    run_git(&worktree_path, &["add", "-A"]);
+    run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+
+    let result = RunMerge.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Cascade { to, .. } if to == default_states::DONE));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("repo/exports.py"))
+            .expect("integrated exports read"),
+        "core = 1\ncli = 1\napi = 1\n"
+    );
+}
+
+#[tokio::test]
+async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
+    let ctx = build_test_ctx(
+        "task-conflict-handoff-exhausted",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (_dir, _worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    for _ in 0..5 {
+        db::TransitionLogRepo::insert(
+            &*ctx.db,
+            db::CreateTransitionLog {
+                id: new_uuid_v4(),
+                task_id: ctx.task_id.clone(),
+                from_state: default_states::MERGING.to_owned(),
+                to_state: default_states::MERGE_FAILED.to_owned(),
+                trigger_name: None,
+                triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
+                    .display(),
+                trigger_reason: format!(
+                    "{} rebased onto main; conflicts were committed with markers in: exports.py",
+                    crate::workflow::CONFLICT_HANDOFF_MARKER
+                ),
+                hook_results_json: None,
+                rejection: true,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("prior handoff records");
+    }
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
+
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(
+        blocked.version,
+        task.version + 1,
+        "block and annotation land in one write, so one interruption event wakes the Project Agent"
+    );
+    assert!(blocked.blocked_json.is_some());
+    let annotation: api_types::TaskAnnotation = serde_json::from_str(
+        blocked
+            .error_annotation
+            .as_deref()
+            .expect("escalation is annotated"),
+    )
+    .expect("annotation parses");
+    let api_types::TaskAnnotation::Blocking(annotation) = annotation else {
+        panic!("escalation must be typed")
+    };
+    assert_eq!(
+        annotation.blocked_by.as_deref(),
+        Some("manual_workspace_repair")
     );
 }
 

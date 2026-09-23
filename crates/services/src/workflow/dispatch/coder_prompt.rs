@@ -73,7 +73,7 @@ Review-fix boundary:
 
 const MERGE_FIX_ROLE_BOUNDARY: &str = "\
 Merge-fix boundary:
-- May finish uncommitted Task-worktree changes, but must not rebase or attempt a real branch conflict repair. Forge parks real merge conflicts for manual workspace repair.
+- May finish uncommitted Task-worktree changes and reconcile conflict markers Forge committed after rebasing the branch; must never run Git to rebase, merge, or rewrite history — Forge owns the branch.
 - Must complete delivery according to the execution harness contract, then run targeted verification.
 - Must not rewrite the feature or add unrelated cleanup.
 - Red flags: redesigns, formatting churn outside conflicted areas, unrelated fixes.";
@@ -255,6 +255,12 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
             user.push_str("Integration found uncommitted changes in the task worktree, not a merge conflict. Preserve the existing work; do not rebase or discard it.\n\n");
         }
         user.push_str("Inspect the worktree changes, finish the intended implementation, complete delivery according to the execution harness contract, and verify the focused checks pass.");
+    } else if let Some(reason) = conflict_handoff_reason(ctx) {
+        user.push_str("Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nConflict:\n");
+        user.push_str(&reason);
+        if ctx.task.review_passed_at.is_some() {
+            user.push_str("\n\nThe task previously passed review; the reconciled commit will receive a fresh review before Forge retries integration.");
+        }
     } else {
         if ctx.task.review_passed_at.is_some() {
             user.push_str("The task previously passed review, but integration found a real merge conflict. That conflict requires manual workspace repair and a fresh review before Forge retries integration.\n\n");
@@ -262,6 +268,13 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
         user.push_str("Do not rebase or attempt integration from this managed sandbox. Report that manual task-worktree repair is required and stop without changing unrelated files.");
     }
     user
+}
+
+/// The latest `merge_failed` entry, when Forge committed a rebase conflict
+/// with its markers for this Worker to reconcile.
+fn conflict_handoff_reason(ctx: &AgentDispatchContext) -> Option<String> {
+    last_merge_failed_reason(ctx)
+        .filter(|reason| reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
 }
 
 fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {

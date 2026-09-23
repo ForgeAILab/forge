@@ -1280,7 +1280,16 @@ impl WorkflowEngine {
             // rejected merge attempt. Normalize the persisted transition even
             // when a caller supplied `rejection = true`; otherwise the bridge
             // itself spends merge-fix budget before the real conflict is seen.
-            let rejection = rejection && !review_refresh_bridge;
+            let conflict_handoff_bridge = current_status == crate::workflow::default_states::MERGING
+                && target_state == crate::workflow::default_states::MERGE_FAILED
+                && reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+                && matches!(
+                    &actor,
+                    Actor::System {
+                        component: api_types::SystemComponent::Workflow
+                    }
+                );
+            let rejection = rejection && !review_refresh_bridge && !conflict_handoff_bridge;
             let has_blocking_before_enter = !review_refresh_bridge
                 && to_state
                     .hooks
@@ -2347,6 +2356,8 @@ impl WorkflowEngine {
                         && !cascade_reason.starts_with("gate skipped:")
                         && !cascade_reason
                             .contains(crate::workflow::REVIEW_REFRESH_MARKER)
+                        && !cascade_reason
+                            .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
                         && !Self::is_terminal(workflow, &cascade_to);
 
                     tracing::info!(

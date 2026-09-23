@@ -133,7 +133,7 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             default_roles::CODER,
             vec![
                 "Merge-fix boundary:",
-                "must not rebase or attempt a real branch conflict repair",
+                "must never run Git to rebase, merge, or rewrite history",
                 "Must not rewrite the feature or add unrelated cleanup.",
             ],
         ),
@@ -353,6 +353,63 @@ fn coder_prompt_merge_failed_follow_up_contains_rereview_directive() {
     // reviewer is done with it.
     assert!(prompt.user.contains("fresh review"));
     assert!(!prompt.user.contains("will not re-review"));
+}
+
+/// A rebase conflict Forge committed with markers is the Worker's to
+/// reconcile: both merge-fix builders must say so instead of the manual-repair
+/// refusal, and must name the conflicted files.
+#[test]
+fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
+    let handoff = db::TransitionLog {
+        id: "handoff".to_owned(),
+        task_id: "task".to_owned(),
+        from_state: default_states::MERGING.to_owned(),
+        to_state: default_states::MERGE_FAILED.to_owned(),
+        trigger_name: None,
+        triggered_by: "system:workflow".to_owned(),
+        trigger_reason: format!(
+            "{} rebased onto main; conflicts were committed with markers in: src/pkg/__init__.py, uv.lock",
+            crate::workflow::CONFLICT_HANDOFF_MARKER
+        ),
+        hook_results_json: None,
+        rejection: true,
+        created_at: "2026-09-22T10:00:00Z".to_owned(),
+    };
+    for (builder_id, role) in [
+        (BUILDER_ID_CODER_MERGE_FIX_V2, default_roles::CODER),
+        (BUILDER_ID_WORKER_MERGE_FIX_V1, default_roles::WORKER),
+    ] {
+        let mut ctx = fake_context(role);
+        ctx.state_name = default_states::MERGE_FAILED.to_string();
+        ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
+        ctx.transition_log = vec![handoff.clone()];
+
+        let prompt = resolve_prompt_builder(builder_id).build(&ctx);
+
+        assert!(
+            prompt.user.contains("committed the merge conflicts"),
+            "{builder_id}: {}",
+            prompt.user
+        );
+        assert!(prompt.user.contains("src/pkg/__init__.py"), "{builder_id}");
+        assert!(prompt.user.contains("keep the intent of BOTH sides"));
+        assert!(prompt.user.contains("regenerate it"));
+        // The embedded executor refuses uncommitted edits, so the Worker must
+        // be told to commit; saying Forge commits for it wasted two attempts
+        // on a live handoff.
+        assert!(
+            prompt.user.contains("`git commit`"),
+            "{builder_id}: {}",
+            prompt.user
+        );
+        assert!(!prompt.user.contains("Forge commits your changes"));
+        assert!(
+            !prompt
+                .user
+                .contains("manual task-worktree repair is required"),
+            "{builder_id} must not refuse a conflict it can reconcile"
+        );
+    }
 }
 
 #[test]

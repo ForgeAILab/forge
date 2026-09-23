@@ -63,12 +63,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A merge conflict goes back to the Task's Worker instead of parking the
+  Task for a person. Since 1ea2011 every content conflict in the rebase onto a
+  moved target stopped in `merging` with `blocked_by: manual_workspace_repair`,
+  and the Worker prompt told the agent to refuse, because a managed agent
+  cannot rebase a linked worktree. With sibling Tasks that each add an entry to
+  the same export list, workspace member list or command index, that parked
+  every sibling after the first to merge: six Tasks across three Projects sat
+  there, each blocking its dependents. Forge now commits the conflicted rebase
+  steps with their markers, finishes the rebase itself, and sends the Task to
+  `merge_failed` (`[conflict-handoff]`) with the conflicted text files, so the
+  Worker reconciles them by editing files and the repair gets a fresh review.
+  Only text content conflicts are handed off; modify/delete and binary
+  conflicts require manual repair. Integration checks conflict markers only in
+  files handed off in the current retry window and escalates unresolved files
+  for manual repair. A sixth handoff in one retry window and conflicts on
+  coordination roots also require manual repair. Handoffs do not spend the
+  merge-fix retry budget.
 - A Task interrupted by a restart resumes before new Tasks start. The
   dispatcher scheduled `todo` Tasks before it recovered in-flight ones, so on a
   single-slot agent every fresh Task claimed the slot first and a Task whose
   coder a restart had stopped (with an automatic resume) sat in `in_progress`,
   holding its worktree, until nothing else in the Project was ready. Observed
   on a 12-Task Project where the interrupted Task was passed over three times.
+- A Task blocked at integration now wakes its Project Agent. Every merge block
+  wrote the block and its recovery annotation as two Task updates, a few
+  milliseconds apart; the wake consumer admitted a wake for the first, dropped
+  the second as a duplicate of that live wake, then dropped the first because
+  the incident had changed under it. Both writes now land in one update. This
+  is why a merge-conflict block sat unreported for 13 hours on one Project
+  while the Project Agent's last message promised to check the Task on its
+  next wake.
 - Recovering a Task parked in `review` opens a new review attempt instead of
   failing forever. A reviewer execution durably binds the current Review row
   and that binding only accepts an attempt still in `running`; entering

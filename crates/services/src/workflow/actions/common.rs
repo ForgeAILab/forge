@@ -369,6 +369,25 @@ pub(super) async fn block_task(
     kind: api_types::FailureKind,
     source: Option<&str>,
 ) -> db::Result<()> {
+    block_task_with_annotation(ctx, task, reason, kind, source, None).await
+}
+
+/// Block the Task and, when given, replace its error annotation in the same
+/// write.
+///
+/// A block followed by a separate annotation write emits two interruption
+/// changes a few milliseconds apart. The wake consumer admits a wake for the
+/// first, suppresses the second as a duplicate of that live wake, then drops
+/// the admitted one because the incident changed under it — so the Project
+/// Agent never hears about the block. One write, one change.
+pub(super) async fn block_task_with_annotation(
+    ctx: &HookContext,
+    task: &db::Task,
+    reason: &str,
+    kind: api_types::FailureKind,
+    source: Option<&str>,
+    annotation: Option<String>,
+) -> db::Result<()> {
     let now = now_rfc3339();
     let blocked_meta = json!({
         "reason": reason,
@@ -389,7 +408,7 @@ pub(super) async fn block_task(
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: None,
+                error_annotation: annotation.clone().map(Some),
                 blocked_json: Some(Some(blocked_meta.to_string())),
                 failed_json: Some(None),
                 task_state_config: None,
