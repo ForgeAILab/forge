@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-23
+
 ### Added
 
 - `GET /api/v1/tasks/{id}/detail` loads a Task's detail view in one request:
