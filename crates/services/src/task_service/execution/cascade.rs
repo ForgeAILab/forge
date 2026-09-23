@@ -1979,7 +1979,11 @@ fn reviewer_comment(
     if !report.findings.is_empty() {
         out.push_str("\n\n**Findings**\n");
         for finding in &report.findings {
-            let severity = if finding.blocking { "blocking" } else { "non-blocking" };
+            let severity = if finding.blocking {
+                "blocking"
+            } else {
+                "non-blocking"
+            };
             out.push_str(&format!(
                 "\n- **{severity}** Expected {}; actual {}{}",
                 single_line(&finding.expected),
@@ -2124,7 +2128,9 @@ mod reviewer_message_tests {
         assert!(message.contains("===REVIEW: PASS==="));
     }
 
-    fn conformance(assessment: Option<api_types::ReviewAssessment>) -> api_types::ReviewConformance {
+    fn conformance(
+        assessment: Option<api_types::ReviewAssessment>,
+    ) -> api_types::ReviewConformance {
         api_types::ReviewConformance {
             status: api_types::ConformanceStatus::Failed,
             contract: None,
