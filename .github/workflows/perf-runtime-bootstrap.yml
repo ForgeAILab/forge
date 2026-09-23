@@ -52,19 +52,24 @@ jobs:
               1,
           )
 
-          temporary_args = '''        let command = execute_workspace_command(
-              "python3",
-              &["-c".to_owned(), "import time; time.sleep(30)".to_owned()],
-              None,
-              &ctx,
-          );
-          '''
-          bound_args = '''        let args = [
-              "-c".to_owned(),
-              "import time; time.sleep(30)".to_owned(),
-          ];
-          let command = execute_workspace_command("python3", &args, None, &ctx);
-          '''
+          temporary_args = '\n'.join([
+              '        let command = execute_workspace_command(',
+              '            "python3",',
+              '            &[',
+              '                "-c".to_owned(),',
+              '                "import time; time.sleep(30)".to_owned(),',
+              '            ],',
+              '            None,',
+              '            &ctx,',
+              '        );',
+          ]) + '\n'
+          bound_args = '\n'.join([
+              '        let args = [',
+              '            "-c".to_owned(),',
+              '            "import time; time.sleep(30)".to_owned(),',
+              '        ];',
+              '        let command = execute_workspace_command("python3", &args, None, &ctx);',
+          ]) + '\n'
           if text.count(temporary_args) != 1:
               raise SystemExit('command cancellation test target drifted')
           text = text.replace(temporary_args, bound_args, 1)
