@@ -29,7 +29,7 @@ const DEFAULT_HOOK_LOG_LIMIT: usize = 500;
 const MAX_HOOK_LOG_LIMIT: usize = 5_000;
 const DEFAULT_HOOK_LOG_BYTES: usize = 1024 * 1024;
 const MAX_HOOK_LOG_BYTES: usize = 8 * 1024 * 1024;
-const MAX_HOOK_LOG_DIRECTORY_ENTRIES: usize = 1_024;
+const MAX_HOOK_LOG_DIRECTORY_ENTRIES: usize = 16_384;
 const MAX_HOOK_LOG_FILES: usize = 256;
 
 pub async fn list_executions(
@@ -163,14 +163,19 @@ pub async fn get_hook_logs(
     // Directory walking and line-oriented file reads are blocking. Keep them
     // off Tokio workers and cap directory entries, files, bytes, and decoded
     // entries so a large execution directory cannot cause an unbounded scan.
-    let hook_entries = tokio::task::spawn_blocking(move || {
-        read_hook_log_entries(&log_dir, limit, max_bytes)
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("hook log reader failed: {error}")))?;
+    let hook_entries =
+        tokio::task::spawn_blocking(move || read_hook_log_entries(&log_dir, limit, max_bytes))
+            .await
+            .map_err(|error| ApiError::internal(format!("hook log reader failed: {error}")))?;
     Ok(Json(hook_entries))
 }
 
+/// The newest hook entries that fit the budgets, returned oldest first.
+///
+/// Hook files are named by event and index, so names do not sort by time;
+/// modification time does. Budgets are spent newest-first (the tail of a file
+/// that does not fit), so truncation drops the oldest hooks rather than the
+/// recent runs a reader is usually looking for.
 fn read_hook_log_entries(
     log_dir: &StdPath,
     limit: usize,
@@ -180,7 +185,7 @@ fn read_hook_log_entries(
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
     };
-    let mut paths = entries
+    let mut files = entries
         .take(MAX_HOOK_LOG_DIRECTORY_ENTRIES)
         .flatten()
         .filter(|entry| {
@@ -188,41 +193,53 @@ fn read_hook_log_entries(
             let name = name.to_string_lossy();
             name.starts_with("hook-") && name.ends_with(".jsonl")
         })
-        .map(|entry| entry.path())
-        .take(MAX_HOOK_LOG_FILES)
-        .collect::<Vec<PathBuf>>();
-    paths.sort();
+        .filter_map(|entry| {
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect::<Vec<(std::time::SystemTime, PathBuf)>>();
+    files.sort_by(|a, b| b.cmp(a));
+    files.truncate(MAX_HOOK_LOG_FILES);
 
-    let mut hook_entries = Vec::with_capacity(limit.min(DEFAULT_HOOK_LOG_LIMIT));
+    // Newest file first; each chunk keeps its file's own line order.
+    let mut chunks: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut collected = 0;
     let mut remaining_bytes = max_bytes;
-    for path in paths {
-        if hook_entries.len() >= limit || remaining_bytes == 0 {
+    for (_, path) in files {
+        if collected >= limit || remaining_bytes == 0 {
             break;
         }
-        let Ok(file) = fs::File::open(path) else {
+        let Some((bytes, starts_mid_line)) = read_file_tail(&path, remaining_bytes) else {
             continue;
         };
-        let mut bytes = Vec::with_capacity(remaining_bytes.min(64 * 1024));
-        if file
-            .take(remaining_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            continue;
+        remaining_bytes -= bytes.len();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines = text.lines();
+        if starts_mid_line {
+            lines.next();
         }
-        let consumed = bytes.len().min(remaining_bytes);
-        bytes.truncate(consumed);
-        remaining_bytes -= consumed;
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            if hook_entries.len() >= limit {
-                break;
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                hook_entries.push(value);
-            }
-        }
+        let values = lines
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        let keep = values.len().min(limit - collected);
+        collected += keep;
+        chunks.push(values[values.len() - keep..].to_vec());
     }
-    hook_entries
+    chunks.into_iter().rev().flatten().collect()
+}
+
+/// Up to `max_bytes` from the end of `path`, and whether that cut a line.
+fn read_file_tail(path: &StdPath, max_bytes: usize) -> Option<(Vec<u8>, bool)> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.take(max_bytes as u64).read_to_end(&mut bytes).ok()?;
+    Some((bytes, start > 0))
 }
 
 pub async fn follow_up_execution(
@@ -357,4 +374,66 @@ pub async fn get_task_usage(
 ) -> ApiResult<Json<api_types::UsageAggregate>> {
     let usage = services::usage_projection::usage_aggregate_for_task(&state.db, &task_id).await?;
     Ok(Json(usage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("forge-hook-logs-{name}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_hook(dir: &StdPath, name: &str, seqs: std::ops::Range<u32>, age_secs: u64) {
+        let body: String = seqs.map(|seq| format!("{{\"seq\":{seq}}}\n")).collect();
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+            .unwrap();
+    }
+
+    fn seqs(entries: &[serde_json::Value]) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|entry| entry["seq"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn hook_logs_keep_the_newest_entries_in_order() {
+        let dir = scratch_dir("limit");
+        // Named so that name order and time order disagree.
+        write_hook(&dir, "hook-a-0.jsonl", 0..3, 300);
+        write_hook(&dir, "hook-z-0.jsonl", 3..6, 200);
+        write_hook(&dir, "hook-m-0.jsonl", 6..9, 100);
+        fs::write(dir.join("execution.jsonl"), "{\"seq\":99}\n").unwrap();
+
+        let all = read_hook_log_entries(&dir, 100, 1024 * 1024);
+        assert_eq!(seqs(&all), (0..9).collect::<Vec<_>>());
+
+        let newest = read_hook_log_entries(&dir, 4, 1024 * 1024);
+        assert_eq!(seqs(&newest), vec![5, 6, 7, 8]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hook_logs_spend_the_byte_budget_on_the_newest_file_tail() {
+        let dir = scratch_dir("bytes");
+        write_hook(&dir, "hook-old-0.jsonl", 0..5, 200);
+        write_hook(&dir, "hook-new-0.jsonl", 10..15, 100);
+
+        // Each line is 11 bytes; 25 bytes cut mid-line into the newest file,
+        // and the partial line is dropped rather than half-parsed.
+        let tail = read_hook_log_entries(&dir, 100, 25);
+        assert_eq!(seqs(&tail), vec![13, 14]);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
