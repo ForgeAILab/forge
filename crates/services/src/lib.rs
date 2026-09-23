@@ -285,6 +285,7 @@ pub use project_documents::{
 pub use project_execution_setup::{ExecutionPrincipalRole, ProjectExecutionSetupService};
 pub use project_execution_setup_projection::{
     load_project_execution_setup, load_task_execution_blocker,
+    load_task_execution_blocker_with_context, TaskExecutionProjectionContext,
 };
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;

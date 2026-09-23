@@ -6,11 +6,17 @@ use db::{
     SystemSettingRepo, User, UserRepo,
 };
 use sha2::{Digest, Sha256};
+use sqlx::Row;
+use tokio::sync::Semaphore;
 
 use crate::{Result, ServiceError};
 
 const ACCESS_TOKEN_EXPIRY_SECS: u64 = 900; // 15 minutes
 const REFRESH_TOKEN_EXPIRY_SECS: u64 = 7 * 24 * 3600; // 7 days
+const PAT_LAST_USED_WRITE_INTERVAL_SECONDS: i64 = 5 * 60;
+const MAX_CONCURRENT_BCRYPT_JOBS: usize = 4;
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$LJ3m4ys3Lg7ECg8Mmpfmkea3RADRCnFXaOJsDaF5LxlWAyrVaoHDu";
+static BCRYPT_JOBS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_BCRYPT_JOBS);
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -70,11 +76,7 @@ impl AuthService {
             }
         }
 
-        let password_hash = bcrypt::hash(password, self.bcrypt_cost).map_err(|e| {
-            ServiceError::InvalidOperation {
-                message: format!("hash error: {e}"),
-            }
-        })?;
+        let password_hash = hash_password(password, self.bcrypt_cost).await?;
 
         let now = now_rfc3339();
         let user = User {
@@ -106,25 +108,20 @@ impl AuthService {
         let email = email.trim().to_lowercase();
         let user = UserRepo::get_user_by_email(&*self.db, &email).await?;
 
-        match user {
+        let (user, password_hash) = match user {
             Some(user) => {
-                let valid = bcrypt::verify(password, &user.password_hash).unwrap_or(false);
-                if !valid {
-                    return Err(ServiceError::InvalidOperation {
-                        message: "invalid_credentials".into(),
-                    });
-                }
-                self.issue_token_pair(&user).await
+                let password_hash = user.password_hash.clone();
+                (Some(user), password_hash)
             }
-            None => {
-                // Timing-safe: perform dummy bcrypt verify to prevent enumeration
-                let dummy_hash = "$2b$12$LJ3m4ys3Lg7ECg8Mmpfmkea3RADRCnFXaOJsDaF5LxlWAyrVaoHDu";
-                let _ = bcrypt::verify(password, dummy_hash);
-                Err(ServiceError::InvalidOperation {
-                    message: "invalid_credentials".into(),
-                })
-            }
-        }
+            None => (None, DUMMY_BCRYPT_HASH.to_owned()),
+        };
+        let valid = verify_password(password, &password_hash).await?;
+        let Some(user) = user.filter(|_| valid) else {
+            return Err(ServiceError::InvalidOperation {
+                message: "invalid_credentials".into(),
+            });
+        };
+        self.issue_token_pair(&user).await
     }
 
     pub async fn refresh(&self, raw_refresh_token: &str) -> Result<TokenPair> {
@@ -309,27 +306,50 @@ impl AuthService {
         raw_token: &str,
     ) -> std::result::Result<(String, String, bool), String> {
         let token_hash = hash_token(raw_token);
-        let pat = PersonalAccessTokenRepo::get_pat_by_token_hash(&*self.db, &token_hash)
-            .await
+        let row = sqlx::query(
+            "SELECT pat.id AS pat_id, pat.expires_at, pat.last_used_at, \
+                    u.id AS user_id, u.email, u.is_admin \
+             FROM personal_access_token pat \
+             JOIN user u ON u.id = pat.user_id \
+             WHERE pat.token_hash = ?",
+        )
+        .bind(&token_hash)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| "invalid_token".to_string())?
+        .ok_or_else(|| "invalid_token".to_string())?;
+        let pat_id: String = row
+            .try_get("pat_id")
+            .map_err(|_| "invalid_token".to_string())?;
+        let expires_at: Option<String> = row
+            .try_get("expires_at")
+            .map_err(|_| "invalid_token".to_string())?;
+        let last_used_at: Option<String> = row
+            .try_get("last_used_at")
+            .map_err(|_| "invalid_token".to_string())?;
+        let user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| "invalid_token".to_string())?;
+        let email: String = row
+            .try_get("email")
+            .map_err(|_| "invalid_token".to_string())?;
+        let is_admin = row
+            .try_get::<i64, _>("is_admin")
             .map_err(|_| "invalid_token".to_string())?
-            .ok_or_else(|| "invalid_token".to_string())?;
-
-        if let Some(ref expires_at) = pat.expires_at {
-            let now = now_rfc3339();
-            if *expires_at < now {
-                return Err("token_expired".to_string());
-            }
-        }
-
-        let user = UserRepo::get_user_by_id(&*self.db, &pat.user_id)
-            .await
-            .map_err(|_| "invalid_token".to_string())?
-            .ok_or_else(|| "invalid_token".to_string())?;
+            != 0;
 
         let now = now_rfc3339();
-        let _ = PersonalAccessTokenRepo::update_last_used(&*self.db, &pat.id, &now).await;
+        if expires_at
+            .as_ref()
+            .is_some_and(|expires_at| expires_at < &now)
+        {
+            return Err("token_expired".to_string());
+        }
+        if pat_usage_write_due(last_used_at.as_deref(), &now) {
+            let _ = PersonalAccessTokenRepo::update_last_used(&*self.db, &pat_id, &now).await;
+        }
 
-        Ok((user.id, user.email, user.is_admin))
+        Ok((user_id, email, is_admin))
     }
 
     async fn bootstrap_first_user(&self, user_id: &str) -> Result<()> {
@@ -489,6 +509,56 @@ impl AuthService {
     }
 }
 
+async fn hash_password(password: &str, cost: u32) -> Result<String> {
+    let permit = BCRYPT_JOBS
+        .acquire()
+        .await
+        .map_err(|_| ServiceError::InvalidOperation {
+            message: "password hashing unavailable".to_owned(),
+        })?;
+    let password = password.to_owned();
+    let result = tokio::task::spawn_blocking(move || bcrypt::hash(password, cost))
+        .await
+        .map_err(|_| ServiceError::InvalidOperation {
+            message: "password hashing unavailable".to_owned(),
+        })?;
+    drop(permit);
+    result.map_err(|error| ServiceError::InvalidOperation {
+        message: format!("hash error: {error}"),
+    })
+}
+
+async fn verify_password(password: &str, password_hash: &str) -> Result<bool> {
+    let permit = BCRYPT_JOBS
+        .acquire()
+        .await
+        .map_err(|_| ServiceError::InvalidOperation {
+            message: "password verification unavailable".to_owned(),
+        })?;
+    let password = password.to_owned();
+    let password_hash = password_hash.to_owned();
+    let result = tokio::task::spawn_blocking(move || bcrypt::verify(password, &password_hash))
+        .await
+        .map_err(|_| ServiceError::InvalidOperation {
+            message: "password verification unavailable".to_owned(),
+        })?;
+    drop(permit);
+    Ok(result.unwrap_or(false))
+}
+
+fn pat_usage_write_due(last_used_at: Option<&str>, now: &str) -> bool {
+    let Some(last_used_at) = last_used_at else {
+        return true;
+    };
+    let Ok(last_used_at) = chrono::DateTime::parse_from_rfc3339(last_used_at) else {
+        return true;
+    };
+    let Ok(now) = chrono::DateTime::parse_from_rfc3339(now) else {
+        return true;
+    };
+    now.signed_duration_since(last_used_at).num_seconds() >= PAT_LAST_USED_WRITE_INTERVAL_SECONDS
+}
+
 fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -617,6 +687,16 @@ mod tests {
         let err = svc.register("dup@test.com", "password456", None).await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("email_exists"));
+    }
+
+    #[test]
+    fn pat_usage_timestamp_writes_are_throttled() {
+        let now = "2026-09-23T12:00:00Z";
+        assert!(pat_usage_write_due(None, now));
+        assert!(pat_usage_write_due(Some("not-a-time"), now));
+        assert!(!pat_usage_write_due(Some("2026-09-23T11:59:59Z"), now));
+        assert!(!pat_usage_write_due(Some("2026-09-23T11:55:01Z"), now));
+        assert!(pat_usage_write_due(Some("2026-09-23T11:55:00Z"), now));
     }
 
     #[tokio::test]

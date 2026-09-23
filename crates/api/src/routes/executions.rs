@@ -16,7 +16,7 @@ use crate::{
     },
     state::AppState,
 };
-use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 pub async fn list_executions(
     State(state): State<AppState>,
@@ -24,11 +24,13 @@ pub async fn list_executions(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
-    let items = try_join_all(
+    let items = stream::iter(
         page.items
             .into_iter()
             .map(|execution| execution_response_with_usage(&state.db, execution)),
     )
+    .buffered(4)
+    .try_collect::<Vec<_>>()
     .await?;
     let has_more = page.next_cursor.is_some();
     Ok(Json(PaginatedResponse {

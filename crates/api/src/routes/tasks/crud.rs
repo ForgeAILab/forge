@@ -140,6 +140,9 @@ pub async fn list_tasks(
             .unwrap_or_default()
             .to_owned();
         let db = &*state.db;
+        let execution_projection =
+            services::TaskExecutionProjectionContext::new(project_id.clone());
+        let execution_projection = &execution_projection;
         let items = futures_util::stream::iter(page.items.into_iter().map(|task| {
             let latest_review = latest_reviews.get(&task.id).cloned();
             let latest_execution = latest_executions.get(&task.id).cloned();
@@ -155,6 +158,7 @@ pub async fn list_tasks(
                     latest_review,
                     latest_execution,
                     &workflow,
+                    execution_projection,
                 )
                 .await
             }

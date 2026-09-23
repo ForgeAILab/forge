@@ -2,7 +2,7 @@ use super::*;
 use api_types::{
     TaskDetailExecutionsPage, TaskDetailResponse, TaskRelationSummary, TaskRelationsResponse,
 };
-use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 
 pub async fn get_task_detail(
     State(state): State<AppState>,
@@ -29,12 +29,14 @@ pub async fn get_task_detail(
     };
     let ((task, workflow), executions) = tokio::try_join!(task_response, executions)?;
 
-    let items = try_join_all(
+    let items = stream::iter(
         executions
             .items
             .into_iter()
             .map(|execution| execution_response_with_usage(&state.db, execution)),
     )
+    .buffered(4)
+    .try_collect::<Vec<_>>()
     .await?;
     let has_more = executions.next_cursor.is_some();
 

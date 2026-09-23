@@ -256,6 +256,7 @@ pub async fn task_response_and_workflow_with_awaiting_human(
         latest_review,
         latest_execution,
         &workflow,
+        None,
     )
     .await?;
     Ok((response, workflow))
@@ -272,6 +273,7 @@ pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<Tas
         latest_review,
         latest_execution,
         &workflow,
+        None,
     )
     .await
 }
@@ -294,6 +296,7 @@ pub(crate) async fn task_response_light_with_latest_and_workflow(
     latest_review: Option<Review>,
     latest_execution: Option<Execution>,
     workflow: &api_types::WorkflowDefinition,
+    execution_projection: &services::TaskExecutionProjectionContext,
 ) -> ApiResult<TaskResponse> {
     task_response_inner(
         db,
@@ -303,6 +306,7 @@ pub(crate) async fn task_response_light_with_latest_and_workflow(
         latest_review,
         latest_execution,
         workflow,
+        Some(execution_projection),
     )
     .await
 }
@@ -331,6 +335,7 @@ async fn latest_diagnostic_rows(
     Ok((reviews.pop(), executions.pop()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_response_inner(
     db: &db::SqliteDb,
     task: Task,
@@ -339,6 +344,7 @@ async fn task_response_inner(
     latest_review: Option<Review>,
     latest_execution: Option<Execution>,
     workflow: &api_types::WorkflowDefinition,
+    execution_projection: Option<&services::TaskExecutionProjectionContext>,
 ) -> ApiResult<TaskResponse> {
     let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
     let role_assignments = task_role_assignments
@@ -506,8 +512,12 @@ async fn task_response_inner(
     // so Task detail, banner, and chat context all render the same server-
     // owned progress language and blocker instead of reinterpreting raw
     // gate/status enums per surface.
-    let (execution_evidence, execution_blocker) =
-        services::load_task_execution_blocker(db, &task).await?;
+    let (execution_evidence, execution_blocker) = match execution_projection {
+        Some(context) => {
+            services::load_task_execution_blocker_with_context(db, &task, context).await?
+        }
+        None => services::load_task_execution_blocker(db, &task).await?,
+    };
 
     Ok(TaskResponse {
         id: task.id,

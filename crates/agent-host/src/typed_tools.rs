@@ -10,12 +10,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::{Component, Path},
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 
+use agent_runtime::core::error::ErrorKind as RuntimeErrorKind;
 use agent_runtime::core::{
     cancel::Cancellation,
     clock::{Clock, SystemClock},
@@ -39,7 +41,11 @@ use agent_runtime::registry::{Permission, TrustClass};
 use agent_runtime::runtime::RuntimeBuilder;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    task::JoinHandle,
+};
 
 use agent_runtime::harness::{FetchTool, FetchTransport};
 
@@ -117,7 +123,7 @@ pub struct CommandObservation {
     pub args: Vec<String>,
     pub exit_code: Option<i32>,
     pub success: bool,
-    /// SHA-256 over the complete stdout, a separator, and the complete stderr.
+    /// Versioned SHA-256 over the complete stdout/stderr stream digests and byte lengths.
     pub output_digest: String,
     pub stdout_excerpt: String,
     pub stderr_excerpt: String,
@@ -1979,8 +1985,8 @@ impl Tool for TaskReadTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let path = required_string(prepared.arguments(), "path")?;
         let path = bounded_workspace_path(ctx.workspace.as_ref(), path)?;
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(tool_error_outcome(json!({
                     "code": "not_found",
@@ -1988,29 +1994,43 @@ impl Tool for TaskReadTool {
                     "path": workspace_relative_path(ctx.workspace.root(), &path)?,
                 })));
             }
-            Err(_) if Path::new(&path).is_dir() => {
-                let (entries, truncated) = directory_entries(ctx.workspace.root(), &path, None)?;
-                return Ok(tool_error_outcome(json!({
-                    "code": "is_directory",
-                    "message": "Task Workspace path is a directory; use forge_task_list to enumerate it",
-                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
-                    "entries": entries,
-                    "truncated": truncated,
-                })));
-            }
             Err(error) => {
                 return Err(RuntimeError::tool(format!(
-                    "Task Workspace file could not be read ({:?})",
+                    "Task Workspace path could not be inspected ({:?})",
                     error.kind()
                 )));
             }
         };
+        if metadata.is_dir() {
+            let (entries, truncated) =
+                directory_entries_async(ctx.workspace.root(), &path, None).await?;
+            return Ok(tool_error_outcome(json!({
+                "code": "is_directory",
+                "message": "Task Workspace path is a directory; use forge_task_list to enumerate it",
+                "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+                "entries": entries,
+                "truncated": truncated,
+            })));
+        }
+        let file = tokio::fs::File::open(&path).await.map_err(|error| {
+            RuntimeError::tool(format!(
+                "Task Workspace file could not be opened ({:?})",
+                error.kind()
+            ))
+        })?;
+        let mut bytes = Vec::with_capacity(MAX_FILE_READ_BYTES + 1);
+        file.take((MAX_FILE_READ_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| {
+                RuntimeError::tool(format!(
+                    "Task Workspace file could not be read ({:?})",
+                    error.kind()
+                ))
+            })?;
         let truncated = bytes.len() > MAX_FILE_READ_BYTES;
-        let bounded = bytes
-            .into_iter()
-            .take(MAX_FILE_READ_BYTES)
-            .collect::<Vec<_>>();
-        let text = String::from_utf8_lossy(&bounded).into_owned();
+        bytes.truncate(MAX_FILE_READ_BYTES);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         Ok(ToolOutcome::json(json!({
             "path": path,
             "content": text,
@@ -2073,24 +2093,31 @@ impl Tool for TaskListTool {
         let path = required_string(prepared.arguments(), "path")?;
         let path = bounded_workspace_path(ctx.workspace.as_ref(), path)?;
         let glob = directory_glob(prepared.arguments())?;
-        let (entries, truncated) = match directory_entries(ctx.workspace.root(), &path, glob) {
-            Ok(listing) => listing,
-            Err(error) if error.kind == agent_runtime::core::error::ErrorKind::NotFound => {
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(tool_error_outcome(json!({
                     "code": "not_found",
                     "message": "Task Workspace directory was not found",
                     "path": workspace_relative_path(ctx.workspace.root(), &path)?,
                 })));
             }
-            Err(_error) if !Path::new(&path).is_dir() => {
-                return Ok(tool_error_outcome(json!({
-                    "code": "not_a_directory",
-                    "message": "Task Workspace list path must be a directory",
-                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
-                })));
+            Err(error) => {
+                return Err(RuntimeError::tool(format!(
+                    "Task Workspace directory could not be inspected ({:?})",
+                    error.kind()
+                )));
             }
-            Err(error) => return Err(error),
         };
+        if !metadata.is_dir() {
+            return Ok(tool_error_outcome(json!({
+                "code": "not_a_directory",
+                "message": "Task Workspace list path must be a directory",
+                "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+            })));
+        }
+        let (entries, truncated) =
+            directory_entries_async(ctx.workspace.root(), &path, glob).await?;
         Ok(ToolOutcome::json(json!({
             "path": workspace_relative_path(ctx.workspace.root(), &path)?,
             "glob": glob,
@@ -2160,11 +2187,14 @@ impl Tool for TaskWriteTool {
         let content = required_string(prepared.arguments(), "content")?;
         let path = bounded_workspace_path(ctx.workspace.as_ref(), path)?;
         if let Some(parent) = Path::new(&path).parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|error| RuntimeError::tool(error.to_string()))?;
         }
         let path = bounded_workspace_path(ctx.workspace.as_ref(), &path)?;
-        std::fs::write(&path, content).map_err(|error| RuntimeError::tool(error.to_string()))?;
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|error| RuntimeError::tool(error.to_string()))?;
         Ok(ToolOutcome::json(json!({"path": path, "written": true})))
     }
 }
@@ -2287,8 +2317,16 @@ impl Tool for TaskCommandTool {
                     exit_code: run.status_code,
                     success: run.success,
                     output_digest: run.output_digest(),
-                    stdout_excerpt: bounded_text(&run.stdout, MAX_OBSERVATION_EXCERPT_BYTES).0,
-                    stderr_excerpt: bounded_text(&run.stderr, MAX_OBSERVATION_EXCERPT_BYTES).0,
+                    stdout_excerpt: bounded_text(
+                        &run.stdout.excerpt,
+                        MAX_OBSERVATION_EXCERPT_BYTES,
+                    )
+                    .0,
+                    stderr_excerpt: bounded_text(
+                        &run.stderr.excerpt,
+                        MAX_OBSERVATION_EXCERPT_BYTES,
+                    )
+                    .0,
                 },
             )
             .await
@@ -2362,27 +2400,110 @@ impl Tool for TaskValidateTool {
 
 /// Bytes of stdout/stderr kept verbatim in a recorded observation.
 const MAX_OBSERVATION_EXCERPT_BYTES: usize = 4_000;
+const COMMAND_STREAM_BUFFER_BYTES: usize = 8 * 1024;
+const COMMAND_OUTPUT_DIGEST_DOMAIN: &[u8] = b"forge-command-output-v2\0";
 
-/// A workspace command after it ran: the exact bytes it produced, kept whole
-/// until the outcome is rendered so an observation digest covers all of it.
+/// One command stream after it has been consumed. Memory is bounded by the
+/// model-facing excerpt while the digest and byte count cover the complete
+/// stream, including bytes beyond the excerpt.
+#[derive(Debug)]
+struct CapturedCommandOutput {
+    excerpt: Vec<u8>,
+    digest: [u8; 32],
+    total_bytes: u64,
+    truncated: bool,
+}
+
+#[derive(Debug)]
 struct ExecutedCommand {
     program: String,
     args: Vec<String>,
     status_code: Option<i32>,
     success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: CapturedCommandOutput,
+    stderr: CapturedCommandOutput,
 }
 
 impl ExecutedCommand {
     fn output_digest(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(&self.stdout);
-        hasher.update(b"\n--stderr--\n");
-        hasher.update(&self.stderr);
+        hasher.update(COMMAND_OUTPUT_DIGEST_DOMAIN);
+        for (label, output) in [(b"stdout\0", &self.stdout), (b"stderr\0", &self.stderr)] {
+            hasher.update(label);
+            hasher.update(output.total_bytes.to_le_bytes());
+            hasher.update(output.digest);
+        }
         hex::encode(hasher.finalize())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStopReason {
+    Cancelled,
+    Deadline,
+}
+
+async fn wait_for_command_stop(ctx: &InvocationContext) -> CommandStopReason {
+    match ctx.deadline.remaining_millis(ctx.clock.as_ref()) {
+        Some(0) => CommandStopReason::Deadline,
+        Some(remaining) => {
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => CommandStopReason::Cancelled,
+                () = tokio::time::sleep(Duration::from_millis(remaining)) => {
+                    CommandStopReason::Deadline
+                }
+            }
+        }
+        None => {
+            ctx.cancel.cancelled().await;
+            CommandStopReason::Cancelled
+        }
+    }
+}
+
+async fn capture_command_output<R>(mut reader: R) -> io::Result<CapturedCommandOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    use sha2::{Digest, Sha256};
+
+    let mut excerpt = Vec::with_capacity(MAX_COMMAND_OUTPUT_BYTES);
+    let mut digest = Sha256::new();
+    let mut total_bytes = 0_u64;
+    let mut buffer = [0_u8; COMMAND_STREAM_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &buffer[..read];
+        digest.update(bytes);
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(excerpt.len());
+        excerpt.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    }
+    Ok(CapturedCommandOutput {
+        truncated: total_bytes > excerpt.len() as u64,
+        excerpt,
+        digest: digest.finalize().into(),
+        total_bytes,
+    })
+}
+
+async fn join_command_capture(
+    stream: &'static str,
+    handle: JoinHandle<io::Result<CapturedCommandOutput>>,
+) -> Result<CapturedCommandOutput, RuntimeError> {
+    handle
+        .await
+        .map_err(|error| {
+            RuntimeError::internal(format!("Task command {stream} reader stopped: {error}"))
+        })?
+        .map_err(|error| {
+            RuntimeError::tool(format!("Task command could not read {stream}: {error}"))
+        })
 }
 
 async fn execute_workspace_command(
@@ -2407,32 +2528,65 @@ async fn execute_workspace_command(
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .await
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RuntimeError::internal("Task command stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RuntimeError::internal("Task command stderr was not captured"))?;
+    let stdout_task = tokio::spawn(capture_command_output(stdout));
+    let stderr_task = tokio::spawn(capture_command_output(stderr));
+    let stop = wait_for_command_stop(ctx);
+    tokio::pin!(stop);
+    let status = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(match reason {
+                CommandStopReason::Cancelled => RuntimeError::cancelled("Task command cancelled"),
+                CommandStopReason::Deadline => RuntimeError::new(
+                    RuntimeErrorKind::Timeout,
+                    "Task command deadline elapsed",
+                )
+                .retryable(),
+            });
+        }
+        status = child.wait() => status
+            .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?,
+    };
+    let stdout = join_command_capture("stdout", stdout_task).await?;
+    let stderr = join_command_capture("stderr", stderr_task).await?;
     Ok(ExecutedCommand {
         program: program.to_owned(),
         args: args.to_vec(),
-        status_code: output.status.code(),
-        success: output.status.success(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        status_code: status.code(),
+        success: status.success(),
+        stdout,
+        stderr,
     })
 }
 
 fn command_outcome(run: &ExecutedCommand, observation_id: Option<&str>) -> ToolOutcome {
-    let stdout = bounded_text(&run.stdout, MAX_COMMAND_OUTPUT_BYTES);
-    let stderr = bounded_text(&run.stderr, MAX_COMMAND_OUTPUT_BYTES);
+    let stdout = String::from_utf8_lossy(&run.stdout.excerpt).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr.excerpt).into_owned();
     let mut value = json!({
         "program": run.program,
         "args": run.args,
         "status": run.status_code,
         "success": run.success,
-        "stdout": stdout.0,
-        "stderr": stderr.0,
-        "truncated": stdout.1 || stderr.1
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": run.stdout.truncated || run.stderr.truncated
     });
     if let Some(observation_id) = observation_id {
         value["observation_id"] = json!(observation_id);
@@ -2639,6 +2793,23 @@ fn directory_glob(arguments: &Value) -> Result<Option<&str>, RuntimeError> {
         ));
     }
     Ok(Some(glob))
+}
+
+async fn directory_entries_async(
+    workspace_root: &str,
+    directory: &str,
+    glob: Option<&str>,
+) -> Result<(Vec<Value>, bool), RuntimeError> {
+    let workspace_root = workspace_root.to_owned();
+    let directory = directory.to_owned();
+    let glob = glob.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        directory_entries(&workspace_root, &directory, glob.as_deref())
+    })
+    .await
+    .map_err(|error| {
+        RuntimeError::internal(format!("Task Workspace directory reader stopped: {error}"))
+    })?
 }
 
 fn directory_entries(
@@ -3001,6 +3172,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_command_output_is_bounded_before_it_reaches_the_model() {
+        let root = tempfile::tempdir().expect("workspace");
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.path().to_string_lossy().into_owned(),
+        });
+        let ctx = command_invocation_context(workspace);
+        let emitted = MAX_COMMAND_OUTPUT_BYTES + 4_096;
+        let script = format!(
+            "import sys; sys.stdout.write('x' * {emitted}); sys.stderr.write('y' * {emitted})"
+        );
+        let run = execute_workspace_command("python3", &["-c".to_owned(), script], None, &ctx)
+            .await
+            .expect("command runs");
+
+        assert_eq!(run.stdout.excerpt.len(), MAX_COMMAND_OUTPUT_BYTES);
+        assert_eq!(run.stderr.excerpt.len(), MAX_COMMAND_OUTPUT_BYTES);
+        assert_eq!(run.stdout.total_bytes, emitted as u64);
+        assert_eq!(run.stderr.total_bytes, emitted as u64);
+        assert!(run.stdout.truncated && run.stderr.truncated);
+        let outcome = command_outcome(&run, None);
+        assert_eq!(outcome.value["truncated"], true);
+        assert_eq!(
+            outcome.value["stdout"].as_str().map(str::len),
+            Some(MAX_COMMAND_OUTPUT_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_command_observes_invocation_cancellation() {
+        let root = tempfile::tempdir().expect("workspace");
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.path().to_string_lossy().into_owned(),
+        });
+        let cancellation = Cancellation::new();
+        let mut ctx = command_invocation_context(workspace);
+        ctx.cancel = cancellation.clone();
+        let args = ["-c".to_owned(), "import time; time.sleep(30)".to_owned()];
+        let command = execute_workspace_command("python3", &args, None, &ctx);
+        tokio::pin!(command);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel(agent_runtime::core::cancel::CancelReason::UserRequested);
+        let error = tokio::time::timeout(Duration::from_secs(3), &mut command)
+            .await
+            .expect("cancelled command exits promptly")
+            .expect_err("command reports cancellation");
+        assert_eq!(error.kind, RuntimeErrorKind::Cancelled);
+    }
+
+    #[tokio::test]
     async fn verification_commands_run_inside_the_checkout_never_at_the_workspace_root() {
         // The verification workspace root is the parent of the checkout. A
         // command run there would let a build tool's upward manifest search
@@ -3292,9 +3512,16 @@ mod tests {
         // inline evidence claim can be checked against what really printed.
         let expected = {
             use sha2::{Digest, Sha256};
+            let stdout = Sha256::digest(b"observed output\n");
+            let stderr = Sha256::digest(b"");
             let mut hasher = Sha256::new();
-            hasher.update(b"observed output\n");
-            hasher.update(b"\n--stderr--\n");
+            hasher.update(COMMAND_OUTPUT_DIGEST_DOMAIN);
+            hasher.update(b"stdout\0");
+            hasher.update(16_u64.to_le_bytes());
+            hasher.update(stdout);
+            hasher.update(b"stderr\0");
+            hasher.update(0_u64.to_le_bytes());
+            hasher.update(stderr);
             hex::encode(hasher.finalize())
         };
         assert_eq!(observation.output_digest, expected);

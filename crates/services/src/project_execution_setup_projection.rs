@@ -53,6 +53,55 @@ impl ReconciliationConflictRow {
     }
 }
 
+/// Request-scoped lazy state shared while projecting several Tasks from the
+/// same Project. Expensive Project setup checks (including local Git probes)
+/// and reconciliation reads run at most once, and only when a Task actually
+/// reaches the execution-blocker projection.
+#[derive(Debug)]
+pub struct TaskExecutionProjectionContext {
+    project_id: String,
+    project: tokio::sync::OnceCell<Option<Project>>,
+    setup: tokio::sync::OnceCell<ProjectExecutionSetupResponse>,
+    conflicts: tokio::sync::OnceCell<Vec<ReconciliationConflictRow>>,
+}
+
+impl TaskExecutionProjectionContext {
+    pub fn new(project_id: impl Into<String>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            project: tokio::sync::OnceCell::new(),
+            setup: tokio::sync::OnceCell::new(),
+            conflicts: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn project<'a>(&'a self, db: &SqliteDb) -> Result<Option<&'a Project>> {
+        let project = self
+            .project
+            .get_or_try_init(|| async {
+                ProjectRepo::get_by_id(db, &self.project_id)
+                    .await
+                    .map_err(ServiceError::from)
+            })
+            .await?;
+        Ok(project.as_ref())
+    }
+
+    async fn setup<'a>(&'a self, db: &SqliteDb) -> Result<&'a ProjectExecutionSetupResponse> {
+        self.setup
+            .get_or_try_init(|| async { load_project_execution_setup(db, &self.project_id).await })
+            .await
+    }
+
+    async fn conflicts<'a>(&'a self, db: &SqliteDb) -> Result<&'a Vec<ReconciliationConflictRow>> {
+        self.conflicts
+            .get_or_try_init(|| async {
+                required_reconciliation_conflicts(db, &self.project_id).await
+            })
+            .await
+    }
+}
+
 /// Load every `required` reconciliation record for a Project, joined with
 /// its canonical conflict. Ordered most-recently-updated first so the
 /// exact same "current" conflict is chosen everywhere it is consulted.
@@ -766,13 +815,27 @@ pub async fn load_task_execution_blocker(
     db: &SqliteDb,
     task: &db::Task,
 ) -> Result<(ExecutionEvidenceSummary, Option<ExecutionBlockerProjection>)> {
+    let context = TaskExecutionProjectionContext::new(task.project_id.clone());
+    load_task_execution_blocker_with_context(db, task, &context).await
+}
+
+pub async fn load_task_execution_blocker_with_context(
+    db: &SqliteDb,
+    task: &db::Task,
+    context: &TaskExecutionProjectionContext,
+) -> Result<(ExecutionEvidenceSummary, Option<ExecutionBlockerProjection>)> {
+    if context.project_id != task.project_id {
+        return Err(ServiceError::invalid_operation(
+            "Task execution projection context belongs to another Project",
+        ));
+    }
     let evidence = task_execution_evidence(db, &task.id).await?;
 
     if matches!(task.status.as_str(), "done" | "cancelled") {
         return Ok((evidence, None));
     }
 
-    let Some(project) = ProjectRepo::get_by_id(db, &task.project_id).await? else {
+    let Some(project) = context.project(db).await? else {
         return Ok((evidence, None));
     };
     let charter_backed = project.charter_status == "charter_backed"
@@ -811,16 +874,16 @@ pub async fn load_task_execution_blocker(
         return Ok((evidence, None));
     }
 
-    let setup = load_project_execution_setup(db, &task.project_id).await?;
-    if let Some(mut blocker) = setup.execution_blocker {
+    if let Some(mut blocker) = context.setup(db).await?.execution_blocker.clone() {
         blocker.evidence = Some(evidence.clone());
         return Ok((evidence, Some(blocker)));
     }
 
     // The Project itself is fully clear. A reconciliation scoped to exactly
     // this Task still blocks only this Task's repository mutation.
-    let conflicts = required_reconciliation_conflicts(db, &task.project_id).await?;
-    let Some(conflict) = conflicts
+    let Some(conflict) = context
+        .conflicts(db)
+        .await?
         .iter()
         .find(|conflict| conflict.is_scoped_to_task(&task.id))
     else {
