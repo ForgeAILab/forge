@@ -29,6 +29,7 @@ const DEFAULT_HOOK_LOG_LIMIT: usize = 500;
 const MAX_HOOK_LOG_LIMIT: usize = 5_000;
 const DEFAULT_HOOK_LOG_BYTES: usize = 1024 * 1024;
 const MAX_HOOK_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOOK_LOG_DIRECTORY_ENTRIES: usize = 1_024;
 const MAX_HOOK_LOG_FILES: usize = 256;
 
 pub async fn list_executions(
@@ -160,8 +161,8 @@ pub async fn get_hook_logs(
         .clamp(1, MAX_HOOK_LOG_BYTES);
 
     // Directory walking and line-oriented file reads are blocking. Keep them
-    // off Tokio workers and cap files, bytes, and decoded entries so a large
-    // execution directory cannot turn one request into an unbounded scan.
+    // off Tokio workers and cap directory entries, files, bytes, and decoded
+    // entries so a large execution directory cannot cause an unbounded scan.
     let hook_entries = tokio::task::spawn_blocking(move || {
         read_hook_log_entries(&log_dir, limit, max_bytes)
     })
@@ -180,12 +181,14 @@ fn read_hook_log_entries(
         Err(_) => return Vec::new(),
     };
     let mut paths = entries
+        .take(MAX_HOOK_LOG_DIRECTORY_ENTRIES)
         .flatten()
-        .filter_map(|entry| {
+        .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            (name.starts_with("hook-") && name.ends_with(".jsonl")).then(|| entry.path())
+            name.starts_with("hook-") && name.ends_with(".jsonl")
         })
+        .map(|entry| entry.path())
         .take(MAX_HOOK_LOG_FILES)
         .collect::<Vec<PathBuf>>();
     paths.sort();
