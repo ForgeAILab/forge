@@ -3398,6 +3398,11 @@ pub trait RefreshTokenRepo: Send + Sync {
 pub trait PersonalAccessTokenRepo: Send + Sync {
     async fn create_pat(&self, input: CreatePersonalAccessToken) -> Result<PersonalAccessToken>;
     async fn get_pat_by_token_hash(&self, token_hash: &str) -> Result<Option<PersonalAccessToken>>;
+    /// The PAT and its user joined, for the per-request authentication path.
+    async fn get_pat_identity_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PersonalAccessTokenIdentity>>;
     async fn list_pats_by_user(&self, user_id: &str) -> Result<Vec<PersonalAccessToken>>;
     async fn delete_pat(&self, id: &str, user_id: &str) -> Result<()>;
     async fn update_last_used(&self, id: &str, last_used_at: &str) -> Result<()>;

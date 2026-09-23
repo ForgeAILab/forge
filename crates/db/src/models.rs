@@ -2723,6 +2723,17 @@ pub struct PersonalAccessToken {
     pub created_at: String,
 }
 
+/// What authenticating one request with a PAT needs, read in a single query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalAccessTokenIdentity {
+    pub pat_id: String,
+    pub expires_at: Option<String>,
+    pub last_used_at: Option<String>,
+    pub user_id: String,
+    pub email: String,
+    pub is_admin: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePersonalAccessToken {
     pub id: String,

@@ -2,7 +2,9 @@ use super::*;
 use api_types::{
     TaskDetailExecutionsPage, TaskDetailResponse, TaskRelationSummary, TaskRelationsResponse,
 };
-use futures_util::future::try_join_all;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
+
+const EXECUTION_USAGE_CONCURRENCY: usize = 8;
 
 pub async fn get_task_detail(
     State(state): State<AppState>,
@@ -29,12 +31,17 @@ pub async fn get_task_detail(
     };
     let ((task, workflow), executions) = tokio::try_join!(task_response, executions)?;
 
-    let items = try_join_all(
+    // A page can contain 100 executions while SQLite has a much smaller
+    // connection pool. `try_join_all` queued one usage query per row at once;
+    // a small ordered buffer preserves parallelism without flooding the pool.
+    let items = stream::iter(
         executions
             .items
             .into_iter()
             .map(|execution| execution_response_with_usage(&state.db, execution)),
     )
+    .buffered(EXECUTION_USAGE_CONCURRENCY)
+    .try_collect::<Vec<_>>()
     .await?;
     let has_more = executions.next_cursor.is_some();
 
