@@ -26,6 +26,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   visibility for every Task in one request. Execution lists and Task detail
   bound their per-execution usage lookups to eight at a time.
 
+- An embedded reviewer whose report Forge cannot parse (a garbled key, a missing
+  field) now fixes it in the same run: up to two short follow-up turns carry the
+  exact parse error and the rejected report. It used to lose the whole review
+  and start a fresh full-cost reviewer run against the retry budget.
+
 - A milestone definition now binds the Project's current Charter when its
   author omits the reference, and a revision of an unbound definition repairs
   it. Readiness checks every validation against the definition's Charter while

@@ -34,6 +34,8 @@ use crate::{
     ContextManifestInput, ContextManifestService, ContextSourceInput, Result, ServiceError,
 };
 
+mod review_correction;
+
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
 const TASK_ROLE_MARKER: &str = executors::TASK_ROLE_CONFIG_KEY;
 pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
@@ -406,51 +408,51 @@ impl EmbeddedTaskExecutor {
             _ => self.embedded_agents.effective_command_allowlist(None).await,
         };
 
+        let native_provider = {
+            let (context_tokens, max_input_tokens, max_output_tokens) =
+                crate::embedded_agent_service::effective_native_limits(
+                    &provider,
+                    config.context_tokens,
+                    config.max_input_tokens,
+                    config.max_output_tokens,
+                );
+            NativeProviderConfig {
+                provider: provider.clone(),
+                base_url: config.base_url,
+                model: model.clone(),
+                reasoning_effort: profile.reasoning_effort.clone(),
+                credential_handle_id: credential_ref.to_owned(),
+                owner_user_id: owner_user_id.clone(),
+                provider_account_id,
+                context_tokens,
+                max_input_tokens,
+                max_output_tokens,
+            }
+        };
+        // One request shape for the turn and any report-correction turns.
+        let turn_request = |input: String| AgentTurnRequest {
+            forge_session_id: session.id.clone(),
+            runtime_session_id: runtime_session_id.clone(),
+            scope: CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: ctx.task_id.clone(),
+                workspace_access: if worktree_read_only {
+                    WorkspaceAccess::TaskRead
+                } else {
+                    WorkspaceAccess::TaskWrite
+                },
+            },
+            workspace_path: Some(ctx.worktree_path.clone()),
+            provider: native_provider.clone(),
+            system_prompt: system_prompt.clone(),
+            history: Vec::new(),
+            input,
+            command_allowlist: Some(command_allowlist.clone()),
+            cancellation: cancellation.clone(),
+        };
         let output = self
             .backend
-            .run_turn(
-                AgentTurnRequest {
-                    forge_session_id: session.id.clone(),
-                    runtime_session_id: runtime_session_id.clone(),
-                    scope: CanonicalScope {
-                        scope_type: CanonicalScopeType::Task,
-                        scope_id: ctx.task_id.clone(),
-                        workspace_access: if worktree_read_only {
-                            WorkspaceAccess::TaskRead
-                        } else {
-                            WorkspaceAccess::TaskWrite
-                        },
-                    },
-                    workspace_path: Some(ctx.worktree_path.clone()),
-                    provider: {
-                        let (context_tokens, max_input_tokens, max_output_tokens) =
-                            crate::embedded_agent_service::effective_native_limits(
-                                &provider,
-                                config.context_tokens,
-                                config.max_input_tokens,
-                                config.max_output_tokens,
-                            );
-                        NativeProviderConfig {
-                            provider: provider.clone(),
-                            base_url: config.base_url,
-                            model: model.clone(),
-                            reasoning_effort: profile.reasoning_effort.clone(),
-                            credential_handle_id: credential_ref.to_owned(),
-                            owner_user_id: owner_user_id.clone(),
-                            provider_account_id,
-                            context_tokens,
-                            max_input_tokens,
-                            max_output_tokens,
-                        }
-                    },
-                    system_prompt,
-                    history: Vec::new(),
-                    input: ctx.description.clone(),
-                    command_allowlist: Some(command_allowlist),
-                    cancellation: cancellation.clone(),
-                },
-                log_sink.clone(),
-            )
+            .run_turn(turn_request(ctx.description.clone()), log_sink.clone())
             .await;
         self.active.write().await.remove(&ctx.execution_id);
 
@@ -543,6 +545,20 @@ impl EmbeddedTaskExecutor {
             }
             Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
         };
+        let output =
+            if role == crate::workflow::default_roles::REVIEWER && !cancellation.is_cancelled() {
+                self.correct_review_report(
+                    ctx,
+                    output,
+                    &turn_request,
+                    &log_sink,
+                    &runtime_session_id,
+                    &cancellation,
+                )
+                .await
+            } else {
+                output
+            };
         if cancellation.is_cancelled() {
             let usage_reports = native_usage_reports(
                 &ctx.execution_id,
@@ -629,6 +645,63 @@ impl EmbeddedTaskExecutor {
             usage_reports,
             ..ExecutionResult::default()
         })
+    }
+
+    /// Give a reviewer whose report Forge cannot parse up to
+    /// [`review_correction::MAX_REPORT_CORRECTIONS`] follow-up turns to fix
+    /// it, checked by the same parser the review cascade applies. Without a
+    /// frozen contract there is nothing to check against, so the report is
+    /// returned unchanged.
+    async fn correct_review_report(
+        &self,
+        ctx: &ExecutionContext,
+        output: forge_agent_host::AgentTurnOutput,
+        turn_request: &impl Fn(String) -> AgentTurnRequest,
+        log_sink: &Arc<TurnLogSink>,
+        runtime_session_id: &str,
+        cancellation: &CancellationToken,
+    ) -> forge_agent_host::AgentTurnOutput {
+        let contract =
+            match db::ReviewConformanceRepo::review_contract(&*self.db, &ctx.execution_id).await {
+                Ok(Some(contract)) => contract,
+                _ => return output,
+            };
+        // Keep the run cancellable while a correction turn is in flight.
+        self.active.write().await.insert(
+            ctx.execution_id.clone(),
+            ActiveTaskTurn {
+                cancellation: cancellation.clone(),
+                runtime_session_id: runtime_session_id.to_owned(),
+            },
+        );
+        let corrected = review_correction::correct_report(
+            output,
+            |text| ::review::contract::parse_assessment(text, &contract).err(),
+            |problem, report| {
+                let request = turn_request(review_correction::correction_prompt(&problem, &report));
+                let log_sink = Arc::clone(log_sink);
+                async move {
+                    let _ = log_sink
+                        .write(LogKind::Assistant, serde_json::json!({ "text": report }))
+                        .await;
+                    let _ = log_sink
+                        .write(
+                            LogKind::System,
+                            serde_json::json!({
+                                "text": format!(
+                                    "Forge rejected this report before verification ({problem}) \
+                                     and asked the reviewer to correct it."
+                                )
+                            }),
+                        )
+                        .await;
+                    self.backend.run_turn(request, log_sink).await
+                }
+            },
+        )
+        .await;
+        self.active.write().await.remove(&ctx.execution_id);
+        corrected
     }
 
     /// Links the final Agent Runtime manifest to Forge's immutable Task

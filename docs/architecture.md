@@ -2584,8 +2584,14 @@ current Task outcome, never as evidence that pre-existing content was introduced
 by that Task. `unverified` represents insufficient proof and can never support
 PASS.
 
-Forge separates a verified review failure from an unverified reviewer result. A
-response that cannot be bound structurally to its frozen contract, or whose
+Forge separates a verified review failure from an unverified reviewer result.
+Before an embedded reviewer run completes, Forge parses its report with the same
+parser the review applies; a report it cannot parse (a garbled key, a missing
+field, prose instead of the object) gets up to two short follow-up turns in the
+same run, each carrying the exact parse error and the rejected report, asking for
+the corrected object only. The corrections are part of the one execution and do
+not spend the reviewer retry budget; CLI reviewers do not get them yet. A
+response that still cannot be bound structurally to its frozen contract, or whose
 semantic claims cannot be verified against that contract, uses the bounded
 reviewer execution-retry path and eventually creates a durable execution blocker;
 it never dispatches a coder. Forge still preserves a structurally bound partial or
