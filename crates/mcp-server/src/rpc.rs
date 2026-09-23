@@ -1,4 +1,6 @@
-use db::{ExecutionRepo, ProjectRepo, TaskDependencyRepo, TaskRepo};
+use std::{collections::HashSet, sync::OnceLock};
+
+use db::{ExecutionRepo, ProjectRepo, Task, TaskDependencyRepo, TaskRepo};
 use serde_json::{json, Value};
 
 use crate::{
@@ -81,8 +83,18 @@ pub(crate) async fn dispatch_with_context(
     }
 }
 
+fn descriptor_catalog(scoped_project: bool) -> &'static Value {
+    static SCOPED: OnceLock<Value> = OnceLock::new();
+    static UNSCOPED: OnceLock<Value> = OnceLock::new();
+    if scoped_project {
+        SCOPED.get_or_init(|| tool_descriptors(true))
+    } else {
+        UNSCOPED.get_or_init(|| tool_descriptors(false))
+    }
+}
+
 fn known_tool(name: &str, scoped_project: bool) -> bool {
-    tool_descriptors(scoped_project)
+    descriptor_catalog(scoped_project)
         .as_array()
         .is_some_and(|descriptors| {
             descriptors
@@ -184,7 +196,9 @@ async fn apply_project_scope(
         .as_deref()
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))?;
-    if let Some(project_id) = context.project_id.as_deref() {
+    let scoped_project_id = context.project_id.as_deref();
+    if let Some(project_id) = scoped_project_id {
+        // This visibility read is the proof reused by every Task check below.
         assert_project_access(state, project_id, user_id).await?;
     }
 
@@ -193,7 +207,7 @@ async fn apply_project_scope(
         .ok_or_else(|| McpToolError::new(-32602, "tool arguments must be an object"))?;
 
     if tool_accepts_project_id(tool_name) {
-        if let Some(project_id) = context.project_id.as_deref() {
+        if let Some(project_id) = scoped_project_id {
             match object.get("project_id") {
                 None => {
                     object.insert(
@@ -223,18 +237,28 @@ async fn apply_project_scope(
             .and_then(Value::as_str)
             .filter(|id| !id.trim().is_empty())
         {
-            assert_project_access(state, project_id, user_id).await?;
+            // A scoped request proved this exact Project once at entry. Only
+            // an unscoped request needs to resolve visibility here.
+            if scoped_project_id != Some(project_id) {
+                assert_project_access(state, project_id, user_id).await?;
+            }
             if tool_name == "forge_create_task" {
                 if let Some(parent_id) = object
                     .get("parent_task_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.trim().is_empty())
                 {
-                    assert_task_access(state, Some(project_id), parent_id, user_id).await?;
+                    let _ = assert_task_access(state, Some(project_id), parent_id, user_id).await?;
                 }
                 if let Some(value) = object.get("depends_on_ids") {
                     for dependency_id in string_array_arg(value, "depends_on_ids")? {
-                        assert_task_access(state, Some(project_id), dependency_id, user_id).await?;
+                        let _ = assert_task_access(
+                            state,
+                            Some(project_id),
+                            dependency_id,
+                            user_id,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -244,20 +268,26 @@ async fn apply_project_scope(
 
     if let Some(field_name) = task_scope_field(tool_name) {
         let task_id = required_string_arg(object, field_name)?;
-        assert_task_access(state, context.project_id.as_deref(), task_id, user_id).await?;
+        let task = assert_task_access(state, scoped_project_id, task_id, user_id).await?;
+        let authorized_project_id = task.project_id.as_str();
         if matches!(
             tool_name,
             "forge_add_task_dependency" | "forge_remove_task_dependency"
         ) {
             let depends_on_id = required_string_arg(object, "depends_on_id")?;
-            assert_task_access(state, context.project_id.as_deref(), depends_on_id, user_id)
-                .await?;
+            let _ = assert_task_access(
+                state,
+                Some(authorized_project_id),
+                depends_on_id,
+                user_id,
+            )
+            .await?;
         }
         if tool_name == "forge_list_task_dependencies" {
             for depends_on_id in TaskDependencyRepo::list_dependencies(&*state.db, task_id).await? {
-                assert_task_access(
+                let _ = assert_task_access(
                     state,
-                    context.project_id.as_deref(),
+                    Some(authorized_project_id),
                     &depends_on_id,
                     user_id,
                 )
@@ -266,23 +296,36 @@ async fn apply_project_scope(
         }
         if tool_name == "forge_list_task_dependents" {
             for dependent_id in TaskDependencyRepo::list_dependents(&*state.db, task_id).await? {
-                assert_task_access(state, context.project_id.as_deref(), &dependent_id, user_id)
-                    .await?;
+                let _ = assert_task_access(
+                    state,
+                    Some(authorized_project_id),
+                    &dependent_id,
+                    user_id,
+                )
+                .await?;
             }
         }
         if tool_name == "forge_list_sub_tasks" {
             for subtask in TaskRepo::list_subtasks_ordered(&*state.db, task_id).await? {
-                assert_task_access(state, context.project_id.as_deref(), &subtask.id, user_id)
-                    .await?;
+                if subtask.project_id != authorized_project_id {
+                    return Err(McpToolError::not_found("task", subtask.id));
+                }
             }
         }
         if tool_name == "forge_reorder_sub_tasks" {
             let ordered_ids = object
                 .get("ordered_ids")
                 .ok_or_else(|| McpToolError::new(-32602, "missing required field `ordered_ids`"))?;
+            let sibling_ids = TaskRepo::list_subtasks_ordered(&*state.db, task_id)
+                .await?
+                .into_iter()
+                .filter(|subtask| subtask.project_id == authorized_project_id)
+                .map(|subtask| subtask.id)
+                .collect::<HashSet<_>>();
             for subtask_id in string_array_arg(ordered_ids, "ordered_ids")? {
-                assert_task_access(state, context.project_id.as_deref(), subtask_id, user_id)
-                    .await?;
+                if !sibling_ids.contains(subtask_id) {
+                    return Err(McpToolError::not_found("task", subtask_id.to_owned()));
+                }
             }
         }
         return Ok(arguments);
@@ -290,8 +333,13 @@ async fn apply_project_scope(
 
     if tool_name == "forge_follow_up_execution" {
         let execution_id = required_string_arg(object, "execution_id")?;
-        assert_execution_access(state, context.project_id.as_deref(), execution_id, user_id)
-            .await?;
+        let _ = assert_execution_access(
+            state,
+            scoped_project_id,
+            execution_id,
+            user_id,
+        )
+        .await?;
     }
 
     Ok(arguments)
@@ -372,27 +420,40 @@ async fn assert_task_access(
     project_id: Option<&str>,
     task_id: &str,
     user_id: &str,
-) -> Result<(), McpToolError> {
+) -> Result<Task, McpToolError> {
     let task = TaskRepo::get_by_id(&*state.db, task_id, false)
         .await?
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
+    if let Some(scope) = project_id {
+        if task.project_id != scope {
+            // Preserve the existing non-leakage contract. Only a user who can
+            // also see the Task's actual Project receives the scoped mismatch.
+            if ProjectRepo::get_visible_by_id(&*state.db, &task.project_id, user_id)
+                .await?
+                .is_none()
+            {
+                return Err(McpToolError::not_found("task", task_id.to_owned()));
+            }
+            return Err(
+                McpToolError::new(-32602, "task does not belong to scoped MCP project").with_data(
+                    json!({
+                        "project_id": project_id,
+                        "task_id": task_id,
+                    }),
+                ),
+            );
+        }
+        // Project visibility was proved once by the caller. Do not repeat it
+        // for every dependency, dependent, or ordered subtask.
+        return Ok(task);
+    }
     if ProjectRepo::get_visible_by_id(&*state.db, &task.project_id, user_id)
         .await?
         .is_none()
     {
         return Err(McpToolError::not_found("task", task_id.to_owned()));
     }
-    if project_id.is_some_and(|scope| task.project_id != scope) {
-        return Err(
-            McpToolError::new(-32602, "task does not belong to scoped MCP project").with_data(
-                json!({
-                    "project_id": project_id,
-                    "task_id": task_id,
-                }),
-            ),
-        );
-    }
-    Ok(())
+    Ok(task)
 }
 
 async fn assert_execution_access(
@@ -400,7 +461,7 @@ async fn assert_execution_access(
     project_id: Option<&str>,
     execution_id: &str,
     user_id: &str,
-) -> Result<(), McpToolError> {
+) -> Result<Task, McpToolError> {
     let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
@@ -432,7 +493,7 @@ fn handle_initialize() -> Result<Value, McpToolError> {
 }
 
 fn handle_tools_list(context: &McpContext) -> Result<Value, McpToolError> {
-    Ok(json!({ "tools": tool_descriptors(context.project_id.is_some()) }))
+    Ok(json!({ "tools": descriptor_catalog(context.project_id.is_some()).clone() }))
 }
 
 fn tool_call_result(result: Value) -> Value {
