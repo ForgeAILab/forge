@@ -64,11 +64,25 @@ impl PersonalAccessTokenRepo for SqliteDb {
     }
 
     async fn update_last_used(&self, id: &str, last_used_at: &str) -> Result<()> {
-        sqlx::query("UPDATE personal_access_token SET last_used_at = ? WHERE id = ?")
-            .bind(last_used_at)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        // Authentication can be the hottest path in API and MCP traffic. A
+        // timestamp write per request serializes otherwise read-only traffic
+        // behind SQLite's single writer. The service skips fresh timestamps;
+        // this predicate also collapses concurrent stale readers so only the
+        // first request in a five-minute window changes the row.
+        sqlx::query(
+            "UPDATE personal_access_token
+             SET last_used_at = ?
+             WHERE id = ?
+               AND (
+                   last_used_at IS NULL
+                   OR julianday(last_used_at) <= julianday(?) - (5.0 / 1440.0)
+               )",
+        )
+        .bind(last_used_at)
+        .bind(id)
+        .bind(last_used_at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }
