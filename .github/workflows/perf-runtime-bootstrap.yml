@@ -73,8 +73,20 @@ jobs:
           if text.count(temporary_args) != 1:
               raise SystemExit('command cancellation test target drifted')
           text = text.replace(temporary_args, bound_args, 1)
-
           path.write_text(text)
+
+          auth_path = Path('crates/services/src/auth_service.rs')
+          auth_text = auth_path.read_text()
+          verify_target = 'bcrypt::verify(password, password_hash)'
+          if auth_text.count(verify_target) != 1:
+              raise SystemExit('blocking bcrypt verification target drifted')
+          auth_path.write_text(
+              auth_text.replace(
+                  verify_target,
+                  'bcrypt::verify(password, &password_hash)',
+                  1,
+              )
+          )
           PY
           cargo fmt --all
 
