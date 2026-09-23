@@ -86,6 +86,27 @@ impl ExecutionRepo for SqliteDb {
             .transpose()
     }
 
+    async fn get_by_ids(&self, ids: &[&str]) -> Result<Vec<Execution>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM execution WHERE id IN (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(") ORDER BY id");
+
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_execution)
+            .collect()
+    }
+
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats> {
         let run_row = sqlx::query(
             "SELECT \

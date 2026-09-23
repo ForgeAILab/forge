@@ -1147,6 +1147,7 @@ pub trait ExecutionRepo: Send + Sync {
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
+    async fn get_by_ids(&self, ids: &[&str]) -> Result<Vec<Execution>>;
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
     /// Return the running executions for one Task with one SQL predicate.
@@ -2241,6 +2242,8 @@ pub trait TaskDependencyRepo: Send + Sync {
     async fn remove_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()>;
     async fn list_dependencies(&self, task_id: &str) -> Result<Vec<String>>;
     async fn list_dependents(&self, depends_on_id: &str) -> Result<Vec<String>>;
+    async fn list_dependency_tasks(&self, task_id: &str) -> Result<Vec<Task>>;
+    async fn list_dependent_tasks(&self, depends_on_id: &str) -> Result<Vec<Task>>;
     async fn unsatisfied_dependencies(&self, task_id: &str) -> Result<Vec<String>>;
 }
 

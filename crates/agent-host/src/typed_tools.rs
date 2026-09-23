@@ -41,8 +41,10 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
 
+use agent_runtime::harness::{FetchTool, FetchTransport};
+
 use crate::{
-    AgentHostError, CanonicalScope, CanonicalScopeType, WorkspaceAccess,
+    AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
         MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
@@ -244,6 +246,34 @@ pub struct ProjectChatToolContext {
     pub charter_setup_required: bool,
 }
 
+/// Host-owned runtime inputs for one composition.
+///
+/// These are resolved by the server for this turn — never by model input —
+/// and are optional so a composition built for inspection still behaves like
+/// the real one, minus the surfaces that need a live transport.
+#[derive(Clone, Default)]
+pub struct ScopeToolRuntime {
+    /// Programs workspace commands may spawn. `None` uses the built-in set.
+    pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    /// Outbound transport for the runtime's web fetch tool. `None` leaves
+    /// `fetch` out of the catalog entirely, which is what an inspection-only
+    /// composition wants.
+    pub fetch_transport: Option<Arc<dyn FetchTransport>>,
+}
+
+impl fmt::Debug for ScopeToolRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeToolRuntime")
+            .field(
+                "command_allowlist",
+                &self.command_allowlist.as_ref().map(|list| list.len()),
+            )
+            .field("fetch_transport", &self.fetch_transport.is_some())
+            .finish()
+    }
+}
+
 impl fmt::Debug for ScopeToolComposition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -307,6 +337,7 @@ impl ScopeToolComposition {
                 charter_setup_required: false,
             },
             provider,
+            ScopeToolRuntime::default(),
         )
     }
 
@@ -315,6 +346,11 @@ impl ScopeToolComposition {
     /// Project Agent can read the bounded current state, send a message, and
     /// draft the unapproved adoption Charter only.  This boolean must come
     /// from the protected Project record, never from model arguments.
+    // Eight inputs, each a distinct server-derived authority: identity, scope,
+    // Task role, workspace root, permissions, Project chat state, the Forge
+    // operation provider, and the host's runtime inputs. Bundling them into
+    // one struct would only move the list somewhere less checked.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_scope_with_permissions_and_project_context(
         actor_identity_id: impl Into<String>,
         scope: CanonicalScope,
@@ -323,8 +359,16 @@ impl ScopeToolComposition {
         allowed_permissions: &BTreeSet<String>,
         project_chat: ProjectChatToolContext,
         provider: Option<Arc<dyn ForgeToolProvider>>,
+        runtime: ScopeToolRuntime,
     ) -> Result<Self, AgentHostError> {
         scope.validate()?;
+        // `None` is the built-in set. An owner widens or replaces it in the
+        // Forge config and per Project; the resolved list arrives with the
+        // turn, so model input can never reach this.
+        let command_allowlist = runtime
+            .command_allowlist
+            .clone()
+            .unwrap_or_else(|| Arc::new(CommandAllowlist::builtin()));
         let actor_identity_id = actor_identity_id.into();
         if actor_identity_id.trim().is_empty() {
             return Err(AgentHostError::Authority(
@@ -401,6 +445,7 @@ impl ScopeToolComposition {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
                             tools.push(Arc::new(TaskCommandTool {
+                                allowlist: Arc::clone(&command_allowlist),
                                 observer: None,
                                 command_dir: None,
                             }));
@@ -417,6 +462,17 @@ impl ScopeToolComposition {
                     // The planner surface is the read tool above only: no
                     // writes, no command spawn, no validation process.
                     TaskToolRole::Planner => {}
+                }
+                // Reading public documentation is part of writing code against
+                // a dependency. It is the same authority the chat agents get,
+                // bounded to GET over https by the transport, and gated on the
+                // Task read permission so a Task that may not read its own
+                // record cannot reach the network either.
+                if task_read_allowed {
+                    if let Some(transport) = runtime.fetch_transport.clone() {
+                        tools.push(Arc::new(FetchTool::new(transport)));
+                        coverage_set.insert(Permission::NetHttp);
+                    }
                 }
                 if let Some(provider) = provider {
                     let (read_operations, propose_operations) = task_operations(role);
@@ -461,6 +517,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskReadTool));
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        allowlist: Arc::clone(&command_allowlist),
                         observer: provider.clone().map(|provider| CommandObserver {
                             actor_identity_id: actor_identity_id.clone(),
                             scope: scope.clone(),
@@ -483,6 +540,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskWriteTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        allowlist: Arc::clone(&command_allowlist),
                         observer: None,
                         command_dir: None,
                     }));
@@ -524,6 +582,20 @@ impl ScopeToolComposition {
                             .insert(Permission::other(FORGE_SCOPE_PROPOSE_PERMISSION));
                     }
 
+                    // `fetch` reaches the public web directly, which is the
+                    // same authority class as the search tool below, so it is
+                    // gated on the same permission. Unlike search it needs no
+                    // configured endpoint: the transport is the host's.
+                    if let Some(transport) = runtime.fetch_transport.clone() {
+                        let fetch_permission = public_search_permission(
+                            scope.scope_type,
+                            project_chat.is_project_agent_chat,
+                        );
+                        if allowed_permissions.contains(fetch_permission) {
+                            tools.push(Arc::new(FetchTool::new(transport)));
+                            coverage_set.insert(Permission::NetHttp);
+                        }
+                    }
                     if let Some(search_scope) =
                         public_search_scope(scope.scope_type, project_chat.is_project_agent_chat)
                     {
@@ -1178,6 +1250,27 @@ fn filter_operations(
         .collect()
 }
 
+/// Whether `origin` is an https origin outside this host's own network.
+///
+/// The authorization gate cannot resolve DNS — that is the transport's job at
+/// connect time, pinned to the addresses it checked — so this refuses the
+/// shapes that need no lookup: a non-https scheme, a literal private or
+/// loopback address, and a hostname that names the local network.
+fn public_https_origin(origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => !crate::transport::restricted_provider_hostname(domain),
+        Some(url::Host::Ipv4(address)) => !crate::transport::restricted_provider_ip(address.into()),
+        Some(url::Host::Ipv6(address)) => !crate::transport::restricted_provider_ip(address.into()),
+        None => false,
+    }
+}
+
 #[derive(Debug)]
 struct ForgeScopeSecurityCheck {
     id: SecurityCheckId,
@@ -1216,6 +1309,21 @@ impl SecurityCheck for ForgeScopeSecurityCheck {
                             && !segment.contains('/')
                             && !segment.contains('\\')
                     })
+            }
+            // The fetch tool's resource. The runtime already validated the
+            // URL and the transport re-checks every resolved address, but this
+            // is the authoritative gate, so it independently refuses anything
+            // that is not a plain public https GET.
+            SecurityResource::Network {
+                origin,
+                method,
+                segments,
+            } => {
+                method == "GET"
+                    && public_https_origin(origin)
+                    && segments
+                        .iter()
+                        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
             }
             SecurityResource::Other { kind, .. } => {
                 kind == "forge.scope" || kind == "forge.public_search" || kind == "process"
@@ -2078,6 +2186,9 @@ struct CommandObserver {
 
 #[derive(Debug)]
 struct TaskCommandTool {
+    /// Programs this composition may spawn. Resolved by the host from owner
+    /// configuration and the owning Project, never from model input.
+    allowlist: Arc<CommandAllowlist>,
     /// Present only for a Project Agent verification session: every command
     /// it runs is recorded as an observation the Agent cites in
     /// `project.validation`. A Task worker's commands are its own business.
@@ -2124,7 +2235,7 @@ impl Tool for TaskCommandTool {
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
         let program = required_string(&arguments, "program")?;
-        validate_command_program(program)?;
+        validate_command_program(&self.allowlist, program)?;
         let args = string_array(&arguments, "args")?;
         validate_command_args(&args)?;
         if ctx.workspace.root() == "<none>" {
@@ -2701,16 +2812,15 @@ fn filesystem_resource(root: &str, path: &str) -> Result<SecurityResource, Runti
     Ok(SecurityResource::filesystem(root.to_owned(), segments))
 }
 
-fn validate_command_program(program: &str) -> Result<(), RuntimeError> {
-    const ALLOWED: &[&str] = &[
-        "bash", "bundle", "cargo", "cat", "diff", "echo", "false", "find", "git", "go", "gradle",
-        "grep", "head", "java", "make", "mvn", "node", "npm", "pnpm", "pytest", "python",
-        "python3", "rg", "rustc", "sed", "sh", "swift", "tail", "true", "wc",
-    ];
-    if program.contains('/') || program.contains('\\') || !ALLOWED.contains(&program) {
-        return Err(RuntimeError::tool(
-            "Task command is not in the host allowlist",
-        ));
+fn validate_command_program(
+    allowlist: &CommandAllowlist,
+    program: &str,
+) -> Result<(), RuntimeError> {
+    if program.contains('/') || program.contains('\\') || !allowlist.allows(program) {
+        return Err(RuntimeError::tool(format!(
+            "`{program}` is not in this workspace's command allowlist; the owner configures it \
+             under `commands` in the Forge config or `command_allowlist` in the Project settings"
+        )));
     }
     Ok(())
 }
@@ -2912,6 +3022,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
         });
         let tool = TaskCommandTool {
+            allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: None,
             command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
         };
@@ -3146,6 +3257,7 @@ mod tests {
         });
         let provider = Arc::new(TestProvider::default());
         let tool = TaskCommandTool {
+            allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: Some(CommandObserver {
                 actor_identity_id: "agent-1".to_owned(),
                 scope: CanonicalScope {
@@ -3206,6 +3318,59 @@ mod tests {
         assert_eq!(kind["type"], "string");
         let count = &schema["oneOf"][0]["properties"]["count"];
         assert!(count.get("enum").is_none());
+    }
+
+    #[test]
+    fn only_the_effective_allowlist_decides_which_program_may_spawn() {
+        let builtin = CommandAllowlist::builtin();
+        validate_command_program(&builtin, "cargo").expect("cargo is built in");
+        let refused = validate_command_program(&builtin, "docker")
+            .expect_err("docker needs owner configuration");
+        assert!(
+            refused.to_string().contains("command allowlist"),
+            "the refusal must name the allowlist so the model stops guessing: {refused}"
+        );
+
+        let (configured, _) =
+            CommandAllowlist::resolve(Some(&["docker".to_owned()]), &["podman".to_owned()]);
+        validate_command_program(&configured, "docker").expect("configured program runs");
+        validate_command_program(&configured, "podman").expect("added program runs");
+        validate_command_program(&configured, "cargo")
+            .expect_err("`only` drops the built-in set, cargo included");
+    }
+
+    #[test]
+    fn a_program_name_carrying_a_path_is_refused_even_if_the_list_holds_it() {
+        // The list is keyed on bare names, so a path that ends in an allowed
+        // name must not slip through on a substring match.
+        let (allowlist, rejected) = CommandAllowlist::resolve(None, &[]);
+        assert!(rejected.is_empty());
+        for smuggled in ["/bin/sh", "../sh", "usr/bin/cargo", "..\\sh"] {
+            validate_command_program(&allowlist, smuggled)
+                .expect_err("a path is not a program name");
+        }
+    }
+
+    #[test]
+    fn the_authorization_gate_binds_fetch_to_a_public_https_origin() {
+        assert!(public_https_origin("https://docs.rs"));
+        assert!(public_https_origin("https://example.com:8443"));
+        for refused in [
+            "http://example.com",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://10.1.2.3",
+            "https://169.254.169.254",
+            "https://[::1]",
+            "https://forge.internal",
+            "ftp://example.com",
+            "not a url",
+        ] {
+            assert!(
+                !public_https_origin(refused),
+                "{refused} must not be an authorizable fetch origin"
+            );
+        }
     }
 
     fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
@@ -3907,6 +4072,7 @@ mod tests {
                 charter_setup_required: true,
             },
             Some(Arc::new(TestProvider::default())),
+            ScopeToolRuntime::default(),
         )
         .expect("setup Project composition");
         let proposal = composition

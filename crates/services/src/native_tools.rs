@@ -42,8 +42,8 @@ use forge_agent_host::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
     PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
-    TASK_WORKLOG_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION,
+    TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -62,7 +62,8 @@ use crate::{
     },
     task_service::{
         AdaptiveTaskChild, AdaptiveTaskCommand, AdaptiveTaskCommandResult, AdaptiveTaskOperation,
-        DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload,
+        DirectTaskProposalInput, TaskDependencyAction, TaskProposalCommandResult,
+        TaskProposalPayload,
     },
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
     MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
@@ -133,6 +134,48 @@ enum TaskCancelPayload {
         expected_task_version: i64,
         reason: String,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskDependencyPayload {
+    Add {
+        task_id: String,
+        depends_on_task_id: String,
+        rationale: String,
+    },
+    Remove {
+        task_id: String,
+        depends_on_task_id: String,
+        rationale: String,
+    },
+}
+
+impl TaskDependencyPayload {
+    fn into_parts(self) -> (String, String, TaskDependencyAction, String) {
+        match self {
+            Self::Add {
+                task_id,
+                depends_on_task_id,
+                rationale,
+            } => (
+                task_id,
+                depends_on_task_id,
+                TaskDependencyAction::Add,
+                rationale,
+            ),
+            Self::Remove {
+                task_id,
+                depends_on_task_id,
+                rationale,
+            } => (
+                task_id,
+                depends_on_task_id,
+                TaskDependencyAction::Remove,
+                rationale,
+            ),
+        }
+    }
 }
 
 impl TaskCancelPayload {
@@ -1882,12 +1925,16 @@ impl CoordinationToolProvider {
                     "direct command has no canonical permission descriptor".to_owned(),
                 )
             })?;
-            let target_id = if operation == TASK_PROPOSE_OPERATION
-                || operation == TASK_ADAPTIVE_OPERATION
-                || operation == TASK_REVIEW_OPERATION
-                || operation == TASK_CANCEL_OPERATION
-                || operation == TASK_RECOVER_OPERATION
-                || forge_agent_host::is_project_orchestration_operation(operation)
+            // Both halves are read off the catalog: a coordination command
+            // admitted under this permission, or a Project-orchestration
+            // operation. Re-listing the coordination names here was the
+            // second place a new operation had to be registered, and missing
+            // it failed with "no canonical target derivation" — a message
+            // that names neither the operation nor the list.
+            let target_id = if forge_agent_host::is_coordination_direct_command(
+                operation,
+                requested_permission,
+            ) || forge_agent_host::is_project_orchestration_operation(operation)
             {
                 Some(
                     self.authorization
@@ -2352,6 +2399,66 @@ impl CoordinationToolProvider {
                 "task_id": result.task.id,
                 "task_status": result.task.status,
                 "task_version": result.task.version,
+                "requires_user_authorization": false,
+            }));
+        }
+
+        if operation == TASK_DEPENDENCY_OPERATION {
+            let Some(task_service) = self.task_service_handle() else {
+                return Err(AgentHostError::Configuration(
+                    "Task dependency execution is not wired to a TaskService".to_owned(),
+                ));
+            };
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task dependency command has no server-derived Project target".to_owned(),
+                )
+            })?;
+            let payload: TaskDependencyPayload =
+                typed_command_payload(operation, scope, &correlation_id, payload)?;
+            let (task_id, depends_on_task_id, action, _rationale) = payload.into_parts();
+            let (policy_result, policy_reason) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    None,
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                tracing::warn!(
+                    operation,
+                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
+                    "Task dependency command policy denied"
+                );
+                return Err(AgentHostError::Authority(
+                    "Task dependency command policy did not admit execution".to_owned(),
+                ));
+            }
+            let task = task_service
+                .perform_project_agent_dependency(
+                    &project_id,
+                    &task_id,
+                    &depends_on_task_id,
+                    action,
+                )
+                .await
+                .map_err(service_error)?;
+            return Ok(json!({
+                "operation": operation,
+                "status": "succeeded",
+                "replayed": false,
+                "materialized": true,
+                "domain_committed": true,
+                "correlation_id": correlation_id,
+                "task_id": task.id,
+                "task_status": task.status,
+                "task_version": task.version,
+                "blocked": task.blocked_json.is_some(),
                 "requires_user_authorization": false,
             }));
         }
@@ -3941,6 +4048,14 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
         serde_json::from_value::<TaskCancelPayload>(payload.clone()).map_err(|_| {
             AgentHostError::Authority(
                 "Task cancellation payload must contain cancel, an exact Task version, and a non-empty reason"
+                    .to_owned(),
+            )
+        })?;
+    }
+    if operation == TASK_DEPENDENCY_OPERATION {
+        serde_json::from_value::<TaskDependencyPayload>(payload.clone()).map_err(|_| {
+            AgentHostError::Authority(
+                "Task dependency payload must contain add or remove, both Task ids, and a rationale"
                     .to_owned(),
             )
         })?;

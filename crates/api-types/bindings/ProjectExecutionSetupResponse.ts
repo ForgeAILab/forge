@@ -10,7 +10,7 @@ import type { RepoResponse } from "./RepoResponse";
 import type { RetryAction } from "./RetryAction";
 import type { SetupRequirement } from "./SetupRequirement";
 
-export type ProjectExecutionSetupResponse = { project_id: string, project_version: bigint, coordination_state: CoordinationState, execution_setup_state: ExecutionSetupState, execution_gate: ExecutionGate, availability: ProjectExecutionSetupAvailability, primary_repo: RepoResponse | null, worker: ExecutionPrincipalResponse | null, independent_reviewer: ExecutionPrincipalResponse | null, eligible_workers: Array<ExecutionPrincipalResponse>, eligible_reviewers: Array<ExecutionPrincipalResponse>, setup_requirements: Array<SetupRequirement>, next_action: RetryAction | null, provisioning: ProvisioningOperationResponse | null,
+export type ProjectExecutionSetupResponse = { project_id: string, project_version: bigint, coordination_state: CoordinationState, execution_setup_state: ExecutionSetupState, execution_gate: ExecutionGate, availability: ProjectExecutionSetupAvailability, primary_repo: RepoResponse | null, worker: ExecutionPrincipalResponse | null, independent_reviewer: ExecutionPrincipalResponse | null, eligible_workers: Array<ExecutionPrincipalResponse>, eligible_reviewers: Array<ExecutionPrincipalResponse>, setup_requirements: Array<SetupRequirement>, next_action: RetryAction | null, provisioning: ProvisioningOperationResponse | null, 
 /**
  * The one canonical Project-wide execution blocker (D17), or `None`
  * when the Project has no outstanding blocker. Consumers render this

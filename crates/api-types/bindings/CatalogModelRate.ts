@@ -5,7 +5,7 @@ import type { RateBuckets } from "./RateBuckets";
 /**
  * One exact provider-scoped models.dev model rate row.
  */
-export type CatalogModelRate = { snapshot_id: string, rate_revision_id: string, provider_id: string, model_id: string, rates: RateBuckets,
+export type CatalogModelRate = { snapshot_id: string, rate_revision_id: string, provider_id: string, model_id: string, rates: RateBuckets, 
 /**
  * Source-preserved exact context-tier bands. Unknown sibling fields are
  * not promoted into this public contract.

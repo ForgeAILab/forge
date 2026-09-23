@@ -27,7 +27,11 @@ async fn identity(db: &SqliteDb, id: &str) {
             id: id.to_owned(),
             name: "wake-test".to_owned(),
             description: None,
-            max_concurrent_tasks: 1,
+            // Several wake fixtures stage more than one Running execution for
+            // this identity on purpose (a superseded attempt beside its
+            // replacement); a capacity of 1 makes the fixture itself
+            // unbuildable. No test here asserts capacity behaviour.
+            max_concurrent_tasks: 4,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
             status: AgentStatus::Idle,

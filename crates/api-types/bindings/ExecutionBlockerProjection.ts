@@ -16,23 +16,23 @@ import type { RetryAction } from "./RetryAction";
  * it, and Cancel (when applicable) is a separate, always-available Task
  * control rather than a second gate-recovery option.
  */
-export type ExecutionBlockerProjection = { code: ExecutionBlockerCode, stage: ExecutionBlockerStage, scope: ExecutionBlockerScope,
+export type ExecutionBlockerProjection = { code: ExecutionBlockerCode, stage: ExecutionBlockerStage, scope: ExecutionBlockerScope, 
 /**
  * The exact record(s) this blocker attaches to. For `scope: project`
  * this is empty or names the Project itself; for a scoped blocker it
  * names exactly the affected Task/plan item/milestone.
  */
-affected_refs: Array<ExecutionBlockerRecordRef>,
+affected_refs: Array<ExecutionBlockerRecordRef>, 
 /**
  * The authoritative record this blocker is measured against (for
  * example the governing execution-baseline revision).
  */
-governing_ref: ExecutionBlockerRecordRef | null, headline: string, safe_explanation: string,
+governing_ref: ExecutionBlockerRecordRef | null, headline: string, safe_explanation: string, 
 /**
  * Present only when the blocker is scoped to (or evaluated against) a
  * specific Task's own attempt/commit history.
  */
-evidence: ExecutionEvidenceSummary | null, required_principal: ExecutionBlockerPrincipal,
+evidence: ExecutionEvidenceSummary | null, required_principal: ExecutionBlockerPrincipal, 
 /**
  * Exactly one permitted next action. A phase control must never offer a
  * second option that only re-enters this same blocker.

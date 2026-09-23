@@ -11,25 +11,24 @@ import {
   useCreateComment,
   useDeleteComment,
   useDuplicateTask,
-  useExecutionsQuery,
   useLaunchExecution,
   useRecoverTask,
   useReviewsQuery,
   useTaskDiffQuery,
-  useTaskQuery,
+  useTaskDetailQuery,
   useRejectGate,
   useTransitionTask,
   useTriggerReview,
   useUpdateTask,
-  useWorkflowQuery,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
+import { ErrorBanner } from '@/components/error-banner'
 import type { AssigneeSelection } from '@/components/task-controls'
 import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
-import { getApiErrorMessage } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
 import { productTerm } from '@/lib/i18n'
 import { outgoingWorkflowEdges, workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
@@ -117,11 +116,12 @@ export function TaskDetailPage({
 }) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const taskQuery = useTaskQuery(taskId)
-  const executionsQuery = useExecutionsQuery(taskId)
-  const reviewsQuery = useReviewsQuery(taskId)
-  const diffQuery = useTaskDiffQuery(taskId)
-  const agentsQuery = useAgentsQuery()
+  const taskDetailQuery = useTaskDetailQuery(taskId)
+  const reviewsQuery = useReviewsQuery(taskId, { enabled: initialTab === 'review' })
+  const diffQuery = useTaskDiffQuery(taskId, { enabled: initialTab === 'diff' })
+  const agentsQuery = useAgentsQuery({
+    enabled: initialTab === 'overview' || initialTab === 'executions' || initialTab === 'diff',
+  })
   const updateTask = useUpdateTask()
   const transitionTask = useTransitionTask()
   const advanceTask = useAdvanceTask()
@@ -133,7 +133,7 @@ export function TaskDetailPage({
   const cancelTask = useCancelTask()
   const duplicateTask = useDuplicateTask()
   const recoverTask = useRecoverTask()
-  const commentsQuery = useCommentsQuery(taskId)
+  const commentsQuery = useCommentsQuery(taskId, { enabled: initialTab === 'comments' })
   const createComment = useCreateComment()
   const deleteComment = useDeleteComment()
 
@@ -176,11 +176,14 @@ export function TaskDetailPage({
     onError: (error) => toast.error(getApiErrorMessage(error, 'Re-execute failed')),
   })
 
-  const task = taskQuery.data
+  const task = taskDetailQuery.data?.task
   const coderAssignment = task?.role_assignments.find(
     (assignment) => assignment.role_name === 'coder',
   )
-  const executions = useMemo(() => executionsQuery.data?.items ?? [], [executionsQuery.data])
+  const executions = useMemo(
+    () => taskDetailQuery.data?.executions.items ?? [],
+    [taskDetailQuery.data?.executions.items],
+  )
   const reviewDisabledReason = undefined
   const runSuffix = task ? extractRunSuffix(task.title) : ''
   const agentNamesById = useMemo(
@@ -194,8 +197,7 @@ export function TaskDetailPage({
   const reviews = useMemo(() => reviewsQuery.data ?? [], [reviewsQuery.data])
   const latestReview = useMemo(() => getLatestReview(reviews), [reviews])
   const comments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data])
-  const workflowQuery = useWorkflowQuery(task?.project_id ?? '')
-  const workflow = workflowQuery.data
+  const workflow = taskDetailQuery.data?.workflow
   const effectiveWorkflow = workflow
   const workflowRetryBudgets = retryBudgetFromStateConfig(effectiveWorkflow, task?.status)
 
@@ -566,23 +568,34 @@ export function TaskDetailPage({
       <div className="flex h-full gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
         <TaskDetailSidebar
           task={task}
-          isLoading={taskQuery.isLoading}
+          isLoading={taskDetailQuery.isLoading}
           taskId={taskId}
           runSuffix={runSuffix}
           activeTab={initialTab}
-          executionCount={executions.length}
-          commentCount={comments.length}
+          executionCount={taskDetailQuery.data?.executions.total_count ?? undefined}
+          commentCount={commentsQuery.data?.length}
           showReviewTab={showReviewTab}
         />
 
         <div className="flex-1 overflow-y-auto">
+          {taskDetailQuery.isError && !taskDetailQuery.data && initialTab !== 'overview' ? (
+            <div className="p-6">
+              <ErrorBanner
+                error={taskDetailQuery.error}
+                fallback="Task details failed to load"
+                onRetry={() => void taskDetailQuery.refetch()}
+                showRetry={isTransientApiError(taskDetailQuery.error)}
+              />
+            </div>
+          ) : null}
+
           {initialTab === 'overview' && (
             <TaskOverviewPanel
               task={task}
-              isLoading={taskQuery.isLoading}
-              isError={taskQuery.isError}
-              error={taskQuery.error}
-              onRetryLoad={() => void taskQuery.refetch()}
+              isLoading={taskDetailQuery.isLoading}
+              isError={taskDetailQuery.isError}
+              error={taskDetailQuery.error instanceof Error ? taskDetailQuery.error : null}
+              onRetryLoad={() => void taskDetailQuery.refetch()}
               updatePending={updateTask.isPending}
               recoverPending={recoverTask.isPending}
               transitionPending={transitionTask.isPending}
@@ -636,12 +649,12 @@ export function TaskDetailPage({
             />
           )}
 
-          {initialTab === 'executions' && (
+          {initialTab === 'executions' && !(taskDetailQuery.isError && !taskDetailQuery.data) && (
             <div className="p-6">
               <TaskExecutionsTab
                 taskId={taskId}
                 executions={executions}
-                isLoading={executionsQuery.isLoading}
+                isLoading={taskDetailQuery.isLoading}
                 agentName={agentName}
                 formatDate={formatDate}
               />
@@ -655,6 +668,9 @@ export function TaskDetailPage({
                 reviews={reviews}
                 latestReview={latestReview}
                 reviewsLoading={reviewsQuery.isLoading}
+                reviewsIsError={reviewsQuery.isError}
+                reviewsError={reviewsQuery.error}
+                onRetryReviews={() => void reviewsQuery.refetch()}
                 transitionPending={transitionTask.isPending}
                 triggerReviewPending={triggerReview.isPending}
                 recoverPending={recoverTask.isPending}
@@ -691,6 +707,10 @@ export function TaskDetailPage({
                   <TaskCommentsPanel
                     task={task}
                     comments={comments}
+                    commentsLoading={commentsQuery.isLoading}
+                    commentsIsError={commentsQuery.isError}
+                    commentsError={commentsQuery.error}
+                    onRetryComments={() => void commentsQuery.refetch()}
                     commentDraft={commentDraft}
                     setCommentDraft={setCommentDraft}
                     createComment={createComment}

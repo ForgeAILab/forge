@@ -334,6 +334,10 @@ Your inquiry id is {inquiry_id}."
             // scope: empty initial history alone cannot override a snapshot.
             history: Vec::new(),
             input: Self::user_input(request),
+            // An inquiry works in a scratch directory that holds no
+            // repository, so it takes the configured baseline with no Project
+            // to layer over it.
+            command_allowlist: Some(embedded_agents.effective_command_allowlist(None).await),
             cancellation: turn_cancellation.clone(),
         };
 

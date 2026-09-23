@@ -181,6 +181,7 @@ async fn inquiry_fixture(
         system_prompt: Some("Answer this inquiry only.".to_owned()),
         history: Vec::new(),
         input: "first-inquiry-question".to_owned(),
+        command_allowlist: None,
         cancellation: CancellationToken::new(),
     };
     (db, backend, provider, request, root)
@@ -546,6 +547,7 @@ async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    command_allowlist: None,
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -710,6 +712,7 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    command_allowlist: None,
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -800,6 +803,7 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                 ),
                 history: Vec::new(),
                 input: format!("turn {}: continue after compaction", compaction_turn + 1),
+                command_allowlist: None,
                 cancellation: CancellationToken::new(),
             },
             Arc::new(NoopSink),

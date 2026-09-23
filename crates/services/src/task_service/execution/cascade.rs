@@ -1068,7 +1068,7 @@ impl TaskService {
             ReviewStatus::Failed
         };
         let auditor_details = json!({ "verdict": if passed { "pass" } else { "fail" }, "reason": conformance.reason });
-        let comment = reviewer_comment(status.clone(), review.attempt_number, &final_message);
+        let comment = reviewer_comment(status.clone(), review.attempt_number, &conformance);
 
         let finished_at = now_rfc3339();
         let mut review_details = strict_review_details(&review)?;
@@ -1924,34 +1924,104 @@ fn execution_failure_reason(execution: &Execution) -> String {
         .unwrap_or_else(|| format!("ended with status {}", execution.status))
 }
 
-fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &str) -> String {
-    let fallback = match status {
+/// Render the reviewer's Task comment from the admitted assessment.
+///
+/// The first line keeps the `Review <outcome> (attempt N)` headline; below it
+/// every requirement and finding is one Markdown list item with a fixed shape
+/// (`**disposition** \`id\` — rationale · evidence`), so people and agents read
+/// the same structure the conformance record stores instead of reviewer prose.
+fn reviewer_comment(
+    status: ReviewStatus,
+    attempt_number: i64,
+    conformance: &api_types::ReviewConformance,
+) -> String {
+    let assessment = conformance.assessment.as_ref();
+    let mut out = match status {
         ReviewStatus::AwaitingHuman => format!(
             "Review passed automated checks and is awaiting user approval (attempt {attempt_number})"
         ),
         ReviewStatus::Passed => format!("Review passed (attempt {attempt_number})"),
         ReviewStatus::Failed => {
-            let reason = match ::review::auditor::parse_verdict(final_message) {
-                ::review::auditor::AuditorVerdict::Failed { reason } => reason,
-                ::review::auditor::AuditorVerdict::Passed => "review failed".to_owned(),
-            };
+            let reason = assessment
+                .and_then(|report| report.findings.iter().find(|f| f.blocking))
+                .map(|f| format!("Expected {}; actual {}", f.expected, f.actual))
+                .or_else(|| conformance.reason.clone())
+                .unwrap_or_else(|| "review conformance failed".to_owned());
             format!("Review failed (attempt {attempt_number}): {reason}")
         }
         _ => format!("Review updated (attempt {attempt_number})"),
     };
-    let Ok(report) = serde_json::from_str::<api_types::ReviewAssessment>(final_message) else {
-        return fallback;
+    let Some(report) = assessment else {
+        return out;
     };
-    let findings = report
-        .findings
-        .iter()
-        .map(|f| format!("Expected {}; actual {}", f.expected, f.actual))
-        .collect::<Vec<_>>();
-    if findings.is_empty() {
-        fallback
-    } else {
-        format!("{fallback}\n\n{}", findings.join("\n"))
+    let verdict = match report.verdict {
+        api_types::ConformanceVerdict::Pass => "pass",
+        api_types::ConformanceVerdict::Fail => "fail",
+    };
+    out.push_str(&format!("\n\n**Verdict:** {verdict}"));
+    if !report.requirements.is_empty() {
+        out.push_str("\n\n**Requirements**\n");
+        for requirement in &report.requirements {
+            let disposition = match requirement.disposition {
+                api_types::RequirementDisposition::Satisfied => "satisfied",
+                api_types::RequirementDisposition::Violated => "violated",
+                api_types::RequirementDisposition::Unverified => "unverified",
+                api_types::RequirementDisposition::OutsideTaskScope => "outside task scope",
+            };
+            out.push_str(&format!(
+                "\n- **{disposition}** `{}` — {}{}",
+                requirement.requirement_id,
+                single_line(&requirement.rationale),
+                evidence_suffix(&requirement.evidence)
+            ));
+        }
     }
+    if !report.findings.is_empty() {
+        out.push_str("\n\n**Findings**\n");
+        for finding in &report.findings {
+            let severity = if finding.blocking {
+                "blocking"
+            } else {
+                "non-blocking"
+            };
+            out.push_str(&format!(
+                "\n- **{severity}** Expected {}; actual {}{}",
+                single_line(&finding.expected),
+                single_line(&finding.actual),
+                evidence_suffix(&finding.evidence)
+            ));
+        }
+    }
+    out
+}
+
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn evidence_suffix(evidence: &[api_types::ReviewEvidenceRef]) -> String {
+    if evidence.is_empty() {
+        return String::new();
+    }
+    let refs = evidence
+        .iter()
+        .map(|reference| match reference {
+            api_types::ReviewEvidenceRef::File {
+                path,
+                start_line,
+                end_line,
+                ..
+            } if start_line == end_line => format!("`{path}:{start_line}`"),
+            api_types::ReviewEvidenceRef::File {
+                path,
+                start_line,
+                end_line,
+                ..
+            } => format!("`{path}:{start_line}-{end_line}`"),
+            api_types::ReviewEvidenceRef::Check { check_id } => format!("check `{check_id}`"),
+        })
+        .collect::<Vec<_>>();
+    format!(" · {}", refs.join(", "))
 }
 
 #[cfg(test)]
@@ -2058,21 +2128,66 @@ mod reviewer_message_tests {
         assert!(message.contains("===REVIEW: PASS==="));
     }
 
-    #[test]
-    fn reviewer_comment_summarizes_structured_findings() {
-        let comment = reviewer_comment(
-            ReviewStatus::Passed,
-            1,
-            r#"{"contract_digest":"digest","verdict":"pass","requirements":[],"findings":[]}"#,
-        );
-
-        assert_eq!(comment, "Review passed (attempt 1)");
+    fn conformance(
+        assessment: Option<api_types::ReviewAssessment>,
+    ) -> api_types::ReviewConformance {
+        api_types::ReviewConformance {
+            status: api_types::ConformanceStatus::Failed,
+            contract: None,
+            assessment,
+            checks: Vec::new(),
+            reason: Some("blocking finding".to_owned()),
+        }
     }
 
     #[test]
-    fn reviewer_comment_falls_back_when_only_marker_exists() {
-        let comment = reviewer_comment(ReviewStatus::Passed, 2, "===REVIEW: PASS===");
+    fn reviewer_comment_renders_requirements_and_findings_as_structured_lines() {
+        let assessment = api_types::ReviewAssessment {
+            contract_digest: "digest".to_owned(),
+            verdict: api_types::ConformanceVerdict::Fail,
+            requirements: vec![api_types::RequirementAssessment {
+                requirement_id: "R1".to_owned(),
+                disposition: api_types::RequirementDisposition::Violated,
+                rationale: "export is\nmissing".to_owned(),
+                evidence: vec![api_types::ReviewEvidenceRef::File {
+                    path: "src/lib.rs".to_owned(),
+                    commit_sha: "abc".to_owned(),
+                    start_line: 3,
+                    end_line: 9,
+                }],
+            }],
+            findings: vec![api_types::ConformanceFinding {
+                blocking: true,
+                expected: "api exported".to_owned(),
+                actual: "not exported".to_owned(),
+                evidence: vec![api_types::ReviewEvidenceRef::Check {
+                    check_id: "ci-0".to_owned(),
+                }],
+            }],
+        };
 
-        assert_eq!(comment, "Review passed (attempt 2)");
+        let comment = reviewer_comment(ReviewStatus::Failed, 2, &conformance(Some(assessment)));
+
+        assert_eq!(
+            comment,
+            "Review failed (attempt 2): Expected api exported; actual not exported\n\n\
+             **Verdict:** fail\n\n\
+             **Requirements**\n\n\
+             - **violated** `R1` — export is missing · `src/lib.rs:3-9`\n\n\
+             **Findings**\n\n\
+             - **blocking** Expected api exported; actual not exported · check `ci-0`"
+        );
+    }
+
+    #[test]
+    fn reviewer_comment_without_an_assessment_is_the_headline_only() {
+        assert_eq!(
+            reviewer_comment(ReviewStatus::Passed, 1, &conformance(None)),
+            "Review passed (attempt 1)"
+        );
+        assert_eq!(
+            reviewer_comment(ReviewStatus::Failed, 1, &conformance(None)),
+            "Review failed (attempt 1): blocking finding"
+        );
     }
 }

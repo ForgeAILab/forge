@@ -256,6 +256,7 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
     )
     .await;
     let connected = connect_embedded_agent(app, &token, "project-charter-fixture-agent-1").await;
+    let operating_skill_revision = common::current_project_operating_skill_revision(&harness).await;
     let content = adoption_content("Legacy Charter Project", "one");
     let rendered = services::render_and_digest_charter(&content);
 
@@ -321,6 +322,7 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
             project.version + 1,
             &connected,
             &rendered,
+            &operating_skill_revision,
             "project-adoption-approval-stale-project",
         ),
     )
@@ -342,6 +344,7 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
             project.version,
             &connected,
             &rendered,
+            &operating_skill_revision,
             "project-adoption-approval-1",
         ),
         StatusCode::CREATED,
@@ -451,6 +454,7 @@ async fn project_charter_adoption_and_amendment_commit_with_binding_history() {
             project_after_adoption.version,
             &rotated,
             &amendment_rendered,
+            &operating_skill_revision,
             "project-amendment-approval-2",
         ),
         StatusCode::CREATED,
@@ -632,6 +636,7 @@ fn adoption_save_body(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn approval_body(
     charter_id: &str,
     revision: &ProjectCharterRevision,
@@ -639,6 +644,7 @@ fn approval_body(
     expected_project_version: i64,
     connected: &ConnectedEmbeddedAgentResponse,
     rendered: &services::CharterRender,
+    operating_skill_revision: &str,
     idempotency_key: &str,
 ) -> serde_json::Value {
     json!({
@@ -661,7 +667,7 @@ fn approval_body(
         "project_mode": "compact",
         "selected_project_agent_identity_id": connected.agent.id,
         "selected_project_agent_profile_revision_id": connected.profile.id,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
+        "selected_project_agent_operating_skill_revision": operating_skill_revision,
         "selected_project_agent_policy_digest": project_agent_policy_digest(&connected.profile.tool_policy)
     })
 }

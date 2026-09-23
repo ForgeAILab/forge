@@ -7,7 +7,8 @@ use crate::{
     ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
     PlanArtifactDetail, PlanProgressSummary, RecoveryAction, ResumePolicy, StopReason,
     TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
-    UsageBreakdown, WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
+    UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
+    WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -109,6 +110,46 @@ pub struct TaskResponse {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskDetailExecutionsPage {
+    pub items: Vec<ExecutionResponse>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub total_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskDetailResponse {
+    pub task: TaskResponse,
+    pub workflow: WorkflowDefinition,
+    pub executions: TaskDetailExecutionsPage,
+}
+
+/// Small task projection for a direct parent, child, or dependency relation.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskRelationSummary {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub parent_task_id: Option<String>,
+    pub subtask_order: Option<i64>,
+    pub created_at: String,
+}
+
+/// Direct relations for a task, loaded without scanning its whole project.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskRelationsResponse {
+    pub parent: Option<TaskRelationSummary>,
+    pub subtasks: Vec<TaskRelationSummary>,
+    pub dependencies: Vec<TaskRelationSummary>,
+    pub missing_dependency_ids: Vec<String>,
+    pub dependents: Vec<TaskRelationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

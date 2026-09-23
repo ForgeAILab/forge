@@ -49,7 +49,8 @@ import {
   type CancelAgentInquiryInput,
 } from '@/api/agent-inquiries'
 import { qk } from '@/api/query-keys'
-import { getApiErrorCode } from '@/lib/api-error'
+import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
+import { getApiErrorCode, isTransientApiError } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type {
   Agent,
@@ -89,6 +90,8 @@ import type {
   ReviewDecisionResponse,
   Task,
   TaskMediaResponse,
+  TaskDetailResponse,
+  TaskRelationsResponse,
   TaskRoleAssignmentResponse,
   TransitionLogEntry,
   TransitionTaskResponse,
@@ -526,10 +529,39 @@ export function useAgentRecentTasks(agentId?: string, limit = 5) {
   })
 }
 
-export function useTaskQuery(taskId: string) {
+function shouldRetryTaskDetailQuery(failureCount: number, error: unknown): boolean {
+  return failureCount < 1 && isTransientApiError(error)
+}
+
+export function useTaskDetailQuery(taskId: string, options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: qk.taskDetail(taskId),
+    queryFn: ({ signal }) =>
+      apiFetch<TaskDetailResponse>(`/tasks/${taskId}/detail`, {
+        search: { include_total: true },
+        signal,
+      }),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
+    retry: shouldRetryTaskDetailQuery,
+  })
+}
+
+export function useTaskRelationsQuery(taskId: string, projectId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.taskRelations(taskId),
+    queryFn: ({ signal }) =>
+      apiFetch<TaskRelationsResponse>(`/tasks/${taskId}/relations`, { signal }),
+    enabled: Boolean(taskId) && enabled,
+    meta: { projectId },
+    retry: shouldRetryTaskDetailQuery,
+  })
+}
+
+export function useTaskQuery(taskId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.task(taskId),
-    queryFn: () => apiFetch<Task>(`/tasks/${taskId}`),
+    queryFn: ({ signal }) => apiFetch<Task>(`/tasks/${taskId}`, { signal }),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }
 
@@ -712,11 +744,11 @@ export function useTriggerReview() {
   })
 }
 
-export function useReviewsQuery(taskId: string) {
+export function useReviewsQuery(taskId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.reviews(taskId),
-    queryFn: () => apiFetch<Review[]>(`/tasks/${taskId}/reviews`),
-    enabled: Boolean(taskId),
+    queryFn: ({ signal }) => apiFetch<Review[]>(`/tasks/${taskId}/reviews`, { signal }),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }
 
@@ -751,27 +783,29 @@ export function useRejectReview() {
   })
 }
 
-export function useCommentsQuery(taskId: string) {
+export function useCommentsQuery(taskId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.comments(taskId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const response = await apiFetch<PaginatedResponse<Comment>>(`/tasks/${taskId}/comments`, {
         search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
+        signal,
       })
       return response.items
     },
-    enabled: Boolean(taskId),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }
 
 export function useTaskMediaQuery(taskId: string) {
   return useQuery({
     queryKey: qk.taskMedia(taskId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const response = await apiFetch<PaginatedResponse<TaskMediaResponse>>(
         `/tasks/${taskId}/media`,
         {
           search: { limit: 200, sort_by: 'created_at', sort_order: 'asc' },
+          signal,
         },
       )
       return response.items
@@ -959,7 +993,7 @@ export function useDuplicateTask() {
 export function useTaskWorkspace(taskId: string) {
   return useQuery({
     queryKey: qk.taskWorkspace(taskId),
-    queryFn: () => apiFetch<Workspace>(`/tasks/${taskId}/workspace`),
+    queryFn: ({ signal }) => apiFetch<Workspace>(`/tasks/${taskId}/workspace`, { signal }),
     enabled: Boolean(taskId),
     retry: false,
   })
@@ -1036,11 +1070,11 @@ export function useFollowUpExecution(executionId: string) {
   })
 }
 
-export function useTaskDiffQuery(taskId: string) {
+export function useTaskDiffQuery(taskId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.taskDiff(taskId),
-    queryFn: () => apiFetch<DiffEnvelope>(`/tasks/${taskId}/diff`),
-    enabled: Boolean(taskId),
+    queryFn: ({ signal }) => apiFetch<DiffEnvelope>(`/tasks/${taskId}/diff`, { signal }),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }
 
@@ -1087,10 +1121,12 @@ function findCachedAgent(
   return undefined
 }
 
-export function useAgentsQuery() {
+export function useAgentsQuery(options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.agents,
-    queryFn: () => apiFetch<PaginatedResponse<Agent>>('/agents', { search: { limit: 100 } }),
+    queryFn: ({ signal }) =>
+      apiFetch<PaginatedResponse<Agent>>('/agents', { search: { limit: 100 }, signal }),
+    enabled: options.enabled ?? true,
     staleTime: AGENTS_CACHE_STALE_TIME,
     gcTime: AGENTS_CACHE_GC_TIME,
   })
@@ -1356,10 +1392,12 @@ export function useSyncRepo(repoId: string, projectId: string) {
 
 // --- Executions ---
 
-export function useExecutionsQuery(taskId: string) {
+export function useExecutionsQuery(taskId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.executions(taskId),
-    queryFn: () => apiFetch<PaginatedResponse<Execution>>(`/tasks/${taskId}/executions`),
+    queryFn: ({ signal }) =>
+      apiFetch<PaginatedResponse<Execution>>(`/tasks/${taskId}/executions`, { signal }),
+    enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }
 
@@ -1381,7 +1419,7 @@ export function useUsageBreakdownsQuery(executionId: string) {
 export function useTaskUsageQuery(taskId: string) {
   return useQuery({
     queryKey: qk.taskUsage(taskId),
-    queryFn: () => apiFetch<UsageAggregate>(`/tasks/${taskId}/usage`),
+    queryFn: ({ signal }) => apiFetch<UsageAggregate>(`/tasks/${taskId}/usage`, { signal }),
   })
 }
 
@@ -1390,11 +1428,12 @@ export function useTaskUsageQuery(taskId: string) {
  */
 // --- Workflow ---
 
-export function useWorkflowQuery(projectId: string) {
+export function useWorkflowQuery(projectId: string, options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: qk.workflow(projectId),
-    queryFn: () => apiFetch<WorkflowDefinition>(`/projects/${projectId}/workflow`),
-    enabled: Boolean(projectId),
+    queryFn: ({ signal }) =>
+      apiFetch<WorkflowDefinition>(`/projects/${projectId}/workflow`, { signal }),
+    enabled: Boolean(projectId) && (options.enabled ?? true),
   })
 }
 
@@ -1409,6 +1448,7 @@ export function useUpdateWorkflow() {
     onSuccess: (_, vars) => {
       void queryClient.invalidateQueries({ queryKey: qk.workflow(vars.projectId) })
       void queryClient.invalidateQueries({ queryKey: qk.project(vars.projectId) })
+      invalidateProjectTaskDetails(queryClient, vars.projectId)
     },
   })
 }
@@ -1464,9 +1504,10 @@ export function useDeleteWorkflowTemplate() {
 export function useTransitionLogQuery(taskId: string, enabled = true) {
   return useQuery({
     queryKey: qk.transitions(taskId),
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const response = await apiFetch<{ items: TransitionLogEntry[] }>(
         `/tasks/${taskId}/transitions`,
+        { signal },
       )
       return response.items
     },
@@ -1479,7 +1520,8 @@ export function useTransitionLogQuery(taskId: string, enabled = true) {
 export function useTaskRolesQuery(taskId: string, enabled = true) {
   return useQuery({
     queryKey: qk.taskRoles(taskId),
-    queryFn: () => apiFetch<TaskRoleAssignmentResponse[]>(`/tasks/${taskId}/roles`),
+    queryFn: ({ signal }) =>
+      apiFetch<TaskRoleAssignmentResponse[]>(`/tasks/${taskId}/roles`, { signal }),
     enabled: Boolean(taskId) && enabled,
   })
 }
@@ -1801,8 +1843,10 @@ export function useAddDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (dependsOnId: string) => addDependency(taskId, dependsOnId),
-    onSuccess: () => {
+    onSuccess: (_, dependsOnId) => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskRelations(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskRelations(dependsOnId) })
     },
   })
 }
@@ -1811,8 +1855,10 @@ export function useRemoveDependency(taskId: string) {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (dependsOnId: string) => removeDependency(taskId, dependsOnId),
-    onSuccess: () => {
+    onSuccess: (_, dependsOnId) => {
       void queryClient.invalidateQueries({ queryKey: qk.taskDependencies(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskRelations(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskRelations(dependsOnId) })
     },
   })
 }
@@ -1871,7 +1917,7 @@ export function useUserSearch(query: string) {
 export function useMembersQuery(projectId: string) {
   return useQuery({
     queryKey: qk.projectMembers(projectId),
-    queryFn: () => listMembers(projectId),
+    queryFn: ({ signal }) => listMembers(projectId, { signal }),
     enabled: Boolean(projectId),
   })
 }
@@ -1879,7 +1925,7 @@ export function useMembersQuery(projectId: string) {
 export function useProjectAgentsQuery(projectId: string) {
   return useQuery({
     queryKey: qk.projectAgents(projectId),
-    queryFn: () => listProjectAgents(projectId),
+    queryFn: ({ signal }) => listProjectAgents(projectId, { signal }),
     enabled: Boolean(projectId),
   })
 }

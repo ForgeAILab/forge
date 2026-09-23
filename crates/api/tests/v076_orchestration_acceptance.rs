@@ -349,28 +349,37 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     assert!(edited_authority.2 > admitted_authority.2);
     assert_ne!(edited_authority.3, admitted_authority.3);
 
+    // Publish a successor under the same skill key. Both ids are derived from
+    // whatever the migrations currently ship, so a new published revision does
+    // not turn this case into a primary-key collision on a hardcoded number.
+    let (current_skill_revision_id, next_skill_revision_id, next_skill_revision) =
+        project_skill_revisions(&harness).await;
     sqlx::query(
         "INSERT INTO operating_skill_revision (
             id, operating_skill_id, skill_key, revision, schema_version,
             render_version, canonical_body, policy_json, policy_digest,
             content_digest, created_by_type, created_at
          )
-         SELECT 'forge.project.orchestration/v1@16', operating_skill_id,
-                skill_key, 16, schema_version, render_version, canonical_body,
+         SELECT ?, operating_skill_id,
+                skill_key, ?, schema_version, render_version, canonical_body,
                 policy_json, policy_digest, content_digest, 'system', ?
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@15'",
+         WHERE id = ?",
     )
+    .bind(&next_skill_revision_id)
+    .bind(next_skill_revision)
     .bind(Utc::now().to_rfc3339())
+    .bind(&current_skill_revision_id)
     .execute(harness.state.db.pool())
     .await
     .expect("seed same-key Project operating-skill revision");
     sqlx::query(
         "UPDATE operating_skill
-         SET current_revision_id = 'forge.project.orchestration/v1@16',
+         SET current_revision_id = ?,
              version = version + 1, updated_at = ?
          WHERE skill_key = 'forge.project.orchestration/v1'",
     )
+    .bind(&next_skill_revision_id)
     .bind(Utc::now().to_rfc3339())
     .execute(harness.state.db.pool())
     .await
@@ -401,7 +410,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     .await
     .expect("same-key skill replacement authority");
     assert_eq!(skill_authority.0, original_authority.0);
-    assert_eq!(skill_authority.1, "forge.project.orchestration/v1@16");
+    assert_eq!(skill_authority.1, next_skill_revision_id);
     let admitted_after_skill_revision = request_json(
         app,
         Method::POST,
@@ -424,7 +433,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     .await
     .expect("fresh turn uses current same-key operating skill");
     assert_eq!(skill_turn.0, skill_binding_id);
-    assert_eq!(skill_turn.1, "forge.project.orchestration/v1@16");
+    assert_eq!(skill_turn.1, next_skill_revision_id);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM agent_handoff WHERE target_chat_id = ?",
@@ -437,10 +446,11 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     );
     sqlx::query(
         "UPDATE operating_skill
-         SET current_revision_id = 'forge.project.orchestration/v1@15',
+         SET current_revision_id = ?,
              version = version + 1, updated_at = ?
          WHERE skill_key = 'forge.project.orchestration/v1'",
     )
+    .bind(&current_skill_revision_id)
     .bind(Utc::now().to_rfc3339())
     .execute(harness.state.db.pool())
     .await
@@ -543,7 +553,8 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": mcp_identity,
             "selected_project_agent_profile_revision_id": edited_profile_id,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
+            "selected_project_agent_operating_skill_revision":
+                common::current_project_operating_skill_revision(&harness).await,
             "selected_project_agent_policy_digest": project_policy_digest(&edited_profile_policy)
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -778,7 +789,8 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
+            "selected_project_agent_operating_skill_revision":
+                common::current_project_operating_skill_revision(&harness).await,
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -2653,6 +2665,14 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
     let charter_version = projection["charter"]["version"]
         .as_i64()
         .expect("charter version");
+    // Read the selection the server is offering rather than pinning a
+    // revision: a migration that publishes a new Project operating skill
+    // otherwise turns every approval here into
+    // `project_agent_selection_conflict`.
+    let operating_skill_revision = required_string(
+        &projection,
+        &["selected_project_agent", "operating_skill_revision"],
+    );
     let policy_digest = project_policy_digest(&project_agent["profile"]["tool_policy"]);
     let approval_body = json!({
         "mutation": {
@@ -2671,7 +2691,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
+        "selected_project_agent_operating_skill_revision": operating_skill_revision,
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3107,6 +3127,28 @@ fn user_provenance(summary: &str) -> Value {
         "source_refs": [],
         "change_summary": summary
     })
+}
+
+/// The current Project operating-skill revision id, the id its same-key
+/// successor would have, and that successor's revision number.
+async fn project_skill_revisions(harness: &common::Harness) -> (String, String, i64) {
+    let (current_id, revision): (String, i64) = sqlx::query_as(
+        "SELECT revision.id, revision.revision
+         FROM operating_skill skill
+         JOIN operating_skill_revision revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+         WHERE skill.skill_key = 'forge.project.orchestration/v1'",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("current Project operating-skill revision loads");
+    let next = revision + 1;
+    (
+        current_id,
+        format!("forge.project.orchestration/v1@{next}"),
+        next,
+    )
 }
 
 fn project_policy_digest(policy: &Value) -> String {

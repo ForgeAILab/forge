@@ -15,6 +15,7 @@ use agent_runtime::core::{
     prelude::{InvocationContext, PreparationContext, RuntimeError, ToolOutcome},
     workspace::DenyAllWorkspace,
 };
+use agent_runtime::harness::{FetchTransport, FETCH_TOOL_NAME};
 use api_types::WorkflowTrigger;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
@@ -22,19 +23,20 @@ use db::{
 };
 use events::EventBus;
 use forge_agent_host::{
-    CanonicalScope, CanonicalScopeType, ProjectChatToolContext, ScopeToolComposition,
-    WorkspaceAccess, FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
-    FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    MIGRATED_OPERATION_CONTRACTS, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CHARTER_READ_OPERATION, PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION,
-    PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION,
+    CanonicalScope, CanonicalScopeType, ForgeFetchTransport, ProjectChatToolContext,
+    ScopeToolComposition, ScopeToolRuntime, WorkspaceAccess, FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
+    FORGE_MAIN_ORCHESTRATION_READ_TOOL, FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+    FORGE_PROJECT_ORCHESTRATION_READ_TOOL, MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
+    MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
+    MAIN_CHARTER_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
+    MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
+    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
     TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
@@ -569,6 +571,20 @@ fn adaptive_task_arguments(
     })
 }
 
+fn task_dependency_arguments(key: &str, action: &str, task_id: &str, depends_on: &str) -> Value {
+    json!({
+        "operation": TASK_DEPENDENCY_OPERATION,
+        "payload": {
+            "action": action,
+            "task_id": task_id,
+            "depends_on_task_id": depends_on,
+            "rationale": "The graph is re-planned without changing either Task id."
+        },
+        "dedupe_key": key,
+        "correlation_id": format!("correlation-{key}")
+    })
+}
+
 fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -> Value {
     json!({
         "operation": TASK_CANCEL_OPERATION,
@@ -982,6 +998,49 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .fetch_one(fixture.db.pool())
         .await
         .expect("cancellable Task version");
+    // The graph command: point the cancellable Task at the Task proposed
+    // earlier, then take the edge away again. Neither id changes, which is the
+    // whole reason this operation exists.
+    let edge_added = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_dependency_arguments(
+            "matrix-task-dependency-add",
+            "add",
+            cancellable_task_id,
+            source_task_id,
+        ),
+        TASK_DEPENDENCY_OPERATION,
+    )
+    .await
+    .expect("task.dependency add composition call");
+    assert_outcome_operation(&edge_added, TASK_DEPENDENCY_OPERATION);
+    assert!(
+        !edge_added.is_error,
+        "adding a prerequisite edge should commit: {}",
+        edge_added.value
+    );
+    let edge_removed = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_dependency_arguments(
+            "matrix-task-dependency-remove",
+            "remove",
+            cancellable_task_id,
+            source_task_id,
+        ),
+        TASK_DEPENDENCY_OPERATION,
+    )
+    .await
+    .expect("task.dependency remove composition call");
+    assert_outcome_operation(&edge_removed, TASK_DEPENDENCY_OPERATION);
+    assert!(
+        !edge_removed.is_error,
+        "removing a prerequisite edge should commit: {}",
+        edge_removed.value
+    );
+    covered_operations.insert(TASK_DEPENDENCY_OPERATION.to_owned());
+
     let cancelled = invoke_tool(
         &project,
         "forge_scope_propose",
@@ -1077,6 +1136,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             charter_setup_required: true,
         },
         Some(Arc::new(fixture.provider.clone())),
+        ScopeToolRuntime::default(),
     )
     .expect("setup Project composition");
     let setup_propose = setup
@@ -1174,6 +1234,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             charter_setup_required: false,
         },
         Some(Arc::new(fixture.provider.clone())),
+        ScopeToolRuntime::default(),
     )
     .expect("Task composition");
     let task_tool_names = task_composition
@@ -1222,6 +1283,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
                 charter_setup_required: false,
             },
             Some(Arc::new(fixture.provider.clone())),
+            ScopeToolRuntime::default(),
         )
         .expect("Main Chat composition");
     let main_chat_reads = main_chat_composition
@@ -1827,4 +1889,92 @@ async fn scope_composition_keeps_setup_not_found_and_internal_failures_structure
     let rendered = internal.value.to_string();
     assert!(!rendered.contains("no such table"));
     assert!(!rendered.contains("sqlx"));
+}
+
+/// Reaching the public web is authority, so it is gated twice: the host must
+/// supply a transport, and the scope must hold the same permission that gates
+/// the search tool. `fetch` differs from search in needing no configured
+/// endpoint, which would otherwise make it the one web surface that appears
+/// without the owner deciding anything.
+#[tokio::test]
+async fn fetch_needs_both_a_host_transport_and_the_scopes_web_permission() {
+    let fixture = fixture(false).await;
+    let compose = |permissions: BTreeSet<String>, transport: bool| {
+        ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            AGENT_ID,
+            fixture.main_scope.clone(),
+            None,
+            None,
+            &permissions,
+            ProjectChatToolContext::default(),
+            Some(Arc::new(fixture.provider.clone())),
+            ScopeToolRuntime {
+                command_allowlist: None,
+                fetch_transport: transport
+                    .then(|| Arc::new(ForgeFetchTransport::new()) as Arc<dyn FetchTransport>),
+            },
+        )
+        .expect("Main chat composition")
+        .tools()
+        .into_iter()
+        .any(|tool| tool.spec().name == FETCH_TOOL_NAME)
+    };
+
+    assert!(
+        compose(broad_permissions(), true),
+        "a Main chat that may propose discovery reaches the public web"
+    );
+    assert!(
+        !compose(broad_permissions(), false),
+        "without a host transport there is nothing to compose"
+    );
+    let mut narrowed = broad_permissions();
+    narrowed.remove("propose_discovery");
+    assert!(
+        !compose(narrowed, true),
+        "a scope without the web permission must not receive fetch"
+    );
+}
+
+/// A Task worker writes code against real dependencies, so it reads their
+/// documentation through the same bounded tool — gated on the Task read
+/// permission, because a Task that may not read its own record has no
+/// business reaching the network either.
+#[tokio::test]
+async fn a_task_worker_reaches_documentation_only_with_its_read_permission() {
+    let fixture = fixture(false).await;
+    let compose = |permissions: BTreeSet<String>| {
+        ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            AGENT_ID,
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "scope-composition-task".to_owned(),
+                workspace_access: WorkspaceAccess::TaskWrite,
+            },
+            Some("coder"),
+            Some("/tmp/forge-scope-composition-worktree"),
+            &permissions,
+            ProjectChatToolContext::default(),
+            Some(Arc::new(fixture.provider.clone())),
+            ScopeToolRuntime {
+                command_allowlist: None,
+                fetch_transport: Some(Arc::new(ForgeFetchTransport::new())),
+            },
+        )
+        .expect("Task composition")
+        .tools()
+        .into_iter()
+        .any(|tool| tool.spec().name == FETCH_TOOL_NAME)
+    };
+
+    let mut worker = broad_permissions();
+    worker.insert("task_read".to_owned());
+    worker.insert("task_write".to_owned());
+    assert!(compose(worker.clone()), "a coder may read documentation");
+
+    worker.remove("task_read");
+    assert!(
+        !compose(worker),
+        "a Task without read authority does not get a network tool"
+    );
 }

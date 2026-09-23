@@ -75,6 +75,38 @@ impl TaskDependencyRepo for SqliteDb {
         .await?)
     }
 
+    async fn list_dependency_tasks(&self, task_id: &str) -> Result<Vec<Task>> {
+        let columns = task_columns_with_alias("t");
+        let sql = format!(
+            "SELECT {columns}
+             FROM task_dependency AS td
+             JOIN task AS t ON t.id = td.depends_on_id
+             WHERE td.task_id = ? AND t.deleted_at IS NULL
+             ORDER BY td.created_at ASC, t.id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(task_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(map_task).collect()
+    }
+
+    async fn list_dependent_tasks(&self, depends_on_id: &str) -> Result<Vec<Task>> {
+        let columns = task_columns_with_alias("t");
+        let sql = format!(
+            "SELECT {columns}
+             FROM task_dependency AS td
+             JOIN task AS t ON t.id = td.task_id
+             WHERE td.depends_on_id = ? AND t.deleted_at IS NULL
+             ORDER BY td.created_at ASC, t.id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(depends_on_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(map_task).collect()
+    }
+
     async fn unsatisfied_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             "SELECT depends_on_id FROM task_dependency WHERE task_id = ? AND depends_on_id NOT IN (SELECT id FROM task WHERE status = 'done')",
@@ -83,4 +115,12 @@ impl TaskDependencyRepo for SqliteDb {
         .fetch_all(&self.pool)
         .await?)
     }
+}
+
+fn task_columns_with_alias(alias: &str) -> String {
+    TASK_COLUMNS
+        .split(", ")
+        .map(|column| format!("{alias}.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

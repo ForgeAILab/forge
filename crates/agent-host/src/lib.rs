@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod command_allowlist;
+mod fetch;
 mod interaction;
 mod lcm;
 mod manifest;
@@ -31,12 +33,15 @@ pub use agent_runtime::core::interaction::{
 pub use agent_runtime::core::store::Secret;
 pub use agent_runtime::lcm::{LcmClassification, LcmSourceMetadata};
 pub use agent_runtime::registry::{RegistryRevision, TrustClass};
+pub use command_allowlist::{BUILTIN_COMMAND_ALLOWLIST, CommandAllowlist};
+pub use fetch::ForgeFetchTransport;
 pub use interaction::{
     InteractionAnswer, InteractionAnswerValue, InteractionBrokerHandle, ProtectedInteractionSummary,
 };
 pub use lcm::{
-    DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION,
-    SqliteLcmStore, TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
+    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_SIZER_REVISION,
+    FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION, ForgeLcmSizer, SqliteLcmStore,
+    TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
 };
 pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
@@ -56,11 +61,12 @@ pub use operation_catalog::{
     PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
     PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
     PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION,
-    TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION, classify_operation,
-    contains_adaptive_authority_override, contains_authority_override,
+    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    classify_operation, contains_adaptive_authority_override, contains_authority_override,
     descriptor as operation_descriptor, is_allowed_project_direct_payload,
-    is_approval_required_operation, is_denied_operation, is_project_orchestration_operation,
+    is_approval_required_operation, is_coordination_direct_command,
+    is_coordination_generic_proposal, is_denied_operation, is_project_orchestration_operation,
     is_query_operation, operation_contract, operation_contract_permission,
     operation_names_for_surface, operation_permission, operation_supported_in_scope,
 };
@@ -76,7 +82,7 @@ pub use typed_tools::{
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
     FORGE_PUBLIC_WEB_SEARCH_TOOL, FORGE_SCOPE_PROPOSE_PERMISSION, FORGE_SCOPE_READ_PERMISSION,
     ForgeToolProvider, ProjectChatToolContext, PublicSearchScope, ScopeToolComposition,
-    TaskToolRole,
+    ScopeToolRuntime, TaskToolRole,
 };
 
 /// The concrete Agent Runtime guard that ended a provider-backed turn.
@@ -276,6 +282,10 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
     pub input: String,
+    /// Programs this turn's workspace commands may spawn, resolved by the
+    /// caller from owner configuration and the owning Project. `None` uses
+    /// the built-in set; the composition never takes this from model input.
+    pub command_allowlist: Option<Arc<CommandAllowlist>>,
     pub cancellation: CancellationToken,
 }
 

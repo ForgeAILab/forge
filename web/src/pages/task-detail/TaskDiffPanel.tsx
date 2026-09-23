@@ -8,6 +8,7 @@ import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
+import { isTransientApiError } from '@/lib/api-error'
 import { productTerm } from '@/lib/i18n'
 import { useLayoutStore } from '@/stores/layout'
 import type { DiffEnvelope } from '@/types/generated'
@@ -83,8 +84,7 @@ export function TaskDiffPanel({
     diffQuery.error.message.includes('workspace.not_found')
 
   const diffIsWorkspaceCleaned =
-    diffQuery.error instanceof ApiError &&
-    diffQuery.error.message.includes('status=cleaned')
+    diffQuery.error instanceof ApiError && diffQuery.error.message.includes('status=cleaned')
 
   const fileCount = diffData?.stats.files_changed ?? 0
 
@@ -153,7 +153,12 @@ export function TaskDiffPanel({
           description={`Launch a ${productTerm('run').toLowerCase()} to start working on this task.`}
           action={
             canLaunch ? (
-              <Button size="sm" variant="outline" disabled={!hasAgents} onClick={onOpenLaunchDialog}>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!hasAgents}
+                onClick={onOpenLaunchDialog}
+              >
                 Launch {productTerm('run')}
               </Button>
             ) : undefined
@@ -169,6 +174,7 @@ export function TaskDiffPanel({
           error={diffQuery.error}
           fallback="Failed to load diff"
           onRetry={() => void diffQuery.refetch()}
+          showRetry={isTransientApiError(diffQuery.error)}
         />
       ) : diffData && diffData.files.length === 0 ? (
         <EmptyState
@@ -254,7 +260,9 @@ export function TaskDiffPanel({
                 </div>
               </>
             ) : (
-              <div className="p-6 text-sm text-muted-foreground">No selectable file diff content.</div>
+              <div className="p-6 text-sm text-muted-foreground">
+                No selectable file diff content.
+              </div>
             )}
           </div>
         </div>

@@ -918,6 +918,30 @@ impl TaskService {
         // clear is still current and no replacement is running.
         let original_recovery_task = task.clone();
         let recovered = self.clear_recovery_metadata_at_version(&task).await?;
+        // A reviewer execution durably binds the current Review attempt, and
+        // that binding only accepts a Running attempt. Entering `review`
+        // opens one through the transition hooks, but recovery re-executes
+        // inside the state -- so once a reviewer execution had died and
+        // settled its attempt, which is the normal shape after an executor
+        // failure, `reexecute` rejected every attempt as a bare
+        // `version_conflict` and the Task could not be recovered at all.
+        // Apply the rule dispatch already uses: reuse a live attempt,
+        // otherwise open one for the current candidate.
+        if role_name == crate::workflow::default_roles::REVIEWER {
+            if let Err(error) = self
+                .ensure_review_attempt_for_recovery(&recovered, &project)
+                .await
+            {
+                self.restore_recovery_metadata_after_failed_resume(
+                    &recovered,
+                    &original_recovery_task,
+                    None,
+                    role_name,
+                )
+                .await;
+                return Err(error);
+            }
+        }
         let now = now_rfc3339();
         let execution = match self
             .create_running_execution(
@@ -992,6 +1016,83 @@ impl TaskService {
             "recovery re-execute dispatched current state role"
         );
         Ok(recovered)
+    }
+
+    /// Reuse the Task's live Review attempt, or open one for the current
+    /// implementation candidate. A reviewer execution can only bind an
+    /// attempt that is still `Running`, so a settled attempt has to be
+    /// replaced before recovery can launch. An attempt awaiting human
+    /// approval is deliberately left alone: opening a new one would discard
+    /// the gate, so recovery says so instead of failing as a conflict.
+    pub(super) async fn ensure_review_attempt_for_recovery(
+        &self,
+        task: &Task,
+        project: &db::Project,
+    ) -> Result<()> {
+        let latest = ReviewRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()));
+        match latest.as_ref().map(|review| &review.status) {
+            Some(ReviewStatus::Running) => return Ok(()),
+            Some(ReviewStatus::AwaitingHuman) => {
+                return Err(ServiceError::invalid_operation(
+                    "the current review attempt is awaiting human approval; approve or reject it \
+                     instead of re-executing the reviewer",
+                ));
+            }
+            _ => {}
+        }
+        let candidate = super::super::latest_executor_execution_for_task(&self.db, task)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "review recovery requires a current implementation candidate",
+                )
+            })?;
+        // A reviewer cannot start without the pre-review check results, and
+        // nothing re-runs them here. The attempt being replaced ran them
+        // against this same candidate, so carry those results across -- and
+        // only those, never its verdict, which belongs to the attempt that
+        // reached it.
+        let carried_ci_steps = latest
+            .as_ref()
+            .filter(|review| review.execution_id == candidate.id)
+            .and_then(|review| {
+                serde_json::from_str::<serde_json::Value>(&review.step_results_json).ok()
+            })
+            .and_then(|details| details.get("ci_steps").cloned())
+            .unwrap_or_else(|| serde_json::json!([]));
+        let now = now_rfc3339();
+        ReviewRepo::create_with_task_authority(
+            &*self.db,
+            db::CreateReview {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                execution_id: candidate.id.clone(),
+                attempt_number: 0,
+                status: ReviewStatus::Running,
+                step_results_json: serde_json::json!({ "ci_steps": carried_ci_steps }).to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            task.version,
+            &task.status,
+            Some(project.version),
+            Some(&project.workflow_definition),
+            Some(&candidate.id),
+        )
+        .await
+        .map_err(|error| match error {
+            db::DbError::VersionConflict => ServiceError::conflict(format!(
+                "could not open a review attempt for candidate {} at task {} version {}: the \
+                 Task, Project workflow, or implementation candidate moved",
+                candidate.id, task.id, task.version
+            )),
+            other => other.into(),
+        })?;
+        Ok(())
     }
 
     async fn spawn_recovery_execution(

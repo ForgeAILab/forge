@@ -1375,6 +1375,25 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
     // (`task_service::claim`), so its outcome is observable here without
     // reaching real git operations. The blocked Task must fail with exactly
     // the reconciliation conflict; the unrelated Task must not.
+    // Claim resolves its target from the Task's current state. These fixtures
+    // are `in_progress`, whose claim target is review, and F11 deliberately
+    // lets a baseline-governance pointer conflict past the read-only review
+    // gate. The blocker under test is the repository-mutation gate, so claim
+    // from a state whose target is the worker role.
+    sqlx::query("UPDATE task SET status = 'todo', version = version + 1 WHERE id IN (?, ?)")
+        .bind(&blocked_task.id)
+        .bind(&unrelated_task.id)
+        .execute(db.pool())
+        .await
+        .expect("fixtures return to a worker-claimable state");
+    let blocked_task = TaskRepo::get_by_id(&*db, &blocked_task_id, false)
+        .await
+        .expect("blocked task reloads")
+        .expect("blocked task exists");
+    let unrelated_task = TaskRepo::get_by_id(&*db, &unrelated_task_id, false)
+        .await
+        .expect("unrelated task reloads")
+        .expect("unrelated task exists");
     let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     let blocked_result = tasks
         .claim_task(

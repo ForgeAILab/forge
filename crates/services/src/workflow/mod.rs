@@ -77,6 +77,43 @@ pub(crate) const REVIEW_REFRESH_MARKER: &str = "[review-refresh]";
 /// Additional marker used to bound repeated automatic target rebases.
 pub(crate) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
 
+/// Marks a rebase conflict Forge committed with its markers and handed back to
+/// the Worker to reconcile. Worker prompts key their merge-fix instructions on
+/// it, and it bounds how many conflicts one Task may be handed.
+pub(crate) const CONFLICT_HANDOFF_MARKER: &str = "[conflict-handoff]";
+pub(crate) const CONFLICT_HANDOFF_PATHS_PREFIX: &str = "; paths_json=";
+
+/// Only paths handed to the Worker in the current retry window require a
+/// conflict-marker check at integration. The transition reason is durable and
+/// carries a JSON path list so punctuation and non-ASCII names stay intact.
+pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<String> {
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    let mut paths = Vec::new();
+    for entry in crate::task_diagnostics::entries_since_retry_window_boundary(entries, None) {
+        if entry.from_state != default_states::MERGING
+            || entry.to_state != default_states::MERGE_FAILED
+            || entry.triggered_by != workflow_actor
+            || !entry.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
+        {
+            continue;
+        }
+        let Some((_, encoded)) = entry
+            .trigger_reason
+            .rsplit_once(CONFLICT_HANDOFF_PATHS_PREFIX)
+        else {
+            continue;
+        };
+        if let Ok(handoff_paths) = serde_json::from_str::<Vec<String>>(encoded) {
+            for path in handoff_paths {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
 pub(crate) async fn review_refresh_transition_pending(
     db: &db::SqliteDb,
     task_id: &str,

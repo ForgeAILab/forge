@@ -77,7 +77,10 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(created_task.status, "todo".to_owned());
-    assert_eq!(created_task.version, 1);
+    // Creation commits the Project's default role assignments too, and the
+    // response carries the Task as those writes left it -- a client's next
+    // optimistic write uses this version.
+    assert_eq!(created_task.version, 4);
     let task_id = created_task.id;
 
     let tasks: PaginatedResponse<TaskResponse> = empty_request(
@@ -98,7 +101,9 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(claimed_task.status, "in_progress".to_owned());
-    assert_eq!(claimed_task.version, 2);
+    // The claim is the coder assignment, the transition, and the entry
+    // barrier its blocking before-work hook opens and closes.
+    assert_eq!(claimed_task.version, 5);
 
     let cancelled_task: TaskResponse = empty_request(
         &app,
@@ -108,7 +113,7 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(cancelled_task.status, "cancelled".to_owned());
-    assert_eq!(cancelled_task.version, 3);
+    assert_eq!(cancelled_task.version, 7);
 
     let terminal_error = raw_json_request(
         &app,
@@ -273,6 +278,15 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
         Method::PUT,
         &format!("/api/v1/tasks/{}/roles/coder", third.id),
         json!({ "assignee_type": "user", "assignee_id": "test-user-id" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Assigning the coder advanced the Task version.
+    let third: TaskResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", third.id),
         StatusCode::OK,
     )
     .await;

@@ -6,7 +6,7 @@ use api_types::{
     CreateProjectRequest, OutcomeCostMetric, OutcomeCostScope, OutcomeEligibility,
     OutcomeIneligibilityReason, OutcomeKind, PaginatedResponse, ProjectAnalyticsResponse,
     ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
-    ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
+    ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
     UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
@@ -1086,6 +1086,12 @@ async fn update_settings(
     Ok(Some(serialize_settings(&settings)?))
 }
 
+/// Validates a settings document through the one shared implementation.
+///
+/// REST and MCP each had their own copy of these rules and the copies had
+/// drifted in both directions, so a document one surface accepted was one the
+/// other would refuse on the same Project. The checks now live in
+/// `services::project_settings`.
 async fn validate_project_settings(
     db: &db::SqliteDb,
     settings: &serde_json::Value,
@@ -1093,106 +1099,11 @@ async fn validate_project_settings(
     project_id: Option<&str>,
     user_id: Option<&str>,
 ) -> ApiResult<()> {
-    let settings: ProjectSettings = serde_json::from_value(settings.clone())
-        .map_err(|error| ApiError::bad_request(format!("invalid settings: {error}")))?;
-    let role_names: HashSet<&str> = workflow
-        .roles
-        .iter()
-        .map(|role| role.name.as_str())
-        .collect();
-
-    for assignment in &settings.default_role_assignments {
-        if !role_names.contains(assignment.role_name.as_str()) {
-            return Err(ApiError::bad_request(format!(
-                "unknown role: {}",
-                assignment.role_name
-            )));
-        }
-
-        match assignment.assignee_type.as_str() {
-            "agent" => {
-                if option_is_blank(assignment.assignee_id.as_ref()) {
-                    return Err(ApiError::bad_request(format!(
-                        "default role assignment for role '{}' requires assignee_id",
-                        assignment.role_name
-                    )));
-                }
-                if let (Some(project_id), Some(user_id), Some(assignee_id)) =
-                    (project_id, user_id, assignment.assignee_id.as_ref())
-                {
-                    let usable_agents = db
-                        .list_agents_usable_in_project(project_id, user_id)
-                        .await
-                        .map_err(ApiError::from)?;
-                    let is_usable = usable_agents
-                        .into_iter()
-                        .any(|agent| agent.id == *assignee_id);
-                    if !is_usable {
-                        return Err(ApiError::bad_request("agent not usable in this project"));
-                    }
-                }
-            }
-            "user" => {
-                if option_is_blank(assignment.assignee_id.as_ref()) {
-                    return Err(ApiError::bad_request(format!(
-                        "default role assignment for role '{}' requires assignee_id",
-                        assignment.role_name
-                    )));
-                }
-                if is_legacy_manual_default_assignee(assignment.assignee_id.as_deref()) {
-                    continue;
-                }
-                if let (Some(project_id), Some(assignee_id)) =
-                    (project_id, assignment.assignee_id.as_ref())
-                {
-                    let member =
-                        db::ProjectMemberRepo::get_member(db, project_id, assignee_id).await?;
-                    if member.is_none() {
-                        return Err(ApiError::bad_request("assignee must be a project member"));
-                    }
-                }
-            }
-            _ => {
-                return Err(ApiError::bad_request(format!(
-                    "default role assignment for role '{}' must use assignee_type 'agent' or 'user'",
-                    assignment.role_name
-                )));
-            }
-        }
-    }
-
-    for (name, value) in [
-        ("review", settings.retry_budgets.review),
-        ("merge_fix", settings.retry_budgets.merge_fix),
-    ] {
-        if value.is_some_and(|value| value < 0) {
-            return Err(ApiError::bad_request(format!(
-                "retry_budgets.{name} must be 0 or greater"
-            )));
-        }
-    }
-
-    for (event, hooks) in &settings.lifecycle_hooks {
-        for hook in hooks {
-            if let api_types::LifecycleHookDef::Script { blocking, .. } = hook {
-                if *blocking && *event != api_types::LifecycleEvent::BeforeWork {
-                    return Err(ApiError::bad_request(
-                        "blocking lifecycle hooks are only supported for before_work",
-                    ));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn option_is_blank(value: Option<&String>) -> bool {
-    value.map(|value| value.trim().is_empty()).unwrap_or(true)
-}
-
-fn is_legacy_manual_default_assignee(assignee_id: Option<&str>) -> bool {
-    assignee_id == Some("human")
+    services::project_settings::validate_project_settings(
+        db, settings, workflow, project_id, user_id,
+    )
+    .await
+    .map_err(ApiError::from)
 }
 
 fn apply_default_review_config(
@@ -1380,8 +1291,7 @@ mod tests {
     };
 
     use super::{
-        is_legacy_manual_default_assignee, released_milestone_outcome,
-        remove_confined_direct_child, validate_analytics_window,
+        released_milestone_outcome, remove_confined_direct_child, validate_analytics_window,
     };
 
     fn cost_summary(coverage: CostCoverage, complete_total: Option<&str>) -> CostSummary {
@@ -1434,13 +1344,6 @@ mod tests {
             },
             sources: Vec::new(),
         }
-    }
-
-    #[test]
-    fn recognizes_legacy_manual_default_assignee() {
-        assert!(is_legacy_manual_default_assignee(Some("human")));
-        assert!(!is_legacy_manual_default_assignee(Some("user-123")));
-        assert!(!is_legacy_manual_default_assignee(None));
     }
 
     #[test]

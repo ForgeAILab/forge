@@ -3874,8 +3874,8 @@ pub enum FrozenPriceSelectionError {
     MissingDigest,
     #[error("frozen pricing selection digest does not match canonical provenance")]
     DigestMismatch,
-    #[error("frozen pricing selection violates semantic invariants")]
-    SemanticInvariantViolation,
+    #[error("frozen pricing selection violates a semantic invariant: {0}")]
+    SemanticInvariantViolation(&'static str),
 }
 
 impl PriceSelectionReasonCode {
@@ -4006,7 +4006,11 @@ impl FrozenPriceSelection {
 fn validate_frozen_selection_semantics(
     selection: &FrozenPriceSelection,
 ) -> Result<(), FrozenPriceSelectionError> {
-    let invalid = || Err(FrozenPriceSelectionError::SemanticInvariantViolation);
+    let invalid = |reason: &'static str| {
+        Err(FrozenPriceSelectionError::SemanticInvariantViolation(
+            reason,
+        ))
+    };
     let optional_fields = [
         selection.subject_id.as_deref(),
         selection.subject_revision_digest.as_deref(),
@@ -4023,17 +4027,17 @@ fn validate_frozen_selection_semantics(
         .flatten()
         .any(|value| value.trim().is_empty())
     {
-        return invalid();
+        return invalid("a provenance field is present but blank");
     }
 
     if selection.subject_id.is_some() != selection.subject_revision_digest.is_some() {
-        return invalid();
+        return invalid("subject id and revision digest must be present together");
     }
     if selection.status == PriceSelectionStatus::Priced && selection.reason.is_some() {
-        return invalid();
+        return invalid("a priced selection cannot carry an unpriced reason");
     }
     if selection.status == PriceSelectionStatus::Unpriced && selection.reason.is_none() {
-        return invalid();
+        return invalid("an unpriced selection must carry a reason");
     }
 
     let catalog_provenance_present = selection.catalog_provider_id.is_some()
@@ -4056,7 +4060,7 @@ fn validate_frozen_selection_semantics(
                     )
                 )
             {
-                return invalid();
+                return invalid("an unsourced selection cannot carry rate provenance");
             }
         }
         Some(PricingSourceKind::ManualOverride) => {
@@ -4070,7 +4074,9 @@ fn validate_frozen_selection_semantics(
                 || selection.catalog_freshness != CatalogFreshness::NotApplicable
                 || selection.status != PriceSelectionStatus::Priced
             {
-                return invalid();
+                return invalid(
+                    "a manual override must carry its subject, model, rate and rates only",
+                );
             }
         }
         Some(PricingSourceKind::ModelsDevCatalog) => {
@@ -4082,13 +4088,16 @@ fn validate_frozen_selection_semantics(
                 || selection.rates.is_none()
                 || selection.catalog_freshness == CatalogFreshness::NotApplicable
             {
-                return invalid();
+                return invalid("a catalog selection is missing its rate or catalog provenance");
             }
-            if selection.admitted_provider_id.is_some()
-                && selection.admitted_provider_id != selection.catalog_provider_id
-            {
-                return invalid();
-            }
+            // The admitted provider and the catalog provider are two
+            // namespaces, not two copies of one fact: the first is the
+            // runtime identity Forge dispatched (`gemini`), the second is
+            // the models.dev row the rate came from (`google`). Requiring
+            // them to match makes every provider whose labels differ
+            // unpriceable, and admission deliberately does not compare them.
+            // Settlement is where a provider claim is checked, against the
+            // actual provider an execution reported.
             if selection.status == PriceSelectionStatus::Unpriced
                 && !matches!(
                     selection.reason,
@@ -4098,7 +4107,7 @@ fn validate_frozen_selection_semantics(
                     )
                 )
             {
-                return invalid();
+                return invalid("an unpriced catalog selection must name a rate or tier reason");
             }
         }
     }
@@ -4113,7 +4122,7 @@ fn validate_frozen_selection_semantics(
             .as_ref()
             .is_some_and(|legacy| rates_exceed_plausibility_bound(legacy.rates))
     {
-        return invalid();
+        return invalid("a rate exceeds the plausibility bound");
     }
 
     let mut thresholds = BTreeSet::new();
@@ -4122,7 +4131,7 @@ fn validate_frozen_selection_semantics(
         .iter()
         .any(|tier| tier.threshold_tokens == 0 || !thresholds.insert(tier.threshold_tokens))
     {
-        return invalid();
+        return invalid("context tiers must have distinct nonzero thresholds");
     }
     Ok(())
 }
@@ -6082,10 +6091,10 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Priced,
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             missing_priced_provenance.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+            Err(FrozenPriceSelectionError::SemanticInvariantViolation(_))
+        ));
         assert!(!missing_priced_provenance.is_priced());
 
         let missing_unpriced_reason = FrozenPriceSelection::from_parts(
@@ -6107,10 +6116,10 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Unpriced,
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             missing_unpriced_reason.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+            Err(FrozenPriceSelectionError::SemanticInvariantViolation(_))
+        ));
 
         let manual_with_catalog_freshness = FrozenPriceSelection::from_parts(
             Some("subject".to_owned()),
@@ -6131,10 +6140,10 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Priced,
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             manual_with_catalog_freshness.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+            Err(FrozenPriceSelectionError::SemanticInvariantViolation(_))
+        ));
 
         let catalog_providerless = FrozenPriceSelection::from_parts(
             None,
@@ -6177,20 +6186,25 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Priced,
             None,
         );
-        assert_eq!(
+        assert!(matches!(
             catalog_with_invalid_freshness.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+            Err(FrozenPriceSelectionError::SemanticInvariantViolation(_))
+        ));
 
-        let catalog_with_conflicting_provider = FrozenPriceSelection::from_parts(
+        // A runtime provider label that differs from the catalog provider id
+        // is the ordinary case, not a contradiction: Forge dispatches
+        // `gemini` and models.dev prices the same model under `google`.
+        // Whether the execution actually ran on the admitted provider is
+        // settlement's question, answered against reported evidence.
+        let catalog_provider_in_its_own_namespace = FrozenPriceSelection::from_parts(
             None,
             None,
-            Some("gpt".to_owned()),
+            Some("gemini-3.8-flash".to_owned()),
             None,
             0,
-            Some("different-provider".to_owned()),
-            Some("openai".to_owned()),
-            Some("gpt-5".to_owned()),
+            Some("gemini".to_owned()),
+            Some("google".to_owned()),
+            Some("gemini-3.8-flash".to_owned()),
             Some(PricingSourceKind::ModelsDevCatalog),
             Some("catalog-rate-1".to_owned()),
             Some("catalog-snapshot-1".to_owned()),
@@ -6201,10 +6215,8 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Priced,
             None,
         );
-        assert_eq!(
-            catalog_with_conflicting_provider.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+        assert_eq!(catalog_provider_in_its_own_namespace.validate(), Ok(()));
+        assert!(catalog_provider_in_its_own_namespace.is_priced());
     }
 
     #[test]

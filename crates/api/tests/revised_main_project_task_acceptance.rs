@@ -44,6 +44,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         .await
         .expect("builtin workflow templates initialize");
     let app = &harness.app;
+    let operating_skill_revision = common::current_project_operating_skill_revision(&harness).await;
     let token = common::test_jwt();
 
     // Main, Project, and Worker are separate account-owned identities.  The
@@ -170,7 +171,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "content": charter_content,
             "rendered_view": rendered_charter.rendered_view,
             "render_version": rendered_charter.render_version,
-            "provenance": user_provenance("Approved Todo Charter")
+            "provenance": user_provenance("Approved Todo Charter", &operating_skill_revision)
         }),
         &[StatusCode::CREATED],
     )
@@ -215,7 +216,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": project_identity,
             "selected_project_agent_profile_revision_id": project_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
+            "selected_project_agent_operating_skill_revision": operating_skill_revision,
             "selected_project_agent_policy_digest": project_policy_digest(
                 &project_agent["profile"]["tool_policy"]
             )
@@ -695,10 +696,10 @@ fn user_authorization(action: &str, event_id: &str) -> Value {
     })
 }
 
-fn user_provenance(summary: &str) -> Value {
+fn user_provenance(summary: &str, operating_skill_revision: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@15",
+        "operating_skill_revision": operating_skill_revision,
         "source_refs": [],
         "change_summary": summary
     })

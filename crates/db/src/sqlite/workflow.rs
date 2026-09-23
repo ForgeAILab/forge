@@ -258,11 +258,21 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)?;
 
+        // A passed review is authority over the implementation it reviewed,
+        // so only a change to who owns that implementation invalidates it.
+        // Swapping the reviewer leaves the reviewed code exactly as it was,
+        // and clearing the marker there silently sends a Task back through a
+        // review it had already earned. The Task version advances either
+        // way: the assignment snapshot admission compares against changed.
+        let invalidates_review = matches!(input.role_name.as_str(), "coder" | "executor");
         let result = sqlx::query(
             "UPDATE task
-             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             SET review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,
+                 updated_at = ?,
+                 version = version + 1
              WHERE id = ? AND deleted_at IS NULL AND version = ?",
         )
+        .bind(invalidates_review)
         .bind(updated_at)
         .bind(&input.task_id)
         .bind(expected_task_version)
@@ -331,11 +341,22 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
+        // Removing the coder assignment removes the authority behind the
+        // implementation a passed review approved, so that marker goes with
+        // it. Removing any other role leaves the reviewed code untouched and
+        // must not force it through review again. The Task version advances
+        // either way, because the assignment snapshot admission compares
+        // against has changed.
+        let invalidates_review =
+            matches!(expected_assignment.role_name.as_str(), "coder" | "executor");
         let result = sqlx::query(
             "UPDATE task
-             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             SET review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,
+                 updated_at = ?,
+                 version = version + 1
              WHERE id = ? AND deleted_at IS NULL AND version = ?",
         )
+        .bind(invalidates_review)
         .bind(updated_at)
         .bind(&expected_assignment.task_id)
         .bind(expected_task_version)

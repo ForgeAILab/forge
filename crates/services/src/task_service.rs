@@ -61,6 +61,7 @@ mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
 mod move_task;
+pub(crate) mod project_agent_workspace;
 mod proposal;
 mod reorder_subtasks;
 mod repository_authority;
@@ -79,6 +80,7 @@ pub use adaptive::{
 };
 pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
+pub use dependencies::TaskDependencyAction;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };

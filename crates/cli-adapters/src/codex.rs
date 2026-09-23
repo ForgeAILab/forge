@@ -1230,15 +1230,27 @@ fn prepare_managed_codex_home(
         )?;
     }
 
-    // Codex materializes config.toml (project trust) and bundled system skills
-    // in its home while it runs. They are runtime cache, not durable authority:
-    // discard them before every execution and recreate only Forge's canonical
-    // config. This also makes a second attempt safe when it reuses the Task log
-    // directory. Files that Codex does not create remain fail-closed.
+    // Codex materializes config.toml (project trust), bundled system skills,
+    // and a plugins directory in its home while it runs. They are runtime
+    // cache, not durable authority: discard them before every execution and
+    // recreate only Forge's canonical config. This also makes a second attempt
+    // safe when it reuses the Task log directory. Files that Codex does not
+    // create remain fail-closed.
+    //
+    // `plugins` used to sit on the fail-closed list below, which meant the
+    // first Codex execution in a Task always succeeded and every later one in
+    // the same log directory died deterministically with "forbidden
+    // configuration input" — Codex had created the directory itself during the
+    // first run. Every re-review and every retry after a review was therefore
+    // unreachable; observed as three identical reviewer failures on one Task
+    // whose first reviewer attempt had completed normally.
     reset_managed_runtime_path(&managed_home.join("config.toml"))?;
     reset_managed_runtime_path(&managed_home.join("skills"))?;
     reset_managed_runtime_path(&managed_home.join("task-scratch"))?;
-    for forbidden in ["AGENTS.md", "hooks.json", "plugins"] {
+    reset_managed_runtime_path(&managed_home.join("plugins"))?;
+    // These two Codex never writes. A repository or a user planting one is the
+    // case this guard exists for, so they stay fail-closed.
+    for forbidden in ["AGENTS.md", "hooks.json"] {
         let path = managed_home.join(forbidden);
         if path.exists() {
             return Err(ExecutorError::Other(format!(
@@ -1659,6 +1671,57 @@ mod tests {
         let error = prepare_managed_codex_home(&managed, &ambient)
             .expect_err("managed authority inputs fail closed");
         assert!(error.to_string().contains("unexpected rules file"));
+    }
+
+    #[test]
+    fn a_plugins_directory_codex_created_does_not_block_the_next_execution() {
+        // Codex writes `plugins/` into its home while it runs. Treating that
+        // as a forbidden configuration input meant the first execution in a
+        // Task's log directory always succeeded and every later one died
+        // deterministically — so a re-review, or any retry after a review,
+        // could not run at all. Observed as three identical reviewer failures
+        // on a Task whose first reviewer attempt had completed normally.
+        let root = std::env::temp_dir().join(format!(
+            "forge-codex-plugins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let managed = root.join("managed");
+        let ambient = root.join("ambient");
+        fs::create_dir_all(&ambient).expect("ambient home writes");
+        fs::write(ambient.join("auth.json"), "{}").expect("ambient auth writes");
+
+        prepare_managed_codex_home(&managed, &ambient).expect("first execution prepares");
+
+        // Exactly what Codex leaves behind: the directory plus its own
+        // staging and cache children.
+        fs::create_dir_all(managed.join("plugins/.remote-plugin-install-staging"))
+            .expect("Codex plugin staging writes");
+        fs::create_dir_all(managed.join("plugins/cache")).expect("Codex plugin cache writes");
+
+        prepare_managed_codex_home(&managed, &ambient)
+            .expect("a second execution must prepare over Codex's own plugins directory");
+        assert!(
+            !managed.join("plugins").exists(),
+            "the plugins directory is runtime cache and is discarded, not inherited"
+        );
+
+        // The inputs Codex never writes stay fail-closed.
+        for forbidden in ["AGENTS.md", "hooks.json"] {
+            fs::write(managed.join(forbidden), "planted").expect("planted input writes");
+            let error = prepare_managed_codex_home(&managed, &ambient)
+                .expect_err("a planted configuration input must fail closed");
+            assert!(
+                error.to_string().contains("forbidden configuration input"),
+                "{forbidden} must still be refused: {error}"
+            );
+            fs::remove_file(managed.join(forbidden)).expect("planted input clears");
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

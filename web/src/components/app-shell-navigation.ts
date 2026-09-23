@@ -2,6 +2,7 @@ import type { ComponentType } from 'react'
 import type { IconWeight } from '@phosphor-icons/react'
 import {
   ChatCircleDots,
+  ChatsCircle,
   ChartLineUp,
   Desktop,
   Gear,
@@ -12,8 +13,7 @@ import {
   Sliders,
 } from '@phosphor-icons/react'
 
-export type AppShellNavItem = {
-  to: string
+type NavItemBase = {
   key:
     | 'overview'
     | 'board'
@@ -27,20 +27,36 @@ export type AppShellNavItem = {
     | 'settings'
     | 'forgeSettings'
   icon: ComponentType<{ size?: string | number; weight?: IconWeight; className?: string }>
-  section: 'primary' | 'project' | 'workspace'
 }
 
+export type AppShellNavItem = NavItemBase &
+  (
+    | {
+        section: 'project'
+        to:
+          | '/projects/$projectId/board'
+          | '/projects/$projectId/chat'
+          | '/projects/$projectId/tasks'
+          | '/projects/$projectId/overview'
+          | '/projects/$projectId/settings'
+      }
+    | {
+        section: 'account' | 'workspace'
+        to: '/chat' | '/agents' | '/mission-control' | '/daemons' | '/operations' | '/settings'
+      }
+  )
+
 const navItems: AppShellNavItem[] = [
-  { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'primary' },
-  { to: '/chat', key: 'mainChat', icon: ChatCircleDots, section: 'primary' },
-  { to: '/projects/$projectId/overview', key: 'overview', icon: ChartLineUp, section: 'project' },
-  { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
+  { to: '/chat', key: 'mainChat', icon: ChatCircleDots, section: 'account' },
+  { to: '/projects/$projectId/board', key: 'board', icon: Kanban, section: 'project' },
   {
     to: '/projects/$projectId/chat',
     key: 'agentWorkspace',
-    icon: ChatCircleDots,
+    icon: ChatsCircle,
     section: 'project',
   },
+  { to: '/projects/$projectId/tasks', key: 'tasks', icon: List, section: 'project' },
+  { to: '/projects/$projectId/overview', key: 'overview', icon: ChartLineUp, section: 'project' },
   { to: '/projects/$projectId/settings', key: 'settings', icon: Gear, section: 'project' },
   { to: '/agents', key: 'agentSettings', icon: Robot, section: 'workspace' },
   { to: '/mission-control', key: 'missionControl', icon: Pulse, section: 'workspace' },

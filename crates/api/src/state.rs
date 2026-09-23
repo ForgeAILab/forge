@@ -226,6 +226,8 @@ impl AppState {
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
+        self.embedded_agent_service
+            .set_command_policy(&config.commands);
         // The constructor only had `ForgeConfig::default()`, so every data-dir
         // path resolved against `~/.forge` rather than the server's actual
         // `--data-dir`. Re-point them here, where the real configuration first

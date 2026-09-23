@@ -300,12 +300,24 @@ async fn transition_to_review_runs_configured_review_runner() {
             .expect("workspace loads")
             .expect("workspace exists");
     std::fs::create_dir_all(&workspace.worktree_path).expect("temp worktree creates");
+    // Review reviews a finished attempt: the claimed execution is the
+    // candidate, and it has to be terminal before the Task can enter review.
+    sqlx::query("UPDATE execution SET status = 'completed', stopped_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&claimed.execution.id)
+        .execute(db.pool())
+        .await
+        .expect("candidate execution completes");
+    let claimed_task = TaskRepo::get_by_id(&*db, &claimed.task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
 
     let result = service
         .transition(
-            claimed.task.id.clone(),
+            claimed_task.id.clone(),
             "review".to_owned(),
-            claimed.task.version,
+            claimed_task.version,
         )
         .await
         .expect("task enters review and review runs");

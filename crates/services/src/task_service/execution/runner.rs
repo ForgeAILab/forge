@@ -1303,13 +1303,24 @@ impl TaskService {
         }
 
         if updated.status == ExecutionStatus::Completed {
-            if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
-                tracing::warn!(
-                    task_id = %task.id,
-                    execution_id = %updated.id,
-                    %error,
-                    "failed to clear execution retry metadata"
-                );
+            // A reviewer/auditor process exiting cleanly is not progress: the
+            // verdict it produced decides whether the Task advances, and an
+            // unusable verdict schedules another review attempt. Clearing the
+            // retry budget here would reset that counter on every attempt, so
+            // the budget could never deplete and the review would re-run
+            // without bound. A verdict that does settle leaves `review`, and
+            // the state change clears the budget on the transition instead.
+            let reviewer_outcome_pending = updated.role == crate::workflow::default_roles::REVIEWER
+                || updated.role == crate::workflow::default_roles::AUDITOR;
+            if !reviewer_outcome_pending {
+                if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        execution_id = %updated.id,
+                        %error,
+                        "failed to clear execution retry metadata"
+                    );
+                }
             }
             if updated.role == crate::workflow::default_roles::PLANNER
                 && task.status == crate::workflow::default_states::PLANNING

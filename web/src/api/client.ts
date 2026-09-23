@@ -366,12 +366,18 @@ export function searchUsers(q: string): Promise<UserSearchResult[]> {
 
 // --- Project Members ---
 
-export function listMembers(projectId: string): Promise<ProjectMemberResponse[]> {
-  return apiFetch<ProjectMemberResponse[]>(`/projects/${projectId}/members`)
+export function listMembers(
+  projectId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<ProjectMemberResponse[]> {
+  return apiFetch<ProjectMemberResponse[]>(`/projects/${projectId}/members`, options)
 }
 
-export function listProjectAgents(projectId: string): Promise<Agent[]> {
-  return apiFetch<Agent[]>(`/projects/${projectId}/agents`)
+export function listProjectAgents(
+  projectId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<Agent[]> {
+  return apiFetch<Agent[]>(`/projects/${projectId}/agents`, options)
 }
 
 export function addMember(

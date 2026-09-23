@@ -28,6 +28,24 @@ pub struct ForgeConfig {
     pub project: ProjectSettings,
     #[serde(default)]
     pub providers: ProviderDeclarations,
+    #[serde(default)]
+    pub commands: CommandPolicyConfig,
+}
+
+/// Which programs an Agent may spawn inside its own workspace.
+///
+/// Forge ships a built-in allowlist covering build and test tooling. This is
+/// how an owner widens it for a stack Forge does not know about, or narrows
+/// it to exactly what a deployment permits. A Project can layer its own
+/// `command_allowlist` over the result through its settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommandPolicyConfig {
+    /// Programs added to the built-in allowlist (or to `only`, when set).
+    pub allow: Vec<String>,
+    /// Replaces the built-in allowlist outright. An empty list denies every
+    /// command, which is a legitimate choice for a read-only deployment.
+    pub only: Option<Vec<String>>,
 }
 
 /// Model providers declared in the user-owned Forge config file. Solo uses
@@ -359,6 +377,7 @@ impl Default for ForgeConfig {
             scaffold: ScaffoldConfig::default(),
             project: ProjectSettings::default(),
             providers: ProviderDeclarations::default(),
+            commands: CommandPolicyConfig::default(),
         }
     }
 }

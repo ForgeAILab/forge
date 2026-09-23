@@ -2,7 +2,7 @@
 import type { AuthorizationProvenance } from "./AuthorizationProvenance";
 import type { DecisionRecordState } from "./DecisionRecordState";
 
-export type ReleaseDecisionReference = { decision_id: string, state: DecisionRecordState, digest: string, rationale: string, authorization: AuthorizationProvenance,
+export type ReleaseDecisionReference = { decision_id: string, state: DecisionRecordState, digest: string, rationale: string, authorization: AuthorizationProvenance, 
 /**
  * A decision may govern a whole baseline/Charter rather than one check;
  * scope is therefore explicit and nullable rather than fabricated.

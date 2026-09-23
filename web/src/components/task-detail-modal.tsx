@@ -8,15 +8,13 @@ import {
   useAgentsQuery,
   useApproveGate,
   useCancelTask,
-  useExecutionsQuery,
   useRejectGate,
   useResetTaskWorkspace,
   useReviewsQuery,
   useRecoverTask,
-  useTaskQuery,
+  useTaskDetailQuery,
   useTransitionTask,
   useUpdateTask,
-  useWorkflowQuery,
 } from '@/api/hooks'
 import { TaskDetailHeader } from '@/components/task-detail/task-detail-header'
 import { TaskDetailSidebar } from '@/components/task-detail/task-detail-sidebar'
@@ -35,7 +33,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getAvailableTaskTransitions } from '@/components/task-controls'
-import { getApiErrorMessage } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { getBlockingAnnotation } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
@@ -85,10 +83,12 @@ interface TaskDetailModalProps {
 
 export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps) {
   const navigate = useNavigate()
-  const taskQuery = useTaskQuery(taskId)
-  const executionsQuery = useExecutionsQuery(taskId)
-  const reviewsQuery = useReviewsQuery(taskId)
-  const agentsQuery = useAgentsQuery()
+  const taskDetailQuery = useTaskDetailQuery(taskId, { enabled: open })
+  const [activeModalTab, setActiveModalTab] = useState<'executions' | 'review' | 'history'>(
+    'executions',
+  )
+  const reviewsQuery = useReviewsQuery(taskId, { enabled: open })
+  const agentsQuery = useAgentsQuery({ enabled: open })
   const updateTask = useUpdateTask()
   const transitionTask = useTransitionTask()
   const approveGate = useApproveGate()
@@ -102,11 +102,13 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   const [descriptionDraft, setDescriptionDraft] = useState('')
   const [priorityDraft, setPriorityDraft] = useState('')
 
-  const task = taskQuery.data
+  const task = taskDetailQuery.data?.task
   const errorInfo = useMemo(() => getErrorInfo(task), [task])
-  const workflowQuery = useWorkflowQuery(task?.project_id ?? '')
-  const workflow = workflowQuery.data
-  const executions = useMemo(() => executionsQuery.data?.items ?? [], [executionsQuery.data])
+  const workflow = taskDetailQuery.data?.workflow
+  const executions = useMemo(
+    () => taskDetailQuery.data?.executions.items ?? [],
+    [taskDetailQuery.data?.executions.items],
+  )
   const agents = agentsQuery.data?.items ?? []
   const agentNamesById = useMemo(
     () => new Map(agents.map((agent) => [agent.id, agent.name])),
@@ -129,6 +131,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
 
   useEffect(() => {
     if (open) return
+    setActiveModalTab('executions')
     const timeout = window.setTimeout(() => {
       setEditingTitle(false)
       setEditingDescription(false)
@@ -347,16 +350,17 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
 
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
           <main className="min-w-0 shrink-0 p-4 sm:p-6 lg:flex-1 lg:overflow-y-auto">
-            {taskQuery.isLoading ? (
+            {taskDetailQuery.isLoading ? (
               <div className="space-y-4">
                 <Skeleton className="h-8 w-3/4" />
                 <Skeleton className="h-24 w-full" />
               </div>
-            ) : taskQuery.isError ? (
+            ) : taskDetailQuery.isError && !taskDetailQuery.data ? (
               <ErrorBanner
-                error={taskQuery.error}
-                fallback="Task failed to load"
-                onRetry={() => void taskQuery.refetch()}
+                error={taskDetailQuery.error}
+                fallback="Task details failed to load"
+                onRetry={() => void taskDetailQuery.refetch()}
+                showRetry={isTransientApiError(taskDetailQuery.error)}
               />
             ) : task ? (
               <div className="space-y-6">
@@ -452,17 +456,22 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   )}
                 </div>
 
-                {task.parent_task_id == null ? <TaskSubtasksPanel task={task} /> : null}
+                {task.parent_task_id == null ? (
+                  <TaskSubtasksPanel task={task} executions={executions} />
+                ) : null}
 
                 <TaskDependenciesPanel task={task} />
 
-                <Tabs defaultValue="executions">
+                <Tabs
+                  value={activeModalTab}
+                  onValueChange={(value) => setActiveModalTab(value as typeof activeModalTab)}
+                >
                   <TabsList>
                     <TabsTrigger value="executions">
                       {productTerm('run', 0)}
-                      {executions.length > 0 && (
+                      {(taskDetailQuery.data?.executions.total_count ?? 0) > 0 && (
                         <span className="ml-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-muted-foreground/10 px-1.5 text-micro font-medium">
-                          {executions.length}
+                          {taskDetailQuery.data?.executions.total_count}
                         </span>
                       )}
                     </TabsTrigger>
@@ -489,7 +498,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                       agentName={agentName}
                       executions={executions}
                       formatDate={formatDate}
-                      isLoading={executionsQuery.isLoading}
+                      isLoading={taskDetailQuery.isLoading}
                       taskId={taskId}
                       onClose={onClose}
                     />
@@ -497,11 +506,22 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
 
                   {showReviewTab ? (
                     <TabsContent value="review" className="space-y-4 pt-2">
-                      <ModalReviewSummary
-                        latestReview={latestReview}
-                        reviewCount={reviews.length}
-                        onOpenFullPage={openFullPage}
-                      />
+                      {reviewsQuery.isError ? (
+                        <ErrorBanner
+                          error={reviewsQuery.error}
+                          fallback="Reviews failed to load"
+                          onRetry={() => void reviewsQuery.refetch()}
+                          showRetry={isTransientApiError(reviewsQuery.error)}
+                        />
+                      ) : reviewsQuery.isLoading ? (
+                        <Skeleton className="h-20 w-full" />
+                      ) : (
+                        <ModalReviewSummary
+                          latestReview={latestReview}
+                          reviewCount={reviews.length}
+                          onOpenFullPage={openFullPage}
+                        />
+                      )}
                     </TabsContent>
                   ) : null}
 
@@ -524,7 +544,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             cancelTask={cancelTask}
             executions={executions}
             formatDate={formatDate}
-            isLoading={taskQuery.isLoading}
+            isLoading={taskDetailQuery.isLoading}
             priorityDraft={priorityDraft}
             savePriority={savePriority}
             setPriorityDraft={setPriorityDraft}

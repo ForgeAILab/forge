@@ -107,6 +107,8 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
+| GET    | `/api/v1/tasks/{id}/detail` | Load the Task detail bootstrap in one request: task, effective workflow, and a page of executions |
+| GET    | `/api/v1/tasks/{id}/relations` | Read direct subtask, dependency, and dependent summaries without scanning the Project task list |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
@@ -933,6 +935,22 @@ cancellation state succeeds without another transition. `task.recover`
 remains the command for stopped work that should run again. This is a native
 operation only; the existing `POST /api/v1/tasks/{id}/cancel` endpoint remains
 the human/API surface.
+
+The ReadyOnly native `task.dependency` operation adds or removes one
+prerequisite edge between two Tasks in the bound Project. Its closed payload is
+`action: "add" | "remove"`, `task_id` (the Task that waits),
+`depends_on_task_id` (the Task it waits for), and a non-empty `rationale`.
+Forge derives the Project from the authenticated binding and rejects a Task
+from another Project in either position. Adding refuses a cancelled
+prerequisite and a self-edge; removing the last cancelled prerequisite clears
+the dependency block it caused.
+
+Without this, `depends_on_task_ids` was settable only at `task.propose` and an
+Agent re-planning a graph had to cancel and recreate every downstream Task —
+each with a new id — because a dependent of a cancelled Task is blocked with
+`cancel_task` as its only advertised recovery, and a cancelled Task cannot be
+recovered at all. The existing `POST`/`DELETE /api/v1/tasks/{id}/dependencies`
+endpoints remain the human/API surface and are unchanged.
 
 Main Charter drafts execute directly through the shared Genesis command, while
 Charter reads/readiness/diffs/approval targets use the query boundary and do
@@ -2402,6 +2420,28 @@ resolution events. Human `task.blocked` and `task.failed` notifications are
 emitted only from the committed Task outcome after disposition, never from an
 individual attempt failure.
 
+## Task detail bootstrap
+
+`GET /api/v1/tasks/{id}/detail` returns a `TaskDetailResponse` with `task`
+(`TaskResponse`), `workflow` (the effective `WorkflowDefinition` for that
+Task), and `executions` (one `PaginatedResponse<ExecutionResponse>` shaped
+page). The execution page accepts the same `cursor`, `limit`, `include_total`,
+`sort_by`, and `sort_order` parameters as
+`GET /api/v1/tasks/{id}/executions`. Its `next_cursor` can be passed to the
+execution-list endpoint for subsequent pages. Reviews, comments, diffs, and
+logs are loaded from their existing endpoints when needed.
+
+`GET /api/v1/tasks/{id}/relations` returns `parent` (or `null`) and three arrays: `subtasks` in
+subtask order, `dependencies` (Tasks this Task depends on), and `dependents`
+(Tasks that depend on this Task). Each `TaskRelationSummary` contains its
+`id`, `title`, `status`, `parent_task_id`, `subtask_order`, and `created_at`.
+`missing_dependency_ids` lists retained edges whose target Task was soft-deleted,
+so clients can still offer removal without exposing the deleted Task's title.
+The `subtasks` array omits archived children, matching the default Project Task
+list used by the modal.
+These arrays include only direct relations and do not scan all Project Tasks.
+Task pickers can use the paginated Project task list with `q` search instead.
+
 ## Pagination
 
 Paginated list endpoints return `items` (not `data`) and opaque cursors.
@@ -2425,6 +2465,7 @@ subset and defaults.
 |-------|-------------|
 | `cursor` | Opaque pagination cursor returned from the previous page |
 | `limit` | Page size (default 20, max 100) |
+| `q` | Search Task titles and descriptions within the Project before pagination |
 | `sort_by` | `created_at`, `updated_at`, `priority`, `board_position`, `title`, `status`, `agent`, `task_type`, `id` |
 | `sort_order` | `asc`, `desc` |
 | `status` | Comma-separated status filter |
@@ -2623,6 +2664,34 @@ Terminal configuration lives under the `terminal` config section:
 `terminal.max_sessions_per_task` must be less than or equal to
 `terminal.max_sessions_per_user`; invalid terminal configuration is rejected
 when Forge loads config.
+
+Workspace command policy lives under `commands`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `commands.allow` | `[]` | Programs added to the built-in allowlist |
+| `commands.only` | unset | Replaces the built-in allowlist outright; `[]` denies every command |
+
+Entries must be bare program names — a path, an argument, or anything with a
+separator is dropped and logged at startup, so a malformed entry can never
+widen the set. The built-in list covers building and testing software
+(`cargo`, `go`, `pnpm`, `uv`, `gradle`, `swift`, `make`, `git`, core file and
+text utilities, and their peers). Programs that can mount the host filesystem
+(`docker`, `podman`), open an outbound session (`curl`, `wget`, `ssh`), or run
+a program chosen at runtime (`xargs`, `env`) are deliberately absent and must
+be added here.
+
+A Project layers its own policy over that result through the `command_allowlist`
+key in its settings (`PATCH /api/v1/projects/{id}` with
+`{"settings": {"command_allowlist": {"allow": ["terraform"]}}}`), using the same
+two keys and the same rules: `only` replaces the inherited set, `allow` adds to
+it. A Project that declares nothing inherits the server's list unchanged, and a
+Project's additions never reach another Project or the account scratch scope.
+
+The allowlist is a blast-radius bound, not a sandbox: `bash` and `sh` are on it
+because real build tooling needs them, and a shell can reach anything the
+workspace itself can. What it does buy is that the reachable tool surface is
+the owner's decision rather than whatever is on `PATH`.
 
 Public search configuration lives under `public_search`:
 

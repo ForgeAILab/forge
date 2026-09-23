@@ -547,6 +547,14 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::tasks::delete_task),
         )
         .route(
+            "/api/v1/tasks/{id}/detail",
+            get(routes::tasks::get_task_detail),
+        )
+        .route(
+            "/api/v1/tasks/{id}/relations",
+            get(routes::tasks::get_task_relations),
+        )
+        .route(
             "/api/v1/tasks/{id}/prompt-preview",
             get(routes::tasks::prompt_preview),
         )

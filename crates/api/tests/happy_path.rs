@@ -113,7 +113,18 @@ PY"# }
     .await;
     let task_id = created_task.id;
     assert_eq!(created_task.status, "todo".to_owned());
-    assert_eq!(created_task.version, 1);
+    // Creation applies the Project's default role assignments, so the created
+    // Task is past version 1 by the time it is returned. What matters is that
+    // the response is not a pre-assignment snapshot: a client's next optimistic
+    // write must succeed against the version it was handed.
+    let persisted_task: TaskResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(created_task.version, persisted_task.version);
 
     let claimed: TaskResponse = json_request(
         &harness.app,
@@ -124,7 +135,11 @@ PY"# }
     )
     .await;
     assert_eq!(claimed.status, "in_progress".to_owned());
-    assert_eq!(claimed.version, 2);
+    // Claiming is several authority writes, not one: the coder assignment,
+    // the transition itself, and the entry barrier its blocking before-work
+    // hook opens and closes. The exact count is asserted so a change to what
+    // a claim commits shows up here rather than silently.
+    assert_eq!(claimed.version, 5);
 
     let execution = single_execution_for_task(&harness.app, &task_id).await;
     let execution_id = execution.id.clone();

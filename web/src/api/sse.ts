@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { invalidateAnalyticsQueries } from '@/api/analytics-query-invalidation'
 import { qk } from '@/api/query-keys'
+import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
 import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
 import type { AgentChatTurn } from '@/features/agent-chat/types'
@@ -90,6 +91,37 @@ function invalidateAllActiveQueries(queryClient: QueryClient): void {
     },
     { cancelRefetch: false },
   )
+}
+
+const TASK_RELATION_SUMMARY_EVENTS = new Set([
+  'task.created',
+  'task.updated',
+  'task.status_changed',
+  'task.transitioned',
+  'task.moved',
+  'task.done',
+  'task.completed',
+  'task.blocked',
+  'task.failed',
+  'task.cancelled',
+  'task.recovered',
+  'task.archived',
+  'task.deleted',
+])
+
+function invalidateProjectTaskRelations(
+  queryClient: QueryClient,
+  projectId: string,
+  changedTaskId: string,
+): void {
+  void queryClient.invalidateQueries({
+    predicate: (query) =>
+      query.queryKey[0] === 'tasks' &&
+      query.queryKey[2] === 'relations' &&
+      query.queryKey[1] !== changedTaskId &&
+      query.meta?.projectId === projectId,
+    refetchType: 'active',
+  }, { cancelRefetch: false })
 }
 
 const TASK_LIST_INVALIDATION_THROTTLE_MS = 500
@@ -242,7 +274,6 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
 
   if (scopeType === 'task' && scopeId) {
     void queryClient.invalidateQueries({ queryKey: qk.task(scopeId) })
-    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(scopeId) })
     invalidateProjectTaskLists(queryClient)
     if (entityType === 'review') {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(scopeId) })
@@ -304,8 +335,10 @@ export function routeSsePayload(
   if (eventType.startsWith('task.')) {
     const taskId = payload.task_id ?? payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
     invalidateProjectTaskLists(queryClient, payload.project_id)
+    if (payload.project_id && TASK_RELATION_SUMMARY_EVENTS.has(eventType)) {
+      invalidateProjectTaskRelations(queryClient, payload.project_id, taskId)
+    }
 
     if (
       eventType === 'task.status_changed' ||
@@ -361,7 +394,6 @@ export function routeSsePayload(
     }
     if (payload.task_id) {
       void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(payload.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.executions(payload.task_id) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDiff(payload.task_id) })
       invalidateProjectTaskLists(queryClient)
@@ -398,6 +430,7 @@ export function routeSsePayload(
   if (eventType.startsWith('project.')) {
     void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
     void queryClient.invalidateQueries({ queryKey: qk.projects })
+    invalidateProjectTaskDetails(queryClient, payload.entity_id)
     invalidateAnalyticsQueries(queryClient, payload.entity_id)
     if (eventType === 'project.deleted') {
       // 8.4.4 / F17: an external deletion while a deleted route is open
@@ -412,7 +445,6 @@ export function routeSsePayload(
 
   if ((eventType.startsWith('review.') || eventType.startsWith('merge.')) && payload.task_id) {
     void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
-    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(payload.task_id) })
     if (eventType.startsWith('review.')) {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(payload.task_id) })
     }
@@ -420,7 +452,6 @@ export function routeSsePayload(
   }
   if (eventType === 'follow_up.dispatched' && payload.task_id) {
     void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
-    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(payload.task_id) })
     void queryClient.invalidateQueries({ queryKey: qk.executions(payload.task_id) })
     if (payload.execution_id) {
       void queryClient.invalidateQueries({ queryKey: qk.execution(payload.execution_id) })

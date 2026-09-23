@@ -8,7 +8,9 @@ import {
   getExecutionLogs,
   type ProjectMilestoneReleaseInput,
   useReleaseProjectMilestone,
+  useUpdateWorkflow,
 } from './hooks'
+import { qk } from './query-keys'
 import { useAuthStore } from '@/stores/auth'
 
 describe('execution log API helpers', () => {
@@ -97,5 +99,35 @@ describe('execution log API helpers', () => {
       queryKey: ['projects', 'project-1', 'analytics'],
     })
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['analytics', 'usage'] })
+  })
+
+  it('invalidates cached task details for the updated project workflow', async () => {
+    useAuthStore.setState({ accessToken: 'access-token', refreshToken: 'refresh-token' })
+    vi.spyOn(window, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ states: [], transitions: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+    })
+    queryClient.setQueryData(qk.taskDetail('task-1'), { task: { project_id: 'project-1' } })
+    queryClient.setQueryData(qk.taskDetail('task-2'), { task: { project_id: 'project-2' } })
+    const { result } = renderHook(() => useUpdateWorkflow(), {
+      wrapper: ({ children }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    })
+
+    act(() =>
+      result.current.mutate({
+        projectId: 'project-1',
+        body: { template_name: null, definition: null },
+      }),
+    )
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    expect(queryClient.getQueryState(qk.taskDetail('task-1'))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.taskDetail('task-2'))?.isInvalidated).toBe(false)
   })
 })

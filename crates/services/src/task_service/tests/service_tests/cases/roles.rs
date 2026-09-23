@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::task_service::tests::helpers::seed_role_assignment;
 
 #[tokio::test]
 async fn reassign_role_updates_assignment_and_emits_event() {
@@ -229,6 +230,13 @@ async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
         .await
         .expect("agent capacity updates");
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
     let workspace_root = TempDir::new().expect("workspace root creates");
     let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     let execution = {

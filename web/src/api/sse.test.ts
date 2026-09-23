@@ -5,6 +5,7 @@ import { routeSsePayload, useSSE } from './sse'
 import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
 import type { AgentChatTurn } from '@/features/agent-chat/types'
+import { qk } from '@/api/query-keys'
 
 function createMocks() {
   const invalidateQueries = vi.fn()
@@ -47,7 +48,6 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['executions', 'exec-1'] }],
         [{ queryKey: ['tasks', 'task-1'] }],
-        [{ queryKey: ['tasks', 'task-1', 'detail'] }],
         [{ queryKey: ['tasks', 'task-1', 'executions'] }],
         [{ queryKey: ['tasks', 'task-1', 'diff'] }],
         [{ queryKey: ['agents'] }],
@@ -94,10 +94,76 @@ describe('routeSsePayload', () => {
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
         [{ queryKey: ['tasks', 'task-1'] }],
-        [{ queryKey: ['tasks', 'task-1', 'detail'] }],
         [{ queryKey: ['projects', 'proj-1', 'tasks'] }, { cancelRefetch: false }],
       ]),
     )
+  })
+
+  it('invalidates only active task relation queries from the changed task project', () => {
+    const { queryClient, invalidateQueries, dispatch } = createMocks()
+    routeSsePayload(
+      {
+        event_type: 'task.status_changed',
+        entity_id: 'task-1',
+        task_id: 'task-1',
+        project_id: 'proj-1',
+        timestamp: '2026-05-05T00:00:00Z',
+      },
+      queryClient,
+      { dispatch },
+    )
+
+    const call = invalidateQueries.mock.calls.find(([options]) =>
+      Boolean(options && typeof options === 'object' && 'predicate' in options),
+    )
+    expect(call?.[0]).toMatchObject({ refetchType: 'active' })
+    expect(call?.[1]).toMatchObject({ cancelRefetch: false })
+    const predicate = (call?.[0] as { predicate?: (query: unknown) => boolean }).predicate
+    expect(predicate).toBeTypeOf('function')
+    expect(
+      predicate?.({
+        queryKey: ['tasks', 'task-parent', 'relations'],
+        meta: { projectId: 'proj-1' },
+      }),
+    ).toBe(true)
+    expect(
+      predicate?.({
+        queryKey: ['tasks', 'task-1', 'relations'],
+        meta: { projectId: 'proj-1' },
+      }),
+    ).toBe(false)
+    expect(
+      predicate?.({
+        queryKey: ['tasks', 'other-parent', 'relations'],
+        meta: { projectId: 'proj-2' },
+      }),
+    ).toBe(false)
+    expect(
+      predicate?.({
+        queryKey: ['tasks', 'task-1', 'detail'],
+        meta: { projectId: 'proj-1' },
+      }),
+    ).toBe(false)
+  })
+
+  it('does not invalidate task relations for high-frequency task media events', () => {
+    const { queryClient, invalidateQueries, dispatch } = createMocks()
+    routeSsePayload(
+      {
+        event_type: 'task.media.uploaded',
+        entity_id: 'task-1',
+        task_id: 'task-1',
+        project_id: 'proj-1',
+        timestamp: '2026-05-05T00:00:00Z',
+      },
+      queryClient,
+      { dispatch },
+    )
+    expect(
+      invalidateQueries.mock.calls.some(([options]) =>
+        Boolean(options && typeof options === 'object' && 'predicate' in options),
+      ),
+    ).toBe(false)
   })
 
   it('ignores uncommitted Agent Chat streaming deltas until the ledger entry arrives', () => {
@@ -157,7 +223,6 @@ describe('routeSsePayload', () => {
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
         [{ queryKey: ['tasks', 'task-1'] }],
-        [{ queryKey: ['tasks', 'task-1', 'detail'] }],
         [{ queryKey: ['tasks', 'task-1', 'reviews'] }],
       ]),
     )
@@ -227,6 +292,27 @@ describe('routeSsePayload', () => {
       ]),
     )
     expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('invalidates cached task details for the project on project events', () => {
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(qk.taskDetail('task-1'), { task: { project_id: 'proj-1' } })
+    queryClient.setQueryData(qk.taskDetail('task-2'), { task: { project_id: 'proj-2' } })
+    queryClient.setQueryData(qk.taskDiff('task-1'), { files: [] })
+
+    routeSsePayload(
+      {
+        event_type: 'project.updated',
+        entity_id: 'proj-1',
+        timestamp: '2026-05-05T00:00:00Z',
+      },
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+
+    expect(queryClient.getQueryState(qk.taskDetail('task-1'))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.taskDetail('task-2'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.taskDiff('task-1'))?.isInvalidated).toBe(false)
   })
 
   it('routes agent_chat.turn.control_transferred to the Agent Chat queries', () => {
@@ -386,7 +472,6 @@ describe('routeSsePayload', () => {
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
         [{ queryKey: ['tasks', 'task-1'] }],
-        [{ queryKey: ['tasks', 'task-1', 'detail'] }],
         [{ queryKey: ['tasks', 'task-1', 'reviews'] }],
       ]),
     )

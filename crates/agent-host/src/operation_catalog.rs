@@ -74,6 +74,15 @@ pub const TASK_REVIEW_OPERATION: &str = "task.review";
 /// This is a normal lifecycle command, including for a healthy queued or
 /// running Task; `task.recover` remains reserved for work that has stopped.
 pub const TASK_CANCEL_OPERATION: &str = "task.cancel";
+
+/// Add or remove one prerequisite edge between two Tasks in the bound
+/// Project.
+///
+/// Without this an Agent could only set edges at `task.propose` and never
+/// change one, so re-planning meant cancelling every downstream Task and
+/// recreating it under a new id — while the same capability was already
+/// reachable over REST.
+pub const TASK_DEPENDENCY_OPERATION: &str = "task.dependency";
 /// Repair a Task that stopped, instead of replacing it. A transient failure --
 /// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
@@ -149,7 +158,24 @@ pub enum OperationPermission {
 }
 
 impl OperationPermission {
+    /// Whether this contract's permission is the one a caller asked for, in
+    /// any scope that carries it.
+    ///
+    /// The mapping is per scope (`ProposeTask` is `propose_task` for a
+    /// Project and an Agent Chat, and nothing for a Task), so admission has
+    /// to ask the enum rather than compare a string it guessed.
     #[must_use]
+    pub fn admits_permission(self, permission: &str) -> bool {
+        [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+            CanonicalScopeType::Task,
+        ]
+        .into_iter()
+        .any(|scope_type| self.for_scope(scope_type) == Some(permission))
+    }
+
     pub const fn for_scope(self, scope_type: CanonicalScopeType) -> Option<&'static str> {
         match (self, scope_type) {
             (Self::ReadAccountOrAgentChat, CanonicalScopeType::Account) => Some("read_account"),
@@ -526,6 +552,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: TASK_DEPENDENCY_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::GenericProposal,
+        input: OperationInputContract::CoordinationEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeTask,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: TASK_RECOVER_OPERATION,
         surface: OperationSurface::Coordination,
         // Coordination composes GenericProposal operations into
@@ -735,6 +772,40 @@ pub fn operation_permission(
         _ => return None,
     };
     Some(permission)
+}
+
+/// Whether `operation` is a coordination command an Agent may execute
+/// directly under `requested_permission`.
+///
+/// This used to be a hand-written list of operation names in the policy
+/// layer, and its own comment recorded the cost: `task.recover` was declared,
+/// implemented end to end, and omitted from that list, so it was refused at
+/// runtime with a message that named nothing. The catalog row already carries
+/// every fact the decision needs — a coordination surface, the generic
+/// proposal exposure, a direct classification, and the permission — so ask it
+/// instead. Typed-proposal coordination operations (`task.worklog`,
+/// `task.evidence`) execute through their own dedicated path and are
+/// deliberately not admitted here.
+#[must_use]
+pub fn is_coordination_direct_command(operation: &str, requested_permission: &str) -> bool {
+    is_coordination_generic_proposal(operation)
+        && operation_contract(operation)
+            .is_some_and(|contract| contract.permission.admits_permission(requested_permission))
+}
+
+/// Whether `operation` rides the generic coordination proposal envelope.
+///
+/// This is the set the flat provider-facing payload surface has to serve: one
+/// envelope shared by every such operation, so a field any of them requires
+/// must be declared there or a provider that surfaces only declared
+/// properties will strip it.
+#[must_use]
+pub fn is_coordination_generic_proposal(operation: &str) -> bool {
+    operation_contract(operation).is_some_and(|contract| {
+        contract.surface == OperationSurface::Coordination
+            && contract.exposure == OperationExposure::GenericProposal
+            && contract.classification == OperationClassification::DirectCommand
+    })
 }
 
 #[must_use]
@@ -996,6 +1067,47 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn direct_command_admission_is_derived_and_still_excludes_the_typed_pair() {
+        // The set the policy layer used to hand-list. Pinning it here means a
+        // new coordination command is admitted the moment its catalog row
+        // exists, while a change that would widen admission by accident — a
+        // typed-proposal operation switching exposure, say — fails loudly.
+        let admitted: Vec<&str> = MIGRATED_OPERATION_CONTRACTS
+            .iter()
+            .map(|contract| contract.operation)
+            .filter(|operation| is_coordination_direct_command(operation, "propose_task"))
+            .collect();
+        assert_eq!(
+            admitted,
+            vec![
+                TASK_PROPOSE_OPERATION,
+                TASK_ADAPTIVE_OPERATION,
+                TASK_REVIEW_OPERATION,
+                TASK_CANCEL_OPERATION,
+                TASK_DEPENDENCY_OPERATION,
+                TASK_RECOVER_OPERATION,
+            ]
+        );
+
+        // These two are coordination direct commands as well, but they run
+        // through their own capture path and must not be admitted here.
+        for typed in [TASK_WORKLOG_OPERATION, TASK_EVIDENCE_OPERATION] {
+            assert!(!is_coordination_direct_command(typed, "propose_task"));
+            assert!(!is_coordination_direct_command(typed, "task_read"));
+        }
+
+        // The permission is part of the decision, not decoration.
+        assert!(!is_coordination_direct_command(
+            TASK_CANCEL_OPERATION,
+            "read_project"
+        ));
+        assert!(!is_coordination_direct_command(
+            "task.invented",
+            "propose_task"
+        ));
+    }
 
     #[test]
     fn migrated_contracts_have_unique_complete_metadata() {

@@ -193,7 +193,7 @@ fn dispatch_role_follow_up_impl(
         };
         let lineage_parent = role_parent.as_ref().unwrap_or(&supplied_parent_execution);
         let agent_id = agent_override
-            .or(assigned_agent_for_follow_up(&service, &task_id, &role).await?)
+            .or(assigned_agent_for_role(&service, &task_id, &role).await?)
             .or_else(|| lineage_parent.agent_id.clone())
             .or_else(|| supplied_parent_execution.agent_id.clone())
             .ok_or_else(|| {
@@ -411,7 +411,11 @@ fn dispatch_role_follow_up_impl(
     })
 }
 
-async fn assigned_agent_for_follow_up(
+/// The Agent the current role assignment names, when it names one. The
+/// execution INSERT compares the launched principal against this row, so any
+/// launcher that picks an Agent for a workflow role must read it here rather
+/// than carry one over from an earlier execution.
+pub(super) async fn assigned_agent_for_role(
     service: &TaskService,
     task_id: &str,
     role: &str,

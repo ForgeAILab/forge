@@ -14,7 +14,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
+use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo};
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
     LogKind, ProviderCallAdmission, TaskExecutor, UsageCounters, UsageReport, UsageTelemetryState,
@@ -395,6 +395,17 @@ impl EmbeddedTaskExecutor {
             }
         }
 
+        // A Task worker's commands run in the Task worktree, so the owning
+        // Project's settings layer over the configured baseline.
+        let command_allowlist = match TaskRepo::get_by_id(&*self.db, &ctx.task_id, true).await {
+            Ok(Some(task)) => {
+                self.embedded_agents
+                    .effective_command_allowlist(Some(&task.project_id))
+                    .await
+            }
+            _ => self.embedded_agents.effective_command_allowlist(None).await,
+        };
+
         let output = self
             .backend
             .run_turn(
@@ -435,6 +446,7 @@ impl EmbeddedTaskExecutor {
                     system_prompt,
                     history: Vec::new(),
                     input: ctx.description.clone(),
+                    command_allowlist: Some(command_allowlist),
                     cancellation: cancellation.clone(),
                 },
                 log_sink.clone(),

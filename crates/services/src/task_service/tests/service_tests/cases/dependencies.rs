@@ -150,6 +150,11 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
     TaskDependencyRepo::add_dependency(&*db, &dependent.id, &prerequisite.id, &now_rfc3339())
         .await
         .expect("dependency creates");
+    // Adding a dependency edge advances the Task version.
+    let dependent = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("task reloads after its dependency edge")
+        .expect("task exists");
 
     let mut rx = event_bus.subscribe();
     let done = service
@@ -343,7 +348,11 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
         Some(&agent_id),
     )
     .await;
-
+    // The dependency edge advanced the Task version.
+    let dependent = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
     let blocked = service
         .transition(
             dependent.id.clone(),
@@ -351,10 +360,14 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
             dependent.version,
         )
         .await;
-    assert!(matches!(
-        blocked,
-        Err(ServiceError::GuardRejection { guard, .. }) if guard == "dependency_gate"
-    ));
+    assert!(
+        matches!(
+            blocked,
+            Err(ServiceError::GuardRejection { ref guard, .. }) if guard == "dependency_gate"
+        ),
+        "an unsatisfied dependency must reject agent work, got {:?}",
+        blocked.as_ref().map(|result| result.task.status.clone())
+    );
     let still_todo = TaskRepo::get_by_id(&*db, &dependent.id, false)
         .await
         .expect("dependent reloads")
@@ -401,6 +414,11 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
     TaskDependencyRepo::add_dependency(&*db, &parked.id, &prerequisite.id, &now_rfc3339())
         .await
         .expect("dependency creates");
+    // Adding a dependency edge advances the Task version.
+    let parked = TaskRepo::get_by_id(&*db, &parked.id, false)
+        .await
+        .expect("task reloads after its dependency edge")
+        .expect("task exists");
 
     let moved_back = service
         .transition(
@@ -432,6 +450,11 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
     TaskDependencyRepo::add_dependency(&*db, &cancellable.id, &prerequisite.id, &now_rfc3339())
         .await
         .expect("dependency creates");
+    // Adding a dependency edge advances the Task version.
+    let cancellable = TaskRepo::get_by_id(&*db, &cancellable.id, false)
+        .await
+        .expect("task reloads after its dependency edge")
+        .expect("task exists");
 
     let cancelled = service
         .cancel_task(cancellable.id)

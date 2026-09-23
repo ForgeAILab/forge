@@ -12,12 +12,11 @@ use db::{
     UpdateAgentCommitment, UpdateAgentInboxItem,
 };
 use forge_agent_host::{
-    classify_operation, is_allowed_project_direct_payload,
+    classify_operation, is_allowed_project_direct_payload, is_coordination_direct_command,
     is_project_orchestration_operation as is_catalog_project_orchestration_operation,
     operation_contract, OperationClassification, MAIN_CHARTER_DRAFT_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_PROPOSE_OPERATION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1326,14 +1325,11 @@ pub(crate) fn is_admitted_direct_command(
     if is_allowed_main_orchestration_operation(requested_permission, operation) {
         return true;
     }
-    matches!(
-        operation,
-        TASK_ADAPTIVE_OPERATION
-            | TASK_CANCEL_OPERATION
-            | TASK_PROPOSE_OPERATION
-            | TASK_REVIEW_OPERATION
-            | TASK_RECOVER_OPERATION
-    ) && requested_permission == "propose_task"
+    // Derived from the operation's own catalog row rather than re-listed
+    // here. A command that is declared and implemented but missing from a
+    // second list is refused at runtime with a message that names nothing,
+    // which is exactly how `task.recover` and `task.dependency` each failed.
+    is_coordination_direct_command(operation, requested_permission)
 }
 
 async fn evaluate_action_policy(
@@ -1674,6 +1670,7 @@ mod tests {
         CreateAgentProfile, CreateProject, CreateProjectAgentBinding, ProjectAgentBindingRepo,
         ProjectRepo, ReplaceProjectAgentBinding,
     };
+    use forge_agent_host::TASK_RECOVER_OPERATION;
     use forge_agent_host::{
         MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION,
         PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,

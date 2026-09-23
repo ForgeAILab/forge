@@ -6,14 +6,14 @@ use crate::{
     merge_service::MergeOutcome,
     task_service::config::{runtime_retry_budget, RetryBudgetKind},
     workflow::{
-        default_states, HookAction, HookContext, HookResult, REVIEW_REFRESH_MARKER,
-        TARGET_MOVED_MARKER,
+        default_states, HookAction, HookContext, HookResult, CONFLICT_HANDOFF_MARKER,
+        REVIEW_REFRESH_MARKER, TARGET_MOVED_MARKER,
     },
 };
 
 use super::common::{
-    block_task, create_system_comment, merge_fix_budget_result, persist_merge_error,
-    persist_target_repo_dirty_error, task, workspace_id,
+    block_task, block_task_with_annotation, create_system_comment, merge_fix_budget_result,
+    persist_merge_error, persist_target_repo_dirty_error, task, workspace_id,
 };
 
 pub struct RunMerge;
@@ -32,12 +32,20 @@ impl HookAction for RunMerge {
             };
         }
 
+        let outcome = merge_service.merge(ctx.task_id.clone()).await;
+        // The merge writes through the workspace and execution ledgers, so a
+        // Task snapshot read before it is already stale. Every compare-and-set
+        // below has to carry the version the merge left behind: with the
+        // pre-merge version they all fail as a version conflict, and because
+        // this hook is not blocking that failure is swallowed -- the Task sits
+        // in `merging` with no blocker, no annotation and no follow-up, which
+        // is what every real merge conflict did.
         let mut task = match task(ctx).await {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
 
-        match merge_service.merge(ctx.task_id.clone()).await {
+        match outcome {
             Ok(MergeOutcome::ReviewRequired { reason }) => {
                 if let Err(error) = db::TaskRepo::set_review_passed_at_cas(
                     &*ctx.db,
@@ -141,13 +149,20 @@ impl HookAction for RunMerge {
                         reason: error.to_string(),
                     };
                 }
-                if let Err(error) =
-                    persist_merge_error(ctx, &task, api_types::FailureKind::MergeConflict, &details)
-                        .await
+                match persist_merge_error(
+                    ctx,
+                    &task,
+                    api_types::FailureKind::MergeConflict,
+                    &details,
+                )
+                .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),
@@ -172,13 +187,20 @@ impl HookAction for RunMerge {
                 } else {
                     format!("worktree has uncommitted changes: {}", files.join(", "))
                 };
-                if let Err(error) =
-                    persist_merge_error(ctx, &task, api_types::FailureKind::DirtyWorktree, &details)
-                        .await
+                match persist_merge_error(
+                    ctx,
+                    &task,
+                    api_types::FailureKind::DirtyWorktree,
+                    &details,
+                )
+                .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 // The merging gate's only defined reject edge is merge_failed;
                 // cascading to review wedges the task in merging forever.
@@ -204,12 +226,13 @@ impl HookAction for RunMerge {
                         reason: error.to_string(),
                     };
                 }
-                if let Err(error) =
-                    persist_target_repo_dirty_error(ctx, &task, &details, &files).await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                match persist_target_repo_dirty_error(ctx, &task, &details, &files).await {
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),
@@ -226,6 +249,34 @@ impl HookAction for RunMerge {
                     &details,
                     api_types::FailureKind::TargetRepoDirty,
                     None,
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                HookResult::Ok
+            }
+            Ok(MergeOutcome::UnresolvedConflictMarkers { paths }) => {
+                // The Worker was handed this conflict and did not reconcile
+                // it; escalate rather than merge the markers or loop.
+                let block_reason = format!(
+                    "unresolved Git conflict markers remain in handed-off file(s) {} after the Worker's conflict repair",
+                    paths.join(", ")
+                );
+                if let Err(error) = block_task_with_annotation(
+                    ctx,
+                    &task,
+                    &block_reason,
+                    api_types::FailureKind::MergeConflict,
+                    None,
+                    Some(manual_merge_recovery_annotation(
+                        ctx,
+                        api_types::FailureKind::MergeConflict,
+                        &block_reason,
+                        "manual_workspace_repair",
+                    )),
                 )
                 .await
                 {
@@ -266,8 +317,8 @@ impl HookAction for RunMerge {
 /// Only actions the recover endpoint actually accepts for a Task parked in
 /// `merging` are advertised: `proceed_once` is review-only and would be
 /// rejected, so it is deliberately left out.
-async fn persist_merge_budget_annotation(ctx: &HookContext, reason: &str) -> db::Result<()> {
-    let annotation = serde_json::json!({
+fn merge_budget_annotation(reason: &str) -> String {
+    serde_json::json!({
         "type": api_types::FailureKind::MergeFixBudgetExhausted,
         "blocking_reason": reason,
         "message": reason,
@@ -277,41 +328,8 @@ async fn persist_merge_budget_annotation(ctx: &HookContext, reason: &str) -> db:
             api_types::RecoveryAction::OpenInteractive,
             api_types::RecoveryAction::CancelTask,
         ],
-    });
-    let mut current = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await?
-        .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
-        match db::TaskRepo::update(
-            &*ctx.db,
-            db::UpdateTask {
-                id: current.id.clone(),
-                expected_version: current.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(Some(annotation.to_string())),
-                blocked_json: None,
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: db::now_rfc3339(),
-            },
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    })
+    .to_string()
 }
 
 /// How many times one Task may be bounced back by contention before Forge
@@ -344,7 +362,7 @@ fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
 /// merge. A rebase conflict is a genuine failure and falls through to the
 /// manual-repair path. Managed Task agents cannot rebase or write the linked
 /// Git metadata, so Forge must not dispatch a follow-up they cannot complete.
-async fn target_moved_result(
+pub(super) async fn target_moved_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: &str,
@@ -362,20 +380,16 @@ async fn target_moved_result(
         let block_reason = format!(
             "{target_branch} kept advancing during review; stopped after {MAX_TARGET_MOVED_REBASES} rebase attempts"
         );
-        if let Err(error) = block_task(
+        if let Err(error) = block_task_with_annotation(
             ctx,
             task,
             &block_reason,
             api_types::FailureKind::MergeFixBudgetExhausted,
             None,
+            Some(merge_budget_annotation(&block_reason)),
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
-        if let Err(error) = persist_merge_budget_annotation(ctx, &block_reason).await {
             return HookResult::Failed {
                 reason: error.to_string(),
             };
@@ -440,18 +454,155 @@ async fn target_moved_result(
             }
         }
         Err(git::GitError::MergeConflict { stderr, .. }) => {
-            let _ = git::abort_rebase(worktree_path).await;
-            merge_failure_result(
-                ctx,
-                task,
-                format!("rebase onto {target_branch} conflicted: {stderr}"),
-                api_types::FailureKind::MergeConflict,
-            )
-            .await
+            // Coordination roots aggregate subtask branches and keep the
+            // manual-repair path; everything else goes back to its Worker.
+            match crate::task_service::coordination_root_has_subtasks(&ctx.db, task).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    let _ = git::abort_rebase(worktree_path).await;
+                    return merge_failure_result(
+                        ctx,
+                        task,
+                        format!("rebase onto {target_branch} conflicted: {stderr}"),
+                        api_types::FailureKind::MergeConflict,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = git::abort_rebase(worktree_path).await;
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            match git::continue_rebase_keeping_conflicts(worktree_path).await {
+                Ok(paths) => conflict_handoff_result(ctx, task, target_branch, &paths).await,
+                // The helper aborted the rebase, so the branch is as it was.
+                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
+                    merge_failure_result(
+                        ctx,
+                        task,
+                        format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"),
+                        api_types::FailureKind::MergeConflict,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    merge_failure_result(
+                        ctx,
+                        task,
+                        format!(
+                            "rebase onto {target_branch} conflicted: {stderr}; committing the conflict for the Worker failed: {error}"
+                        ),
+                        api_types::FailureKind::MergeConflict,
+                    )
+                    .await
+                }
+            }
         }
         Err(error) => HookResult::Failed {
             reason: error.to_string(),
         },
+    }
+}
+
+/// How many rebase conflicts one Task may be handed back to its Worker before
+/// Forge escalates. Each handoff is a *new* conflict — a sibling landed first
+/// again — not a failed repair; a repair that leaves markers behind escalates
+/// on its own through [`MergeOutcome::UnresolvedConflictMarkers`].
+const MAX_CONFLICT_HANDOFFS: i64 = 5;
+
+fn conflict_handoffs_since_boundary(entries: &[db::TransitionLog]) -> i64 {
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    crate::task_diagnostics::entries_since_retry_window_boundary(entries, None)
+        .iter()
+        .filter(|entry| {
+            entry.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
+                && entry.triggered_by == workflow_actor
+        })
+        .count() as i64
+}
+
+/// A rebase onto the moved target conflicted and Forge committed the conflict
+/// with its markers. Send the Task to `merge_failed` so its Worker reconciles
+/// the marked files — editing files is all that takes, and the Worker cannot
+/// run the rebase itself — after which the repair gets a fresh review.
+async fn conflict_handoff_result(
+    ctx: &HookContext,
+    task: &db::Task,
+    target_branch: &str,
+    paths: &[String],
+) -> HookResult {
+    let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return HookResult::Failed {
+                reason: error.to_string(),
+            };
+        }
+    };
+    let files = paths.join(", ");
+    if conflict_handoffs_since_boundary(&entries) >= MAX_CONFLICT_HANDOFFS {
+        let block_reason = format!(
+            "rebase onto {target_branch} conflicted again after {MAX_CONFLICT_HANDOFFS} conflict repairs (now in {files}); the branch is committed with conflict markers for repair"
+        );
+        if let Err(error) = block_task_with_annotation(
+            ctx,
+            task,
+            &block_reason,
+            api_types::FailureKind::MergeConflict,
+            None,
+            Some(manual_merge_recovery_annotation(
+                ctx,
+                api_types::FailureKind::MergeConflict,
+                &block_reason,
+                "manual_workspace_repair",
+            )),
+        )
+        .await
+        {
+            return HookResult::Failed {
+                reason: error.to_string(),
+            };
+        }
+        return HookResult::Ok;
+    }
+
+    let details =
+        format!("rebased onto {target_branch}; conflicts were committed with markers in: {files}");
+    if let Err(error) = create_system_comment(
+        ctx,
+        format!("Merge conflict handed back to the Worker: {details}"),
+    )
+    .await
+    {
+        return HookResult::Failed {
+            reason: error.to_string(),
+        };
+    }
+    if let Err(error) =
+        persist_merge_error(ctx, task, api_types::FailureKind::MergeConflict, &details).await
+    {
+        return HookResult::Failed {
+            reason: error.to_string(),
+        };
+    }
+    ctx.event_bus.publish(ForgeEvent {
+        event_type: "merge.failed".to_string(),
+        entity_id: ctx.task_id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::MergeFailed {
+            task_id: ctx.task_id.clone(),
+            reason: details.clone(),
+        },
+    });
+    HookResult::Cascade {
+        to: default_states::MERGE_FAILED.to_string(),
+        reason: format!(
+            "{CONFLICT_HANDOFF_MARKER} {details}{}{encoded}",
+            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
+            encoded = serde_json::to_string(paths).expect("path list serializes"),
+        ),
     }
 }
 
@@ -486,16 +637,18 @@ pub(super) async fn merge_failure_result(
             let block_reason = format!(
                 "coordination root requires manual workspace repair before integration can continue: {reason}"
             );
-            if let Err(error) = block_task(ctx, &task, &block_reason, kind, None).await {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
-            }
-            if let Err(error) = persist_manual_merge_recovery_annotation(
+            if let Err(error) = block_task_with_annotation(
                 ctx,
-                kind,
+                &task,
                 &block_reason,
-                "coordination_root",
+                kind,
+                None,
+                Some(manual_merge_recovery_annotation(
+                    ctx,
+                    kind,
+                    &block_reason,
+                    "coordination_root",
+                )),
             )
             .await
             {
@@ -517,16 +670,18 @@ pub(super) async fn merge_failure_result(
         let block_reason = format!(
             "manual task-worktree repair is required before integration can continue: {reason}"
         );
-        if let Err(error) = block_task(ctx, &task, &block_reason, kind, None).await {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
-        if let Err(error) = persist_manual_merge_recovery_annotation(
+        if let Err(error) = block_task_with_annotation(
             ctx,
-            kind,
+            &task,
             &block_reason,
-            "manual_workspace_repair",
+            kind,
+            None,
+            Some(manual_merge_recovery_annotation(
+                ctx,
+                kind,
+                &block_reason,
+                "manual_workspace_repair",
+            )),
         )
         .await
         {
@@ -564,20 +719,16 @@ pub(super) async fn merge_failure_result(
 
     if existing_follow_ups >= i64::from(budget) {
         let block_reason = "merge-fix retry budget exhausted";
-        if let Err(error) = block_task(
+        if let Err(error) = block_task_with_annotation(
             ctx,
             &task,
             block_reason,
             api_types::FailureKind::MergeFixBudgetExhausted,
             None,
+            Some(merge_budget_annotation(block_reason)),
         )
         .await
         {
-            return HookResult::Failed {
-                reason: error.to_string(),
-            };
-        }
-        if let Err(error) = persist_merge_budget_annotation(ctx, block_reason).await {
             return HookResult::Failed {
                 reason: error.to_string(),
             };
@@ -591,18 +742,17 @@ pub(super) async fn merge_failure_result(
     }
 }
 
-async fn persist_manual_merge_recovery_annotation(
+fn manual_merge_recovery_annotation(
     ctx: &HookContext,
     kind: api_types::FailureKind,
     reason: &str,
     blocked_by: &str,
-) -> db::Result<()> {
-    let now = db::now_rfc3339();
+) -> String {
     let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
         annotation_type: kind,
         blocking_reason: reason.to_owned(),
         blocked_by: Some(blocked_by.to_owned()),
-        blocked_at: Some(now.clone()),
+        blocked_at: Some(db::now_rfc3339()),
         blocked_execution_id: ctx.execution_id.clone(),
         artifact: None,
         message: Some(reason.to_owned()),
@@ -612,43 +762,7 @@ async fn persist_manual_merge_recovery_annotation(
             api_types::RecoveryAction::CancelTask,
         ],
     });
-    let mut current = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await?
-        .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
-        match db::TaskRepo::update(
-            &*ctx.db,
-            db::UpdateTask {
-                id: current.id.clone(),
-                expected_version: current.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(Some(
-                    serde_json::to_string(&annotation)
-                        .map_err(|error| db::DbError::Check(error.to_string()))?,
-                )),
-                blocked_json: None,
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: db::now_rfc3339(),
-            },
-        )
-        .await
-        {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+    serde_json::to_string(&annotation).expect("a blocking annotation always serializes")
 }
 
 pub struct CheckMergeFixBudget;

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use api_types::{LifecycleHooks, WorkflowTrigger};
-use db::{AgentStatus, PageRequest, SortBy, SortOrder, TaskStatus};
+use db::{AgentStatus, PageRequest, SortOrder, TaskStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -383,9 +383,10 @@ pub(crate) fn page_request(
 ) -> Result<PageRequest, McpToolError> {
     Ok(PageRequest {
         cursor,
-        limit: limit.unwrap_or(20).clamp(1, 100),
+        limit: db::clamp_page_limit(limit),
         include_total: false,
-        sort_by: parse_sort_by(sort_by.as_deref())?,
+        sort_by: db::sort_by_from_name(sort_by.as_deref())
+            .map_err(|error| McpToolError::new(-32602, error.to_string()))?,
         sort_order: SortOrder::Desc,
     })
 }
@@ -396,28 +397,15 @@ pub(crate) fn task_page_request(
     sort_by: Option<String>,
 ) -> Result<PageRequest, McpToolError> {
     if sort_by.is_none() {
+        let (sort_by, sort_order) = db::task_sort_defaults();
         return Ok(PageRequest {
             cursor,
-            limit: limit.unwrap_or(20).clamp(1, 100),
+            limit: db::clamp_page_limit(limit),
             include_total: false,
-            sort_by: SortBy::BoardPosition,
-            sort_order: SortOrder::Asc,
+            sort_by,
+            sort_order,
         });
     }
 
     page_request(cursor, limit, sort_by)
-}
-
-fn parse_sort_by(value: Option<&str>) -> Result<SortBy, McpToolError> {
-    match value.unwrap_or("created_at") {
-        "created_at" => Ok(SortBy::CreatedAt),
-        "updated_at" => Ok(SortBy::UpdatedAt),
-        "priority" => Ok(SortBy::Priority),
-        "board_position" => Ok(SortBy::BoardPosition),
-        "id" => Ok(SortBy::Id),
-        value => Err(McpToolError::new(
-            -32602,
-            format!("invalid sort_by: {value}"),
-        )),
-    }
 }

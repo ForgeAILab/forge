@@ -38,8 +38,8 @@ interface TaskDetailSidebarProps {
   taskId: string
   runSuffix: string
   activeTab: ActiveTab
-  executionCount: number
-  commentCount: number
+  executionCount?: number
+  commentCount?: number
   showReviewTab: boolean
 }
 
@@ -64,7 +64,7 @@ export function TaskDetailSidebar({
       id: 'executions' as const,
       label: productTerm('run', 0),
       Icon: Play,
-      badge: executionCount > 0 ? String(executionCount) : undefined,
+      badge: executionCount != null && executionCount > 0 ? String(executionCount) : undefined,
     },
     ...(showReviewTab
       ? [
@@ -87,7 +87,7 @@ export function TaskDetailSidebar({
       id: 'comments' as const,
       label: 'Comments',
       Icon: Chat,
-      badge: commentCount > 0 ? String(commentCount) : undefined,
+      badge: commentCount != null && commentCount > 0 ? String(commentCount) : undefined,
     },
     {
       id: 'history' as const,

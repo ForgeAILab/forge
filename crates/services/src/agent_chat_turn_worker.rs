@@ -2876,6 +2876,13 @@ impl FederatedAgentChatTurnRunner {
                     None => (None, WorkspaceAccess::Deny),
                 },
             };
+        // A Project Agent's commands run in that Project's checkout, so the
+        // Project's own settings layer over the configured baseline; the Main
+        // Agent's scratch belongs to the account and takes the baseline.
+        let command_allowlist = self
+            .embedded_agents
+            .effective_command_allowlist(chat.as_ref().and_then(|chat| chat.project_id.as_deref()))
+            .await;
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
         let output = match self
@@ -2922,6 +2929,7 @@ impl FederatedAgentChatTurnRunner {
                     ),
                     history: runtime_history(&history),
                     input: input.content,
+                    command_allowlist: Some(command_allowlist),
                     cancellation,
                 },
                 turn_log,
@@ -6315,12 +6323,14 @@ mod tests {
             },
             "governing_charter": {
                 "id": "charter-1", "revision_id": "charter-revision-2", "revision": 2,
-                "version": 3, "content_digest": "charter-content", "render_digest": "charter-render"
+                "version": 3, "content_digest": "charter-content",
+                "render_version": "charter-render-v1", "render_digest": "charter-render"
             },
             "approved_documents": [{
                 "id": "document-1", "kind": "delivery_brief", "title": "Brief",
                 "revision_id": "document-revision-3", "revision": 3, "version": 2,
-                "lifecycle": "approved", "content_digest": "document-content", "render_digest": "document-render"
+                "lifecycle": "approved", "content_digest": "document-content",
+                "render_version": "document-render-v1", "render_digest": "document-render"
             }],
             "active_decisions": [{
                 "id": "decision-1", "state": "active", "decision_class": "project_implementation",

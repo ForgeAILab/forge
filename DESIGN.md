@@ -116,9 +116,9 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
   must not briefly use a stale default width while waiting for a resize event.
 
 - Viewport shell: `min-height: 100vh` fallback plus `100dvh`; the page itself never owns horizontal overflow.
-- Shell hierarchy: one compact top bar owns brand, Project selection, the two primary tabs, and account utilities. There is no persistent sidebar, compact rail, or mobile drawer competing with the work surface.
-- Primary tabs are exactly `Kanban` and `Main Chat`. At desktop they sit inline in the top bar; below 768px they occupy a second, full-width row with equal targets. The selected tab uses the ember edge/surface treatment and remains named in text.
-- Secondary Project and Workspace destinations live in one `More` menu. Account settings remain in the user menu. Removing a destination from primary navigation must never make it unreachable.
+- Shell hierarchy: one compact top bar owns brand, Project selection, and account utilities. At desktop widths, a persistent 224px navigation sidebar separates account, selected Project, and Workspace destinations; the work surface owns the remaining width.
+- The sidebar names `Main Agent` under Account and `Project Agent` under Project, each with a short scope description. Kanban remains the default Project destination. The selected link uses the ember edge/surface treatment and remains named in text.
+- Below 1024px, the sidebar becomes a left navigation dialog opened from the top bar, preserving the board's tablet width. The dialog traps focus, closes on Escape or navigation, and restores focus to its trigger. Account settings remain in the user menu.
 - Board route main: `min-width: 0`, no scrolling, and no generic page padding. Other routes retain the existing 20px content padding and main scroll.
 - Board page: toolbar is fixed above a single `min-height: 0` board viewport. The viewport owns both horizontal and vertical drag scrolling.
 - Columns: `min-width: 220px` at 1280px, a comfortable tablet width that allows at least two columns at 768px, and `min-width: 280px` at 375px. Column/task-list children never establish another scroll container.
@@ -150,10 +150,10 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### App shell navigation
 
-- **Structure:** skip link, one responsive top bar, a primary tablist-like navigation containing `Kanban` and `Main Chat`, one Project switcher, a `More` menu for secondary destinations, account utilities, and the main landmark.
-- **Primary hierarchy:** Kanban is the default destination whenever an authorized Project exists. Main Chat is the one account-level chat entry. Overview, Tasks, Project Agent, Project settings, Agent settings, Mission Control, runtimes, operations, and Forge settings are secondary destinations and never appear as peer tabs.
-- **States:** active tab, hover, active press, visible focus, disabled Kanban when no Project exists, open/closed menus, loading Project selection, and compact wrapping below 768px.
-- **Accessibility:** tabs are semantic links with visible labels and `aria-current`; the disabled Kanban target explains that a Project is required. Dropdown menus use the existing keyboard behavior and return focus to their triggers.
+- **Structure:** skip link, compact utility top bar, Project switcher, persistent desktop navigation sidebar, mobile navigation dialog, account utilities, and the main landmark. Sidebar groups are Account (`Main Agent`), Project (`Kanban`, `Project Agent`, `Tasks`, `Overview`, `Project settings`), and Workspace.
+- **Primary hierarchy:** Kanban is the default destination whenever an authorized Project exists. Main Agent is the one account-level chat entry; Project Agent opens only the selected Project's chat. Scope descriptions distinguish them without adding duplicate launchers.
+- **States:** active link, hover, active press, visible focus, disabled Project links when no Project exists, loading Project selection, and open/closed mobile dialog.
+- **Accessibility:** entries are semantic links with visible labels and `aria-current`; unavailable Project targets explain that a Project is required. The mobile dialog traps focus, closes on Escape, and restores focus to its trigger.
 - **Motion:** color, opacity, and transform only using the micro timing token; reduced motion removes non-essential movement.
 
 ### Board toolbar
@@ -198,11 +198,11 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### Agent scope navigation
 
-- **Structure:** scope is represented once in the application shell. `Main Chat` is one of two primary tabs; it never gains a second launcher or duplicate roster. The selected Project's Project Agent remains reachable from the contextual `More` menu as `Project Agent`.
-- **Order:** Project switcher; primary `Kanban` and `Main Chat` tabs; secondary Project destinations; secondary Workspace destinations; account utilities.
+- **Structure:** scope is represented once in the application sidebar. `Main Agent` opens the account Main Chat; `Project Agent` opens the selected Project's chat. Each has a short scope description and neither gains a duplicate launcher or roster.
+- **Order:** Project switcher; Account/Main Agent; selected Project/Kanban and Project Agent; remaining Project destinations; Workspace destinations; account utilities.
 - **States:** active, ready, setup required, loading, unavailable, and empty Project selection. Setup status stays visible on the destination surface rather than adding another navigation model.
-- **Accessibility:** primary entries are semantic links with `aria-current="page"` and visible focus rings. Secondary destinations remain keyboard reachable through the named `More` menu.
-- **Responsive:** the same two primary tabs remain visible at every width. Menus and tab rows never create document-wide horizontal overflow.
+- **Accessibility:** entries are semantic links with `aria-current="page"` and visible focus rings. The mobile menu button names the navigation dialog; unavailable Project links explain why they cannot open.
+- **Responsive:** the desktop sidebar is replaced by a navigation dialog below 1024px. The dialog and content never create document-wide horizontal overflow.
 
 ### Agent chat timeline and composer
 
@@ -234,8 +234,8 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### Singular Main Chat entry
 
-- **Structure:** `/chat` is reached from the one persistent `Main Chat` primary tab. Do not render a floating launcher, duplicate panel, alternate global-chat button, or local fork of the timeline.
-- **Accessibility:** the tab is visible and keyboard reachable at every breakpoint, uses `aria-current="page"` when selected, and keeps the chat composer reachable above the safe area.
+- **Structure:** `/chat` is reached from the single `Main Agent` entry in the account navigation group. Do not render a floating launcher, duplicate panel, alternate global-chat button, or local fork of the timeline.
+- **Accessibility:** the entry is keyboard reachable at every breakpoint, uses `aria-current="page"` when selected, and keeps the chat composer reachable above the safe area.
 
 ### Settings tab bar
 

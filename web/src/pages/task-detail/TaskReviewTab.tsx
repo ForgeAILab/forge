@@ -1,5 +1,7 @@
 import { ArrowCounterClockwise, CaretDown, Spinner } from '@phosphor-icons/react'
 import { useState } from 'react'
+import { ErrorBanner } from '@/components/error-banner'
+import { isTransientApiError } from '@/lib/api-error'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -53,6 +55,9 @@ type TaskReviewTabProps = {
   reviews: Review[]
   latestReview?: Review
   reviewsLoading: boolean
+  reviewsIsError?: boolean
+  reviewsError?: unknown
+  onRetryReviews?: () => void
   transitionPending: boolean
   triggerReviewPending: boolean
   recoverPending: boolean
@@ -72,6 +77,9 @@ export function TaskReviewTab({
   reviews,
   latestReview,
   reviewsLoading,
+  reviewsIsError = false,
+  reviewsError,
+  onRetryReviews,
   transitionPending,
   triggerReviewPending,
   recoverPending,
@@ -92,6 +100,14 @@ export function TaskReviewTab({
 
   return (
     <div className="space-y-3">
+      {reviewsIsError ? (
+        <ErrorBanner
+          error={reviewsError}
+          fallback="Reviews failed to load"
+          onRetry={() => void onRetryReviews?.()}
+          showRetry={isTransientApiError(reviewsError)}
+        />
+      ) : null}
       <WorkflowExceptionPanel
         task={task}
         actions={workflowExceptionActions}
@@ -121,9 +137,9 @@ export function TaskReviewTab({
                     {formatDuration(latestReview.started_at, latestReview.finished_at)}
                   </span>
                 </div>
-              ) : (
+              ) : !reviewsIsError ? (
                 <p className="text-xs text-muted-foreground">No review details yet.</p>
-              )}
+              ) : null}
             </div>
 
             {/* Actions grouped together */}

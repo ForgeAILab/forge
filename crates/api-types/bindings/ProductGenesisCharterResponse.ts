@@ -7,7 +7,7 @@ import type { ProjectCharterRevision } from "./ProjectCharterRevision";
 /**
  * Canonical Charter projection rendered inside the singular Main Chat.
  */
-export type ProductGenesisCharterResponse = {
+export type ProductGenesisCharterResponse = { 
 /**
  * Absent until the Main Agent persists the first canonical Charter.
  * Forge never fabricates a placeholder Charter for projection purposes.

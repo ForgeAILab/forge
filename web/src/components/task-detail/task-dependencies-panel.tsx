@@ -1,73 +1,105 @@
 import { GitFork, Plus, X } from '@phosphor-icons/react'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { useState, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import {
-  useAddDependency,
-  useRemoveDependency,
-  useTaskDependenciesQuery,
-  useTaskDependentsQuery,
-} from '@/api/hooks'
+import { apiFetch } from '@/api/client'
+import { useAddDependency, useRemoveDependency, useTaskRelationsQuery } from '@/api/hooks'
+import { qk } from '@/api/query-keys'
 import { TaskStatusBadge } from '@/components/task-controls'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type { Task } from '@/types/generated'
-import { useProjectTasksForSubtasks } from './task-subtasks-panel'
+import type { PaginatedResponse, Task } from '@/types/generated'
+
+const CANDIDATE_TASK_LIMIT = 30
+const TASK_SEARCH_DEBOUNCE_MS = 250
 
 interface TaskDependenciesPanelProps {
   task: Task
 }
 
+function useDependencyCandidatesQuery(projectId: string, search: string, enabled: boolean) {
+  return useQuery({
+    queryKey: [
+      ...qk.projectTasks(projectId),
+      'dependency-candidates',
+      search,
+      CANDIDATE_TASK_LIMIT,
+    ],
+    queryFn: ({ signal }) =>
+      apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
+        search: {
+          q: search || undefined,
+          limit: CANDIDATE_TASK_LIMIT,
+          include_cancelled: false,
+        },
+        signal,
+      }),
+    enabled: enabled && Boolean(projectId),
+    retry: false,
+    staleTime: 15_000,
+  })
+}
+
 export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
   const navigate = useNavigate()
-  const dependenciesQuery = useTaskDependenciesQuery(task.id)
-  const dependentsQuery = useTaskDependentsQuery(task.id)
-  const projectTasksQuery = useProjectTasksForSubtasks(task.project_id, true, {
-    includeCancelled: true,
-  })
+  const relationsQuery = useTaskRelationsQuery(task.id, task.project_id)
   const addDependency = useAddDependency(task.id)
   const removeDependency = useRemoveDependency(task.id)
 
   const [showPicker, setShowPicker] = useState(false)
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
 
-  const allTasks = projectTasksQuery.data ?? []
-  const taskById = useMemo(() => new Map(allTasks.map((t) => [t.id, t])), [allTasks])
-  const dependencyRows = dependenciesQuery.data ?? []
+  useEffect(() => {
+    if (!showPicker) {
+      setDebouncedSearch('')
+      return
+    }
+
+    const timeout = window.setTimeout(
+      () => setDebouncedSearch(search.trim()),
+      TASK_SEARCH_DEBOUNCE_MS,
+    )
+    return () => window.clearTimeout(timeout)
+  }, [search, showPicker])
+
+  const candidatesQuery = useDependencyCandidatesQuery(
+    task.project_id,
+    debouncedSearch,
+    showPicker && Boolean(relationsQuery.data),
+  )
+
+  const candidatePageTasks = candidatesQuery.data?.items ?? []
+  const dependencyTasks = relationsQuery.data?.dependencies ?? []
+  const missingDependencyIds = relationsQuery.data?.missing_dependency_ids ?? []
+  const dependentTasks = relationsQuery.data?.dependents ?? []
   const depIds = useMemo(
-    () => new Set(dependencyRows.map((d) => d.depends_on_id)),
-    [dependencyRows],
+    () => new Set(dependencyTasks.map((dependency) => dependency.id)),
+    [dependencyTasks],
   )
-
-  const dependencyTasks = useMemo(
-    () =>
-      dependencyRows.map((dependency) => ({
-        dependency,
-        task: taskById.get(dependency.depends_on_id),
-      })),
-    [dependencyRows, taskById],
+  const dependentTaskIds = useMemo(
+    () => new Set(dependentTasks.map((dependent) => dependent.id)),
+    [dependentTasks],
   )
-
-  const dependentTaskIds = new Set((dependentsQuery.data ?? []).map((d) => d.task_id))
-  const dependentTasks = useMemo(
-    () => allTasks.filter((t) => dependentTaskIds.has(t.id)),
-    [allTasks, dependentTaskIds],
+  const missingDependencies = useMemo(
+    () => missingDependencyIds.filter((id) => !depIds.has(id)),
+    [missingDependencyIds, depIds],
   )
+  const hasDependencies = dependencyTasks.length > 0 || missingDependencies.length > 0
 
   const isTerminal = task.status === 'done' || task.status === 'cancelled'
 
   const candidateTasks = useMemo(() => {
-    const q = search.toLowerCase()
-    return allTasks.filter(
+    return candidatePageTasks.filter(
       (t) =>
         t.id !== task.id &&
         !depIds.has(t.id) &&
         !dependentTaskIds.has(t.id) &&
-        t.status !== 'cancelled' &&
-        (q === '' || t.title.toLowerCase().includes(q)),
+        t.status !== 'cancelled',
     )
-  }, [allTasks, task.id, depIds, dependentTaskIds, search])
+  }, [candidatePageTasks, task.id, depIds, dependentTaskIds])
 
   const handleAdd = (dependsOnId: string) => {
     addDependency.mutate(dependsOnId, {
@@ -91,7 +123,8 @@ export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
     void navigate({ to: '/tasks/$taskId', params: { taskId } })
   }
 
-  const isLoading = dependenciesQuery.isLoading || projectTasksQuery.isLoading
+  const isLoading = !relationsQuery.data && relationsQuery.isLoading
+  const isSearchPending = showPicker && search.trim() !== debouncedSearch
 
   return (
     <div className="mt-4 border-t pt-4">
@@ -120,7 +153,7 @@ export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
           <input
             autoFocus
             type="text"
-            placeholder="Search tasks…"
+            placeholder="Search task titles or descriptions…"
             className="mb-1.5 w-full rounded border bg-muted/40 px-2 py-1 text-sm outline-none placeholder:text-muted-foreground focus:ring-1 focus:ring-ring"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -132,10 +165,43 @@ export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
             }}
           />
           <div className="max-h-40 overflow-y-auto">
-            {projectTasksQuery.isLoading ? (
+            {!relationsQuery.data && relationsQuery.isLoading ? (
               <div className="space-y-1 p-1">
                 <Skeleton className="h-7 w-full" />
                 <Skeleton className="h-7 w-full" />
+              </div>
+            ) : isSearchPending || candidatesQuery.isLoading ? (
+              <div className="space-y-1 p-1">
+                <Skeleton className="h-7 w-full" />
+                <Skeleton className="h-7 w-full" />
+              </div>
+            ) : relationsQuery.isError && !relationsQuery.data ? (
+              <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+                <p role="status" className="text-xs text-muted-foreground">
+                  Couldn&apos;t load task relationships
+                </p>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => void relationsQuery.refetch()}
+                >
+                  Retry
+                </Button>
+              </div>
+            ) : candidatesQuery.isError ? (
+              <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+                <p role="status" className="text-xs text-muted-foreground">
+                  Couldn&apos;t load tasks
+                </p>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => void candidatesQuery.refetch()}
+                >
+                  Retry
+                </Button>
               </div>
             ) : candidateTasks.length === 0 ? (
               <p className="px-2 py-1.5 text-xs text-muted-foreground">No matching tasks</p>
@@ -152,6 +218,11 @@ export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
                   <TaskStatusBadge status={t.status} />
                 </button>
               ))
+            )}
+            {candidatesQuery.data?.has_more && !candidatesQuery.isError && (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                Showing the first {CANDIDATE_TASK_LIMIT} results. Refine your search to see more.
+              </p>
             )}
           </div>
           <Button
@@ -173,38 +244,67 @@ export function TaskDependenciesPanel({ task }: TaskDependenciesPanelProps) {
           <Skeleton className="h-8 w-full" />
           <Skeleton className="h-8 w-full" />
         </div>
-      ) : dependencyTasks.length === 0 ? (
+      ) : relationsQuery.isError && !relationsQuery.data ? (
+        <div className="flex items-center justify-between gap-2 rounded-md border px-3 py-2">
+          <p role="status" className="text-sm text-muted-foreground">
+            Couldn&apos;t load task relationships
+          </p>
+          <Button size="sm" variant="ghost" onClick={() => void relationsQuery.refetch()}>
+            Retry
+          </Button>
+        </div>
+      ) : !hasDependencies ? (
         <p className="text-sm text-muted-foreground">No dependencies</p>
       ) : (
         <div className="space-y-1.5">
-          {dependencyTasks.map(({ dependency, task: dep }) => (
+          {dependencyTasks.map((dep) => (
             <div
-              key={dependency.depends_on_id}
+              key={dep.id}
               className="group flex items-center gap-2 rounded-md border bg-background px-2 py-1.5"
             >
               <button
                 type="button"
                 className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                onClick={() => openTaskDetail(dependency.depends_on_id)}
+                onClick={() => openTaskDetail(dep.id)}
               >
-                <span className="min-w-0 flex-1 truncate text-sm">
-                  {dep?.title ?? dependency.depends_on_id}
-                </span>
-                {dep ? (
-                  <TaskStatusBadge status={dep.status} />
-                ) : (
-                  <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-                    Missing
-                  </span>
-                )}
+                <span className="min-w-0 flex-1 truncate text-sm">{dep.title}</span>
+                <TaskStatusBadge status={dep.status} />
               </button>
               {!isTerminal && (
                 <button
                   type="button"
-                  aria-label={`Remove dependency on ${dep?.title ?? dependency.depends_on_id}`}
+                  aria-label={`Remove dependency on ${dep.title}`}
                   className="ml-0.5 shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-destructive"
                   disabled={removeDependency.isPending}
-                  onClick={() => handleRemove(dependency.depends_on_id)}
+                  onClick={() => handleRemove(dep.id)}
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+          ))}
+          {missingDependencies.map((dependencyId) => (
+            <div
+              key={dependencyId}
+              className="group flex items-center gap-2 rounded-md border bg-background px-2 py-1.5"
+            >
+              <button
+                type="button"
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm text-left transition-colors hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={() => openTaskDetail(dependencyId)}
+              >
+                <span className="min-w-0 flex-1 truncate text-sm">{dependencyId}</span>
+                <span className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                  Missing
+                </span>
+              </button>
+              {!isTerminal && (
+                <button
+                  type="button"
+                  aria-label={`Remove dependency on ${dependencyId}`}
+                  className="ml-0.5 shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-destructive"
+                  disabled={removeDependency.isPending}
+                  onClick={() => handleRemove(dependencyId)}
                 >
                   <X size={12} />
                 </button>

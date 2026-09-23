@@ -107,11 +107,22 @@ fn notify_workflow() -> Value {
 }
 
 async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResponse {
+    // Read the version rather than reusing the caller's snapshot: the writes
+    // a claim, an assignment or a hook commits advance it, and this helper is
+    // asked to move the Task, not to prove a stale precondition.
+    let current: TaskResponse = json_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
     let response: TransitionTaskResponse = json_request(
         app,
         Method::POST,
         &format!("/api/v1/tasks/{}/transition", task.id),
-        json!({ "status": status, "version": task.version, "reason": format!("to {status}") }),
+        json!({ "status": status, "version": current.version, "reason": format!("to {status}") }),
         StatusCode::OK,
     )
     .await;

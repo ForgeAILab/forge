@@ -666,14 +666,26 @@ async fn project_proposal_target_is_derived_from_scope() {
         "an admitted proposal materializes exactly one Task through the TaskService path"
     );
     // Without an active execution baseline the Task is a charter-bound plan
-    // and must not gain execution authority from the proposal envelope.
+    // and must not gain execution authority from the proposal envelope. Since
+    // 1ea2011 `runnable` records Charter authorization rather than execution
+    // setup, and the authority the envelope must not grant is proven by the
+    // absence of any issued WorkspaceLease: workflow, role, repository,
+    // capability and lease checks all run again immediately before dispatch.
     let runnable: i64 =
         sqlx::query_scalar("SELECT runnable FROM project_task_governance WHERE task_id = ?")
             .bind(&task_id)
             .fetch_one(db.pool())
             .await
             .expect("governance row");
-    assert_eq!(runnable, 0, "a pre-baseline Task must not be runnable");
+    assert_eq!(runnable, 1, "the Charter authorizes the proposed Task");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_lease")
+            .fetch_one(db.pool())
+            .await
+            .expect("WorkspaceLease count"),
+        0,
+        "a proposal envelope must not issue repository authority"
+    );
 }
 
 #[tokio::test]
@@ -1151,7 +1163,9 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
             .fetch_one(db.pool())
             .await
             .expect("governance row");
-    assert_eq!(runnable, 0, "text cannot make a Task runnable");
+    // `runnable` is Charter authorization since 1ea2011; that argument text
+    // cannot buy execution authority is proven by the lease count below.
+    assert_eq!(runnable, 1, "the Charter authorizes the proposed Task");
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_lease")
             .fetch_one(db.pool())

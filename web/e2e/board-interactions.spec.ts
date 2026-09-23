@@ -269,7 +269,7 @@ test('search/filter and incomplete pagination disable only ordering', async ({ p
   }
 })
 
-test('responsive board keeps one scroll owner and the two primary tabs at 375, 768, and 1280', async ({
+test('responsive board keeps one scroll owner and reachable navigation at 375, 768, and 1280', async ({
   page,
   request,
 }) => {
@@ -297,12 +297,22 @@ test('responsive board keeps one scroll owner and the two primary tabs at 375, 7
       await page.setViewportSize({ width: viewport.width, height: viewport.height })
       await page.goto(`/projects/${setup.projectId}/board`)
       await expect(page.getByText(setup.tasks[0].title).first()).toBeVisible({ timeout: 15_000 })
-      await expect(page.locator('[data-shell-mode]')).toHaveAttribute('data-shell-mode', 'topbar')
-      const primaryNavigation = page.getByRole('navigation', { name: 'Primary navigation' })
-      await expect(primaryNavigation).toBeVisible()
-      await expect(primaryNavigation.getByRole('link', { name: 'Kanban' })).toBeVisible()
-      await expect(primaryNavigation.getByRole('link', { name: 'Main Chat' })).toBeVisible()
-      await expect(page.getByRole('button', { name: 'Open navigation' })).toHaveCount(0)
+      await expect(page.locator('[data-shell-mode]')).toHaveAttribute('data-shell-mode', 'sidebar')
+      if (viewport.width >= 1024) {
+        const navigation = page.getByRole('navigation', { name: 'Main navigation' })
+        await expect(navigation).toBeVisible()
+        await expect(navigation.getByRole('link', { name: 'Kanban' })).toBeVisible()
+        await expect(navigation.getByRole('link', { name: /Main Agent/ })).toBeVisible()
+        await expect(navigation.getByRole('link', { name: /Project Agent/ })).toBeVisible()
+      } else {
+        const menu = page.getByRole('button', { name: 'Open navigation' })
+        await expect(menu).toBeVisible()
+        await menu.click()
+        const navigation = page.getByRole('dialog', { name: 'Navigation' })
+        await expect(navigation.getByRole('link', { name: /Main Agent/ })).toBeVisible()
+        await expect(navigation.getByRole('link', { name: /Project Agent/ })).toBeVisible()
+        await navigation.getByRole('button', { name: 'Close navigation' }).click()
+      }
       await expect(page.locator('[data-board-scroll-owner]')).toHaveCount(1)
 
       const documentOverflows = await page.evaluate(
@@ -338,7 +348,7 @@ test('responsive board keeps one scroll owner and the two primary tabs at 375, 7
   }
 })
 
-test('the top bar switches between Kanban and the singular Main Chat', async ({
+test('the sidebar distinguishes Main Agent and Project Agent navigation', async ({
   page,
   request,
 }) => {
@@ -356,37 +366,51 @@ test('the top bar switches between Kanban and the singular Main Chat', async ({
       await page.setViewportSize({ width: viewport.width, height: viewport.height })
       await page.goto(`/projects/${setup.projectId}/board`)
 
-      const primaryNavigation = page.getByRole('navigation', { name: 'Primary navigation' })
-      await expect(primaryNavigation.getByRole('link')).toHaveCount(2)
-      await expect(page.getByRole('button', { name: 'Open global chat' })).toHaveCount(0)
-
-      await primaryNavigation.getByRole('link', { name: 'Main Chat' }).click()
+      if (viewport.width < 1024) {
+        await page.getByRole('button', { name: 'Open navigation' }).click()
+      }
+      let navigation = page.getByRole('navigation', { name: 'Main navigation' })
+      await navigation.getByRole('link', { name: /Main Agent/ }).click()
       await expect(page).toHaveURL(/\/chat$/)
       await expect(page.getByRole('heading', { name: 'Main Agent' })).toBeVisible({
         timeout: 15_000,
       })
-      await expect(
-        page
-          .getByRole('navigation', { name: 'Primary navigation' })
-          .getByRole('link', { name: 'Main Chat' }),
-      ).toHaveAttribute('data-status', 'active')
+      if (viewport.width < 1024) {
+        await page.getByRole('button', { name: 'Open navigation' }).click()
+      }
+      navigation = page.getByRole('navigation', { name: 'Main navigation' })
+      await expect(navigation.getByRole('link', { name: /Main Agent/ })).toHaveAttribute(
+        'data-status',
+        'active',
+      )
+      if (viewport.width < 1024) {
+        await page.getByRole('button', { name: 'Close navigation' }).click()
+      }
       await page.screenshot({ path: join(proofDir, viewport.name), animations: 'disabled' })
+      if (viewport.width < 1024) {
+        await page.getByRole('button', { name: 'Open navigation' }).click()
+        navigation = page.getByRole('navigation', { name: 'Main navigation' })
+      }
 
-      await page
-        .getByRole('navigation', { name: 'Primary navigation' })
-        .getByRole('link', { name: 'Kanban' })
-        .click()
+      await navigation.getByRole('link', { name: /Project Agent/ }).click()
+      await expect(page).toHaveURL(new RegExp(`/projects/${setup.projectId}/chat`))
+      if (viewport.width < 1024) {
+        await page.getByRole('button', { name: 'Open navigation' }).click()
+      }
+      navigation = page.getByRole('navigation', { name: 'Main navigation' })
+      await navigation.getByRole('link', { name: 'Kanban' }).click()
       await expect(page).toHaveURL(new RegExp(`/projects/${setup.projectId}/board`))
     }
 
-    await page.getByRole('button', { name: 'More navigation' }).click()
-    await expect(page.getByRole('button', { name: 'Project Agent' })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Agent Settings' })).toBeVisible()
+    await page.getByRole('button', { name: 'Open navigation' }).click()
+    const navigation = page.getByRole('dialog', { name: 'Navigation' })
+    await expect(navigation.getByRole('link', { name: /Project Agent/ })).toBeVisible()
+    await expect(navigation.getByRole('link', { name: 'Agent Settings' })).toBeVisible()
     await page.screenshot({
       path: join(proofDir, 'secondary-navigation-375.png'),
       animations: 'disabled',
     })
-    await page.getByRole('button', { name: 'More navigation' }).click()
+    await navigation.getByRole('button', { name: 'Close navigation' }).click()
 
     const filters = page.getByRole('button', { name: 'Filters' })
     await filters.focus()

@@ -56,6 +56,10 @@ pub enum MergeOutcome {
     TargetDirty {
         files: Vec<String>,
     },
+    /// A file handed to the Worker still adds Git conflict marker lines.
+    UnresolvedConflictMarkers {
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +128,19 @@ impl MergeService {
             return Ok(MergeOutcome::TargetDirty {
                 files: git::status_porcelain(repo_path).await?,
             });
+        }
+        let transitions = db::TransitionLogRepo::list_by_task(&*self.db, &task_id).await?;
+        let handed_off_paths = crate::workflow::handed_off_conflict_paths(&transitions);
+        if !handed_off_paths.is_empty() {
+            let marker_paths =
+                git::paths_adding_conflict_markers(worktree_path, &target_branch, "HEAD").await?;
+            let unresolved = marker_paths
+                .into_iter()
+                .filter(|path| handed_off_paths.contains(path))
+                .collect::<Vec<_>>();
+            if !unresolved.is_empty() {
+                return Ok(MergeOutcome::UnresolvedConflictMarkers { paths: unresolved });
+            }
         }
 
         let before_sha = git::get_current_sha(repo_path).await?;
@@ -769,6 +786,114 @@ mod tests {
             .expect("execution exists");
         assert_eq!(execution.before_sha, Some(worktree_sha.clone()));
         assert_eq!(execution.after_sha, Some(worktree_sha));
+    }
+
+    #[tokio::test]
+    async fn marker_gate_applies_only_to_handed_off_paths_and_resolved_files_integrate() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().expect("temp creates");
+        let repo_path = setup_repo(&temp).await;
+        let task_id = new_uuid_v4();
+        let worktree_path = temp.path().join("marker_worktree");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&task_id),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree creates");
+        std::fs::write(
+            worktree_path.join("handoff.txt"),
+            "<<<<<<< ours\n>>>>>>> theirs\n",
+        )
+        .expect("handed-off file writes");
+        std::fs::write(worktree_path.join("example.txt"), "<<<<<<< example\n")
+            .expect("legitimate example writes");
+        git::commit_all(&worktree_path, "add marker-shaped lines")
+            .await
+            .expect("branch commits");
+        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        let service = MergeService::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // Without a handoff, the branch is allowed to document marker lines.
+        assert!(matches!(
+            service.merge(&task_id).await.expect("merge evaluates"),
+            MergeOutcome::Done { .. }
+        ));
+
+        // A second Task is handed only handoff.txt. An unrelated example
+        // remains legitimate even while the handoff gate is active.
+        let second_id = new_uuid_v4();
+        let second_path = temp.path().join("second_marker_worktree");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&second_id),
+            &second_path,
+        )
+        .await
+        .expect("second worktree creates");
+        std::fs::write(
+            second_path.join("handoff.txt"),
+            "<<<<<<< worker\n>>>>>>> target\n",
+        )
+        .expect("second handed-off file writes");
+        std::fs::write(
+            second_path.join("example2.txt"),
+            "<<<<<<< documented example\n",
+        )
+        .expect("unrelated example writes");
+        git::commit_all(&second_path, "unresolved handoff")
+            .await
+            .expect("second branch commits");
+        seed_merge_rows(&db, &repo_path, &second_path, &second_id).await;
+        db::TransitionLogRepo::insert(
+            &*db,
+            db::CreateTransitionLog {
+                id: new_uuid_v4(),
+                task_id: second_id.clone(),
+                from_state: "merging".to_owned(),
+                to_state: "merge_failed".to_owned(),
+                trigger_name: None,
+                triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
+                    .display(),
+                trigger_reason: format!(
+                    "{} rebased onto main; conflicts were committed with markers in: handoff.txt{}[\"handoff.txt\"]",
+                    crate::workflow::CONFLICT_HANDOFF_MARKER,
+                    crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
+                ),
+                hook_results_json: None,
+                rejection: false,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("handoff records");
+        assert_eq!(
+            service
+                .merge(&second_id)
+                .await
+                .expect("marker gate evaluates"),
+            MergeOutcome::UnresolvedConflictMarkers {
+                paths: vec!["handoff.txt".to_owned()]
+            }
+        );
+
+        std::fs::write(second_path.join("handoff.txt"), "both sides resolved\n")
+            .expect("repair writes");
+        git::commit_all(&second_path, "resolve handoff")
+            .await
+            .expect("repair commits");
+        assert!(matches!(
+            service
+                .merge(&second_id)
+                .await
+                .expect("resolved branch integrates"),
+            MergeOutcome::Done { .. }
+        ));
     }
 
     #[tokio::test]

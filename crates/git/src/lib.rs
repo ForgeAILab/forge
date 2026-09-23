@@ -16,6 +16,12 @@ pub enum GitError {
     #[error("merge conflict in {path}: {stderr}")]
     MergeConflict { path: String, stderr: String },
 
+    #[error("rebase conflict requires manual repair: {details}")]
+    UnsupportedRebaseConflict { details: String },
+
+    #[error("no rebase in progress to hand off")]
+    NoRebaseInProgress,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -319,6 +325,242 @@ pub async fn abort_rebase(worktree_path: &Path) -> Result<()> {
 pub async fn continue_rebase(worktree_path: &Path) -> Result<()> {
     run_git(worktree_path, &["rebase", "--continue"]).await?;
     Ok(())
+}
+
+/// Finish a rebase that stopped on conflicts by committing each conflicted
+/// step as-is, conflict markers included, and return every path that
+/// conflicted along the way.
+///
+/// This hands a content conflict to an agent that may edit files but not Git
+/// metadata: afterwards the branch sits on the new base with no rebase in
+/// progress, and the markers show exactly what is left to reconcile. On any
+/// failure the rebase is aborted, restoring the branch as it was.
+pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<Vec<String>> {
+    const MAX_STEPS: usize = 200;
+    let mut conflicted: Vec<String> = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let in_progress = match detect_rebase_in_progress(worktree_path).await {
+            Ok(in_progress) => in_progress,
+            Err(error) => {
+                let _ = abort_rebase(worktree_path).await;
+                return Err(error);
+            }
+        };
+        if !in_progress {
+            return if conflicted.is_empty() {
+                Err(GitError::NoRebaseInProgress)
+            } else {
+                Ok(conflicted)
+            };
+        }
+        let unmerged = run_git(
+            worktree_path,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+        )
+        .await;
+        let unmerged = match unmerged {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = abort_rebase(worktree_path).await;
+                return Err(error);
+            }
+        };
+        let step = async {
+            let mut step_conflicts = 0;
+            for record in unmerged.split('\0').filter(|record| !record.is_empty()) {
+                let Some(status) = record.get(..2) else {
+                    continue;
+                };
+                if !matches!(status, "UU" | "AA" | "DU" | "UD" | "AU" | "UA" | "DD") {
+                    continue;
+                }
+                let path = record
+                    .get(3..)
+                    .ok_or_else(|| GitError::UnsupportedRebaseConflict {
+                        details: format!("incomplete unmerged status for {status}"),
+                    })?;
+                step_conflicts += 1;
+                if !matches!(status, "UU" | "AA") {
+                    return Err(GitError::UnsupportedRebaseConflict {
+                        details: format!("{path} has {status} conflict (only text UU/AA can be handed to the Worker)"),
+                    });
+                }
+                let ours = format!(":2:{path}");
+                let theirs = format!(":3:{path}");
+                let numstat =
+                    run_git(worktree_path, &["diff", "--numstat", &ours, &theirs]).await?;
+                let attr =
+                    run_git(worktree_path, &["check-attr", "-z", "binary", "--", path]).await?;
+                if numstat.lines().any(|line| line.starts_with("-\t-\t"))
+                    || attr.split('\0').nth(2) == Some("set")
+                {
+                    return Err(GitError::UnsupportedRebaseConflict {
+                        details: format!("{path} is binary and cannot be handed to the Worker"),
+                    });
+                }
+                if !conflicted.iter().any(|known| known == path) {
+                    conflicted.push(path.to_owned());
+                }
+            }
+            if step_conflicts == 0 {
+                return Err(GitError::UnsupportedRebaseConflict {
+                    details: "rebase stopped without unmerged content paths".to_owned(),
+                });
+            }
+            run_git(worktree_path, &["add", "-A"]).await?;
+            let output = Command::new("git")
+                .args(["-c", "core.editor=true", "rebase", "--continue"])
+                .current_dir(worktree_path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .await?;
+            let continued = if output.status.success() {
+                Ok(())
+            } else {
+                Err(GitError::CommandFailed {
+                    command: "git -c core.editor=true rebase --continue".to_owned(),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                })
+            };
+            match continued {
+                Ok(_) => Ok(()),
+                // The next commit conflicted too; the loop commits it next.
+                Err(GitError::CommandFailed { stdout, stderr, .. })
+                    if stdout.contains("CONFLICT")
+                        || stderr.contains("CONFLICT")
+                        || stderr.contains("could not apply") =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = step.await {
+            let _ = abort_rebase(worktree_path).await;
+            return Err(error);
+        }
+    }
+    let _ = abort_rebase(worktree_path).await;
+    Err(GitError::CommandFailed {
+        command: "git rebase --continue".to_owned(),
+        stdout: String::new(),
+        stderr: format!("rebase did not finish within {MAX_STEPS} steps"),
+    })
+}
+
+/// Paths where `branch_head` adds a Git conflict marker line relative to its
+/// merge base with `base`.
+///
+/// Only marker lines the branch itself introduces count, so a file that
+/// documents conflict markers on the target is never mistaken for an
+/// unresolved conflict.
+pub async fn paths_adding_conflict_markers(
+    worktree_path: &Path,
+    base: &str,
+    branch_head: &str,
+) -> Result<Vec<String>> {
+    let range = format!("{base}...{branch_head}");
+    let diff = run_git(
+        worktree_path,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--unified=0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &range,
+        ],
+    )
+    .await?;
+    let mut paths: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    let mut in_hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            current = None;
+            in_hunk = false;
+        } else if line.starts_with("@@ ") {
+            in_hunk = true;
+        } else if !in_hunk && line.starts_with("+++ ") {
+            current = diff_destination_path(line);
+        } else if in_hunk {
+            if let Some(added) = line.strip_prefix('+') {
+                // A bare `=======` is also a Markdown heading underline.
+                let is_marker = added.starts_with("<<<<<<< ")
+                    || added.starts_with("||||||| ")
+                    || added.starts_with(">>>>>>> ");
+                if is_marker {
+                    if let Some(path) = current.as_deref() {
+                        if !paths.iter().any(|known| known == path) {
+                            paths.push(path.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn diff_destination_path(header: &str) -> Option<String> {
+    let raw = header.strip_prefix("+++ ")?.trim_end_matches('\t');
+    let decoded = if let Some(quoted) = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        let bytes = quoted.as_bytes();
+        let mut path = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'\\' {
+                path.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            index += 1;
+            let escaped = *bytes.get(index)?;
+            if (b'0'..=b'7').contains(&escaped) {
+                let mut value = 0_u8;
+                for _ in 0..3 {
+                    let Some(&digit) = bytes.get(index) else {
+                        break;
+                    };
+                    if !(b'0'..=b'7').contains(&digit) {
+                        break;
+                    }
+                    value = value * 8 + digit - b'0';
+                    index += 1;
+                }
+                path.push(value);
+                continue;
+            }
+            path.push(match escaped {
+                b'"' => b'"',
+                b'\\' => b'\\',
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'a' => 7,
+                b'b' => 8,
+                b'f' => 12,
+                b'v' => 11,
+                _ => return None,
+            });
+            index += 1;
+        }
+        String::from_utf8(path).ok()?
+    } else {
+        raw.to_owned()
+    };
+    decoded.strip_prefix("b/").map(str::to_owned)
 }
 
 /// Detect if a rebase is in progress via `git rev-parse`.
@@ -702,6 +944,224 @@ mod tests {
         // Cleanup
         remove_worktree(&repo_path, &wt1).await.unwrap();
         remove_worktree(&repo_path, &wt2).await.unwrap();
+    }
+
+    /// Two siblings each append an export to the same list: the second one's
+    /// rebase conflicts, and Forge must be able to hand that conflict to an
+    /// agent as committed markers on the new base, with no rebase left open.
+    #[tokio::test]
+    async fn rebase_conflict_is_committed_with_markers_on_the_new_base() {
+        let (dir, repo_path) = setup_repo().await;
+        let branch = run_git(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .unwrap();
+        fs::write(repo_path.join("exports.txt"), "core\n")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "exports").await.unwrap();
+
+        let wt = dir.path().join("wt_sibling");
+        create_worktree(&repo_path, "sibling", &wt).await.unwrap();
+        fs::write(wt.join("exports.txt"), "core\napi\n")
+            .await
+            .unwrap();
+        fs::write(wt.join("api.txt"), "api\n").await.unwrap();
+        commit_all(&wt, "add api").await.unwrap();
+
+        fs::write(repo_path.join("exports.txt"), "core\ncli\n")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "add cli").await.unwrap();
+        let target_sha = get_current_sha(&repo_path).await.unwrap();
+
+        assert!(matches!(
+            rebase(&wt, &branch).await,
+            Err(GitError::MergeConflict { .. })
+        ));
+        let conflicted = continue_rebase_keeping_conflicts(&wt).await.unwrap();
+
+        assert_eq!(conflicted, vec!["exports.txt".to_owned()]);
+        assert!(!detect_rebase_in_progress(&wt).await.unwrap());
+        assert!(is_worktree_clean(&wt).await.unwrap());
+        let base = run_git(&wt, &["merge-base", "HEAD", &branch])
+            .await
+            .unwrap();
+        assert_eq!(base, target_sha, "the branch now sits on the new target");
+        let exports = fs::read_to_string(wt.join("exports.txt")).await.unwrap();
+        assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
+        assert_eq!(
+            fs::read_to_string(wt.join("api.txt")).await.unwrap(),
+            "api\n"
+        );
+        assert_eq!(
+            paths_adding_conflict_markers(&wt, &branch, "HEAD")
+                .await
+                .unwrap(),
+            vec!["exports.txt".to_owned()]
+        );
+
+        // The agent reconciles both sides; nothing marker-shaped remains.
+        fs::write(wt.join("exports.txt"), "core\ncli\napi\n")
+            .await
+            .unwrap();
+        commit_all(&wt, "resolve").await.unwrap();
+        assert!(paths_adding_conflict_markers(&wt, &branch, "HEAD")
+            .await
+            .unwrap()
+            .is_empty());
+
+        remove_worktree(&repo_path, &wt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_commit_rebase_hands_off_each_text_conflict() {
+        let (dir, repo_path) = setup_repo().await;
+        let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .unwrap();
+        fs::write(repo_path.join("one.txt"), "base\n")
+            .await
+            .unwrap();
+        fs::write(repo_path.join("two.txt"), "base\n")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "two files").await.unwrap();
+        let wt = dir.path().join("multi");
+        create_worktree(&repo_path, "multi", &wt).await.unwrap();
+        fs::write(wt.join("one.txt"), "worker one\n").await.unwrap();
+        commit_all(&wt, "first").await.unwrap();
+        fs::write(wt.join("two.txt"), "worker two\n").await.unwrap();
+        commit_all(&wt, "second").await.unwrap();
+        fs::write(repo_path.join("one.txt"), "target one\n")
+            .await
+            .unwrap();
+        fs::write(repo_path.join("two.txt"), "target two\n")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "target changes both").await.unwrap();
+
+        assert!(matches!(
+            rebase(&wt, &branch).await,
+            Err(GitError::MergeConflict { .. })
+        ));
+        let paths = continue_rebase_keeping_conflicts(&wt).await.unwrap();
+        assert_eq!(paths, vec!["one.txt", "two.txt"]);
+        assert!(!detect_rebase_in_progress(&wt).await.unwrap());
+        assert!(is_worktree_clean(&wt).await.unwrap());
+        for path in &paths {
+            assert!(fs::read_to_string(wt.join(path))
+                .await
+                .unwrap()
+                .contains("<<<<<<< "));
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_handoff_requires_an_active_rebase() {
+        let (_dir, repo_path) = setup_repo().await;
+        assert!(matches!(
+            continue_rebase_keeping_conflicts(&repo_path).await,
+            Err(GitError::NoRebaseInProgress)
+        ));
+    }
+
+    #[tokio::test]
+    async fn modify_delete_rebase_requires_manual_repair() {
+        let (dir, repo_path) = setup_repo().await;
+        let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .unwrap();
+        fs::write(repo_path.join("deleted.txt"), "base\n")
+            .await
+            .unwrap();
+        commit_all(&repo_path, "add file").await.unwrap();
+        let wt = dir.path().join("modify_delete");
+        create_worktree(&repo_path, "modify_delete", &wt)
+            .await
+            .unwrap();
+        fs::write(wt.join("deleted.txt"), "worker\n").await.unwrap();
+        commit_all(&wt, "modify file").await.unwrap();
+        fs::remove_file(repo_path.join("deleted.txt"))
+            .await
+            .unwrap();
+        commit_all(&repo_path, "delete file").await.unwrap();
+
+        assert!(matches!(
+            rebase(&wt, &branch).await,
+            Err(GitError::MergeConflict { .. })
+        ));
+        let error = continue_rebase_keeping_conflicts(&wt).await.unwrap_err();
+        assert!(
+            matches!(error, GitError::UnsupportedRebaseConflict { .. }),
+            "{error}"
+        );
+        assert!(!detect_rebase_in_progress(&wt).await.unwrap());
+        assert_eq!(
+            fs::read_to_string(wt.join("deleted.txt")).await.unwrap(),
+            "worker\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_rebase_requires_manual_repair() {
+        let (dir, repo_path) = setup_repo().await;
+        let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .unwrap();
+        fs::write(repo_path.join("image.bin"), [0, 1, 2])
+            .await
+            .unwrap();
+        commit_all(&repo_path, "binary base").await.unwrap();
+        let wt = dir.path().join("binary");
+        create_worktree(&repo_path, "binary", &wt).await.unwrap();
+        fs::write(wt.join("image.bin"), [0, 3, 2]).await.unwrap();
+        commit_all(&wt, "worker binary").await.unwrap();
+        fs::write(repo_path.join("image.bin"), [0, 4, 2])
+            .await
+            .unwrap();
+        commit_all(&repo_path, "target binary").await.unwrap();
+
+        assert!(matches!(
+            rebase(&wt, &branch).await,
+            Err(GitError::MergeConflict { .. })
+        ));
+        let error = continue_rebase_keeping_conflicts(&wt).await.unwrap_err();
+        assert!(
+            matches!(error, GitError::UnsupportedRebaseConflict { .. }),
+            "{error}"
+        );
+        assert!(!detect_rebase_in_progress(&wt).await.unwrap());
+        assert_eq!(fs::read(wt.join("image.bin")).await.unwrap(), vec![0, 3, 2]);
+    }
+
+    #[tokio::test]
+    async fn marker_scan_keeps_hunk_header_like_content_and_unicode_paths() {
+        let (dir, repo_path) = setup_repo().await;
+        let branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .unwrap();
+        let wt = dir.path().join("markers");
+        create_worktree(&repo_path, "markers", &wt).await.unwrap();
+        let path = "quoted \"ü\" name.txt";
+        fs::write(wt.join(path), "++ b/not-a-header\n||||||| base\n")
+            .await
+            .unwrap();
+        commit_all(&wt, "marker-like content").await.unwrap();
+        assert_eq!(
+            paths_adding_conflict_markers(&wt, &branch, "HEAD")
+                .await
+                .unwrap(),
+            vec![path]
+        );
+
+        fs::write(wt.join(path), "++ b/not-a-header\n=======\n")
+            .await
+            .unwrap();
+        commit_all(&wt, "bare separator").await.unwrap();
+        assert!(paths_adding_conflict_markers(&wt, &branch, "HEAD")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -49,11 +49,14 @@
   "appShell": {
     "toggleTheme": "Toggle theme",
     "navigation": {
+      "account": "Account",
       "agentSettings": "Agent Settings",
       "agentWorkspace": "Project Agent",
+      "mainAgentDescription": "Ideas and projects",
+      "projectAgentDescription": "Planning and tasks here",
       "overview": "Overview",
       "board": "Kanban",
-      "mainChat": "Main Chat",
+      "mainChat": "Main Agent",
       "daemons": "Runtimes",
       "mcp": "MCP",
       "operations": "Operations",
