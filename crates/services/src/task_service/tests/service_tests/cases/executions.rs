@@ -2194,6 +2194,135 @@ async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
 }
 
 #[tokio::test]
+async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
+    let now = now_rfc3339();
+    let candidate = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("candidate completed".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("candidate execution creates");
+    let reviewer = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: Some(candidate.id.clone()),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("review completed".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("reviewer execution creates");
+    let review = ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review creates");
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&reviewer.id)
+        .bind(&review.id)
+        .execute(db.pool())
+        .await
+        .expect("reviewer attempt binding records");
+
+    ReviewRepo::update_status(
+        &*db,
+        &review.id,
+        ReviewStatus::Failed,
+        json!({ "ci_steps": [], "auditor": { "verdict": "fail" } }).to_string(),
+        Some(now.clone()),
+        &now,
+    )
+    .await
+    .expect("review outcome commits");
+
+    // The dispatcher's reconciliation arriving while the inline completion
+    // path is still settling this execution must not settle it again.
+    let in_flight = service
+        .claim_completion_cascade(&reviewer.id)
+        .expect("first claim succeeds");
+    assert!(service.claim_completion_cascade(&reviewer.id).is_none());
+    service
+        .maybe_cascade_executor_completion(&reviewer.id)
+        .await
+        .expect("concurrent delivery is a no-op");
+    let untouched = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(untouched.status, "review");
+    assert_eq!(untouched.version, task.version);
+
+    drop(in_flight);
+    service
+        .maybe_cascade_executor_completion(&reviewer.id)
+        .await
+        .expect("delivery after the slot frees settles");
+    let settled = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(settled.status, crate::workflow::default_states::IN_PROGRESS);
+}
+
+#[tokio::test]
 async fn duplicate_parent_bound_reviewer_delivery_reconciles_without_new_review_attempt() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

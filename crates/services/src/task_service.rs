@@ -404,6 +404,11 @@ pub struct TaskService {
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Executions whose completion cascade is running right now. Shared by
+    /// every clone, so the inline completion path and the dispatcher's
+    /// terminal-execution reconciliation never settle the same execution
+    /// twice at once.
+    completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
     credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
 }
 
@@ -480,6 +485,7 @@ impl TaskService {
             workspace_root: default_workspace_root(),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            completion_cascades: Arc::default(),
             credential_env: None,
         }
     }

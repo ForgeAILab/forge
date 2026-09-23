@@ -3,8 +3,55 @@ use super::*;
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
+/// Holds one execution's slot in `TaskService::completion_cascades` and frees
+/// it on drop, including when the cascade returns early or errors.
+pub(crate) struct CompletionCascadeSlot {
+    in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    execution_id: String,
+}
+
+impl Drop for CompletionCascadeSlot {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .expect("completion cascade set lock")
+            .remove(&self.execution_id);
+    }
+}
+
 impl TaskService {
+    /// Settle one terminal execution. The inline completion path and the
+    /// dispatcher's reconciliation of terminal executions both call this, and
+    /// a reviewer's cascade can run for seconds (the clean-checkout setup and
+    /// checks). A second caller that arrives meanwhile returns at once: the
+    /// cascade in flight settles the execution, and running it twice spent
+    /// the retry budget twice and re-froze the review assessment.
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
+        let Some(_slot) = self.claim_completion_cascade(execution_id) else {
+            tracing::debug!(
+                execution_id,
+                "completion cascade already in flight; leaving it to the running one"
+            );
+            return Ok(());
+        };
+        self.cascade_executor_completion(execution_id).await
+    }
+
+    pub(crate) fn claim_completion_cascade(
+        &self,
+        execution_id: &str,
+    ) -> Option<CompletionCascadeSlot> {
+        self.completion_cascades
+            .lock()
+            .expect("completion cascade set lock")
+            .insert(execution_id.to_owned())
+            .then(|| CompletionCascadeSlot {
+                in_flight: Arc::clone(&self.completion_cascades),
+                execution_id: execution_id.to_owned(),
+            })
+    }
+
+    async fn cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
         let execution = match ExecutionRepo::get_by_id(&*self.db, execution_id).await? {
             Some(execution) => execution,
             None => return Ok(()),

@@ -20,6 +20,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   classified as an unverified reviewer result, so the reviewer was retried
   until the Task blocked and the coder was never told.
 
+- A reviewer execution's completion is settled once. The inline completion path
+  and the dispatcher's reconciliation of terminal reviewer executions could both
+  run it while the clean-checkout checks were still going, which charged the
+  retry budget twice and hard-blocked the Task with
+  `check constraint failed: assessment is already frozen`.
+
 ## [0.13.0] - 2026-09-23
 
 ### Added
