@@ -6,7 +6,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Changed
+
+- A personal access token's `last_used_at` now advances at most once per five
+  minutes instead of on every request, so API and MCP traffic no longer writes
+  to SQLite per call.
+
+- `GET /api/v1/executions/{id}/hook-logs` is bounded: it returns at most
+  `limit` entries (default 500, max 5000) from at most `max_bytes` of hook log
+  (default 1 MiB, max 8 MiB). When a Task has more, the newest hook entries are
+  kept, still returned oldest first. It previously read every hook file in the
+  Task's log directory whole.
+
 ### Fixed
+
+- Password hashing and verification run on the blocking pool (at most four at
+  once) instead of stalling async workers, PAT authentication reads the token
+  and its user in one query, and MCP tool calls stop re-checking Project
+  visibility for every Task in one request. Execution lists and Task detail
+  bound their per-execution usage lookups to eight at a time.
 
 - `GET /api/v1/agents` and the agent detail routes no longer slow down as
   usage history grows. Each agent's lifetime cost aggregate issued several

@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use api_types::McpAccessTokenClaims;
 use db::{
-    new_uuid_v4, now_rfc3339, PersonalAccessTokenRepo, RefreshToken, RefreshTokenRepo, SqliteDb,
-    SystemSettingRepo, User, UserRepo,
+    new_uuid_v4, now_rfc3339, PersonalAccessTokenIdentity, PersonalAccessTokenRepo, RefreshToken,
+    RefreshTokenRepo, SqliteDb, SystemSettingRepo, User, UserRepo,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
@@ -14,8 +14,7 @@ const ACCESS_TOKEN_EXPIRY_SECS: u64 = 900; // 15 minutes
 const REFRESH_TOKEN_EXPIRY_SECS: u64 = 7 * 24 * 3600; // 7 days
 const BCRYPT_MAX_CONCURRENT_JOBS: usize = 4;
 const PAT_LAST_USED_WRITE_INTERVAL_SECS: i64 = 5 * 60;
-const DUMMY_BCRYPT_HASH: &str =
-    "$2b$12$LJ3m4ys3Lg7ECg8Mmpfmkea3RADRCnFXaOJsDaF5LxlWAyrVaoHDu";
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$LJ3m4ys3Lg7ECg8Mmpfmkea3RADRCnFXaOJsDaF5LxlWAyrVaoHDu";
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -312,29 +311,19 @@ impl AuthService {
         let token_hash = hash_token(raw_token);
         // PAT and user identity are one authentication read. The previous
         // repository path loaded them separately for every API/MCP request.
-        let row = sqlx::query_as::<
-            _,
-            (
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                String,
-                i64,
-            ),
-        >(
-            "SELECT pat.id, pat.expires_at, pat.last_used_at,
-                    u.id, u.email, u.is_admin
-             FROM personal_access_token pat
-             JOIN user u ON u.id = pat.user_id
-             WHERE pat.token_hash = ?",
-        )
-        .bind(token_hash)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| "invalid_token".to_string())?
-        .ok_or_else(|| "invalid_token".to_string())?;
-        let (pat_id, expires_at, last_used_at, user_id, email, is_admin) = row;
+        let identity =
+            PersonalAccessTokenRepo::get_pat_identity_by_token_hash(&*self.db, &token_hash)
+                .await
+                .map_err(|_| "invalid_token".to_string())?
+                .ok_or_else(|| "invalid_token".to_string())?;
+        let PersonalAccessTokenIdentity {
+            pat_id,
+            expires_at,
+            last_used_at,
+            user_id,
+            email,
+            is_admin,
+        } = identity;
 
         let now = chrono::Utc::now();
         if expires_at.as_deref().is_some_and(|expires_at| {
@@ -353,7 +342,7 @@ impl AuthService {
             let _ = PersonalAccessTokenRepo::update_last_used(&*self.db, &pat_id, &now).await;
         }
 
-        Ok((user_id, email, is_admin != 0))
+        Ok((user_id, email, is_admin))
     }
 
     async fn bootstrap_first_user(&self, user_id: &str) -> Result<()> {
@@ -519,12 +508,13 @@ fn bcrypt_gate() -> Arc<Semaphore> {
 }
 
 async fn hash_password(password: &str, cost: u32) -> Result<String> {
-    let permit = bcrypt_gate()
-        .acquire_owned()
-        .await
-        .map_err(|error| ServiceError::InvalidOperation {
-            message: format!("password hashing unavailable: {error}"),
-        })?;
+    let permit =
+        bcrypt_gate()
+            .acquire_owned()
+            .await
+            .map_err(|error| ServiceError::InvalidOperation {
+                message: format!("password hashing unavailable: {error}"),
+            })?;
     let password = password.to_owned();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -540,24 +530,23 @@ async fn hash_password(password: &str, cost: u32) -> Result<String> {
 }
 
 async fn verify_password(password: &str, password_hash: &str) -> Result<bool> {
-    let permit = bcrypt_gate()
-        .acquire_owned()
-        .await
-        .map_err(|error| ServiceError::InvalidOperation {
-            message: format!("password verification unavailable: {error}"),
-        })?;
+    let permit =
+        bcrypt_gate()
+            .acquire_owned()
+            .await
+            .map_err(|error| ServiceError::InvalidOperation {
+                message: format!("password verification unavailable: {error}"),
+            })?;
     let password = password.to_owned();
     let password_hash = password_hash.to_owned();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        bcrypt::verify(password, &password_hash)
+        // A malformed stored hash is a failed login, not a server error.
+        bcrypt::verify(password, &password_hash).unwrap_or(false)
     })
     .await
     .map_err(|error| ServiceError::InvalidOperation {
         message: format!("password verification task failed: {error}"),
-    })?
-    .map_err(|error| ServiceError::InvalidOperation {
-        message: format!("password verification failed: {error}"),
     })
 }
 
@@ -888,23 +877,21 @@ mod tests {
         let (verified_user_id, email, _) = svc.verify_pat(raw_token).await.expect("PAT verifies");
         assert_eq!(verified_user_id, user.id);
         assert_eq!(email, "pat@test.com");
-        let first_touch: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'",
-        )
-        .fetch_one(svc.db.pool())
-        .await
-        .expect("first touch reads");
+        let first_touch: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'")
+                .fetch_one(svc.db.pool())
+                .await
+                .expect("first touch reads");
         let first_touch = first_touch.expect("first verification records usage");
 
         svc.verify_pat(raw_token)
             .await
             .expect("fresh PAT verifies without another write");
-        let second_touch: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'",
-        )
-        .fetch_one(svc.db.pool())
-        .await
-        .expect("second touch reads");
+        let second_touch: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'")
+                .fetch_one(svc.db.pool())
+                .await
+                .expect("second touch reads");
         assert_eq!(second_touch.as_deref(), Some(first_touch.as_str()));
 
         let stale = (chrono::Utc::now() - chrono::Duration::minutes(10))
@@ -917,12 +904,11 @@ mod tests {
         svc.verify_pat(raw_token)
             .await
             .expect("stale PAT usage refreshes");
-        let refreshed: Option<String> = sqlx::query_scalar(
-            "SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'",
-        )
-        .fetch_one(svc.db.pool())
-        .await
-        .expect("refreshed touch reads");
+        let refreshed: Option<String> =
+            sqlx::query_scalar("SELECT last_used_at FROM personal_access_token WHERE id = 'pat-1'")
+                .fetch_one(svc.db.pool())
+                .await
+                .expect("refreshed touch reads");
         assert_ne!(refreshed.as_deref(), Some(stale.as_str()));
     }
 

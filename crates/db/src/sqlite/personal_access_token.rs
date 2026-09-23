@@ -1,5 +1,8 @@
 use super::*;
-use crate::{CreatePersonalAccessToken, PersonalAccessToken, PersonalAccessTokenRepo};
+use crate::{
+    CreatePersonalAccessToken, PersonalAccessToken, PersonalAccessTokenIdentity,
+    PersonalAccessTokenRepo,
+};
 
 #[async_trait]
 impl PersonalAccessTokenRepo for SqliteDb {
@@ -39,6 +42,33 @@ impl PersonalAccessTokenRepo for SqliteDb {
             .await?
             .map(map_pat)
             .transpose()
+    }
+
+    async fn get_pat_identity_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PersonalAccessTokenIdentity>> {
+        sqlx::query(
+            "SELECT pat.id AS pat_id, pat.expires_at, pat.last_used_at,
+                    u.id AS user_id, u.email, u.is_admin
+             FROM personal_access_token pat
+             JOIN user u ON u.id = pat.user_id
+             WHERE pat.token_hash = ?",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok(PersonalAccessTokenIdentity {
+                pat_id: row.try_get("pat_id")?,
+                expires_at: row.try_get("expires_at")?,
+                last_used_at: row.try_get("last_used_at")?,
+                user_id: row.try_get("user_id")?,
+                email: row.try_get("email")?,
+                is_admin: row.try_get::<i64, _>("is_admin")? != 0,
+            })
+        })
+        .transpose()
     }
 
     async fn list_pats_by_user(&self, user_id: &str) -> Result<Vec<PersonalAccessToken>> {
