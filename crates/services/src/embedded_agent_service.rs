@@ -428,7 +428,7 @@ impl EmbeddedAgentService {
     /// Resolve the Project Agent's workspace, provisioning it on first use.
     pub async fn project_agent_workspace(&self, project_id: &str) -> Option<std::path::PathBuf> {
         let (_, workspaces_root) = self.workspace_roots()?;
-        match crate::task_service::workspace::ensure_project_agent_workspace(
+        match crate::task_service::project_agent_workspace::ensure_project_agent_workspace(
             &self.db,
             &workspaces_root,
             project_id,

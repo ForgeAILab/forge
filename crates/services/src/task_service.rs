@@ -61,6 +61,7 @@ mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
 mod move_task;
+pub(crate) mod project_agent_workspace;
 mod proposal;
 mod reorder_subtasks;
 mod repository_authority;
