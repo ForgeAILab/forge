@@ -4208,8 +4208,10 @@ pub trait RetrospectiveEstimateRepo: Send + Sync {
         &self,
         run_id: &str,
     ) -> Result<Vec<CostEstimateRevision>>;
-    async fn list_cost_estimate_revisions_for_event(
+    /// Every revision for every event of one invocation, grouped by event and
+    /// newest first within each event.
+    async fn list_cost_estimate_revisions_for_invocation(
         &self,
-        usage_event_id: &str,
+        invocation_id: &str,
     ) -> Result<Vec<CostEstimateRevision>>;
 }

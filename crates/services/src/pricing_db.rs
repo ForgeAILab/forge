@@ -4447,6 +4447,8 @@ mod tests {
         project_id
     }
 
+    const FIXTURE_AGENT_ID: &str = "pricing-agent";
+
     async fn usage_event_fixture(
         db: &db::SqliteDb,
         project_id: &str,
@@ -4514,7 +4516,7 @@ mod tests {
                 pricing_subject_id: None,
                 pricing_subject_revision_id: None,
                 subject_revision_digest: None,
-                agent_id: None,
+                agent_id: Some(FIXTURE_AGENT_ID.to_owned()),
                 profile_id: None,
                 agent_name_snapshot: None,
                 project_name_snapshot: Some("Pricing project".to_owned()),
@@ -4607,7 +4609,7 @@ mod tests {
                     runtime_model: Some("gpt-test".to_owned()),
                     candidate_key: Some("candidate-0".to_owned()),
                     attempt_ordinal: 0,
-                    agent_id: None,
+                    agent_id: Some(FIXTURE_AGENT_ID.to_owned()),
                     profile_id: None,
                     agent_name_snapshot: None,
                     project_name_snapshot: Some("Pricing project".to_owned()),
@@ -5628,6 +5630,32 @@ mod tests {
             Some(pricing::COST_FORMULA_REVISION)
         );
 
+        // The public projection overlays the applied revision onto the
+        // immutable event, including the preview's frozen provenance.
+        let breakdowns = crate::usage_projection::usage_breakdowns_for_source(
+            &db,
+            "execution-retrospective-estimated",
+        )
+        .await
+        .expect("breakdowns project");
+        assert_eq!(breakdowns.len(), 1);
+        let cost = &breakdowns[0].cost;
+        assert_eq!(cost.kind, api_types::CostKind::Estimated);
+        assert_eq!(cost.sources.len(), 1);
+        assert!(cost.sources[0].retrospective);
+        assert_eq!(
+            cost.sources[0].rate_revision_id,
+            revisions[0].rate_revision_id
+        );
+        assert_eq!(
+            cost.sources[0].catalog_snapshot_id.as_deref(),
+            Some(snapshot.id.as_str())
+        );
+        assert_eq!(
+            cost.sources[0].freshness,
+            api_types::CostSourceFreshness::Fresh
+        );
+
         let reported = db::UsageLedgerRepo::get_usage_event(&*db, &reported_event)
             .await
             .expect("reported event lookup")
@@ -5650,6 +5678,57 @@ mod tests {
             .expect("revisions remain immutable")
             .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_usage_cache_reuses_until_the_ledger_moves() {
+        let db = database().await;
+        let _ = subject_fixture(&db).await;
+        let project_id = project_fixture(&db).await;
+        usage_event_fixture(
+            &db,
+            &project_id,
+            "cache-first",
+            Some(EventTokenCounts::new(1, 0, 0, 0)),
+            None,
+        )
+        .await;
+        let cache = crate::usage_projection::AgentUsageAggregateCache::default();
+        let first = cache.get(&db, FIXTURE_AGENT_ID).await.expect("aggregate");
+        assert_eq!(first.tokens.input_tokens, 1);
+
+        // An unchanged ledger is served from the cache, not recomputed.
+        let mut sentinel = first.clone();
+        sentinel.tokens.input_tokens = 999;
+        cache.replace_cached_aggregate(FIXTURE_AGENT_ID, sentinel);
+        assert_eq!(
+            cache
+                .get(&db, FIXTURE_AGENT_ID)
+                .await
+                .expect("hit")
+                .tokens
+                .input_tokens,
+            999
+        );
+
+        // A new event moves the fingerprint and forces a recompute.
+        usage_event_fixture(
+            &db,
+            &project_id,
+            "cache-second",
+            Some(EventTokenCounts::new(2, 0, 0, 0)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            cache
+                .get(&db, FIXTURE_AGENT_ID)
+                .await
+                .expect("miss")
+                .tokens
+                .input_tokens,
+            3
         );
     }
 }

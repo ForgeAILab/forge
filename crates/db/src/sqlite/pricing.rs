@@ -3329,15 +3329,18 @@ impl RetrospectiveEstimateRepo for SqliteDb {
         .collect()
     }
 
-    async fn list_cost_estimate_revisions_for_event(
+    async fn list_cost_estimate_revisions_for_invocation(
         &self,
-        usage_event_id: &str,
+        invocation_id: &str,
     ) -> Result<Vec<CostEstimateRevision>> {
         sqlx::query(
-            "SELECT * FROM cost_estimate_revision
-             WHERE usage_event_id = ? ORDER BY revision DESC, created_at DESC, id DESC",
+            "SELECT revision.* FROM cost_estimate_revision revision
+             JOIN usage_event event ON event.id = revision.usage_event_id
+             WHERE event.invocation_id = ?
+             ORDER BY revision.usage_event_id, revision.revision DESC,
+                      revision.created_at DESC, revision.id DESC",
         )
-        .bind(usage_event_id)
+        .bind(invocation_id)
         .fetch_all(&self.pool)
         .await?
         .into_iter()

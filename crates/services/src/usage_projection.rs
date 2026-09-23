@@ -143,15 +143,24 @@ async fn list_effective_usage_events(
     invocation: &UsageInvocation,
 ) -> Result<Vec<EffectiveUsageEvent>> {
     let events = UsageLedgerRepo::list_usage_events_for_invocation(db, &invocation.id).await?;
+    // Batched per invocation: an agent's lifetime aggregate walks every event
+    // it ever produced, so per-event queries made list endpoints linear in
+    // usage history.
+    let mut applied_by_event = HashMap::new();
+    for revision in
+        RetrospectiveEstimateRepo::list_cost_estimate_revisions_for_invocation(db, &invocation.id)
+            .await?
+    {
+        if revision.state == CostEstimateRevisionState::Applied {
+            applied_by_event
+                .entry(revision.usage_event_id.clone())
+                .or_insert(revision);
+        }
+    }
+    let mut metadata_cache = HashMap::new();
     let mut effective = Vec::with_capacity(events.len());
     for event in events {
-        let revisions =
-            RetrospectiveEstimateRepo::list_cost_estimate_revisions_for_event(db, &event.id)
-                .await?;
-        if let Some(revision) = revisions
-            .into_iter()
-            .find(|revision| revision.state == CostEstimateRevisionState::Applied)
-        {
+        if let Some(revision) = applied_by_event.remove(&event.id) {
             if event.cost_kind == UsageCostKind::ProviderReported {
                 return Err(invalid_transition());
             }
@@ -165,14 +174,22 @@ async fn list_effective_usage_events(
             event.catalog_snapshot_id = revision.catalog_snapshot_id.or(event.catalog_snapshot_id);
             event.formula_revision = revision.formula_revision.or(event.formula_revision);
             event.retrospective = revision.retrospective;
-            let source_metadata =
-                load_event_source_metadata(db, invocation, &event, Some(&revision.id)).await?;
+            let source_metadata = cached_event_source_metadata(
+                &mut metadata_cache,
+                db,
+                invocation,
+                &event,
+                Some(&revision.id),
+            )
+            .await?;
             effective.push(EffectiveUsageEvent {
                 source: event_source_with_metadata(&event, Some(&source_metadata))?,
                 event,
             });
         } else {
-            let source_metadata = load_event_source_metadata(db, invocation, &event, None).await?;
+            let source_metadata =
+                cached_event_source_metadata(&mut metadata_cache, db, invocation, &event, None)
+                    .await?;
             effective.push(EffectiveUsageEvent {
                 source: event_source_with_metadata(&event, Some(&source_metadata))?,
                 event,
@@ -180,6 +197,30 @@ async fn list_effective_usage_events(
         }
     }
     Ok(effective)
+}
+
+/// The metadata join depends only on the invocation plus these three ids, and
+/// an invocation's events almost always share them.
+type EventSourceMetadataKey = (Option<String>, Option<String>, Option<String>);
+
+async fn cached_event_source_metadata(
+    cache: &mut HashMap<EventSourceMetadataKey, EventSourceMetadata>,
+    db: &db::SqliteDb,
+    invocation: &UsageInvocation,
+    event: &UsageEvent,
+    applied_revision_id: Option<&str>,
+) -> Result<EventSourceMetadata> {
+    let key = (
+        event.rate_revision_id.clone(),
+        event.catalog_snapshot_id.clone(),
+        applied_revision_id.map(str::to_owned),
+    );
+    if let Some(metadata) = cache.get(&key) {
+        return Ok(metadata.clone());
+    }
+    let metadata = load_event_source_metadata(db, invocation, event, applied_revision_id).await?;
+    cache.insert(key, metadata.clone());
+    Ok(metadata)
 }
 
 #[derive(Debug, Clone)]
@@ -720,6 +761,101 @@ fn aggregate_usage_with_sources(
             sources: source_items,
         },
     })
+}
+
+/// Everything `usage_aggregate_for_agent` reads, reduced to counters that move
+/// whenever any input does. Usage events and cost estimate revisions are
+/// append-only, an invocation bumps `version` on every update, and pricing
+/// provenance is joined by frozen ids, so an unchanged fingerprint means an
+/// unchanged aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentUsageFingerprint {
+    event_count: i64,
+    event_max_rowid: i64,
+    invocation_count: i64,
+    invocation_version_sum: i64,
+    revision_max_rowid: i64,
+    execution_count: i64,
+    running_execution_count: i64,
+}
+
+async fn agent_usage_fingerprint(
+    db: &db::SqliteDb,
+    identity_id: &str,
+) -> Result<AgentUsageFingerprint> {
+    let row = sqlx::query(
+        "WITH sources AS (
+             SELECT source_id FROM usage_invocation WHERE agent_id = ?1
+             UNION SELECT source_id FROM usage_event WHERE agent_id = ?1
+         )
+         SELECT
+             (SELECT COUNT(*) FROM usage_event
+               WHERE source_id IN sources) AS event_count,
+             (SELECT COALESCE(MAX(rowid), 0) FROM usage_event
+               WHERE source_id IN sources) AS event_max_rowid,
+             (SELECT COUNT(*) FROM usage_invocation
+               WHERE source_id IN sources) AS invocation_count,
+             (SELECT COALESCE(SUM(version), 0) FROM usage_invocation
+               WHERE source_id IN sources) AS invocation_version_sum,
+             (SELECT COALESCE(MAX(rowid), 0) FROM cost_estimate_revision) AS revision_max_rowid,
+             (SELECT COUNT(*) FROM execution WHERE agent_id = ?1) AS execution_count,
+             (SELECT COUNT(*) FROM execution
+               WHERE agent_id = ?1 AND status = 'running') AS running_execution_count",
+    )
+    .bind(identity_id)
+    .fetch_one(db.pool())
+    .await?;
+    Ok(AgentUsageFingerprint {
+        event_count: sqlx::Row::try_get(&row, "event_count")?,
+        event_max_rowid: sqlx::Row::try_get(&row, "event_max_rowid")?,
+        invocation_count: sqlx::Row::try_get(&row, "invocation_count")?,
+        invocation_version_sum: sqlx::Row::try_get(&row, "invocation_version_sum")?,
+        revision_max_rowid: sqlx::Row::try_get(&row, "revision_max_rowid")?,
+        execution_count: sqlx::Row::try_get(&row, "execution_count")?,
+        running_execution_count: sqlx::Row::try_get(&row, "running_execution_count")?,
+    })
+}
+
+/// Process-local memo of each agent's lifetime usage aggregate. The aggregate
+/// walks every event the agent ever produced, so agent list and detail routes
+/// reuse it until the fingerprint moves rather than recomputing it per request.
+#[derive(Debug, Default)]
+pub struct AgentUsageAggregateCache {
+    entries: std::sync::Mutex<HashMap<String, (AgentUsageFingerprint, UsageAggregate)>>,
+}
+
+impl AgentUsageAggregateCache {
+    pub async fn get(&self, db: &db::SqliteDb, identity_id: &str) -> Result<UsageAggregate> {
+        let fingerprint = agent_usage_fingerprint(db, identity_id).await?;
+        if let Some((cached, aggregate)) = self
+            .entries
+            .lock()
+            .expect("agent usage cache lock")
+            .get(identity_id)
+        {
+            if *cached == fingerprint {
+                return Ok(aggregate.clone());
+            }
+        }
+        let aggregate = usage_aggregate_for_agent(db, identity_id).await?;
+        self.entries
+            .lock()
+            .expect("agent usage cache lock")
+            .insert(identity_id.to_owned(), (fingerprint, aggregate.clone()));
+        Ok(aggregate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_cached_aggregate(&self, identity_id: &str, aggregate: UsageAggregate) {
+        if let Some(entry) = self
+            .entries
+            .lock()
+            .expect("agent usage cache lock")
+            .get_mut(identity_id)
+        {
+            entry.1 = aggregate;
+        }
+    }
 }
 
 /// Collect all ledger rows attributed to an Agent identity and build its

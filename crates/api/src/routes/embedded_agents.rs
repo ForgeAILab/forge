@@ -313,7 +313,7 @@ async fn set_session_status(
 
 async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
+    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
     let active_assigned_task_count =
         AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let running_execution_count =

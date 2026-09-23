@@ -6,6 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- `GET /api/v1/agents` and the agent detail routes no longer slow down as
+  usage history grows. Each agent's lifetime cost aggregate issued several
+  queries per usage event (8.8s for 23 agents on a real install); it now reads
+  cost revisions and pricing provenance once per invocation and is memoized
+  until the agent's ledger changes.
+
 ## [0.13.0] - 2026-09-23
 
 ### Added

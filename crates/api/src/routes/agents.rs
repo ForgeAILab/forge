@@ -450,7 +450,7 @@ async fn build_agent_response(
         .as_str()
         .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
+    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
     // Derived here rather than threaded through every caller: this is the
     // quantity `max_concurrent_tasks` actually bounds, so it should always be
     // present wherever the cap is.

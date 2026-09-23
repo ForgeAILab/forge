@@ -37,8 +37,7 @@ pub async fn list_project_agents(
             .as_str()
             .to_owned();
         let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-        let usage =
-            services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
+        let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
         responses.push(agent_response(
             agent,
             Some(active_assigned_task_count),

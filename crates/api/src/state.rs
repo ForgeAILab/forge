@@ -30,6 +30,8 @@ pub struct AppState {
     /// One process-wide models.dev client per AppState. Clones share the
     /// client's single-flight refresh gate and its fixed endpoint transport.
     pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
+    /// Memoized lifetime usage per agent, shared by the agent routes.
+    pub agent_usage_cache: Arc<services::usage_projection::AgentUsageAggregateCache>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
@@ -178,6 +180,7 @@ impl AppState {
             db: Arc::clone(&runtime.db),
             pricing_repository: Arc::clone(&runtime.pricing_repository),
             models_dev_client: Arc::clone(&runtime.models_dev_client),
+            agent_usage_cache: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
             agent_service: Arc::clone(&runtime.agent_service),
             embedded_agent_service: Arc::clone(&runtime.embedded_agent_service),
