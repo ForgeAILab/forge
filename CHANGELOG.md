@@ -98,6 +98,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An agent's workspace command can no longer hold a Task execution until its
+  hard deadline or outlive it. Commands run in their own process group with a
+  15-minute limit, and the group is killed when the command exits, is stopped,
+  or its turn is cancelled. A test suite that hung (boardlite's vitest) used to
+  burn every 30-minute attempt and leave its whole worker tree running: about
+  150 orphaned processes after an afternoon. A stopped command now returns as a
+  failed run with the reason, so the agent can change course.
+
 - A merge conflict goes back to the Task's Worker instead of parking the
   Task for a person. Since 1ea2011 every content conflict in the rebase onto a
   moved target stopped in `merging` with `blocked_by: manual_workspace_repair`,

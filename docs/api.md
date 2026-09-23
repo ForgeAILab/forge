@@ -2681,6 +2681,12 @@ text utilities, and their peers). Programs that can mount the host filesystem
 a program chosen at runtime (`xargs`, `env`) are deliberately absent and must
 be added here.
 
+Every allowed command runs in its own process group with a 15-minute limit.
+When it exits, is stopped at the limit, or its agent turn is cancelled, Forge
+kills the whole group, so nothing it started (a backgrounded server, a test
+runner's workers) outlives it. A command stopped at the limit returns as a
+failed run whose stderr starts with the reason.
+
 A Project layers its own policy over that result through the `command_allowlist`
 key in its settings (`PATCH /api/v1/projects/{id}` with
 `{"settings": {"command_allowlist": {"allow": ["terraform"]}}}`), using the same

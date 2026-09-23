@@ -85,6 +85,9 @@ const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 256;
 const MAX_DIRECTORY_GLOB_CHARS: usize = 256;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 128 * 1024;
+/// A Task command that runs longer is stopped, so a watch mode, a server, or
+/// a hung test suite cannot hold the execution until its hard deadline.
+const TASK_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 const MAX_PUBLIC_SEARCH_QUERY_CHARS: usize = 512;
 const MAX_PUBLIC_SEARCH_RESULTS: u64 = 10;
 
@@ -2404,22 +2407,155 @@ async fn execute_workspace_command(
         .args(args)
         .current_dir(&current_dir)
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = command
-        .output()
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
+    let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
     Ok(ExecutedCommand {
         program: program.to_owned(),
         args: args.to_vec(),
-        status_code: output.status.code(),
-        success: output.status.success(),
+        status_code: output.status_code,
+        success: output.success,
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+struct BoundedOutput {
+    status_code: Option<i32>,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `command` in its own process group and never leave it behind.
+///
+/// The group is killed when the command exits (reaping anything it
+/// backgrounded), when it outlives `timeout`, and when this future is dropped
+/// because the turn was cancelled or hit its deadline. Before this, a command
+/// that never exited held the execution until its hard deadline and then
+/// survived it: one Project leaked a hung test runner's whole worker tree on
+/// every attempt. Exit is judged by the command's own status, not by its pipes
+/// closing, so a backgrounded process holding stdout cannot stall the result.
+/// A timeout is reported as a failed run with the reason appended to stderr,
+/// so the agent can change course instead of losing the execution.
+async fn run_bounded_command(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<BoundedOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    let group = ProcessGroupGuard::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| tokio::spawn(read_capped(pipe)));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| tokio::spawn(read_capped(pipe)));
+    let status = tokio::time::timeout(timeout, child.wait()).await;
+    // Killing the group closes every pipe a leftover process still holds.
+    drop(group);
+    let collect = |reader: Option<tokio::task::JoinHandle<Vec<u8>>>| async move {
+        match reader {
+            Some(reader) => reader.await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    };
+    let stdout = collect(stdout).await;
+    let mut stderr = collect(stderr).await;
+    match status {
+        Ok(status) => {
+            let status = status?;
+            Ok(BoundedOutput {
+                status_code: status.code(),
+                success: status.success(),
+                stdout,
+                stderr,
+            })
+        }
+        Err(_) => {
+            // Lead with the reason: the tail of a full stderr is what gets cut.
+            let mut reason = format!(
+                "Forge stopped this command after {} seconds. Commands must exit on their \
+                 own: run tests once instead of in watch mode, and do not start servers or \
+                 other long-running processes in the foreground.\n",
+                timeout.as_secs()
+            )
+            .into_bytes();
+            reason.append(&mut stderr);
+            let stderr = reason;
+            Ok(BoundedOutput {
+                status_code: None,
+                success: false,
+                stdout,
+                stderr,
+            })
+        }
+    }
+}
+
+/// Drain `pipe` to its end, keeping only what a tool result can show. The
+/// rest is read and discarded so a chatty command never blocks on a full pipe.
+async fn read_capped(mut pipe: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let cap = MAX_COMMAND_OUTPUT_BYTES + 1;
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+    }
+    kept
+}
+
+/// Kills a spawned command's whole process group when dropped.
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: pid.and_then(|pid| i32::try_from(pid).ok()),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Self {}
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // The group was created for this command by `process_group(0)`,
+            // so its id is the child's pid and names no unrelated group. An
+            // already-empty group is not an error worth reporting.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
 
 fn command_outcome(run: &ExecutedCommand, observation_id: Option<&str>) -> ToolOutcome {
@@ -4769,5 +4905,99 @@ mod tests {
             Path::new(path) == Path::new(&self.root)
                 || Path::new(path).starts_with(Path::new(&self.root))
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_command_tests {
+    use std::time::Duration;
+
+    use tokio::process::Command;
+
+    use super::run_bounded_command;
+
+    /// A shell that backgrounds `sleep 60`, records its pid, then runs `tail`.
+    fn backgrounding_shell(pid_file: &std::path::Path, tail: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 60 & echo $! > '{}'; {tail}",
+            pid_file.display()
+        ));
+        command
+    }
+
+    async fn background_pid(pid_file: &std::path::Path) -> i32 {
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("background pid was never recorded");
+    }
+
+    async fn assert_gone(pid: i32) {
+        let pid = nix::unistd::Pid::from_raw(pid);
+        for _ in 0..50 {
+            if nix::sys::signal::kill(pid, None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        panic!("process {pid} outlived its Task command");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_never_exits_is_stopped_with_its_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let output = run_bounded_command(
+            backgrounding_shell(&pid_file, "wait"),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        assert!(!output.success);
+        assert_eq!(output.status_code, None);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Forge stopped this command"));
+        assert_gone(background_pid(&pid_file).await).await;
+    }
+
+    #[tokio::test]
+    async fn a_finished_command_leaves_nothing_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let output = run_bounded_command(
+            backgrounding_shell(&pid_file, "echo done"),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+        assert_gone(background_pid(&pid_file).await).await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_kills_the_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // The runtime cancels a tool by dropping its future.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_bounded_command(
+                backgrounding_shell(&pid_file, "wait"),
+                Duration::from_secs(60),
+            ),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the command should still have been running"
+        );
+        assert_gone(background_pid(&pid_file).await).await;
     }
 }

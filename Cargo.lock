@@ -1295,6 +1295,7 @@ dependencies = [
  "futures-util",
  "hex",
  "jsonschema",
+ "nix 0.28.0",
  "regex",
  "reqwest",
  "serde",
