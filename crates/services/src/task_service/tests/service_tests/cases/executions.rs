@@ -4189,12 +4189,7 @@ async fn re_execute_follows_a_reassigned_role_principal() {
     .expect("parent execution creates");
     service
         .reassign_role(
-            role_assignment_input(
-                &task.id,
-                "coder",
-                Some(replacement_agent_id.clone()),
-                None,
-            ),
+            role_assignment_input(&task.id, "coder", Some(replacement_agent_id.clone()), None),
             false,
             false,
         )
@@ -4790,8 +4785,8 @@ async fn resume_without_session_clears_manual_stop_before_reexecute() {
 async fn reexecute_opens_a_fresh_review_attempt_when_the_last_one_settled() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus)
-        .with_task_executor(Arc::new(NoDiffExecutor));
+    let service =
+        TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(NoDiffExecutor));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let coder_agent_id = seed_agent(&db).await;
     let reviewer_agent_id = seed_agent(&db).await;
@@ -4894,14 +4889,16 @@ async fn reexecute_opens_a_fresh_review_attempt_when_the_last_one_settled() {
         .expect("a review attempt exists");
     assert_eq!(latest.attempt_number, 2);
     assert_eq!(latest.execution_id, candidate.id);
-    assert!(ExecutionRepo::count_by_task_and_role(
-        &*db,
-        &task.id,
-        crate::workflow::default_roles::REVIEWER,
-    )
-    .await
-    .expect("reviewer executions count")
-        >= 2);
+    assert!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::REVIEWER,
+        )
+        .await
+        .expect("reviewer executions count")
+            >= 2
+    );
 }
 
 #[tokio::test]

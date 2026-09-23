@@ -760,7 +760,10 @@ impl TaskService {
         // INSERT rejects the launch as a bare version conflict. This must
         // precede the dispatch context, which snapshots the attempt.
         if parent_execution.role == crate::workflow::default_roles::REVIEWER {
-            if let Err(error) = self.ensure_review_attempt_for_recovery(&task, &project).await {
+            if let Err(error) = self
+                .ensure_review_attempt_for_recovery(&task, &project)
+                .await
+            {
                 if let Some(original) = original_recovery_task.as_ref() {
                     self.restore_recovery_metadata_after_failed_resume(
                         &task,
