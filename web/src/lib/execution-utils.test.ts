@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildExecutionChains, isResumeExecution, turnLabel } from '@/lib/execution-utils'
+import {
+  buildExecutionChains,
+  continuesParentSession,
+  isResumeExecution,
+  turnLabel,
+} from '@/lib/execution-utils'
 import type { Execution } from '@/types/generated'
 
 function execution(overrides: Partial<Execution>): Execution {
@@ -73,5 +78,39 @@ describe('execution utils', () => {
     expect(chains[0].turns.map((turn) => turn.id)).toEqual(['old-root', 'child'])
     expect(turnLabel(0, oldRoot)).toBe('Initial run')
     expect(turnLabel(1, child)).toBe('Follow-up turn')
+  })
+
+  it('keeps a reviewer bound to its candidate run in its own session', () => {
+    const coder = execution({
+      id: 'coder',
+      role: 'coder',
+      agent_id: 'worker-agent',
+      created_at: '2026-05-02T10:00:00.000Z',
+    })
+    // A reviewer points at the candidate it reviewed; that is not a turn of
+    // the coder's session, even when both agents run the same model.
+    const reviewer = execution({
+      id: 'reviewer',
+      role: 'reviewer',
+      agent_id: 'reviewer-agent',
+      parent_execution_id: coder.id,
+      created_at: '2026-05-02T10:05:00.000Z',
+    })
+    const reviewerRetry = execution({
+      id: 'reviewer-retry',
+      role: 'reviewer',
+      agent_id: 'reviewer-agent',
+      parent_execution_id: reviewer.id,
+      created_at: '2026-05-02T10:07:00.000Z',
+    })
+
+    const chains = buildExecutionChains([coder, reviewer, reviewerRetry])
+
+    expect(chains.map((chain) => chain.turns.map((turn) => turn.id))).toEqual([
+      ['reviewer', 'reviewer-retry'],
+      ['coder'],
+    ])
+    expect(continuesParentSession(reviewer, coder)).toBe(false)
+    expect(continuesParentSession(reviewerRetry, reviewer)).toBe(true)
   })
 })

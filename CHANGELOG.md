@@ -34,6 +34,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   never become ready: every result read back as
   `immutable validation result is stale for the active authority`.
 
+- The Task and run views no longer show a reviewer run as a later turn of the
+  coder's session. A reviewer links to the candidate run it reviewed, and any
+  such link was read as a session continuation, so the review appeared as a
+  "Re-execution" inside the Coder Session and its timeline included the coder's
+  transcript. A run now continues its parent's session only when it has the
+  same role and agent.
+
 - `GET /api/v1/agents` and the agent detail routes no longer slow down as
   usage history grows. Each agent's lifetime cost aggregate issued several
   queries per usage event (8.8s for 23 agents on a real install); it now reads

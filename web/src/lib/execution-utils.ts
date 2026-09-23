@@ -36,22 +36,38 @@ export function turnLabel(index: number, execution: Execution): string {
 
 export type ExecutionChain = { root: Execution; turns: Execution[] }
 
+/**
+ * Whether `execution` is a later turn of `parent`'s session. A parent link
+ * alone does not say so: a reviewer run points at the candidate run it
+ * reviewed, which is a different role and agent with its own session.
+ */
+export function continuesParentSession(
+  execution: Pick<Execution, 'role' | 'agent_id'>,
+  parent: Pick<Execution, 'role' | 'agent_id'>,
+): boolean {
+  return execution.role === parent.role && execution.agent_id === parent.agent_id
+}
+
 export function buildExecutionChains(executions: Execution[]): ExecutionChain[] {
   const byId = new Map(executions.map((e) => [e.id, e]))
   const childrenOf = new Map<string, Execution[]>()
 
+  const sessionParentOf = (e: Execution): Execution | undefined => {
+    const parent = e.parent_execution_id ? byId.get(e.parent_execution_id) : undefined
+    return parent && continuesParentSession(e, parent) ? parent : undefined
+  }
+
   for (const e of executions) {
-    if (e.parent_execution_id && byId.has(e.parent_execution_id)) {
-      const arr = childrenOf.get(e.parent_execution_id) ?? []
+    const parent = sessionParentOf(e)
+    if (parent) {
+      const arr = childrenOf.get(parent.id) ?? []
       arr.push(e)
-      childrenOf.set(e.parent_execution_id, arr)
+      childrenOf.set(parent.id, arr)
     }
   }
 
-  // Roots: no parent, or parent not in this list
-  const roots = executions.filter(
-    (e) => !e.parent_execution_id || !byId.has(e.parent_execution_id),
-  )
+  // Roots: no parent in this list, or a parent from another session
+  const roots = executions.filter((e) => !sessionParentOf(e))
   roots.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
   const chains: ExecutionChain[] = []

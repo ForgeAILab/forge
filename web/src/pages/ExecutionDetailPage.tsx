@@ -34,7 +34,7 @@ import { Button } from '@/components/ui/button'
 import { Tooltip } from '@/components/ui/tooltip'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
-import { roleDisplayName } from '@/lib/execution-utils'
+import { continuesParentSession, roleDisplayName } from '@/lib/execution-utils'
 import { productTerm } from '@/lib/i18n'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
 import { useAuthStore } from '@/stores/auth'
@@ -243,6 +243,7 @@ export function ExecutionDetailPage({
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [showConfigBar, setShowConfigBar] = useState(false)
   const [ancestorTurns, setAncestorTurns] = useState<ExecutionTurn[]>([])
+  const [sessionStartId, setSessionStartId] = useState<string | null>(null)
   const [isLoadingOlderTurn, setIsLoadingOlderTurn] = useState(false)
   const nextLoadedSequence = useMemo(() => nextSequenceForLogs(logs), [logs])
 
@@ -264,16 +265,25 @@ export function ExecutionDetailPage({
       setHasMoreLogs(false)
       setLogsParams({ tail: LOG_PAGE_LIMIT })
       setAncestorTurns([])
+      setSessionStartId(null)
       setIsLoadingOlderTurn(false)
       setAutoScroll(true)
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [executionId])
 
+  // Only a turn of this run's own session belongs in its timeline; a reviewer's
+  // parent is the candidate run it reviewed, with another role and agent.
+  const continuesSession = Boolean(
+    execution &&
+      parentTurnQuery.data &&
+      continuesParentSession(execution, parentTurnQuery.data.execution),
+  )
+
   useEffect(() => {
-    if (!parentTurnQuery.data) return
+    if (!parentTurnQuery.data || !continuesSession) return
     setAncestorTurns([parentTurnQuery.data])
-  }, [parentTurnQuery.data])
+  }, [continuesSession, parentTurnQuery.data])
 
   useEffect(() => {
     if (!logsQuery.data) return
@@ -341,21 +351,25 @@ export function ExecutionDetailPage({
       : undefined
 
   const timelineLogs = useMemo(() => {
-    if (!execution || !parentExecutionId) return logs
+    if (!execution || !continuesSession) return logs
     return timelineLogsForTurns([
       ...ancestorTurns,
       { execution, logs },
     ])
-  }, [ancestorTurns, execution, logs, parentExecutionId])
+  }, [ancestorTurns, continuesSession, execution, logs])
 
   const filteredLogs = useMemo(
     () => timelineLogs.filter((log) => enabledKinds.has(effectiveLogFilterKind(log))),
     [enabledKinds, timelineLogs],
   )
 
-  const viewerUserPrompt = parentExecutionId ? undefined : syntheticUserPrompt
+  const viewerUserPrompt = continuesSession ? undefined : syntheticUserPrompt
 
-  const oldestLoadedParentExecutionId = ancestorTurns[0]?.execution.parent_execution_id ?? null
+  const oldestLoadedTurn = ancestorTurns[0]?.execution
+  const oldestLoadedParentExecutionId =
+    oldestLoadedTurn && oldestLoadedTurn.id !== sessionStartId
+      ? (oldestLoadedTurn.parent_execution_id ?? null)
+      : null
 
   const loadOlderFollowUpTurn = useCallback(async () => {
     if (!oldestLoadedParentExecutionId || isLoadingOlderTurn) return
@@ -363,6 +377,11 @@ export function ExecutionDetailPage({
     setIsLoadingOlderTurn(true)
     try {
       const olderTurn = await fetchExecutionTurn(oldestLoadedParentExecutionId)
+      if (oldestLoadedTurn && !continuesParentSession(oldestLoadedTurn, olderTurn.execution)) {
+        // The loaded turn opened this session; older history is another run's.
+        setSessionStartId(oldestLoadedTurn.id)
+        return
+      }
       setAncestorTurns((current) => {
         if (current.some((turn) => turn.execution.id === olderTurn.execution.id)) return current
         return [olderTurn, ...current]
@@ -372,7 +391,7 @@ export function ExecutionDetailPage({
     } finally {
       setIsLoadingOlderTurn(false)
     }
-  }, [isLoadingOlderTurn, oldestLoadedParentExecutionId])
+  }, [isLoadingOlderTurn, oldestLoadedParentExecutionId, oldestLoadedTurn])
 
   const recoveryExecution = useMutation({
     mutationFn: () => {
@@ -549,7 +568,9 @@ export function ExecutionDetailPage({
                 errorMessage={execution?.error}
                 autoScroll={autoScroll}
                 isLoadingHistory={
-                  logsQuery.isLoading || parentTurnQuery.isLoading || isLoadingOlderTurn
+                  logsQuery.isLoading ||
+                  (continuesSession && parentTurnQuery.isLoading) ||
+                  isLoadingOlderTurn
                 }
                 onModeChange={(mode) => {
                   void navigate({
