@@ -37,6 +37,15 @@ jobs:
         run: |
           cat tools/perf_patch.b64.* | base64 --decode | gzip --decompress > /tmp/apply_perf_patch.py
           python /tmp/apply_perf_patch.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('crates/agent-host/src/typed_tools.rs')
+          text = path.read_text()
+          needle = '\nstruct ExecutedCommand {\n'
+          if text.count(needle) != 1:
+              raise SystemExit('ExecutedCommand derive insertion target drifted')
+          path.write_text(text.replace(needle, '\n#[derive(Debug)]\nstruct ExecutedCommand {\n', 1))
+          PY
           cargo fmt --all
 
       - name: Agent-host regression tests
