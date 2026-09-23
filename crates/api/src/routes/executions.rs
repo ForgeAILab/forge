@@ -1,3 +1,9 @@
+use std::{
+    fs,
+    io::Read,
+    path::{Path as StdPath, PathBuf},
+};
+
 use api_types::{ExecutionResponse, FollowUpRequest, LaunchExecutionResponse, PaginatedResponse};
 use axum::{
     extract::{Path, Query, State},
@@ -5,6 +11,7 @@ use axum::{
 };
 use db::ExecutionRepo;
 use executors::{ExecutionOverrides, LogReader};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use services::ServiceError;
 
@@ -16,7 +23,13 @@ use crate::{
     },
     state::AppState,
 };
-use futures_util::future::try_join_all;
+
+const EXECUTION_USAGE_CONCURRENCY: usize = 8;
+const DEFAULT_HOOK_LOG_LIMIT: usize = 500;
+const MAX_HOOK_LOG_LIMIT: usize = 5_000;
+const DEFAULT_HOOK_LOG_BYTES: usize = 1024 * 1024;
+const MAX_HOOK_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOOK_LOG_FILES: usize = 256;
 
 pub async fn list_executions(
     State(state): State<AppState>,
@@ -24,11 +37,15 @@ pub async fn list_executions(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
-    let items = try_join_all(
+    // A maximum page is larger than the SQLite pool. Keep enough parallelism
+    // to hide individual projection latency without queueing one query per row.
+    let items = stream::iter(
         page.items
             .into_iter()
             .map(|execution| execution_response_with_usage(&state.db, execution)),
     )
+    .buffered(EXECUTION_USAGE_CONCURRENCY)
+    .try_collect::<Vec<_>>()
     .await?;
     let has_more = page.next_cursor.is_some();
     Ok(Json(PaginatedResponse {
@@ -113,9 +130,16 @@ pub(crate) async fn read_log_page(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HookLogsQuery {
+    pub limit: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
+
 pub async fn get_hook_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<HookLogsQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
     let execution = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
@@ -123,31 +147,79 @@ pub async fn get_hook_logs(
     let Some(logs_path) = execution.logs_path.as_deref() else {
         return Ok(Json(Vec::new()));
     };
-    let log_dir = match std::path::Path::new(logs_path).parent() {
-        Some(dir) => dir,
-        None => return Ok(Json(Vec::new())),
+    let Some(log_dir) = StdPath::new(logs_path).parent().map(StdPath::to_path_buf) else {
+        return Ok(Json(Vec::new()));
     };
-    let entries = match std::fs::read_dir(log_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Json(Vec::new())),
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_HOOK_LOG_LIMIT)
+        .clamp(1, MAX_HOOK_LOG_LIMIT);
+    let max_bytes = params
+        .max_bytes
+        .unwrap_or(DEFAULT_HOOK_LOG_BYTES)
+        .clamp(1, MAX_HOOK_LOG_BYTES);
+
+    // Directory walking and line-oriented file reads are blocking. Keep them
+    // off Tokio workers and cap files, bytes, and decoded entries so a large
+    // execution directory cannot turn one request into an unbounded scan.
+    let hook_entries = tokio::task::spawn_blocking(move || {
+        read_hook_log_entries(&log_dir, limit, max_bytes)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("hook log reader failed: {error}")))?;
+    Ok(Json(hook_entries))
+}
+
+fn read_hook_log_entries(
+    log_dir: &StdPath,
+    limit: usize,
+    max_bytes: usize,
+) -> Vec<serde_json::Value> {
+    let entries = match fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
     };
-    let mut hook_entries = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("hook-") || !name.ends_with(".jsonl") {
+    let mut paths = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("hook-") && name.ends_with(".jsonl")).then(|| entry.path())
+        })
+        .take(MAX_HOOK_LOG_FILES)
+        .collect::<Vec<PathBuf>>();
+    paths.sort();
+
+    let mut hook_entries = Vec::with_capacity(limit.min(DEFAULT_HOOK_LOG_LIMIT));
+    let mut remaining_bytes = max_bytes;
+    for path in paths {
+        if hook_entries.len() >= limit || remaining_bytes == 0 {
+            break;
+        }
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(remaining_bytes.min(64 * 1024));
+        if file
+            .take(remaining_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
             continue;
         }
-        let content = match std::fs::read_to_string(entry.path()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        for line in content.lines() {
+        let consumed = bytes.len().min(remaining_bytes);
+        bytes.truncate(consumed);
+        remaining_bytes -= consumed;
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            if hook_entries.len() >= limit {
+                break;
+            }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
                 hook_entries.push(value);
             }
         }
     }
-    Ok(Json(hook_entries))
+    hook_entries
 }
 
 pub async fn follow_up_execution(
