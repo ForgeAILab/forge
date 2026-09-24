@@ -7,7 +7,7 @@
 //! provider request or a long-running tool must stay live while its owner is
 //! healthy.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use api_types::ToolResultSummary;
 use async_trait::async_trait;
@@ -15,8 +15,15 @@ use executors::{LogEntry, LogKind, LogStream, LogWriter};
 use forge_agent_host::TurnEventSink;
 use tokio::sync::Mutex;
 
-/// Notified after every durable turn event so a caller can bump a liveness
-/// marker (for example an execution row's semantic progress timestamp).
+/// Streaming provider deltas can arrive many times per second. Persisting an
+/// execution-row CAS for every delta creates avoidable SQLite write pressure;
+/// one update per second is sufficient for semantic liveness. Tool boundaries
+/// and explicit calls bypass this interval.
+const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Notified at a bounded cadence after durable turn events so a caller can
+/// bump a liveness marker (for example an execution row's semantic progress
+/// timestamp). This never renews the execution owner lease.
 #[async_trait]
 pub trait TurnProgressObserver: Send + Sync {
     async fn record_progress(&self);
@@ -25,6 +32,7 @@ pub trait TurnProgressObserver: Send + Sync {
 pub struct TurnLogSink {
     writer: Mutex<LogWriter>,
     progress: Option<Arc<dyn TurnProgressObserver>>,
+    last_progress_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl std::fmt::Debug for TurnLogSink {
@@ -51,6 +59,7 @@ impl TurnLogSink {
         Self {
             writer: Mutex::new(writer),
             progress,
+            last_progress_at: Mutex::new(None),
         }
     }
 
@@ -76,9 +85,36 @@ impl TurnLogSink {
         .await
     }
 
-    /// Bump the caller's liveness marker, if one was attached.
+    /// Force a caller-visible semantic progress update. Explicit boundaries
+    /// keep their prior immediate behavior; only high-frequency stream deltas
+    /// use the bounded path below.
     pub async fn record_progress(&self) {
-        if let Some(progress) = self.progress.as_ref() {
+        self.record_progress_inner(true).await;
+    }
+
+    async fn record_stream_progress(&self) {
+        self.record_progress_inner(false).await;
+    }
+
+    async fn record_progress_inner(&self, force: bool) {
+        let Some(progress) = self.progress.as_ref() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let should_record = {
+            let mut last_progress_at = self.last_progress_at.lock().await;
+            let due = match *last_progress_at {
+                None => true,
+                Some(last) => now.duration_since(last) >= STREAM_PROGRESS_INTERVAL,
+            };
+            if force || due {
+                *last_progress_at = Some(now);
+                true
+            } else {
+                false
+            }
+        };
+        if should_record {
             progress.record_progress().await;
         }
     }
@@ -90,7 +126,7 @@ impl TurnEventSink for TurnLogSink {
         let _ = self
             .write(LogKind::AssistantDelta, serde_json::json!({"text": text}))
             .await;
-        self.record_progress().await;
+        self.record_stream_progress().await;
     }
 
     async fn reasoning_delta(&self, text: &str, redacted: bool) {
@@ -99,7 +135,7 @@ impl TurnEventSink for TurnLogSink {
                 .write(LogKind::Thinking, serde_json::json!({"text": text}))
                 .await;
         }
-        self.record_progress().await;
+        self.record_stream_progress().await;
     }
 
     async fn tool_call_started(
@@ -146,7 +182,21 @@ impl TurnEventSink for TurnLogSink {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[derive(Default)]
+    struct CountingProgress {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TurnProgressObserver for CountingProgress {
+        async fn record_progress(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[tokio::test]
     async fn tool_call_finished_persists_the_bounded_summary_in_the_durable_log() {
@@ -277,5 +327,50 @@ mod tests {
         assert!(raw.lines().all(|line| !line.contains("hidden")));
         assert!(!raw.contains("api_key"));
         assert!(!raw.contains("sk-super-secret"));
+    }
+
+    #[tokio::test]
+    async fn stream_progress_is_rate_limited_but_boundaries_force_updates() {
+        tokio::time::pause();
+
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let log_path = dir.path().join("turn.jsonl");
+        let counter = Arc::new(CountingProgress::default());
+        let progress: Arc<dyn TurnProgressObserver> = counter.clone();
+        let sink = TurnLogSink::new(&log_path, "turn-progress", None, Some(progress));
+
+        for _ in 0..10 {
+            sink.text_delta("x").await;
+        }
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        sink.reasoning_delta("hidden", true).await;
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        sink.reasoning_delta("hidden", true).await;
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 2);
+
+        sink.tool_call_started(
+            "call-1",
+            "forge_scope_read",
+            &[],
+            &serde_json::Map::new(),
+        )
+        .await;
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 3);
+
+        sink.tool_call_finished(
+            "call-1",
+            "forge_scope_read",
+            false,
+            &ToolResultSummary::unclassified(false, "call-1"),
+        )
+        .await;
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 4);
+
+        sink.record_progress().await;
+        assert_eq!(counter.calls.load(Ordering::SeqCst), 5);
     }
 }
