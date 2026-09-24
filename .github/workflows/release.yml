@@ -5,20 +5,203 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  contents: read
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  WEB_ARTIFACT: forge-web-${{ github.sha }}
 
 jobs:
+  verify-version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate tag, manifests, lockfile, and changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import tomllib
+
+          version = sys.argv[1]
+          root = pathlib.Path(".")
+          workspace = tomllib.loads((root / "Cargo.toml").read_text())
+          workspace_version = workspace["workspace"]["package"]["version"]
+          if workspace_version != version:
+              raise SystemExit(
+                  f"Cargo.toml workspace version {workspace_version!r} does not match tag {version!r}"
+              )
+
+          expected_packages = set()
+          for member in workspace["workspace"]["members"]:
+              manifest = tomllib.loads((root / member / "Cargo.toml").read_text())
+              package = manifest["package"]
+              if package.get("version") == {"workspace": True}:
+                  expected_packages.add(package["name"])
+
+          lock = tomllib.loads((root / "Cargo.lock").read_text())
+          lock_versions = {}
+          for package in lock["package"]:
+              lock_versions.setdefault(package["name"], set()).add(package["version"])
+          mismatched = sorted(
+              name
+              for name in expected_packages
+              if version not in lock_versions.get(name, set())
+          )
+          if mismatched:
+              raise SystemExit(
+                  "Cargo.lock does not carry the release version for: "
+                  + ", ".join(mismatched)
+              )
+
+          for manifest_path in [root / "web/package.json", root / "npx-cli/package.json"]:
+              manifest_version = json.loads(manifest_path.read_text())["version"]
+              if manifest_version != version:
+                  raise SystemExit(
+                      f"{manifest_path} version {manifest_version!r} does not match tag {version!r}"
+                  )
+
+          changelog = (root / "CHANGELOG.md").read_text()
+          if f"## [{version}]" not in changelog:
+              raise SystemExit(f"CHANGELOG.md has no release section for {version}")
+          PY
+
+  verify-rust:
+    name: Verify Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust CI
+        run: ./scripts/ci-rust.sh
+
+      - name: Test performance collector
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+
+  verify-audit:
+    name: Verify security audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  verify-web:
+    name: Verify and build web
+    runs-on: ubuntu-latest
+    container: mcr.microsoft.com/playwright:v1.59.1-noble
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        run: pnpm typecheck
+
+      - name: Unit tests
+        if: ${{ !cancelled() }}
+        run: pnpm test
+
+      - name: Build
+        if: ${{ !cancelled() }}
+        run: pnpm build
+
+      - name: Playwright smoke
+        if: ${{ !cancelled() }}
+        run: pnpm run e2e
+
+      - name: Upload verified web assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.WEB_ARTIFACT }}
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  verify-npm:
+    name: Verify npm bootstrapper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Syntax check
+        run: node --check npx-cli/bin/cli.js
+
+      - name: Pack dry run
+        working-directory: npx-cli
+        run: npm pack --dry-run
+
   build:
     name: Build ${{ matrix.target }}
+    needs:
+      - verify-version
+      - verify-rust
+      - verify-audit
+      - verify-web
+      - verify-npm
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -54,29 +237,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Enable Corepack
-        run: corepack enable
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6
-        with:
-          version: 10
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-
-      - name: Install web dependencies
-        working-directory: web
-        run: pnpm install --frozen-lockfile
-
-      - name: Build web assets
-        working-directory: web
-        run: pnpm build
-
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -94,76 +254,51 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build forge binary
+      - name: Download verified web assets
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.WEB_ARTIFACT }}
+          path: dist/web/dist
+
+      - name: Build all release binaries
         env:
           FORGE_SKIP_WEB_BUILD: "1"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: ${{ matrix.builder }} build -p forge-cli --release --target ${{ matrix.target }}
+        run: >-
+          ${{ matrix.builder }} build --locked --release
+          --target ${{ matrix.target }}
+          -p forge-cli -p forge-client -p forge-solo
 
-      - name: Build forge-ctl binary
-        env:
-          FORGE_SKIP_WEB_BUILD: "1"
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: ${{ matrix.builder }} build -p forge-client --release --target ${{ matrix.target }}
-
-      - name: Build forge-solo binary
-        env:
-          FORGE_SKIP_WEB_BUILD: "1"
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: ${{ matrix.builder }} build -p forge-solo --release --target ${{ matrix.target }}
-
-      - name: Package binaries
+      - name: Package and validate archive
+        shell: bash
         run: |
-          mkdir -p dist/web
+          set -euo pipefail
           cp target/${{ matrix.target }}/release/forge dist/
           cp target/${{ matrix.target }}/release/forge-ctl dist/
           cp target/${{ matrix.target }}/release/forge-solo dist/
-          cp -R web/dist dist/web/dist
-          tar -czf ${{ matrix.artifact }}.tar.gz -C dist forge forge-ctl forge-solo web
+          test -s dist/web/dist/index.html
+          archive="${{ matrix.artifact }}.tar.gz"
+          tar -czf "$archive" -C dist forge forge-ctl forge-solo web
+          for expected in forge forge-ctl forge-solo web/dist/index.html; do
+            tar -tzf "$archive" | grep -Fxq "$expected"
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Generate checksums
-        run: |
-          # download-artifact nests files as artifacts/<name>/<name>.tar.gz; flatten
-          # so SHA256SUMS lists clean filenames that match what users download from
-          # the release page (`sha256sum -c SHA256SUMS` works against downloaded files).
-          mkdir -p release-files
-          find artifacts -name '*.tar.gz' -type f -exec cp {} release-files/ \;
-          cd release-files && sha256sum *.tar.gz > ../SHA256SUMS
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/**/*.tar.gz
-            SHA256SUMS
+          if-no-files-found: error
 
   container:
-    name: Publish GHCR Image
+    name: Publish GHCR image
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -199,10 +334,48 @@ jobs:
           provenance: true
           sbom: true
 
+  release:
+    name: Create GitHub release
+    needs:
+      - build
+      - container
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          find artifacts -name '*.tar.gz' -type f -exec cp {} release-files/ \;
+          test "$(find release-files -name '*.tar.gz' -type f | wc -l)" -eq 6
+          cd release-files
+          sha256sum *.tar.gz > ../SHA256SUMS
+          sha256sum -c ../SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            release-files/*.tar.gz
+            SHA256SUMS
+
   publish-npm:
-    name: Publish npm Bootstrapper
+    name: Publish npm bootstrapper
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -220,6 +393,7 @@ jobs:
       - name: Publish package
         working-directory: npx-cli
         run: |
+          set -euo pipefail
           package_name=$(node -p "require('./package.json').name")
           version="${GITHUB_REF_NAME#v}"
           if npm view "$package_name@$version" version >/dev/null 2>&1; then
@@ -234,9 +408,11 @@ jobs:
           npm publish --access public --provenance --tag "$npm_tag"
 
   update-homebrew-tap:
-    name: Request Homebrew Tap Update
+    name: Request Homebrew tap update
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
       - name: Dispatch tap update
