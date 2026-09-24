@@ -240,6 +240,12 @@ struct ActiveTaskTurn {
     runtime_session_id: String,
 }
 
+#[derive(Clone, Copy)]
+struct ReviewCorrectionProvider<'a> {
+    runtime_session_id: &'a str,
+    credential_ref: &'a str,
+}
+
 impl std::fmt::Debug for EmbeddedTaskExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -455,6 +461,18 @@ impl EmbeddedTaskExecutor {
             .run_turn(turn_request(ctx.description.clone()), log_sink.clone())
             .await;
         self.active.write().await.remove(&ctx.execution_id);
+        if !cancellation.is_cancelled() {
+            let error_text = output.as_ref().err().map(ToString::to_string);
+            if let Err(error) = crate::provider_health::record_entry_outcome(
+                &self.db,
+                credential_ref,
+                error_text.as_deref().map_or(Ok(()), Err),
+            )
+            .await
+            {
+                tracing::warn!(execution_id = %ctx.execution_id, error = %error, "provider health could not be recorded");
+            }
+        }
 
         let output = match output {
             Ok(output) => output,
@@ -552,7 +570,10 @@ impl EmbeddedTaskExecutor {
                     output,
                     &turn_request,
                     &log_sink,
-                    &runtime_session_id,
+                    ReviewCorrectionProvider {
+                        runtime_session_id: &runtime_session_id,
+                        credential_ref,
+                    },
                     &cancellation,
                 )
                 .await
@@ -658,7 +679,7 @@ impl EmbeddedTaskExecutor {
         output: forge_agent_host::AgentTurnOutput,
         turn_request: &impl Fn(String) -> AgentTurnRequest,
         log_sink: &Arc<TurnLogSink>,
-        runtime_session_id: &str,
+        provider: ReviewCorrectionProvider<'_>,
         cancellation: &CancellationToken,
     ) -> forge_agent_host::AgentTurnOutput {
         let contract =
@@ -671,7 +692,7 @@ impl EmbeddedTaskExecutor {
             ctx.execution_id.clone(),
             ActiveTaskTurn {
                 cancellation: cancellation.clone(),
-                runtime_session_id: runtime_session_id.to_owned(),
+                runtime_session_id: provider.runtime_session_id.to_owned(),
             },
         );
         let corrected = review_correction::correct_report(
@@ -695,7 +716,20 @@ impl EmbeddedTaskExecutor {
                             }),
                         )
                         .await;
-                    self.backend.run_turn(request, log_sink).await
+                    let result = self.backend.run_turn(request, log_sink).await;
+                    if !cancellation.is_cancelled() {
+                        let error_text = result.as_ref().err().map(ToString::to_string);
+                        if let Err(error) = crate::provider_health::record_entry_outcome(
+                            &self.db,
+                            provider.credential_ref,
+                            error_text.as_deref().map_or(Ok(()), Err),
+                        )
+                        .await
+                        {
+                            tracing::warn!(execution_id = %ctx.execution_id, error = %error, "review correction provider health could not be recorded");
+                        }
+                    }
+                    result
                 }
             },
         )

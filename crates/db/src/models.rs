@@ -511,13 +511,29 @@ pub struct CredentialHandle {
     pub updated_at: String,
 }
 
+/// Live health of a provider entry learned from real provider calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderEntryHealth {
+    pub credential_id: String,
+    pub owner_user_id: String,
+    /// `healthy`, `backoff` (transient), or `error` (auth / exhausted usage).
+    pub status: String,
+    pub consecutive_failures: i64,
+    pub last_error_kind: Option<String>,
+    pub last_error_message: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub backoff_until: Option<String>,
+    pub version: i64,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialUsage {
     pub credential_id: String,
     pub agent_id: String,
     pub agent_name: String,
     pub runtime: String,
-    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3759,6 +3775,67 @@ pub enum PricingSubjectKind {
     CliRuntime,
 }
 
+/// How an owner's price differs from the models.dev list price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingAdjustmentMode {
+    List,
+    Discount,
+    Fixed,
+}
+
+/// What a pricing adjustment applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PricingAdjustmentScope {
+    ProviderEntry(String),
+    CliRuntime {
+        daemon_id: String,
+        executor_type: String,
+    },
+    Agent(String),
+}
+
+impl PricingAdjustmentScope {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ProviderEntry(_) => "provider_entry",
+            Self::CliRuntime { .. } => "cli_runtime",
+            Self::Agent(_) => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricingAdjustment {
+    pub id: String,
+    pub owner_user_id: String,
+    pub scope: PricingAdjustmentScope,
+    pub mode: PricingAdjustmentMode,
+    /// Hundredths of a percent, present only for `Discount`.
+    pub discount_bps: Option<i64>,
+    /// Present only for `Fixed`.
+    pub fixed_rates: RateBuckets,
+    pub catalog_provider_id: Option<String>,
+    pub catalog_model_id: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertPricingAdjustment {
+    pub owner_user_id: String,
+    pub scope: PricingAdjustmentScope,
+    pub mode: PricingAdjustmentMode,
+    pub discount_bps: Option<i64>,
+    pub fixed_rates: RateBuckets,
+    pub catalog_provider_id: Option<String>,
+    pub catalog_model_id: Option<String>,
+    /// `0` creates; otherwise the row must be at this version.
+    pub expected_version: i64,
+    pub now: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingSubjectState {
@@ -3912,6 +3989,11 @@ enum_strings!(PricingRateSourceKind {
 enum_strings!(PricingSubjectKind {
     ProviderEntry => "provider_entry",
     CliRuntime => "cli_runtime",
+});
+enum_strings!(PricingAdjustmentMode {
+    List => "list",
+    Discount => "discount",
+    Fixed => "fixed",
 });
 enum_strings!(PricingSubjectState {
     Active => "active",
@@ -4251,6 +4333,8 @@ pub struct PricingSubjectBinding {
     pub subject_id: String,
     pub subject_revision_id: String,
     pub subject_revision_digest: String,
+    /// `''` for the provider-wide binding, `agent:<id>` for one agent's own.
+    pub scope_key: String,
     pub runtime_model: String,
     pub source_kind: PricingRateSourceKind,
     pub catalog_provider_id: Option<String>,
@@ -4272,6 +4356,7 @@ pub struct CreatePricingSubjectBinding {
     pub subject_id: String,
     pub subject_revision_id: String,
     pub subject_revision_digest: String,
+    pub scope_key: String,
     pub runtime_model: String,
     pub source_kind: PricingRateSourceKind,
     pub catalog_provider_id: Option<String>,

@@ -707,6 +707,11 @@ impl EmbeddedAgentService {
                             status.as_u16()
                         ),
                     )
+                } else if status.as_u16() == 429 || status.is_server_error() {
+                    ProviderEntryTestOutcome::failed(
+                        latency_ms,
+                        format!("provider returned HTTP {}", status.as_u16()),
+                    )
                 } else if openai_oauth {
                     // Auth middleware answers before routing: a non-401/403
                     // response means the token was accepted.
@@ -2038,19 +2043,34 @@ impl EmbeddedAgentService {
             Ok(()) => ("healthy".to_owned(), None),
             Err(code) => ("unavailable".to_owned(), Some(code)),
         };
-        AgentConnectionHealthRepo::upsert_connection_health(
+        let health = AgentConnectionHealthRepo::upsert_connection_health(
             &*self.db,
             UpsertAgentConnectionHealth {
                 profile_id: profile.id.clone(),
                 status,
                 capability_status_json: profile.capabilities_json.clone(),
                 checked_at: Some(now.clone()),
-                error_code,
+                error_code: error_code.clone(),
                 updated_at: now,
             },
         )
         .await
-        .map_err(Into::into)
+        .map_err(ServiceError::from)?;
+        if let Some(credential_id) = profile.credential_ref.as_deref() {
+            let outcome = match error_code.as_deref() {
+                None => Some(Ok(())),
+                Some("provider_authentication_failed") => Some(Err("provider returned HTTP 401")),
+                Some("provider_timeout" | "provider_unreachable") => {
+                    Some(Err("provider HTTP request failed"))
+                }
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                crate::provider_health::record_entry_outcome(&self.db, credential_id, outcome)
+                    .await?;
+            }
+        }
+        Ok(health)
     }
 
     async fn probe_provider(

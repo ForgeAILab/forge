@@ -3597,6 +3597,18 @@ impl AgentChatTurnWorker {
                  WHERE job.status IN ('queued', 'retry_wait')
                    AND job.attempt_count < job.max_attempts
                    AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ?)
+                   -- A responder whose provider entry is backing off waits
+                   -- without spending an attempt; the first claim after the
+                   -- window lapses is the trial call.
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agent_identity AS responder
+                       JOIN agent_profile AS profile ON profile.id = responder.selected_profile_id
+                       JOIN provider_entry_health AS health
+                         ON health.credential_id = profile.credential_ref
+                       WHERE responder.id = job.responder_identity_id
+                         AND (health.last_error_kind = 'auth'
+                              OR julianday(health.backoff_until) > julianday(?))
+                   )
                    AND NOT EXISTS (
                        SELECT 1 FROM agent_chat_turn_job AS prior
                        WHERE prior.id <> job.id
@@ -3621,6 +3633,7 @@ impl AgentChatTurnWorker {
                AND status IN ('queued', 'retry_wait')
              RETURNING id",
         )
+        .bind(&now)
         .bind(&now)
         .bind(&self.lease_owner)
         .bind(&leased_until)
@@ -4009,6 +4022,24 @@ impl AgentChatTurnWorker {
         }
         stop.cancel();
         let _ = renewal.await;
+        let provider_outcome = match result.as_ref() {
+            Some(AgentChatTurnRunOutcome::Completed { .. }) => Some(Ok(())),
+            Some(AgentChatTurnRunOutcome::Failed { error, .. }) => Some(Err(error.to_string())),
+            None => None,
+        };
+        if let (Some(outcome), Some(responder)) =
+            (provider_outcome, job.responder_identity_id.as_deref())
+        {
+            if let Err(error) = crate::provider_health::record_agent_outcome(
+                &self.db,
+                responder,
+                outcome.as_ref().map(|_| ()).map_err(String::as_str),
+            )
+            .await
+            {
+                tracing::warn!(job_id = %job.id, error = %error, "provider health could not be recorded");
+            }
+        }
         // Renewal is versioned. Re-read after the backend stops so a long
         // native turn commits against the current lease version rather than
         // the snapshot that was originally claimed.

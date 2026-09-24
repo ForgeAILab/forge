@@ -1,8 +1,8 @@
 use crate::{
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScope, AgentContextScopeRepo,
     AgentSession, AgentSessionRepo, CreateAgentContextScope, CreateAgentSession, CredentialHandle,
-    CredentialHandleRepo, CredentialUsage, DbError, Result, RotateAgentSession, SqliteDb,
-    UpdateAgentSession, UpsertAgentConnectionHealth,
+    CredentialHandleRepo, CredentialUsage, DbError, ProviderEntryHealth, Result,
+    RotateAgentSession, SqliteDb, UpdateAgentSession, UpsertAgentConnectionHealth,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -105,10 +105,7 @@ impl CredentialHandleRepo for SqliteDb {
             "SELECT ap.credential_ref AS credential_id,
                     ai.id AS agent_id,
                     ai.name AS agent_name,
-                    ap.executor_type AS runtime,
-                    (SELECT MAX(s.last_activity_at)
-                       FROM agent_session s
-                      WHERE s.identity_id = ai.id) AS last_used_at
+                    ap.executor_type AS runtime
              FROM agent_identity ai
              JOIN agent_profile ap ON ap.id = ai.selected_profile_id
              WHERE ap.credential_ref IS NOT NULL
@@ -125,9 +122,119 @@ impl CredentialHandleRepo for SqliteDb {
                     agent_id: row.try_get("agent_id")?,
                     agent_name: row.try_get("agent_name")?,
                     runtime: row.try_get("runtime")?,
-                    last_used_at: row.try_get("last_used_at")?,
                 })
             })
+            .collect()
+    }
+
+    async fn get_provider_entry_health(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<ProviderEntryHealth>> {
+        sqlx::query("SELECT * FROM provider_entry_health WHERE credential_id = ?")
+            .bind(credential_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_provider_entry_health)
+            .transpose()
+    }
+
+    async fn list_provider_entry_health(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<ProviderEntryHealth>> {
+        sqlx::query("SELECT * FROM provider_entry_health WHERE owner_user_id = ?")
+            .bind(owner_user_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_provider_entry_health)
+            .collect()
+    }
+
+    async fn upsert_provider_entry_health(
+        &self,
+        health: ProviderEntryHealth,
+        expected_version: Option<i64>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "INSERT INTO provider_entry_health (
+                credential_id, owner_user_id, status, consecutive_failures,
+                last_error_kind, last_error_message, last_failure_at, last_success_at,
+                backoff_until, version, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(credential_id) DO UPDATE SET
+                status = excluded.status,
+                consecutive_failures = excluded.consecutive_failures,
+                last_error_kind = excluded.last_error_kind,
+                last_error_message = excluded.last_error_message,
+                last_failure_at = excluded.last_failure_at,
+                last_success_at = excluded.last_success_at,
+                backoff_until = excluded.backoff_until,
+                version = provider_entry_health.version + 1,
+                updated_at = excluded.updated_at
+             WHERE provider_entry_health.version = ?",
+        )
+        .bind(&health.credential_id)
+        .bind(&health.owner_user_id)
+        .bind(&health.status)
+        .bind(health.consecutive_failures)
+        .bind(health.last_error_kind.as_deref())
+        .bind(health.last_error_message.as_deref())
+        .bind(health.last_failure_at.as_deref())
+        .bind(health.last_success_at.as_deref())
+        .bind(health.backoff_until.as_deref())
+        .bind(health.version)
+        .bind(&health.updated_at)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
+    async fn mark_provider_entry_healthy(
+        &self,
+        credential_id: &str,
+        now: &str,
+        manual_test: bool,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE provider_entry_health
+             SET status = 'healthy', consecutive_failures = 0, backoff_until = NULL,
+                 last_error_kind = NULL, last_error_message = NULL,
+                 last_success_at = ?, updated_at = ?, version = version + 1
+             WHERE credential_id = ? AND status != 'healthy'
+               AND (last_error_kind IS NULL OR last_error_kind != 'auth' OR ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(credential_id)
+        .bind(manual_test)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
+    async fn list_credential_last_used(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let rows = sqlx::query(
+            "SELECT ap.credential_ref AS credential_id,
+                    MAX(u.admitted_at) AS last_used_at
+             FROM usage_invocation u
+             JOIN agent_profile ap ON ap.id = u.profile_id
+             WHERE u.owner_user_id = ?
+               AND ap.credential_ref IS NOT NULL
+             GROUP BY ap.credential_ref",
+        )
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("credential_id")?, row.try_get("last_used_at")?)))
             .collect()
     }
 
@@ -780,6 +887,22 @@ fn map_connection_health(row: SqliteRow) -> Result<AgentConnectionHealth> {
         capability_status_json: row.try_get("capability_status_json")?,
         checked_at: row.try_get("checked_at")?,
         error_code: row.try_get("error_code")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_provider_entry_health(row: sqlx::sqlite::SqliteRow) -> Result<ProviderEntryHealth> {
+    Ok(ProviderEntryHealth {
+        credential_id: row.try_get("credential_id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        status: row.try_get("status")?,
+        consecutive_failures: row.try_get("consecutive_failures")?,
+        last_error_kind: row.try_get("last_error_kind")?,
+        last_error_message: row.try_get("last_error_message")?,
+        last_failure_at: row.try_get("last_failure_at")?,
+        last_success_at: row.try_get("last_success_at")?,
+        backoff_until: row.try_get("backoff_until")?,
+        version: row.try_get("version")?,
         updated_at: row.try_get("updated_at")?,
     })
 }

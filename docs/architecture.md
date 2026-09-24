@@ -1209,6 +1209,24 @@ lease, evidence, review-contract, or review-assessment record remain rejected.
 V134 rebuilds the V132 conformance foreign keys and delete guards without losing
 rows, allowing those review records to cascade only during parent teardown.
 
+### Provider entry health
+
+Migration V144 stores the outcome learned from direct provider calls, agent
+creation probes, and live connection tests for each credentialed entry.
+HTTP 429, provider 5xx, and network failures back off exponentially from 30
+seconds to 15 minutes; usage exhaustion waits for the
+reported reset when available. Auth failures have no timer and require a
+successful manual connection test to clear. A successful provider call clears
+a transient failure. The first call after a timed backoff is the trial: another
+failure increases the delay.
+
+`compute_effective_status` reports the entry's agents as degraded while the
+entry is unavailable, so new Task dispatch skips them. The Agent Chat claim
+query leaves queued and retry-wait jobs unclaimed during backoff without
+incrementing their attempt count. The provider list projects the stored
+redacted failure and retry time. CLI runtimes retain their separate account
+cooldown behavior.
+
 ### Usage accounting and provider pricing
 
 Usage accounting is an append-only ledger at the provider-call grain. A Task
@@ -1256,11 +1274,21 @@ accounting. Late owner/CAS losers cannot append usage.
 Provider rates are immutable estimate inputs, not billing authority. Forge
 refreshes the fixed models.dev catalog endpoint only through an explicit
 authorized operation, activates a candidate snapshot atomically after bounded
-validation, and keeps the last known good snapshot on failure. Exact
-provider-entry/runtime plus model bindings and versioned manual overrides
-select rates; missing identity, rate, or tier evidence stays unknown. Catalog
-refresh and override publication affect future admissions only, while an
-explicit retrospective operation may create a separately versioned estimate.
+validation, and keeps the last known good snapshot on failure.
+
+Rates are resolved at admission by `services::pricing_auto`, inside the
+admission transaction. It provisions the pricing subject (provider entry or
+CLI runtime) and its non-secret revision, picks the effective
+`pricing_adjustment` (the agent's own, else the subject's, else list price),
+matches the runtime model to one models.dev row (pin → `provider/model` id →
+subject provider → model-family provider → sole provider), and makes exactly
+one binding active in the scope admission resolves: `''` for the provider-wide
+binding, `agent:<id>` for an agent with its own adjustment. Discounted and
+fixed prices are materialized as manual rate revisions, so a frozen selection
+still references one immutable rate revision through one active binding.
+Missing identity, rate, or tier evidence stays unknown. Adjustment and catalog
+changes affect future admissions only, while an explicit retrospective
+operation may create a separately versioned estimate.
 
 New money paths use integer nano-USD values and an `i128` intermediate. Forge
 sums the four measurable token buckets, divides once by one million with

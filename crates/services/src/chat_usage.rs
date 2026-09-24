@@ -390,6 +390,20 @@ async fn create_chat_invocation(
         }
     }
     let resolved = if let Some(runtime_model) = runtime_model.as_deref() {
+        let scope_key = crate::pricing_auto::prepare_price_in_tx(
+            db,
+            &mut transaction,
+            &scope.owner_user_id,
+            &crate::pricing_auto::SubjectRef {
+                provider_entry_id: provider_entry.clone(),
+                daemon_id: daemon_id.clone(),
+                executor_type: Some(profile.executor_type.clone()),
+            },
+            Some(agent.id.as_str()),
+            runtime_model,
+            &admitted_at,
+        )
+        .await?;
         db::PricingSubjectRepo::resolve_active_pricing_subject_binding_in_tx(
             db,
             &mut transaction,
@@ -397,6 +411,7 @@ async fn create_chat_invocation(
             provider_entry.as_deref(),
             daemon_id.as_deref(),
             Some(profile.executor_type.as_str()),
+            &scope_key,
             runtime_model,
         )
         .await?

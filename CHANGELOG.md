@@ -8,6 +8,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [0.13.0] - 2026-09-23
 
+### Breaking
+
+- Pricing is an adjustment on top of models.dev instead of a per-model
+  binding list. `GET`/`PUT /api/v1/providers/{id}/pricing` and
+  `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` now
+  read and write one `PricingSettings` (`mode`: `list` | `discount` | `fixed`,
+  `discount_percent`, `fixed_rates`, optional models.dev `catalog_provider_id`
+  pin, `expected_version`) and gain `DELETE ?version=`. The replace-all
+  binding request (`ReplaceProviderPricingRequest`, `ProviderPricing`,
+  `PricingBinding`, `idempotency_key`, `subject_revision_digest`) is gone.
+  New `GET`/`PUT`/`DELETE /api/v1/agents/{id}/pricing` sets an agent's own
+  adjustment and previews the matched models.dev row and effective rates.
+  Migration V143 carries explicit manual bindings over as fixed adjustments,
+  and explicit catalog choices as pins, on the agents that run that entry and
+  model.
+
 ### Added
 
 - `GET /api/v1/tasks/{id}/detail` loads a Task's detail view in one request:
@@ -60,6 +76,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Provider entries now track real call failures in V144. Rate limits, provider
+  5xx responses, and network failures back off from 30 seconds to 15 minutes;
+  usage exhaustion waits for its reported reset. Agents using an unavailable
+  entry stop receiving new Tasks, and queued chat turns wait without spending
+  attempts. Auth failures remain blocked until a successful live connection
+  test. Provider cards show the redacted failure and retry time.
+- Every run is priced without setup. Admission provisions the pricing
+  subject and matches the agent's model to a models.dev row (a pin, the
+  provider billing the entry directly, the model family's publisher, or the
+  only listing provider). Before, a provider entry was priced only after its
+  owner opened the pricing dialog, only the four reviewed API-key providers
+  were matched automatically, and chat turns never were. The Providers page
+  drops the per-model binding dialog for one inline adjustment, and the agent
+  panel gains a Pricing section.
+
 - The app shell has a navigation sidebar instead of the `Kanban` / `Main Chat`
   tabs and `More` menu: **Main Agent** under Account, **Project Agent**,
   Kanban, Tasks, Overview and Project settings under the selected Project, and
@@ -97,6 +128,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Task's log directory whole.
 
 ### Fixed
+
+- A provider entry's "Last used" read "Never" for every entry. It was taken
+  from `agent_session.last_activity_at`, which no runtime writes. It now comes
+  from the most recent admitted invocation made through a profile bound to the
+  entry, so usage by agents that have since moved to another entry still
+  counts.
 
 - An agent's workspace command can no longer hold a Task execution until its
   hard deadline or outlive it. Commands run in their own process group with a
@@ -398,6 +435,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   run it while the clean-checkout checks were still going, which charged the
   retry budget twice and hard-blocked the Task with
   `check constraint failed: assessment is already frozen`.
+
+### Removed
+
+- The agent detail panel's "When this agent runs" section. It described the
+  same four server-defined activation paths for every agent and had nothing to
+  configure.
 
 ## [0.12.0] - 2026-09-14
 

@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use api_types::{
     AgentProviderCapabilitiesResponse, CliRuntimeEntryResponse, CreateProviderEntryRequest,
     DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse, ProviderEntryAgentRef,
-    ProviderEntryResponse, ProviderEntryTestResponse, ProviderRevocationStatus,
-    ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest, SessionVersionRequest,
-    SetCliRuntimeAvailabilityRequest, SetProviderEntryAvailabilityRequest,
+    ProviderEntryHealthResponse, ProviderEntryResponse, ProviderEntryTestResponse,
+    ProviderRevocationStatus, ProviderUsageResponse, ProviderUsageWindow,
+    RenameProviderEntryRequest, SessionVersionRequest, SetCliRuntimeAvailabilityRequest,
+    SetProviderEntryAvailabilityRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -17,8 +18,8 @@ use axum::{
 };
 use db::{
     now_rfc3339, AgentConnectionHealthRepo, AgentListQuery, AgentRepo, CredentialHandle,
-    CredentialHandleRepo, CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest, SortBy,
-    SortOrder, UpsertAgentConnectionHealth,
+    CredentialHandleRepo, CredentialUsage, Daemon, DaemonRepo, DbError, PageRequest,
+    ProviderEntryHealth, SortBy, SortOrder, UpsertAgentConnectionHealth,
 };
 use forge_agent_host::{AgentHostError, CredentialRevocationOutcome, Secret};
 use serde_json::Value;
@@ -43,6 +44,13 @@ pub async fn list_providers(
 ) -> ApiResult<Json<ProviderEntriesResponse>> {
     let handles = CredentialHandleRepo::list_credential_handles(&*state.db, &user.user_id).await?;
     let usage = CredentialHandleRepo::list_credential_usage(&*state.db, &user.user_id).await?;
+    let mut last_used =
+        CredentialHandleRepo::list_credential_last_used(&*state.db, &user.user_id).await?;
+    let mut health = CredentialHandleRepo::list_provider_entry_health(&*state.db, &user.user_id)
+        .await?
+        .into_iter()
+        .map(|row| (row.credential_id.clone(), row))
+        .collect::<HashMap<_, _>>();
     let mut usage_by_credential: HashMap<String, Vec<CredentialUsage>> = HashMap::new();
     for row in usage {
         usage_by_credential
@@ -54,7 +62,9 @@ pub async fn list_providers(
         .into_iter()
         .map(|handle| {
             let usage = usage_by_credential.remove(&handle.id).unwrap_or_default();
-            entry_response(handle, usage)
+            let last_used_at = last_used.remove(&handle.id);
+            let entry_health = health.remove(&handle.id);
+            entry_response(handle, usage, last_used_at, entry_health)
         })
         .collect();
     let cli_runtimes = cli_runtime_entries(&state, &user.user_id).await?;
@@ -80,7 +90,7 @@ pub async fn create_provider_entry(
             base_url: request.base_url,
         })
         .await?;
-    Ok(Json(entry_response(handle, Vec::new())))
+    Ok(Json(entry_response(handle, Vec::new(), None, None)))
 }
 
 pub async fn test_provider_entry(
@@ -92,6 +102,19 @@ pub async fn test_provider_entry(
         .embedded_agent_service
         .test_provider_entry(&user.user_id, &id)
         .await?;
+    // A manual test is a trial call: success clears a backoff, a provider
+    // failure extends it.
+    let message = outcome.message.clone().unwrap_or_default();
+    services::provider_health::record_test_outcome(
+        &state.db,
+        &id,
+        if outcome.ok {
+            Ok(())
+        } else {
+            Err(message.as_str())
+        },
+    )
+    .await?;
     Ok(Json(ProviderEntryTestResponse {
         status: if outcome.ok { "ok" } else { "failed" }.to_owned(),
         latency_ms: outcome.latency_ms,
@@ -159,7 +182,11 @@ pub async fn rename_provider_entry(
         .into_iter()
         .filter(|row| row.credential_id == handle.id)
         .collect();
-    Ok(Json(entry_response(handle, usage)))
+    let last_used_at = CredentialHandleRepo::list_credential_last_used(&*state.db, &user.user_id)
+        .await?
+        .remove(&handle.id);
+    let health = CredentialHandleRepo::get_provider_entry_health(&*state.db, &handle.id).await?;
+    Ok(Json(entry_response(handle, usage, last_used_at, health)))
 }
 
 pub async fn set_provider_entry_availability(
@@ -189,7 +216,11 @@ pub async fn set_provider_entry_availability(
         .into_iter()
         .filter(|row| row.credential_id == handle.id)
         .collect();
-    Ok(Json(entry_response(handle, usage)))
+    let last_used_at = CredentialHandleRepo::list_credential_last_used(&*state.db, &user.user_id)
+        .await?
+        .remove(&handle.id);
+    let health = CredentialHandleRepo::get_provider_entry_health(&*state.db, &handle.id).await?;
+    Ok(Json(entry_response(handle, usage, last_used_at, health)))
 }
 
 pub async fn set_cli_runtime_availability(
@@ -324,7 +355,12 @@ pub async fn delete_provider_entry(
     }))
 }
 
-fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> ProviderEntryResponse {
+fn entry_response(
+    handle: CredentialHandle,
+    usage: Vec<CredentialUsage>,
+    last_used_at: Option<String>,
+    health: Option<ProviderEntryHealth>,
+) -> ProviderEntryResponse {
     let metadata = serde_json::from_str::<Value>(&handle.metadata_json).unwrap_or(Value::Null);
     let base_url = metadata
         .get("base_url")
@@ -333,11 +369,6 @@ fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> Prov
     let provider_account_id = metadata
         .get("provider_account_id")
         .and_then(Value::as_str)
-        .map(str::to_owned);
-    let last_used_at = usage
-        .iter()
-        .filter_map(|row| row.last_used_at.as_deref())
-        .max()
         .map(str::to_owned);
     ProviderEntryResponse {
         id: handle.id,
@@ -350,6 +381,14 @@ fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> Prov
         provider_account_id,
         used_by: usage.into_iter().map(usage_ref).collect(),
         last_used_at,
+        health: health.map(|health| ProviderEntryHealthResponse {
+            status: health.status,
+            consecutive_failures: health.consecutive_failures,
+            last_error_kind: health.last_error_kind,
+            last_error_message: health.last_error_message,
+            last_failure_at: health.last_failure_at,
+            backoff_until: health.backoff_until,
+        }),
         version: handle.version,
         created_at: handle.created_at,
         updated_at: handle.updated_at,

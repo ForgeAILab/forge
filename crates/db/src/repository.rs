@@ -335,8 +335,38 @@ pub trait CredentialHandleRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<CredentialHandle>;
     /// Agents whose active profile references each of the owner's provider
-    /// entries, with the identity's most recent session activity.
+    /// entries.
     async fn list_credential_usage(&self, owner_user_id: &str) -> Result<Vec<CredentialUsage>>;
+    /// Most recent admitted invocation per provider entry, keyed by
+    /// credential id. Attributed through the invoking profile, so usage by
+    /// agents that have since switched entries still counts.
+    async fn get_provider_entry_health(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<ProviderEntryHealth>>;
+    async fn list_provider_entry_health(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<ProviderEntryHealth>>;
+    /// Writes the whole health row only if the row seen by the caller is still
+    /// current. A failed compare lets concurrent outcomes recompute backoff.
+    async fn upsert_provider_entry_health(
+        &self,
+        health: ProviderEntryHealth,
+        expected_version: Option<i64>,
+    ) -> Result<bool>;
+    /// Clears an unhealthy entry back to healthy. Auth failures clear only
+    /// after a successful manual test. A no-op when absent or already healthy.
+    async fn mark_provider_entry_healthy(
+        &self,
+        credential_id: &str,
+        now: &str,
+        manual_test: bool,
+    ) -> Result<bool>;
+    async fn list_credential_last_used(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>>;
     async fn revoke_credential_handle(
         &self,
         id: &str,
@@ -3971,6 +4001,7 @@ pub trait PricingSubjectRepo: Send + Sync {
     /// Resolves one subject's current revision and active exact binding in an
     /// existing transaction. Manual overrides take precedence over catalog
     /// bindings; the returned rate is validated against that binding.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_active_pricing_subject_binding_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
@@ -3978,8 +4009,33 @@ pub trait PricingSubjectRepo: Send + Sync {
         provider_entry_id: Option<&str>,
         daemon_id: Option<&str>,
         executor_type: Option<&str>,
+        scope_key: &str,
         runtime_model: &str,
     ) -> Result<Option<ResolvedPricingSubjectBinding>>;
+    async fn get_pricing_adjustment(
+        &self,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+    ) -> Result<Option<PricingAdjustment>>;
+    async fn get_pricing_adjustment_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+    ) -> Result<Option<PricingAdjustment>>;
+    /// Creates (`expected_version == 0`) or replaces the adjustment for one
+    /// scope. A stale writer gets `DbError::VersionConflict`.
+    async fn upsert_pricing_adjustment(
+        &self,
+        input: UpsertPricingAdjustment,
+    ) -> Result<PricingAdjustment>;
+    /// Removes one scope's adjustment so it falls back to its parent.
+    async fn delete_pricing_adjustment(
+        &self,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+        expected_version: i64,
+    ) -> Result<()>;
     async fn list_pricing_subject_bindings(
         &self,
         subject_id: &str,

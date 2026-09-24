@@ -862,12 +862,20 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing",
             get(routes::pricing::get_cli_runtime_pricing)
-                .put(routes::pricing::replace_cli_runtime_pricing),
+                .put(routes::pricing::update_cli_runtime_pricing)
+                .delete(routes::pricing::delete_cli_runtime_pricing),
         )
         .route(
             "/api/v1/providers/{id}/pricing",
             get(routes::pricing::get_provider_pricing)
-                .put(routes::pricing::replace_provider_pricing),
+                .put(routes::pricing::update_provider_pricing)
+                .delete(routes::pricing::delete_provider_pricing),
+        )
+        .route(
+            "/api/v1/agents/{id}/pricing",
+            get(routes::pricing::get_agent_pricing)
+                .put(routes::pricing::update_agent_pricing)
+                .delete(routes::pricing::delete_agent_pricing),
         )
         .route(
             "/api/v1/providers",

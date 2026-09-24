@@ -148,6 +148,85 @@ fn map_subject_revision(row: SqliteRow) -> Result<PricingSubjectRevision> {
     })
 }
 
+fn map_adjustment(row: SqliteRow) -> Result<PricingAdjustment> {
+    let scope_kind: String = row.try_get("scope_kind")?;
+    let scope = match scope_kind.as_str() {
+        "provider_entry" => {
+            PricingAdjustmentScope::ProviderEntry(row.try_get("provider_entry_id")?)
+        }
+        "cli_runtime" => PricingAdjustmentScope::CliRuntime {
+            daemon_id: row.try_get("daemon_id")?,
+            executor_type: row.try_get("executor_type")?,
+        },
+        "agent" => PricingAdjustmentScope::Agent(row.try_get("agent_id")?),
+        other => {
+            return Err(DbError::Check(format!(
+                "invalid pricing adjustment scope: {other}"
+            )))
+        }
+    };
+    Ok(PricingAdjustment {
+        id: row.try_get("id")?,
+        owner_user_id: row.try_get("owner_user_id")?,
+        scope,
+        mode: enum_value(&row, "mode")?,
+        discount_bps: row.try_get("discount_bps")?,
+        fixed_rates: RateBuckets::new(
+            row.try_get("input_nano_usd_per_million")?,
+            row.try_get("output_nano_usd_per_million")?,
+            row.try_get("cache_read_nano_usd_per_million")?,
+            row.try_get("cache_write_nano_usd_per_million")?,
+        ),
+        catalog_provider_id: row.try_get("catalog_provider_id")?,
+        catalog_model_id: row.try_get("catalog_model_id")?,
+        version: row.try_get("version")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// `(provider_entry_id, daemon_id, executor_type, agent_id)` for a scope.
+fn adjustment_scope_columns(
+    scope: &PricingAdjustmentScope,
+) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+    match scope {
+        PricingAdjustmentScope::ProviderEntry(id) => (Some(id), None, None, None),
+        PricingAdjustmentScope::CliRuntime {
+            daemon_id,
+            executor_type,
+        } => (None, Some(daemon_id), Some(executor_type), None),
+        PricingAdjustmentScope::Agent(id) => (None, None, None, Some(id)),
+    }
+}
+
+const ADJUSTMENT_SCOPE_FILTER: &str = "owner_user_id = ? AND scope_kind = ?
+       AND provider_entry_id IS ? AND daemon_id IS ? AND executor_type IS ?
+       AND agent_id IS ?";
+
+async fn get_adjustment_on<'e, E>(
+    executor: E,
+    owner_user_id: &str,
+    scope: &PricingAdjustmentScope,
+) -> Result<Option<PricingAdjustment>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let (provider_entry_id, daemon_id, executor_type, agent_id) = adjustment_scope_columns(scope);
+    sqlx::query(&format!(
+        "SELECT * FROM pricing_adjustment WHERE {ADJUSTMENT_SCOPE_FILTER}"
+    ))
+    .bind(owner_user_id)
+    .bind(scope.kind())
+    .bind(provider_entry_id)
+    .bind(daemon_id)
+    .bind(executor_type)
+    .bind(agent_id)
+    .fetch_optional(executor)
+    .await?
+    .map(map_adjustment)
+    .transpose()
+}
+
 fn map_binding(row: SqliteRow) -> Result<PricingSubjectBinding> {
     Ok(PricingSubjectBinding {
         id: row.try_get("id")?,
@@ -155,6 +234,7 @@ fn map_binding(row: SqliteRow) -> Result<PricingSubjectBinding> {
         subject_id: row.try_get("subject_id")?,
         subject_revision_id: row.try_get("subject_revision_id")?,
         subject_revision_digest: row.try_get("subject_revision_digest")?,
+        scope_key: row.try_get("scope_key")?,
         runtime_model: row.try_get("runtime_model")?,
         source_kind: enum_value(&row, "source_kind")?,
         catalog_provider_id: row.try_get("catalog_provider_id")?,
@@ -1197,6 +1277,7 @@ impl PricingSubjectRepo for SqliteDb {
         .transpose()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_active_pricing_subject_binding_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
@@ -1204,6 +1285,7 @@ impl PricingSubjectRepo for SqliteDb {
         provider_entry_id: Option<&str>,
         daemon_id: Option<&str>,
         executor_type: Option<&str>,
+        scope_key: &str,
         runtime_model: &str,
     ) -> Result<Option<ResolvedPricingSubjectBinding>> {
         let subject_row = if let Some(provider_entry_id) = provider_entry_id {
@@ -1263,8 +1345,8 @@ impl PricingSubjectRepo for SqliteDb {
         let binding = sqlx::query(
             "SELECT * FROM pricing_subject_binding
              WHERE subject_id = ? AND subject_revision_id = ?
-               AND subject_revision_digest = ? AND runtime_model = ?
-               AND state = 'active'
+               AND subject_revision_digest = ? AND scope_key = ?
+               AND runtime_model = ? AND state = 'active'
              ORDER BY CASE source_kind
                         WHEN 'manual_override' THEN 0
                         WHEN 'models_dev_catalog' THEN 1
@@ -1276,6 +1358,7 @@ impl PricingSubjectRepo for SqliteDb {
         .bind(&subject.id)
         .bind(&revision.id)
         .bind(&revision.revision_digest)
+        .bind(scope_key)
         .bind(runtime_model)
         .fetch_optional(&mut **transaction)
         .await?
@@ -1550,17 +1633,18 @@ impl PricingSubjectRepo for SqliteDb {
         sqlx::query(
             "INSERT INTO pricing_subject_binding (
                 id, owner_user_id, subject_id, subject_revision_id,
-                subject_revision_digest, runtime_model, source_kind,
+                subject_revision_digest, scope_key, runtime_model, source_kind,
                 catalog_provider_id, catalog_model_id, rate_revision_id,
                 binding_digest, state, version, effective_at, retired_at,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, NULL, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, NULL, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.owner_user_id)
         .bind(&input.subject_id)
         .bind(&input.subject_revision_id)
         .bind(&input.subject_revision_digest)
+        .bind(&input.scope_key)
         .bind(&input.runtime_model)
         .bind(input.source_kind.to_string())
         .bind(input.catalog_provider_id.as_deref())
@@ -1614,6 +1698,123 @@ impl PricingSubjectRepo for SqliteDb {
         .map_err(check_error)?
         .map(map_binding)
         .transpose()
+    }
+
+    async fn get_pricing_adjustment(
+        &self,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+    ) -> Result<Option<PricingAdjustment>> {
+        get_adjustment_on(&self.pool, owner_user_id, scope).await
+    }
+
+    async fn get_pricing_adjustment_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+    ) -> Result<Option<PricingAdjustment>> {
+        get_adjustment_on(&mut **transaction, owner_user_id, scope).await
+    }
+
+    async fn upsert_pricing_adjustment(
+        &self,
+        input: UpsertPricingAdjustment,
+    ) -> Result<PricingAdjustment> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current =
+            get_adjustment_on(&mut *transaction, &input.owner_user_id, &input.scope).await?;
+        let current_version = current.as_ref().map_or(0, |row| row.version);
+        if current_version != input.expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        let (provider_entry_id, daemon_id, executor_type, agent_id) =
+            adjustment_scope_columns(&input.scope);
+        let id = current
+            .as_ref()
+            .map(|row| row.id.clone())
+            .unwrap_or_else(new_uuid_v4);
+        sqlx::query(
+            "INSERT INTO pricing_adjustment (
+                id, owner_user_id, scope_kind, provider_entry_id, daemon_id,
+                executor_type, agent_id, mode, discount_bps,
+                input_nano_usd_per_million, output_nano_usd_per_million,
+                cache_read_nano_usd_per_million, cache_write_nano_usd_per_million,
+                catalog_provider_id, catalog_model_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                mode = excluded.mode,
+                discount_bps = excluded.discount_bps,
+                input_nano_usd_per_million = excluded.input_nano_usd_per_million,
+                output_nano_usd_per_million = excluded.output_nano_usd_per_million,
+                cache_read_nano_usd_per_million = excluded.cache_read_nano_usd_per_million,
+                cache_write_nano_usd_per_million = excluded.cache_write_nano_usd_per_million,
+                catalog_provider_id = excluded.catalog_provider_id,
+                catalog_model_id = excluded.catalog_model_id,
+                version = pricing_adjustment.version + 1,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&id)
+        .bind(&input.owner_user_id)
+        .bind(input.scope.kind())
+        .bind(provider_entry_id)
+        .bind(daemon_id)
+        .bind(executor_type)
+        .bind(agent_id)
+        .bind(input.mode.to_string())
+        .bind(input.discount_bps)
+        .bind(input.fixed_rates.input)
+        .bind(input.fixed_rates.output)
+        .bind(input.fixed_rates.cache_read)
+        .bind(input.fixed_rates.cache_write)
+        .bind(input.catalog_provider_id.as_deref())
+        .bind(input.catalog_model_id.as_deref())
+        .bind(&input.now)
+        .bind(&input.now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(check_error)?;
+        let saved = get_adjustment_on(&mut *transaction, &input.owner_user_id, &input.scope)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        transaction.commit().await?;
+        Ok(saved)
+    }
+
+    async fn delete_pricing_adjustment(
+        &self,
+        owner_user_id: &str,
+        scope: &PricingAdjustmentScope,
+        expected_version: i64,
+    ) -> Result<()> {
+        let (provider_entry_id, daemon_id, executor_type, agent_id) =
+            adjustment_scope_columns(scope);
+        let deleted = sqlx::query(&format!(
+            "DELETE FROM pricing_adjustment WHERE {ADJUSTMENT_SCOPE_FILTER} AND version = ?"
+        ))
+        .bind(owner_user_id)
+        .bind(scope.kind())
+        .bind(provider_entry_id)
+        .bind(daemon_id)
+        .bind(executor_type)
+        .bind(agent_id)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if deleted == 0 {
+            return Err(
+                if get_adjustment_on(&self.pool, owner_user_id, scope)
+                    .await?
+                    .is_some()
+                {
+                    DbError::VersionConflict
+                } else {
+                    DbError::NotFound
+                },
+            );
+        }
+        Ok(())
     }
 
     async fn list_pricing_subject_bindings(

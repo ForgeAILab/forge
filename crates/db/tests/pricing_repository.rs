@@ -487,6 +487,7 @@ async fn subject_revision_binding_uses_optimistic_versions() {
             subject_id: subject.id.clone(),
             subject_revision_id: revision.id,
             subject_revision_digest: "subject-digest-1".to_owned(),
+            scope_key: String::new(),
             runtime_model: "custom-model".to_owned(),
             source_kind: PricingRateSourceKind::ManualOverride,
             catalog_provider_id: None,

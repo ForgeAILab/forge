@@ -37,6 +37,7 @@ import {
   formatTokens,
 } from '@/components/settings/project-settings-utils'
 import { formatMoneyAmount } from '@/lib/money-format'
+import { PricingSettingsEditor } from './PricingSettingsEditor'
 import {
   DEFAULT_CEILING,
   humanize,
@@ -44,7 +45,6 @@ import {
   runtimeDisplayNames,
   supportsDirectReasoningEntry,
 } from './format'
-import { AgentActivationSummary } from './AgentActivationSummary'
 
 export function AgentDetailPanel({
   agent,
@@ -272,7 +272,10 @@ export function AgentDetailPanel({
 
         <AgentSettingsForm agent={agent} entries={entries} />
 
-        <AgentActivationSummary agent={agent} chatEntries={chatEntries} />
+        <PricingSettingsEditor
+          key={agent.id}
+          subject={{ kind: 'agent', id: agent.id, providerLabel: credentialEntry?.label }}
+        />
 
         {requiresRecovery ? (
           <p
@@ -547,6 +550,7 @@ function AgentSettingsForm({
         })
       }
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricing(agent.id) })
     } catch (cause) {
       setError(
         isVersionConflict(cause)

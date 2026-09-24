@@ -1795,6 +1795,7 @@ mod tests {
                 subject_id: subject.id.clone(),
                 subject_revision_id: revision.id.clone(),
                 subject_revision_digest: revision.revision_digest.clone(),
+                scope_key: String::new(),
                 runtime_model: "grok-test".to_owned(),
                 source_kind: PricingRateSourceKind::ManualOverride,
                 catalog_provider_id: None,
@@ -2066,6 +2067,7 @@ mod tests {
             Some("disconnect-pricing-handle"),
             None,
             None,
+            "",
             "grok-test",
         )
         .await

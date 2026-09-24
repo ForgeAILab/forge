@@ -12,15 +12,15 @@ use std::{
 };
 
 use api_types::{
-    CatalogModelRate, CatalogModelSourceKind, CostCoverage, CostCoverageReason,
+    AgentPricing, CatalogModelRate, CatalogModelSourceKind, CostCoverage, CostCoverageReason,
     CostCoverageReasonCode, CostEstimationPreview as ApiCostEstimationPreview,
     CostEstimationRun as ApiCostEstimationRun, CostEstimationRunStatus as ApiRunStatus, CostKind,
     CostSourceFreshness, CostSourceKind, CostSourceRef, CostSummary,
-    CreateCostEstimationPreviewRequest, CreateCostEstimationRunRequest, MoneyAmount,
-    PricingBinding as ApiPricingBinding, PricingBindingSourceKind, PricingCatalogModelsQuery,
-    PricingCatalogModelsResponse, PricingCatalogRefreshRequest, PricingCatalogState,
-    PricingCatalogStatus, ProviderPricing, RateAmount, RateBuckets as ApiRateBuckets,
-    ReplaceProviderPricingBinding, ReplaceProviderPricingRequest, TokenCounters, UsageCostCoverage,
+    CreateCostEstimationPreviewRequest, CreateCostEstimationRunRequest, DeletePricingSettingsQuery,
+    MoneyAmount, PricingAdjustmentSource, PricingCatalogModelsQuery, PricingCatalogModelsResponse,
+    PricingCatalogRefreshRequest, PricingCatalogState, PricingCatalogStatus, PricingMode,
+    PricingResolutionStatus, PricingSettings, RateAmount, RateBuckets as ApiRateBuckets,
+    SubjectPricingResponse, TokenCounters, UpdatePricingSettingsRequest, UsageCostCoverage,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -32,22 +32,22 @@ use axum::{
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use db::{
-    new_uuid_v4, now_rfc3339, CostEstimationPreview as DbCostEstimationPreview,
-    CostEstimationRun as DbCostEstimationRun, CredentialHandle, CredentialHandleRepo, Daemon,
-    DaemonRepo, DbError, PageRequest, PricingCatalogModelQuery as DbCatalogModelQuery,
-    PricingCatalogRepo, PricingRateSourceKind, PricingSubject, PricingSubjectKind,
-    PricingSubjectRepo, PricingSubjectState, Project, ProjectRepo, RetrospectiveEstimateRepo,
-    SortBy, SortOrder, UsageEvent, UsageLedgerRepo,
+    now_rfc3339, AgentRepo, CostEstimationPreview as DbCostEstimationPreview,
+    CostEstimationRun as DbCostEstimationRun, CredentialHandleRepo, DaemonRepo, DbError,
+    PageRequest, PricingAdjustment, PricingAdjustmentMode, PricingAdjustmentScope,
+    PricingCatalogModelQuery as DbCatalogModelQuery, PricingCatalogRepo, PricingSubjectRepo,
+    Project, ProjectRepo, RetrospectiveEstimateRepo, SortBy, SortOrder, UsageEvent,
+    UsageLedgerRepo,
 };
 use serde_json::{json, Value};
 use services::{
     pricing::{
         self, CatalogClientError, CatalogFreshness, CatalogSnapshot, CatalogStatus,
-        DesiredPricingBinding, EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion,
-        PriceSelectionReasonCode, PricingBindingRepository, PricingBindingSource,
-        PricingConfiguration, ReplacePricingRequest, RetrospectiveCommitRequest,
-        RetrospectivePreview, RetrospectiveRepositoryError, RetrospectiveUsageEvent,
+        EventBucketRates, EventTokenCounts, NanoUsd, NanoUsdPerMillion, PriceSelectionReasonCode,
+        RetrospectiveCommitRequest, RetrospectivePreview, RetrospectiveRepositoryError,
+        RetrospectiveUsageEvent,
     },
+    pricing_auto,
     pricing_db::SqlitePricingRepository,
 };
 
@@ -61,7 +61,7 @@ use crate::{
 
 const MAX_QUERY_TEXT_BYTES: usize = 256;
 const MAX_CURSOR_BYTES: usize = 2_048;
-const MAX_BINDINGS: usize = 1_000;
+
 const PREVIEW_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // -------------------------------------------------------------------------
@@ -271,26 +271,42 @@ async fn load_snapshot(
 }
 
 // -------------------------------------------------------------------------
-// Provider entry and CLI-runtime pricing subjects
+// Provider entry, CLI runtime, and agent pricing adjustments
 // -------------------------------------------------------------------------
 
 pub async fn get_provider_pricing(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
-) -> ApiResult<Json<ProviderPricing>> {
-    let subject = provider_subject(&state, &user.user_id, &id).await?;
-    get_subject_pricing(&state, subject).await.map(Json)
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = provider_scope(&state, &user.user_id, &id).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
+        .await
+        .map(Json)
 }
 
-pub async fn replace_provider_pricing(
+pub async fn update_provider_pricing(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
-    Json(request): Json<ReplaceProviderPricingRequest>,
-) -> ApiResult<Json<ProviderPricing>> {
-    let subject = provider_subject(&state, &user.user_id, &id).await?;
-    replace_subject_pricing(&state, subject, request)
+    Json(request): Json<UpdatePricingSettingsRequest>,
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = provider_scope(&state, &user.user_id, &id).await?;
+    upsert_adjustment(&state, &user.user_id, scope.clone(), request).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
+        .await
+        .map(Json)
+}
+
+pub async fn delete_provider_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Query(query): Query<DeletePricingSettingsQuery>,
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = provider_scope(&state, &user.user_id, &id).await?;
+    delete_adjustment(&state, &user.user_id, &scope, query.version).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
         .await
         .map(Json)
 }
@@ -299,306 +315,93 @@ pub async fn get_cli_runtime_pricing(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((daemon_id, executor_type)): Path<(String, String)>,
-) -> ApiResult<Json<ProviderPricing>> {
-    let subject = cli_runtime_subject(&state, &user.user_id, &daemon_id, &executor_type).await?;
-    get_subject_pricing(&state, subject).await.map(Json)
-}
-
-pub async fn replace_cli_runtime_pricing(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((daemon_id, executor_type)): Path<(String, String)>,
-    Json(request): Json<ReplaceProviderPricingRequest>,
-) -> ApiResult<Json<ProviderPricing>> {
-    let subject = cli_runtime_subject(&state, &user.user_id, &daemon_id, &executor_type).await?;
-    replace_subject_pricing(&state, subject, request)
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = cli_runtime_scope(&state, &user.user_id, &daemon_id, &executor_type).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
         .await
         .map(Json)
 }
 
-async fn get_subject_pricing(
-    state: &AppState,
-    subject: PricingSubject,
-) -> ApiResult<ProviderPricing> {
-    let config = state
-        .pricing_repository
-        .pricing_configuration(&subject.id)
+pub async fn update_cli_runtime_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((daemon_id, executor_type)): Path<(String, String)>,
+    Json(request): Json<UpdatePricingSettingsRequest>,
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = cli_runtime_scope(&state, &user.user_id, &daemon_id, &executor_type).await?;
+    upsert_adjustment(&state, &user.user_id, scope.clone(), request).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
         .await
-        .map_err(map_catalog_repository_error)?;
-    subject_pricing_response(state, &subject, config).await
+        .map(Json)
 }
 
-async fn replace_subject_pricing(
-    state: &AppState,
-    subject: PricingSubject,
-    request: ReplaceProviderPricingRequest,
-) -> ApiResult<ProviderPricing> {
-    if subject.state != PricingSubjectState::Active {
-        return Err(ApiError::conflict_with_code(
-            "pricing_subject_retired",
-            "pricing for this disconnected source is retired",
-        ));
-    }
-    let domain_request = desired_pricing_request(state, request).await?;
-    let config = state
-        .pricing_repository
-        .replace_pricing_configuration(&subject.id, domain_request, SystemTime::now())
+pub async fn delete_cli_runtime_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((daemon_id, executor_type)): Path<(String, String)>,
+    Query(query): Query<DeletePricingSettingsQuery>,
+) -> ApiResult<Json<SubjectPricingResponse>> {
+    let scope = cli_runtime_scope(&state, &user.user_id, &daemon_id, &executor_type).await?;
+    delete_adjustment(&state, &user.user_id, &scope, query.version).await?;
+    subject_pricing_response(&state, &user.user_id, &scope)
         .await
-        .map_err(map_binding_mutation_error)?;
-    let subject = PricingSubjectRepo::get_pricing_subject(&*state.db, &subject.id)
+        .map(Json)
+}
+
+pub async fn get_agent_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AgentPricing>> {
+    let agent = owned_agent(&state, &user.user_id, &id).await?;
+    agent_pricing_response(&state, &user.user_id, &agent)
         .await
-        .map_err(map_db_read_error)?
-        .ok_or_else(|| ApiError::not_found("pricing_subject", subject.id.clone()))?;
-    subject_pricing_response(state, &subject, config).await
+        .map(Json)
 }
 
-async fn desired_pricing_request(
-    state: &AppState,
-    request: ReplaceProviderPricingRequest,
-) -> ApiResult<ReplacePricingRequest> {
-    if request.expected_version < 0 {
-        return Err(ApiError::validation(
-            "expected_version must be zero or greater",
-        ));
-    }
-    validate_required_identifier(&request.idempotency_key, "idempotency_key")?;
-    if request.idempotency_key.len() > 256 {
-        return Err(ApiError::validation(
-            "idempotency_key exceeds the supported length",
-        ));
-    }
-    validate_required_identifier(&request.subject_revision_digest, "subject_revision_digest")?;
-    if request.bindings.len() > MAX_BINDINGS {
-        return Err(ApiError::validation("too many pricing bindings"));
-    }
-    let status = state
-        .models_dev_client
-        .status_at(SystemTime::now())
+pub async fn update_agent_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Json(request): Json<UpdatePricingSettingsRequest>,
+) -> ApiResult<Json<AgentPricing>> {
+    let agent = owned_agent(&state, &user.user_id, &id).await?;
+    upsert_adjustment(
+        &state,
+        &user.user_id,
+        PricingAdjustmentScope::Agent(agent.id.clone()),
+        request,
+    )
+    .await?;
+    agent_pricing_response(&state, &user.user_id, &agent)
         .await
-        .map_err(map_catalog_client_error)?;
-    let freshness = status.freshness_at(SystemTime::now());
-    let mut bindings = Vec::with_capacity(request.bindings.len());
-    for binding in request.bindings {
-        bindings.push(desired_binding(state, &binding, freshness).await?);
-    }
-    Ok(ReplacePricingRequest {
-        expected_version: u64::try_from(request.expected_version)
-            .map_err(|_| ApiError::validation("expected_version is invalid"))?,
-        idempotency_key: request.idempotency_key,
-        subject_revision_digest: request.subject_revision_digest,
-        bindings,
-    })
+        .map(Json)
 }
 
-async fn desired_binding(
-    state: &AppState,
-    binding: &ReplaceProviderPricingBinding,
-    catalog_freshness: CatalogFreshness,
-) -> ApiResult<DesiredPricingBinding> {
-    validate_required_identifier(&binding.runtime_model, "runtime_model")?;
-    match binding.source_kind {
-        PricingBindingSourceKind::ManualOverride => {
-            if binding.catalog_provider_id.is_some()
-                || binding.catalog_model_id.is_some()
-                || binding.catalog_rate_revision_id.is_some()
-            {
-                return Err(ApiError::validation(
-                    "manual pricing bindings cannot contain catalog references",
-                ));
-            }
-            let rates = binding.manual_rates.as_ref().ok_or_else(|| {
-                ApiError::validation("manual pricing bindings require manual_rates")
-            })?;
-            Ok(DesiredPricingBinding::manual(
-                binding.runtime_model.clone(),
-                service_rate_buckets(rates)?,
-            ))
-        }
-        PricingBindingSourceKind::ModelsDevCatalog => {
-            if binding.manual_rates.is_some() {
-                return Err(ApiError::validation(
-                    "catalog pricing bindings cannot contain manual_rates",
-                ));
-            }
-            let provider_id = binding.catalog_provider_id.as_deref().ok_or_else(|| {
-                ApiError::validation("catalog pricing bindings require catalog_provider_id")
-            })?;
-            let model_id = binding.catalog_model_id.as_deref().ok_or_else(|| {
-                ApiError::validation("catalog pricing bindings require catalog_model_id")
-            })?;
-            let rate_revision_id =
-                binding.catalog_rate_revision_id.as_deref().ok_or_else(|| {
-                    ApiError::validation(
-                        "catalog pricing bindings require catalog_rate_revision_id",
-                    )
-                })?;
-            validate_required_identifier(provider_id, "catalog_provider_id")?;
-            validate_required_identifier(model_id, "catalog_model_id")?;
-            validate_required_identifier(rate_revision_id, "catalog_rate_revision_id")?;
-            let rate = PricingCatalogRepo::get_pricing_rate_revision(&*state.db, rate_revision_id)
-                .await
-                .map_err(map_db_read_error)?
-                .ok_or_else(|| ApiError::validation("catalog rate revision is not available"))?;
-            if rate.source_kind != PricingRateSourceKind::ModelsDevCatalog
-                || rate.currency != "USD"
-                || rate.catalog_provider_id.as_deref() != Some(provider_id)
-                || rate.catalog_model_id.as_deref() != Some(model_id)
-            {
-                return Err(ApiError::validation(
-                    "catalog rate revision does not match the requested provider/model",
-                ));
-            }
-            let snapshot_id = rate
-                .catalog_snapshot_id
-                .as_deref()
-                .ok_or_else(|| ApiError::validation("catalog rate revision has no snapshot"))?;
-            let snapshot = state
-                .pricing_repository
-                .catalog_snapshot(snapshot_id)
-                .await
-                .map_err(map_catalog_repository_error)?
-                .ok_or_else(|| ApiError::validation("catalog snapshot is not available"))?;
-            let model = snapshot.model_rate(provider_id, model_id).ok_or_else(|| {
-                ApiError::validation("catalog rate revision does not match its snapshot")
-            })?;
-            if model.rate_digest(&snapshot.id) != rate.id
-                || rate.rates
-                    != db::RateBuckets::new(
-                        model
-                            .rates
-                            .input
-                            .map(NanoUsdPerMillion::as_nano_usd_per_million),
-                        model
-                            .rates
-                            .output
-                            .map(NanoUsdPerMillion::as_nano_usd_per_million),
-                        model
-                            .rates
-                            .cache_read
-                            .map(NanoUsdPerMillion::as_nano_usd_per_million),
-                        model
-                            .rates
-                            .cache_write
-                            .map(NanoUsdPerMillion::as_nano_usd_per_million),
-                    )
-            {
-                return Err(ApiError::validation(
-                    "catalog rate revision provenance is invalid",
-                ));
-            }
-            let tiers = pricing::parse_persisted_context_tiers(&rate.tiers_json)
-                .map_err(|_| ApiError::validation("catalog context tiers are invalid"))?;
-            let legacy_context = rate
-                .legacy_context_over_200k_json
-                .as_deref()
-                .map(pricing::parse_persisted_legacy_context_rate)
-                .transpose()
-                .map_err(|_| ApiError::validation("catalog legacy context rates are invalid"))?;
-            Ok(DesiredPricingBinding::models_dev(
-                binding.runtime_model.clone(),
-                provider_id.to_owned(),
-                model_id.to_owned(),
-                snapshot.id.clone(),
-                rate_revision_id.to_owned(),
-                model.rates,
-                tiers,
-                legacy_context,
-                catalog_freshness,
-            ))
-        }
-    }
-}
-
-async fn subject_pricing_response(
-    state: &AppState,
-    subject: &PricingSubject,
-    config: PricingConfiguration,
-) -> ApiResult<ProviderPricing> {
-    let rows = PricingSubjectRepo::list_pricing_subject_bindings(&*state.db, &subject.id, true)
+pub async fn delete_agent_pricing(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Query(query): Query<DeletePricingSettingsQuery>,
+) -> ApiResult<Json<AgentPricing>> {
+    let agent = owned_agent(&state, &user.user_id, &id).await?;
+    delete_adjustment(
+        &state,
+        &user.user_id,
+        &PricingAdjustmentScope::Agent(agent.id.clone()),
+        query.version,
+    )
+    .await?;
+    agent_pricing_response(&state, &user.user_id, &agent)
         .await
-        .map_err(map_db_read_error)?;
-    let rows_by_id = rows
-        .into_iter()
-        .map(|row| (row.id.clone(), row))
-        .collect::<HashMap<_, _>>();
-    let mut bindings = Vec::with_capacity(config.bindings.len());
-    for source in config.bindings {
-        let id = source_id(&source);
-        let row = rows_by_id.get(&id).ok_or_else(|| {
-            ApiError::internal("stored pricing binding is missing its database row")
-        })?;
-        bindings.push(api_binding(source, row)?);
-    }
-    bindings.sort_by(|left, right| {
-        left.runtime_model
-            .cmp(&right.runtime_model)
-            .then_with(|| {
-                let left_kind =
-                    matches!(left.source_kind, PricingBindingSourceKind::ManualOverride);
-                let right_kind =
-                    matches!(right.source_kind, PricingBindingSourceKind::ManualOverride);
-                right_kind.cmp(&left_kind)
-            })
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(ProviderPricing {
-        subject_id: config.subject_id,
-        subject_revision_digest: config.subject_revision_digest,
-        version: i64::try_from(config.version)
-            .map_err(|_| ApiError::internal("pricing subject version exceeds the API range"))?,
-        bindings,
-    })
+        .map(Json)
 }
 
-fn source_id(source: &PricingBindingSource) -> String {
-    match source {
-        PricingBindingSource::ModelsDev(binding) => binding.id.clone(),
-        PricingBindingSource::Manual(binding) => binding.id.clone(),
-    }
-}
-
-fn api_binding(
-    source: PricingBindingSource,
-    row: &db::PricingSubjectBinding,
-) -> ApiResult<ApiPricingBinding> {
-    match source {
-        PricingBindingSource::ModelsDev(binding) => Ok(ApiPricingBinding {
-            id: binding.id,
-            runtime_model: binding.runtime_model,
-            subject_revision_digest: row.subject_revision_digest.clone(),
-            source_kind: PricingBindingSourceKind::ModelsDevCatalog,
-            catalog_provider_id: Some(binding.provider_id),
-            catalog_model_id: Some(binding.model_id),
-            catalog_rate_revision_id: Some(binding.rate_revision_id),
-            manual_rates: None,
-            effective_at: row.effective_at.clone(),
-            retired_at: row.retired_at.clone(),
-            version: row.version,
-        }),
-        PricingBindingSource::Manual(binding) => Ok(ApiPricingBinding {
-            id: binding.id,
-            runtime_model: binding.runtime_model,
-            subject_revision_digest: binding.subject_revision_digest,
-            source_kind: PricingBindingSourceKind::ManualOverride,
-            catalog_provider_id: None,
-            catalog_model_id: None,
-            catalog_rate_revision_id: Some(binding.rate_revision_id),
-            manual_rates: Some(api_rate_buckets_from_service(binding.rates)?),
-            effective_at: rfc3339(binding.effective_at),
-            retired_at: binding
-                .retired_at
-                .map(rfc3339)
-                .or_else(|| row.retired_at.clone()),
-            version: row.version,
-        }),
-    }
-}
-
-async fn provider_subject(
+async fn provider_scope(
     state: &AppState,
     user_id: &str,
     provider_entry_id: &str,
-) -> ApiResult<PricingSubject> {
+) -> ApiResult<PricingAdjustmentScope> {
     let handle = CredentialHandleRepo::get_credential_handle_for_owner(
         &*state.db,
         provider_entry_id,
@@ -606,50 +409,17 @@ async fn provider_subject(
     )
     .await
     .map_err(map_db_read_error)?
+    .filter(|handle| handle.status != "revoked")
     .ok_or_else(|| ApiError::not_found("provider_entry", provider_entry_id.to_owned()))?;
-    if handle.status == "revoked" {
-        // Revocation is terminal for the credential's pricing subject. Keep
-        // its historical rows, but do not allow a GET/PUT to resurrect or
-        // provision a subject for a credential that no longer exists.
-        return Err(ApiError::not_found(
-            "provider_entry",
-            provider_entry_id.to_owned(),
-        ));
-    }
-    let identity = provider_identity(&handle);
-    if let Some(subject) =
-        PricingSubjectRepo::get_pricing_subject_for_provider(&*state.db, user_id, provider_entry_id)
-            .await
-            .map_err(map_db_read_error)?
-    {
-        return ensure_subject_identity(
-            state,
-            subject,
-            identity,
-            Some(provider_entry_id.to_owned()),
-            None,
-            None,
-        )
-        .await;
-    }
-    ensure_subject(
-        state,
-        user_id,
-        PricingSubjectKind::ProviderEntry,
-        Some(provider_entry_id.to_owned()),
-        None,
-        None,
-        identity,
-    )
-    .await
+    Ok(PricingAdjustmentScope::ProviderEntry(handle.id))
 }
 
-async fn cli_runtime_subject(
+async fn cli_runtime_scope(
     state: &AppState,
     user_id: &str,
     daemon_id: &str,
     executor_type: &str,
-) -> ApiResult<PricingSubject> {
+) -> ApiResult<PricingAdjustmentScope> {
     let daemon = DaemonRepo::get_by_id(&*state.db, daemon_id)
         .await
         .map_err(map_db_read_error)?
@@ -662,467 +432,328 @@ async fn cli_runtime_subject(
         .ok_or_else(|| {
             ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
         })?;
-    let detected = detected_cli(&daemon, executor_type).ok_or_else(|| {
-        ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
-    })?;
-    if let Some(subject) = PricingSubjectRepo::get_pricing_subject_for_cli_runtime(
-        &*state.db,
-        user_id,
-        daemon_id,
-        executor_type,
-    )
-    .await
-    .map_err(map_db_read_error)?
-    {
-        return ensure_subject_identity(
-            state,
-            subject,
-            cli_identity(executor_type, &detected),
+    if pricing_auto::detected_cli(&daemon.detected_clis_json, executor_type).is_none() {
+        return Err(ApiError::not_found(
+            "cli_runtime",
+            format!("{daemon_id}/{executor_type}"),
+        ));
+    }
+    Ok(PricingAdjustmentScope::CliRuntime {
+        daemon_id: daemon_id.to_owned(),
+        executor_type: executor_type.to_owned(),
+    })
+}
+
+async fn owned_agent(state: &AppState, user_id: &str, agent_id: &str) -> ApiResult<db::Agent> {
+    AgentRepo::get_by_id(&*state.db, agent_id)
+        .await
+        .map_err(map_db_read_error)?
+        .filter(|agent| agent.owner_id.as_deref() == Some(user_id))
+        .ok_or_else(|| ApiError::not_found("agent", agent_id.to_owned()))
+}
+
+async fn subject_pricing_response(
+    state: &AppState,
+    user_id: &str,
+    scope: &PricingAdjustmentScope,
+) -> ApiResult<SubjectPricingResponse> {
+    let adjustment = PricingSubjectRepo::get_pricing_adjustment(&*state.db, user_id, scope)
+        .await
+        .map_err(map_db_read_error)?;
+    Ok(SubjectPricingResponse {
+        settings: adjustment.as_ref().map(api_settings).transpose()?,
+    })
+}
+
+async fn agent_pricing_response(
+    state: &AppState,
+    user_id: &str,
+    agent: &db::Agent,
+) -> ApiResult<AgentPricing> {
+    let preview = pricing_auto::preview_agent_price(&state.db, user_id, agent)
+        .await
+        .map_err(|_| ApiError::internal("agent pricing could not be resolved"))?;
+    let (status, catalog_row, candidates, desired, source) = match &preview.resolution {
+        None => (
+            PricingResolutionStatus::NoModel,
             None,
-            Some(daemon_id.to_owned()),
-            Some(executor_type.to_owned()),
-        )
-        .await;
-    }
-    ensure_subject(
-        state,
-        user_id,
-        PricingSubjectKind::CliRuntime,
-        None,
-        Some(daemon_id.to_owned()),
-        Some(executor_type.to_owned()),
-        cli_identity(executor_type, &detected),
-    )
-    .await
-}
-
-fn provider_identity(handle: &CredentialHandle) -> pricing::PricingSubjectIdentity {
-    let endpoint_class = services::embedded_agent_service::entry_base_url(handle)
-        .ok()
-        .and_then(|base_url| canonical_endpoint_class(&base_url))
-        .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| handle.provider.clone());
-    let credential_method = if handle.credential_method == "oauth_bundle" {
-        "oauth".to_owned()
-    } else {
-        handle.credential_method.clone()
-    };
-    pricing::PricingSubjectIdentity {
-        subject_kind: "provider_entry".to_owned(),
-        provider_kind: handle.provider.clone(),
-        credential_method,
-        endpoint_class,
-        runtime_fingerprint: None,
-        schema_revision: "pricing-subject-v1".to_owned(),
-    }
-}
-
-/// Canonicalizes the non-secret endpoint identity used by pricing subjects.
-/// Scheme, host, explicit port, and custom path all participate in the
-/// digest; credentials, query parameters, and fragments never do. Trailing
-/// path slashes are normalized so equivalent root/API spellings do not create
-/// needless subject revisions.
-fn canonical_endpoint_class(base_url: &str) -> Option<String> {
-    let parsed = url::Url::parse(base_url).ok()?;
-    let scheme = parsed.scheme().trim().to_ascii_lowercase();
-    let host = parsed.host_str()?.trim().to_ascii_lowercase();
-    if scheme.is_empty() || host.is_empty() {
-        return None;
-    }
-    let port = parsed
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    let trimmed_path = parsed.path().trim_end_matches('/');
-    let path = if trimmed_path.is_empty() {
-        "/"
-    } else {
-        trimmed_path
-    };
-    Some(format!("{scheme}://{host}{port}{path}"))
-}
-
-fn cli_identity(
-    executor_type: &str,
-    detected: &api_types::DetectedCli,
-) -> pricing::PricingSubjectIdentity {
-    // Daemon reports are untrusted input. In particular, CLI paths and config
-    // paths may be URL-shaped or contain copied credentials. Keep the raw
-    // values in memory only while computing a domain-separated digest; the
-    // subject row and API response receive only that fixed-size opaque value.
-    let fingerprint = cli_fingerprint(executor_type, detected);
-    pricing::PricingSubjectIdentity {
-        subject_kind: "cli_runtime".to_owned(),
-        provider_kind: executor_type.to_owned(),
-        credential_method: "cli_login".to_owned(),
-        endpoint_class: "cli_runtime".to_owned(),
-        runtime_fingerprint: Some(fingerprint),
-        schema_revision: "pricing-subject-v1".to_owned(),
-    }
-}
-
-const CLI_FINGERPRINT_DOMAIN: &str = "forge-pricing-cli-runtime-fingerprint-v1";
-
-fn cli_fingerprint(executor_type: &str, detected: &api_types::DetectedCli) -> String {
-    let mut bytes = Vec::with_capacity(256);
-    append_cli_fingerprint_field(&mut bytes, Some(CLI_FINGERPRINT_DOMAIN));
-    append_cli_fingerprint_field(&mut bytes, Some(executor_type));
-    // Availability/authentication is deliberately excluded: it is a
-    // reversible eligibility state, not runtime identity, and must not mint
-    // a new subject revision on routine login/disable transitions.
-    append_cli_fingerprint_field(&mut bytes, detected.version.as_deref());
-    append_cli_fingerprint_field(&mut bytes, detected.path.as_deref());
-    append_cli_fingerprint_field(&mut bytes, detected.config_path.as_deref());
-    format!("sha256:{}", pricing::sha256_hex(&bytes))
-}
-
-fn append_cli_fingerprint_field(bytes: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        None => bytes.push(0),
-        Some(value) => {
-            bytes.push(1);
-            let value = value.as_bytes();
-            let length = match u64::try_from(value.len()) {
-                Ok(length) => length,
-                Err(_) => {
-                    // This is unreachable on supported targets, but retain a
-                    // deterministic bounded representation if usize ever
-                    // exceeds the digest length prefix.
-                    bytes.push(2);
-                    bytes.extend_from_slice(&u64::MAX.to_be_bytes());
-                    bytes.extend_from_slice(pricing::sha256_hex(value).as_bytes());
-                    return;
+            Vec::new(),
+            None,
+            if preview.agent_adjustment.is_some() {
+                PricingAdjustmentSource::Agent
+            } else if preview.provider_adjustment.is_some() {
+                PricingAdjustmentSource::Provider
+            } else {
+                PricingAdjustmentSource::Default
+            },
+        ),
+        Some(resolution) => {
+            let (status, row, candidates) = match &resolution.catalog {
+                pricing_auto::CatalogMatch::Found(row) => {
+                    (PricingResolutionStatus::Priced, Some(row), Vec::new())
+                }
+                pricing_auto::CatalogMatch::Ambiguous(providers) => {
+                    (PricingResolutionStatus::Ambiguous, None, providers.clone())
+                }
+                pricing_auto::CatalogMatch::NotFound => {
+                    (PricingResolutionStatus::NotInCatalog, None, Vec::new())
+                }
+                pricing_auto::CatalogMatch::CatalogAbsent => {
+                    (PricingResolutionStatus::CatalogAbsent, None, Vec::new())
                 }
             };
-            bytes.extend_from_slice(&length.to_be_bytes());
-            bytes.extend_from_slice(value);
+            // A fixed price does not need a catalog row to be priced.
+            let status = if resolution.desired.is_some() {
+                PricingResolutionStatus::Priced
+            } else {
+                status
+            };
+            (
+                status,
+                row,
+                candidates,
+                resolution.desired.as_ref(),
+                match resolution.adjustment.source {
+                    pricing_auto::AdjustmentSource::Agent => PricingAdjustmentSource::Agent,
+                    pricing_auto::AdjustmentSource::Provider => PricingAdjustmentSource::Provider,
+                    pricing_auto::AdjustmentSource::Default => PricingAdjustmentSource::Default,
+                },
+            )
         }
-    }
-}
-
-fn detected_cli(daemon: &Daemon, executor_type: &str) -> Option<api_types::DetectedCli> {
-    serde_json::from_str::<Vec<api_types::DetectedCli>>(&daemon.detected_clis_json)
-        .ok()?
-        .into_iter()
-        .find(|cli| cli.kind == executor_type)
-}
-
-async fn ensure_subject(
-    state: &AppState,
-    user_id: &str,
-    subject_kind: PricingSubjectKind,
-    provider_entry_id: Option<String>,
-    daemon_id: Option<String>,
-    executor_type: Option<String>,
-    identity: pricing::PricingSubjectIdentity,
-) -> ApiResult<PricingSubject> {
-    for attempt in 0..2 {
-        match provision_subject(
-            state,
-            user_id,
-            subject_kind,
-            provider_entry_id.clone(),
-            daemon_id.clone(),
-            executor_type.clone(),
-            &identity,
-        )
-        .await
-        {
-            Ok(subject) => return Ok(subject),
-            Err(DbError::IdempotencyConflict) if attempt == 0 => {
-                // Another request may have provisioned the same subject between
-                // the visibility lookup and this insert. Re-read through the
-                // visibility-scoped key; never expose the competing row by its
-                // generated ID. If the read races the commit, one retry gives
-                // the writer time to publish the pointer.
-                if let Some(subject) = lookup_subject(
-                    state,
-                    user_id,
-                    subject_kind,
-                    provider_entry_id.as_deref(),
-                    daemon_id.as_deref(),
-                    executor_type.as_deref(),
-                )
-                .await?
-                {
-                    return ensure_subject_identity(
-                        state,
-                        subject,
-                        identity.clone(),
-                        provider_entry_id.clone(),
-                        daemon_id.clone(),
-                        executor_type.clone(),
-                    )
-                    .await;
-                }
-            }
-            Err(error) => return Err(map_db_mutation_error(error)),
-        }
-    }
-    Err(ApiError::internal(
-        "pricing subject could not be provisioned",
-    ))
-}
-
-async fn provision_subject(
-    state: &AppState,
-    user_id: &str,
-    subject_kind: PricingSubjectKind,
-    provider_entry_id: Option<String>,
-    daemon_id: Option<String>,
-    executor_type: Option<String>,
-    identity: &pricing::PricingSubjectIdentity,
-) -> Result<PricingSubject, DbError> {
-    let now = now_rfc3339();
-    let subject_id = new_uuid_v4();
-    let mut transaction = db::begin_immediate(state.db.pool()).await?;
-    let subject = PricingSubjectRepo::create_pricing_subject_in_tx(
-        &*state.db,
-        &mut transaction,
-        db::CreatePricingSubject {
-            id: subject_id,
-            owner_user_id: user_id.to_owned(),
-            subject_kind,
-            provider_entry_id: provider_entry_id.clone(),
-            daemon_id: daemon_id.clone(),
-            executor_type: executor_type.clone(),
-            current_revision_id: None,
-            state: PricingSubjectState::Active,
-            last_idempotency_key: None,
-            last_update_digest: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await?;
-    let revision_id = new_uuid_v4();
-    let revision_digest = pricing::pricing_subject_revision_digest(identity);
-    let revision = PricingSubjectRepo::create_pricing_subject_revision_in_tx(
-        &*state.db,
-        &mut transaction,
-        subject_revision_input(SubjectRevisionDraft {
-            id: revision_id,
-            subject_id: subject.id.clone(),
-            owner_user_id: user_id,
-            revision: 1,
-            revision_digest,
-            subject_kind,
-            provider_entry_id,
-            daemon_id,
-            executor_type,
-            identity,
-            created_at: now.clone(),
-        }),
-    )
-    .await?;
-    let subject = PricingSubjectRepo::update_pricing_subject_in_tx(
-        &*state.db,
-        &mut transaction,
-        db::UpdatePricingSubject {
-            id: subject.id,
-            expected_version: subject.version,
-            current_revision_id: Some(Some(revision.id)),
-            state: None,
-            last_idempotency_key: None,
-            last_update_digest: None,
-            updated_at: now,
-        },
-    )
-    .await?;
-    transaction.commit().await?;
-    Ok(subject)
-}
-
-async fn ensure_subject_identity(
-    state: &AppState,
-    subject: PricingSubject,
-    identity: pricing::PricingSubjectIdentity,
-    provider_entry_id: Option<String>,
-    daemon_id: Option<String>,
-    executor_type: Option<String>,
-) -> ApiResult<PricingSubject> {
-    // Retirement is terminal for a pricing subject. Keep the immutable
-    // historical revision/configuration readable, but do not mint a new
-    // revision after the source has been disconnected or disabled.
-    if subject.state == PricingSubjectState::Retired {
-        return Ok(subject);
-    }
-    let expected_digest = pricing::pricing_subject_revision_digest(&identity);
-    let mut subject = subject;
-    for attempt in 0..3 {
-        let current_revision = match subject.current_revision_id.as_deref() {
-            Some(revision_id) => {
-                PricingSubjectRepo::get_pricing_subject_revision(&*state.db, revision_id)
-                    .await
-                    .map_err(map_db_read_error)?
-            }
-            None => None,
-        };
-        if current_revision
+    };
+    Ok(AgentPricing {
+        agent_id: agent.id.clone(),
+        runtime_model: preview.runtime_model.clone(),
+        settings: preview
+            .agent_adjustment
             .as_ref()
-            .is_some_and(|revision| revision.revision_digest == expected_digest)
-        {
-            return Ok(subject);
-        }
-        let next_revision = match current_revision.as_ref() {
-            Some(revision) => revision
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| ApiError::internal("pricing subject revision overflow"))?,
-            None => 1,
-        };
-        match append_subject_revision(
-            state,
-            &subject,
-            identity.clone(),
-            provider_entry_id.clone(),
-            daemon_id.clone(),
-            executor_type.clone(),
-            next_revision,
-        )
-        .await
-        {
-            Ok(updated) => return Ok(updated),
-            Err(DbError::VersionConflict | DbError::IdempotencyConflict) if attempt < 2 => {
-                subject = lookup_subject(
-                    state,
-                    &subject.owner_user_id,
-                    subject.subject_kind,
-                    provider_entry_id.as_deref(),
-                    daemon_id.as_deref(),
-                    executor_type.as_deref(),
-                )
-                .await?
-                .ok_or_else(|| ApiError::not_found("pricing_subject", subject.id.clone()))?;
-            }
-            Err(error) => return Err(map_db_mutation_error(error)),
-        }
+            .map(api_settings)
+            .transpose()?,
+        provider_settings: preview
+            .provider_adjustment
+            .as_ref()
+            .map(api_settings)
+            .transpose()?,
+        source,
+        status,
+        catalog_provider_id: catalog_row.and_then(|row| row.catalog_provider_id.clone()),
+        catalog_model_id: catalog_row.and_then(|row| row.catalog_model_id.clone()),
+        catalog_rates: catalog_row
+            .map(|row| api_db_rate_buckets(row.rates))
+            .transpose()?,
+        effective_rates: desired
+            .map(|desired| api_db_rate_buckets(desired.rates()))
+            .transpose()?,
+        candidate_providers: candidates,
+    })
+}
+
+fn api_db_rate_buckets(rates: db::RateBuckets) -> ApiResult<ApiRateBuckets> {
+    Ok(ApiRateBuckets {
+        input: api_rate_amount(rates.input)?,
+        output: api_rate_amount(rates.output)?,
+        cache_read: api_rate_amount(rates.cache_read)?,
+        cache_write: api_rate_amount(rates.cache_write)?,
+    })
+}
+
+fn api_settings(adjustment: &PricingAdjustment) -> ApiResult<PricingSettings> {
+    Ok(PricingSettings {
+        mode: match adjustment.mode {
+            PricingAdjustmentMode::List => PricingMode::List,
+            PricingAdjustmentMode::Discount => PricingMode::Discount,
+            PricingAdjustmentMode::Fixed => PricingMode::Fixed,
+        },
+        discount_percent: adjustment.discount_bps.map(discount_percent_text),
+        fixed_rates: (adjustment.mode == PricingAdjustmentMode::Fixed)
+            .then(|| api_db_rate_buckets(adjustment.fixed_rates))
+            .transpose()?,
+        catalog_provider_id: adjustment.catalog_provider_id.clone(),
+        catalog_model_id: adjustment.catalog_model_id.clone(),
+        version: adjustment.version,
+    })
+}
+
+/// `2050` basis points → `"20.5"`.
+fn discount_percent_text(bps: i64) -> String {
+    let whole = bps / 100;
+    let fraction = bps % 100;
+    match fraction {
+        0 => whole.to_string(),
+        f if f % 10 == 0 => format!("{whole}.{}", f / 10),
+        f => format!("{whole}.{f:02}"),
     }
-    Err(ApiError::conflict_with_code(
-        "pricing.version_conflict",
-        "pricing subject identity changed while it was being refreshed",
+}
+
+/// `"20.5"` → `2050` basis points; 0–100 with at most two decimals.
+fn parse_discount_percent(value: &str) -> ApiResult<i64> {
+    let invalid = || {
+        ApiError::validation("discount_percent must be 0 to 100 with at most two decimal places")
+    };
+    let value = value.trim();
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.is_empty()
+        || fraction.len() > 2
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+        || whole.len() > 3
+    {
+        return Err(invalid());
+    }
+    let whole: i64 = whole.parse().map_err(|_| invalid())?;
+    let fraction: i64 = format!("{fraction:0<2}").parse().map_err(|_| invalid())?;
+    let bps = whole * 100 + fraction;
+    if !(0..=10_000).contains(&bps) {
+        return Err(invalid());
+    }
+    Ok(bps)
+}
+
+fn db_fixed_rates(rates: &ApiRateBuckets) -> ApiResult<db::RateBuckets> {
+    let rates = service_rate_buckets(rates)?;
+    Ok(db::RateBuckets::new(
+        rates.input.map(NanoUsdPerMillion::as_nano_usd_per_million),
+        rates.output.map(NanoUsdPerMillion::as_nano_usd_per_million),
+        rates
+            .cache_read
+            .map(NanoUsdPerMillion::as_nano_usd_per_million),
+        rates
+            .cache_write
+            .map(NanoUsdPerMillion::as_nano_usd_per_million),
     ))
 }
 
-async fn append_subject_revision(
-    state: &AppState,
-    subject: &PricingSubject,
-    identity: pricing::PricingSubjectIdentity,
-    provider_entry_id: Option<String>,
-    daemon_id: Option<String>,
-    executor_type: Option<String>,
-    revision_number: i64,
-) -> Result<PricingSubject, DbError> {
-    let now = now_rfc3339();
-    let mut transaction = db::begin_immediate(state.db.pool()).await?;
-    let revision = PricingSubjectRepo::create_pricing_subject_revision_in_tx(
-        &*state.db,
-        &mut transaction,
-        subject_revision_input(SubjectRevisionDraft {
-            id: new_uuid_v4(),
-            subject_id: subject.id.clone(),
-            owner_user_id: &subject.owner_user_id,
-            revision: revision_number,
-            revision_digest: pricing::pricing_subject_revision_digest(&identity),
-            subject_kind: subject.subject_kind,
-            provider_entry_id,
-            daemon_id,
-            executor_type,
-            identity: &identity,
-            created_at: now.clone(),
-        }),
-    )
-    .await?;
-    let subject = PricingSubjectRepo::update_pricing_subject_in_tx(
-        &*state.db,
-        &mut transaction,
-        db::UpdatePricingSubject {
-            id: subject.id.clone(),
-            expected_version: subject.version,
-            current_revision_id: Some(Some(revision.id)),
-            state: None,
-            last_idempotency_key: None,
-            last_update_digest: None,
-            updated_at: now,
-        },
-    )
-    .await?;
-    transaction.commit().await?;
-    Ok(subject)
-}
-
-struct SubjectRevisionDraft<'a> {
-    id: String,
-    subject_id: String,
-    owner_user_id: &'a str,
-    revision: i64,
-    revision_digest: String,
-    subject_kind: PricingSubjectKind,
-    provider_entry_id: Option<String>,
-    daemon_id: Option<String>,
-    executor_type: Option<String>,
-    identity: &'a pricing::PricingSubjectIdentity,
-    created_at: String,
-}
-
-fn subject_revision_input(input: SubjectRevisionDraft<'_>) -> db::CreatePricingSubjectRevision {
-    db::CreatePricingSubjectRevision {
-        id: input.id,
-        subject_id: input.subject_id,
-        owner_user_id: input.owner_user_id.to_owned(),
-        revision: input.revision,
-        revision_digest: input.revision_digest,
-        subject_kind: input.subject_kind,
-        provider_entry_id: input.provider_entry_id,
-        daemon_id: input.daemon_id,
-        executor_type: input.executor_type,
-        provider_kind: input.identity.provider_kind.clone(),
-        credential_method: input.identity.credential_method.clone(),
-        endpoint_class: input.identity.endpoint_class.clone(),
-        runtime_fingerprint: input.identity.runtime_fingerprint.clone(),
-        schema_revision: input.identity.schema_revision.clone(),
-        non_secret_identity_json: serde_json::to_string(&identity_json(input.identity))
-            .unwrap_or_else(|_| "{}".to_owned()),
-        created_at: input.created_at,
-    }
-}
-
-async fn lookup_subject(
+async fn upsert_adjustment(
     state: &AppState,
     user_id: &str,
-    subject_kind: PricingSubjectKind,
-    provider_entry_id: Option<&str>,
-    daemon_id: Option<&str>,
-    executor_type: Option<&str>,
-) -> ApiResult<Option<PricingSubject>> {
-    match subject_kind {
-        PricingSubjectKind::ProviderEntry => PricingSubjectRepo::get_pricing_subject_for_provider(
-            &*state.db,
-            user_id,
-            provider_entry_id.unwrap_or_default(),
-        )
-        .await
-        .map_err(map_db_read_error),
-        PricingSubjectKind::CliRuntime => PricingSubjectRepo::get_pricing_subject_for_cli_runtime(
-            &*state.db,
-            user_id,
-            daemon_id.unwrap_or_default(),
-            executor_type.unwrap_or_default(),
-        )
-        .await
-        .map_err(map_db_read_error),
+    scope: PricingAdjustmentScope,
+    request: UpdatePricingSettingsRequest,
+) -> ApiResult<()> {
+    if request.expected_version < 0 {
+        return Err(ApiError::validation(
+            "expected_version must be zero or greater",
+        ));
     }
+    let catalog_provider_id = request
+        .catalog_provider_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let catalog_model_id = request
+        .catalog_model_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    for (value, field) in [
+        (catalog_provider_id.as_deref(), "catalog_provider_id"),
+        (catalog_model_id.as_deref(), "catalog_model_id"),
+    ] {
+        if let Some(value) = value {
+            validate_required_identifier(value, field)?;
+        }
+    }
+    if catalog_model_id.is_some() && !matches!(scope, PricingAdjustmentScope::Agent(_)) {
+        return Err(ApiError::validation(
+            "catalog_model_id can only be pinned on an agent",
+        ));
+    }
+    if catalog_model_id.is_some() && catalog_provider_id.is_none() {
+        return Err(ApiError::validation(
+            "catalog_model_id requires catalog_provider_id",
+        ));
+    }
+    if let Some(provider_id) = catalog_provider_id.as_deref() {
+        let listed =
+            pricing_auto::catalog_lists(&state.db, provider_id, catalog_model_id.as_deref())
+                .await
+                .map_err(|_| ApiError::internal("pricing catalog is temporarily unavailable"))?;
+        if !listed {
+            return Err(ApiError::validation(
+                "the pinned models.dev provider/model is not in the current catalog",
+            ));
+        }
+    }
+    let (mode, discount_bps, fixed_rates) = match request.mode {
+        PricingMode::List => {
+            if request.discount_percent.is_some() || request.fixed_rates.is_some() {
+                return Err(ApiError::validation(
+                    "list pricing takes neither discount_percent nor fixed_rates",
+                ));
+            }
+            (
+                PricingAdjustmentMode::List,
+                None,
+                db::RateBuckets::default(),
+            )
+        }
+        PricingMode::Discount => {
+            if request.fixed_rates.is_some() {
+                return Err(ApiError::validation(
+                    "discount pricing does not take fixed_rates",
+                ));
+            }
+            let percent = request.discount_percent.as_deref().ok_or_else(|| {
+                ApiError::validation("discount pricing requires discount_percent")
+            })?;
+            (
+                PricingAdjustmentMode::Discount,
+                Some(parse_discount_percent(percent)?),
+                db::RateBuckets::default(),
+            )
+        }
+        PricingMode::Fixed => {
+            if request.discount_percent.is_some() {
+                return Err(ApiError::validation(
+                    "fixed pricing does not take discount_percent",
+                ));
+            }
+            let rates = request
+                .fixed_rates
+                .as_ref()
+                .ok_or_else(|| ApiError::validation("fixed pricing requires fixed_rates"))?;
+            let rates = db_fixed_rates(rates)?;
+            if [
+                rates.input,
+                rates.output,
+                rates.cache_read,
+                rates.cache_write,
+            ]
+            .iter()
+            .all(Option::is_none)
+            {
+                return Err(ApiError::validation(
+                    "fixed pricing requires at least one rate",
+                ));
+            }
+            (PricingAdjustmentMode::Fixed, None, rates)
+        }
+    };
+    PricingSubjectRepo::upsert_pricing_adjustment(
+        &*state.db,
+        db::UpsertPricingAdjustment {
+            owner_user_id: user_id.to_owned(),
+            scope,
+            mode,
+            discount_bps,
+            fixed_rates,
+            catalog_provider_id,
+            catalog_model_id,
+            expected_version: request.expected_version,
+            now: now_rfc3339(),
+        },
+    )
+    .await
+    .map_err(map_db_mutation_error)?;
+    Ok(())
 }
 
-fn identity_json(identity: &pricing::PricingSubjectIdentity) -> Value {
-    json!({
-        "subject_kind": identity.subject_kind.clone(),
-        "provider_kind": identity.provider_kind.clone(),
-        "credential_method": identity.credential_method.clone(),
-        "endpoint_class": identity.endpoint_class.clone(),
-        "runtime_fingerprint": identity.runtime_fingerprint.clone(),
-        "schema_revision": identity.schema_revision.clone(),
-    })
+async fn delete_adjustment(
+    state: &AppState,
+    user_id: &str,
+    scope: &PricingAdjustmentScope,
+    version: i64,
+) -> ApiResult<()> {
+    PricingSubjectRepo::delete_pricing_adjustment(&*state.db, user_id, scope, version)
+        .await
+        .map_err(map_db_mutation_error)
 }
 
 // -------------------------------------------------------------------------
@@ -1539,15 +1170,6 @@ fn api_rate_buckets(rates: db::RateBuckets) -> ApiResult<ApiRateBuckets> {
     })
 }
 
-fn api_rate_buckets_from_service(rates: EventBucketRates) -> ApiResult<ApiRateBuckets> {
-    Ok(ApiRateBuckets {
-        input: rates.input.map(service_rate_amount).transpose()?,
-        output: rates.output.map(service_rate_amount).transpose()?,
-        cache_read: rates.cache_read.map(service_rate_amount).transpose()?,
-        cache_write: rates.cache_write.map(service_rate_amount).transpose()?,
-    })
-}
-
 fn api_rate_amount(value: Option<i64>) -> ApiResult<Option<RateAmount>> {
     value
         .map(|value| {
@@ -1559,13 +1181,6 @@ fn api_rate_amount(value: Option<i64>) -> ApiResult<Option<RateAmount>> {
             })
         })
         .transpose()
-}
-
-fn service_rate_amount(rate: NanoUsdPerMillion) -> ApiResult<RateAmount> {
-    Ok(RateAmount {
-        currency: "USD".to_owned(),
-        decimal_per_million: rate.to_usd_decimal_per_million(),
-    })
 }
 
 fn service_rate_buckets(rates: &ApiRateBuckets) -> ApiResult<EventBucketRates> {
@@ -2176,32 +1791,6 @@ fn map_catalog_repository_error(error: services::pricing::CatalogRepositoryError
     }
 }
 
-fn map_binding_mutation_error(error: services::pricing::CatalogRepositoryError) -> ApiError {
-    match error {
-        services::pricing::CatalogRepositoryError::Conflict(message) => {
-            let lower = message.to_ascii_lowercase();
-            if lower.contains("version conflict")
-                || lower.contains("idempotency")
-                || lower.contains("changed while")
-            {
-                ApiError::conflict_with_code(
-                    if lower.contains("idempotency") {
-                        "idempotency_conflict"
-                    } else {
-                        "pricing.version_conflict"
-                    },
-                    "pricing configuration changed before the operation completed",
-                )
-            } else {
-                ApiError::validation("pricing binding request is invalid")
-            }
-        }
-        services::pricing::CatalogRepositoryError::Unavailable(_) => {
-            ApiError::internal("pricing configuration is temporarily unavailable")
-        }
-    }
-}
-
 fn map_db_read_error(error: DbError) -> ApiError {
     match error {
         DbError::InvalidCursor => ApiError::validation("cursor is invalid"),
@@ -2255,6 +1844,7 @@ mod tests {
 
     #[test]
     fn endpoint_identity_keeps_scheme_port_and_custom_path_distinct() {
+        use pricing_auto::canonical_endpoint_class;
         assert_eq!(
             canonical_endpoint_class("HTTPS://API.OpenAI.com/v1/").as_deref(),
             Some("https://api.openai.com/v1")
@@ -2302,8 +1892,8 @@ mod tests {
             ),
             path: Some("https://user:sentinel-secret@example.test/bin?token=sentinel".to_owned()),
         };
-        let identity = cli_identity("shell", &detected);
-        let persisted = identity_json(&identity).to_string();
+        let identity = pricing_auto::cli_identity("shell", Some(&detected));
+        let persisted = format!("{identity:?}");
         assert!(!persisted.contains("sentinel"));
         assert!(!persisted.contains("example.test"));
         assert!(identity
@@ -2311,14 +1901,8 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("sha256:")));
 
-        let response = serde_json::to_string(&ProviderPricing {
-            subject_id: "subject-1".to_owned(),
-            subject_revision_digest: pricing::pricing_subject_revision_digest(&identity),
-            version: 1,
-            bindings: Vec::new(),
-        })
-        .expect("pricing response serializes");
-        assert!(!response.contains("sentinel"));
-        assert!(!response.contains("example.test"));
+        let digest = pricing::pricing_subject_revision_digest(&identity);
+        assert!(!digest.contains("sentinel"));
+        assert!(!digest.contains("example.test"));
     }
 }

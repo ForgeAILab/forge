@@ -184,6 +184,20 @@ pub struct ProviderEntryAgentRef {
     pub runtime: String,
 }
 
+/// Last observed provider-call health. Error text is a bounded redacted reason;
+/// no response bodies or credentials are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProviderEntryHealthResponse {
+    pub status: String,
+    #[ts(type = "number")]
+    pub consecutive_failures: i64,
+    pub last_error_kind: Option<String>,
+    pub last_error_message: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub backoff_until: Option<String>,
+}
+
 /// One configured provider entry: a credentialed connection a user added.
 /// Multiple entries of the same provider type may coexist.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -201,6 +215,7 @@ pub struct ProviderEntryResponse {
     pub provider_account_id: Option<String>,
     pub used_by: Vec<ProviderEntryAgentRef>,
     pub last_used_at: Option<String>,
+    pub health: Option<ProviderEntryHealthResponse>,
     #[ts(type = "number")]
     pub version: i64,
     pub created_at: String,

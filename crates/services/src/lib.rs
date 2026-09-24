@@ -54,6 +54,7 @@ pub mod orchestration_authorization;
 pub mod plan_artifact;
 pub mod pr_service;
 pub mod pricing;
+pub mod pricing_auto;
 pub mod pricing_db;
 pub mod product_genesis;
 pub mod project_agent_actions;
@@ -75,6 +76,7 @@ pub mod project_runtime;
 pub mod project_settings;
 pub mod prompt_preview;
 pub mod provider_authorization;
+pub mod provider_health;
 pub mod recovery;
 pub mod runtime;
 pub mod shared_media_cleanup;
@@ -609,3 +611,7 @@ mod execution_admission_error_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "pricing_auto_tests.rs"]
+mod pricing_auto_tests;

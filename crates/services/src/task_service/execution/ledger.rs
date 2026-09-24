@@ -235,47 +235,34 @@ async fn resolve_price_identity(
     };
     let (provider_entry, daemon_id) = subject_ref(candidate, snapshot, agent);
     let executor_type = candidate.executor_type.to_string();
-    let mut resolved = db::PricingSubjectRepo::resolve_active_pricing_subject_binding_in_tx(
+    // Provision the subject and materialize the binding this agent resolves:
+    // the models.dev row for the runtime model under the effective
+    // adjustment (agent, else provider entry / CLI runtime, else list).
+    let scope_key = crate::pricing_auto::prepare_price_in_tx(
+        db,
+        tx,
+        owner_user_id,
+        &crate::pricing_auto::SubjectRef {
+            provider_entry_id: provider_entry.clone(),
+            daemon_id: daemon_id.clone(),
+            executor_type: Some(executor_type.clone()),
+        },
+        Some(agent.id.as_str()),
+        runtime_model,
+        admitted_at,
+    )
+    .await?;
+    let resolved = db::PricingSubjectRepo::resolve_active_pricing_subject_binding_in_tx(
         db,
         tx,
         owner_user_id,
         provider_entry.as_deref(),
         daemon_id.as_deref(),
         Some(executor_type.as_str()),
+        &scope_key,
         runtime_model,
     )
     .await?;
-    // Reviewed provider identities receive their initial exact catalog alias
-    // at admission time, after the subject/revision has been resolved.  The
-    // helper is deliberately bounded to the four built-in provider endpoint
-    // identities; custom, subscription, and CLI subjects remain explicit.
-    let current_subject_id = resolved.as_ref().map(|current| current.subject.id.clone());
-    if let Some(current_subject_id) = current_subject_id {
-        let admitted_at_time = chrono::DateTime::parse_from_rfc3339(admitted_at)
-            .map(|value| value.with_timezone(&chrono::Utc).into())
-            .unwrap_or_else(|_| SystemTime::now());
-        if crate::pricing_db::ensure_reviewed_provider_binding_in_tx(
-            db,
-            tx,
-            &current_subject_id,
-            runtime_model,
-            admitted_at_time,
-        )
-        .await
-        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
-        {
-            resolved = db::PricingSubjectRepo::resolve_active_pricing_subject_binding_in_tx(
-                db,
-                tx,
-                owner_user_id,
-                provider_entry.as_deref(),
-                daemon_id.as_deref(),
-                Some(executor_type.as_str()),
-                runtime_model,
-            )
-            .await?;
-        }
-    }
     let Some(resolved) = resolved else {
         return Ok(PriceIdentity {
             status: PricingSelectionStatus::Unpriced,

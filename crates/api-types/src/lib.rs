@@ -283,6 +283,7 @@ fn export_typescript() {
     AgentProviderCapability::export().expect("export AgentProviderCapability");
     AgentProviderCapabilitiesResponse::export().expect("export AgentProviderCapabilitiesResponse");
     ProviderEntryAgentRef::export().expect("export ProviderEntryAgentRef");
+    ProviderEntryHealthResponse::export().expect("export ProviderEntryHealthResponse");
     ProviderEntryResponse::export().expect("export ProviderEntryResponse");
     CliRuntimeEntryResponse::export().expect("export CliRuntimeEntryResponse");
     ProviderEntriesResponse::export().expect("export ProviderEntriesResponse");
@@ -617,11 +618,14 @@ fn export_typescript() {
     CatalogModelRate::export().expect("export CatalogModelRate");
     PricingCatalogModelsQuery::export().expect("export PricingCatalogModelsQuery");
     PricingCatalogModelsResponse::export().expect("export PricingCatalogModelsResponse");
-    PricingBindingSourceKind::export().expect("export PricingBindingSourceKind");
-    PricingBinding::export().expect("export PricingBinding");
-    ProviderPricing::export().expect("export ProviderPricing");
-    ReplaceProviderPricingBinding::export().expect("export ReplaceProviderPricingBinding");
-    ReplaceProviderPricingRequest::export().expect("export ReplaceProviderPricingRequest");
+    PricingMode::export().expect("export PricingMode");
+    PricingSettings::export().expect("export PricingSettings");
+    SubjectPricingResponse::export().expect("export SubjectPricingResponse");
+    UpdatePricingSettingsRequest::export().expect("export UpdatePricingSettingsRequest");
+    DeletePricingSettingsQuery::export().expect("export DeletePricingSettingsQuery");
+    PricingAdjustmentSource::export().expect("export PricingAdjustmentSource");
+    PricingResolutionStatus::export().expect("export PricingResolutionStatus");
+    AgentPricing::export().expect("export AgentPricing");
     CreateCostEstimationPreviewRequest::export()
         .expect("export CreateCostEstimationPreviewRequest");
     CostEstimationPreview::export().expect("export CostEstimationPreview");

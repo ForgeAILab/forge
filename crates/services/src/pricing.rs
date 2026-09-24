@@ -113,69 +113,6 @@ pub const COST_ROUNDING_REVISION: &str = "cost-rounding-v1";
 /// Revision of the four-bucket token-cost formula.
 pub const COST_FORMULA_REVISION: &str = "token-cost-v1";
 
-/// Credential class used by a reviewed built-in provider alias.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltInProviderAuthClass {
-    /// A direct API-key-backed public provider endpoint.
-    ApiKey,
-    /// The direct Gemini endpoint may use an API key or reviewed OAuth flow.
-    ApiKeyOrOauth,
-}
-
-/// An exact, reviewed mapping from a Forge provider subject to models.dev.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BuiltInProviderAlias {
-    /// Stable Forge subject kind, not a mutable display label.
-    pub forge_subject: &'static str,
-    /// Canonical endpoint class required for this mapping. Scheme, host, and
-    /// provider API path are all significant; custom paths do not alias.
-    pub endpoint_host: &'static str,
-    /// Credential class required for this mapping.
-    pub auth_class: BuiltInProviderAuthClass,
-    /// Top-level provider ID in models.dev `/api.json`.
-    pub models_dev_provider_id: &'static str,
-}
-
-/// Direct OpenAI Platform API → models.dev `openai`.
-pub const BUILT_IN_ALIAS_OPENAI: BuiltInProviderAlias = BuiltInProviderAlias {
-    forge_subject: "direct_openai_platform_api",
-    endpoint_host: "https://api.openai.com/v1",
-    auth_class: BuiltInProviderAuthClass::ApiKey,
-    models_dev_provider_id: "openai",
-};
-
-/// Direct xAI API → models.dev `xai`.
-pub const BUILT_IN_ALIAS_XAI: BuiltInProviderAlias = BuiltInProviderAlias {
-    forge_subject: "direct_xai_api",
-    endpoint_host: "https://api.x.ai/v1",
-    auth_class: BuiltInProviderAuthClass::ApiKey,
-    models_dev_provider_id: "xai",
-};
-
-/// Direct Gemini API → models.dev `google`.
-pub const BUILT_IN_ALIAS_GEMINI: BuiltInProviderAlias = BuiltInProviderAlias {
-    forge_subject: "direct_gemini_api",
-    endpoint_host: "https://generativelanguage.googleapis.com/v1beta",
-    auth_class: BuiltInProviderAuthClass::ApiKeyOrOauth,
-    models_dev_provider_id: "google",
-};
-
-/// Direct OpenRouter API → models.dev `openrouter`.
-pub const BUILT_IN_ALIAS_OPENROUTER: BuiltInProviderAlias = BuiltInProviderAlias {
-    forge_subject: "direct_openrouter_api",
-    endpoint_host: "https://openrouter.ai/api/v1",
-    auth_class: BuiltInProviderAuthClass::ApiKey,
-    models_dev_provider_id: "openrouter",
-};
-
-/// The reviewed aliases, in stable order for deterministic fixtures and UI.
-pub const BUILT_IN_PROVIDER_ALIASES: [BuiltInProviderAlias; 4] = [
-    BUILT_IN_ALIAS_OPENAI,
-    BUILT_IN_ALIAS_XAI,
-    BUILT_IN_ALIAS_GEMINI,
-    BUILT_IN_ALIAS_OPENROUTER,
-];
-
 /// Non-secret billable identity used to version a provider entry or CLI
 /// runtime.  Labels and credentials are intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,32 +141,6 @@ pub fn pricing_subject_revision_digest(identity: &PricingSubjectIdentity) -> Str
         append_option_str(encoded, identity.runtime_fingerprint.as_deref());
         append_str(encoded, &identity.schema_revision);
     })
-}
-
-/// Returns a reviewed built-in models.dev alias only for exact endpoint and
-/// credential classes.  Custom URLs, OpenAI-compatible entries, subscriptions
-/// and CLI runtimes intentionally return `None`.
-pub fn reviewed_provider_alias(identity: &PricingSubjectIdentity) -> Option<BuiltInProviderAlias> {
-    if identity.subject_kind != "provider_entry" {
-        return None;
-    }
-    let expected = match identity.provider_kind.as_str() {
-        "openai" => BUILT_IN_ALIAS_OPENAI,
-        "xai" => BUILT_IN_ALIAS_XAI,
-        "gemini" => BUILT_IN_ALIAS_GEMINI,
-        "openrouter" => BUILT_IN_ALIAS_OPENROUTER,
-        _ => return None,
-    };
-    if identity.endpoint_class != expected.endpoint_host {
-        return None;
-    }
-    let auth_matches = match expected.auth_class {
-        BuiltInProviderAuthClass::ApiKey => identity.credential_method == "api_key",
-        BuiltInProviderAuthClass::ApiKeyOrOauth => {
-            matches!(identity.credential_method.as_str(), "api_key" | "oauth")
-        }
-    };
-    auth_matches.then_some(expected)
 }
 
 /// A non-negative amount represented as integer nano-USD.
@@ -1005,63 +916,6 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_provider_aliases_are_exact_and_distinct() {
-        assert_eq!(BUILT_IN_PROVIDER_ALIASES.len(), 4);
-        assert_eq!(BUILT_IN_ALIAS_OPENAI.models_dev_provider_id, "openai");
-        assert_eq!(
-            BUILT_IN_ALIAS_OPENAI.endpoint_host,
-            "https://api.openai.com/v1"
-        );
-        assert_eq!(BUILT_IN_ALIAS_XAI.models_dev_provider_id, "xai");
-        assert_eq!(BUILT_IN_ALIAS_XAI.endpoint_host, "https://api.x.ai/v1");
-        assert_eq!(BUILT_IN_ALIAS_GEMINI.models_dev_provider_id, "google");
-        assert_eq!(
-            BUILT_IN_ALIAS_GEMINI.endpoint_host,
-            "https://generativelanguage.googleapis.com/v1beta"
-        );
-        assert_eq!(
-            BUILT_IN_ALIAS_OPENROUTER.models_dev_provider_id,
-            "openrouter"
-        );
-        assert_eq!(
-            BUILT_IN_ALIAS_OPENROUTER.endpoint_host,
-            "https://openrouter.ai/api/v1"
-        );
-
-        let provider_ids: std::collections::BTreeSet<_> = BUILT_IN_PROVIDER_ALIASES
-            .iter()
-            .map(|alias| alias.models_dev_provider_id)
-            .collect();
-        assert_eq!(provider_ids.len(), BUILT_IN_PROVIDER_ALIASES.len());
-
-        let openai = PricingSubjectIdentity {
-            subject_kind: "provider_entry".to_owned(),
-            provider_kind: "openai".to_owned(),
-            credential_method: "api_key".to_owned(),
-            endpoint_class: "https://api.openai.com/v1".to_owned(),
-            runtime_fingerprint: None,
-            schema_revision: "provider-v1".to_owned(),
-        };
-        assert_eq!(
-            reviewed_provider_alias(&openai).map(|alias| alias.models_dev_provider_id),
-            Some("openai")
-        );
-
-        let mut custom_endpoint = openai.clone();
-        custom_endpoint.endpoint_class = "https://api.openai.com/v2".to_owned();
-        assert!(reviewed_provider_alias(&custom_endpoint).is_none());
-
-        let mut subscription = openai.clone();
-        subscription.subject_kind = "cli_runtime".to_owned();
-        subscription.credential_method = "oauth_subscription".to_owned();
-        assert!(reviewed_provider_alias(&subscription).is_none());
-
-        let mut cli_runtime = openai;
-        cli_runtime.subject_kind = "cli_runtime".to_owned();
-        assert!(reviewed_provider_alias(&cli_runtime).is_none());
-    }
-
-    #[test]
     fn pricing_subject_revision_digest_is_injective_for_delimiter_values() {
         let left = PricingSubjectIdentity {
             subject_kind: "provider_entry|nested".to_owned(),
@@ -1086,16 +940,6 @@ mod tests {
         assert_ne!(
             pricing_subject_revision_digest(&option_left),
             pricing_subject_revision_digest(&option_right)
-        );
-    }
-
-    #[test]
-    fn binding_revision_digest_is_injective_for_delimiter_values() {
-        let left = DesiredPricingBinding::manual("model|source", EventBucketRates::default());
-        let right = DesiredPricingBinding::manual("model", EventBucketRates::default());
-        assert_ne!(
-            binding_revision_digest(&left),
-            binding_revision_digest(&right)
         );
     }
 
@@ -3067,722 +2911,12 @@ impl PricingSourceKind {
     }
 }
 
-/// Lifecycle of an exact pricing binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PricingBindingState {
-    /// Used for future admissions.
-    Active,
-    /// Retained for historical provenance but not future resolution.
-    Retired,
-}
-
-/// An exact catalog rate reference attached to a runtime model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatalogRateBinding {
-    /// Immutable binding row ID.
-    pub id: String,
-    /// Exact provider ID from `/api.json`.
-    pub provider_id: String,
-    /// Exact provider-scoped model ID from `/api.json`.
-    pub model_id: String,
-    /// Immutable normalized rate-revision ID.
-    pub rate_revision_id: String,
-    /// Immutable catalog snapshot ID.
-    pub snapshot_id: String,
-    /// Runtime model identifier; compared byte-for-byte.
-    pub runtime_model: String,
-    /// Normalized base rates.
-    pub rates: EventBucketRates,
-    /// Exact tiers retained from the source row.
-    pub tiers: Vec<ContextTier>,
-    /// Legacy threshold-unknown source values, if any.
-    pub legacy_context_over_200k: Option<LegacyContextRate>,
-    /// Catalog status frozen at selection time when known.
-    pub catalog_freshness: CatalogFreshness,
-    /// Binding lifecycle state.
-    pub state: PricingBindingState,
-}
-
-impl CatalogRateBinding {
-    /// Returns whether this binding is an exact runtime-model match.
-    pub fn matches_runtime_model(&self, runtime_model: &str) -> bool {
-        self.state == PricingBindingState::Active && self.runtime_model == runtime_model
-    }
-}
-
-/// An immutable user-entered rate revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManualRateOverride {
-    /// Immutable binding/revision ID.
-    pub id: String,
-    /// Immutable pricing-subject revision digest.
-    pub subject_revision_digest: String,
-    /// Runtime model identifier; compared byte-for-byte.
-    pub runtime_model: String,
-    /// Immutable manual rate revision ID.
-    pub rate_revision_id: String,
-    /// User-entered rates, preserving absent versus explicit zero.
-    pub rates: EventBucketRates,
-    /// Time from which this revision may be admitted.
-    pub effective_at: SystemTime,
-    /// Retirement time, if this revision is no longer used for admissions.
-    pub retired_at: Option<SystemTime>,
-}
-
-impl ManualRateOverride {
-    /// Returns whether this override is active for the exact subject/model.
-    pub fn matches(&self, subject_revision_digest: &str, runtime_model: &str) -> bool {
-        self.retired_at.is_none()
-            && self.subject_revision_digest == subject_revision_digest
-            && self.runtime_model == runtime_model
-    }
-}
-
-/// One source of an exact binding.  Manual and catalog entries are kept as
-/// distinct variants so resolution can enforce manual-over-catalog precedence
-/// even when a caller is reconciling old and new configuration rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PricingBindingSource {
-    /// Exact models.dev provider/model reference.
-    ModelsDev(CatalogRateBinding),
-    /// Exact user override.
-    Manual(ManualRateOverride),
-}
-
-impl PricingBindingSource {
-    /// Returns the source kind.
-    pub const fn kind(&self) -> PricingSourceKind {
-        match self {
-            Self::ModelsDev(_) => PricingSourceKind::ModelsDevCatalog,
-            Self::Manual(_) => PricingSourceKind::ManualOverride,
-        }
-    }
-
-    /// Returns the exact runtime model.
-    pub fn runtime_model(&self) -> &str {
-        match self {
-            Self::ModelsDev(binding) => &binding.runtime_model,
-            Self::Manual(override_) => &override_.runtime_model,
-        }
-    }
-
-    /// Returns whether the source is active for a subject/model.
-    pub fn is_active_for(&self, subject_revision_digest: &str, runtime_model: &str) -> bool {
-        match self {
-            Self::ModelsDev(binding) => {
-                binding.state == PricingBindingState::Active
-                    && binding.runtime_model == runtime_model
-            }
-            Self::Manual(override_) => override_.matches(subject_revision_digest, runtime_model),
-        }
-    }
-}
-
-/// Exact binding/override configuration for one pricing subject revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PricingConfiguration {
-    /// Stable provider-entry or CLI-runtime subject ID.
-    pub subject_id: String,
-    /// Immutable non-secret subject revision digest.
-    pub subject_revision_digest: String,
-    /// Optimistic configuration version.
-    pub version: u64,
-    /// Active and retired immutable source rows.
-    pub bindings: Vec<PricingBindingSource>,
-    /// Last completed mutation key, for idempotent retries.
-    pub last_idempotency_key: Option<String>,
-    /// Digest of the last desired binding set.
-    pub last_update_digest: Option<String>,
-}
-
-impl PricingConfiguration {
-    /// Creates an empty configuration for a subject revision.
-    pub fn new(subject_id: impl Into<String>, subject_revision_digest: impl Into<String>) -> Self {
-        Self {
-            subject_id: subject_id.into(),
-            subject_revision_digest: subject_revision_digest.into(),
-            version: 1,
-            bindings: Vec::new(),
-            last_idempotency_key: None,
-            last_update_digest: None,
-        }
-    }
-
-    /// Resolves manual first, then catalog, using exact runtime-model equality.
-    pub fn resolve(&self, runtime_model: &str) -> Option<&PricingBindingSource> {
-        self.bindings
-            .iter()
-            .find(|binding| {
-                matches!(binding, PricingBindingSource::Manual(override_)
-                    if override_.matches(&self.subject_revision_digest, runtime_model))
-            })
-            .or_else(|| {
-                self.bindings.iter().find(|binding| {
-                    matches!(binding, PricingBindingSource::ModelsDev(binding)
-                        if binding.matches_runtime_model(runtime_model))
-                })
-            })
-    }
-
-    /// Returns active sources in deterministic manual-then-catalog order.
-    pub fn active_for(&self, runtime_model: &str) -> Vec<&PricingBindingSource> {
-        let mut manual = Vec::new();
-        let mut catalog = Vec::new();
-        for binding in &self.bindings {
-            if !binding.is_active_for(&self.subject_revision_digest, runtime_model) {
-                continue;
-            }
-            match binding {
-                PricingBindingSource::Manual(_) => manual.push(binding),
-                PricingBindingSource::ModelsDev(_) => catalog.push(binding),
-            }
-        }
-        manual.extend(catalog);
-        manual
-    }
-
-    /// Replaces the complete desired exact binding set with optimistic CAS.
-    /// Changed manual values produce a new immutable revision; rows omitted
-    /// from the desired set are retired rather than deleted.
-    pub fn replace(
-        &mut self,
-        request: ReplacePricingRequest,
-        now: SystemTime,
-    ) -> Result<BindingMutationResult, PricingBindingError> {
-        validate_replace_request(self, &request)?;
-        let desired_digest = desired_binding_set_digest(&request.bindings);
-        if self.last_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
-            if self.last_update_digest.as_deref() == Some(desired_digest.as_str()) {
-                return Ok(BindingMutationResult {
-                    configuration: self.clone(),
-                    changed: false,
-                });
-            }
-            return Err(PricingBindingError::IdempotencyConflict);
-        }
-        if request.expected_version != self.version {
-            return Err(PricingBindingError::VersionConflict {
-                expected: request.expected_version,
-                actual: self.version,
-            });
-        }
-
-        let mut changed = false;
-        let mut desired_keys = BTreeSet::new();
-        for desired in &request.bindings {
-            let key = (desired.source_kind(), desired.runtime_model().to_owned());
-            desired_keys.insert(key.clone());
-            if let Some(existing) = self.bindings.iter().find(|binding| {
-                binding_key(binding) == key
-                    && binding_matches_desired(binding, desired, &self.subject_revision_digest)
-            }) {
-                if binding_is_active(existing) {
-                    continue;
-                }
-            }
-            // Retire any older row for the same source/model before creating
-            // the new immutable revision.
-            for binding in &mut self.bindings {
-                if binding_key(binding) == key && binding_is_active(binding) {
-                    retire_binding_source(binding, now);
-                }
-            }
-            self.bindings.push(desired.to_source(
-                &self.subject_id,
-                &self.subject_revision_digest,
-                now,
-            ));
-            changed = true;
-        }
-        for binding in &mut self.bindings {
-            if binding_is_active(binding) && !desired_keys.contains(&binding_key(binding)) {
-                retire_binding_source(binding, now);
-                changed = true;
-            }
-        }
-        if changed {
-            self.version = self.version.saturating_add(1);
-        }
-        self.last_idempotency_key = Some(request.idempotency_key);
-        self.last_update_digest = Some(desired_digest);
-        Ok(BindingMutationResult {
-            configuration: self.clone(),
-            changed,
-        })
-    }
-
-    /// Retires every active exact source for one runtime model.
-    pub fn retire_binding(
-        &mut self,
-        runtime_model: &str,
-        expected_version: u64,
-        idempotency_key: impl Into<String>,
-        now: SystemTime,
-    ) -> Result<BindingMutationResult, PricingBindingError> {
-        let request = ReplacePricingRequest {
-            expected_version,
-            idempotency_key: idempotency_key.into(),
-            subject_revision_digest: self.subject_revision_digest.clone(),
-            bindings: self
-                .bindings
-                .iter()
-                .filter(|binding| {
-                    binding_is_active(binding) && binding.runtime_model() != runtime_model
-                })
-                .map(DesiredPricingBinding::from_source)
-                .collect(),
-        };
-        self.replace(request, now)
-    }
-}
-
-/// A complete replacement request for one subject's exact bindings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplacePricingRequest {
-    /// Optimistic version expected by the caller.
-    pub expected_version: u64,
-    /// Stable retry/idempotency key.
-    pub idempotency_key: String,
-    /// Exact subject revision the bindings belong to.
-    pub subject_revision_digest: String,
-    /// Complete desired set. Omitted active rows are retired.
-    pub bindings: Vec<DesiredPricingBinding>,
-}
-
-/// One desired exact catalog or manual binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DesiredPricingBinding {
-    /// Exact runtime model identifier.
-    pub runtime_model: String,
-    /// Source and immutable rate data.
-    pub source: DesiredPricingSource,
-}
-
-impl DesiredPricingBinding {
-    /// Creates a desired manual override.
-    pub fn manual(runtime_model: impl Into<String>, rates: EventBucketRates) -> Self {
-        Self {
-            runtime_model: runtime_model.into(),
-            source: DesiredPricingSource::Manual { rates },
-        }
-    }
-
-    /// Creates a desired exact catalog binding.
-    #[allow(clippy::too_many_arguments)]
-    pub fn models_dev(
-        runtime_model: impl Into<String>,
-        provider_id: impl Into<String>,
-        model_id: impl Into<String>,
-        snapshot_id: impl Into<String>,
-        rate_revision_id: impl Into<String>,
-        rates: EventBucketRates,
-        tiers: Vec<ContextTier>,
-        legacy_context_over_200k: Option<LegacyContextRate>,
-        catalog_freshness: CatalogFreshness,
-    ) -> Self {
-        Self {
-            runtime_model: runtime_model.into(),
-            source: DesiredPricingSource::ModelsDev {
-                provider_id: provider_id.into(),
-                model_id: model_id.into(),
-                snapshot_id: snapshot_id.into(),
-                rate_revision_id: rate_revision_id.into(),
-                rates,
-                tiers,
-                legacy_context_over_200k,
-                catalog_freshness,
-            },
-        }
-    }
-
-    fn runtime_model(&self) -> &str {
-        &self.runtime_model
-    }
-
-    fn source_kind(&self) -> PricingSourceKind {
-        match &self.source {
-            DesiredPricingSource::ModelsDev { .. } => PricingSourceKind::ModelsDevCatalog,
-            DesiredPricingSource::Manual { .. } => PricingSourceKind::ManualOverride,
-        }
-    }
-
-    fn to_source(
-        &self,
-        subject_id: &str,
-        subject_revision_digest: &str,
-        now: SystemTime,
-    ) -> PricingBindingSource {
-        match &self.source {
-            DesiredPricingSource::ModelsDev {
-                provider_id,
-                model_id,
-                snapshot_id,
-                rate_revision_id,
-                rates,
-                tiers,
-                legacy_context_over_200k,
-                catalog_freshness,
-            } => PricingBindingSource::ModelsDev(CatalogRateBinding {
-                id: binding_id(
-                    subject_id,
-                    subject_revision_digest,
-                    &self.runtime_model,
-                    &self.source_kind(),
-                    rate_revision_id,
-                    now,
-                ),
-                provider_id: provider_id.clone(),
-                model_id: model_id.clone(),
-                rate_revision_id: rate_revision_id.clone(),
-                snapshot_id: snapshot_id.clone(),
-                runtime_model: self.runtime_model.clone(),
-                rates: *rates,
-                tiers: tiers.clone(),
-                legacy_context_over_200k: legacy_context_over_200k.clone(),
-                catalog_freshness: *catalog_freshness,
-                state: PricingBindingState::Active,
-            }),
-            DesiredPricingSource::Manual { rates } => {
-                let rate_revision_id = manual_rate_revision_id(
-                    subject_id,
-                    subject_revision_digest,
-                    &self.runtime_model,
-                    *rates,
-                    now,
-                );
-                PricingBindingSource::Manual(ManualRateOverride {
-                    id: binding_id(
-                        subject_id,
-                        subject_revision_digest,
-                        &self.runtime_model,
-                        &self.source_kind(),
-                        &rate_revision_id,
-                        now,
-                    ),
-                    subject_revision_digest: subject_revision_digest.to_owned(),
-                    runtime_model: self.runtime_model.clone(),
-                    rate_revision_id,
-                    rates: *rates,
-                    effective_at: now,
-                    retired_at: None,
-                })
-            }
-        }
-    }
-
-    fn from_source(source: &PricingBindingSource) -> Self {
-        match source {
-            PricingBindingSource::ModelsDev(binding) => Self {
-                runtime_model: binding.runtime_model.clone(),
-                source: DesiredPricingSource::ModelsDev {
-                    provider_id: binding.provider_id.clone(),
-                    model_id: binding.model_id.clone(),
-                    snapshot_id: binding.snapshot_id.clone(),
-                    rate_revision_id: binding.rate_revision_id.clone(),
-                    rates: binding.rates,
-                    tiers: binding.tiers.clone(),
-                    legacy_context_over_200k: binding.legacy_context_over_200k.clone(),
-                    catalog_freshness: binding.catalog_freshness,
-                },
-            },
-            PricingBindingSource::Manual(override_) => {
-                Self::manual(override_.runtime_model.clone(), override_.rates)
-            }
-        }
-    }
-}
-
-/// Source data in a replacement request.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DesiredPricingSource {
-    /// Exact models.dev row and snapshot.
-    ModelsDev {
-        provider_id: String,
-        model_id: String,
-        snapshot_id: String,
-        rate_revision_id: String,
-        rates: EventBucketRates,
-        tiers: Vec<ContextTier>,
-        legacy_context_over_200k: Option<LegacyContextRate>,
-        catalog_freshness: CatalogFreshness,
-    },
-    /// User-entered fixed-point rates.
-    Manual { rates: EventBucketRates },
-}
-
-/// Computes the canonical digest for one desired immutable binding revision.
-///
-/// This is also useful to persistence adapters that need a stable identity
-/// for one binding without reimplementing the domain encoding.
-pub fn binding_revision_digest(binding: &DesiredPricingBinding) -> String {
-    let key = desired_binding_digest_key(binding);
-    canonical_hash("binding-revision-v2", |encoded| {
-        append_len_prefixed(encoded, &key);
-    })
-}
-
-/// Result of an optimistic binding mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindingMutationResult {
-    /// Current configuration after the mutation.
-    pub configuration: PricingConfiguration,
-    /// Whether any binding/revision/state changed.
-    pub changed: bool,
-}
-
-/// Validation and optimistic-concurrency errors for pricing configuration.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PricingBindingError {
-    #[error("pricing subject revision digest is empty")]
-    EmptySubjectRevision,
-    #[error("pricing binding idempotency key is empty or too long")]
-    InvalidIdempotencyKey,
-    #[error("pricing binding request targets a different subject revision")]
-    SubjectRevisionMismatch,
-    #[error("pricing binding version conflict: expected {expected}, actual {actual}")]
-    VersionConflict { expected: u64, actual: u64 },
-    #[error("pricing binding idempotency key was reused with a different payload")]
-    IdempotencyConflict,
-    #[error("pricing binding runtime model is empty")]
-    EmptyRuntimeModel,
-    #[error("pricing binding contains a duplicate exact source/model")]
-    DuplicateRuntimeModel,
-    #[error("pricing catalog binding has an empty exact identifier")]
-    InvalidCatalogReference,
-    #[error("pricing binding contains a rate above the $1,000,000-per-million plausibility bound")]
-    ImplausiblyLargeRate,
-}
-
-fn validate_replace_request(
-    configuration: &PricingConfiguration,
-    request: &ReplacePricingRequest,
-) -> Result<(), PricingBindingError> {
-    if configuration.subject_revision_digest.trim().is_empty() {
-        return Err(PricingBindingError::EmptySubjectRevision);
-    }
-    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 256 {
-        return Err(PricingBindingError::InvalidIdempotencyKey);
-    }
-    if request.subject_revision_digest != configuration.subject_revision_digest {
-        return Err(PricingBindingError::SubjectRevisionMismatch);
-    }
-    let mut seen = BTreeSet::new();
-    for binding in &request.bindings {
-        if binding.runtime_model.is_empty() {
-            return Err(PricingBindingError::EmptyRuntimeModel);
-        }
-        let key = (binding.source_kind(), binding.runtime_model.clone());
-        if !seen.insert(key) {
-            return Err(PricingBindingError::DuplicateRuntimeModel);
-        }
-        match &binding.source {
-            DesiredPricingSource::ModelsDev {
-                provider_id,
-                model_id,
-                snapshot_id,
-                rate_revision_id,
-                rates,
-                tiers,
-                legacy_context_over_200k,
-                ..
-            } => {
-                if provider_id.trim().is_empty()
-                    || model_id.trim().is_empty()
-                    || snapshot_id.trim().is_empty()
-                    || rate_revision_id.trim().is_empty()
-                {
-                    return Err(PricingBindingError::InvalidCatalogReference);
-                }
-                if rates_exceed_plausibility_bound(*rates)
-                    || tiers
-                        .iter()
-                        .any(|tier| rates_exceed_plausibility_bound(tier.rates))
-                    || legacy_context_over_200k
-                        .as_ref()
-                        .is_some_and(|legacy| rates_exceed_plausibility_bound(legacy.rates))
-                {
-                    return Err(PricingBindingError::ImplausiblyLargeRate);
-                }
-            }
-            DesiredPricingSource::Manual { rates } => {
-                if rates_exceed_plausibility_bound(*rates) {
-                    return Err(PricingBindingError::ImplausiblyLargeRate);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn rates_exceed_plausibility_bound(rates: EventBucketRates) -> bool {
     rates
         .as_array()
         .iter()
         .flatten()
         .any(|rate| rate.as_nano_usd_per_million() > MAX_MANUAL_RATE_NANO_USD_PER_MILLION)
-}
-
-fn binding_key(source: &PricingBindingSource) -> (PricingSourceKind, String) {
-    (source.kind(), source.runtime_model().to_owned())
-}
-
-fn binding_is_active(source: &PricingBindingSource) -> bool {
-    match source {
-        PricingBindingSource::ModelsDev(binding) => binding.state == PricingBindingState::Active,
-        PricingBindingSource::Manual(override_) => override_.retired_at.is_none(),
-    }
-}
-
-fn binding_matches_desired(
-    source: &PricingBindingSource,
-    desired: &DesiredPricingBinding,
-    subject_revision_digest: &str,
-) -> bool {
-    match (source, &desired.source) {
-        (
-            PricingBindingSource::ModelsDev(existing),
-            DesiredPricingSource::ModelsDev {
-                provider_id,
-                model_id,
-                snapshot_id,
-                rate_revision_id,
-                rates,
-                tiers,
-                legacy_context_over_200k,
-                catalog_freshness,
-            },
-        ) => {
-            existing.runtime_model == desired.runtime_model
-                && existing.provider_id == *provider_id
-                && existing.model_id == *model_id
-                && existing.snapshot_id == *snapshot_id
-                && existing.rate_revision_id == *rate_revision_id
-                && existing.rates == *rates
-                && existing.tiers == *tiers
-                && existing.legacy_context_over_200k == *legacy_context_over_200k
-                && existing.catalog_freshness == *catalog_freshness
-        }
-        (PricingBindingSource::Manual(existing), DesiredPricingSource::Manual { rates }) => {
-            existing.subject_revision_digest == subject_revision_digest
-                && existing.runtime_model == desired.runtime_model
-                && existing.rates == *rates
-        }
-        _ => false,
-    }
-}
-
-fn retire_binding_source(source: &mut PricingBindingSource, now: SystemTime) {
-    match source {
-        PricingBindingSource::ModelsDev(binding) => {
-            binding.state = PricingBindingState::Retired;
-        }
-        PricingBindingSource::Manual(override_) => {
-            override_.retired_at = Some(now);
-        }
-    }
-}
-
-fn desired_binding_set_digest(bindings: &[DesiredPricingBinding]) -> String {
-    let mut keys = bindings
-        .iter()
-        .map(desired_binding_digest_key)
-        .collect::<Vec<Vec<u8>>>();
-    keys.sort();
-    canonical_hash("desired-binding-set-v2", |encoded| {
-        append_u64(
-            encoded,
-            u64::try_from(keys.len()).expect("in-memory binding count fits u64"),
-        );
-        for key in keys {
-            append_len_prefixed(encoded, &key);
-        }
-    })
-}
-
-fn desired_binding_digest_key(binding: &DesiredPricingBinding) -> Vec<u8> {
-    let mut encoded = Vec::new();
-    append_str(&mut encoded, &binding.runtime_model);
-    match &binding.source {
-        DesiredPricingSource::ModelsDev {
-            provider_id,
-            model_id,
-            snapshot_id,
-            rate_revision_id,
-            rates,
-            tiers,
-            legacy_context_over_200k,
-            catalog_freshness,
-        } => {
-            append_str(&mut encoded, PricingSourceKind::ModelsDevCatalog.as_str());
-            append_str(&mut encoded, provider_id);
-            append_str(&mut encoded, model_id);
-            append_str(&mut encoded, snapshot_id);
-            append_str(&mut encoded, rate_revision_id);
-            append_rates(&mut encoded, *rates);
-            append_tiers(&mut encoded, tiers);
-            append_option_legacy_context(&mut encoded, legacy_context_over_200k.as_ref());
-            append_str(&mut encoded, catalog_freshness.as_str());
-        }
-        DesiredPricingSource::Manual { rates } => {
-            append_str(&mut encoded, PricingSourceKind::ManualOverride.as_str());
-            append_rates(&mut encoded, *rates);
-        }
-    }
-    encoded
-}
-
-fn binding_id(
-    subject_id: &str,
-    subject_revision_digest: &str,
-    runtime_model: &str,
-    source_kind: &PricingSourceKind,
-    rate_revision_id: &str,
-    effective_at: SystemTime,
-) -> String {
-    canonical_hash("binding-id-v2", |encoded| {
-        append_str(encoded, subject_id);
-        append_str(encoded, subject_revision_digest);
-        append_str(encoded, runtime_model);
-        append_str(encoded, source_kind.as_str());
-        append_str(encoded, rate_revision_id);
-        append_system_time(encoded, effective_at);
-    })
-}
-
-fn manual_rate_revision_id(
-    subject_id: &str,
-    subject_revision_digest: &str,
-    runtime_model: &str,
-    rates: EventBucketRates,
-    effective_at: SystemTime,
-) -> String {
-    canonical_hash("manual-rate-revision-v2", |encoded| {
-        append_str(encoded, subject_id);
-        append_str(encoded, subject_revision_digest);
-        append_str(encoded, runtime_model);
-        append_rates(encoded, rates);
-        append_system_time(encoded, effective_at);
-    })
-}
-
-/// Abstract persistence boundary for exact binding replacements.
-#[async_trait]
-pub trait PricingBindingRepository: Send + Sync {
-    /// Reads one subject's current configuration.
-    async fn pricing_configuration(
-        &self,
-        subject_id: &str,
-    ) -> Result<PricingConfiguration, CatalogRepositoryError>;
-
-    /// Atomically validates the expected version, creates immutable revisions,
-    /// retires omitted rows, and updates the mutable binding pointer.
-    async fn replace_pricing_configuration(
-        &self,
-        subject_id: &str,
-        request: ReplacePricingRequest,
-        now: SystemTime,
-    ) -> Result<PricingConfiguration, CatalogRepositoryError>;
 }
 
 /// A frozen admission-time decision for one candidate/attempt.
@@ -4207,165 +3341,6 @@ fn validate_bounded_json_fragment(raw_json: &str) -> Result<(), String> {
     }
     validate_json_nesting_depth(raw_json.as_bytes())
         .map_err(|error| bounded_error_text(&error.to_string()))
-}
-
-/// Resolves and freezes one exact candidate price at admission.
-///
-/// When a mutable catalog status is available, prefer
-/// [`resolve_and_freeze_price_selection_with_freshness`] so the selection
-/// records the latest successful check (including a 304) rather than the
-/// freshness retained on the binding itself.
-pub fn resolve_and_freeze_price_selection(
-    configuration: &PricingConfiguration,
-    runtime_model: Option<&str>,
-    candidate_key: Option<&str>,
-    attempt_ordinal: u32,
-    admitted_provider_id: Option<&str>,
-) -> FrozenPriceSelection {
-    resolve_and_freeze_price_selection_internal(
-        configuration,
-        runtime_model,
-        candidate_key,
-        attempt_ordinal,
-        admitted_provider_id,
-        None,
-    )
-}
-
-/// Resolves and freezes one exact candidate price, overriding a catalog
-/// binding's historical freshness with the caller's current status when one
-/// is available.  Manual selections remain `NotApplicable`.
-pub fn resolve_and_freeze_price_selection_with_freshness(
-    configuration: &PricingConfiguration,
-    runtime_model: Option<&str>,
-    candidate_key: Option<&str>,
-    attempt_ordinal: u32,
-    admitted_provider_id: Option<&str>,
-    current_catalog_freshness: CatalogFreshness,
-) -> FrozenPriceSelection {
-    resolve_and_freeze_price_selection_internal(
-        configuration,
-        runtime_model,
-        candidate_key,
-        attempt_ordinal,
-        admitted_provider_id,
-        Some(current_catalog_freshness),
-    )
-}
-
-fn resolve_and_freeze_price_selection_internal(
-    configuration: &PricingConfiguration,
-    runtime_model: Option<&str>,
-    candidate_key: Option<&str>,
-    attempt_ordinal: u32,
-    admitted_provider_id: Option<&str>,
-    current_catalog_freshness: Option<CatalogFreshness>,
-) -> FrozenPriceSelection {
-    let runtime_model_owned = runtime_model
-        .map(str::to_owned)
-        .filter(|value| !value.trim().is_empty());
-    let candidate_key_owned = candidate_key.map(str::to_owned);
-    let mut selection = FrozenPriceSelection {
-        subject_id: Some(configuration.subject_id.clone()),
-        subject_revision_digest: Some(configuration.subject_revision_digest.clone()),
-        runtime_model: runtime_model_owned,
-        candidate_key: candidate_key_owned,
-        attempt_ordinal,
-        admitted_provider_id: admitted_provider_id.map(str::to_owned),
-        catalog_provider_id: None,
-        catalog_model_id: None,
-        source_kind: None,
-        rate_revision_id: None,
-        catalog_snapshot_id: None,
-        rates: None,
-        tiers: Vec::new(),
-        legacy_context_over_200k: None,
-        catalog_freshness: CatalogFreshness::NotApplicable,
-        status: PriceSelectionStatus::Unpriced,
-        reason: None,
-        selection_digest: String::new(),
-    };
-    let Some(runtime_model) = selection.runtime_model.as_deref() else {
-        selection.reason = Some(PriceSelectionReasonCode::MissingModel);
-        selection.selection_digest = frozen_selection_digest(&selection);
-        return selection;
-    };
-    if runtime_model.is_empty() {
-        selection.reason = Some(PriceSelectionReasonCode::MissingModel);
-        selection.selection_digest = frozen_selection_digest(&selection);
-        return selection;
-    }
-    let Some(binding) = configuration.resolve(runtime_model) else {
-        let retired = configuration
-            .bindings
-            .iter()
-            .any(|binding| binding.runtime_model() == runtime_model && !binding_is_active(binding));
-        selection.reason = Some(if retired {
-            PriceSelectionReasonCode::RetiredBinding
-        } else {
-            PriceSelectionReasonCode::MissingBinding
-        });
-        selection.selection_digest = frozen_selection_digest(&selection);
-        return selection;
-    };
-    selection.status = PriceSelectionStatus::Priced;
-    match binding {
-        PricingBindingSource::ModelsDev(binding) => {
-            selection.source_kind = Some(PricingSourceKind::ModelsDevCatalog);
-            selection.rate_revision_id = Some(binding.rate_revision_id.clone());
-            selection.catalog_snapshot_id = Some(binding.snapshot_id.clone());
-            selection.catalog_provider_id = Some(binding.provider_id.clone());
-            selection.catalog_model_id = Some(binding.model_id.clone());
-            selection.rates = Some(binding.rates);
-            selection.tiers = binding.tiers.clone();
-            selection.legacy_context_over_200k = binding.legacy_context_over_200k.clone();
-            selection.catalog_freshness =
-                current_catalog_freshness.unwrap_or(binding.catalog_freshness);
-        }
-        PricingBindingSource::Manual(override_) => {
-            selection.source_kind = Some(PricingSourceKind::ManualOverride);
-            selection.rate_revision_id = Some(override_.rate_revision_id.clone());
-            selection.rates = Some(override_.rates);
-        }
-    }
-    selection.selection_digest = frozen_selection_digest(&selection);
-    selection
-}
-
-/// Alias emphasizing that the function freezes all candidate provenance.
-pub fn freeze_price_selection(
-    configuration: &PricingConfiguration,
-    runtime_model: Option<&str>,
-    candidate_key: Option<&str>,
-    attempt_ordinal: u32,
-    admitted_provider_id: Option<&str>,
-) -> FrozenPriceSelection {
-    resolve_and_freeze_price_selection(
-        configuration,
-        runtime_model,
-        candidate_key,
-        attempt_ordinal,
-        admitted_provider_id,
-    )
-}
-
-/// Alias for [`resolve_and_freeze_price_selection_with_freshness`].
-pub fn freeze_price_selection_with_freshness(
-    configuration: &PricingConfiguration,
-    runtime_model: Option<&str>,
-    candidate_key: Option<&str>,
-    attempt_ordinal: u32,
-    admitted_provider_id: Option<&str>,
-    current_catalog_freshness: CatalogFreshness,
-) -> FrozenPriceSelection {
-    resolve_and_freeze_price_selection_with_freshness(
-        configuration,
-        runtime_model,
-        candidate_key,
-        attempt_ordinal,
-        admitted_provider_id,
-        current_catalog_freshness,
-    )
 }
 
 /// Computes the canonical digest for a frozen selection's provenance.
@@ -5616,207 +4591,86 @@ mod catalog_domain_tests {
     }
 
     #[test]
-    fn exact_manual_precedence_retirement_and_optimistic_conflict() {
-        let now = at(10);
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        let catalog = DesiredPricingBinding::models_dev(
-            "gpt-custom",
-            "openai",
-            "gpt-5",
-            "snapshot-1",
-            "catalog-rate-1",
-            EventBucketRates::new(
-                Some(rate(1_000_000_000)),
-                Some(rate(2_000_000_000)),
+    fn admission_can_freeze_current_catalog_freshness_over_binding_metadata() {
+        let selection = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate".to_owned()),
+            0,
+            Some("openai".to_owned()),
+            Some("openai".to_owned()),
+            Some("gpt-5".to_owned()),
+            Some(PricingSourceKind::ModelsDevCatalog),
+            Some("rate-1".to_owned()),
+            Some("snapshot-1".to_owned()),
+            Some(EventBucketRates::new(
+                Some(rate(1)),
+                Some(rate(2)),
                 None,
                 None,
-            ),
+            )),
             Vec::new(),
             None,
             CatalogFreshness::Fresh,
-        );
-        let manual = DesiredPricingBinding::manual(
-            "gpt-custom",
-            EventBucketRates::new(
-                Some(rate(3_000_000_000)),
-                Some(rate(4_000_000_000)),
-                None,
-                None,
-            ),
-        );
-        let replaced = configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "bind-1".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![catalog, manual],
-                },
-                now,
-            )
-            .expect("binding replacement");
-        assert!(replaced.changed);
-        let resolved = configuration.resolve("gpt-custom").expect("manual wins");
-        assert!(matches!(resolved, PricingBindingSource::Manual(_)));
-        assert_eq!(
-            match resolved {
-                PricingBindingSource::Manual(override_) => override_.rates.input,
-                PricingBindingSource::ModelsDev(_) => None,
-            },
-            Some(rate(3_000_000_000))
-        );
-        let conflict = configuration.replace(
-            ReplacePricingRequest {
-                expected_version: 1,
-                idempotency_key: "stale".to_owned(),
-                subject_revision_digest: "subject-rev-1".to_owned(),
-                bindings: Vec::new(),
-            },
-            at(11),
-        );
-        assert!(matches!(
-            conflict,
-            Err(PricingBindingError::VersionConflict { .. })
-        ));
-        let retired = configuration
-            .retire_binding("gpt-custom", configuration.version, "retire-1", at(12))
-            .expect("retirement");
-        assert!(retired.changed);
-        assert!(configuration.resolve("gpt-custom").is_none());
-        assert!(configuration
-            .bindings
-            .iter()
-            .all(|binding| !binding_is_active(binding)));
-    }
-
-    #[test]
-    fn manual_revision_and_binding_ids_are_scoped_to_the_subject() {
-        let request = |key: &str| ReplacePricingRequest {
-            expected_version: 1,
-            idempotency_key: key.to_owned(),
-            subject_revision_digest: "same-identity-revision".to_owned(),
-            bindings: vec![DesiredPricingBinding::manual(
-                "gpt",
-                EventBucketRates::new(Some(rate(1_000_000_000)), None, None, None),
-            )],
-        };
-        let mut first = PricingConfiguration::new("subject-a", "same-identity-revision");
-        let mut second = PricingConfiguration::new("subject-b", "same-identity-revision");
-        first
-            .replace(request("first"), at(10))
-            .expect("first replace");
-        second
-            .replace(request("second"), at(10))
-            .expect("second replace");
-
-        let first_manual = match first.bindings.first().expect("first binding") {
-            PricingBindingSource::Manual(override_) => override_,
-            PricingBindingSource::ModelsDev(_) => panic!("expected manual binding"),
-        };
-        let second_manual = match second.bindings.first().expect("second binding") {
-            PricingBindingSource::Manual(override_) => override_,
-            PricingBindingSource::ModelsDev(_) => panic!("expected manual binding"),
-        };
-        assert_ne!(
-            first_manual.rate_revision_id,
-            second_manual.rate_revision_id
-        );
-        assert_ne!(first_manual.id, second_manual.id);
-    }
-
-    #[test]
-    fn admission_can_freeze_current_catalog_freshness_over_binding_metadata() {
-        let now = at(10);
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "catalog".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![DesiredPricingBinding::models_dev(
-                        "gpt",
-                        "openai",
-                        "gpt-5",
-                        "snapshot-1",
-                        "rate-1",
-                        EventBucketRates::new(Some(rate(1)), Some(rate(2)), None, None),
-                        Vec::new(),
-                        None,
-                        CatalogFreshness::Stale,
-                    )],
-                },
-                now,
-            )
-            .expect("catalog binding");
-        let selection = resolve_and_freeze_price_selection_with_freshness(
-            &configuration,
-            Some("gpt"),
-            Some("candidate"),
-            0,
-            Some("openai"),
-            CatalogFreshness::Fresh,
+            PriceSelectionStatus::Priced,
+            None,
         );
         assert_eq!(selection.catalog_freshness, CatalogFreshness::Fresh);
         assert_eq!(selection.validate(), Ok(()));
 
-        let historical = resolve_and_freeze_price_selection(
-            &configuration,
-            Some("gpt"),
-            Some("candidate"),
+        let historical = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate".to_owned()),
             0,
-            Some("openai"),
+            Some("openai".to_owned()),
+            Some("openai".to_owned()),
+            Some("gpt-5".to_owned()),
+            Some(PricingSourceKind::ModelsDevCatalog),
+            Some("rate-1".to_owned()),
+            Some("snapshot-1".to_owned()),
+            Some(EventBucketRates::new(
+                Some(rate(1)),
+                Some(rate(2)),
+                None,
+                None,
+            )),
+            Vec::new(),
+            None,
+            CatalogFreshness::Stale,
+            PriceSelectionStatus::Priced,
+            None,
         );
         assert_eq!(historical.catalog_freshness, CatalogFreshness::Stale);
     }
 
     #[test]
-    fn replacement_rejects_manual_rates_above_the_catalog_bound() {
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        let result = configuration.replace(
-            ReplacePricingRequest {
-                expected_version: 1,
-                idempotency_key: "too-large".to_owned(),
-                subject_revision_digest: "subject-rev-1".to_owned(),
-                bindings: vec![DesiredPricingBinding::manual(
-                    "gpt",
-                    EventBucketRates::new(
-                        Some(rate(MODELS_DEV_MAX_RATE_NANO_USD_PER_MILLION + 1)),
-                        None,
-                        None,
-                        None,
-                    ),
-                )],
-            },
-            at(10),
-        );
-        assert_eq!(result, Err(PricingBindingError::ImplausiblyLargeRate));
-    }
-
-    #[test]
     fn estimate_distinguishes_reported_unmetered_zero_missing_rate_tier_and_identity() {
-        let now = at(10);
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "manual".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![DesiredPricingBinding::manual(
-                        "gpt",
-                        EventBucketRates::new(Some(rate(1_000_000_000)), None, None, None),
-                    )],
-                },
-                now,
-            )
-            .expect("manual binding");
-        let selection = resolve_and_freeze_price_selection(
-            &configuration,
-            Some("gpt"),
-            Some("candidate-a"),
+        let selection = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate-a".to_owned()),
             0,
-            Some("openai"),
+            Some("openai".to_owned()),
+            None,
+            None,
+            Some(PricingSourceKind::ManualOverride),
+            Some("manual-rate-1".to_owned()),
+            None,
+            Some(EventBucketRates::new(
+                Some(rate(1_000_000_000)),
+                None,
+                None,
+                None,
+            )),
+            Vec::new(),
+            None,
+            CatalogFreshness::NotApplicable,
+            PriceSelectionStatus::Priced,
+            None,
         );
         let reported = estimate_usage_event(UsageEventEstimateInput {
             counters: None,
@@ -5906,32 +4760,29 @@ mod catalog_domain_tests {
             }
         );
 
-        let mut free_configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        free_configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "free".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![DesiredPricingBinding::manual(
-                        "gpt",
-                        EventBucketRates::new(
-                            Some(NanoUsdPerMillion::ZERO),
-                            Some(NanoUsdPerMillion::ZERO),
-                            None,
-                            None,
-                        ),
-                    )],
-                },
-                now,
-            )
-            .expect("free binding");
-        let free_selection = resolve_and_freeze_price_selection(
-            &free_configuration,
-            Some("gpt"),
-            Some("candidate-a"),
+        let free_selection = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate-a".to_owned()),
             0,
-            Some("openai"),
+            Some("openai".to_owned()),
+            None,
+            None,
+            Some(PricingSourceKind::ManualOverride),
+            Some("manual-free-rate".to_owned()),
+            None,
+            Some(EventBucketRates::new(
+                Some(NanoUsdPerMillion::ZERO),
+                Some(NanoUsdPerMillion::ZERO),
+                None,
+                None,
+            )),
+            Vec::new(),
+            None,
+            CatalogFreshness::NotApplicable,
+            PriceSelectionStatus::Priced,
+            None,
         );
         let free = estimate_usage_event(UsageEventEstimateInput {
             counters: Some(EventTokenCounts::new(1, 1, 0, 0)),
@@ -5960,33 +4811,28 @@ mod catalog_domain_tests {
 
     #[test]
     fn estimate_uses_catalog_provider_for_providerless_runtime_admissions() {
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "catalog".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![DesiredPricingBinding::models_dev(
-                        "gpt",
-                        "openai",
-                        "gpt-5",
-                        "snapshot-1",
-                        "rate-1",
-                        EventBucketRates::new(Some(rate(1_000_000_000)), None, None, None),
-                        Vec::new(),
-                        None,
-                        CatalogFreshness::Fresh,
-                    )],
-                },
-                at(10),
-            )
-            .expect("catalog binding");
-        let selection = resolve_and_freeze_price_selection(
-            &configuration,
-            Some("gpt"),
-            Some("candidate"),
+        let selection = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate".to_owned()),
             0,
+            None,
+            Some("openai".to_owned()),
+            Some("gpt-5".to_owned()),
+            Some(PricingSourceKind::ModelsDevCatalog),
+            Some("rate-1".to_owned()),
+            Some("snapshot-1".to_owned()),
+            Some(EventBucketRates::new(
+                Some(rate(1_000_000_000)),
+                None,
+                None,
+                None,
+            )),
+            Vec::new(),
+            None,
+            CatalogFreshness::Fresh,
+            PriceSelectionStatus::Priced,
             None,
         );
         assert_eq!(selection.admitted_provider_id, None);
@@ -6030,26 +4876,28 @@ mod catalog_domain_tests {
 
     #[test]
     fn frozen_selection_digest_covers_freshness_and_option_boundaries() {
-        let mut configuration = PricingConfiguration::new("subject", "subject-rev-1");
-        configuration
-            .replace(
-                ReplacePricingRequest {
-                    expected_version: 1,
-                    idempotency_key: "manual".to_owned(),
-                    subject_revision_digest: "subject-rev-1".to_owned(),
-                    bindings: vec![DesiredPricingBinding::manual(
-                        "gpt",
-                        EventBucketRates::new(Some(rate(1)), Some(rate(2)), None, None),
-                    )],
-                },
-                at(10),
-            )
-            .expect("manual binding");
-        let selection = resolve_and_freeze_price_selection(
-            &configuration,
-            Some("gpt"),
-            Some("candidate"),
+        let selection = freeze_persisted_price_selection(
+            Some("subject".to_owned()),
+            Some("subject-rev-1".to_owned()),
+            Some("gpt".to_owned()),
+            Some("candidate".to_owned()),
             0,
+            None,
+            None,
+            None,
+            Some(PricingSourceKind::ManualOverride),
+            Some("manual-rate-1".to_owned()),
+            None,
+            Some(EventBucketRates::new(
+                Some(rate(1)),
+                Some(rate(2)),
+                None,
+                None,
+            )),
+            Vec::new(),
+            None,
+            CatalogFreshness::NotApplicable,
+            PriceSelectionStatus::Priced,
             None,
         );
         assert_eq!(selection.validate(), Ok(()));

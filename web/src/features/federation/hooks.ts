@@ -11,6 +11,7 @@ import {
   getEffectivePermissions,
   getContextManifest,
   getCliRuntimePricing,
+  getAgentPricing,
   getMainAgentBinding,
   getMissionControl,
   getProviderAuthorization,
@@ -26,6 +27,9 @@ import {
   getProviderUsage,
   registerHarnessAgent,
   refreshPricingCatalog,
+  deleteAgentPricing,
+  deleteCliRuntimePricing,
+  deleteProviderPricing,
   removeProviderEntry,
   renameProviderEntry,
   rotateAgentSession,
@@ -36,8 +40,9 @@ import {
   setAgentSessionStatus,
   startProviderAuthorization,
   steerAgentSessionTurn,
-  replaceCliRuntimePricing,
-  replaceProviderPricing,
+  updateAgentPricing,
+  updateCliRuntimePricing,
+  updateProviderPricing,
 } from './api'
 import type {
   ConnectEmbeddedProfileInput,
@@ -55,7 +60,7 @@ import type {
   StartProviderAuthorizationRequest,
   PricingCatalogModelsQuery,
   PricingCatalogRefreshRequest,
-  ReplaceProviderPricingRequest,
+  UpdatePricingSettingsRequest,
 } from '@/types/generated'
 
 export const federationQueryKeys = {
@@ -78,6 +83,8 @@ export const federationQueryKeys = {
   providerPricing: (id: string) => ['agent-providers', id, 'pricing'] as const,
   cliRuntimePricing: (daemonId: string, executorType: string) =>
     ['agent-providers', 'cli-runtime', daemonId, executorType, 'pricing'] as const,
+  agentPricingAll: ['agent-pricing'] as const,
+  agentPricing: (id: string) => ['agent-pricing', id] as const,
   providerAuthorization: (id: string) => ['provider-authorizations', id] as const,
 } as const
 
@@ -86,6 +93,7 @@ export function useFederatedAgentsQuery() {
     queryKey: federationQueryKeys.agents,
     queryFn: () => listFederatedAgents(),
     staleTime: 10_000,
+    refetchInterval: 30_000,
   })
 }
 
@@ -125,6 +133,7 @@ export function useCreateEmbeddedAgentMutation() {
         connected.session,
       ])
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
     },
   })
 }
@@ -226,6 +235,7 @@ export function useProvidersQuery() {
     queryKey: federationQueryKeys.credentials,
     queryFn: listProviders,
     staleTime: 15_000,
+    refetchInterval: 30_000,
   })
 }
 
@@ -357,6 +367,7 @@ export function useRefreshPricingCatalogMutation() {
       void queryClient.invalidateQueries({
         queryKey: ['agent-providers', 'pricing-catalog', 'models'],
       })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricingAll })
     },
     onError: () => {
       // A failed refresh is itself represented by the status projection. Pull
@@ -389,7 +400,17 @@ export function useCliRuntimePricingQuery(
   })
 }
 
-export function useReplaceProviderPricingMutation() {
+export function useAgentPricingQuery(agentId: string | undefined) {
+  return useQuery({
+    queryKey: federationQueryKeys.agentPricing(agentId ?? 'none'),
+    queryFn: () => getAgentPricing(agentId!),
+    enabled: Boolean(agentId),
+    staleTime: 30_000,
+    retry: false,
+  })
+}
+
+export function useUpdateProviderPricingMutation() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({
@@ -397,15 +418,28 @@ export function useReplaceProviderPricingMutation() {
       input,
     }: {
       subjectId: string
-      input: ReplaceProviderPricingRequest
-    }) => replaceProviderPricing(subjectId, input),
+      input: UpdatePricingSettingsRequest
+    }) => updateProviderPricing(subjectId, input),
     onSuccess: (pricing, variables) => {
       queryClient.setQueryData(federationQueryKeys.providerPricing(variables.subjectId), pricing)
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricingAll })
     },
   })
 }
 
-export function useReplaceCliRuntimePricingMutation() {
+export function useResetProviderPricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ subjectId, version }: { subjectId: string; version: number }) =>
+      deleteProviderPricing(subjectId, version),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(federationQueryKeys.providerPricing(variables.subjectId), pricing)
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricingAll })
+    },
+  })
+}
+
+export function useUpdateCliRuntimePricingMutation() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({
@@ -415,13 +449,58 @@ export function useReplaceCliRuntimePricingMutation() {
     }: {
       daemonId: string
       executorType: string
-      input: ReplaceProviderPricingRequest
-    }) => replaceCliRuntimePricing(daemonId, executorType, input),
+      input: UpdatePricingSettingsRequest
+    }) => updateCliRuntimePricing(daemonId, executorType, input),
     onSuccess: (pricing, variables) => {
       queryClient.setQueryData(
         federationQueryKeys.cliRuntimePricing(variables.daemonId, variables.executorType),
         pricing,
       )
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricingAll })
+    },
+  })
+}
+
+export function useResetCliRuntimePricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      daemonId,
+      executorType,
+      version,
+    }: {
+      daemonId: string
+      executorType: string
+      version: number
+    }) => deleteCliRuntimePricing(daemonId, executorType, version),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(
+        federationQueryKeys.cliRuntimePricing(variables.daemonId, variables.executorType),
+        pricing,
+      )
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agentPricingAll })
+    },
+  })
+}
+
+export function useUpdateAgentPricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ agentId, input }: { agentId: string; input: UpdatePricingSettingsRequest }) =>
+      updateAgentPricing(agentId, input),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(federationQueryKeys.agentPricing(variables.agentId), pricing)
+    },
+  })
+}
+
+export function useResetAgentPricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ agentId, version }: { agentId: string; version: number }) =>
+      deleteAgentPricing(agentId, version),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(federationQueryKeys.agentPricing(variables.agentId), pricing)
     },
   })
 }

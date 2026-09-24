@@ -607,13 +607,13 @@ healthy sources when selecting Main, Project, Worker, or reviewer Agents.
 
 ## Configuring provider pricing and usage estimates
 
-Connecting a provider does not imply a price. Forge keeps pricing separate from
-the provider entry's quota/rate-limit `Usage` view and uses the fixed public
-models.dev catalog only as an estimate input. Catalog refresh is explicit and
+Forge keeps pricing separate from the provider entry's quota/rate-limit
+`Usage` view and uses the fixed public models.dev catalog as its estimate
+input. Catalog refresh is explicit and
 server-side; startup, execution, chat, and inquiry admission do not require
 network access.
 
-Check the active catalog before configuring a rate:
+Check the active catalog:
 
 ```bash
 curl -sS "$FORGE_URL/api/v1/providers/pricing-catalog/status" | jq
@@ -636,59 +636,41 @@ models.dev `provider_id`/`model_id` keys; use
 `GET /api/v1/providers/pricing-catalog/models` with its opaque `cursor`,
 `limit`, exact `provider_id`, and literal `query` filters when inspecting them.
 
-Configure pricing for a provider entry with
-`GET`/`PUT /api/v1/providers/{id}/pricing`. A `PUT` replaces the complete
-desired binding set and must include the current `expected_version`, a stable
-`idempotency_key`, and the subject revision digest. For example, an exact
-catalog binding looks like:
+Pricing needs no setup once a catalog is loaded. Each run is priced from the
+models.dev row that matches the agent's model: Forge prefers the provider that
+bills the entry directly (OpenAI, Gemini, xAI, OpenRouter, Codex → `openai`,
+Claude Code → `anthropic`), then the provider that publishes the model family
+(`glm-` → `zai`, `gpt-` → `openai`, …), then the only provider listing it.
+The agent detail panel shows the matched row and the rates the next run uses.
 
-```json
-{
-  "expected_version": 0,
-  "idempotency_key": "pricing-openai-1",
-  "subject_revision_digest": "sha256:provider-entry-revision",
-  "bindings": [
-    {
-      "runtime_model": "gpt-5.6-terra",
-      "source_kind": "models_dev_catalog",
-      "catalog_provider_id": "openai",
-      "catalog_model_id": "gpt-5.6-terra",
-      "catalog_rate_revision_id": "rate-revision-uuid",
-      "manual_rates": null
-    }
-  ]
-}
+When your price differs from the list price, set an adjustment in the UI or
+through the API. On a provider entry or CLI runtime it applies to every agent
+using it; an agent can override it:
+
+```bash
+# 20% off list for everything on this provider entry
+curl -sS -X PUT "$FORGE_URL/api/v1/providers/$ENTRY_ID/pricing" \
+  -H 'content-type: application/json' \
+  -d '{"mode":"discount","discount_percent":"20","fixed_rates":null,
+       "catalog_provider_id":null,"catalog_model_id":null,"expected_version":0}'
+
+# A flat subscription: 100% off
+# Fixed rates for one agent, per one million tokens
+curl -sS -X PUT "$FORGE_URL/api/v1/agents/$AGENT_ID/pricing" \
+  -H 'content-type: application/json' \
+  -d '{"mode":"fixed","discount_percent":null,
+       "fixed_rates":{"input":{"currency":"USD","decimal_per_million":"0.5"},
+                      "output":{"currency":"USD","decimal_per_million":"2"},
+                      "cache_read":null,"cache_write":null},
+       "catalog_provider_id":null,"catalog_model_id":null,"expected_version":0}'
 ```
 
-For a manual override, set `source_kind` to `manual_override`, leave the
-catalog identifiers null, and provide non-negative USD `manual_rates` for the
-input, output, cache-read, and cache-write buckets (each per one million
-tokens). Money and rates are decimal strings, not floating-point numbers. A
-manual override wins over an exact catalog binding. Every edit creates an
-immutable rate revision; removing an override affects future admissions only.
-Stale writes return `409` rather than merging drafts.
-
-Bindings are exact. Forge does not fuzzy-match a custom model name, infer a
-family price, strip a relay prefix, or guess a relationship from an endpoint.
-Only reviewed direct mappings for OpenAI Platform (`openai`), xAI (`xai`), the
-Gemini API (`google`), and canonical OpenRouter (`openrouter`) are automatic.
-ChatGPT subscription OAuth, `openai_compatible`, custom base URLs, Smith, and
-all discovered CLI runtimes require an explicit exact binding. Public API list
-prices may not match a subscription plan or private provider contract, and
-Forge does not present them as an invoice or billed amount.
-
-Some providers also charge different cache-write prices for different cache
-TTLs or service modes. This revision records the four token buckets Forge can
-measure independently, but it does not infer a TTL-specific price that the
-runtime did not report. Use a manual exact binding when the public catalog row
-does not describe the runtime's billing mode, and continue to treat the result
-as an estimate rather than an invoice.
-
-Discovered CLI runtimes use the equivalent exact routes
-`GET`/`PUT /api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing`.
-The runtime model identifier is sent in the request body, so model IDs that
-contain `/` remain valid. A provider/model identity mismatch reported by a
-runtime is recorded as unpriced rather than charged against the wrong rate.
+If several models.dev providers list a model and none of the rules picks one,
+the agent reports `ambiguous`; pin a row with `catalog_provider_id` (and on an
+agent, `catalog_model_id`). An OpenAI-compatible relay can pin its catalog
+provider once on the entry. Changes apply to runs admitted afterwards. Public
+list prices are estimates, not invoices. A provider/model mismatch reported by
+a runtime is recorded as unpriced rather than charged against the wrong rate.
 
 Usage and cost reports distinguish provider-reported amounts from Forge
 estimates and show `complete`, `partial`, `pending`, `unavailable`, or

@@ -62,6 +62,9 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         if !source_enabled {
             return Ok(EffectiveStatus::SourceDisabled);
         }
+        if crate::provider_health::entry_unavailable(db, credential_ref).await? {
+            return Ok(EffectiveStatus::ConnectionDegraded);
+        }
     }
 
     if agent.backend_kind == "native" {

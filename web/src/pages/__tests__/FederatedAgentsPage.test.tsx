@@ -5,6 +5,7 @@ import { FederatedAgentsPage } from '@/pages/FederatedAgentsPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { FederatedAgent } from '@/features/federation/types'
 import type {
+  AgentPricing,
   ProviderAuthorizationOperationResponse,
   ProviderEntryResponse,
   UsageAggregate,
@@ -24,6 +25,8 @@ const testProviderEntry = vi.fn().mockResolvedValue({
   message: null,
   checked_at: '2026-08-15T00:00:00Z',
 })
+const updateAgentPricing = vi.fn().mockResolvedValue({})
+let agentPricing: AgentPricing
 
 const emptyUsage: UsageAggregate = {
   counts: {
@@ -165,6 +168,13 @@ vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
   }),
 }))
 vi.mock('@/features/federation/hooks', () => ({
+  federationQueryKeys: {
+    agents: ['federated-agents'],
+    credentials: ['federated-agents', 'credentials'],
+    agentPricing: (id: string) => ['agent-pricing', id],
+    providerUsage: (id: string) => ['agent-providers', id, 'usage'],
+    pricingCatalogStatus: ['agent-providers', 'pricing-catalog', 'status'],
+  },
   isVersionConflict: () => false,
   useFederatedAgentsQuery: () => ({
     data: { items: [agent, cliAgent], has_more: false },
@@ -284,35 +294,35 @@ vi.mock('@/features/federation/hooks', () => ({
     refetch: vi.fn(),
   }),
   useProviderPricingQuery: () => ({
-    data: {
-      subject_id: 'credential-1',
-      subject_revision_digest: 'subject-revision-1',
-      version: 1,
-      bindings: [],
-    },
+    data: { settings: null },
     isLoading: false,
     isError: false,
     refetch: vi.fn(),
   }),
   useCliRuntimePricingQuery: () => ({
-    data: {
-      subject_id: 'daemon-1:codex',
-      subject_revision_digest: 'subject-revision-1',
-      version: 1,
-      bindings: [],
-    },
+    data: { settings: null },
     isLoading: false,
     isError: false,
     refetch: vi.fn(),
   }),
-  useReplaceProviderPricingMutation: () => ({
+  useAgentPricingQuery: () => ({
+    data: agentPricing,
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useUpdateProviderPricingMutation: () => ({
     mutateAsync: vi.fn(),
     isPending: false,
   }),
-  useReplaceCliRuntimePricingMutation: () => ({
+  useResetProviderPricingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useUpdateCliRuntimePricingMutation: () => ({
     mutateAsync: vi.fn(),
     isPending: false,
   }),
+  useResetCliRuntimePricingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useUpdateAgentPricingMutation: () => ({ mutateAsync: updateAgentPricing, isPending: false }),
+  useResetAgentPricingMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useProjectAgentBindingQuery: () => ({
     data: undefined,
     isLoading: false,
@@ -379,6 +389,7 @@ const providerEntries: ProviderEntryResponse[] = [
     provider_account_id: 'acct-123',
     used_by: [{ agent_id: 'agent-1', agent_name: 'Forge Guide', runtime: 'direct' }],
     last_used_at: '2026-08-14T12:00:00Z',
+    health: null,
     version: 1,
     created_at: '2026-08-12T11:00:00Z',
     updated_at: '2026-08-12T12:00:00Z',
@@ -394,6 +405,7 @@ const providerEntries: ProviderEntryResponse[] = [
     provider_account_id: null,
     used_by: [],
     last_used_at: null,
+    health: null,
     version: 1,
     created_at: '2026-08-12T11:00:00Z',
     updated_at: '2026-08-12T12:00:00Z',
@@ -513,6 +525,20 @@ function openProvidersTab() {
 
 describe('FederatedAgentsPage', () => {
   beforeEach(() => {
+    agentPricing = {
+      agent_id: 'agent-1',
+      runtime_model: 'gpt-test',
+      settings: null,
+      provider_settings: null,
+      source: 'default',
+      status: 'priced',
+      catalog_provider_id: 'openai',
+      catalog_model_id: 'gpt-test',
+      catalog_rates: null,
+      effective_rates: null,
+      candidate_providers: [],
+    }
+    updateAgentPricing.mockClear()
     authorizationOperation = undefined
     createEmbeddedAgent.mockClear()
     registerHarnessAgent.mockClear()
@@ -567,6 +593,35 @@ describe('FederatedAgentsPage', () => {
       }),
     )
     expect(updateAgent).not.toHaveBeenCalled()
+  })
+
+  it('offers catalog provider choices when agent pricing is ambiguous', async () => {
+    agentPricing = {
+      ...agentPricing,
+      status: 'ambiguous',
+      catalog_provider_id: null,
+      catalog_model_id: null,
+      candidate_providers: ['openai', 'openrouter'],
+    }
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+    expect(screen.getByText('Listed by several providers — pick one')).toBeTruthy()
+    const select = screen.getByRole('combobox', { name: 'Choose models.dev provider' })
+    expect(within(select).getByRole('option', { name: 'openrouter' })).toBeTruthy()
+    fireEvent.change(select, { target: { value: 'openrouter' } })
+    await vi.waitFor(() =>
+      expect(updateAgentPricing).toHaveBeenCalledWith({
+        agentId: 'agent-1',
+        input: {
+          mode: 'list',
+          discount_percent: null,
+          fixed_rates: null,
+          catalog_provider_id: 'openrouter',
+          catalog_model_id: 'gpt-test',
+          expected_version: 0,
+        },
+      }),
+    )
   })
 
   it("discards inline edits back to the agent's current settings", () => {

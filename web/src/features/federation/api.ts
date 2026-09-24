@@ -8,12 +8,13 @@ import type {
   PricingCatalogModelsResponse,
   PricingCatalogRefreshRequest,
   PricingCatalogStatus,
-  ProviderPricing,
+  AgentPricing,
+  SubjectPricingResponse,
+  UpdatePricingSettingsRequest,
   ProviderAuthorizationOperationResponse,
   ProviderEntriesResponse,
   ProviderEntryResponse,
   ProviderEntryTestResponse,
-  ReplaceProviderPricingRequest,
   RenameProviderEntryRequest,
   SetCliRuntimeAvailabilityRequest,
   SetProviderEntryAvailabilityRequest,
@@ -255,19 +256,27 @@ export function listPricingCatalogModels(
   })
 }
 
-/** Read exact pricing bindings for one connected provider entry. */
-export function getProviderPricing(subjectId: string): Promise<ProviderPricing> {
-  return apiFetch<ProviderPricing>(`/providers/${subjectId}/pricing`)
+export function getProviderPricing(subjectId: string): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(`/providers/${encodeURIComponent(subjectId)}/pricing`)
 }
 
-/** Replace all exact pricing bindings for one connected provider entry. */
-export function replaceProviderPricing(
+export function updateProviderPricing(
   subjectId: string,
-  input: ReplaceProviderPricingRequest,
-): Promise<ProviderPricing> {
-  return apiFetch<ProviderPricing>(`/providers/${subjectId}/pricing`, {
+  input: UpdatePricingSettingsRequest,
+): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(`/providers/${encodeURIComponent(subjectId)}/pricing`, {
     method: 'PUT',
     body: JSON.stringify(input),
+  })
+}
+
+export function deleteProviderPricing(
+  subjectId: string,
+  version: number,
+): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(`/providers/${encodeURIComponent(subjectId)}/pricing`, {
+    method: 'DELETE',
+    search: { version },
   })
 }
 
@@ -275,23 +284,57 @@ function cliRuntimePricingPath(daemonId: string, executorType: string): string {
   return `/providers/cli-runtimes/${encodeURIComponent(daemonId)}/${encodeURIComponent(executorType)}/pricing`
 }
 
-/** Read exact pricing bindings for one discovered CLI runtime. */
 export function getCliRuntimePricing(
   daemonId: string,
   executorType: string,
-): Promise<ProviderPricing> {
-  return apiFetch<ProviderPricing>(cliRuntimePricingPath(daemonId, executorType))
+): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(cliRuntimePricingPath(daemonId, executorType))
 }
 
-/** Replace all exact pricing bindings for one discovered CLI runtime. */
-export function replaceCliRuntimePricing(
+export function updateCliRuntimePricing(
   daemonId: string,
   executorType: string,
-  input: ReplaceProviderPricingRequest,
-): Promise<ProviderPricing> {
-  return apiFetch<ProviderPricing>(cliRuntimePricingPath(daemonId, executorType), {
+  input: UpdatePricingSettingsRequest,
+): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(cliRuntimePricingPath(daemonId, executorType), {
     method: 'PUT',
     body: JSON.stringify(input),
+  })
+}
+
+export function deleteCliRuntimePricing(
+  daemonId: string,
+  executorType: string,
+  version: number,
+): Promise<SubjectPricingResponse> {
+  return apiFetch<SubjectPricingResponse>(cliRuntimePricingPath(daemonId, executorType), {
+    method: 'DELETE',
+    search: { version },
+  })
+}
+
+function agentPricingPath(agentId: string): string {
+  return `/agents/${encodeURIComponent(agentId)}/pricing`
+}
+
+export function getAgentPricing(agentId: string): Promise<AgentPricing> {
+  return apiFetch<AgentPricing>(agentPricingPath(agentId))
+}
+
+export function updateAgentPricing(
+  agentId: string,
+  input: UpdatePricingSettingsRequest,
+): Promise<AgentPricing> {
+  return apiFetch<AgentPricing>(agentPricingPath(agentId), {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+}
+
+export function deleteAgentPricing(agentId: string, version: number): Promise<AgentPricing> {
+  return apiFetch<AgentPricing>(agentPricingPath(agentId), {
+    method: 'DELETE',
+    search: { version },
   })
 }
 

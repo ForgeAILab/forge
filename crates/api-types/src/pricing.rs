@@ -479,65 +479,114 @@ pub struct PricingCatalogModelsResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Which exact rate source a provider/runtime binding uses.
+/// How an owner's price differs from the models.dev list price.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum PricingBindingSourceKind {
-    ModelsDevCatalog,
-    ManualOverride,
+pub enum PricingMode {
+    /// models.dev rates unchanged.
+    List,
+    /// models.dev rates reduced by `discount_percent`.
+    Discount,
+    /// `fixed_rates`, models.dev ignored.
+    Fixed,
 }
 
-/// Exact runtime-model pricing binding and its immutable rate provenance.
+/// A pricing adjustment on a provider entry, CLI runtime, or agent.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-pub struct PricingBinding {
-    pub id: String,
-    pub runtime_model: String,
-    pub subject_revision_digest: String,
-    pub source_kind: PricingBindingSourceKind,
+pub struct PricingSettings {
+    pub mode: PricingMode,
+    /// Percent off list price as decimal text with at most two fractional
+    /// digits (`"20"`, `"12.5"`); present only for `discount`.
+    pub discount_percent: Option<String>,
+    /// Per-million-token USD rates; present only for `fixed`.
+    pub fixed_rates: Option<RateBuckets>,
+    /// models.dev provider to price with instead of the inferred one.
     pub catalog_provider_id: Option<String>,
+    /// models.dev model to price with; agent settings only.
     pub catalog_model_id: Option<String>,
-    pub catalog_rate_revision_id: Option<String>,
-    pub manual_rates: Option<RateBuckets>,
-    pub effective_at: String,
-    pub retired_at: Option<String>,
     #[ts(type = "number")]
     pub version: i64,
 }
 
-/// Provider entry or discovered CLI runtime pricing configuration.
+/// A provider entry's or CLI runtime's pricing adjustment. `settings` is
+/// `null` when it uses list price with inferred models.dev rows.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-pub struct ProviderPricing {
-    pub subject_id: String,
-    pub subject_revision_digest: String,
-    #[ts(type = "number")]
-    pub version: i64,
-    pub bindings: Vec<PricingBinding>,
+pub struct SubjectPricingResponse {
+    pub settings: Option<PricingSettings>,
 }
 
-/// Desired exact binding in a replace-all pricing mutation.
+/// Create or replace a pricing adjustment.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-pub struct ReplaceProviderPricingBinding {
-    pub runtime_model: String,
-    pub source_kind: PricingBindingSourceKind,
+pub struct UpdatePricingSettingsRequest {
+    pub mode: PricingMode,
+    pub discount_percent: Option<String>,
+    pub fixed_rates: Option<RateBuckets>,
     pub catalog_provider_id: Option<String>,
     pub catalog_model_id: Option<String>,
-    pub catalog_rate_revision_id: Option<String>,
-    pub manual_rates: Option<RateBuckets>,
-}
-
-/// Replace the complete exact binding set for a provider/runtime subject.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct ReplaceProviderPricingRequest {
+    /// `0` when no adjustment exists yet, else the current `version`.
     #[ts(type = "number")]
     pub expected_version: i64,
-    pub idempotency_key: String,
-    pub subject_revision_digest: String,
-    pub bindings: Vec<ReplaceProviderPricingBinding>,
+}
+
+/// Remove a pricing adjustment, falling back to its parent.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct DeletePricingSettingsQuery {
+    #[ts(type = "number")]
+    pub version: i64,
+}
+
+/// Which adjustment an agent's price uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PricingAdjustmentSource {
+    Agent,
+    Provider,
+    Default,
+}
+
+/// Whether Forge can price an agent's next run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PricingResolutionStatus {
+    Priced,
+    /// The agent has no model configured.
+    NoModel,
+    /// No models.dev catalog has been loaded.
+    CatalogAbsent,
+    /// No models.dev row matches the model or pin.
+    NotInCatalog,
+    /// Several models.dev providers list the model; pin one.
+    Ambiguous,
+}
+
+/// An agent's pricing: its own adjustment, the one it inherits, and the
+/// price Forge would freeze for its next run.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct AgentPricing {
+    pub agent_id: String,
+    pub runtime_model: Option<String>,
+    /// The agent's own adjustment, `null` when it inherits.
+    pub settings: Option<PricingSettings>,
+    /// The adjustment on the agent's provider entry or CLI runtime.
+    pub provider_settings: Option<PricingSettings>,
+    pub source: PricingAdjustmentSource,
+    pub status: PricingResolutionStatus,
+    pub catalog_provider_id: Option<String>,
+    pub catalog_model_id: Option<String>,
+    /// models.dev list rates for the matched row.
+    pub catalog_rates: Option<RateBuckets>,
+    /// Rates after the adjustment; what the next run is estimated with.
+    pub effective_rates: Option<RateBuckets>,
+    /// models.dev providers listing the model when `status` is `ambiguous`.
+    pub candidate_providers: Vec<String>,
 }
 
 /// Request an explicit retrospective cost-estimation preview for one snapshot.

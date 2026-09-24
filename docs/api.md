@@ -157,6 +157,9 @@ database for historical provenance.
 | PATCH  | `/api/v1/agents/{id}` | Update the Agent definition with optimistic concurrency, including its reversible `paused` state |
 | POST   | `/api/v1/agents/{id}/pause` | Disable one Agent without deleting its provider/runtime configuration |
 | POST   | `/api/v1/agents/{id}/resume` | Re-enable one paused Agent |
+| GET    | `/api/v1/agents/{id}/pricing` | Read the agent's pricing adjustment, the inherited one, and the price its next run would freeze |
+| PUT    | `/api/v1/agents/{id}/pricing` | Set the agent's own pricing adjustment, overriding its provider's |
+| DELETE | `/api/v1/agents/{id}/pricing` | Remove the agent's adjustment (`?version=`) so it inherits again |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 
@@ -193,21 +196,32 @@ credential health), so it may be `active` below the concurrency cap while
 | GET    | `/api/v1/providers/pricing-catalog/status` | Read the active models.dev pricing snapshot, revision, last check, freshness, and bounded refresh error state |
 | POST   | `/api/v1/providers/pricing-catalog/refresh` | Explicitly refresh and conditionally activate a validated models.dev pricing snapshot |
 | GET    | `/api/v1/providers/pricing-catalog/models` | List exact provider/model catalog rates with opaque-cursor pagination and optional exact filters |
-| GET    | `/api/v1/providers` | List the account's configured provider entries with usage (referencing agents, last used) plus CLI runtimes discovered on connected daemons |
+| GET    | `/api/v1/providers` | List the account's configured provider entries with usage (referencing agents, last used), live provider health, and CLI runtimes discovered on connected daemons |
 | POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); custom base URLs must be HTTPS and cannot contain userinfo, query parameters, or fragments; never creates an agent |
 | PATCH  | `/api/v1/providers/{id}` | Rename a provider entry with optimistic concurrency |
 | PATCH  | `/api/v1/providers/{id}/availability` | Disable or re-enable this exact provider entry with `expected_version`; every dependent Agent becomes unavailable/eligible accordingly |
 | PATCH  | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/availability` | Disable or re-enable one exact daemon + CLI executor runtime with optimistic concurrency |
-| GET    | `/api/v1/providers/{id}/pricing` | Read exact model pricing bindings and immutable rate provenance for one provider entry |
-| PUT    | `/api/v1/providers/{id}/pricing` | Replace one provider entry's complete exact pricing binding set with optimistic concurrency and idempotency |
-| GET    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Read exact model pricing bindings for one discovered CLI runtime |
-| PUT    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Replace one discovered CLI runtime's complete exact pricing binding set with optimistic concurrency and idempotency |
-| POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
+| GET    | `/api/v1/providers/{id}/pricing` | Read the provider entry's pricing adjustment (`null` = list price) |
+| PUT    | `/api/v1/providers/{id}/pricing` | Set the provider entry's pricing adjustment for every agent using it |
+| DELETE | `/api/v1/providers/{id}/pricing` | Remove the adjustment (`?version=`), back to list price |
+| GET    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Read a CLI runtime's pricing adjustment |
+| PUT    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Set a CLI runtime's pricing adjustment |
+| DELETE | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Remove a CLI runtime's pricing adjustment |
+| POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at`; a successful test clears stored auth failures |
 | GET    | `/api/v1/providers/{id}/usage` | Account usage (rate-limit windows) for the entry, e.g. ChatGPT's 5h/weekly windows; `source` is `probe` when live data was fetched, `unknown` (empty `windows`, a `detail` message) otherwise — only ChatGPT-OAuth (Codex backend) entries are probeable today |
 | DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
 | POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation. Browser flows require `redirect_origin` to be a trusted origin: a configured `cors_origins` / `public_base_url` entry, the server's own serving origin, or the origin the request itself arrived from (`Origin` header, else dialed `Host`) |
 | GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |
 | POST   | `/api/v1/provider-authorizations/{id}/cancel` | Cancel a non-terminal provider authorization using `expected_version` |
+
+Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
+when no provider outcome has been recorded. Health contains `status`
+(`healthy`, `backoff`, or `error`), `consecutive_failures`,
+`last_error_kind`, redacted `last_error_message`, `last_failure_at`, and
+`backoff_until`. A timed backoff stops new Task dispatch and leaves queued
+Agent Chat turns waiting without consuming attempts. Auth failures have a
+`null` backoff time and remain unavailable until `POST /providers/{id}/test`
+succeeds. The connection test itself updates the health row.
 | GET    | `/api/v1/provider-authorizations/{provider}/callback` | Complete a browser callback after validating the protected state and trusted redirect origin |
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
 | POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |
@@ -1370,69 +1384,96 @@ and is not silently applied to a context-sensitive estimate. Each row also
 includes its immutable `rate_revision_id`; this identifies the exact rate
 revision and is intentionally distinct from the containing `snapshot_id`.
 
-### Exact provider and CLI-runtime pricing
+### Pricing adjustments
 
-`GET`/`PUT /api/v1/providers/{id}/pricing` and
-`GET`/`PUT /api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing`
-configure one exact pricing subject. A subject is a provider entry or one discovered
-daemon/runtime revision; disconnecting or deleting it cannot erase bindings or
-usage history. Its non-secret `subject_revision_digest` covers provider/runtime
-kind, credential method, endpoint class, daemon/runtime fingerprint where
-applicable, and schema revision. A label-only rename does not change the digest;
-changing one of those identity inputs creates a new subject revision. `GET`
-returns:
+Forge prices every run automatically. At admission it matches the agent's
+runtime model to one models.dev row and freezes that price for the run. Owners
+only say how their price differs from the list price.
+
+The models.dev row is chosen in this order:
+
+1. a pin on the agent (`catalog_provider_id` and optionally `catalog_model_id`),
+2. a pin on the agent's provider entry or CLI runtime (`catalog_provider_id`),
+3. a `provider/model` runtime id,
+4. the provider that bills the subject directly (`openai` for OpenAI entries
+   and Codex, `google` for Gemini, `anthropic` for Claude Code, `xai`,
+   `openrouter`),
+5. the provider that publishes the model family (`gpt-`→`openai`,
+   `claude-`→`anthropic`, `gemini-`→`google`, `glm-`→`zai`, `grok-`→`xai`,
+   `deepseek-`, `kimi-`→`moonshotai`, `qwen`→`alibaba`, `mistral`/`devstral`/
+   `codestral`→`mistral`),
+6. the only provider listing the model.
+
+Otherwise the run is unpriced (`missing_binding`) and the agent's pricing
+reports `ambiguous` or `not_in_catalog` so the owner can pin a row.
+
+An adjustment has a `mode`:
+
+- `list` — models.dev rates unchanged (useful with a pin).
+- `discount` — models.dev rates, context tiers included, reduced by
+  `discount_percent` (decimal text, 0–100, at most two decimals).
+- `fixed` — `fixed_rates` (`RateBuckets`: input, output, cache-read,
+  cache-write USD per one million tokens); models.dev is not consulted.
+
+The adjustment on a provider entry or CLI runtime applies to every agent that
+runs through it. An agent's own adjustment replaces it entirely.
+
+| Method | Path | Body / query | Response |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/providers/{id}/pricing` | — | `SubjectPricingResponse` |
+| `PUT` | `/api/v1/providers/{id}/pricing` | `UpdatePricingSettingsRequest` | `SubjectPricingResponse` |
+| `DELETE` | `/api/v1/providers/{id}/pricing` | `?version=` | `SubjectPricingResponse` |
+| `GET`/`PUT`/`DELETE` | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | same | `SubjectPricingResponse` |
+| `GET`/`PUT`/`DELETE` | `/api/v1/agents/{id}/pricing` | same | `AgentPricing` |
 
 ```json
+PUT /api/v1/providers/{id}/pricing
 {
-  "subject_id": "provider-uuid",
-  "subject_revision_digest": "sha256:...",
-  "version": 3,
-  "bindings": [
-    {
-      "id": "binding-uuid",
-      "runtime_model": "gpt-5.6-terra",
-      "subject_revision_digest": "sha256:...",
-      "source_kind": "models_dev_catalog",
-      "catalog_provider_id": "openai",
-      "catalog_model_id": "gpt-5.6-terra",
-      "catalog_rate_revision_id": "rate-revision-uuid",
-      "manual_rates": null,
-      "effective_at": "2026-09-07T12:05:00Z",
-      "retired_at": null,
-      "version": 1
-    }
-  ]
+  "mode": "discount",
+  "discount_percent": "20",
+  "fixed_rates": null,
+  "catalog_provider_id": "zai",
+  "catalog_model_id": null,
+  "expected_version": 0
 }
 ```
 
-`PUT` replaces the complete desired binding set and carries
-`expected_version`, a stable `idempotency_key`,
-`subject_revision_digest`, and each binding's `runtime_model`, `source_kind`,
-catalog identifiers, or manual `RateBuckets`. The four manual/catalog buckets
-are input, output, cache-read, and cache-write USD rates per one million
-tokens. Money and rates use decimal strings, never client-side floating-point
-arithmetic. Every manual edit creates an immutable rate revision; retirement
-affects future admissions only, and stale writes return `409` without merging.
-Model identifiers are request-body/query fields rather than path segments, so
-valid provider-scoped IDs containing `/` remain addressable.
+`SubjectPricingResponse.settings` is `null` when no adjustment exists (list
+price, inferred rows). `expected_version` is `0` to create and the current
+`version` afterwards; a stale write returns `409`. `DELETE` removes the
+adjustment so the subject returns to list price, or the agent inherits its
+provider's setting again. `catalog_model_id` is accepted only on an agent, and
+a pin must name a row in the active catalog.
 
-Resolution is exact and ordered: an active manual override for the exact
-subject revision and runtime model wins, then an exact active models.dev
-binding, otherwise the event is unpriced. Forge does not fuzzy-match names,
-infer a model-family price, strip prefixes, or use prefix heuristics. The
-reviewed built-in mappings cover only direct OpenAI Platform (`openai`), xAI
-(`xai`), Gemini API (`google`), and canonical OpenRouter (`openrouter`) subjects.
-ChatGPT subscription OAuth, `openai_compatible`, custom base URLs, Smith, and
-every discovered CLI runtime have no automatic mapping and require an explicit
-exact binding. Public API list rates are estimates and may not describe a
-subscription plan, private contract, credits, discounts, or other provider
-billing terms.
+`GET /api/v1/agents/{id}/pricing` also previews the price the agent's next run
+would freeze:
 
-The measurable rate contract has one cache-write bucket. Providers may bill
-cache writes differently by TTL or service mode; Forge does not infer a
-TTL-specific rate when the runtime supplies no such evidence. Configure a
-manual exact binding when the selected catalog row does not match the runtime's
-billing mode.
+```json
+{
+  "agent_id": "agent-uuid",
+  "runtime_model": "glm-5.3",
+  "settings": null,
+  "provider_settings": {"mode": "discount", "discount_percent": "20", "...": "..."},
+  "source": "provider",
+  "status": "priced",
+  "catalog_provider_id": "zai",
+  "catalog_model_id": "glm-5.3",
+  "catalog_rates": {"input": {"currency": "USD", "decimal_per_million": "0.6"}, "...": null},
+  "effective_rates": {"input": {"currency": "USD", "decimal_per_million": "0.48"}, "...": null},
+  "candidate_providers": []
+}
+```
+
+`status` is `priced`, `no_model`, `catalog_absent`, `not_in_catalog`, or
+`ambiguous` (with `candidate_providers`). A change applies to runs admitted
+afterwards; frozen selections are never repriced.
+
+Internally the pricing subject (provider entry or CLI runtime), its
+non-secret revision, and the binding a run resolves are created at admission.
+Discounted and fixed prices become manual rate revisions, so selections keep
+pointing at one immutable rate revision. Public list rates remain estimates
+and may not describe a subscription plan or private contract; set a discount
+(100% for a flat subscription) or fixed rates when they differ.
 
 ### Retrospective estimation
 
