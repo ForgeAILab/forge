@@ -352,13 +352,8 @@ mod tests {
         sink.reasoning_delta("hidden", true).await;
         assert_eq!(counter.calls.load(Ordering::SeqCst), 2);
 
-        sink.tool_call_started(
-            "call-1",
-            "forge_scope_read",
-            &[],
-            &serde_json::Map::new(),
-        )
-        .await;
+        sink.tool_call_started("call-1", "forge_scope_read", &[], &serde_json::Map::new())
+            .await;
         assert_eq!(counter.calls.load(Ordering::SeqCst), 3);
 
         sink.tool_call_finished(
