@@ -1999,6 +1999,26 @@ mod tests {
         assert_eq!(event.estimated_nano_usd, Some(11_375_000_000));
         assert_eq!(event.cache_write_tokens, None);
 
+        // models.dev lists GLM with `cache_write: 0`: a zero rate is priced
+        // as free, so omitting that counter hides no spend either.
+        let zero_write = rate_revision("rate-zero-write", Some(0));
+        let mut selection = priced_selection(&zero_write.id);
+        selection.selection_digest = frozen_selection(&selection, Some(&zero_write), None)
+            .expect("priced selection freezes")
+            .selection_digest;
+        let event = usage_event_for_report_with_rate(
+            &invocation,
+            &selection,
+            &report,
+            "2026-09-08T00:00:02Z",
+            Some(&zero_write),
+        )
+        .await
+        .expect("report converts")
+        .expect("evidence is retained");
+        assert_eq!(event.cost_kind, db::UsageCostKind::Estimated);
+        assert_eq!(event.estimated_nano_usd, Some(11_375_000_000));
+
         let priced_write = rate_revision("rate-priced-write", Some(1_250_000_000));
         let mut selection = priced_selection(&priced_write.id);
         selection.selection_digest = frozen_selection(&selection, Some(&priced_write), None)
@@ -2019,6 +2039,59 @@ mod tests {
             event.coverage_reason_code,
             Some(CostCoverageReasonCode::Unmetered)
         );
+    }
+
+    /// gpt-5.6-sol-shaped pricing: a context tier from 272K. The request's
+    /// prompt size picks the band; without it the estimate cannot be made.
+    #[tokio::test]
+    async fn context_tier_is_selected_from_the_request_prompt_size() {
+        let invocation = invocation();
+        let mut rate = rate_revision("rate-tiered", Some(1_250_000_000));
+        rate.tiers_json = r#"[{"input":2.5,"output":20,"cache_read":0.25,"cache_write":2.5,"tier":{"type":"context","size":272000}}]"#.to_owned();
+        let mut selection = priced_selection(&rate.id);
+        selection.selection_digest = frozen_selection(&selection, Some(&rate), None)
+            .expect("tiered selection freezes")
+            .selection_digest;
+        let counters = executors::UsageCounters {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+        };
+        let settle = |context_tokens: Option<u64>| {
+            let mut report = UsageReport::metered("tiered", counters.clone());
+            report.context_tokens = context_tokens;
+            let selection = selection.clone();
+            let rate = rate.clone();
+            let invocation = invocation.clone();
+            async move {
+                usage_event_for_report_with_rate(
+                    &invocation,
+                    &selection,
+                    &report,
+                    "2026-09-08T00:00:02Z",
+                    Some(&rate),
+                )
+                .await
+                .expect("report converts")
+                .expect("evidence is retained")
+            }
+        };
+
+        let small = settle(Some(100_000)).await;
+        assert_eq!(small.cost_kind, db::UsageCostKind::Estimated);
+        // Base band: 1.25 + 10.00 USD.
+        assert_eq!(small.estimated_nano_usd, Some(11_250_000_000));
+        assert_eq!(small.selected_tier, None);
+
+        let large = settle(Some(300_000)).await;
+        assert_eq!(large.cost_kind, db::UsageCostKind::Estimated);
+        // Tier band: 2.50 + 20.00 USD.
+        assert_eq!(large.estimated_nano_usd, Some(22_500_000_000));
+        assert_eq!(large.selected_tier.as_deref(), Some("context_272000"));
+
+        let unknown = settle(None).await;
+        assert_ne!(unknown.cost_kind, db::UsageCostKind::Estimated);
     }
 
     #[tokio::test]

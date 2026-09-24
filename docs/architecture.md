@@ -1257,7 +1257,13 @@ a started obligation `unsettled` only when no replayable provider result
 survives, and any provider retry receives a new attempt identity.
 
 Usage events carry disjoint nullable input, output, cache-read, and cache-write
-counters. Explicit metered zero is distinct from absent telemetry. A
+counters. Explicit metered zero is distinct from absent telemetry. The native
+runtime's provider adapters split one reported prompt total into those buckets
+and drop a bucket only when it is zero, so the host reports every bucket of a
+metered attempt (absent ones as `0`) and each attempt's prompt size (the three
+input buckets) as `context_tokens` for context-tier selection. A bucket a
+report omits blocks the estimate only when the frozen rate charges a positive
+rate for it. A
 reported-money-only call creates one event with null counters; a settled call
 with neither counters nor reported money creates no event while its invocation
 remains visible as unmetered. Event and invocation idempotency keys come from

@@ -785,7 +785,7 @@ pub(crate) fn usage_report_from_host(
             cache_write_tokens: report.cache_write_tokens,
         },
         telemetry_state,
-        context_tokens: None,
+        context_tokens: report.prompt_tokens(),
         selected_tier: None,
         reported_cost_usd: None,
         outcome: None,

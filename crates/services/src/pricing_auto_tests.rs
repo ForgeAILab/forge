@@ -10,7 +10,7 @@ use db::{
 };
 
 use crate::{
-    pricing::{parse_models_dev_catalog, PricingCatalogRepository},
+    pricing::{self, parse_models_dev_catalog, PricingCatalogRepository},
     pricing_auto::{prepare_price_in_tx, SubjectRef},
     pricing_db::SqlitePricingRepository,
 };
@@ -29,6 +29,23 @@ async fn database() -> Arc<db::SqliteDb> {
 }
 
 async fn seed(db: &Arc<db::SqliteDb>) {
+    seed_with_catalog(
+        db,
+        br#"{
+      "zai": {"id":"zai","name":"Z.ai","models":{
+        "glm-5.3":{"id":"glm-5.3","last_updated":"2026-09-01",
+          "cost":{"input":1,"output":2}}
+      }},
+      "requesty": {"id":"requesty","name":"Requesty","models":{
+        "glm-5.3":{"id":"glm-5.3","last_updated":"2026-09-01",
+          "cost":{"input":3,"output":4}}
+      }}
+    }"#,
+    )
+    .await;
+}
+
+async fn seed_with_catalog(db: &Arc<db::SqliteDb>, body: &[u8]) {
     let now = db::now_rfc3339();
     UserRepo::create_user(
         &**db,
@@ -99,16 +116,6 @@ async fn seed(db: &Arc<db::SqliteDb>) {
     .await
     .expect("agent identity");
 
-    let body = br#"{
-      "zai": {"id":"zai","name":"Z.ai","models":{
-        "glm-5.3":{"id":"glm-5.3","last_updated":"2026-09-01",
-          "cost":{"input":1,"output":2}}
-      }},
-      "requesty": {"id":"requesty","name":"Requesty","models":{
-        "glm-5.3":{"id":"glm-5.3","last_updated":"2026-09-01",
-          "cost":{"input":3,"output":4}}
-      }}
-    }"#;
     let when = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let snapshot = parse_models_dev_catalog(body)
         .expect("catalog parses")
@@ -256,4 +263,95 @@ async fn materializes_catalog_discount_and_agent_fixed_rates_without_duplicate_b
     .await
     .expect("active agent bindings after repeat");
     assert_eq!((before, after), (1, 1));
+}
+
+/// A discount on a catalog row with context tiers (gpt-5.6's 272K band)
+/// scales every band, and the manual price it materializes must still freeze
+/// into a valid settlement selection.
+#[tokio::test]
+async fn discount_on_a_tiered_catalog_row_scales_every_band_and_freezes() {
+    let db = database().await;
+    seed_with_catalog(
+        &db,
+        br#"{
+      "zai": {"id":"zai","name":"Z.ai","models":{
+        "glm-5.3":{"id":"glm-5.3","last_updated":"2026-09-01",
+          "cost":{"input":4,"output":20,"cache_read":0.4,
+            "tiers":[{"input":8,"output":30,"cache_read":0.8,
+              "tier":{"type":"context","size":272000}}]}}
+      }}
+    }"#,
+    )
+    .await;
+    PricingSubjectRepo::upsert_pricing_adjustment(
+        &*db,
+        UpsertPricingAdjustment {
+            owner_user_id: OWNER.to_owned(),
+            scope: PricingAdjustmentScope::ProviderEntry(PROVIDER.to_owned()),
+            mode: PricingAdjustmentMode::Discount,
+            discount_bps: Some(2_500),
+            fixed_rates: RateBuckets::default(),
+            catalog_provider_id: None,
+            catalog_model_id: None,
+            expected_version: 0,
+            now: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("provider discount");
+
+    let (_, resolved) = prepare_and_resolve(&db, None).await;
+    let rate = resolved.rate.expect("discounted rate");
+    assert_eq!(rate.source_kind, PricingRateSourceKind::ManualOverride);
+    assert_eq!(
+        rate.rates,
+        RateBuckets::new(
+            Some(3_000_000_000),
+            Some(15_000_000_000),
+            Some(300_000_000),
+            None
+        )
+    );
+    let tiers = pricing::parse_persisted_context_tiers(&rate.tiers_json).expect("tiers parse");
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers[0].threshold_tokens, 272_000);
+    let band = tiers[0].rates;
+    assert_eq!(
+        [band.input, band.output, band.cache_read, band.cache_write]
+            .map(|rate| rate.map(pricing::NanoUsdPerMillion::as_nano_usd_per_million)),
+        [
+            Some(6_000_000_000),
+            Some(22_500_000_000),
+            Some(600_000_000),
+            None
+        ]
+    );
+
+    let selection = pricing::FrozenPriceSelection::from_parts(
+        Some("subject".to_owned()),
+        Some("subject-digest".to_owned()),
+        Some(MODEL.to_owned()),
+        Some("candidate".to_owned()),
+        0,
+        None,
+        None,
+        None,
+        Some(pricing::PricingSourceKind::ManualOverride),
+        Some(rate.id.clone()),
+        None,
+        Some(pricing::EventBucketRates::new(
+            Some(pricing::NanoUsdPerMillion::from_nano_usd(3_000_000_000).unwrap()),
+            Some(pricing::NanoUsdPerMillion::from_nano_usd(15_000_000_000).unwrap()),
+            Some(pricing::NanoUsdPerMillion::from_nano_usd(300_000_000).unwrap()),
+            None,
+        )),
+        tiers,
+        None,
+        pricing::CatalogFreshness::NotApplicable,
+        pricing::PriceSelectionStatus::Priced,
+        None,
+    );
+    selection
+        .validate()
+        .expect("a discounted tiered price freezes into a valid selection");
 }

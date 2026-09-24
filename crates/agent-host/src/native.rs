@@ -655,19 +655,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .filter(|record| record.source == UsageSource::ProviderAttempt)
             .enumerate()
             .map(|(index, record)| {
-                let output_tokens = match (
-                    sparse_counter(&record.delta, CounterKind::Output),
-                    sparse_counter(&record.delta, CounterKind::Reasoning),
-                ) {
-                    (Some(output), Some(reasoning)) => {
-                        Some(output.checked_add(reasoning).ok_or_else(|| {
-                            AgentHostError::Runtime("usage counter overflow".to_owned())
-                        })?)
-                    }
-                    (Some(output), None) => Some(output),
-                    (None, Some(reasoning)) => Some(reasoning),
-                    (None, None) => None,
-                };
+                let counters = record_counters(&record.delta)?;
                 let request_id = record.provenance.request.as_ref().map(ToString::to_string);
                 let attempt_id = record.provenance.attempt.as_ref().map(ToString::to_string);
                 let report_id = format!(
@@ -679,22 +667,17 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                         .unwrap_or(turn_id.as_str()),
                     index
                 );
-                let has_counters = sparse_counter(&record.delta, CounterKind::InputUncached)
-                    .is_some()
-                    || output_tokens.is_some()
-                    || sparse_counter(&record.delta, CounterKind::InputCached).is_some()
-                    || sparse_counter(&record.delta, CounterKind::CacheWrite).is_some();
                 Ok(AgentTurnUsageReport {
                     report_id,
                     request_id,
                     attempt_id,
                     provider_id: Some(request.provider.provider.clone()),
                     model_id: Some(request.provider.model.clone()),
-                    input_tokens: sparse_counter(&record.delta, CounterKind::InputUncached),
-                    output_tokens,
-                    cache_read_tokens: sparse_counter(&record.delta, CounterKind::InputCached),
-                    cache_write_tokens: sparse_counter(&record.delta, CounterKind::CacheWrite),
-                    telemetry_state: if has_counters {
+                    input_tokens: counters.map(|counters| counters[0]),
+                    output_tokens: counters.map(|counters| counters[1]),
+                    cache_read_tokens: counters.map(|counters| counters[2]),
+                    cache_write_tokens: counters.map(|counters| counters[3]),
+                    telemetry_state: if counters.is_some() {
                         AgentTurnTelemetryState::Metered
                     } else {
                         AgentTurnTelemetryState::Unmetered
@@ -783,6 +766,34 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         Ok(())
     }
+}
+
+/// One provider attempt's disjoint `[input, output, cache_read, cache_write]`
+/// counters, or `None` when the attempt reported no usage.
+///
+/// Every provider adapter splits one reported prompt total into these buckets
+/// and leaves a bucket out of the delta only when it is zero, so in a metered
+/// record an absent bucket is a known zero. Reporting it as unknown left every
+/// Gemini turn without a cache hit, and every full cache hit, uncosted.
+fn record_counters(
+    delta: &agent_runtime::core::usage::UsageDelta,
+) -> Result<Option<[u64; 4]>, AgentHostError> {
+    let buckets = [
+        sparse_counter(delta, CounterKind::InputUncached),
+        sparse_counter(delta, CounterKind::Output),
+        sparse_counter(delta, CounterKind::Reasoning),
+        sparse_counter(delta, CounterKind::InputCached),
+        sparse_counter(delta, CounterKind::CacheWrite),
+    ];
+    if buckets.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let [input, output, reasoning, cache_read, cache_write] =
+        buckets.map(Option::unwrap_or_default);
+    let output = output
+        .checked_add(reasoning)
+        .ok_or_else(|| AgentHostError::Runtime("usage counter overflow".to_owned()))?;
+    Ok(Some([input, output, cache_read, cache_write]))
 }
 
 fn sparse_counter(
@@ -1145,6 +1156,59 @@ mod workspace_tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_counter_tests {
+    use super::*;
+    use agent_runtime::core::usage::UsageDelta;
+
+    #[test]
+    fn a_metered_attempt_reports_every_bucket_with_absent_ones_as_zero() {
+        // Gemini with no cache hit: the adapter omits the zero cached bucket.
+        let no_cache_hit = UsageDelta::new()
+            .with(CounterKind::InputUncached, 3_847)
+            .with(CounterKind::Output, 400)
+            .with(CounterKind::Reasoning, 63);
+        assert_eq!(
+            record_counters(&no_cache_hit).expect("counters fit"),
+            Some([3_847, 463, 0, 0])
+        );
+
+        // A full cache hit omits the zero uncached bucket instead.
+        let full_hit = UsageDelta::new()
+            .with(CounterKind::InputCached, 57_025)
+            .with(CounterKind::Output, 12);
+        assert_eq!(
+            record_counters(&full_hit).expect("counters fit"),
+            Some([0, 12, 57_025, 0])
+        );
+
+        assert_eq!(record_counters(&UsageDelta::new()).expect("empty"), None);
+    }
+
+    #[test]
+    fn prompt_size_is_the_three_input_buckets_of_one_attempt() {
+        let report = AgentTurnUsageReport {
+            report_id: "r".to_owned(),
+            request_id: None,
+            attempt_id: None,
+            provider_id: None,
+            model_id: None,
+            input_tokens: Some(3_847),
+            output_tokens: Some(463),
+            cache_read_tokens: Some(270_000),
+            cache_write_tokens: Some(0),
+            telemetry_state: AgentTurnTelemetryState::Metered,
+            failed: false,
+        };
+        assert_eq!(report.prompt_tokens(), Some(273_847));
+        let unmetered = AgentTurnUsageReport {
+            telemetry_state: AgentTurnTelemetryState::Unmetered,
+            ..report
+        };
+        assert_eq!(unmetered.prompt_tokens(), None);
     }
 }
 

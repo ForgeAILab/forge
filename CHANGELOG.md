@@ -6,6 +6,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Native Gemini runs are costed again. The runtime leaves a zero bucket out of
+  a usage delta, so a turn with no cache hit (or a full cache hit) arrived with
+  an unknown cache-read (or input) counter and was stored `unmetered`; on the
+  live data that was about one in six Gemini usage events. A metered attempt
+  now reports every bucket, absent ones as zero. Events already recorded are
+  immutable and keep their coverage.
+- Models with context tiers (gpt-5.6's 272K band, the 200K tiers on Claude and
+  Gemini Pro) are costed. Native usage never carried the request's prompt size,
+  so every event under a tiered rate was left `unresolved_tier`; each attempt
+  now reports its prompt size and the matching band is applied.
+- A `discount` adjustment on a tiered model no longer fails to freeze: the
+  discounted price keeps the catalog's context bands, which the settlement
+  validator rejected for a manual price.
+- A zero rate (models.dev lists GLM with `cache_write: 0`) no longer makes a
+  report that omits that counter unpriceable.
+
 ## [0.13.0] - 2026-09-23
 
 ### Breaking

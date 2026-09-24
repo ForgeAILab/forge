@@ -303,14 +303,30 @@ pub struct AgentTurnUsageReport {
     pub attempt_id: Option<String>,
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
-    /// Sparse disjoint counters. `None` means the provider did not expose that
-    /// bucket; `Some(0)` is an explicit zero when the source supplied it.
+    /// Disjoint counters. A metered report carries all four, with `Some(0)`
+    /// for a bucket the provider split out as zero; `None` appears only on an
+    /// unmetered report.
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub telemetry_state: AgentTurnTelemetryState,
     pub failed: bool,
+}
+
+impl AgentTurnUsageReport {
+    /// Prompt size of this one provider request: the three disjoint input
+    /// buckets together. This is what context-tier pricing (for example the
+    /// over-272K band) is keyed on.
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        if self.telemetry_state != AgentTurnTelemetryState::Metered {
+            return None;
+        }
+        self.input_tokens
+            .unwrap_or(0)
+            .checked_add(self.cache_read_tokens.unwrap_or(0))?
+            .checked_add(self.cache_write_tokens.unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

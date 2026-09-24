@@ -3032,9 +3032,9 @@ impl FrozenPriceSelection {
     /// Buckets this frozen selection can charge for, in formula order
     /// (`input`, `output`, `cache_read`, `cache_write`).
     ///
-    /// A bucket with no rate in the base band and none in any context tier
-    /// cannot move the total, so a report that omits its counter has hidden
-    /// no spend. Callers use this to tell an omitted-but-free bucket (safe to
+    /// A bucket with no positive rate in the base band or any context tier
+    /// cannot move the total (models.dev lists `cache_write: 0` for GLM), so a
+    /// report that omits its counter has hidden no spend. Callers use this to tell an omitted-but-free bucket (safe to
     /// read as zero) from an omitted-but-priced one (a real gap).
     pub fn priced_buckets(&self) -> [bool; 4] {
         let mut priced = [false; 4];
@@ -3044,7 +3044,7 @@ impl FrozenPriceSelection {
             .chain(self.tiers.iter().map(|tier| &tier.rates))
         {
             for (slot, rate) in priced.iter_mut().zip(rates.as_array()) {
-                *slot = *slot || rate.is_some();
+                *slot = *slot || rate.is_some_and(|rate| rate.as_nano_usd_per_million() > 0);
             }
         }
         priced
@@ -3197,19 +3197,20 @@ fn validate_frozen_selection_semantics(
                 return invalid("an unsourced selection cannot carry rate provenance");
             }
         }
+        // A manual price may keep context bands: a discount scales every band
+        // of the catalog row it came from (gpt-5.6's 272K tier, the 200K
+        // tiers on Claude and Gemini Pro), not just the base rate.
         Some(PricingSourceKind::ManualOverride) => {
             if selection.subject_id.is_none()
                 || selection.runtime_model.is_none()
                 || selection.rate_revision_id.is_none()
                 || selection.rates.is_none()
                 || catalog_provenance_present
-                || !selection.tiers.is_empty()
-                || selection.legacy_context_over_200k.is_some()
                 || selection.catalog_freshness != CatalogFreshness::NotApplicable
                 || selection.status != PriceSelectionStatus::Priced
             {
                 return invalid(
-                    "a manual override must carry its subject, model, rate and rates only",
+                    "a manual override must carry its subject, model, rate and rates, and no catalog provenance",
                 );
             }
         }
