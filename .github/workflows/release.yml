@@ -280,9 +280,11 @@ jobs:
           test -s dist/web/dist/index.html
           archive="${{ matrix.artifact }}.tar.gz"
           tar -czf "$archive" -C dist forge forge-ctl forge-solo web
+          tar -tzf "$archive" > "$archive.contents"
           for expected in forge forge-ctl forge-solo web/dist/index.html; do
-            tar -tzf "$archive" | grep -Fxq "$expected"
+            grep -Fx "$expected" "$archive.contents" >/dev/null
           done
+          rm "$archive.contents"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
