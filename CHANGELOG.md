@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-09-24
+
 ### Fixed
 
 - Native Gemini runs are costed again. The runtime leaves a zero bucket out of
