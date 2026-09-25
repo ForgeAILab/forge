@@ -1,6 +1,6 @@
 {
   "name": "@forgeailab/forge",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "NPX bootstrapper for the Forge local-first coding agent workflow engine",
   "license": "MIT",
   "homepage": "https://github.com/ForgeAILab/forge#readme",
