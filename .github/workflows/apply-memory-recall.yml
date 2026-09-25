@@ -1,0 +1,56 @@
+name: Apply bounded memory recall
+
+on:
+  push:
+    branches:
+      - feat/memory-recall-lite
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct implementation payload
+        run: |
+          cat tools/memory-recall-payload/apply.*.b64 | base64 --decode > tools/apply_memory_recall.py
+          cat tools/memory-recall-payload/service.*.b64 | base64 --decode > crates/services/src/memory_recall.rs
+          cat tools/memory-recall-payload/test.*.b64 | base64 --decode > crates/services/tests/memory_recall.rs
+          cat tools/memory-recall-payload/doc.*.b64 | base64 --decode > docs/memory-recall.md
+
+      - name: Apply implementation
+        run: python tools/apply_memory_recall.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Check services and tests
+        run: cargo check -p services --tests --locked
+
+      - name: Run recall integration tests
+        run: cargo test -p services --test memory_recall --locked
+
+      - name: Run recall and prompt unit tests
+        run: |
+          cargo test -p services memory_recall --lib --locked
+          cargo test -p services effective_prompt_appends_bounded_memory --lib --locked
+
+      - name: Lint changed Rust surface
+        run: cargo clippy -p services --tests --locked -- -D warnings
+
+      - name: Commit verified implementation
+        run: |
+          rm -rf tools/memory-recall-payload
+          rm tools/apply_memory_recall.py .github/workflows/apply-memory-recall.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "forge-memory-bot"
+          git config user.email "forge-memory-bot@users.noreply.github.com"
+          git commit -m "feat(memory): add bounded task recall"
+          git push origin HEAD:${GITHUB_REF_NAME}
