@@ -43,7 +43,18 @@ impl TaskService {
         validate_required("task_id", task_id)?;
         validate_required("depends_on_id", depends_on_id)?;
         TaskDependencyRepo::remove_dependency(&*self.db, task_id, depends_on_id).await?;
-        self.clear_resolved_dependency_block(task_id).await
+        self.clear_resolved_dependency_block(task_id).await?;
+
+        let wake_reason = format!("dependency {depends_on_id} removed");
+        if let Err(error) = crate::wake_task_dispatch(&self.db, task_id, &wake_reason).await {
+            tracing::warn!(
+                task_id = %task_id,
+                depends_on_id = %depends_on_id,
+                %error,
+                "dependency removed but waking Task dispatch failed"
+            );
+        }
+        Ok(())
     }
 
     /// Adds or removes one prerequisite edge on behalf of a Project Agent.
