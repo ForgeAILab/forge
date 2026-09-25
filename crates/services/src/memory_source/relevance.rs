@@ -9,11 +9,10 @@ const RRF_K: u64 = 60;
 const RRF_SCALE: u64 = 1_000_000;
 
 const STOP_WORDS: &[&str] = &[
-    "a", "about", "after", "an", "and", "are", "as", "at", "be", "before", "by", "can",
-    "could", "did", "do", "does", "for", "from", "had", "has", "have", "how", "i", "in",
-    "into", "is", "it", "of", "on", "or", "our", "should", "that", "the", "this", "to",
-    "was", "we", "were", "what", "when", "where", "which", "why", "with", "would", "you",
-    "your",
+    "a", "about", "after", "an", "and", "are", "as", "at", "be", "before", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "how", "i", "in", "into", "is", "it",
+    "of", "on", "or", "our", "should", "that", "the", "this", "to", "was", "we", "were", "what",
+    "when", "where", "which", "why", "with", "would", "you", "your",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,10 +107,7 @@ pub(super) fn rank_candidates(
     candidates
 }
 
-pub(super) fn selection_reason(
-    candidate: &RecallCandidate,
-    query_terms: &[String],
-) -> String {
+pub(super) fn selection_reason(candidate: &RecallCandidate, query_terms: &[String]) -> String {
     let matched = candidate.matched_terms.iter().cloned().collect::<Vec<_>>();
     if candidate.all_terms_match {
         return format!(
