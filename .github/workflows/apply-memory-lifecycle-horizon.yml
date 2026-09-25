@@ -1,0 +1,59 @@
+name: Apply Memory Lifecycle Horizon Fix
+
+on:
+  push:
+    branches:
+      - feat/lightweight-memory-recall
+    paths:
+      - scripts/apply_memory_lifecycle_horizon_patch.py
+      - .github/workflows/apply-memory-lifecycle-horizon.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: feat/lightweight-memory-recall
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Apply patch
+        run: python3 scripts/apply_memory_lifecycle_horizon_patch.py
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Focused tests
+        run: |
+          cargo test -p db --lib test_scoped_memory_cutoff_freezes_lifecycle_at_admission -- --nocapture
+          cargo test -p db --lib test_scoped_memory_lifecycle_excludes_retracted_and_keeps_audit -- --nocapture
+          cargo test -p services --lib memory_context::tests -- --nocapture
+          cargo test -p services --test memory_recall -- --nocapture
+
+      - name: Focused clippy
+        run: |
+          cargo clippy -p db --lib -- -D warnings
+          cargo clippy -p services --lib --test memory_recall -- -D warnings
+
+      - name: Commit validated code
+        run: |
+          git checkout -- .github/workflows/apply-memory-lifecycle-horizon.yml
+          rm scripts/apply_memory_lifecycle_horizon_patch.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(memory): freeze lifecycle state at recall admission"
+          git push origin HEAD:feat/lightweight-memory-recall
