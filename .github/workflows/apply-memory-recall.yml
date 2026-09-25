@@ -27,30 +27,55 @@ jobs:
       - name: Apply implementation
         run: python tools/apply_memory_recall.py
 
-      - name: Format
-        run: cargo fmt --all
-
-      - name: Check services and tests
-        run: cargo check -p services --tests --locked
-
-      - name: Run recall integration tests
-        run: cargo test -p services --test memory_recall --locked
-
-      - name: Run recall and prompt unit tests
+      - name: Verify and publish result
+        shell: bash
         run: |
-          cargo test -p services memory_recall --lib --locked
-          cargo test -p services effective_prompt_appends_bounded_memory --lib --locked
+          set -uo pipefail
+          LOG=tools/memory-recall-check.log
+          : > "$LOG"
 
-      - name: Lint changed Rust surface
-        run: cargo clippy -p services --tests --locked -- -D warnings
+          run_check() {
+            local label="$1"
+            shift
+            echo "===== ${label} =====" | tee -a "$LOG"
+            "$@" 2>&1 | tee -a "$LOG"
+            local status=${PIPESTATUS[0]}
+            echo | tee -a "$LOG"
+            return "$status"
+          }
 
-      - name: Commit verified implementation
-        run: |
+          phase=""
+          run_check "cargo fmt --all" cargo fmt --all || phase="format"
+          if [[ -z "$phase" ]]; then
+            run_check "cargo check -p services --tests --locked" cargo check -p services --tests --locked || phase="check"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services --test memory_recall --locked" cargo test -p services --test memory_recall --locked || phase="integration-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services memory_recall --lib --locked" cargo test -p services memory_recall --lib --locked || phase="unit-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services effective_prompt_appends_bounded_memory --lib --locked" cargo test -p services effective_prompt_appends_bounded_memory --lib --locked || phase="prompt-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo clippy -p services --tests --locked -- -D warnings" cargo clippy -p services --tests --locked -- -D warnings || phase="clippy"
+          fi
+
           rm -rf tools/memory-recall-payload
           rm tools/apply_memory_recall.py .github/workflows/apply-memory-recall.yml
-          git add -A
-          git diff --cached --check
           git config user.name "forge-memory-bot"
           git config user.email "forge-memory-bot@users.noreply.github.com"
+
+          if [[ -n "$phase" ]]; then
+            git add -A
+            git commit -m "wip(memory): capture ${phase} diagnostics"
+            git push origin HEAD:${GITHUB_REF_NAME}
+            exit 1
+          fi
+
+          rm "$LOG"
+          git add -A
+          git diff --cached --check
           git commit -m "feat(memory): add bounded task recall"
           git push origin HEAD:${GITHUB_REF_NAME}
