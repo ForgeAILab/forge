@@ -31,6 +31,12 @@ const SMITH_LIMIT_STATUSES: &[&str] = &[
 /// Structured runtime-event error kinds that signal quota exhaustion.
 const SMITH_LIMIT_ERROR_KINDS: &[&str] = &["rate_limited", "limit_exhausted"];
 
+/// Smith `--approval` values. `ask` needs an interactive surface a Forge
+/// execution never has.
+const SMITH_APPROVAL_ASK: &str = "ask";
+const SMITH_APPROVAL_DENY: &str = "deny";
+const SMITH_APPROVAL_ALLOW_ALL: &str = "allow-all";
+
 /// Structured runtime-event error kinds that signal an auth failure a wait
 /// cannot cure.
 const SMITH_AUTH_ERROR_KINDS: &[&str] = &[
@@ -68,6 +74,11 @@ impl SmithAdapter {
             "stream-json".to_owned(),
         ];
 
+        // Forge always runs Smith headless, so nothing can answer an `ask`:
+        // Smith ends the whole run at the first tool call that needs a
+        // decision. Always pass a complete answer instead — allow by default,
+        // and reject back to the model (`deny`) where the agent asked for
+        // supervision, so the run continues rather than halting.
         let policy_is_yolo = matches!(
             config.permission_policy.as_ref(),
             Some(PermissionPolicy::Yolo)
@@ -75,19 +86,23 @@ impl SmithAdapter {
 
         if policy_is_yolo || config.yolo.unwrap_or(false) {
             adapter_args.push("--yolo".to_owned());
-        } else if let Some(ref approval) = config.approval {
+        } else {
+            let approval = match (
+                config.approval.as_deref(),
+                config.permission_policy.as_ref(),
+            ) {
+                (Some(approval), _) if approval.trim() == SMITH_APPROVAL_ASK => SMITH_APPROVAL_DENY,
+                (Some(approval), _) => approval.trim(),
+                (None, Some(PermissionPolicy::Yolo | PermissionPolicy::Auto)) => {
+                    SMITH_APPROVAL_ALLOW_ALL
+                }
+                (None, Some(PermissionPolicy::Supervised | PermissionPolicy::Plan)) => {
+                    SMITH_APPROVAL_DENY
+                }
+                (None, None) => SMITH_APPROVAL_ALLOW_ALL,
+            };
             adapter_args.push("--approval".to_owned());
-            adapter_args.push(approval.clone());
-        } else if let Some(ref policy) = config.permission_policy {
-            match policy {
-                PermissionPolicy::Yolo | PermissionPolicy::Auto => {
-                    adapter_args.push("--yolo".to_owned());
-                }
-                PermissionPolicy::Supervised | PermissionPolicy::Plan => {
-                    adapter_args.push("--approval".to_owned());
-                    adapter_args.push("ask".to_owned());
-                }
-            }
+            adapter_args.push(approval.to_owned());
         }
 
         if let Some(ref profile) = config.profile {
@@ -1264,6 +1279,61 @@ mod tests {
 
         assert!(args.contains(&"--yolo".to_owned()));
         assert!(!args.contains(&"--approval".to_owned()));
+    }
+
+    fn approval_flag(config: &SmithConfig) -> Option<String> {
+        let cmd = SmithAdapter::build_command(config, "test prompt");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        args.iter()
+            .position(|arg| arg == "--approval")
+            .map(|index| args[index + 1].clone())
+    }
+
+    #[test]
+    fn unset_approval_defaults_to_allow_all() {
+        // A headless run with Smith's own `ask` default halts at the first
+        // gated tool call, so Forge must always pass a complete answer.
+        assert_eq!(
+            approval_flag(&SmithConfig::default()).as_deref(),
+            Some("allow-all")
+        );
+    }
+
+    #[test]
+    fn supervised_policies_reject_instead_of_halting() {
+        for policy in [PermissionPolicy::Supervised, PermissionPolicy::Plan] {
+            let config = SmithConfig {
+                permission_policy: Some(policy),
+                ..SmithConfig::default()
+            };
+            assert_eq!(approval_flag(&config).as_deref(), Some("deny"));
+        }
+        let explicit_ask = SmithConfig {
+            approval: Some("ask".to_owned()),
+            ..SmithConfig::default()
+        };
+        assert_eq!(approval_flag(&explicit_ask).as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn explicit_complete_approval_passes_through() {
+        for value in ["deny", "allow-all"] {
+            let config = SmithConfig {
+                approval: Some(value.to_owned()),
+                permission_policy: Some(PermissionPolicy::Supervised),
+                ..SmithConfig::default()
+            };
+            assert_eq!(approval_flag(&config).as_deref(), Some(value));
+        }
+        let auto = SmithConfig {
+            permission_policy: Some(PermissionPolicy::Auto),
+            ..SmithConfig::default()
+        };
+        assert_eq!(approval_flag(&auto).as_deref(), Some("allow-all"));
     }
 
     #[test]
