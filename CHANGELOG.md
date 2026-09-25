@@ -10,6 +10,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native Task workers and planners now use deterministic structural context
+  compaction instead of a persistent Task LCM timeline. Existing native Task
+  sessions rotate once to discard the old LCM capability, preventing retries
+  from failing immediately with `LCM context cannot fit after bounded hard
+  compaction`; Main and Project Agent chats continue to use LCM.
 - Removing a Task dependency now wakes the dependent when deterministic dependency-gate dispatch had parked it.
 - A Project whose linked repository has no commit on `main` yet (a scaffold
   still being written) no longer parks every Task permanently. The dispatcher

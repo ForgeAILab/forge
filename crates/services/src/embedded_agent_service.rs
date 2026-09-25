@@ -1478,9 +1478,16 @@ impl EmbeddedAgentService {
         if let Some(active) =
             AgentSessionRepo::get_active_agent_session(&*self.db, &identity.id, &scope.id).await?
         {
-            if active.profile_id == profile.id {
+            let capabilities = capabilities_for_profile(&profile, &canonical);
+            if active.profile_id == profile.id
+                && serde_json::from_str::<BackendCapabilities>(&active.capabilities_json).ok()
+                    == Some(capabilities)
+            {
                 return Ok(active);
             }
+            // Capability policy is derived runtime state, not immutable
+            // Profile data. Rotate when a server upgrade changes it so an
+            // existing Task runtime cannot keep a now-disabled LCM session.
             return self.rotate_authorized_session(&active, &profile).await;
         }
         let capabilities = capabilities_for_profile(&profile, &canonical);
@@ -2604,7 +2611,7 @@ fn capabilities_for_profile(
             workspace: canonical.workspace_access,
             persistent_session: persistent,
             protected_checkpoints: persistent,
-            lcm: persistent,
+            lcm: persistent && canonical.scope_type != CanonicalScopeType::Task,
             ..native_capabilities()
         }
     } else {
@@ -2905,6 +2912,40 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn native_task_capabilities_keep_sessions_but_disable_lcm() {
+        let profile = AgentProfile {
+            id: "profile-1".to_owned(),
+            identity_id: "agent-1".to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            version: 1,
+            created_at: "2026-09-25T00:00:00Z".to_owned(),
+            updated_at: "2026-09-25T00:00:00Z".to_owned(),
+        };
+        let capabilities = capabilities_for_profile(
+            &profile,
+            &CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "task-1".to_owned(),
+                workspace_access: WorkspaceAccess::TaskWrite,
+            },
+        );
+        assert!(capabilities.persistent_session);
+        assert!(capabilities.protected_checkpoints);
+        assert!(!capabilities.lcm);
+    }
 
     #[test]
     fn generic_input_budget_uses_the_whole_context_window() {

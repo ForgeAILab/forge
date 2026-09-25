@@ -6,6 +6,7 @@ use std::{
 };
 
 use agent_runtime::{
+    context::{CompactionPolicy, StructuralCompactor},
     core::{
         cancel::CancelReason,
         catalog::{ModelLimits, ResolvedModelProfile},
@@ -230,6 +231,13 @@ const LCM_PLANNER_MARGIN_TOKENS: u64 = 1024;
 /// policy configuration error.
 const LCM_MIN_CONVERSATION_BUDGET_TOKENS: u64 = 1024;
 
+/// Direct Task turns use the runtime's deterministic structural compactor,
+/// not the durable LCM summary DAG. Keep enough headroom that the next tool
+/// exchange does not immediately force another compaction pass.
+const TASK_COMPACTION_HIGH_PERCENT: u64 = 85;
+const TASK_COMPACTION_LOW_PERCENT: u64 = 70;
+const TASK_COMPACTION_POLICY_REVISION: &str = "forge-task-structural-compaction-1";
+
 /// The LCM pressure model counts only timeline (conversation) tokens, while
 /// the context planner must fit the system prompt, activated tool schemas,
 /// and the new user input inside the same provider window. Handing the
@@ -294,9 +302,50 @@ fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::
     }
 }
 
-fn persistent_runtime_for_turn(scope: &CanonicalScope, task_role: Option<&str>) -> bool {
-    !scope.is_ephemeral_inquiry()
-        && !(scope.scope_type == CanonicalScopeType::Task && task_role == Some("reviewer"))
+fn task_structural_compactor(max_input_tokens: u32) -> StructuralCompactor {
+    let max_input_tokens = u64::from(max_input_tokens).max(1);
+    let watermark = |percent: u64| {
+        u32::try_from(max_input_tokens.saturating_mul(percent) / 100)
+            .unwrap_or(u32::MAX)
+            .max(1)
+    };
+    StructuralCompactor::new(CompactionPolicy::new(
+        agent_runtime::registry::RegistryRevision::from_content(TASK_COMPACTION_POLICY_REVISION),
+        watermark(TASK_COMPACTION_HIGH_PERCENT),
+        watermark(TASK_COMPACTION_LOW_PERCENT),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnContextMode {
+    persistent_session: bool,
+    lcm: bool,
+    structural_compaction: bool,
+}
+
+fn turn_context_mode(scope: &CanonicalScope, task_role: Option<&str>) -> TurnContextMode {
+    if scope.is_ephemeral_inquiry() {
+        return TurnContextMode {
+            persistent_session: false,
+            lcm: false,
+            structural_compaction: false,
+        };
+    }
+    if scope.scope_type == CanonicalScopeType::Task {
+        return TurnContextMode {
+            // Reviewer attempts are self-contained audits. Worker/planner
+            // follow-ups retain their protected session history, but compact
+            // that history structurally instead of admitting it to LCM.
+            persistent_session: task_role != Some("reviewer"),
+            lcm: false,
+            structural_compaction: true,
+        };
+    }
+    TurnContextMode {
+        persistent_session: true,
+        lcm: true,
+        structural_compaction: false,
+    }
 }
 
 impl fmt::Debug for NativeAgentRuntimeBackend {
@@ -314,12 +363,15 @@ impl fmt::Debug for NativeAgentRuntimeBackend {
 #[async_trait]
 impl AgentSessionBackend for NativeAgentRuntimeBackend {
     fn capabilities(&self, scope: &CanonicalScope) -> BackendCapabilities {
-        let persistent = !scope.is_ephemeral_inquiry();
+        // Capabilities are scope-level, so Task advertises the worker/planner
+        // persistence ceiling. A reviewer turn narrows that further when its
+        // role-bound session is composed.
+        let mode = turn_context_mode(scope, None);
         BackendCapabilities {
             native_runtime: true,
-            persistent_session: persistent,
-            protected_checkpoints: persistent,
-            lcm: persistent,
+            persistent_session: mode.persistent_session,
+            protected_checkpoints: mode.persistent_session,
+            lcm: mode.lcm,
             cancel: true,
             steer: true,
             workspace: scope.workspace_access,
@@ -409,14 +461,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         ));
         let provider = self.provider(&request)?;
         let model_id = ModelId::new(&request.provider.model);
-        // A reviewer attempt is a self-contained audit of one frozen contract.
-        // Reusing the Task's conversational LCM feeds the previous full
-        // contract and report back into each retry and can make the retry
-        // larger than the model context. Worker/planner continuity remains
-        // Task-scoped; reviewer attempts deliberately start clean.
-        let persistent = persistent_runtime_for_turn(&binding.scope, binding.task_role.as_deref());
+        let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
         let mut lcm_link = None;
-        let lcm = if persistent {
+        let lcm = if context_mode.lcm {
             let lcm_store = self
                 .protected_store
                 .lcm_store_for_runtime_session(
@@ -471,11 +518,17 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             // they are ever persisted or rendered; without this opt-in the
             // runtime withholds argument values by default.
             .emit_raw_tool_arguments(true);
-        if let Some(lcm) = lcm {
+        if context_mode.persistent_session {
             builder = builder
                 .session_store(self.protected_store.clone())
-                .checkpoint_store(self.protected_store.clone())
-                .lcm(Arc::new(lcm));
+                .checkpoint_store(self.protected_store.clone());
+        }
+        if let Some(lcm) = lcm {
+            builder = builder.lcm(Arc::new(lcm));
+        }
+        if context_mode.structural_compaction {
+            builder =
+                builder.compactor(task_structural_compactor(request.provider.max_input_tokens));
         }
         builder = composition.apply(builder);
         if let Some(prompt) = request.system_prompt.as_deref() {
@@ -494,7 +547,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .start_session(
                 StartSession::new()
                     .with_id(SessionId::new(&request.runtime_session_id))
-                    .with_history(if persistent {
+                    .with_history(if context_mode.persistent_session {
                         request.history
                     } else {
                         Vec::new()
@@ -1006,15 +1059,43 @@ mod workspace_tests {
     use agent_runtime::core::workspace::Workspace;
 
     #[test]
-    fn reviewer_attempts_do_not_reuse_task_lcm_history() {
+    fn task_turns_use_structural_compaction_instead_of_lcm() {
         let task_scope = CanonicalScope {
             scope_type: CanonicalScopeType::Task,
             scope_id: "task-1".to_owned(),
             workspace_access: WorkspaceAccess::TaskRead,
         };
-        assert!(!persistent_runtime_for_turn(&task_scope, Some("reviewer")));
-        assert!(persistent_runtime_for_turn(&task_scope, Some("planner")));
-        assert!(persistent_runtime_for_turn(&task_scope, Some("worker")));
+        let reviewer = turn_context_mode(&task_scope, Some("reviewer"));
+        assert!(!reviewer.persistent_session);
+        assert!(!reviewer.lcm);
+        assert!(reviewer.structural_compaction);
+
+        for role in ["planner", "worker"] {
+            let mode = turn_context_mode(&task_scope, Some(role));
+            assert!(mode.persistent_session, "{role} keeps protected continuity");
+            assert!(!mode.lcm, "{role} must not use Task-scoped LCM");
+            assert!(
+                mode.structural_compaction,
+                "{role} uses deterministic structural compaction"
+            );
+        }
+
+        let policy = task_structural_compactor(100_000).policy().clone();
+        assert_eq!(policy.high_watermark, 85_000);
+        assert_eq!(policy.low_watermark, 70_000);
+    }
+
+    #[test]
+    fn agent_chat_turns_keep_lcm() {
+        let chat_scope = CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-1".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let mode = turn_context_mode(&chat_scope, None);
+        assert!(mode.persistent_session);
+        assert!(mode.lcm);
+        assert!(!mode.structural_compaction);
     }
 
     #[test]
