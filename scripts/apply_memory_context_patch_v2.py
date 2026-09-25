@@ -38,6 +38,24 @@ elif replacement not in service_text:
     raise RuntimeError("crates/services/src/memory.rs: scoped query constructor not found")
 memory_service.write_text(service_text, encoding="utf-8")
 
+# Recall examines history before it is moved into LoadedAgentChatTurn. Once
+# that extra use exists, the trait return's collected element type is no longer
+# inferred through the final struct construction, so keep it explicit.
+turn_worker = Path("crates/services/src/agent_chat_turn_worker.rs")
+turn_text = turn_worker.read_text(encoding="utf-8")
+history_needle = "        let history = AgentChatMessageRepo::list_agent_chat_messages("
+history_replacement = (
+    "        let history: Vec<AgentChatMessage> = "
+    "AgentChatMessageRepo::list_agent_chat_messages("
+)
+if history_needle in turn_text:
+    turn_text = turn_text.replace(history_needle, history_replacement, 1)
+elif history_replacement not in turn_text:
+    raise RuntimeError(
+        "crates/services/src/agent_chat_turn_worker.rs: history binding not found"
+    )
+turn_worker.write_text(turn_text, encoding="utf-8")
+
 # Dereference the mutable ordinal before checked arithmetic.
 context_path = Path("crates/services/src/memory_context.rs")
 context_text = context_path.read_text(encoding="utf-8")
