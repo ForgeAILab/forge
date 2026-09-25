@@ -17,8 +17,10 @@ use agent_runtime::core::provider::{
 };
 use agent_runtime::provider::fake::{usage_event, FakeProvider, ScriptedStream};
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgentIdentity, CreateAgentProfile, SqliteDb,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentContextScopeRepo, AgentRepo,
+    AgentSessionRepo, AgentStatus, CreateAgentContextScope, CreateAgentIdentity,
+    CreateAgentProfile, CreateAgentSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
+    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType, Message,
@@ -814,4 +816,224 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
         !output.text.trim().is_empty(),
         "the turn after compaction returns assistant text"
     );
+}
+
+#[tokio::test]
+async fn native_task_worker_compacts_over_budget_history_without_lcm() {
+    let db = sqlite_db().await;
+    let service = EmbeddedAgentService::new(Arc::clone(&db), b"task-compaction-test-key");
+    let credential_id = new_uuid_v4();
+    service
+        .protected_store()
+        .create_credential(
+            &credential_id,
+            "user-1",
+            "openai",
+            "scripted provider",
+            Secret::new("unused-test-key"),
+            &now_rfc3339(),
+        )
+        .await
+        .expect("credential creates");
+    let (identity_id, profile_id) = native_identity(&db, &credential_id).await;
+
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    let repo_id = new_uuid_v4();
+    let task_id = new_uuid_v4();
+    let scope_id = new_uuid_v4();
+    let session_id = new_uuid_v4();
+    let runtime_session_id = new_uuid_v4();
+    let workspace = tempfile::tempdir().expect("workspace creates");
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Task compaction project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "repository".to_owned(),
+            remote_url: "https://example.invalid/repository.git".to_owned(),
+            local_path: None,
+            work_mode: WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repository creates");
+    TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.clone(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Compact worker history".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task creates");
+    WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            repo_id,
+            worktree_path: workspace.path().to_string_lossy().into_owned(),
+            branch: "task/compaction".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace persists");
+    AgentContextScopeRepo::create_context_scope(
+        &*db,
+        CreateAgentContextScope {
+            id: scope_id.clone(),
+            identity_id: identity_id.clone(),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            project_id: Some(project_id),
+            task_id: Some(task_id.clone()),
+            task_role: Some("worker".to_owned()),
+            workspace_access: "task_write".to_owned(),
+            workspace_path: None,
+            authority_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Task scope creates");
+    AgentSessionRepo::create_agent_session(
+        &*db,
+        CreateAgentSession {
+            id: session_id.clone(),
+            identity_id: identity_id.clone(),
+            profile_id,
+            context_scope_id: scope_id,
+            backend_kind: "native".to_owned(),
+            runtime_session_id: Some(runtime_session_id.clone()),
+            status: "ready".to_owned(),
+            capabilities_json: serde_json::json!({
+                "native_runtime": true,
+                "persistent_session": true,
+                "protected_checkpoints": true,
+                "lcm": false,
+                "cancel": true,
+                "steer": true,
+                "workspace": "task_write"
+            })
+            .to_string(),
+            connection_status: "healthy".to_owned(),
+            predecessor_session_id: None,
+            last_activity_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Task session creates");
+
+    let provider = Arc::new(scripted_reply_provider(1));
+    let backend = NativeAgentRuntimeBackend::new(service.protected_store())
+        .with_provider_override(provider.clone());
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Task,
+        scope_id: task_id,
+        workspace_access: WorkspaceAccess::TaskWrite,
+    };
+    assert!(!backend.capabilities(&scope).lcm);
+
+    let mut history = Vec::new();
+    for index in 0..32 {
+        history.push(Message::user(format!(
+            "old worker request {index}: {}",
+            "implementation detail. ".repeat(30)
+        )));
+        history.push(Message::text(
+            Role::Assistant,
+            format!(
+                "old worker response {index}: {}",
+                "tool result and implementation notes. ".repeat(30)
+            ),
+        ));
+    }
+    let output = backend
+        .run_turn(
+            AgentTurnRequest {
+                forge_session_id: session_id,
+                runtime_session_id,
+                scope,
+                workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                provider: NativeProviderConfig {
+                    provider: "openai".to_owned(),
+                    base_url: "https://unused.invalid/v1".to_owned(),
+                    model: "fake".to_owned(),
+                    reasoning_effort: None,
+                    credential_handle_id: credential_id,
+                    owner_user_id: "user-1".to_owned(),
+                    provider_account_id: None,
+                    context_tokens: 8_192,
+                    max_input_tokens: 4_096,
+                    max_output_tokens: 256,
+                },
+                system_prompt: Some("Implement the assigned Task.".to_owned()),
+                history,
+                input: "continue the implementation".to_owned(),
+                command_allowlist: None,
+                cancellation: CancellationToken::new(),
+            },
+            Arc::new(NoopSink),
+        )
+        .await
+        .expect("structural compaction lets the Task turn reach the provider");
+    assert!(!output.text.trim().is_empty());
+    assert!(
+        output
+            .context_manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.lcm_timeline_id.is_none()),
+        "Task manifests must not link an LCM timeline"
+    );
+    assert_eq!(provider.requests().len(), 1);
+    let timelines: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_lcm_timeline
+         WHERE identity_id = ? AND scope_type = 'task'",
+    )
+    .bind(identity_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Task timeline count");
+    assert_eq!(timelines, 0, "native Task turns must not create LCM state");
 }
