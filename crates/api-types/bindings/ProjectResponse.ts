@@ -6,7 +6,7 @@ import type { ReviewConfig } from "./ReviewConfig";
 export type ProjectResponse = { id: string, name: string, settings: Record<string, unknown>, project_hooks: Array<ProjectHookRule>, default_review_config: ReviewConfig | null, primary_repo_id: string | null, owner_id: string | null, created_at: string, updated_at: string, workflow_template_name: string | null, paused_at: string | null, 
 /**
  * Only set alongside `paused_at` when the Task dispatcher paused this
- * Project automatically (currently `"missing_repository"`); `None`
+ * Project automatically (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None`
  * for a user's own pause via `POST /projects/{id}/pause`.
  */
 system_pause_reason: string | null, paused: boolean, charter_status: string, charter_setup_required: boolean, current_charter_id: string | null, current_charter_revision_id: string | null, current_charter_version: bigint, primary_milestone_id: string | null, version: bigint, 

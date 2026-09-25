@@ -23,7 +23,7 @@ pub struct Project {
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
     /// Set only alongside `paused_at` by the Task dispatcher's own
-    /// auto-pause (currently `"missing_repository"`); `None` for a user's
+    /// auto-pause (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None` for a user's
     /// own pause. See migration V128.
     pub system_pause_reason: Option<String>,
     pub owner_id: Option<String>,

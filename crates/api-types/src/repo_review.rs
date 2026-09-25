@@ -86,7 +86,7 @@ pub struct ProjectResponse {
     #[serde(default)]
     pub paused_at: Option<String>,
     /// Only set alongside `paused_at` when the Task dispatcher paused this
-    /// Project automatically (currently `"missing_repository"`); `None`
+    /// Project automatically (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None`
     /// for a user's own pause via `POST /projects/{id}/pause`.
     #[serde(default)]
     pub system_pause_reason: Option<String>,

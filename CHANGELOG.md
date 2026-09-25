@@ -11,6 +11,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Fixed
 
 - Removing a Task dependency now wakes the dependent when deterministic dependency-gate dispatch had parked it.
+- A Project whose linked repository has no commit on `main` yet (a scaffold
+  still being written) no longer parks every Task permanently. The dispatcher
+  now pauses such a Project with `system_pause_reason = "repository_not_ready"`
+  and resumes it, waking its Tasks, once the first commit lands. Previously
+  the Project resumed as soon as the Repo row was linked, every Task parked on
+  "execution setup is incomplete", and nothing woke them after the commit.
 
 ## [0.13.2] - 2026-09-24
 

@@ -2041,15 +2041,20 @@ pub trait ProjectRepo: Send + Sync {
         by: i64,
     ) -> Result<i64>;
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
-    /// Pause a Project the Task dispatcher found with no valid primary
+    /// Pause a Project the Task dispatcher found without a usable primary
     /// repository only when the exact Project/repository snapshot that
-    /// produced that decision is still current. A concurrent repository
-    /// attachment, deletion, or explicit pause makes this a benign no-op.
+    /// produced that decision is still current. `repository_linked` states
+    /// which snapshot that was: `false` for a missing/invalid selection (the
+    /// guard requires no owned Repo), `true` for a linked Repo whose checkout
+    /// is not ready yet (the guard requires the owned Repo to still be
+    /// linked). A concurrent repository attachment, deletion, or explicit
+    /// pause makes this a benign no-op.
     async fn set_system_pause_reason_if_unchanged(
         &self,
         id: &str,
         expected_version: i64,
         expected_primary_repo_id: Option<&str>,
+        repository_linked: bool,
         paused_at: &str,
         reason: &str,
     ) -> Result<bool>;
