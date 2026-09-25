@@ -6,6 +6,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Removing a Task dependency now wakes the dependent when deterministic dependency-gate dispatch had parked it.
+
 ## [0.13.2] - 2026-09-24
 
 ### Fixed

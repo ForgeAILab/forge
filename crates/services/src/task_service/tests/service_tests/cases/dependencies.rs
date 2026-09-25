@@ -303,6 +303,84 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
 }
 
 #[tokio::test]
+async fn removing_dependency_wakes_dependent_with_stale_dispatch_disposition() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+
+    let prerequisite = service
+        .create_task(
+            project_id.clone(),
+            "Implement prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("prerequisite task creates");
+    let dependent = service
+        .create_task(
+            project_id,
+            "Implement dependent",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dependent task creates");
+    service
+        .add_task_dependency(&dependent.id, &prerequisite.id)
+        .await
+        .expect("dependency creates");
+
+    // Simulate the dispatcher's deterministic dependency-gate disposition on
+    // the dependent before removing the edge that caused it.
+    let dependent_before = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    crate::deferred_dispatch::record_dispatch_disposition(
+        &db,
+        &dependent_before,
+        "coder",
+        "guard rejected: dependency_gate: task has 1 unsatisfied dependency",
+    )
+    .await
+    .expect("dispatch disposition records");
+    let dependent_parked = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_parked).is_some(),
+        "the dependency-gate disposition must be persisted before the edge is removed"
+    );
+
+    service
+        .remove_task_dependency(&dependent.id, &prerequisite.id)
+        .await
+        .expect("dependency removes");
+
+    let dependent_after = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_none(),
+        "removing the dependency must wake the dependent's stale dispatch disposition"
+    );
+}
+
+#[tokio::test]
 async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_moves() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
