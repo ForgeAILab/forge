@@ -6,7 +6,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-## [0.13.3] - 2026-09-25
+## [0.13.4] - 2026-09-25
 
 ### Fixed
 
@@ -15,6 +15,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   sessions rotate once to discard the old LCM capability, preventing retries
   from failing immediately with `LCM context cannot fit after bounded hard
   compaction`; Main and Project Agent chats continue to use LCM.
+
+## [0.13.3] - 2026-09-25
+
+### Fixed
+
 - Removing a Task dependency now wakes the dependent when deterministic dependency-gate dispatch had parked it.
 - A Project whose linked repository has no commit on `main` yet (a scaffold
   still being written) no longer parks every Task permanently. The dispatcher
