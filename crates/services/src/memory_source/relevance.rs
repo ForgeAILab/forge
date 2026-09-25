@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use db::MemoryItem;
 
 const MAX_QUERY_TERMS: usize = 8;
+const MAX_RAW_QUERY_TERMS: usize = 32;
 const MAX_QUERY_TERM_CHARS: usize = 64;
 const RRF_K: u64 = 60;
 const RRF_SCALE: u64 = 1_000_000;
@@ -138,7 +139,7 @@ fn query_terms(query: &str) -> Vec<String> {
             continue;
         }
         all_terms.push(term);
-        if all_terms.len() == MAX_QUERY_TERMS {
+        if all_terms.len() == MAX_RAW_QUERY_TERMS {
             break;
         }
     }
@@ -151,9 +152,10 @@ fn query_terms(query: &str) -> Vec<String> {
         .iter()
         .filter(|term| !STOP_WORDS.contains(&term.as_str()))
         .cloned()
+        .take(MAX_QUERY_TERMS)
         .collect::<Vec<_>>();
     if salient.is_empty() {
-        all_terms
+        all_terms.into_iter().take(MAX_QUERY_TERMS).collect()
     } else {
         salient
     }
