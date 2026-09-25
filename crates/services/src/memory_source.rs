@@ -302,9 +302,7 @@ where
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let arm_limit = requested
-            .saturating_mul(4)
-            .clamp(8, MAX_RECALL_ARM_RESULTS);
+        let arm_limit = requested.saturating_mul(4).clamp(8, MAX_RECALL_ARM_RESULTS);
         let mut candidates = BTreeMap::new();
         let mut deduplicated_source_ids = BTreeSet::new();
 
