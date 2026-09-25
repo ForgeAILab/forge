@@ -5,393 +5,392 @@
     Updating git repository `https://github.com/ForgeAILab/agent-runtime.git`
  Downloading crates ...
   Downloaded adler2 v2.0.1
-  Downloaded idna_adapter v1.2.1
-  Downloaded include_dir v0.7.4
-  Downloaded include_dir_macros v0.7.4
-  Downloaded iana-time-zone v0.1.65
-  Downloaded hyper-rustls v0.27.7
-  Downloaded alloc-no-stdlib v2.0.4
-  Downloaded alloc-stdlib v0.2.4
-  Downloaded getrandom v0.2.17
   Downloaded getrandom v0.3.4
-  Downloaded getrandom v0.4.2
-  Downloaded icu_provider v2.2.0
+  Downloaded hashbrown v0.15.5
+  Downloaded getrandom v0.2.17
   Downloaded hyper v1.9.0
-  Downloaded hyper-util v0.1.20
+  Downloaded getrandom v0.4.2
+  Downloaded http v1.4.0
+  Downloaded http-body v1.0.1
+  Downloaded http-body-util v0.1.3
   Downloaded icu_collections v2.2.0
-  Downloaded icu_locale_core v2.2.0
-  Downloaded icu_normalizer v2.2.0
+  Downloaded lru-slab v0.1.2
   Downloaded icu_normalizer_data v2.2.0
+  Downloaded memchr v2.8.0
+  Downloaded httparse v1.10.1
+  Downloaded idna v1.1.0
+  Downloaded inout v0.1.4
+  Downloaded ipnet v2.11.0
+  Downloaded mio v1.2.0
+  Downloaded rustls-webpki v0.103.15
+  Downloaded async-stream-impl v0.3.6
+  Downloaded atomic-waker v1.1.2
+  Downloaded cmake v0.1.58
+  Downloaded include_dir_macros v0.7.4
+  Downloaded jsonwebtoken v10.4.0
+  Downloaded num-iter v0.1.46
+  Downloaded pkg-config v0.3.33
+  Downloaded hex v0.4.3
+  Downloaded hybrid-array v0.4.12
+  Downloaded include_dir v0.7.4
+  Downloaded schemars v0.8.22
+  Downloaded iana-time-zone v0.1.65
+  Downloaded idna_adapter v1.2.1
+  Downloaded miniz_oxide v0.8.9
+  Downloaded opaque-debug v0.3.1
+  Downloaded ref-cast v1.0.26
+  Downloaded anyhow v1.0.102
+  Downloaded async-compression v0.4.42
+  Downloaded async-stream v0.3.6
+  Downloaded atoi v2.0.0
+  Downloaded heck v0.5.0
+  Downloaded icu_provider v2.2.0
+  Downloaded lazy_static v1.5.0
+  Downloaded async-trait v0.1.92
+  Downloaded cfg_aliases v0.1.1
+  Downloaded itoa v1.0.18
+  Downloaded outref v0.5.2
+  Downloaded poly1305 v0.8.0
+  Downloaded bytecount v0.6.9
+  Downloaded jobserver v0.1.34
+  Downloaded allocator-api2 v0.2.21
+  Downloaded autocfg v1.5.0
+  Downloaded aws-lc-rs v1.17.0
+  Downloaded icu_locale_core v2.2.0
+  Downloaded powerfmt v0.2.0
+  Downloaded rand_chacha v0.3.1
+  Downloaded ref-cast-impl v1.0.26
+  Downloaded bitflags v2.13.2
+  Downloaded block-buffer v0.10.4
+  Downloaded borrow-or-share v0.2.4
+  Downloaded bytes v1.11.1
+  Downloaded chacha20 v0.9.1
+  Downloaded command-group v5.0.1
+  Downloaded cpufeatures v0.2.17
+  Downloaded crc-catalog v2.4.0
+  Downloaded errno v0.3.14
+  Downloaded hashlink v0.10.0
+  Downloaded hyper-rustls v0.27.7
+  Downloaded litemap v0.8.2
+  Downloaded lock_api v0.4.14
+  Downloaded log v0.4.29
+  Downloaded parking v2.2.1
+  Downloaded parking_lot v0.12.5
+  Downloaded pem v3.0.6
+  Downloaded percent-encoding v2.3.2
+  Downloaded portable-pty v0.9.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded quinn-udp v0.5.14
+  Downloaded rand_chacha v0.9.0
+  Downloaded rustc-hash v2.1.1
+  Downloaded rustls-pki-types v1.14.0
+  Downloaded serial2 v0.2.37
+  Downloaded bit-set v0.8.0
+  Downloaded cc v1.2.60
+  Downloaded cfg_aliases v0.2.1
+  Downloaded cpufeatures v0.3.0
+  Downloaded crc v3.4.0
+  Downloaded crypto-common v0.1.7
+  Downloaded dyn-clone v1.0.20
+  Downloaded either v1.15.0
+  Downloaded env_home v0.1.0
+  Downloaded equivalent v1.0.2
+  Downloaded futures-core v0.3.32
+  Downloaded hashbrown v0.17.0
+  Downloaded hyper-util v0.1.20
+  Downloaded icu_normalizer v2.2.0
   Downloaded icu_properties v2.2.0
   Downloaded indexmap v2.14.0
-  Downloaded lock_api v0.4.14
-  Downloaded allocator-api2 v0.2.21
-  Downloaded hashbrown v0.15.5
-  Downloaded icu_properties_data v2.2.0
-  Downloaded idna v1.1.0
-  Downloaded ipnet v2.11.0
-  Downloaded itoa v1.0.18
-  Downloaded lazy_static v1.5.0
-  Downloaded schemars v0.8.22
-  Downloaded aho-corasick v1.1.4
-  Downloaded async-stream-impl v0.3.6
-  Downloaded inout v0.1.4
   Downloaded num v0.4.3
-  Downloaded anyhow v1.0.102
-  Downloaded borrow-or-share v0.2.4
-  Downloaded cfg_aliases v0.2.1
-  Downloaded async-stream v0.3.6
-  Downloaded autocfg v1.5.0
-  Downloaded bitflags v2.13.2
-  Downloaded blowfish v0.9.1
-  Downloaded cpufeatures v0.2.17
-  Downloaded num-integer v0.1.46
-  Downloaded once_cell v1.21.4
-  Downloaded potential_utf v0.1.5
-  Downloaded bcrypt v0.17.1
-  Downloaded bit-set v0.8.0
-  Downloaded concurrent-queue v2.5.0
-  Downloaded cc v1.2.60
   Downloaded num-cmp v0.1.0
-  Downloaded num-conv v0.2.1
-  Downloaded percent-encoding v2.3.2
-  Downloaded block-buffer v0.10.4
-  Downloaded cfg-if v1.0.4
-  Downloaded compression-core v0.4.32
-  Downloaded const-oid v0.10.2
-  Downloaded async-trait v0.1.92
-  Downloaded byteorder v1.5.0
-  Downloaded chacha20 v0.9.1
-  Downloaded cipher v0.4.4
-  Downloaded compression-codecs v0.4.38
-  Downloaded async-compression v0.4.42
-  Downloaded chacha20poly1305 v0.10.1
-  Downloaded mio v1.2.0
-  Downloaded option-ext v0.2.0
-  Downloaded atoi v2.0.0
-  Downloaded bytes v1.11.1
-  Downloaded aws-lc-rs v1.17.0
-  Downloaded base64 v0.22.1
-  Downloaded cpufeatures v0.3.0
-  Downloaded equivalent v1.0.2
-  Downloaded litemap v0.8.2
-  Downloaded num-complex v0.4.6
-  Downloaded pkg-config v0.3.33
-  Downloaded rustls-pki-types v1.14.0
-  Downloaded bit-vec v0.8.0
-  Downloaded bytecount v0.6.9
-  Downloaded crossbeam-queue v0.3.12
-  Downloaded digest v0.11.3
-  Downloaded dunce v1.0.5
-  Downloaded either v1.15.0
-  Downloaded fluent-uri v0.3.2
-  Downloaded form_urlencoded v1.2.2
-  Downloaded parking v2.2.1
-  Downloaded rustc-hash v2.1.1
+  Downloaded potential_utf v0.1.5
+  Downloaded rand v0.9.3
   Downloaded serde_path_to_error v0.1.20
-  Downloaded dirs-sys v0.5.0
-  Downloaded dyn-clone v1.0.20
-  Downloaded futures-executor v0.3.32
-  Downloaded block-buffer v0.12.0
-  Downloaded crypto-common v0.1.7
-  Downloaded digest v0.10.7
-  Downloaded find-msvc-tools v0.1.9
-  Downloaded futures-task v0.3.32
-  Downloaded generic-array v0.14.7
-  Downloaded schemars_derive v0.8.22
-  Downloaded brotli-decompressor v5.0.3
-  Downloaded crc v3.4.0
-  Downloaded crossbeam-utils v0.8.21
-  Downloaded dirs v6.0.0
-  Downloaded downcast-rs v1.2.1
-  Downloaded hashlink v0.10.0
-  Downloaded http-body v1.0.1
-  Downloaded ref-cast-impl v1.0.26
-  Downloaded shell-words v1.1.1
-  Downloaded lru-slab v0.1.2
-  Downloaded powerfmt v0.2.0
-  Downloaded flume v0.11.1
-  Downloaded fs_extra v1.3.0
-  Downloaded futures-macro v0.3.32
-  Downloaded num-iter v0.1.46
-  Downloaded rand_chacha v0.3.1
-  Downloaded ref-cast v1.0.26
-  Downloaded serde_core v1.0.228
-  Downloaded serde_spanned v1.1.1
-  Downloaded serde_yaml v0.9.34+deprecated
-  Downloaded hex v0.4.3
-  Downloaded atomic-waker v1.1.2
-  Downloaded fastrand v2.4.1
-  Downloaded heck v0.5.0
-  Downloaded serde_urlencoded v0.7.1
-  Downloaded email_address v0.2.9
-  Downloaded opaque-debug v0.3.1
-  Downloaded pin-project-lite v0.2.17
-  Downloaded poly1305 v0.8.0
-  Downloaded serde_derive v1.0.228
-  Downloaded stable_deref_trait v1.2.1
-  Downloaded thiserror v2.0.18
-  Downloaded tower-layer v0.3.3
-  Downloaded cmake v0.1.58
-  Downloaded slab v0.4.12
-  Downloaded chrono v0.4.44
-  Downloaded futures-util v0.3.32
-  Downloaded http-body-util v0.1.3
-  Downloaded miniz_oxide v0.8.9
-  Downloaded num-rational v0.4.2
-  Downloaded pem v3.0.6
-  Downloaded signature v2.2.0
-  Downloaded sqlx-macros v0.8.6
-  Downloaded utf8_iter v1.0.4
-  Downloaded command-group v5.0.1
-  Downloaded jobserver v0.1.34
-  Downloaded outref v0.5.2
-  Downloaded rand_chacha v0.9.0
-  Downloaded rand_core v0.6.4
-  Downloaded sha1_smol v1.0.1
-  Downloaded sync_wrapper v1.0.2
-  Downloaded zeroize v1.8.2
+  Downloaded bcrypt v0.17.1
+  Downloaded byteorder v1.5.0
+  Downloaded cfg-if v1.0.4
   Downloaded crypto-common v0.2.1
-  Downloaded portable-pty v0.9.0
-  Downloaded time-macros v0.2.27
-  Downloaded toml_writer v1.1.2+spec-1.1.0
-  Downloaded tower-service v0.3.3
-  Downloaded url v2.5.8
-  Downloaded uuid-simd v0.8.0
-  Downloaded yoke-derive v0.8.2
-  Downloaded crc32fast v1.5.0
-  Downloaded parking_lot v0.12.5
-  Downloaded ppv-lite86 v0.2.21
+  Downloaded dirs-sys v0.5.0
+  Downloaded dotenvy v0.15.7
+  Downloaded fastrand v2.4.1
+  Downloaded futures-macro v0.3.32
+  Downloaded generic-array v0.14.7
+  Downloaded iri-string v0.7.10
+  Downloaded num-integer v0.1.46
+  Downloaded num-rational v0.4.2
+  Downloaded option-ext v0.2.0
+  Downloaded pin-project-lite v0.2.17
+  Downloaded quote v1.0.45
   Downloaded rand_core v0.9.5
+  Downloaded regex v1.12.3
+  Downloaded serde_spanned v1.1.1
+  Downloaded sha2 v0.11.0
+  Downloaded signature v2.2.0
+  Downloaded universal-hash v0.5.1
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded dirs v6.0.0
+  Downloaded form_urlencoded v1.2.2
+  Downloaded futures-io v0.3.32
+  Downloaded futures-sink v0.3.32
+  Downloaded futures-task v0.3.32
+  Downloaded parking_lot_core v0.9.12
+  Downloaded rand_core v0.6.4
+  Downloaded webpki-roots v0.26.11
+  Downloaded icu_properties_data v2.2.0
+  Downloaded num-complex v0.4.6
+  Downloaded num-conv v0.2.1
+  Downloaded once_cell v1.21.4
+  Downloaded subtle v2.6.1
+  Downloaded sync_wrapper v1.0.2
+  Downloaded compression-codecs v0.4.38
   Downloaded sha2 v0.10.9
   Downloaded signal-hook-registry v1.4.8
-  Downloaded simd-adler32 v0.3.10
-  Downloaded synstructure v0.13.2
-  Downloaded tokio-macros v2.7.0
-  Downloaded try-lock v0.2.5
-  Downloaded untrusted v0.9.0
-  Downloaded serial2 v0.2.37
-  Downloaded time-core v0.1.8
-  Downloaded cfg_aliases v0.1.1
+  Downloaded slab v0.4.12
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded ts-rs-macros v10.1.0
+  Downloaded yoke-derive v0.8.2
+  Downloaded bit-vec v0.8.0
+  Downloaded block-buffer v0.12.0
+  Downloaded cipher v0.4.4
+  Downloaded digest v0.10.7
+  Downloaded downcast-rs v1.2.1
+  Downloaded dunce v1.0.5
   Downloaded filedescriptor v0.8.3
-  Downloaded hybrid-array v0.4.12
-  Downloaded memchr v2.8.0
   Downloaded num-traits v0.2.19
-  Downloaded parking_lot_core v0.9.12
+  Downloaded proc-macro2 v1.0.106
   Downloaded quinn v0.11.9
-  Downloaded quote v1.0.45
+  Downloaded rand v0.8.6
   Downloaded referencing v0.28.3
-  Downloaded simple_asn1 v0.6.4
-  Downloaded tokio-stream v0.1.18
+  Downloaded ryu v1.0.23
+  Downloaded scopeguard v1.2.0
+  Downloaded serde_derive_internals v0.29.1
+  Downloaded sqlx-sqlite v0.8.6
+  Downloaded tinyvec v1.11.0
+  Downloaded tokio-rustls v0.26.4
+  Downloaded uuid v1.23.1
+  Downloaded uuid-simd v0.8.0
+  Downloaded version_check v0.9.5
+  Downloaded blowfish v0.9.1
+  Downloaded compression-core v0.4.32
+  Downloaded concurrent-queue v2.5.0
+  Downloaded deranged v0.5.8
+  Downloaded digest v0.11.3
+  Downloaded displaydoc v0.2.5
+  Downloaded event-listener v5.4.1
+  Downloaded fluent-uri v0.3.2
+  Downloaded foldhash v0.1.5
+  Downloaded fs_extra v1.3.0
+  Downloaded futures-channel v0.3.32
+  Downloaded jsonschema v0.28.3
+  Downloaded num-bigint v0.4.6
+  Downloaded quinn-proto v0.11.15
+  Downloaded reqwest v0.12.28
+  Downloaded schemars_derive v0.8.22
+  Downloaded serde_derive v1.0.228
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded sha1_smol v1.0.1
+  Downloaded shell-words v1.1.1
+  Downloaded simd-adler32 v0.3.10
+  Downloaded smallvec v1.15.1
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded tower v0.5.3
+  Downloaded tower-layer v0.3.3
+  Downloaded tower-service v0.3.3
+  Downloaded tracing-attributes v0.1.31
+  Downloaded try-lock v0.2.5
+  Downloaded typenum v1.20.0
+  Downloaded untrusted v0.9.0
+  Downloaded url v2.5.8
   Downloaded writeable v0.6.3
-  Downloaded zerofrom v0.1.7
-  Downloaded shlex v1.3.0
+  Downloaded zmij v1.0.21
+  Downloaded aho-corasick v1.1.4
+  Downloaded alloc-stdlib v0.2.4
+  Downloaded brotli-decompressor v5.0.3
+  Downloaded crc32fast v1.5.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded email_address v0.2.9
+  Downloaded futures-executor v0.3.32
+  Downloaded simple_asn1 v0.6.4
   Downloaded socket2 v0.6.3
+  Downloaded sqlx-macros v0.8.6
+  Downloaded tokio-macros v2.7.0
+  Downloaded tokio-stream v0.1.18
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded toml_parser v1.1.3+spec-1.1.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded untrusted v0.7.1
+  Downloaded vsimd v0.8.0
+  Downloaded which v7.0.3
+  Downloaded winnow v1.0.4
+  Downloaded yoke v0.8.2
+  Downloaded zeroize_derive v1.4.3
+  Downloaded zerotrie v0.2.4
+  Downloaded zerovec-derive v0.11.3
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded const-oid v0.10.2
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded fraction v0.15.4
+  Downloaded serde_core v1.0.228
+  Downloaded serde_yaml v0.9.34+deprecated
+  Downloaded shlex v1.3.0
+  Downloaded spin v0.9.8
+  Downloaded sqlx v0.8.6
+  Downloaded time-core v0.1.8
+  Downloaded tinystr v0.8.3
+  Downloaded ts-rs v10.1.0
+  Downloaded unsafe-libyaml v0.2.11
+  Downloaded utf8_iter v1.0.4
+  Downloaded zeroize v1.8.2
+  Downloaded base64 v0.22.1
+  Downloaded fancy-regex v0.14.0
+  Downloaded nix v0.27.1
+  Downloaded serde v1.0.228
+  Downloaded sqlx-macros-core v0.8.6
+  Downloaded synstructure v0.13.2
+  Downloaded thiserror v2.0.18
+  Downloaded thiserror-impl v2.0.18
+  Downloaded tracing-core v0.1.36
+  Downloaded want v0.3.1
+  Downloaded zerofrom v0.1.7
+  Downloaded zerofrom-derive v0.1.7
+  Downloaded flate2 v1.1.9
+  Downloaded flume v0.11.1
+  Downloaded futures-intrusive v0.5.0
   Downloaded tempfile v3.27.0
   Downloaded termcolor v1.4.1
+  Downloaded thiserror v1.0.69
   Downloaded thiserror-impl v1.0.69
-  Downloaded thiserror-impl v2.0.18
-  Downloaded ts-rs-macros v10.1.0
-  Downloaded deranged v0.5.8
-  Downloaded displaydoc v0.2.5
-  Downloaded futures-sink v0.3.32
-  Downloaded jsonwebtoken v10.4.0
-  Downloaded proc-macro2 v1.0.106
-  Downloaded quinn-udp v0.5.14
-  Downloaded futures-io v0.3.32
-  Downloaded rand v0.9.3
-  Downloaded ryu v1.0.23
-  Downloaded sha2 v0.11.0
-  Downloaded toml_parser v1.1.3+spec-1.1.0
-  Downloaded tracing-attributes v0.1.31
-  Downloaded ts-rs v10.1.0
-  Downloaded untrusted v0.7.1
-  Downloaded yoke v0.8.2
-  Downloaded zerovec-derive v0.11.3
-  Downloaded zmij v1.0.21
-  Downloaded futures-channel v0.3.32
-  Downloaded httparse v1.10.1
-  Downloaded iri-string v0.7.10
-  Downloaded log v0.4.29
-  Downloaded uuid v1.23.1
-  Downloaded rand v0.8.6
-  Downloaded tinyvec v1.11.0
-  Downloaded tinyvec_macros v0.1.1
-  Downloaded tracing-core v0.1.36
-  Downloaded jsonschema v0.28.3
-  Downloaded rustls-webpki v0.103.15
-  Downloaded brotli v8.0.4
-  Downloaded event-listener v5.4.1
-  Downloaded http v1.4.0
-  Downloaded num-bigint v0.4.6
-  Downloaded scopeguard v1.2.0
-  Downloaded tower v0.5.3
+  Downloaded time-macros v0.2.27
+  Downloaded webpki-roots v1.0.6
+  Downloaded zstd v0.13.3
+  Downloaded zstd-safe v7.3.0
+  Downloaded aead v0.5.2
+  Downloaded alloc-no-stdlib v2.0.4
+  Downloaded sqlx-core v0.8.6
+  Downloaded ahash v0.8.12
+  Downloaded nix v0.28.0
+  Downloaded syn v2.0.117
+  Downloaded serde_json v1.0.149
+  Downloaded syn v3.0.3
+  Downloaded toml v1.1.4+spec-1.1.0
   Downloaded tower-http v0.6.8
   Downloaded zerovec v0.11.6
-  Downloaded env_home v0.1.0
-  Downloaded hashbrown v0.17.0
-  Downloaded regex v1.12.3
-  Downloaded reqwest v0.12.28
-  Downloaded quinn-proto v0.11.15
-  Downloaded zerofrom-derive v0.1.7
-  Downloaded aead v0.5.2
-  Downloaded errno v0.3.14
-  Downloaded futures-core v0.3.32
-  Downloaded time v0.3.47
-  Downloaded nix v0.27.1
-  Downloaded nix v0.28.0
-  Downloaded foldhash v0.1.5
+  Downloaded chrono v0.4.44
+  Downloaded futures-util v0.3.32
   Downloaded regex-syntax v0.8.10
   Downloaded rustls v0.23.45
-  Downloaded tinystr v0.8.3
-  Downloaded toml v1.1.4+spec-1.1.0
-  Downloaded vsimd v0.8.0
-  Downloaded dotenvy v0.15.7
-  Downloaded rustix v1.1.4
-  Downloaded serde_derive_internals v0.29.1
-  Downloaded version_check v0.9.5
-  Downloaded want v0.3.1
-  Downloaded crc-catalog v2.4.0
-  Downloaded sqlx-core v0.8.6
-  Downloaded sqlx-macros-core v0.8.6
-  Downloaded toml_datetime v1.1.1+spec-1.1.0
-  Downloaded tracing v0.1.44
-  Downloaded universal-hash v0.5.1
-  Downloaded zstd v0.13.3
-  Downloaded spin v0.9.8
-  Downloaded thiserror v1.0.69
-  Downloaded tokio-rustls v0.26.4
-  Downloaded flate2 v1.1.9
-  Downloaded serde v1.0.228
-  Downloaded regex-automata v0.4.14
-  Downloaded ahash v0.8.12
-  Downloaded unicode-ident v1.0.24
-  Downloaded unsafe-libyaml v0.2.11
-  Downloaded zeroize_derive v1.4.3
-  Downloaded futures-intrusive v0.5.0
-  Downloaded sqlx-sqlite v0.8.6
-  Downloaded tokio-util v0.7.18
-  Downloaded zerotrie v0.2.4
-  Downloaded fancy-regex v0.14.0
-  Downloaded smallvec v1.15.1
-  Downloaded webpki-roots v0.26.11
-  Downloaded typenum v1.20.0
-  Downloaded fraction v0.15.4
-  Downloaded libc v0.2.184
-  Downloaded subtle v2.6.1
-  Downloaded zerocopy v0.8.48
-  Downloaded which v7.0.3
-  Downloaded serde_json v1.0.149
-  Downloaded sqlx v0.8.6
   Downloaded vcpkg v0.2.15
-  Downloaded zstd-safe v7.3.0
-  Downloaded webpki-roots v1.0.6
-  Downloaded winnow v1.0.4
-  Downloaded syn v2.0.117
-  Downloaded syn v3.0.3
-  Downloaded ring v0.17.14
+  Downloaded tokio-util v0.7.18
+  Downloaded rustix v1.1.4
+  Downloaded time v0.3.47
+  Downloaded regex-automata v0.4.14
+  Downloaded tracing v0.1.44
+  Downloaded zerocopy v0.8.48
+  Downloaded brotli v8.0.4
+  Downloaded libc v0.2.184
   Downloaded tokio v1.52.3
   Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded ring v0.17.14
   Downloaded linux-raw-sys v0.12.1
   Downloaded libsqlite3-sys v0.30.1
   Downloaded aws-lc-sys v0.41.0
    Compiling proc-macro2 v1.0.106
-   Compiling quote v1.0.45
    Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
    Compiling libc v0.2.184
     Checking cfg-if v1.0.4
    Compiling serde_core v1.0.228
-   Compiling syn v2.0.117
    Compiling jobserver v0.1.34
-    Checking pin-project-lite v0.2.17
+   Compiling shlex v1.3.0
+   Compiling syn v2.0.117
    Compiling find-msvc-tools v0.1.9
     Checking memchr v2.8.0
-   Compiling shlex v1.3.0
+    Checking pin-project-lite v0.2.17
    Compiling cc v1.2.60
     Checking typenum v1.20.0
     Checking getrandom v0.2.17
-    Checking itoa v1.0.18
    Compiling serde v1.0.228
+    Checking itoa v1.0.18
    Compiling version_check v0.9.5
     Checking bytes v1.11.1
     Checking errno v0.3.14
     Checking signal-hook-registry v1.4.8
-    Checking socket2 v0.6.3
     Checking mio v1.2.0
+    Checking socket2 v0.6.3
     Checking futures-core v0.3.32
    Compiling generic-array v0.14.7
     Checking rand_core v0.6.4
    Compiling autocfg v1.5.0
-    Checking futures-sink v0.3.32
     Checking stable_deref_trait v1.2.1
+    Checking futures-sink v0.3.32
    Compiling thiserror v2.0.18
    Compiling num-traits v0.2.19
-   Compiling zmij v1.0.21
-    Checking crypto-common v0.1.7
     Checking once_cell v1.21.4
-    Checking futures-io v0.3.32
-    Checking slab v0.4.12
-    Checking smallvec v1.15.1
-   Compiling serde_json v1.0.149
+    Checking crypto-common v0.1.7
+   Compiling zmij v1.0.21
     Checking futures-task v0.3.32
-   Compiling synstructure v0.13.2
+    Checking smallvec v1.15.1
+    Checking slab v0.4.12
+    Checking futures-io v0.3.32
+   Compiling serde_json v1.0.149
    Compiling pkg-config v0.3.33
    Compiling syn v3.0.3
+   Compiling synstructure v0.13.2
     Checking litemap v0.8.2
     Checking writeable v0.6.3
-    Checking utf8_iter v1.0.4
    Compiling icu_normalizer_data v2.2.0
-   Compiling icu_properties_data v2.2.0
+    Checking utf8_iter v1.0.4
     Checking percent-encoding v2.3.2
+   Compiling icu_properties_data v2.2.0
     Checking cpufeatures v0.2.17
    Compiling ring v0.17.14
     Checking equivalent v1.0.2
-    Checking log v0.4.29
-    Checking base64 v0.22.1
     Checking subtle v2.6.1
+    Checking base64 v0.22.1
+    Checking log v0.4.29
+    Checking tracing-core v0.1.36
    Compiling serde_derive v1.0.228
    Compiling zeroize_derive v1.4.3
    Compiling tokio-macros v2.7.0
     Checking tokio v1.52.3
     Checking zeroize v1.8.2
    Compiling zerofrom-derive v0.1.7
-   Compiling yoke-derive v0.8.2
     Checking zerofrom v0.1.7
+   Compiling yoke-derive v0.8.2
    Compiling thiserror-impl v2.0.18
     Checking yoke v0.8.2
    Compiling zerovec-derive v0.11.3
-   Compiling displaydoc v0.2.5
    Compiling futures-macro v0.3.32
-    Checking zerotrie v0.2.4
-    Checking rustls-pki-types v1.14.0
     Checking zerovec v0.11.6
-   Compiling tracing-attributes v0.1.31
+   Compiling displaydoc v0.2.5
     Checking futures-util v0.3.32
-    Checking tracing-core v0.1.36
     Checking tinystr v0.8.3
+    Checking zerotrie v0.2.4
     Checking icu_locale_core v2.2.0
     Checking potential_utf v0.1.5
     Checking icu_collections v2.2.0
+    Checking rustls-pki-types v1.14.0
+    Checking icu_provider v2.2.0
+   Compiling tracing-attributes v0.1.31
+    Checking icu_properties v2.2.0
+    Checking icu_normalizer v2.2.0
     Checking block-buffer v0.10.4
     Checking digest v0.10.7
-    Checking untrusted v0.9.0
-    Checking hashbrown v0.17.0
-    Checking icu_provider v2.2.0
     Checking tracing v0.1.44
-    Checking ryu v1.0.23
-    Checking icu_normalizer v2.2.0
-    Checking icu_properties v2.2.0
-    Checking indexmap v2.14.0
-    Checking sha2 v0.10.9
     Checking idna_adapter v1.2.1
-   Compiling async-trait v0.1.92
+    Checking hashbrown v0.17.0
+    Checking ryu v1.0.23
+    Checking untrusted v0.9.0
     Checking idna v1.1.0
+    Checking sha2 v0.10.9
+   Compiling async-trait v0.1.92
+    Checking indexmap v2.14.0
     Checking form_urlencoded v1.2.2
     Checking bitflags v2.13.2
    Compiling rustls v0.23.45
    Compiling zstd-sys v2.1.0+zstd.1.5.7
     Checking hybrid-array v0.4.12
-    Checking rustls-webpki v0.103.15
    Compiling zerocopy v0.8.48
    Compiling crossbeam-utils v0.8.21
     Checking lazy_static v1.5.0
@@ -402,61 +401,62 @@
     Checking webpki-roots v1.0.6
     Checking num-integer v0.1.46
     Checking futures-channel v0.3.32
-   Compiling getrandom v0.4.2
    Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.4.2
     Checking crypto-common v0.2.1
     Checking block-buffer v0.12.0
     Checking http v1.4.0
-   Compiling zstd-safe v7.3.0
-   Compiling termcolor v1.4.1
-    Checking const-oid v0.10.2
    Compiling crc32fast v1.5.0
-    Checking alloc-no-stdlib v2.0.4
+   Compiling termcolor v1.4.1
+   Compiling zstd-safe v7.3.0
     Checking unsafe-libyaml v0.2.11
+    Checking const-oid v0.10.2
+    Checking alloc-no-stdlib v2.0.4
     Checking alloc-stdlib v0.2.4
-   Compiling ts-rs-macros v10.1.0
-    Checking serde_yaml v0.9.34+deprecated
     Checking digest v0.11.3
+    Checking serde_yaml v0.9.34+deprecated
+   Compiling ts-rs-macros v10.1.0
     Checking http-body v1.0.1
     Checking num-bigint v0.4.6
     Checking either v1.15.0
-    Checking allocator-api2 v0.2.21
-    Checking foldhash v0.1.5
    Compiling vcpkg v0.2.15
+    Checking allocator-api2 v0.2.21
     Checking simd-adler32 v0.3.10
-    Checking cpufeatures v0.3.0
    Compiling httparse v1.10.1
-    Checking adler2 v2.0.1
     Checking iana-time-zone v0.1.65
+    Checking adler2 v2.0.1
+    Checking cpufeatures v0.3.0
+    Checking foldhash v0.1.5
    Compiling getrandom v0.3.4
-   Compiling libsqlite3-sys v0.30.1
-    Checking chrono v0.4.44
-    Checking miniz_oxide v0.8.9
-    Checking sha2 v0.11.0
     Checking hashbrown v0.15.5
-    Checking parking_lot v0.12.5
+    Checking sha2 v0.11.0
+    Checking miniz_oxide v0.8.9
+    Checking chrono v0.4.44
+   Compiling libsqlite3-sys v0.30.1
+    Checking rustls-webpki v0.103.15
     Checking ts-rs v10.1.0
+    Checking parking_lot v0.12.5
     Checking brotli-decompressor v5.0.3
     Checking concurrent-queue v2.5.0
     Checking serde_urlencoded v0.7.1
     Checking agent-runtime-registry v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
-    Checking tower-service v0.3.3
-   Compiling ref-cast v1.0.26
-    Checking try-lock v0.2.5
     Checking parking v2.2.1
     Checking crc-catalog v2.4.0
+    Checking try-lock v0.2.5
     Checking sha1_smol v1.0.1
-    Checking crc v3.4.0
-    Checking agent-runtime-core v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
+    Checking tower-service v0.3.3
+   Compiling ref-cast v1.0.26
     Checking uuid v1.23.1
+    Checking agent-runtime-core v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
+    Checking want v0.3.1
+    Checking crc v3.4.0
     Checking event-listener v5.4.1
     Checking brotli v8.0.4
-    Checking want v0.3.1
-    Checking api-types v0.13.2 (/home/runner/work/forge/forge/crates/api-types)
     Checking flate2 v1.1.9
     Checking futures-intrusive v0.5.0
-    Checking hashlink v0.10.0
+    Checking api-types v0.13.2 (/home/runner/work/forge/forge/crates/api-types)
     Checking zstd v0.13.3
+    Checking hashlink v0.10.0
     Checking crossbeam-queue v0.3.12
     Checking webpki-roots v0.26.11
     Checking spin v0.9.8
@@ -466,85 +466,85 @@
    Compiling ahash v0.8.12
    Compiling cmake v0.1.58
     Checking aho-corasick v1.1.4
-   Compiling fs_extra v1.3.0
-    Checking regex-syntax v0.8.10
-   Compiling rustix v1.1.4
    Compiling dunce v1.0.5
-    Checking atomic-waker v1.1.2
     Checking compression-core v0.4.32
-    Checking compression-codecs v0.4.38
-    Checking hyper v1.9.0
+   Compiling rustix v1.1.4
+    Checking regex-syntax v0.8.10
+    Checking atomic-waker v1.1.2
+   Compiling fs_extra v1.3.0
    Compiling aws-lc-sys v0.41.0
+    Checking hyper v1.9.0
     Checking regex-automata v0.4.14
+    Checking compression-codecs v0.4.38
     Checking cipher v0.4.4
     Checking sqlx-core v0.8.6
     Checking flume v0.11.1
     Checking num-rational v0.4.2
     Checking num-iter v0.1.46
     Checking futures-executor v0.3.32
+   Compiling serde_derive_internals v0.29.1
     Checking num-complex v0.4.6
     Checking atoi v2.0.0
-   Compiling serde_derive_internals v0.29.1
     Checking sync_wrapper v1.0.2
+    Checking bit-vec v0.8.0
+   Compiling cfg_aliases v0.1.1
    Compiling schemars v0.8.22
     Checking linux-raw-sys v0.12.1
-    Checking borrow-or-share v0.2.4
-    Checking bit-vec v0.8.0
-    Checking tower-layer v0.3.3
     Checking ipnet v2.11.0
-   Compiling cfg_aliases v0.1.1
-   Compiling nix v0.28.0
-    Checking tower v0.5.3
-    Checking hyper-util v0.1.20
-    Checking sqlx-sqlite v0.8.6
-    Checking bit-set v0.8.0
-   Compiling schemars_derive v0.8.22
+    Checking tower-layer v0.3.3
+    Checking borrow-or-share v0.2.4
     Checking fluent-uri v0.3.2
+    Checking tower v0.5.3
+    Checking sqlx-sqlite v0.8.6
+    Checking hyper-util v0.1.20
+   Compiling schemars_derive v0.8.22
+   Compiling nix v0.28.0
+    Checking bit-set v0.8.0
     Checking num v0.4.3
     Checking async-compression v0.4.42
-    Checking http-body-util v0.1.3
     Checking tokio-rustls v0.26.4
+    Checking http-body-util v0.1.3
    Compiling async-stream-impl v0.3.6
    Compiling include_dir_macros v0.7.4
-   Compiling time-core v0.1.8
-    Checking outref v0.5.2
-   Compiling db v0.13.2 (/home/runner/work/forge/forge/crates/db)
    Compiling thiserror v1.0.69
-    Checking powerfmt v0.2.0
+   Compiling db v0.13.2 (/home/runner/work/forge/forge/crates/db)
+   Compiling time-core v0.1.8
     Checking dyn-clone v1.0.20
     Checking iri-string v0.7.10
+    Checking powerfmt v0.2.0
+    Checking outref v0.5.2
    Compiling num-conv v0.2.1
     Checking vsimd v0.8.0
     Checking uuid-simd v0.8.0
    Compiling time-macros v0.2.27
     Checking tower-http v0.6.8
     Checking deranged v0.5.8
-    Checking async-stream v0.3.6
     Checking include_dir v0.7.4
+    Checking async-stream v0.3.6
     Checking hyper-rustls v0.27.7
     Checking referencing v0.28.3
     Checking fraction v0.15.4
-    Checking sqlx v0.8.6
     Checking fancy-regex v0.14.0
+    Checking sqlx v0.8.6
     Checking agent-runtime-context v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
     Checking ppv-lite86 v0.2.21
     Checking git v0.13.2 (/home/runner/work/forge/forge/crates/git)
     Checking email_address v0.2.9
-    Checking universal-hash v0.5.1
    Compiling thiserror-impl v1.0.69
-    Checking num-cmp v0.1.0
+    Checking universal-hash v0.5.1
+   Compiling aws-lc-rs v1.17.0
+    Checking opaque-debug v0.3.1
+    Checking bytecount v0.6.9
     Checking hex v0.4.3
    Compiling anyhow v1.0.102
-    Checking option-ext v0.2.0
+    Checking num-cmp v0.1.0
     Checking winnow v1.0.4
-    Checking bytecount v0.6.9
-    Checking opaque-debug v0.3.1
-   Compiling aws-lc-rs v1.17.0
-    Checking toml_parser v1.1.3+spec-1.1.0
-    Checking poly1305 v0.8.0
-    Checking jsonschema v0.28.3
+    Checking option-ext v0.2.0
     Checking time v0.3.47
     Checking dirs-sys v0.5.0
+    Checking toml_parser v1.1.3+spec-1.1.0
+    Checking jsonschema v0.28.3
+    Checking poly1305 v0.8.0
     Checking agent-runtime-lcm v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
     Checking rand_chacha v0.3.1
     Checking reqwest v0.12.28
@@ -553,59 +553,49 @@
     Checking agent-runtime-ability v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
     Checking nix v0.27.1
     Checking aead v0.5.2
-    Checking serde_spanned v1.1.1
     Checking toml_datetime v1.1.1+spec-1.1.0
-    Checking env_home v0.1.0
-    Checking byteorder v1.5.0
-    Checking fastrand v2.4.1
+    Checking serde_spanned v1.1.1
     Checking untrusted v0.7.1
+    Checking byteorder v1.5.0
+    Checking env_home v0.1.0
     Checking toml_writer v1.1.2+spec-1.1.0
-    Checking tempfile v3.27.0
+    Checking fastrand v2.4.1
     Checking toml v1.1.4+spec-1.1.0
-    Checking blowfish v0.9.1
-    Checking which v7.0.3
+    Checking tempfile v3.27.0
     Checking command-group v5.0.1
+    Checking which v7.0.3
+    Checking blowfish v0.9.1
     Checking chacha20poly1305 v0.10.1
     Checking agent-runtime v0.1.0 (https://github.com/ForgeAILab/agent-runtime.git?rev=65a3970#65a39708)
     Checking rand v0.8.6
     Checking simple_asn1 v0.6.4
-    Checking executors v0.13.2 (/home/runner/work/forge/forge/crates/executors)
-    Checking events v0.13.2 (/home/runner/work/forge/forge/crates/events)
-    Checking dirs v6.0.0
     Checking filedescriptor v0.8.3
+    Checking dirs v6.0.0
     Checking regex v1.12.3
     Checking pem v3.0.6
     Checking serial2 v0.2.37
-    Checking shell-words v1.1.1
     Checking signature v2.2.0
+    Checking shell-words v1.1.1
     Checking downcast-rs v1.2.1
     Checking portable-pty v0.9.0
-    Checking cli-adapters v0.13.2 (/home/runner/work/forge/forge/crates/cli-adapters)
     Checking config v0.13.2 (/home/runner/work/forge/forge/crates/config)
     Checking bcrypt v0.17.1
     Checking workspace v0.13.2 (/home/runner/work/forge/forge/crates/workspace)
     Checking serde_path_to_error v0.1.20
+    Checking executors v0.13.2 (/home/runner/work/forge/forge/crates/executors)
+    Checking events v0.13.2 (/home/runner/work/forge/forge/crates/events)
+    Checking cli-adapters v0.13.2 (/home/runner/work/forge/forge/crates/cli-adapters)
     Checking jsonwebtoken v10.4.0
     Checking review v0.13.2 (/home/runner/work/forge/forge/crates/review)
     Checking forge-agent-host v0.13.2 (/home/runner/work/forge/forge/crates/agent-host)
     Checking services v0.13.2 (/home/runner/work/forge/forge/crates/services)
-error[E0505]: cannot move out of `embeddings` because it is borrowed
-   --> crates/services/src/memory_recall.rs:491:18
+error[E0599]: no variant, associated function, or constant named `Procedure` found for enum `MemoryKind` in the current scope
+   --> crates/services/tests/memory_recall.rs:271:21
     |
-464 |         let embeddings = match embedder.embed(&inputs).await {
-    |             ---------- binding `embeddings` declared here
-...
-474 |         let Some(query_embedding) = embeddings.first() else {
-    |                                     ---------- borrow of `embeddings` occurs here
-...
-491 |             .zip(embeddings.into_iter().skip(1))
-    |                  ^^^^^^^^^^ move out of `embeddings` occurs here
-492 |             .filter_map(|(candidate, embedding)| {
-493 |                 cosine_similarity(query_embedding, &embedding)
-    |                                   --------------- borrow later captured here by closure
+271 |         MemoryKind::Procedure,
+    |                     ^^^^^^^^^ variant, associated function, or constant not found in `MemoryKind`
 
-For more information about this error, try `rustc --explain E0505`.
-error: could not compile `services` (lib) due to 1 previous error
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `services` (test "memory_recall") due to 1 previous error
 warning: build failed, waiting for other jobs to finish...
-error: could not compile `services` (lib test) due to 1 previous error
 

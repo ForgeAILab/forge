@@ -471,14 +471,15 @@ where
                 });
             }
         };
-        let Some(query_embedding) = embeddings.first() else {
+        let mut embeddings = embeddings.into_iter();
+        let Some(query_embedding) = embeddings.next() else {
             return Ok(SemanticRecallStatus::Degraded {
                 provider,
                 model,
                 reason: "embedding provider returned no query vector".to_owned(),
             });
         };
-        if embeddings.len() != pool.len() + 1 {
+        if embeddings.len() != pool.len() {
             return Ok(SemanticRecallStatus::Degraded {
                 provider,
                 model,
@@ -488,9 +489,9 @@ where
 
         let mut ranked = pool
             .into_iter()
-            .zip(embeddings.into_iter().skip(1))
+            .zip(embeddings)
             .filter_map(|(candidate, embedding)| {
-                cosine_similarity(query_embedding, &embedding)
+                cosine_similarity(&query_embedding, &embedding)
                     .map(|similarity| (candidate, similarity))
             })
             .collect::<Vec<_>>();
