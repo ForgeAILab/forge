@@ -550,6 +550,7 @@ impl ProjectRepo for SqliteDb {
         id: &str,
         expected_version: i64,
         expected_primary_repo_id: Option<&str>,
+        repository_linked: bool,
         paused_at: &str,
         reason: &str,
     ) -> Result<bool> {
@@ -557,21 +558,26 @@ impl ProjectRepo for SqliteDb {
         // Project/repository state may be auto-paused. A concurrent pause,
         // repository attachment/deletion, or another Project mutation makes
         // this a benign no-op rather than an error.
+        let linkage = if repository_linked {
+            "EXISTS"
+        } else {
+            "NOT EXISTS"
+        };
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let updated_at = now_rfc3339();
-        let result = sqlx::query(
+        let result = sqlx::query(&format!(
             "UPDATE project
              SET paused_at = ?, system_pause_reason = ?, version = version + 1,
                  updated_at = ?
              WHERE id = ? AND version = ? AND paused_at IS NULL
                AND system_pause_reason IS NULL
                AND primary_repo_id IS ?
-               AND NOT EXISTS (
+               AND {linkage} (
                    SELECT 1 FROM repo
                    WHERE repo.id = project.primary_repo_id
                      AND repo.project_id = project.id
-               )",
-        )
+               )"
+        ))
         .bind(paused_at)
         .bind(reason)
         .bind(&updated_at)

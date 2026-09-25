@@ -128,8 +128,14 @@ export function GeneralTab({
             </div>
             {paused && systemPauseReason === 'missing_repository' ? (
               <p className="mt-2 max-w-md text-xs leading-5 text-muted-foreground">
-                Paused automatically: this Project has no repository yet. It resumes on its own
-                once one is attached; resuming it here will not let Tasks run without one.
+                Paused automatically: this Project has no repository yet. It resumes on its own once
+                one is attached; resuming it here will not let Tasks run without one.
+              </p>
+            ) : null}
+            {paused && systemPauseReason === 'repository_not_ready' ? (
+              <p className="mt-2 max-w-md text-xs leading-5 text-muted-foreground">
+                Paused automatically: the repository for this Project has no commit on{' '}
+                <code>main</code> yet. It resumes on its own once the first commit lands.
               </p>
             ) : null}
           </SettingsSection>
@@ -178,7 +184,9 @@ export function GeneralTab({
                   ))}
                 </div>
               )}
-              {projectAgentsQuery.isError && <p className="text-xs text-destructive">Unable to load agents</p>}
+              {projectAgentsQuery.isError && (
+                <p className="text-xs text-destructive">Unable to load agents</p>
+              )}
             </SettingsSection>
           )}
           <SettingsSection

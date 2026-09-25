@@ -2062,8 +2062,14 @@ setup dimension. The Task dispatcher's scan (`TaskDispatcher::sync_repository_pa
 ahead of its per-project dispatch/recovery in `check_once`) resolves
 `primary_repo_id` to a Repo owned by that same Project. Missing or invalid
 selection records a visible setup blocker, issues no execution or lease, and
-never substitutes an unselected legacy Repo row. Attaching a valid Repo wakes
-normal scheduling, so an already governed Task can launch without a Task
+never substitutes an unselected legacy Repo row. A linked Repo whose checkout
+fails the same readiness check execution admission applies (a local checkout
+must be a git repository whose `main` branch has a commit) pauses the Project
+with `system_pause_reason = "repository_not_ready"` instead of letting every
+Task park on a setup refusal that an out-of-band first commit would never
+wake. Positive checkout verification is memoized per Repo snapshot, so a
+ready Project costs no git processes per scan. Attaching a valid, ready Repo
+(or the first commit landing) wakes normal scheduling, so an already governed Task can launch without a Task
 update or backfill. A matching system pause may clear, but a user's own pause
 via `POST /projects/{id}/pause` (or any general Project update that sets
 `paused_at`) always clears `system_pause_reason`, so a deliberate pause is

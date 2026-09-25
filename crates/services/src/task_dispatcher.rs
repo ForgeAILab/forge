@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -26,6 +27,9 @@ pub struct TaskDispatcher {
     check_interval: Duration,
     stopped: AtomicBool,
     stop_notify: Notify,
+    /// Primary Repo snapshots (`id@updated_at`) already verified ready by
+    /// `sync_repository_pause`.
+    ready_repositories: Mutex<HashSet<String>>,
 }
 
 impl TaskDispatcher {
@@ -52,6 +56,7 @@ impl TaskDispatcher {
             check_interval,
             stopped: AtomicBool::new(false),
             stop_notify: Notify::new(),
+            ready_repositories: Mutex::new(HashSet::new()),
         }
     }
 

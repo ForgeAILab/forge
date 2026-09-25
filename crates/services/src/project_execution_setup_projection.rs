@@ -318,7 +318,9 @@ async fn load_primary_repo(
     Ok(Some((repo_response(repo), repository_ready)))
 }
 
-async fn verify_repository_state(repo: &db::Repo) -> Result<bool> {
+/// Whether a Repo's checkout can host execution: a local checkout must be a
+/// git repository whose `main` branch exists and has a commit.
+pub(crate) async fn verify_repository_state(repo: &db::Repo) -> Result<bool> {
     let Some(local_path) = repo.local_path.as_deref() else {
         // A remote repository has no local filesystem claim to verify. Its
         // Project linkage is the authoritative DB-verifiable checkpoint.

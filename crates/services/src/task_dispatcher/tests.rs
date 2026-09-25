@@ -944,6 +944,114 @@ async fn stale_repository_resume_cannot_clear_a_later_manual_pause() {
 }
 
 #[tokio::test]
+async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_commit() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "Unborn repository").await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(
+        &db,
+        &project_id,
+        "created before the first commit",
+        "todo",
+        1,
+    )
+    .await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+
+    // A scaffold links its Repo before `main` has a commit.
+    run_git(repo_dir.path(), &["init", "--initial-branch=main"]);
+    run_git(
+        repo_dir.path(),
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+    );
+    run_git(repo_dir.path(), &["config", "user.email", "test@forge.dev"]);
+    run_git(repo_dir.path(), &["config", "user.name", "Forge Test"]);
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "unborn".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("repo creates");
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("repository attaches");
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    let paused = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert!(paused.paused_at.is_some());
+    assert_eq!(
+        paused.system_pause_reason.as_deref(),
+        Some(super::repo_pause_sync::REPOSITORY_NOT_READY)
+    );
+    // Held at the Project, not parked on a setup refusal nothing would wake.
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    let held = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task exists");
+    assert!(deferred_dispatch::dispatch_disposition_for_test(&held).is_none());
+
+    // The first commit lands outside Forge.
+    std::fs::write(repo_dir.path().join("README.md"), "# Forge\n").expect("README writes");
+    run_git(repo_dir.path(), &["add", "-A"]);
+    run_git(repo_dir.path(), &["commit", "-m", "initial commit"]);
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    let resumed = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert!(resumed.paused_at.is_none());
+    assert!(resumed.system_pause_reason.is_none());
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(execution_ctx.task_id, task.id);
+}
+
+#[tokio::test]
 async fn stale_repository_pause_cannot_pause_after_repository_attachment() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
