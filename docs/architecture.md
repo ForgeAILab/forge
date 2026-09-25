@@ -1718,6 +1718,13 @@ records. It suppresses raw chat-derived memories already represented in the
 active LCM/recent history. LCM summaries remain derived episodic continuity,
 not verified semantic facts.
 
+At the first turn of an Agent Chat topic, and on a retry of that admitted turn,
+Forge runs a small lexical recall over this source. The recall horizon is
+frozen to the turn job's creation timestamp, selected fragments are injected
+as explicitly untrusted historical context, and included, omitted, or
+deduplicated records are persisted in the same immutable context manifest.
+Recall failure does not fail the chat turn; it degrades to no recalled context.
+
 ### Commitments, Attention, and Mission Control
 
 Inbox items, commitments, and typed action/proposal envelopes are durable

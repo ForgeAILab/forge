@@ -249,6 +249,7 @@ where
                 query,
                 limit: i64::from(limit),
                 cursor,
+                not_after: None,
                 include_retracted: false,
             })
             .await?;

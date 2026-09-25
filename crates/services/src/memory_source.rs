@@ -1,4 +1,9 @@
-use std::sync::Arc;
+mod relevance;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use db::{
@@ -9,6 +14,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{MemoryAccessContext, Result, ServiceError};
+
+const MAX_RECALL_RESULTS: u32 = 12;
+const MAX_RECALL_ARM_RESULTS: u32 = 32;
 
 /// The immutable admission identity used to construct a ForgeMemorySource.
 /// The source never accepts a caller-supplied scope after construction.
@@ -37,6 +45,23 @@ pub struct ForgeMemoryQuery {
     pub cursor: Option<String>,
 }
 
+/// Non-pageable, bounded recall for agent context construction.
+///
+/// Recall is deliberately distinct from [`ForgeMemoryQuery`]: paginated search
+/// keeps its stable authority/recency cursor, while recall may combine several
+/// authorized lexical result sets and reorder them by query relevance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMemoryRecallQuery {
+    pub query: String,
+    pub limit: u32,
+    /// Stable source ids already represented by recent canonical Agent Chat
+    /// history or an admitted LCM timeline.
+    pub represented_source_ids: Vec<String>,
+    /// Freeze recall to records that existed when this turn or execution was
+    /// admitted. Retries then reuse the same semantic horizon.
+    pub not_after: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeMemoryRecord {
     pub id: Uuid,
@@ -51,6 +76,21 @@ pub struct ForgeMemoryRecord {
     pub source_ref: Option<String>,
     pub provenance_json: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMemoryRecallRecord {
+    pub record: ForgeMemoryRecord,
+    pub matched_terms: Vec<String>,
+    pub selection_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMemoryRecall {
+    pub records: Vec<ForgeMemoryRecallRecord>,
+    pub query_terms: Vec<String>,
+    pub candidate_count: u32,
+    pub deduplicated_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,24 +233,174 @@ where
             .search_memory_items_scoped(MemoryAccessQuery {
                 identity_id: self.access.identity_id.clone(),
                 grants: self.access.grants.clone(),
-                query: query.query,
+                query: query.query.clone(),
+                not_after: None,
                 limit: i64::from(requested),
-                cursor: query.cursor,
+                cursor: query.cursor.clone(),
                 include_retracted: false,
             })
             .await?;
         let raw_cursor = items.last().map(scoped_cursor_for_item).transpose()?;
-        let mut deduplicated_source_ids = Vec::new();
-        let mut records = Vec::with_capacity(items.len());
-        for item in items {
-            if query.represented_source_ids.iter().any(|source_id| {
-                source_id == &item.id || source_id == &source_ref(&item).unwrap_or_default()
-            }) {
-                if let Some(source_id) = source_ref(&item) {
-                    deduplicated_source_ids.push(source_id);
-                } else {
-                    deduplicated_source_ids.push(item.id.clone());
+        let (records, mut deduplicated_source_ids) =
+            self.records_from_items(items, &query.represented_source_ids)?;
+
+        // Preserve the existing stable paginated search. Only when the exact
+        // all-term query produced no usable record on its first page do we
+        // fall back to the bounded, non-pageable recall path.
+        if records.is_empty() && query.cursor.is_none() {
+            let recall = self
+                .recall(ForgeMemoryRecallQuery {
+                    query: query.query,
+                    limit: requested,
+                    represented_source_ids: query.represented_source_ids,
+                    not_after: None,
+                })
+                .await?;
+            deduplicated_source_ids.extend(recall.deduplicated_source_ids);
+            deduplicated_source_ids.sort();
+            deduplicated_source_ids.dedup();
+            return Ok(ForgeMemorySearch {
+                records: recall
+                    .records
+                    .into_iter()
+                    .map(|record| record.record)
+                    .collect(),
+                has_more: false,
+                next_cursor: None,
+                deduplicated_source_ids,
+            });
+        }
+
+        Ok(ForgeMemorySearch {
+            records,
+            has_more,
+            next_cursor: if has_more { raw_cursor } else { None },
+            deduplicated_source_ids,
+        })
+    }
+
+    /// Recall a small, query-relevant context set without requiring embeddings.
+    ///
+    /// The source first derives a bounded list of salient query terms. It runs
+    /// one exact all-term arm plus one arm per term through the existing
+    /// scope-authorized repository query, fuses the ranked lists with
+    /// reciprocal-rank fusion, and then applies deterministic field/authority
+    /// tie-breakers. This method is intentionally non-pageable.
+    pub async fn recall(&self, query: ForgeMemoryRecallQuery) -> Result<ForgeMemoryRecall> {
+        let requested = query
+            .limit
+            .min(self.max_results)
+            .clamp(1, MAX_RECALL_RESULTS);
+        let (query_terms, arms) = relevance::query_arms(&query.query);
+        if arms.is_empty() {
+            return Ok(ForgeMemoryRecall {
+                records: Vec::new(),
+                query_terms,
+                candidate_count: 0,
+                deduplicated_source_ids: Vec::new(),
+            });
+        }
+
+        let represented_source_ids = query
+            .represented_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let arm_limit = requested.saturating_mul(4).clamp(8, MAX_RECALL_ARM_RESULTS);
+        let mut candidates = BTreeMap::new();
+        let mut deduplicated_source_ids = BTreeSet::new();
+
+        for arm in &arms {
+            let (items, _) = self
+                .db
+                .search_memory_items_scoped(MemoryAccessQuery {
+                    identity_id: self.access.identity_id.clone(),
+                    grants: self.access.grants.clone(),
+                    query: arm.query.clone(),
+                    not_after: query.not_after.clone(),
+                    limit: i64::from(arm_limit),
+                    cursor: None,
+                    include_retracted: false,
+                })
+                .await?;
+
+            let mut eligible = Vec::with_capacity(items.len());
+            for item in items {
+                let item_source_ref = source_ref(&item);
+                let represented = represented_source_ids.contains(item.id.as_str())
+                    || item_source_ref
+                        .as_deref()
+                        .is_some_and(|source_id| represented_source_ids.contains(source_id));
+                if represented {
+                    deduplicated_source_ids
+                        .insert(item_source_ref.unwrap_or_else(|| item.id.clone()));
+                    continue;
                 }
+                if item.sensitivity == "secret"
+                    || (!self.allow_restricted && item.sensitivity == "restricted")
+                {
+                    continue;
+                }
+                eligible.push(item);
+            }
+            relevance::merge_ranked_items(&mut candidates, eligible, arm);
+        }
+
+        let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+        let ranked = relevance::rank_candidates(&query_terms, candidates);
+        let mut seen_sources = BTreeSet::new();
+        let mut records = Vec::with_capacity(requested as usize);
+
+        for candidate in ranked {
+            let source_key =
+                source_ref(&candidate.item).unwrap_or_else(|| candidate.item.id.clone());
+            if !seen_sources.insert(source_key) {
+                continue;
+            }
+            let matched_terms = if candidate.all_terms_match {
+                query_terms.clone()
+            } else {
+                candidate.matched_terms.iter().cloned().collect()
+            };
+            let selection_reason = relevance::selection_reason(&candidate, &query_terms);
+            records.push(ForgeMemoryRecallRecord {
+                record: record_from_item(candidate.item)?,
+                matched_terms,
+                selection_reason,
+            });
+            if records.len() == requested as usize {
+                break;
+            }
+        }
+
+        Ok(ForgeMemoryRecall {
+            records,
+            query_terms,
+            candidate_count,
+            deduplicated_source_ids: deduplicated_source_ids.into_iter().collect(),
+        })
+    }
+
+    fn records_from_items(
+        &self,
+        items: Vec<MemoryItem>,
+        represented_source_ids: &[String],
+    ) -> Result<(Vec<ForgeMemoryRecord>, Vec<String>)> {
+        let represented_source_ids = represented_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut deduplicated_source_ids = BTreeSet::new();
+        let mut records = Vec::with_capacity(items.len());
+
+        for item in items {
+            let item_source_ref = source_ref(&item);
+            let represented = represented_source_ids.contains(item.id.as_str())
+                || item_source_ref
+                    .as_deref()
+                    .is_some_and(|source_id| represented_source_ids.contains(source_id));
+            if represented {
+                deduplicated_source_ids.insert(item_source_ref.unwrap_or_else(|| item.id.clone()));
                 continue;
             }
             if item.sensitivity == "secret"
@@ -220,12 +410,11 @@ where
             }
             records.push(record_from_item(item)?);
         }
-        Ok(ForgeMemorySearch {
+
+        Ok((
             records,
-            has_more,
-            next_cursor: if has_more { raw_cursor } else { None },
-            deduplicated_source_ids,
-        })
+            deduplicated_source_ids.into_iter().collect::<Vec<_>>(),
+        ))
     }
 }
 

@@ -6,6 +6,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Agent Chat startup now injects a bounded, scope-authorized lexical memory
+  context on the first turn of the current topic and on retries. Recall is
+  frozen to the turn job's admission timestamp, rendered as untrusted
+  historical context, and records included, omitted, and deduplicated sources
+  in the immutable context manifest. Recall failures degrade to no memory
+  rather than failing the chat turn.
+
 ## [0.13.2] - 2026-09-24
 
 ### Fixed

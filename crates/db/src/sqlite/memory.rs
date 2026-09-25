@@ -363,13 +363,18 @@ impl ScopedMemoryRepository for SqliteDb {
             } else {
                 " AND NOT EXISTS (SELECT 1 FROM memory_lifecycle_assertion AS lifecycle WHERE lifecycle.memory_item_id = memory_item.id AND lifecycle.assertion_type IN ('superseded', 'retracted', 'expired'))".to_owned()
             };
+            let cutoff_sql = if query.not_after.is_some() {
+                " AND memory_item.created_at <= ?"
+            } else {
+                ""
+            };
             let cursor_sql = if cursor.is_some() {
                 " AND ((CASE memory_item.authority WHEN 'decision' THEN 600 WHEN 'procedure' THEN 500 WHEN 'verified_fact' THEN 450 WHEN 'proposal' THEN 300 WHEN 'hypothesis' THEN 200 ELSE 100 END + memory_item.retention_priority) < ? OR ((CASE memory_item.authority WHEN 'decision' THEN 600 WHEN 'procedure' THEN 500 WHEN 'verified_fact' THEN 450 WHEN 'proposal' THEN 300 WHEN 'hypothesis' THEN 200 ELSE 100 END + memory_item.retention_priority) = ? AND (memory_item.created_at < ? OR (memory_item.created_at = ? AND memory_item.id < ?))))"
             } else {
                 ""
             };
             let sql = format!(
-                "SELECT memory_item.row_id, memory_item.id, memory_item.created_at, (CASE memory_item.authority WHEN 'decision' THEN 600 WHEN 'procedure' THEN 500 WHEN 'verified_fact' THEN 450 WHEN 'proposal' THEN 300 WHEN 'hypothesis' THEN 200 ELSE 100 END + memory_item.retention_priority) AS rank FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.scope_type = ? AND memory_item.scope_id = ? AND memory_item.source_type <> 'room' AND memory_item.kind <> 'room_message' AND memory_item.sensitivity <> 'secret' AND (memory_item.visibility IN ({placeholders}) OR (memory_item.visibility = 'private' AND memory_item.owner_identity_id = ?)){lifecycle} AND memory_item_fts MATCH ?{cursor_sql} ORDER BY rank DESC, memory_item.created_at DESC, memory_item.id DESC LIMIT ?"
+                "SELECT memory_item.row_id, memory_item.id, memory_item.created_at, (CASE memory_item.authority WHEN 'decision' THEN 600 WHEN 'procedure' THEN 500 WHEN 'verified_fact' THEN 450 WHEN 'proposal' THEN 300 WHEN 'hypothesis' THEN 200 ELSE 100 END + memory_item.retention_priority) AS rank FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.scope_type = ? AND memory_item.scope_id = ? AND memory_item.source_type <> 'room' AND memory_item.kind <> 'room_message' AND memory_item.sensitivity <> 'secret' AND (memory_item.visibility IN ({placeholders}) OR (memory_item.visibility = 'private' AND memory_item.owner_identity_id = ?)){lifecycle}{cutoff_sql} AND memory_item_fts MATCH ?{cursor_sql} ORDER BY rank DESC, memory_item.created_at DESC, memory_item.id DESC LIMIT ?"
             );
             let mut statement = sqlx::query(&sql)
                 .bind(&grant.scope_type)
@@ -378,6 +383,9 @@ impl ScopedMemoryRepository for SqliteDb {
                 statement = statement.bind(visibility);
             }
             statement = statement.bind(query.identity_id.as_deref());
+            if let Some(not_after) = query.not_after.as_deref() {
+                statement = statement.bind(not_after);
+            }
             statement = statement.bind(&fts_query);
             if let Some(cursor) = &cursor {
                 statement = statement
