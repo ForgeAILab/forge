@@ -6,6 +6,7 @@ on:
       - feat/lightweight-memory-recall
     paths:
       - scripts/apply_memory_context_patch.py
+      - scripts/apply_memory_context_patch_v2.py
       - .github/workflows/apply-memory-context.yml
 
 permissions:
@@ -31,7 +32,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Apply patch
-        run: python3 scripts/apply_memory_context_patch.py
+        run: python3 scripts/apply_memory_context_patch_v2.py
 
       - name: Format
         run: cargo fmt --all
@@ -49,6 +50,7 @@ jobs:
       - name: Commit validated patch
         run: |
           rm scripts/apply_memory_context_patch.py
+          rm scripts/apply_memory_context_patch_v2.py
           rm .github/workflows/apply-memory-context.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
