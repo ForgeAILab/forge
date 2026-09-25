@@ -20,11 +20,12 @@ Use this checklist for public beta releases.
 ## Release Steps
 
 - [ ] Update `CHANGELOG.md`.
-- [ ] Confirm the workspace version in `Cargo.toml`, its package entries in `Cargo.lock`, `web/package.json`, and `npx-cli/package.json` match. Every workspace crate, `forge-client` included, inherits `version.workspace`; the npm bootstrapper also receives the release tag version in the release workflow.
+- [ ] Confirm the workspace version in `Cargo.toml`, its package entries in `Cargo.lock`, `web/package.json`, and `npx-cli/package.json` match. Every workspace crate, `forge-client` included, inherits `version.workspace`.
 - [ ] Merge the reviewed release PR and confirm the full CI, security, and code-scanning checks pass on the exact release commit before tagging.
 - [ ] Tag the release with `vX.Y.Z`.
-- [ ] Wait for `.github/workflows/release.yml` to publish artifacts and `SHA256SUMS`.
-- [ ] Download one archive, verify its checksum and the presence of `forge`, `forge-ctl`, and `web/dist/index.html`, install it, and smoke-test `forge --help` plus browser navigation outside the repo checkout using an isolated data directory.
+- [ ] Confirm `.github/workflows/release.yml` passes its independent version, Rust, web/browser, security-audit, npm-package, and platform-build gates before any publication job starts.
+- [ ] Wait for the release workflow to publish native archives, `SHA256SUMS`, the GHCR image, npm bootstrapper, and Homebrew update request.
+- [ ] Download one archive, verify its checksum and the presence of `forge`, `forge-ctl`, `forge-solo`, and `web/dist/index.html`, install it, and smoke-test `forge --help` plus browser navigation outside the repo checkout using an isolated data directory.
 - [ ] Confirm the published Docker image contains `/usr/local/share/forge/web/dist/index.html`.
 - [ ] Publish release notes that call the release a public beta/developer preview.
 

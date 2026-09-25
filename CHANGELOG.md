@@ -6,6 +6,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-24
+
+### Fixed
+
+- Operations no longer re-reads an execution log from the start for every
+  500-entry page. Each summary is one sequential scan bounded by the file size
+  at open, and up to 64 summaries are cached (validated by file identity and a
+  30-second maximum age); concurrent readers of one log share the scan.
+- Streaming log activity refreshes Operations at most every five seconds
+  instead of every 500 ms; lifecycle events keep the 500 ms cadence, and a
+  lagged event receiver now forces a reconciliation instead of being ignored.
+- Operations reports a Task carrying an active `blocked_json` blocker even when
+  its workflow phase is not `blocked`. Deleted, archived, `done`, and
+  `cancelled` Tasks are excluded.
+- Native text and reasoning deltas bump the execution's semantic-progress row
+  at most once per second, removing a SQLite write per delta. Every delta is
+  still written to the live stream and durable log; tool-call boundaries and
+  explicit progress updates remain immediate.
+
+### Changed
+
+- Releases are gated on version, Rust, web/browser, security-audit, and npm
+  verification. The tag must match the workspace version, `Cargo.lock`,
+  `web/package.json`, `npx-cli/package.json`, and a `CHANGELOG.md` section.
+  The web bundle is built once and reused across all six targets, binaries are
+  built `--locked`, every archive is checked for all three binaries and
+  `web/dist/index.html`, and the GitHub release waits for the GHCR image.
+- Opt-in `forge::perf` debug tracing and `scripts/collect_performance.py`, a
+  local aggregate-only collector; see `docs/performance-testing.md`.
+- Dependency bumps: vitest 4.1.11, @playwright/test 1.63.0,
+  ossf/scorecard-action 2.4.4.
+
 ## [0.13.1] - 2026-09-24
 
 ### Fixed

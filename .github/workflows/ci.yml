@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
 
 jobs:
@@ -22,6 +24,10 @@ jobs:
 
       - name: Run Rust CI
         run: ./scripts/ci-rust.sh
+
+      - name: Test performance collector
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
 
   audit:
     name: Security Audit
