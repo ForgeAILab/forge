@@ -20,6 +20,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the surviving task branch, or starts fresh from the default branch when the
   branch is gone, instead of failing every dispatch with `workspace for task
   ... is not ready`.
+- A Smith Task execution no longer halts with `smith execution halted: ...
+  requires_authorization` at its first shell or write tool call. Forge runs
+  Smith headless, where Smith's own `ask` default cannot be answered and ends
+  the run. Forge now always passes a complete approval answer.
+
+### Breaking
+
+- Smith agents with no approval setting (`permission_policy`, `yolo`, or
+  `approval` in `config_json`) now run with `--approval allow-all` instead of
+  Smith's `ask`, matching the other CLI adapters' unattended defaults. A
+  `supervised` or `plan` policy, or `approval: "ask"`, now maps to
+  `--approval deny`: a gated tool call is rejected back to the model and the
+  run continues, instead of the run halting. Set `permission_policy: plan` on
+  an agent that must not run authority-bearing tools.
 
 ## [0.13.3] - 2026-09-25
 

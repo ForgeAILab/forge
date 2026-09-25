@@ -2118,7 +2118,14 @@ CLI adapters that can bypass their own approval boundary advertise `yolo` in
 uses that adapter's least-restricted mode (for Codex, `danger-full-access` plus
 `never`; for Claude Code, `bypassPermissions`; for Gemini and Smith, `--yolo`;
 for OpenCode, `--dangerously-skip-permissions`; and for Cursor, `--force`). It
-applies only to admitted CLI Task executions. Forge still derives Project and
+applies only to admitted CLI Task executions.
+
+Forge runs Smith headless, so it never forwards Smith's interactive `ask`
+approval mode, which ends a headless run at its first gated tool call. With no
+setting, Smith runs with `--approval allow-all`; `yolo` and `auto` pass
+`--yolo`; `supervised`, `plan`, and an explicit `approval: "ask"` pass
+`--approval deny`, which rejects each gated call back to the model and lets the
+run continue. An explicit `approval` of `deny` or `allow-all` is passed through. Forge still derives Project and
 Task scope server-side, requires the normal assignment and Workspace lease,
 keeps Main/Project Agent Chats filesystem-denied, and reserves user-only
 approval, waiver, and release operations for the user.
