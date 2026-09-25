@@ -1,0 +1,102 @@
+name: Fix and verify bounded memory recall
+
+on:
+  push:
+    branches:
+      - feat/memory-recall-lite
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fix semantic embedding ownership
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("crates/services/src/memory_recall.rs")
+          text = path.read_text()
+          replacements = [
+              (
+                  "        let Some(query_embedding) = embeddings.first() else {",
+                  "        let mut embeddings = embeddings.into_iter();\n        let Some(query_embedding) = embeddings.next() else {",
+              ),
+              (
+                  "        if embeddings.len() != pool.len() + 1 {",
+                  "        if embeddings.len() != pool.len() {",
+              ),
+              (
+                  "            .zip(embeddings.into_iter().skip(1))",
+                  "            .zip(embeddings)",
+              ),
+              (
+                  "                cosine_similarity(query_embedding, &embedding)",
+                  "                cosine_similarity(&query_embedding, &embedding)",
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit(f"expected one occurrence of {old!r}, found {text.count(old)}")
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+
+      - name: Verify and publish result
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG=tools/memory-recall-check.log
+          : > "$LOG"
+
+          run_check() {
+            local label="$1"
+            shift
+            echo "===== ${label} =====" | tee -a "$LOG"
+            "$@" 2>&1 | tee -a "$LOG"
+            local status=${PIPESTATUS[0]}
+            echo | tee -a "$LOG"
+            return "$status"
+          }
+
+          phase=""
+          run_check "cargo fmt --all" cargo fmt --all || phase="format"
+          if [[ -z "$phase" ]]; then
+            run_check "cargo check -p services --tests --locked" cargo check -p services --tests --locked || phase="check"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services --test memory_recall --locked" cargo test -p services --test memory_recall --locked || phase="integration-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services memory_recall --lib --locked" cargo test -p services memory_recall --lib --locked || phase="unit-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo test -p services effective_prompt_appends_bounded_memory --lib --locked" cargo test -p services effective_prompt_appends_bounded_memory --lib --locked || phase="prompt-test"
+          fi
+          if [[ -z "$phase" ]]; then
+            run_check "cargo clippy -p services --tests --locked -- -D warnings" cargo clippy -p services --tests --locked -- -D warnings || phase="clippy"
+          fi
+
+          rm .github/workflows/fix-memory-recall.yml
+          git config user.name "forge-memory-bot"
+          git config user.email "forge-memory-bot@users.noreply.github.com"
+
+          if [[ -n "$phase" ]]; then
+            git add -A
+            git commit -m "wip(memory): capture ${phase} diagnostics"
+            git push origin HEAD:${GITHUB_REF_NAME}
+            exit 1
+          fi
+
+          rm "$LOG"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix(memory): consume semantic embedding iterator"
+          git push origin HEAD:${GITHUB_REF_NAME}
