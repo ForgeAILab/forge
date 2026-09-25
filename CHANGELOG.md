@@ -6,6 +6,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-09-25
+
+### Fixed
+
+- Native Task workers and planners now use deterministic structural context
+  compaction instead of a persistent Task LCM timeline. Existing native Task
+  sessions rotate once to discard the old LCM capability, preventing retries
+  from failing immediately with `LCM context cannot fit after bounded hard
+  compaction`; Main and Project Agent chats continue to use LCM.
+- A Task whose workspace was cleaned (for example by a role reassignment that
+  resets the Task) can run again. Its next execution rebuilds the worktree from
+  the surviving task branch, or starts fresh from the default branch when the
+  branch is gone, instead of failing every dispatch with `workspace for task
+  ... is not ready`.
+
 ## [0.13.3] - 2026-09-25
 
 ### Fixed

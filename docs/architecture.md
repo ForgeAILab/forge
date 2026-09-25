@@ -1425,8 +1425,12 @@ execution failures and preserve their exact limit in the execution error.
 
 Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
 scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
-use their own canonical timelines and native Task work uses a Task timeline.
-SQLite implements the Agent
+use their own canonical timelines. Native Task workers and planners keep their
+protected runtime sessions for follow-up continuity but do not use LCM; the
+runtime's deterministic structural compactor bounds their older optional
+history and tool results in-place. Reviewer attempts likewise use structural
+compaction while continuing to start without prior Task history or protected
+session reuse. SQLite implements the Agent
 Runtime LCM reader/writer contracts with host-minted view authority on every
 operation, immutable admitted entries, transactional DAG compare-and-swap,
 operation fingerprints, and restart recovery. Session rotation follows the
@@ -1437,8 +1441,8 @@ Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
 serialized canonical form, because the runtime's default sizer scans an
 entry's plain text plus one token per tool part and a tool call's arguments
 and a tool result's body sit inside their content part, invisible to that
-scan. A worker or Project Agent timeline is mostly
-`[assistant tool call, tool result]` pairs, so the default read ~41% under
+scan. A Project Agent timeline is mostly `[assistant tool call, tool result]`
+pairs, so the default read ~41% under
 what the context planner charges: pressure stayed Soft, which never compacts,
 while the planner refused the turn with `budget_exceeded` — and because
 canonical history is durable, every retry replayed it.
@@ -2222,9 +2226,9 @@ CLI profiles continue through the existing executor/daemon path. A compatible
 native profile enters work through the same claim, assignment, workflow,
 Workspace, validation, review, and delivery services; it does not get an
 alternate repository-mutation route. Only the admitted Task session derives
-the role-bounded Workspace/tools and Task LCM timeline. Other simultaneous
-sessions for that identity retain their own denied Main/Project Agent Chat
-workspaces.
+the role-bounded Workspace/tools and structurally compacted Task history.
+Other simultaneous sessions for that identity retain their own denied
+Main/Project Agent Chat workspaces.
 
 Repository claims preflight the selected identity before creating a Task
 branch or worktree: an active Main or Project Agent identity is rejected even
@@ -2638,8 +2642,9 @@ it never dispatches a coder. Forge still preserves a structurally bound partial 
 unverified assessment for diagnosis. A verified assessment with actual violations
 becomes a normal failed review and follows the review-remediation budget. Each
 native reviewer attempt starts with an empty conversation and no Task
-LCM/checkpoint persistence, so a retry cannot accumulate the previous full
-contract and report. Worker and planner Task continuity remains persistent.
+checkpoint persistence, so a retry cannot accumulate the previous full
+contract and report. Worker and planner Task continuity remains persistent,
+with deterministic structural compaction instead of an LCM timeline.
 
 Configured `setup_steps` run first in a detached clean checkout of the frozen
 candidate, followed by required checks, with a 120-second timeout and bounded
