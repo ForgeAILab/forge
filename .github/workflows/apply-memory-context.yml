@@ -1,0 +1,57 @@
+name: Apply Memory Context Patch
+
+on:
+  push:
+    branches:
+      - feat/lightweight-memory-recall
+    paths:
+      - scripts/apply_memory_context_patch.py
+      - .github/workflows/apply-memory-context.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: feat/lightweight-memory-recall
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Apply patch
+        run: python3 scripts/apply_memory_context_patch.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Focused tests
+        run: |
+          cargo test -p services --lib memory_source::relevance::tests -- --nocapture
+          cargo test -p services --lib memory_context::tests -- --nocapture
+          cargo test -p services --test memory_recall -- --nocapture
+          cargo test -p db --lib memory -- --nocapture
+
+      - name: Focused clippy
+        run: cargo clippy -p services --lib --test memory_recall -- -D warnings
+
+      - name: Commit validated patch
+        run: |
+          rm scripts/apply_memory_context_patch.py
+          rm .github/workflows/apply-memory-context.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(memory): inject bounded recall into agent chat context"
+          git push origin HEAD:feat/lightweight-memory-recall
