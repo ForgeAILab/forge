@@ -147,8 +147,8 @@ fn query_terms(query: &str) -> Vec<String> {
     let salient = all_terms
         .iter()
         .filter(|term| !STOP_WORDS.contains(&term.as_str()))
-        .cloned()
         .take(MAX_QUERY_TERMS)
+        .cloned()
         .collect::<Vec<_>>();
     if salient.is_empty() {
         all_terms.into_iter().take(MAX_QUERY_TERMS).collect()
