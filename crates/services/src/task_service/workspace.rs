@@ -103,6 +103,53 @@ pub(crate) async fn prepare_workspace_owned(
 
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, task_id).await? {
         ensure_workspace_repository_current(db, task, &workspace, &authority.repo, task_id).await?;
+        if workspace.status == WorkspaceStatus::Cleaned {
+            // A deliberate teardown (a reassignment reset, cancellation
+            // cleanup) removes the worktree but keeps the row, so the Task's
+            // next execution rebuilds it here instead of failing admission
+            // on a row that can never become ready by itself.
+            let repo_source = resolve_repo_source(&authority.repo, workspace_root).await?;
+            let branch_exists = git::branch_exists(Path::new(&repo_source), &workspace.branch)
+                .await
+                .unwrap_or(false);
+            if !branch_exists {
+                // Nothing left to recover: start over from the default
+                // branch. Deleting the row only unlinks past executions
+                // (`ON DELETE SET NULL`); their own records are kept.
+                WorkspaceRepo::delete(db, &workspace.id).await?;
+                return create_fresh_workspace(
+                    db,
+                    workspace_root,
+                    &authority.repo,
+                    task_id,
+                    repo_cache_locks,
+                )
+                .await;
+            }
+            info!(
+                task_id = task_id,
+                workspace_id = %workspace.id,
+                branch = %workspace.branch,
+                "recreating cleaned workspace from its task branch"
+            );
+            return Ok((
+                clear_workspace_cleanup_after(
+                    db,
+                    recover_missing_worktree(
+                        db,
+                        workspace_root,
+                        &authority.repo,
+                        task_id,
+                        workspace,
+                        repo_cache_locks,
+                        true,
+                    )
+                    .await?,
+                )
+                .await?,
+                false,
+            ));
+        }
         if workspace.status == WorkspaceStatus::Ready {
             match worktree_readiness(Path::new(&workspace.worktree_path)).await {
                 WorktreeReadiness::Ready => {
@@ -1100,6 +1147,76 @@ mod tests {
         assert_eq!(recovered.id, fresh.id);
         assert_eq!(recovered.branch, branch);
         assert!(std::path::Path::new(&recovered.worktree_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cleaned_workspace_is_rebuilt_from_its_task_branch() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+
+        let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        // What a reassignment reset does: the cleanup scheduler removes the
+        // worktree and marks the row cleaned, but the task branch survives.
+        ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
+            .cleanup_worktree(&task.id)
+            .await
+            .expect("worktree cleans");
+        WorkspaceRepo::mark_cleaned(&db, &fresh.id, &now_rfc3339())
+            .await
+            .expect("workspace marks cleaned");
+
+        let rebuilt = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("cleaned workspace is rebuilt");
+        assert_eq!(rebuilt.id, fresh.id);
+        assert_eq!(rebuilt.branch, fresh.branch);
+        assert_eq!(rebuilt.status, WorkspaceStatus::Ready);
+        assert!(std::path::Path::new(&rebuilt.worktree_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cleaned_workspace_without_branch_starts_fresh() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+
+        let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
+            .cleanup_worktree(&task.id)
+            .await
+            .expect("worktree cleans");
+        WorkspaceRepo::mark_cleaned(&db, &fresh.id, &now_rfc3339())
+            .await
+            .expect("workspace marks cleaned");
+        for args in [
+            vec!["worktree", "prune"],
+            vec!["branch", "-D", fresh.branch.as_str()],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo_dir.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("git runs");
+        }
+
+        let rebuilt = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("cleaned workspace starts fresh");
+        assert_ne!(rebuilt.id, fresh.id);
+        assert_eq!(rebuilt.status, WorkspaceStatus::Ready);
+        assert!(std::path::Path::new(&rebuilt.worktree_path).exists());
     }
 
     #[tokio::test]
