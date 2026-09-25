@@ -1605,6 +1605,10 @@ pub trait ScopedMemoryRepository: Send + Sync {
         &self,
         query: MemoryAccessQuery,
     ) -> std::result::Result<(Vec<MemoryItem>, bool), DbError>;
+    async fn recall_memory_items_scoped(
+        &self,
+        query: MemoryRecallAccessQuery,
+    ) -> std::result::Result<Vec<MemoryRecallCandidate>, DbError>;
     async fn insert_memory_lifecycle_assertion(
         &self,
         input: CreateMemoryLifecycleAssertion,

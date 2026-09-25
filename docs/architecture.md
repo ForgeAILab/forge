@@ -1059,6 +1059,17 @@ never contain a separately editable copy of Project truth. A newer approved
 artifact or server state always outranks chat, summaries, memory, or model
 output; cross-Project sources are rejected before retrieval and counting.
 
+Task dispatch uses a separate, non-pageable bounded recall path over that same
+store. Exact, broad, and code-token FTS5/BM25 rankings are fused before
+Task-local scope, authority, retention priority, and recency tie-breakers. The
+selected summaries/bodies are appended to the execution request inside an
+injection-resistant `PROJECT MEMORY` wrapper and consume a fixed token budget.
+Recall is best-effort and cannot block dispatch. An explicitly configured
+loopback Ollama embedder may contribute one semantic ranked list; it has no
+write authority, persists no vector truth, and degrades to lexical recall on
+any configuration, transport, model, or response failure. See
+[memory-recall.md](memory-recall.md).
+
 Genesis Project creation, binding, Project Chat, Charter attachment, handoff
 message/turn, immutable Project admission receipt, events, `handed_off`
 transition, and Charter-approval receipt consumption are one database

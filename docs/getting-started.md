@@ -340,7 +340,10 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
-`FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+`FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`. Optional semantic
+Task memory recall uses `FORGE_MEMORY_OLLAMA_MODEL`,
+`FORGE_MEMORY_OLLAMA_URL`, and `FORGE_MEMORY_OLLAMA_TIMEOUT_MS`; see
+[memory-recall.md](memory-recall.md).
 
 ### Commands an Agent may run in its workspace
 

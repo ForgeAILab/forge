@@ -6,6 +6,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Task dispatch now performs bounded, scope-authorized memory recall before
+  coder, worker, planner, and reviewer execution. SQLite FTS5/BM25 exact,
+  broad, and code-token rankings are fused under a fixed token budget; recalled
+  text is explicitly historical context rather than instructions or authority.
+- Optional loopback-only Ollama embeddings can add a semantic recall arm with
+  `FORGE_MEMORY_OLLAMA_MODEL`. Timeouts, missing models, invalid responses, and
+  disabled configuration degrade to lexical recall without blocking dispatch.
+
 ## [0.13.2] - 2026-09-24
 
 ### Fixed

@@ -1677,6 +1677,23 @@ pub struct MemoryAccessQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRecallAccessQuery {
+    pub identity_id: Option<String>,
+    pub grants: Vec<MemoryScopeGrant>,
+    pub terms: Vec<String>,
+    pub match_all: bool,
+    pub limit: i64,
+    pub include_retracted: bool,
+    pub allow_restricted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecallCandidate {
+    pub item: MemoryItem,
+    pub lexical_rank: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryGetQuery {
     pub id: String,
     pub identity_id: Option<String>,

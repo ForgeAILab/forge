@@ -123,6 +123,7 @@ Deeper dive → [docs/architecture.md](docs/architecture.md).
 |---|---|
 | [Getting started](docs/getting-started.md) | Install, first project, agents, end-to-end task walkthrough. |
 | [Architecture](docs/architecture.md) | Authority model, Project truth, milestones/evidence, crate graph, task state machine, database, event bus. |
+| [Memory recall](docs/memory-recall.md) | Bounded Task-start recall, FTS5/BM25 ranking, security boundaries, and optional Ollama embeddings. |
 | [API reference](docs/api.md) | Charter/Project/Document/Milestone/Release REST endpoints, media retention, pagination, MCP tools, SSE. |
 | [forge-ctl CLI](docs/cli.md) | Subcommands, daemon link, scripted runs. |
 | [Execution logs](docs/execution-logs.md) | JSONL log schema and chat-history reconstruction. |

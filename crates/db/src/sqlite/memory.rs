@@ -2,12 +2,13 @@ use super::*;
 use crate::{
     ContextManifest, ContextManifestSource, CreateContextManifest, CreateContextManifestSource,
     CreateForgeMemorySourceBinding, CreateMemoryLifecycleAssertion, ForgeMemorySourceBinding,
-    MemoryAccessQuery, MemoryGetQuery, MemoryItem, MemoryLifecycleAssertion, MemoryRepository,
-    MemoryScopeGrant, ScopedMemoryRepository,
+    MemoryAccessQuery, MemoryGetQuery, MemoryItem, MemoryLifecycleAssertion,
+    MemoryRecallAccessQuery, MemoryRecallCandidate, MemoryRepository, MemoryScopeGrant,
+    ScopedMemoryRepository,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryCursor {
@@ -28,6 +29,32 @@ struct MemoryCandidate {
     rank: i64,
     created_at: String,
     grant: MemoryScopeGrant,
+}
+
+#[derive(Debug, Clone)]
+struct RecallMemoryCandidate {
+    item: MemoryItem,
+    lexical_rank: Option<f64>,
+    authority_rank: i64,
+}
+
+fn recall_candidate_order(left: &RecallMemoryCandidate, right: &RecallMemoryCandidate) -> Ordering {
+    match (left.lexical_rank, right.lexical_rank) {
+        (Some(left), Some(right)) => left.total_cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+    .then_with(|| right.authority_rank.cmp(&left.authority_rank))
+    .then_with(|| right.item.created_at.cmp(&left.item.created_at))
+    .then_with(|| right.item.id.cmp(&left.item.id))
+}
+
+fn recall_candidate_precedes(
+    candidate: &RecallMemoryCandidate,
+    current: &RecallMemoryCandidate,
+) -> bool {
+    recall_candidate_order(candidate, current).is_lt()
 }
 
 fn decode_memory_cursor(cursor: Option<String>) -> Result<Option<MemoryCursor>> {
@@ -51,16 +78,28 @@ fn map_memory_rows(rows: Vec<SqliteRow>) -> Result<Vec<MemoryItem>> {
         .collect()
 }
 
-fn literal_fts_query(query: &str) -> Option<String> {
-    let terms = query
-        .split_whitespace()
+fn literal_fts_terms(terms: &[String], match_all: bool) -> Option<String> {
+    let terms = terms
+        .iter()
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     if terms.is_empty() {
         None
-    } else {
+    } else if match_all {
         Some(terms.join(" "))
+    } else {
+        Some(terms.join(" OR "))
     }
+}
+
+fn literal_fts_query(query: &str) -> Option<String> {
+    literal_fts_terms(
+        &query
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        true,
+    )
 }
 
 fn reject_retired_room_memory(item: &MemoryItem) -> Result<()> {
@@ -436,6 +475,79 @@ impl ScopedMemoryRepository for SqliteDb {
             items.push(item);
         }
         Ok((items, has_more))
+    }
+
+    async fn recall_memory_items_scoped(
+        &self,
+        query: MemoryRecallAccessQuery,
+    ) -> Result<Vec<MemoryRecallCandidate>> {
+        let limit = query.limit.clamp(1, 500) as usize;
+        let fts_query = literal_fts_terms(&query.terms, query.match_all);
+        let mut candidates = BTreeMap::<String, RecallMemoryCandidate>::new();
+        for grant in query.grants {
+            let placeholders = std::iter::repeat_n("?", grant.visibility.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if placeholders.is_empty() {
+                continue;
+            }
+            let lifecycle = if query.include_retracted {
+                String::new()
+            } else {
+                " AND NOT EXISTS (SELECT 1 FROM memory_lifecycle_assertion AS lifecycle WHERE lifecycle.memory_item_id = memory_item.id AND lifecycle.assertion_type IN ('superseded', 'retracted', 'expired'))".to_owned()
+            };
+            let restricted = if query.allow_restricted {
+                String::new()
+            } else {
+                " AND memory_item.sensitivity <> 'restricted'".to_owned()
+            };
+            let authority = "(CASE memory_item.authority WHEN 'decision' THEN 600 WHEN 'procedure' THEN 500 WHEN 'verified_fact' THEN 450 WHEN 'proposal' THEN 300 WHEN 'hypothesis' THEN 200 ELSE 100 END + memory_item.retention_priority)";
+            let sql = if fts_query.is_some() {
+                format!(
+                    "SELECT memory_item.*, bm25(memory_item_fts, 5.0, 2.5, 1.0) AS lexical_rank, {authority} AS authority_rank FROM memory_item JOIN memory_item_fts ON memory_item_fts.rowid = memory_item.row_id WHERE memory_item.scope_type = ? AND memory_item.scope_id = ? AND memory_item.source_type <> 'room' AND memory_item.kind <> 'room_message' AND memory_item.sensitivity <> 'secret'{restricted} AND (memory_item.visibility IN ({placeholders}) OR (memory_item.visibility = 'private' AND memory_item.owner_identity_id = ?)){lifecycle} AND memory_item_fts MATCH ? ORDER BY lexical_rank ASC, authority_rank DESC, memory_item.created_at DESC, memory_item.id DESC LIMIT ?"
+                )
+            } else {
+                format!(
+                    "SELECT memory_item.*, NULL AS lexical_rank, {authority} AS authority_rank FROM memory_item WHERE memory_item.scope_type = ? AND memory_item.scope_id = ? AND memory_item.source_type <> 'room' AND memory_item.kind <> 'room_message' AND memory_item.sensitivity <> 'secret'{restricted} AND (memory_item.visibility IN ({placeholders}) OR (memory_item.visibility = 'private' AND memory_item.owner_identity_id = ?)){lifecycle} ORDER BY authority_rank DESC, memory_item.created_at DESC, memory_item.id DESC LIMIT ?"
+                )
+            };
+            let mut statement = sqlx::query(&sql)
+                .bind(&grant.scope_type)
+                .bind(&grant.scope_id);
+            for visibility in &grant.visibility {
+                statement = statement.bind(visibility);
+            }
+            statement = statement.bind(query.identity_id.as_deref());
+            if let Some(fts_query) = fts_query.as_deref() {
+                statement = statement.bind(fts_query);
+            }
+            let rows = statement.bind(limit as i64).fetch_all(&self.pool).await?;
+            for row in rows {
+                let candidate = RecallMemoryCandidate {
+                    lexical_rank: row.try_get("lexical_rank")?,
+                    authority_rank: row.try_get("authority_rank")?,
+                    item: MemoryItem::from_row(&row)?,
+                };
+                candidates
+                    .entry(candidate.item.id.clone())
+                    .and_modify(|current| {
+                        if recall_candidate_precedes(&candidate, current) {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            }
+        }
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(recall_candidate_order);
+        candidates.truncate(limit);
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| MemoryRecallCandidate {
+                item: candidate.item,
+                lexical_rank: candidate.lexical_rank,
+            })
+            .collect())
     }
 
     async fn insert_memory_lifecycle_assertion(

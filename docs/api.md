@@ -3460,6 +3460,12 @@ APIs; Forge tests that their descriptor names do not shadow a migrated contract.
 
 ### Memory MCP tools
 
+The paginated MCP/REST search surfaces remain explicit browsing operations.
+Task dispatch separately uses the internal bounded recall path described in
+[memory-recall.md](memory-recall.md); it adds no new public endpoint and never
+changes the authorization contract of `forge_memory_search` or
+`forge_memory_get`.
+
 `forge_memory_search` params:
 
 ```json

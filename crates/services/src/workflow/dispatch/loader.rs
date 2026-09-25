@@ -2,14 +2,17 @@ use std::sync::Arc;
 
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
-    ExecutionRepo, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo, TaskRepo,
-    TransitionLogRepo,
+    ExecutionRepo, MemoryScopeGrant, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo,
+    TaskRepo, TransitionLogRepo,
 };
 use executors::{LogEntry, LogKind};
 use serde_json::Value;
 
 use crate::workflow::dispatch::EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD;
-use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
+use crate::{
+    workflow::dispatch::AgentDispatchContext, MemoryAccessContext, MemoryRecallQuery,
+    MemoryRecallService, Result, ServiceError,
+};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
 
@@ -60,6 +63,21 @@ pub async fn load_agent_dispatch_context(
         .and_then(|execution| execution.logs_path.clone());
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
     let plan = task.plan.clone();
+    let mut represented_source_ids = comments
+        .iter()
+        .map(|comment| comment.id.clone())
+        .chain(prior_reviews.iter().map(|review| review.id.clone()))
+        .collect::<Vec<_>>();
+    represented_source_ids.extend(continuation_of_execution_id.iter().cloned());
+    represented_source_ids.extend(latest_review_context.execution_id.iter().cloned());
+    let memory_context = load_task_memory_context(
+        Arc::clone(&db),
+        &task,
+        plan.as_deref(),
+        latest_review_context.feedback.as_deref(),
+        represented_source_ids,
+    )
+    .await;
     let capability_class = sqlx::query_scalar::<_, Option<String>>(
         "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
     )
@@ -90,8 +108,91 @@ pub async fn load_agent_dispatch_context(
         latest_review_feedback: latest_review_context.feedback,
         latest_review_execution_id: latest_review_context.execution_id,
         latest_review_logs_path: latest_review_context.logs_path,
+        memory_context,
         read_only_task,
     })
+}
+
+const TASK_MEMORY_QUERY_MAX_CHARS: usize = 6_000;
+
+async fn load_task_memory_context(
+    db: Arc<db::SqliteDb>,
+    task: &db::Task,
+    plan: Option<&str>,
+    latest_review_feedback: Option<&str>,
+    represented_source_ids: Vec<String>,
+) -> Option<String> {
+    let mut query = String::new();
+    append_memory_query_part(&mut query, &task.title);
+    if let Some(description) = task.description.as_deref() {
+        append_memory_query_part(&mut query, description);
+    }
+    if let Some(plan) = plan {
+        append_memory_query_part(&mut query, plan);
+    }
+    if let Some(feedback) = latest_review_feedback {
+        append_memory_query_part(&mut query, feedback);
+    }
+    let access = MemoryAccessContext {
+        identity_id: None,
+        grants: vec![
+            MemoryScopeGrant {
+                scope_type: "project".to_owned(),
+                scope_id: task.project_id.clone(),
+                visibility: vec!["project".to_owned()],
+                identity_id: None,
+            },
+            MemoryScopeGrant {
+                scope_type: "task".to_owned(),
+                scope_id: task.id.clone(),
+                visibility: vec!["project".to_owned()],
+                identity_id: None,
+            },
+        ],
+    };
+    match MemoryRecallService::from_env(db)
+        .recall(
+            &access,
+            MemoryRecallQuery {
+                query,
+                token_budget: Some(1_200),
+                max_items: Some(6),
+                preferred_task_id: Some(task.id.clone()),
+                represented_source_ids,
+            },
+        )
+        .await
+    {
+        Ok(response) => {
+            tracing::debug!(
+                task_id = %task.id,
+                recalled_items = response.items.len(),
+                estimated_tokens = response.estimated_tokens,
+                semantic = ?response.semantic,
+                "assembled bounded Task memory context"
+            );
+            response.context
+        }
+        Err(error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                %error,
+                "Task memory recall failed; dispatch continues without memory context"
+            );
+            None
+        }
+    }
+}
+
+fn append_memory_query_part(query: &mut String, value: &str) {
+    if query.chars().count() >= TASK_MEMORY_QUERY_MAX_CHARS {
+        return;
+    }
+    if !query.is_empty() {
+        query.push('\n');
+    }
+    let remaining = TASK_MEMORY_QUERY_MAX_CHARS.saturating_sub(query.chars().count());
+    query.extend(value.chars().take(remaining));
 }
 
 fn should_resume_latest_target_role_thread(execution_policy: Option<&str>) -> bool {
