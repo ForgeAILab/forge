@@ -148,21 +148,29 @@ scanning is measured as a real bottleneck.
 
 ## Runtime integration boundary
 
-This change establishes the agent-facing recall primitive and safe fallback.
-The next runtime-wiring change should call it at bounded lifecycle moments:
+Project and Main Agent Chats now run bounded recall on the first turn in the
+current topic and when retrying a failed turn. Ordinary continuing turns rely
+on the active chat history and LCM rather than paying a new recall cost.
 
-- initial Task claim;
-- the first turn of a new Agent Chat topic;
-- resume after a material context revision;
-- follow-up after a failed execution or review;
-- a Task revision that changes the context fingerprint.
+Recall is frozen to `agent_chat_turn_job.created_at`. A retry therefore cannot
+silently receive memories that appeared after its original admission, and the
+same immutable context-manifest identity remains meaningful.
 
-It should not run before every turn.
+Selected records are rendered in a server-owned historical-context block. The
+block explicitly labels memory as untrusted context rather than instructions,
+and includes only a bounded title, summary/body fragment, authority, stable
+memory ID, revision, source reference, timestamp, and selection rationale.
 
-Selected records should be rendered as historical context with memory ID,
-source revision, authority, confidence, scope, and selection reason. The
-context manifest should record included, deduplicated, and token-truncated
-sources so Forge can later answer exactly what the agent knew when it acted.
+Every included, character-budget-omitted, and active-history-deduplicated
+record is appended to the existing Agent Chat context manifest. Retrieval
+failure is non-fatal: Forge logs the failure and continues the turn without
+recalled memory. Scope, sensitivity, and lifecycle filtering still happen
+before any record body reaches the renderer.
+
+Task-execution recall remains the next runtime boundary. It should run once per
+admitted execution, use the execution creation time as its semantic horizon,
+and be persisted beside the Agent Runtime manifest rather than re-running on
+every provider or correction turn.
 
 ## Evaluation
 
@@ -200,11 +208,10 @@ Track:
 
 ## Follow-up sequence
 
-1. Wire bounded recall into Task and Agent Chat context assembly.
-2. Persist recall selection/disposition in context manifests.
-3. Add an authority-controlled `memory.record` operation for durable agent
+1. Wire the same admission-frozen context pack into native Task execution.
+2. Add an authority-controlled `memory.record` operation for durable agent
    observations and proposals.
-4. Add optional Ollama embeddings only if the benchmark demonstrates a useful
+3. Add optional Ollama embeddings only if the benchmark demonstrates a useful
    improvement.
-5. Consider a small derived Project brief only if individual-memory recall is
+4. Consider a small derived Project brief only if individual-memory recall is
    insufficient for architectural continuity.

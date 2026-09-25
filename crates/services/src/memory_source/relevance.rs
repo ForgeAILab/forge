@@ -116,10 +116,9 @@ pub(super) fn selection_reason(candidate: &RecallCandidate, query_terms: &[Strin
         );
     }
     format!(
-        "matched {}/{} salient query terms: {}; fused lexical recall",
+        "matched {}/{} salient query terms; fused lexical recall",
         matched.len(),
-        query_terms.len(),
-        matched.join(", ")
+        query_terms.len()
     )
 }
 

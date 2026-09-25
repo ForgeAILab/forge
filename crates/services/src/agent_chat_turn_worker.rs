@@ -46,6 +46,7 @@ use crate::{
     embedded_agent_service::{
         CreateFrozenAgentChatSession, CreateScopedSession, RequestedCanonicalScope,
     },
+    memory_context::{build_memory_context, MemoryContextRequest, DEFAULT_MEMORY_RECALL_LIMIT},
     operating_skills::{
         canonical_main_baseline_operating_skill_body,
         canonical_main_baseline_operating_skill_body_for_revision,
@@ -1186,7 +1187,7 @@ impl FederatedAgentChatTurnRunner {
         // any model call.  A Project Chat is never allowed to fall back to a
         // profile-only prompt, an old handoff overlay, or a legacy Project
         // binding when its Charter pointers cannot be proven current.
-        let (mut operating_instruction, operating_context_sources) = match chat.kind.as_str() {
+        let (mut operating_instruction, mut operating_context_sources) = match chat.kind.as_str() {
             "account_main" => {
                 if chat.project_id.is_some() {
                     return Err(ServiceError::invalid_operation(
@@ -1595,7 +1596,7 @@ impl FederatedAgentChatTurnRunner {
                 .await?
                 .map(|topic| topic.starting_message_sequence)
                 .unwrap_or(0);
-        let history = AgentChatMessageRepo::list_agent_chat_messages(
+        let history: Vec<AgentChatMessage> = AgentChatMessageRepo::list_agent_chat_messages(
             &*self.db,
             AgentChatMessageListQuery {
                 chat_id: job.chat_id.clone(),
@@ -1618,6 +1619,66 @@ impl FederatedAgentChatTurnRunner {
                 && message.status == AgentChatMessageStatus::Complete
         })
         .collect();
+        let has_prior_conversation = history
+            .iter()
+            .any(|message| message.author_type != AgentChatMessageAuthorType::System);
+        if !has_prior_conversation || job.attempt_count > 1 || job.error_code.is_some() {
+            let identity_id = uuid::Uuid::parse_str(&agent.id).map_err(|_| {
+                ServiceError::invalid_operation("Agent Chat identity id is invalid")
+            })?;
+            let context_scope_id =
+                uuid::Uuid::parse_str(&session.context_scope_id).map_err(|_| {
+                    ServiceError::invalid_operation("Agent Chat context scope id is invalid")
+                })?;
+            let represented_source_ids = history
+                .iter()
+                .map(|message: &AgentChatMessage| message.id.clone())
+                .chain(std::iter::once(input.id.clone()))
+                .collect();
+            let ordinal_start = i64::try_from(operating_context_sources.len()).map_err(|_| {
+                ServiceError::invalid_operation("Agent Chat memory context source count overflows")
+            })?;
+            match build_memory_context(
+                Arc::clone(&self.db),
+                MemoryContextRequest {
+                    identity_id,
+                    context_scope_id,
+                    scope_type: "agent_chat".to_owned(),
+                    scope_id: job.chat_id.clone(),
+                    account_id: chat.account_id.clone(),
+                    project_id: chat.project_id.clone(),
+                    task_id: None,
+                    visibility: vec!["chat".to_owned()],
+                    query: input.content.clone(),
+                    represented_source_ids,
+                    not_after: Some(job.created_at.clone()),
+                    ordinal_start,
+                    limit: DEFAULT_MEMORY_RECALL_LIMIT,
+                },
+            )
+            .await
+            {
+                Ok(memory_context) => {
+                    if let Some(fragment) = memory_context.prompt_fragment {
+                        if let Some(instruction) = operating_instruction.as_mut() {
+                            instruction.push_str("\n\n");
+                            instruction.push_str(&fragment);
+                        } else {
+                            operating_instruction = Some(fragment);
+                        }
+                    }
+                    operating_context_sources.extend(memory_context.sources);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        chat_id = %job.chat_id,
+                        %error,
+                        "Agent Chat memory recall failed; continuing without recalled context"
+                    );
+                }
+            }
+        }
         Ok(LoadedAgentChatTurn {
             agent,
             profile,

@@ -57,6 +57,9 @@ pub struct ForgeMemoryRecallQuery {
     /// Stable source ids already represented by recent canonical Agent Chat
     /// history or an admitted LCM timeline.
     pub represented_source_ids: Vec<String>,
+    /// Freeze recall to records that existed when this turn or execution was
+    /// admitted. Retries then reuse the same semantic horizon.
+    pub not_after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +234,7 @@ where
                 identity_id: self.access.identity_id.clone(),
                 grants: self.access.grants.clone(),
                 query: query.query.clone(),
+                not_after: None,
                 limit: i64::from(requested),
                 cursor: query.cursor.clone(),
                 include_retracted: false,
@@ -249,6 +253,7 @@ where
                     query: query.query,
                     limit: requested,
                     represented_source_ids: query.represented_source_ids,
+                    not_after: None,
                 })
                 .await?;
             deduplicated_source_ids.extend(recall.deduplicated_source_ids);
@@ -312,6 +317,7 @@ where
                     identity_id: self.access.identity_id.clone(),
                     grants: self.access.grants.clone(),
                     query: arm.query.clone(),
+                    not_after: query.not_after.clone(),
                     limit: i64::from(arm_limit),
                     cursor: None,
                     include_retracted: false,

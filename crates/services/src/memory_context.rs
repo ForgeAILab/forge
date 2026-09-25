@@ -145,9 +145,7 @@ fn render_memory_context(
             "selection_reason": truncate_chars(&recalled.selection_reason, 512),
         });
         let encoded = serde_json::to_string(&value).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "memory context serialization failed: {error}"
-            ))
+            ServiceError::invalid_operation(format!("memory context serialization failed: {error}"))
         })?;
         let included = records.is_empty()
             || encoded_chars.saturating_add(encoded.len()) <= MAX_MEMORY_CONTEXT_CHARS;
@@ -193,9 +191,7 @@ fn render_memory_context(
         None
     } else {
         let rendered = serde_json::to_string_pretty(&records).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "memory context serialization failed: {error}"
-            ))
+            ServiceError::invalid_operation(format!("memory context serialization failed: {error}"))
         })?;
         Some(format!(
             "{MEMORY_CONTEXT_HEADER}\n\n<forge_memory_context revision=\"{MEMORY_CONTEXT_RENDER_REVISION}\">\n{rendered}\n</forge_memory_context>"
@@ -210,7 +206,7 @@ fn render_memory_context(
 
 fn take_ordinal(ordinal: &mut i64) -> Result<i64> {
     let current = *ordinal;
-    *ordinal = ordinal.checked_add(1).ok_or_else(|| {
+    *ordinal = (*ordinal).checked_add(1).ok_or_else(|| {
         ServiceError::invalid_operation("memory context source ordinal overflows")
     })?;
     Ok(current)

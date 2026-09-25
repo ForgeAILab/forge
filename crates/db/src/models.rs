@@ -1671,6 +1671,7 @@ pub struct MemoryAccessQuery {
     pub identity_id: Option<String>,
     pub grants: Vec<MemoryScopeGrant>,
     pub query: String,
+    pub not_after: Option<String>,
     pub limit: i64,
     pub cursor: Option<String>,
     pub include_retracted: bool,

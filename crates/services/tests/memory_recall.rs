@@ -45,6 +45,7 @@ async fn memory_source_falls_back_to_bounded_recall_for_natural_language_queries
             query: "why task leases prevent collisions".to_owned(),
             limit: 5,
             represented_source_ids: Vec::new(),
+            not_after: None,
         })
         .await
         .expect("explicit recall succeeds");
@@ -66,6 +67,31 @@ async fn memory_source_falls_back_to_bounded_recall_for_natural_language_queries
 }
 
 #[tokio::test]
+async fn memory_recall_freezes_candidates_to_the_admission_timestamp() {
+    let fixture = memory_fixture().await;
+
+    let recall = fixture
+        .source
+        .recall(ForgeMemoryRecallQuery {
+            query: "task policy checklist".to_owned(),
+            limit: 5,
+            represented_source_ids: Vec::new(),
+            not_after: Some("2026-06-01T00:00:00Z".to_owned()),
+        })
+        .await
+        .expect("recall succeeds");
+
+    assert!(recall
+        .records
+        .iter()
+        .all(|record| { record.record.created_at.as_str() <= "2026-06-01T00:00:00Z" }));
+    assert!(!recall
+        .records
+        .iter()
+        .any(|record| record.record.title == "Task policy"));
+}
+
+#[tokio::test]
 async fn memory_recall_suppresses_sources_already_represented_by_active_context() {
     let fixture = memory_fixture().await;
 
@@ -75,6 +101,7 @@ async fn memory_recall_suppresses_sources_already_represented_by_active_context(
             query: "task leases prevent collisions".to_owned(),
             limit: 5,
             represented_source_ids: vec![fixture.target_source_ref.clone()],
+            not_after: None,
         })
         .await
         .expect("recall succeeds");

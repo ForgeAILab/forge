@@ -40,6 +40,7 @@ pub mod main_genesis_commands;
 pub mod main_orchestration_actions;
 pub mod main_orchestration_queries;
 pub mod memory;
+pub(crate) mod memory_context;
 pub mod memory_source;
 pub mod merge_service;
 pub mod milestone_orchestration;
