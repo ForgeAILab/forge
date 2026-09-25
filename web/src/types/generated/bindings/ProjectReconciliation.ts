@@ -12,18 +12,18 @@ import type { ReconciliationState } from "./ReconciliationState";
  * record leaves `required`: a resolved reconciliation offers no further
  * action, only its recorded outcome.
  */
-export type ProjectReconciliation = { id: string, project_id: string, conflict: ReconciliationConflictSummary,
+export type ProjectReconciliation = { id: string, project_id: string, conflict: ReconciliationConflictSummary, 
 /**
  * The record whose claim diverges from `governing`. For the adaptive
  * Task-boundary fixture this is the Task at the version the divergence
  * was detected.
  */
-affected: ReconciliationRecordRef,
+affected: ReconciliationRecordRef, 
 /**
  * The record whose claim is authoritative until the reconciliation is
  * resolved.
  */
-governing: ReconciliationRecordRef, state: ReconciliationState, required_principal: PrincipalKind, allowed_actions: Array<ReconciliationResolutionAction>,
+governing: ReconciliationRecordRef, state: ReconciliationState, required_principal: PrincipalKind, allowed_actions: Array<ReconciliationResolutionAction>, 
 /**
  * Server-validated replacement currently eligible for this resolution.
  * For `invalid_active_baseline` this may be the server-prepared correction

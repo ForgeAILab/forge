@@ -8,23 +8,23 @@ import type { RateBuckets } from "./RateBuckets";
  * An agent's pricing: its own adjustment, the one it inherits, and the
  * price Forge would freeze for its next run.
  */
-export type AgentPricing = { agent_id: string, runtime_model: string | null,
+export type AgentPricing = { agent_id: string, runtime_model: string | null, 
 /**
  * The agent's own adjustment, `null` when it inherits.
  */
-settings: PricingSettings | null,
+settings: PricingSettings | null, 
 /**
  * The adjustment on the agent's provider entry or CLI runtime.
  */
-provider_settings: PricingSettings | null, source: PricingAdjustmentSource, status: PricingResolutionStatus, catalog_provider_id: string | null, catalog_model_id: string | null,
+provider_settings: PricingSettings | null, source: PricingAdjustmentSource, status: PricingResolutionStatus, catalog_provider_id: string | null, catalog_model_id: string | null, 
 /**
  * models.dev list rates for the matched row.
  */
-catalog_rates: RateBuckets | null,
+catalog_rates: RateBuckets | null, 
 /**
  * Rates after the adjustment; what the next run is estimated with.
  */
-effective_rates: RateBuckets | null,
+effective_rates: RateBuckets | null, 
 /**
  * models.dev providers listing the model when `status` is `ambiguous`.
  */

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useHotkeys } from 'react-hotkeys-hook'
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
+import { Group, Panel, Separator } from 'react-resizable-panels'
 import { toast } from 'sonner'
 import {
   ArrowDown,
@@ -500,8 +500,8 @@ export function ExecutionDetailPage({
         <span className="text-foreground font-medium">{productTerm('run')}</span>
       </nav>
 
-      <PanelGroup direction="horizontal" className="flex-1 min-h-0 rounded-xl border border-border-subtle bg-card shadow-soft overflow-hidden">
-        <Panel minSize={40}>
+      <Group orientation="horizontal" className="flex-1 min-h-0 rounded-xl border border-border-subtle bg-card shadow-soft overflow-hidden">
+        <Panel minSize="40%">
           <div className="flex h-full flex-col">
             <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
               <div className="flex items-center gap-2.5 min-w-0">
@@ -606,8 +606,8 @@ export function ExecutionDetailPage({
 
         {sidebarOpen ? (
           <>
-            <PanelResizeHandle className="w-px bg-border hover:bg-primary/20 transition-colors" />
-            <Panel defaultSize={28} minSize={20} maxSize={42} collapsible>
+            <Separator className="w-px bg-border hover:bg-primary/20 transition-colors" />
+            <Panel defaultSize="28%" minSize="20%" maxSize="42%" collapsible>
               <ExecutionDetailSidebar
                 isLoading={executionQuery.isLoading}
                 execution={execution ?? null}
@@ -636,7 +636,7 @@ export function ExecutionDetailPage({
             </Panel>
           </>
         ) : null}
-      </PanelGroup>
+      </Group>
     </div>
   )
 }

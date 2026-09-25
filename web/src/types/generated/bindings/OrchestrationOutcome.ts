@@ -10,4 +10,10 @@ import type { SetupRequirement } from "./SetupRequirement";
 /**
  * Shared native/MCP model-facing orchestration result.
  */
-export type OrchestrationOutcome = { code: OutcomeCode, status: OutcomeStatus, operation: string, scope: CanonicalScopeRef, result: unknown | null, approval_target: ApprovalTarget | null, setup_requirements: Array<SetupRequirement> | null, current_version_or_revision: CurrentVersionOrRevision | null, retry: RetryInstruction | null, details: unknown | null, safe_message: string, correlation_id: string, replayed: boolean, receipt_id: string | null, event_id: string | null, };
+export type OrchestrationOutcome = { code: OutcomeCode, status: OutcomeStatus, operation: string, scope: CanonicalScopeRef, result?: unknown | null, approval_target?: ApprovalTarget | null, setup_requirements?: Array<SetupRequirement> | null, current_version_or_revision?: CurrentVersionOrRevision | null, retry?: RetryInstruction | null, 
+/**
+ * Optional typed, redacted discriminator-specific details. MCP known
+ * tools use this for safe conflict targets such as an execution id;
+ * arbitrary internal error payloads never belong here.
+ */
+details?: unknown | null, safe_message: string, correlation_id: string, replayed: boolean, receipt_id?: string | null, event_id?: string | null, };

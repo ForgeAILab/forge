@@ -4,4 +4,4 @@ import type { UpdateForgePathsRequest } from "./UpdateForgePathsRequest";
 import type { UpdateServerSettingsRequest } from "./UpdateServerSettingsRequest";
 import type { UpdateWorkspaceSettingsRequest } from "./UpdateWorkspaceSettingsRequest";
 
-export type UpdateSettingsRequest = { forge: UpdateForgePathsRequest | null, server: UpdateServerSettingsRequest | null, workspace: UpdateWorkspaceSettingsRequest | null, agent: UpdateAgentSettingsRequest | null, project: { [key in string]?: string } | null, };
+export type UpdateSettingsRequest = { forge: UpdateForgePathsRequest | null, server: UpdateServerSettingsRequest | null, workspace: UpdateWorkspaceSettingsRequest | null, agent: UpdateAgentSettingsRequest | null, project: { [key in string]: string } | null, };
