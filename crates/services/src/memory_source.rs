@@ -285,8 +285,7 @@ where
         let requested = query
             .limit
             .min(self.max_results)
-            .min(MAX_RECALL_RESULTS)
-            .max(1);
+            .clamp(1, MAX_RECALL_RESULTS);
         let (query_terms, arms) = relevance::query_arms(&query.query);
         if arms.is_empty() {
             return Ok(ForgeMemoryRecall {
