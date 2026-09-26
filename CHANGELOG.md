@@ -15,6 +15,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unrequested key (`taxonomy`, `classification`) to a finding, one for a
   commit SHA cut short by a character, which voided every citation. Each loss
   re-ran the reviewer from scratch and finally parked the Task.
+- Project-level review `ci_steps` (`default_review_config`) now run before the
+  reviewer. The review runner read CI steps only from the Task's own config
+  while the review contract required the effective ones (workflow, then
+  Project defaults, then Task overrides), so a Project that configured
+  `ci_steps` failed every review admission with `pre-review result for
+  required check ci:0 is unavailable`.
 
 ### Breaking
 

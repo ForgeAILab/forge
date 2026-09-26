@@ -665,6 +665,56 @@ impl TaskExecutor for CheckResultAwareAuditor {
 }
 
 #[tokio::test]
+async fn project_default_ci_steps_run_before_the_reviewer() {
+    // Live case: NK-1's Project set `default_review_config.ci_steps` and the
+    // Task had no review config of its own. The contract required `ci:0`, the
+    // runner only read the Task config, never ran the step, and every review
+    // failed admission with "pre-review result for required check ci:0 is
+    // unavailable".
+    let seed = seeded_review(Vec::new()).await;
+    sqlx::query("UPDATE task SET task_state_config = NULL WHERE id = ?")
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE project SET settings = ? WHERE id = (SELECT project_id FROM task WHERE id = ?)",
+    )
+    .bind(json!({"default_review_config": {"ci_steps": ["true"]}}).to_string())
+    .bind(seed.task_id.to_string())
+    .execute(seed.db.pool())
+    .await
+    .unwrap();
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(CheckResultAwareAuditor),
+    );
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert_eq!(details.conformance.checks[0].check_id, "ci:0");
+}
+
+#[tokio::test]
 async fn reviewer_receives_and_can_cite_the_recorded_pre_review_ci_result() {
     let seed = seeded_review(vec!["true"]).await;
     git::init(seed.workspace.path()).await.unwrap();
