@@ -11,7 +11,7 @@ use db::{
     new_uuid_v4, CreateOAuthAuthorizationCode, CreateOAuthClient, CreateOAuthRefreshToken,
     OAuthAuthorizationCodeRepo, OAuthClientRepo, OAuthRefreshTokenRepo, SqliteDb, UserRepo,
 };
-use rand::RngCore;
+use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, Transaction};
 use url::Url;
@@ -643,7 +643,9 @@ fn base64url_no_pad(bytes: &[u8]) -> String {
 
 fn random_hex_32() -> String {
     let mut bytes = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG unavailable");
     hex::encode(bytes)
 }
 

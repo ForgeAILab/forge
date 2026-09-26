@@ -12,7 +12,7 @@ use db::{
     ProviderAuthorizationRepo, SqliteDb, UpdateProviderAuthorizationOperation,
 };
 use forge_agent_host::{OAuthCredentialBundle, SqliteProtectedRuntimeStore};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, TryRngCore};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1578,7 +1578,9 @@ async fn bounded_bytes(response: reqwest::Response) -> Result<Vec<u8>> {
 
 fn random_url_token() -> String {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG unavailable");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

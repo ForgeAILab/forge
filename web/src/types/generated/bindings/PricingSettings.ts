@@ -5,20 +5,20 @@ import type { RateBuckets } from "./RateBuckets";
 /**
  * A pricing adjustment on a provider entry, CLI runtime, or agent.
  */
-export type PricingSettings = { mode: PricingMode,
+export type PricingSettings = { mode: PricingMode, 
 /**
  * Percent off list price as decimal text with at most two fractional
  * digits (`"20"`, `"12.5"`); present only for `discount`.
  */
-discount_percent: string | null,
+discount_percent: string | null, 
 /**
  * Per-million-token USD rates; present only for `fixed`.
  */
-fixed_rates: RateBuckets | null,
+fixed_rates: RateBuckets | null, 
 /**
  * models.dev provider to price with instead of the inferred one.
  */
-catalog_provider_id: string | null,
+catalog_provider_id: string | null, 
 /**
  * models.dev model to price with; agent settings only.
  */

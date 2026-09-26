@@ -2,13 +2,13 @@
 import type { ConformanceCheck } from "./ConformanceCheck";
 import type { ReviewRequirement } from "./ReviewRequirement";
 
-export type ReviewGoverningContext = { project_id: string, task_id: string, repo_id: string | null, charter_revision_id: string | null, charter_digest: string | null, charter: unknown, task_scope: unknown, linked_documents: unknown[],
+export type ReviewGoverningContext = { project_id: string, task_id: string, repo_id: string | null, charter_revision_id: string | null, charter_digest: string | null, charter: unknown, task_scope: unknown, linked_documents: unknown[], 
 /**
  * Requirements this Task review must disposition. Project-wide
  * requirements that are not assigned to this Task are tracked by the
  * deferred count/digest and remain milestone-readiness obligations.
  */
-requirements: Array<ReviewRequirement>, deferred_requirement_count: number, deferred_requirements_digest: string | null,
+requirements: Array<ReviewRequirement>, deferred_requirement_count: number, deferred_requirements_digest: string | null, 
 /**
  * Commands used to prepare the detached clean checkout before required
  * conformance checks execute.

@@ -64,7 +64,7 @@ fn validate_jwt_secret_bytes(bytes: &[u8]) -> Result<(), ConfigError> {
 
 fn generate_jwt_secret() -> Vec<u8> {
     let mut secret = vec![0_u8; MIN_JWT_SECRET_BYTES];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut secret);
+    rand::fill(&mut secret[..]);
     secret
 }
 
