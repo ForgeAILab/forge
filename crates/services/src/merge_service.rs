@@ -964,11 +964,10 @@ mod tests {
                     .execute(db.pool())
                     .await
                     .unwrap();
-                let contract = ::review::contract::admit(&db, &execution_id, &task_id, &worktree)
+                ::review::contract::admit(&db, &execution_id, &task_id, &worktree)
                     .await
                     .unwrap();
-                let report = serde_json::json!({"contract_digest":contract.digest,"verdict":"pass","findings":[],
-                    "requirements":contract.context.requirements.iter().map(|r|serde_json::json!({"requirement_id":r.id,"disposition":"satisfied","rationale":"Feature exists", "evidence":[{"kind":"file","path":"feature.txt","commit_sha":accepted_sha,"start_line":1,"end_line":1}]})).collect::<Vec<_>>()});
+                let report = serde_json::json!({"result": "pass", "reason": "Feature exists"});
                 let result = ::review::contract::evaluate(
                     &db,
                     &execution_id,

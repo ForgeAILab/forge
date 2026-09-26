@@ -3555,7 +3555,7 @@ writing the reply) and keeps the settled log under the reply it produced.
 ### Review conformance contract
 
 Task review responses include `details.conformance` with `status` (`not_assessed`,
-`passed`, `failed`, `unverified`), nullable `contract`, nullable `assessment`,
+`passed`, `failed`, `blocked`, `unverified`), nullable `contract`, nullable `assessment`,
 `checks`, and nullable `reason`. Historical review statuses remain unchanged;
 missing historical assessments are explicitly `not_assessed`.
 
@@ -3571,32 +3571,44 @@ source pointer, stable ID, universal flag, and optional authoritative allocation
 `deferred_requirement_count` and `deferred_requirements_digest` account for the
 remaining Project requirements that milestone readiness must settle.
 
-The assessment contains `contract_digest`, `verdict` (`pass` or `fail`),
-`requirements` coverage and `findings`. Policy `forge.review-conformance/3` accepts
-the requirement dispositions `satisfied`, `violated`, and `unverified`.
-It is the only current policy; v1 and v2 contracts remain historical and require
-a fresh review before their result can authorize current integration.
-`outside_task_scope` is historical-only: immutable v1/v2 assessments may retain
-it for requirements allocated outside the reviewed Task, while current v3
-contracts omit out-of-scope requirements and reject that disposition. Findings
-include `blocking`, `expected`, `actual`, and evidence. File
-evidence is `{kind:"file",path,commit_sha,start_line,end_line}`; check evidence is
-`{kind:"check",check_id}`. Satisfied claims require evidence. A violated claim or
-blocking finding with file evidence must cite a path in `candidate_changed_paths`;
-otherwise the assessment is retained as `unverified` and cannot send the Task to
-coder remediation. It may use an empty evidence array for an absence that has no
-positive file to cite, with the inspected surface explained in its rationale. The final
-response must be one JSON object: Markdown fences, marker-only verdicts,
-multiple reports, and unknown fields fail structurally. A structurally valid
-partial report is retained and omitted contract requirements make its conformance
-status `unverified`; it therefore cannot pass but does not discard valid findings.
+The reviewer answers in Markdown and ends its reply with one result block:
 
-A structurally valid assessment is retained when a semantic claim or citation
-cannot be verified, and its conformance status becomes `unverified`. Both an
-unverified result and a response that cannot bind to the frozen contract use the
-bounded reviewer execution-retry path and eventually expose a durable recovery
-blocker; neither dispatches a coder or can grant acceptance. A verified `fail`
-assessment follows the normal review-remediation path.
+```json
+{"result": "pass", "reason": "one sentence"}
+```
+
+`result` is `pass`, `fail`, or `blocked` (the review environment, not the code,
+prevented a verdict — for example a missing toolchain). The block is read
+leniently so any model can produce it: the last JSON object in the reply that
+names a result wins, unknown keys are ignored, `verdict` is accepted for
+`result`, case does not matter, and a Markdown fence around the block is
+allowed. The stored `assessment` is `{result, reason, report}`, where `report`
+is the reviewer's Markdown with the block removed. A reply with no readable
+result block is `unverified`.
+
+Conformance `status` follows from the result and Forge's own checks. A failing
+setup step or required check makes the review `failed` whatever the reviewer
+said. Otherwise `pass` → `passed`, `fail` → `failed` (the reason and Markdown
+review become the coder's remediation feedback), and `blocked` → `blocked`,
+which finishes the Review as failed and parks the Task with a `review_blocked`
+blocking annotation for its owner (recovery: `reexecute` after fixing the
+environment); the coder is not dispatched. A `pass` is only as strong as the
+checks Forge ran, so configure `setup_steps` and `conformance_checks` for any
+Task whose acceptance depends on a build or test.
+
+An `unverified` result — no readable result block, or a review context or
+commit that changed under the reviewer — uses the bounded reviewer
+execution-retry path and eventually exposes a durable recovery blocker; it
+neither dispatches a coder nor grants acceptance. Embedded reviewers get up to
+two follow-up turns to supply a missing result block before that happens.
+
+Policy `forge.review-conformance/3` is the only current contract policy; v1
+and v2 contracts remain historical and require a fresh review before their
+result can authorize current integration. Assessments stored before this
+response format (with `contract_digest`, `verdict`, `requirements`, and
+`findings`) were migrated in place: their verdict became the `result`, their
+recorded conformance reason the `reason`, and the original JSON is kept as a
+fenced block in `report`.
 
 `default_review_config` on Project settings and Task review state configuration
 accepts `requirement_ids` and `conformance_checks`. `requirement_ids` names the

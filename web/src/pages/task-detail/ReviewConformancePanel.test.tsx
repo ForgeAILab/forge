@@ -11,7 +11,7 @@ describe('ReviewConformancePanel', () => {
     expect(screen.queryByText('Passed')).not.toBeTruthy()
   })
 
-  it.each(['failed', 'unverified'] as const)('keeps the %s reason visible', (status) => {
+  it.each(['failed', 'blocked', 'unverified'] as const)('keeps the %s reason visible', (status) => {
     const result: ReviewConformance = {
       status,
       reason: 'Required Rust boundary missing',
@@ -107,7 +107,7 @@ describe('ReviewConformancePanel', () => {
     expect(screen.queryByText(/This review covered/)).not.toBeTruthy()
   })
 
-  it('shows the exact Charter and commit with requirement evidence', () => {
+  it('shows the exact Charter and commit with the reviewer\'s Markdown review', () => {
     const result: ReviewConformance = {
       status: 'passed',
       reason: null,
@@ -146,33 +146,16 @@ describe('ReviewConformancePanel', () => {
         },
       },
       assessment: {
-        contract_digest: 'contract-digest',
-        verdict: 'pass',
-        findings: [],
-        requirements: [
-          {
-            requirement_id: 'rust',
-            disposition: 'satisfied',
-            rationale: 'The CLI and library compile',
-            evidence: [
-              {
-                kind: 'file',
-                path: 'src/lib.rs',
-                commit_sha: 'reviewed-sha',
-                start_line: 1,
-                end_line: 3,
-              },
-            ],
-          },
-        ],
+        result: 'pass',
+        reason: 'The CLI and library compile',
+        report: 'The crate is implemented in `src/lib.rs:1-3`.',
       },
     }
     render(<ReviewConformancePanel conformance={result} />)
     expect(screen.getByText('Passed')).toBeTruthy()
     expect(screen.getByText(/covered 1 Task-scoped requirement/)).toBeTruthy()
     expect(screen.getByText(/105 Project requirements remain for milestone readiness/)).toBeTruthy()
-    expect(screen.getByText('One Rust crate')).toBeTruthy()
     expect(screen.getByText('charter-r1')).toBeTruthy()
-    expect(screen.getByText(/src\/lib.rs:1–3/)).toBeTruthy()
+    expect(screen.getByText(/src\/lib.rs:1-3/)).toBeTruthy()
   })
 })

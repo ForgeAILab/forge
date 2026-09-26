@@ -943,13 +943,27 @@ impl ReviewRunner {
             execution_id: auditor_execution.id.clone(),
             reason,
         })?;
-        if conformance.status == api_types::ConformanceStatus::Unverified {
-            return Err(ReviewError::Conformance {
-                execution_id: auditor_execution.id.clone(),
-                reason: conformance
-                    .reason
-                    .unwrap_or_else(|| "unverified review".into()),
-            });
+        // Neither an unusable reply nor an environment the reviewer could not
+        // work in is the coder's to fix; both take the reviewer failure path.
+        match conformance.status {
+            api_types::ConformanceStatus::Unverified => {
+                return Err(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason: conformance
+                        .reason
+                        .unwrap_or_else(|| "unverified review".into()),
+                });
+            }
+            api_types::ConformanceStatus::Blocked => {
+                return Err(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason: format!(
+                        "review blocked by its environment: {}",
+                        conformance.reason.as_deref().unwrap_or("no reason given")
+                    ),
+                });
+            }
+            _ => {}
         }
         let mut result = if conformance.status == api_types::ConformanceStatus::Passed {
             AuditorRunResult {

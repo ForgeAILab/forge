@@ -170,6 +170,7 @@ export type FailureKind =
   | 'ci_failed'
   | 'review_gate_failed'
   | 'review_budget_exhausted'
+  | 'review_blocked'
   | 'retry_exhausted'
   | 'merge_fix_budget_exhausted'
   | 'workflow_guard_rejected'

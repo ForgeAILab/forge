@@ -2651,8 +2651,9 @@ async fn unbound_legacy_reviewer_cannot_settle_a_newer_review() {
     assert_eq!(current.status, crate::workflow::default_states::REVIEW);
 }
 
-#[tokio::test]
-async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() {
+/// A Task in review with a running reviewer execution whose contract is
+/// admitted, ready for the reviewer's final reply.
+async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execution, TempDir) {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -2729,37 +2730,48 @@ async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() 
     .await
     .expect("running review creates");
 
-    let contract = ::review::contract::admit(&db, &execution.id, &task.id, repo_dir.path())
+    ::review::contract::admit(&db, &execution.id, &task.id, repo_dir.path())
         .await
         .expect("review contract admits");
-    let report = json!({
-        "contract_digest": contract.digest,
-        "verdict": "fail",
-        "requirements": contract.context.requirements.iter().map(|requirement| json!({
-            "requirement_id": requirement.id,
-            "disposition": "unverified",
-            "rationale": "The available repository evidence is insufficient to prove this requirement",
-            "evidence": [],
-        })).collect::<Vec<_>>(),
-        "findings": [],
-    })
-    .to_string();
+    (db, service, task, execution, repo_dir)
+}
+
+/// Complete the reviewer execution with `reply` and run the review cascade.
+async fn complete_review_with(
+    db: &SqliteDb,
+    service: &TaskService,
+    execution: &db::Execution,
+    reply: &str,
+) {
     sqlx::query(
         "UPDATE execution
          SET status = 'completed', summary = ?, updated_at = ?
          WHERE id = ?",
     )
-    .bind(&report)
+    .bind(reply)
     .bind(now_rfc3339())
     .bind(&execution.id)
     .execute(db.pool())
     .await
     .expect("reviewer execution completes");
-
     service
         .maybe_cascade_executor_completion(&execution.id)
         .await
-        .expect("complete unverified review cascades");
+        .expect("completed review cascades");
+}
+
+#[tokio::test]
+async fn a_reply_without_a_result_uses_bounded_reviewer_execution_retry() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    // A reply with no result block is unusable: Forge cannot tell pass from
+    // fail, so neither the coder nor the Task's authority may act on it.
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        "I looked at the change and it seems mostly fine.",
+    )
+    .await;
 
     let review = ReviewRepo::list_by_task(&*db, &task.id)
         .await
@@ -2770,7 +2782,7 @@ async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() 
     assert_eq!(
         review.status,
         ReviewStatus::Running,
-        "an evidence gap keeps the review on the bounded reviewer retry path"
+        "an unusable reply keeps the review on the bounded reviewer retry path"
     );
     assert!(review.finished_at.is_none());
     let details: api_types::ReviewDetails =
@@ -2781,7 +2793,7 @@ async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() 
         details.conformance.status,
         api_types::ConformanceStatus::Unverified
     );
-    assert!(details.conformance.assessment.is_some());
+    assert!(details.conformance.assessment.is_none());
     assert_eq!(
         details_json["execution_retry"]["execution_id"],
         execution.id
@@ -2795,7 +2807,7 @@ async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() 
     assert_eq!(
         current.status,
         crate::workflow::default_states::REVIEW,
-        "an unverified assessment must not route the coder into remediation"
+        "an unusable reply must not route the coder into remediation"
     );
     assert!(current.blocked_json.is_none());
     assert!(current.error_annotation.is_none());
@@ -2830,6 +2842,68 @@ async fn complete_unverified_assessment_uses_bounded_reviewer_execution_retry() 
         0,
         "unverified reviewer evidence must never dispatch coder remediation"
     );
+}
+
+#[tokio::test]
+async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    // Live case: the reviewer had no `tsc` or `tauri` and a read-only cargo
+    // home. Neither the coder nor another reviewer can fix that.
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        "`npm run build` exits 127 (`tsc: not found`).\n\n\
+         {\"result\": \"blocked\", \"reason\": \"tsc and tauri are not installed\"}",
+    )
+    .await;
+
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert_eq!(review.status, ReviewStatus::Failed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).expect("review details parse");
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Blocked
+    );
+    let assessment = details.conformance.assessment.expect("review is kept");
+    assert_eq!(
+        assessment.report,
+        "`npm run build` exits 127 (`tsc: not found`)."
+    );
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(
+        current.status,
+        crate::workflow::default_states::REVIEW,
+        "a blocked review must not route the coder into remediation"
+    );
+    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        current
+            .error_annotation
+            .as_deref()
+            .expect("the Task is parked for its owner"),
+    )
+    .expect("annotation parses");
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::ReviewBlocked
+    );
+    assert!(annotation
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("tsc and tauri are not installed")));
+    assert!(annotation
+        .recovery_actions
+        .contains(&api_types::RecoveryAction::Reexecute));
 }
 
 async fn assert_failed_reviewer_disposition(

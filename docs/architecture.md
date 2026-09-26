@@ -2601,7 +2601,8 @@ exact command, exit code, and bounded output, so the reviewer can use the
 already-recorded outcome as check evidence instead of inferring success from a
 configured command. Missing required pre-review CI results fail admission.
 Migration V132 adds immutable contracts/assessments without rewriting historical
-outcomes. Every Task review includes `task:acceptance`, acceptance material from
+outcomes; V145 rewrites stored assessments into the `{result, reason, report}`
+shape, keeping each original assessment JSON as a fenced block in `report`. Every Task review includes `task:acceptance`, acceptance material from
 its linked Documents, and the Charter's explicit non-goals/non-claims as
 universal Project boundaries. Other Charter requirements enter the Task scope
 only when `ReviewConfig.requirement_ids`, a
@@ -2614,35 +2615,42 @@ The contract records the count and digest of the other Project requirements as
 deferred. Those requirements remain integrated milestone-readiness obligations;
 an early Task is never failed merely because later Project work does not exist yet.
 
-Policy `forge.review-conformance/3` requires one JSON assessment. Unknown or
-duplicate IDs, contradictory verdicts, old verdict markers, and unsupported PASS
-evidence cannot grant acceptance. Structurally valid partial assessments are
-retained and omissions make conformance `unverified`, so the report cannot pass
-but useful findings survive. Universal Project boundaries cannot be allocated
-away. File evidence used to attribute a violated requirement or blocking finding
-must name a path in the frozen candidate manifest; unchanged files may still prove
-that a requirement is already satisfied. A violated requirement or blocking
-finding may have no positive file citation when it describes an absence; its
-rationale must state what was inspected. An empty candidate is reviewed as the
-current Task outcome, never as evidence that pre-existing content was introduced
-by that Task. `unverified` represents insufficient proof and can never support
-PASS.
+Universal Project boundaries cannot be allocated away. An empty candidate is
+reviewed as the current Task outcome, never as evidence that pre-existing content
+was introduced by that Task.
 
-Forge separates a verified review failure from an unverified reviewer result.
-Before an embedded reviewer run completes, Forge parses its report with the same
-parser the review applies; a report it cannot parse (a garbled key, a missing
-field, prose instead of the object) gets up to two short follow-up turns in the
-same run, each carrying the exact parse error and the rejected report, asking for
-the corrected object only. The corrections are part of the one execution and do
-not spend the reviewer retry budget; CLI reviewers do not get them yet. A
-response that still cannot be bound structurally to its frozen contract, or whose
-semantic claims cannot be verified against that contract, uses the bounded
-reviewer execution-retry path and eventually creates a durable execution blocker;
-it never dispatches a coder. Forge still preserves a structurally bound partial or
-unverified assessment for diagnosis. A verified assessment with actual violations
-becomes a normal failed review and follows the review-remediation budget. Each
-native reviewer attempt starts with an empty conversation and no Task
-checkpoint persistence, so a retry cannot accumulate the previous full
+The reviewer answers in free Markdown and ends with one small result block,
+`{"result": "pass|fail|blocked", "reason": "..."}`. The response format is kept
+this small on purpose so any model can review: an earlier contract demanded one
+JSON object with per-requirement dispositions and exact file/commit citations,
+and live reviewers lost whole reviews to an invented extra field or a truncated
+commit SHA. `review::contract::parse_assessment` takes the last JSON object in
+the reply that names a result, ignores unknown keys, accepts `verdict` for
+`result`, and keeps everything else as the Markdown `report`. The hard gate is
+Forge's own setup steps and required checks, not the reviewer's citations: a
+failing check fails the review whatever the reviewer said, and a `pass` on a
+Task with no configured checks rests on the reviewer's judgment alone.
+
+Results map to conformance and routing as follows. `pass` becomes `passed`
+(merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
+follows the review-remediation budget, with the reason and Markdown review as the
+coder's feedback. `blocked` — the environment, not the code, stopped the
+reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
+with a `review_blocked` blocking annotation (recovery: `reexecute`) for its owner,
+because neither the coder nor another reviewer can install a missing toolchain.
+A reply with no readable result block, or a review whose context or commit
+changed underneath it, is `unverified`: it uses the bounded reviewer
+execution-retry path, eventually creates a durable execution blocker, and never
+dispatches a coder.
+
+Before an embedded reviewer run completes, Forge parses its reply with the same
+parser; a reply with no readable result block gets up to two short follow-up
+turns in the same run asking for the block alone. Each correction is appended to
+the reply, so the first turn's Markdown review survives, and the whole reply is
+logged as the run's final assistant message. The corrections are part of the one
+execution and do not spend the reviewer retry budget; CLI reviewers do not get
+them yet. Each native reviewer attempt starts with an empty conversation and no
+Task checkpoint persistence, so a retry cannot accumulate the previous full
 contract and report. Worker and planner Task continuity remains persistent,
 with deterministic structural compaction instead of an LCM timeline.
 
@@ -2655,12 +2663,9 @@ the assessment, even when the reviewer cited a frozen pre-review result. If
 setup or the checks modify tracked files (or move HEAD) in that clean checkout,
 the candidate does not reproduce from its own commit — a stale lockfile is the
 usual cause — so the review fails and the coder is told which files changed.
-Tracked changes in the reviewer's own worktree, a citation whose start line does
-not exist, and stale Charter/Task/check inputs make conformance unverified while
-retaining a structurally valid assessment. A citation end line
-may overshoot EOF because its existing start line still identifies real content.
-A real file citation is not proof that the reviewer interpreted its contents
-correctly. Natural-language Charter text never becomes an executable command;
+Tracked changes in the reviewer's own worktree and stale Charter/Task/check
+inputs make conformance unverified while retaining the parsed review.
+Natural-language Charter text never becomes an executable command;
 product-specific deterministic checks must be configured explicitly.
 
 The frozen Task source includes bounded worklog comments and active attached

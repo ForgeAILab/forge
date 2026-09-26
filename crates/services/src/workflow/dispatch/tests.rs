@@ -289,7 +289,7 @@ fn reviewer_base_prompt_defers_the_frozen_contract_to_launch() {
 
     assert!(prompt
         .system
-        .contains("Reviewer findings: Put findings in the JSON findings array."));
+        .contains("Reviewer findings: Write findings in your Markdown review."));
     assert!(prompt
         .system
         .contains("Each BLOCKING finding must include evidence"));
@@ -873,32 +873,13 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         "status": "failed",
         "contract": null,
         "assessment": {
-            "contract_digest": "digest",
-            "verdict": "fail",
-            "requirements": [
-                {
-                    "requirement_id": "charter:/scope/must_have_outcomes/6",
-                    "disposition": "satisfied",
-                    "rationale": "Two-line stderr contract is implemented.",
-                    "evidence": []
-                },
-                {
-                    "requirement_id": "task:acceptance",
-                    "disposition": "violated",
-                    "rationale": "The JSON escaper leaves U+0008 unescaped.",
-                    "evidence": [{
-                        "kind": "file",
-                        "path": "tsvsort/src/main.rs",
-                        "commit_sha": "abc123",
-                        "start_line": 10,
-                        "end_line": 20
-                    }]
-                }
-            ],
-            "findings": []
+            "result": "fail",
+            "reason": "The JSON escaper leaves U+0008 unescaped.",
+            "report": "- task:acceptance violated: the JSON escaper leaves U+0008 unescaped \
+                       (tsvsort/src/main.rs:10-20)."
         },
         "checks": [],
-        "reason": null
+        "reason": "The JSON escaper leaves U+0008 unescaped."
     })
     .to_string();
     sqlx::query("INSERT INTO execution_review_contract VALUES (?, ?, ?, ?, ?, ?)")
@@ -944,12 +925,11 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         .latest_review_feedback
         .expect("the failed review supplies feedback");
     assert!(
-        feedback.contains("The JSON escaper leaves U+0008 unescaped."),
-        "feedback must carry the violated requirement's rationale: {feedback}"
+        feedback.starts_with("The JSON escaper leaves U+0008 unescaped.\n\n"),
+        "feedback leads with the reviewer's reason: {feedback}"
     );
-    assert!(feedback.contains("tsvsort/src/main.rs:10-20"));
     assert!(
-        !feedback.contains("Two-line stderr contract is implemented."),
-        "satisfied requirements are not findings"
+        feedback.contains("tsvsort/src/main.rs:10-20"),
+        "feedback carries the reviewer's Markdown review: {feedback}"
     );
 }

@@ -1,48 +1,33 @@
-//! A reviewer run corrects its own malformed report before it completes.
+//! A reviewer run fixes a missing result block before it completes.
 //!
-//! Forge only accepts a review it can verify: one JSON object in the frozen
-//! contract's schema. A model that garbles a key or omits a field used to lose
-//! the whole review, which started a fresh full-cost reviewer run against the
-//! retry budget. Instead the same run gets one short follow-up turn carrying
-//! the exact parse error and its own report, and is asked for the corrected
-//! object only.
+//! A review is free Markdown ending in one small result block. A model that
+//! forgets the block, or names an unknown result, used to lose the whole
+//! review and start a fresh full-cost reviewer run against the retry budget.
+//! Instead the same run gets a short follow-up turn asking for the block
+//! alone; its Markdown review from the first turn is kept.
 
 use std::future::Future;
 
 use forge_agent_host::{AgentHostError, AgentTurnOutput};
 
-/// Follow-up turns one reviewer run may spend fixing its report's shape.
+/// Follow-up turns one reviewer run may spend fixing its result block.
 pub(super) const MAX_REPORT_CORRECTIONS: usize = 2;
 
-/// The rejected report is echoed back so the model does not have to redo its
-/// investigation; a report past this size is cut, and the model re-emits it.
-const MAX_ECHOED_REPORT_BYTES: usize = 64 * 1024;
-
-/// The follow-up turn's input: what was wrong and the report to fix.
-pub(super) fn correction_prompt(problem: &str, report: &str) -> String {
-    let mut end = report.len().min(MAX_ECHOED_REPORT_BYTES);
-    while !report.is_char_boundary(end) {
-        end -= 1;
-    }
-    let cut = if end < report.len() {
-        "\n[report truncated]"
-    } else {
-        ""
-    };
+/// The follow-up turn's input. The model still has its review in context,
+/// so only the missing block is asked for.
+pub(super) fn correction_prompt(problem: &str) -> String {
     format!(
-        "Forge could not accept your review report, so nothing has been verified yet.\n\n\
+        "Forge could not read the result of your review, so nothing has been recorded yet.\n\n\
          Problem: {problem}\n\n\
-         Reply with ONLY the corrected report: one JSON object in exactly the schema from \
-         your instructions, with the same contract_digest, and no prose or code fences \
-         around it. Keep your verdict, dispositions, and findings unless fixing the problem \
-         requires changing them. Do not repeat the investigation.\n\n\
-         Your previous report:\n{}{cut}",
-        &report[..end]
+         Reply with ONLY the result block for the review you just wrote, for example:\n\
+         {{\"result\": \"fail\", \"reason\": \"one sentence\"}}\n\
+         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation."
     )
 }
 
-/// Run correction turns until `problem_of` accepts the report or the budget
-/// is spent, returning the last report with every turn's usage attached.
+/// Run correction turns until `problem_of` accepts the reply or the budget is
+/// spent. Each correction is appended to the reply so the first turn's
+/// Markdown review survives; the parser reads the last result block.
 ///
 /// A correction turn that fails keeps the last report; the normal review
 /// path then settles it exactly as it would have without a correction.
@@ -72,9 +57,10 @@ where
     output
 }
 
-/// The later turn's report, with both turns' usage. Usage is recorded per
-/// provider attempt under the one execution, so nothing is dropped.
+/// Both turns' text and usage. Usage is recorded per provider attempt under
+/// the one execution, so nothing is dropped.
 fn merge_turns(previous: AgentTurnOutput, next: AgentTurnOutput) -> AgentTurnOutput {
+    let text = format!("{}\n\n{}", previous.text.trim_end(), next.text.trim());
     let mut usage_reports = previous.usage_reports;
     usage_reports.extend(next.usage_reports);
     AgentTurnOutput {
@@ -84,6 +70,7 @@ fn merge_turns(previous: AgentTurnOutput, next: AgentTurnOutput) -> AgentTurnOut
         cache_write_tokens: previous.cache_write_tokens + next.cache_write_tokens,
         usage_reports,
         context_manifest: next.context_manifest.or(previous.context_manifest),
+        text,
         ..next
     }
 }
@@ -124,7 +111,8 @@ mod tests {
     }
 
     fn problem_unless_valid(text: &str) -> Option<String> {
-        (text != "valid").then(|| format!("cannot parse {text}"))
+        (!text.ends_with("valid") || text.ends_with("invalid"))
+            .then(|| format!("cannot parse {text}"))
     }
 
     #[tokio::test]
@@ -133,16 +121,17 @@ mod tests {
         let output = correct_report(
             turn("garbled", "first"),
             problem_unless_valid,
-            |problem, report| {
-                prompts
-                    .borrow_mut()
-                    .push(correction_prompt(&problem, &report));
+            |problem, _| {
+                prompts.borrow_mut().push(correction_prompt(&problem));
                 async { Ok(turn("valid", "second")) }
             },
         )
         .await;
 
-        assert_eq!(output.text, "valid");
+        assert_eq!(
+            output.text, "garbled\n\nvalid",
+            "the first turn's review is kept"
+        );
         let ids: Vec<_> = output
             .usage_reports
             .iter()
@@ -153,7 +142,6 @@ mod tests {
         let prompts = prompts.into_inner();
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("Problem: cannot parse garbled"));
-        assert!(prompts[0].contains("Your previous report:\ngarbled"));
     }
 
     #[tokio::test]
@@ -173,11 +161,11 @@ mod tests {
         let output = correct_report(turn("bad", "0"), problem_unless_valid, |_, _| {
             *calls.borrow_mut() += 1;
             let n = *calls.borrow();
-            async move { Ok(turn("still bad", &n.to_string())) }
+            async move { Ok(turn("still invalid", &n.to_string())) }
         })
         .await;
         assert_eq!(calls.into_inner(), MAX_REPORT_CORRECTIONS);
-        assert_eq!(output.text, "still bad");
+        assert!(output.text.ends_with("still invalid"));
         assert_eq!(output.usage_reports.len(), 1 + MAX_REPORT_CORRECTIONS);
     }
 
@@ -197,13 +185,5 @@ mod tests {
             .map(|r| r.report_id.as_str())
             .collect();
         assert_eq!(ids, ["first", "failed-attempt"]);
-    }
-
-    #[test]
-    fn an_oversized_report_is_echoed_truncated_on_a_char_boundary() {
-        let report = "é".repeat(MAX_ECHOED_REPORT_BYTES);
-        let prompt = correction_prompt("too big", &report);
-        assert!(prompt.ends_with("[report truncated]"));
-        assert!(prompt.len() < report.len());
     }
 }
