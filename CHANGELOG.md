@@ -21,6 +21,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project defaults, then Task overrides), so a Project that configured
   `ci_steps` failed every review admission with `pre-review result for
   required check ci:0 is unavailable`.
+- A Codex Task whose previous session file is gone starts a fresh thread
+  again. Current Codex reports a missing thread as `no rollout found for thread
+  id`, which the fallback did not recognize, so every auditor fork and coder
+  resume on such a Task failed instead of starting fresh.
 
 ### Breaking
 

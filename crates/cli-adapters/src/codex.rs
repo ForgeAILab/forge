@@ -1008,11 +1008,14 @@ impl CodexAdapter {
     }
 }
 
+/// Whether Codex rejected a resume/fork because the thread's rollout no
+/// longer exists. Older Codex builds say "thread not found"; current ones say
+/// "no rollout found for thread id". Missing only the newer wording meant a
+/// Task whose Codex session file was gone could never review or remediate:
+/// every auditor fork and coder resume failed instead of starting fresh.
 fn is_missing_codex_thread_error(error: &ExecutorError) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("thread not found")
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("thread not found") || message.contains("no rollout found")
 }
 
 pub(crate) fn codex_event_error_message(raw: &Value) -> Option<String> {
@@ -2032,6 +2035,23 @@ mod tests {
         assert_eq!(fork_params.thread_id, "source-thread");
         assert_eq!(fork_params.cwd.as_deref(), Some(ctx.worktree_path.as_str()));
         assert_eq!(fork_params.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn both_codex_missing_thread_wordings_are_recognized() {
+        for message in [
+            "thread/fork failed: thread not found: source-thread (-32600)",
+            "thread/fork failed: no rollout found for thread id 01a0db3a-7bb0-7fc2-87f4-4cd2253b52e1 (-32600)",
+            "thread/resume failed: no rollout found for thread id 01a0db3a-7bb0-7fc2-87f4-4cd2253b52e1 (-32600)",
+        ] {
+            assert!(
+                is_missing_codex_thread_error(&ExecutorError::Other(message.to_owned())),
+                "{message}"
+            );
+        }
+        assert!(!is_missing_codex_thread_error(&ExecutorError::Other(
+            "thread/fork failed: rate limited (-32000)".to_owned()
+        )));
     }
 
     #[tokio::test]
