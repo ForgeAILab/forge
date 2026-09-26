@@ -21,7 +21,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-which = "7"
+which = "8"
 toml = "1.1.4"
 
 [dev-dependencies]
