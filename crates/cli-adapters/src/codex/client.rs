@@ -1,6 +1,6 @@
 use super::{
     jsonrpc::{JsonRpcPeer, ServerMessage},
-    normalize::{is_turn_completed, normalize_event},
+    normalize::{extract_thread_id, is_turn_completed, normalize_event},
     protocol::{
         ApprovalDecision, CancelTurnParams, CancelTurnResponse, CommandExecutionApprovalResponse,
         DynamicToolCallOutputContentItem, DynamicToolCallResponse, DynamicToolSpec,
@@ -46,7 +46,6 @@ pub trait ChatToolHandler: Send + Sync {
 #[derive(Debug, Default)]
 pub struct TurnRunResult {
     pub outcome: Option<ExecutionOutcome>,
-    pub thread_id: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage_reports: Vec<UsageReport>,
@@ -192,11 +191,18 @@ impl CodexClient {
             .await
     }
 
+    /// Drive `root_thread_id`'s current turn to completion.
+    ///
+    /// Codex multi-agent runs interleave sub-agent threads on the same
+    /// connection. Their events are logged and their token usage counted, but
+    /// only the root thread's events can complete the turn, fail it, or supply
+    /// its summary.
     pub async fn run_until_turn_complete(
         &mut self,
         writer: Arc<AsyncMutex<LogWriter>>,
         mut stderr_rx: mpsc::Receiver<String>,
         heartbeat_interval_seconds: u64,
+        root_thread_id: &str,
     ) -> Result<TurnRunResult, ExecutorError> {
         let mut result = TurnRunResult::default();
         let heartbeat_interval = std::time::Duration::from_secs(heartbeat_interval_seconds.max(1));
@@ -230,7 +236,10 @@ impl CodexClient {
                         result.error = Some("codex app-server stdout closed".to_owned());
                         return Ok(result);
                     };
-                    if self.handle_server_message(message, &writer, &mut result).await? {
+                    if self
+                        .handle_server_message(message, &writer, &mut result, root_thread_id)
+                        .await?
+                    {
                         result.outcome = Some(if result.error.is_some() {
                             ExecutionOutcome::Failed
                         } else {
@@ -248,20 +257,26 @@ impl CodexClient {
         message: ServerMessage,
         writer: &Arc<AsyncMutex<LogWriter>>,
         result: &mut TurnRunResult,
+        root_thread_id: &str,
     ) -> Result<bool, ExecutorError> {
         match message {
             ServerMessage::Request(request, raw) => {
                 let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw.clone(), result).await?;
+                self.write_normalized(writer, raw.clone(), result, true)
+                    .await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 self.handle_server_request(request.id, &request.method, request.params, writer)
                     .await?;
                 Ok(false)
             }
             ServerMessage::Notification(_notification, raw) => {
+                if is_sub_agent_event(&raw, root_thread_id) {
+                    self.write_normalized(writer, raw, result, false).await?;
+                    return Ok(false);
+                }
                 let completed = is_turn_completed(&raw);
                 let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw, result).await?;
+                self.write_normalized(writer, raw, result, true).await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 Ok(completed)
             }
@@ -271,7 +286,7 @@ impl CodexClient {
                     return Ok(false);
                 }
                 let diagnostic = set_error_if_present(&raw, result);
-                self.write_normalized(writer, raw, result).await?;
+                self.write_normalized(writer, raw, result, true).await?;
                 write_error_diagnostic(writer, diagnostic).await?;
                 Ok(false)
             }
@@ -287,6 +302,7 @@ impl CodexClient {
         writer: &Arc<AsyncMutex<LogWriter>>,
         raw: Value,
         result: &mut TurnRunResult,
+        root_thread: bool,
     ) -> Result<(), ExecutorError> {
         if let Some(usage) = extract_token_usage(&raw)? {
             // Codex emits one `thread/tokenUsage/updated` per turn carrying
@@ -295,10 +311,7 @@ impl CodexClient {
             append_usage_report(&mut result.usage_reports, usage);
         }
         let normalized = normalize_event(raw);
-        if let Some(thread_id) = normalized.thread_id {
-            result.thread_id = Some(thread_id);
-        }
-        if let Some(message) = normalized.assistant_message {
+        if root_thread && let Some(message) = normalized.assistant_message {
             result.summary = Some(message);
         }
         write_log(writer, normalized.kind, normalized.payload).await
@@ -526,6 +539,12 @@ fn mcp_tool_elicitation_allowed(params: &Value) -> bool {
         .get("_meta")
         .and_then(|value| string_field(value, &["codex_approval_kind"]));
     approval_kind == Some("mcp_tool_call")
+}
+
+/// An event that names a thread other than the one Forge started or resumed
+/// belongs to a spawned sub-agent. Events without a thread id stay the root's.
+fn is_sub_agent_event(raw: &Value, root_thread_id: &str) -> bool {
+    extract_thread_id(raw).is_some_and(|thread_id| thread_id != root_thread_id)
 }
 
 fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<String> {
@@ -803,6 +822,65 @@ mod tests {
                 json!({ "value": 42 }),
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_events_do_not_complete_fail_or_summarize_the_root_turn() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let log_path = dir.path().join("codex.jsonl");
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat starts");
+        let stdin = child.stdin.take().expect("cat stdin");
+        let stdout = child.stdout.take().expect("cat stdout");
+        let cancel = CancellationToken::new();
+        let mut client = CodexClient::spawn(stdin, stdout, dir.path(), cancel.clone());
+        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
+            &log_path,
+            "execution-id".to_owned(),
+            1024 * 1024,
+        )));
+        let mut result = TurnRunResult::default();
+        let notification = |raw: Value| {
+            ServerMessage::Notification(
+                serde_json::from_value(raw.clone()).expect("notification parses"),
+                raw,
+            )
+        };
+
+        for raw in [
+            json!({"method": "thread/started", "params": {"thread": {"id": "child"}}}),
+            json!({"method": "item/completed", "params": {"threadId": "child", "turnId": "t2",
+                "item": {"type": "agentMessage", "id": "m1", "text": "child reply"}}}),
+            json!({"method": "error", "params": {"threadId": "child", "error": {"message": "child failed"}}}),
+            json!({"method": "turn/completed", "params": {"threadId": "child", "turn": {"id": "t2"}}}),
+        ] {
+            let completed = client
+                .handle_server_message(notification(raw), &writer, &mut result, "root")
+                .await
+                .expect("child event handled");
+            assert!(!completed, "a sub-agent turn must not end the root turn");
+        }
+        assert!(result.summary.is_none());
+        assert!(result.error.is_none());
+
+        let completed = client
+            .handle_server_message(
+                notification(json!({"method": "turn/completed",
+                    "params": {"threadId": "root", "turn": {"id": "t1"}}})),
+                &writer,
+                &mut result,
+                "root",
+            )
+            .await
+            .expect("root event handled");
+        assert!(completed);
+
+        cancel.cancel();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 
     #[tokio::test]

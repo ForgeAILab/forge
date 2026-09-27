@@ -6,6 +6,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-09-27
+
+### Fixed
+
+- A Codex Task whose agent spawns a sub-agent no longer ends early or wedges.
+  Forge read every event on the Codex connection as the main thread's, so a
+  sub-agent finishing its own turn ended the coder's run mid-work, its reply
+  became the run summary, and its thread id was saved as the Task's session.
+  The next resume then failed with `cannot resume an unloaded multi-agent v2
+  sub-agent through its parent`. Only the thread Forge started or resumed can
+  now complete, fail, or summarize a run, and a Task already holding a
+  sub-agent session starts a fresh thread instead of failing.
+
 ## [0.13.5] - 2026-09-26
 
 ### Fixed
