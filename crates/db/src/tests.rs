@@ -5701,7 +5701,10 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
     .fetch_one(db.pool())
     .await
     .expect("progress event count reads");
-    assert_eq!(progress_event_count, 1);
+    assert_eq!(
+        progress_event_count, 0,
+        "progress outside a warned stall only moves the watermark"
+    );
 
     let out_of_order_progress = ExecutionRepo::record_progress(
         &db,
@@ -5750,7 +5753,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
     .fetch_one(db.pool())
     .await
     .expect("progress event count after duplicate reads");
-    assert_eq!(progress_event_count, 1);
+    assert_eq!(progress_event_count, 0);
 
     let renewed = ExecutionRepo::renew_lease(
         &db,
@@ -5838,6 +5841,33 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             .expect("stale live progress query succeeds");
     assert_eq!(stale_progress.len(), 1);
     assert_eq!(stale_progress[0].id, execution_id);
+
+    // Progress that ends the warned stall epoch is the one durable event:
+    // it resolves the warning's Attention item.
+    let renewed_again = match ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: renewed_again.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:21Z".to_owned(),
+            now: "2026-08-21T00:00:21Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress after a warning commits")
+    {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected progress-after-warning result: {other:?}"),
+    };
+    let progress_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.progressed' AND entity_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("progress event count after warning reads");
+    assert_eq!(progress_event_count, 1);
     let hard_deadline_renewal = ExecutionRepo::renew_lease(
         &db,
         RenewExecutionLease {

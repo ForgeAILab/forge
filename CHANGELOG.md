@@ -6,6 +6,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-09-27
+
+### Fixed
+
+- A running Task no longer floods the server and every open browser. Each
+  line of CLI agent output appended an `execution.progressed` domain event,
+  one receipt row per event consumer, and an SSE frame, which made browsers
+  refetch Project lists and analytics several times a second and pushed the
+  receipts table past most of the database. The liveness watermark
+  (`last_progress_at`) now updates at most once per second for CLI and daemon
+  executions, and `execution.progressed` is stored only when progress clears
+  a stall warning. Migration V146 deletes the stored per-line events. The
+  write load was also what made `POST /tasks/{id}/recover` take 15–18 s: its
+  write transaction queued behind the progress writes and their Attention
+  resolves (normal recover latency is ~0.5 s).
+- Project-scoped SSE frames no longer refetch every Project-owned query (board
+  Tasks, workflow, members, Project Agents). They refresh the exact Project
+  summary and list, don't cancel an in-flight refresh, and coalesce bursts to
+  one refresh per 500 ms.
+
+### Changed
+
+- `domain_event.committed` SSE frames carry `domain_event_type` and
+  `domain_entity_id`. The web client uses them to refresh only the affected
+  Task for execution liveness events.
+
 ## [0.13.6] - 2026-09-27
 
 ### Fixed

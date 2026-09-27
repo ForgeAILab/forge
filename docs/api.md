@@ -3050,6 +3050,11 @@ gate; clients must not treat an SSE notification as the durable source of
 truth. Event context fields are flattened onto the standard `ForgeEvent`
 envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 
+Every committed `domain_event` row is also relayed as a
+`domain_event.committed` frame with `{ "sequence": 1, "domain_event_type":
+"...", "domain_entity_id": "...", "entity_type": "...", "scope_type": "...",
+"scope_id": "..." }`; the frame's own `entity_id` is the domain event id.
+
 | Event | Context payload |
 |-------|-----------------|
 | `product_genesis.started` | `{ "operation": "genesis.start", "session_id": "...", "main_chat_id": "...", "source_message_id": "...", "source_turn_id": "...|null", "admitted_turn_id": "..." }` |

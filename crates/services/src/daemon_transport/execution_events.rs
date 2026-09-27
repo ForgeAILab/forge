@@ -245,6 +245,11 @@ impl ServerExecutionEventSink {
         {
             return Ok(false);
         }
+        if progress_recorded_recently(execution.last_progress_at.as_deref(), progress_at) {
+            // Ownership is already proven above; a log line this close to
+            // the recorded watermark would only add another write.
+            return Ok(true);
+        }
 
         // A heartbeat and a semantic event can arrive concurrently. Retry a
         // single CAS with the current row so an otherwise valid log does not
@@ -726,6 +731,20 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+/// Remote log notifications arrive per line; the liveness watermark only
+/// needs to move once per native stream interval.
+fn progress_recorded_recently(last_progress_at: Option<&str>, progress_at: &str) -> bool {
+    let (Some(last), Some(candidate)) = (
+        last_progress_at.and_then(parse_rfc3339),
+        parse_rfc3339(progress_at),
+    ) else {
+        return false;
+    };
+    candidate.signed_duration_since(last)
+        < ChronoDuration::from_std(crate::turn_log_sink::STREAM_PROGRESS_INTERVAL)
+            .unwrap_or_else(|_| ChronoDuration::seconds(1))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -749,6 +768,18 @@ mod tests {
             "usage_reports": []
         }))
         .expect("terminal notification fixture parses")
+    }
+
+    #[test]
+    fn remote_progress_is_recorded_at_most_once_per_interval() {
+        let last = Some("2026-09-08T00:00:00Z");
+        assert!(progress_recorded_recently(last, "2026-09-08T00:00:00.500Z"));
+        assert!(!progress_recorded_recently(last, "2026-09-08T00:00:01Z"));
+        assert!(!progress_recorded_recently(
+            None,
+            "2026-09-08T00:00:00.500Z"
+        ));
+        assert!(!progress_recorded_recently(last, "not-a-timestamp"));
     }
 
     #[test]

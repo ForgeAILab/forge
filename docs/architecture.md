@@ -667,8 +667,11 @@ diagnostic metadata, never a credential or client capability.
 Lease claim, renewal, semantic progress, and terminalization are repository
 compare-and-swap operations. Renewal runs on a fixed server cadence and does
 not depend on `TurnEventSink`, JSONL output, text, reasoning, tool calls, or
-provider callbacks. Those events may advance `last_progress_at` and append a
-deduplicated `execution.progressed` event, but they do not prove ownership.
+provider callbacks. Those events advance `last_progress_at` at most once per
+second per execution (the live log itself stays in the execution's JSONL
+file), and they do not prove ownership. Progress appends a durable
+`execution.progressed` event only when it ends a stall epoch that already has
+an `execution.progress_warning`, which resolves that Attention item.
 A quiet provider/tool call therefore remains live while its owner lease is
 current. A stale-progress scan can append a distinct, atomically revalidated
 `execution.progress_warning` Attention event; it does not fail a live lease or

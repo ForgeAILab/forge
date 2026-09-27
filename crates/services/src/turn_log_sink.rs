@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 /// execution-row CAS for every delta creates avoidable SQLite write pressure;
 /// one update per second is sufficient for semantic liveness. Tool boundaries
 /// and explicit calls bypass this interval.
-const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const STREAM_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Notified at a bounded cadence after durable turn events so a caller can
 /// bump a liveness marker (for example an execution row's semantic progress

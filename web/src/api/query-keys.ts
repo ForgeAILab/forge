@@ -42,6 +42,7 @@ export const qk = {
       'diff',
       baseRevisionId ?? 'base',
     ] as const,
+  projectPagesRoot: ['projects', 'pages'] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>
