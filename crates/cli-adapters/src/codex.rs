@@ -683,7 +683,7 @@ impl CodexAdapter {
                             )
                         })?
                     }
-                    Err(error) if is_missing_codex_thread_error(&error) => {
+                    Err(error) if is_unresumable_codex_thread_error(&error) => {
                         let response = client
                             .thread_start(Self::thread_start_params(
                                 config,
@@ -734,7 +734,7 @@ impl CodexAdapter {
                 // homes is not visible from the new home. Start clean inside
                 // the managed boundary instead of importing ambient history
                 // or making the Task permanently unrecoverable.
-                Err(error) if is_missing_codex_thread_error(&error) => {
+                Err(error) if is_unresumable_codex_thread_error(&error) => {
                     let response = client.thread_start(thread_params).await?;
                     response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
                         ExecutorError::Other(
@@ -880,7 +880,12 @@ impl CodexAdapter {
         .await?;
 
         let run = client
-            .run_until_turn_complete(writer.clone(), stderr_rx, ctx.heartbeat_interval_seconds)
+            .run_until_turn_complete(
+                writer.clone(),
+                stderr_rx,
+                ctx.heartbeat_interval_seconds,
+                &thread_id,
+            )
             .await?;
         let mut outcome = run.outcome.unwrap_or(ExecutionOutcome::Failed);
         let mut summary = run.summary;
@@ -922,6 +927,7 @@ impl CodexAdapter {
                         writer.clone(),
                         empty_rx,
                         ctx.heartbeat_interval_seconds,
+                        &thread_id,
                     )
                     .await
                 {
@@ -949,7 +955,7 @@ impl CodexAdapter {
             return Ok(ExecutionResult {
                 status: outcome.clone(),
                 after_sha: None,
-                agent_session_id: run.thread_id.or(Some(thread_id)),
+                agent_session_id: Some(thread_id),
                 summary,
                 error,
                 usage_reports,
@@ -957,7 +963,7 @@ impl CodexAdapter {
             });
         }
 
-        let agent_session_id = run.thread_id.or(Some(thread_id));
+        let agent_session_id = Some(thread_id);
         if !auto_commit {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Completed,
@@ -1008,14 +1014,16 @@ impl CodexAdapter {
     }
 }
 
-/// Whether Codex rejected a resume/fork because the thread's rollout no
-/// longer exists. Older Codex builds say "thread not found"; current ones say
-/// "no rollout found for thread id". Missing only the newer wording meant a
-/// Task whose Codex session file was gone could never review or remediate:
-/// every auditor fork and coder resume failed instead of starting fresh.
-fn is_missing_codex_thread_error(error: &ExecutorError) -> bool {
+/// Whether Codex rejected a resume/fork of a thread Forge can never resume,
+/// so the run must start fresh instead. Older Codex builds say "thread not
+/// found"; current ones say "no rollout found for thread id". Before 0.13.6
+/// Forge could also record a multi-agent sub-agent's thread as the session,
+/// which Codex refuses to resume except through its parent.
+fn is_unresumable_codex_thread_error(error: &ExecutorError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
-    message.contains("thread not found") || message.contains("no rollout found")
+    message.contains("thread not found")
+        || message.contains("no rollout found")
+        || message.contains("sub-agent through its parent")
 }
 
 pub(crate) fn codex_event_error_message(raw: &Value) -> Option<String> {
@@ -2038,18 +2046,19 @@ mod tests {
     }
 
     #[test]
-    fn both_codex_missing_thread_wordings_are_recognized() {
+    fn unresumable_codex_thread_wordings_are_recognized() {
         for message in [
             "thread/fork failed: thread not found: source-thread (-32600)",
             "thread/fork failed: no rollout found for thread id 01a0db3a-7bb0-7fc2-87f4-4cd2253b52e1 (-32600)",
             "thread/resume failed: no rollout found for thread id 01a0db3a-7bb0-7fc2-87f4-4cd2253b52e1 (-32600)",
+            "thread/resume failed: cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it (-32600)",
         ] {
             assert!(
-                is_missing_codex_thread_error(&ExecutorError::Other(message.to_owned())),
+                is_unresumable_codex_thread_error(&ExecutorError::Other(message.to_owned())),
                 "{message}"
             );
         }
-        assert!(!is_missing_codex_thread_error(&ExecutorError::Other(
+        assert!(!is_unresumable_codex_thread_error(&ExecutorError::Other(
             "thread/fork failed: rate limited (-32000)".to_owned()
         )));
     }
