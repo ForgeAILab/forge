@@ -443,9 +443,14 @@ Task Worker/reviewer executions in their Task Workspaces.
 The CLI permission policy includes an explicit high-risk `yolo` value. It maps
 to an adapter's strongest local execution mode only where that cannot cross a
 Forge-owned role boundary. Managed Codex Task executions are the deliberate
-exception: the server-selected runtime role overrides profile configuration to
-`read-only` for read-only work or `workspace-write` otherwise, always with
-approvals set to `never`. This is an execution-harness setting, not a Forge
+exception: every managed role overrides profile configuration to
+`workspace-write` with network access, always with approvals set to `never`.
+Forge runs CLI harnesses headless, so nobody can answer a per-tool prompt:
+`supervised` maps to the same unattended mode as `auto` (Claude Code
+`bypassPermissions`, Gemini/Smith `--yolo`, Cursor `--force`, OpenCode
+`--dangerously-skip-permissions`). Only `plan` keeps a harness read-only
+(Claude Code `plan`, Smith `--approval ask`, Cursor without `--force`), which
+suits a reviewer that only reads. This is an execution-harness setting, not a Forge
 capability grant. Canonical scope, Task assignment, Workspace-lease admission,
 chat filesystem denial, and user-only approval/waiver/release authority are
 still enforced independently.
@@ -456,10 +461,17 @@ ambient Codex configuration, rules, hooks, skills, plugins, and connectors,
 disables host skill instructions and account/plugin discovery for the thread,
 enumerates effective local MCP configuration and explicitly disables every
 discovered server, and installs Forge-owned `forbidden` rules for changing
-checkout/branch context or integrating/publishing Git history. The writable
-sandbox excludes both `/tmp` and the inherited `TMPDIR`; the adapter supplies
-one freshly reset Forge-owned `task-scratch` directory as its only extra
-writable root. An unexpected authority-bearing input in that managed home
+checkout/branch context or integrating/publishing Git history. Every managed
+role, including a read-only reviewer, runs in the workspace-write sandbox with
+network access so it can install dependencies, build, and run tests. The
+sandbox excludes both `/tmp` and the inherited `TMPDIR`; beyond the worktree
+its only writable roots are one freshly reset Forge-owned `task-scratch`
+directory, the execution outbox, and the host's package-manager caches
+(`~/.npm`, Cargo `registry`/`git`, the Go module cache, the XDG cache, pnpm's
+store, and `~/Library/Caches` on macOS, each honoring its relocation
+variable). A read-only role still cannot deliver code: Forge skips its
+finalization, fails any execution that changed a tracked file or moved HEAD,
+and resets the worktree afterwards. An unexpected authority-bearing input in that managed home
 fails execution closed. Codex-generated trust configuration and system-skill
 cache are discarded before each attempt and replaced with canonical Forge
 configuration, so a retry cannot reject its own runtime artifacts. The adapter
@@ -1569,7 +1581,9 @@ terminal workflow state under the same transaction as wake budgeting, so
 recovery, cancellation, or deletion after projection suppresses the stale wake.
 Observation belongs to the run that made it. A Task session holds a worktree
 and a process and captures what its own run did (`task.evidence`,
-`task.worklog`). The Project Agent holds its own verification workspace — a
+`task.worklog`; a CLI harness writes the same records to its execution outbox,
+which Forge ingests when the run ends — see
+[api.md](api.md#commitments-inbox-and-typed-actions)). The Project Agent holds its own verification workspace — a
 durable `forge/` plus a disposable `checkout/` of the repository — and every
 Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
 The workspace root also carries two Forge-owned authority markers:
@@ -1897,6 +1911,12 @@ with `merge_failed` returning to worker execution and `cancelled` as the
 terminal cancellation target. `working` and `merge_failed` explicitly use the
 `worker` role; `review` has no reviewer role and requires human approval.
 Entering review runs the before-work hooks and CI steps as blocking guards.
+Implementation prompts (coder and worker) list the exact effective `ci_steps`
+and say they run as `bash -lc` from the worktree root, so the agent validates
+against the real gate rather than its own interpreter or command. A failing
+step's transition reason names the step, exit code, command, and last output
+line (`CI step 1 failed (exit 1): \`pytest\` -- 2 failed`); the full output
+tail stays on the review and is quoted to the coder's fix attempt.
 Review rejection and merge repair resume the latest worker thread. The worker
 plans internally, implements, self-tests, repairs ordinary unfinished-worktree
 failures, and reports verification evidence, so the preset has no planning

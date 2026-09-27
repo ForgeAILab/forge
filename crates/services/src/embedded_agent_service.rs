@@ -399,6 +399,15 @@ impl EmbeddedAgentService {
         self.tool_provider.set_inquiry_runner(runner);
     }
 
+    /// Ingest the worklog and evidence a CLI harness left in its execution
+    /// outbox; see [`CoordinationToolProvider::ingest_execution_outbox`].
+    pub async fn ingest_execution_outbox(
+        &self,
+        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+    ) -> crate::native_tools::ExecutionOutboxReport {
+        self.tool_provider.ingest_execution_outbox(input).await
+    }
+
     /// Attach the media storage root so a Task session can capture the
     /// artifacts its run produced as authoritative evidence.
     pub fn set_media_root(&self, media_root: std::path::PathBuf) {

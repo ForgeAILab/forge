@@ -453,7 +453,7 @@ pollutes `~/.forge`. See the project [Makefile](../Makefile).
 The embedded daemon auto-detects installed CLIs.
 
 Forge's managed Codex and Claude Code adapters launch pinned npm packages via
-`npx`: `@openai/codex@0.154.0` and `@anthropic-ai/claude-code@2.1.267`.
+`npx`: `@openai/codex@0.157.0` and `@anthropic-ai/claude-code@2.1.282`.
 Updating a globally installed CLI does not update these managed versions.
 The packages must be able to install their platform-native dependencies.
 For automatic Task commits, Forge disables repository Git hooks, filesystem

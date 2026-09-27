@@ -1,8 +1,8 @@
 use crate::workflow::{
     default_roles,
     dispatch::{
-        default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_REVIEWER_CONFORMANCE_V1, MANAGED_EXECUTION_CONTRACT,
+        default_tool_names, read_only_report_contract, AgentDispatchContext, AgentPrompt,
+        PromptBuilder, BUILDER_ID_REVIEWER_CONFORMANCE_V1, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
@@ -12,6 +12,7 @@ const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
 - Must remain read-only, inspect diff and relevant logs, run or verify configured checks, and report in the format of the frozen contract Forge appends at launch.
 - Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
+- May install dependencies and produce build output (network and package caches are available); Forge discards the worktree afterwards and fails the run if any tracked file changed.
 - Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, a result that contradicts the review.";
 
 const REVIEWER_FINDINGS_CONTRACT: &str = "\
@@ -83,13 +84,23 @@ impl PromptBuilder for ReviewerPromptBuilder {
 
         if !ctx.read_only_task && !ci_steps.is_empty() {
             user.push_str("\nRequired CI steps:\n");
-            user.push_str(
-                "Forge executes these checks independently against the reviewed content:\n",
-            );
-            for step in ci_steps {
-                user.push_str("- ");
-                user.push_str(step);
-                user.push('\n');
+            match current_ci_results(ctx) {
+                Some(results) => {
+                    user.push_str(
+                        "Forge already ran these checks against the reviewed content before dispatching you. Results (output truncated to the tail):\n",
+                    );
+                    user.push_str(&results);
+                }
+                None => {
+                    user.push_str(
+                        "Forge executes these checks independently against the reviewed content:\n",
+                    );
+                    for step in ci_steps {
+                        user.push_str("- ");
+                        user.push_str(step);
+                        user.push('\n');
+                    }
+                }
             }
         }
 
@@ -112,10 +123,53 @@ impl PromptBuilder for ReviewerPromptBuilder {
 
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}"
+                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
+                read_only_report_contract(ctx.delivery)
             ),
             user,
             tools: default_tool_names(default_roles::REVIEWER),
         }
     }
+}
+
+/// Bytes of each CI step's output tail shown to the reviewer.
+const CI_OUTPUT_TAIL_BYTES: usize = 1500;
+
+/// Render the CI results Forge recorded on the in-flight Review attempt, which
+/// runs before the reviewer is dispatched.
+fn current_ci_results(ctx: &AgentDispatchContext) -> Option<String> {
+    let review = ctx
+        .prior_reviews
+        .iter()
+        .filter(|review| review.status == db::ReviewStatus::Running)
+        .max_by_key(|review| review.attempt_number)?;
+    let details: serde_json::Value = serde_json::from_str(&review.step_results_json).ok()?;
+    let steps = details.get("ci_steps")?.as_array()?;
+    if steps.is_empty() {
+        return None;
+    }
+    let mut rendered = String::new();
+    for step in steps {
+        let command = step.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+        let exit_code = step
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
+        rendered.push_str(&format!("- `{command}` exited {exit_code}\n"));
+        let output = step
+            .get("output_tail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim_end();
+        if !output.is_empty() {
+            let start = output.len().saturating_sub(CI_OUTPUT_TAIL_BYTES);
+            let start = (start..output.len())
+                .find(|&index| output.is_char_boundary(index))
+                .unwrap_or(output.len());
+            rendered.push_str("```\n");
+            rendered.push_str(&output[start..]);
+            rendered.push_str("\n```\n");
+        }
+    }
+    Some(rendered)
 }

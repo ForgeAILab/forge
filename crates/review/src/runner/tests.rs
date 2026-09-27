@@ -2292,3 +2292,127 @@ async fn concurrent_review_attempts_leave_no_orphan_running_execution_or_lease()
     assert_eq!(orphan_running, 0);
     assert_eq!(stale_lease, 0);
 }
+
+#[tokio::test]
+async fn review_source_excludes_evidence_recorded_after_the_reviewer_started() {
+    let seed = seeded_review(Vec::new()).await;
+    let task_id = seed.task_id.to_string();
+    let workspace_id: String =
+        sqlx::query_scalar("SELECT workspace_id FROM execution WHERE id = ?")
+            .bind(seed.executor_execution_id.to_string())
+            .fetch_one(seed.db.pool())
+            .await
+            .expect("executor workspace");
+    let reviewer_execution_id = Uuid::new_v4().to_string();
+    ExecutionRepo::create(
+        &*seed.db,
+        CreateExecution {
+            id: reviewer_execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(seed.auditor_agent_id.clone()),
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: "2026-09-25T12:00:00+00:00".to_owned(),
+            updated_at: "2026-09-25T12:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("reviewer execution creates");
+
+    for (key, execution_id, role, created_at) in [
+        (
+            "coder-validation",
+            seed.executor_execution_id.to_string(),
+            "coder",
+            "2026-09-25T11:00:00+00:00",
+        ),
+        (
+            "reviewer-report",
+            reviewer_execution_id.clone(),
+            "reviewer",
+            "2026-09-25T12:05:00+00:00",
+        ),
+    ] {
+        TaskCommentRepo::create_comment(
+            &*seed.db,
+            CreateTaskComment {
+                id: Uuid::new_v4().to_string(),
+                task_id: task_id.clone(),
+                author_type: CommentAuthorType::Agent,
+                author_id: Some(seed.auditor_agent_id.clone()),
+                author_name: role.to_owned(),
+                content: key.to_owned(),
+                execution_id: Some(execution_id),
+                role: Some(role.to_owned()),
+                worklog_kind: Some("validation".to_owned()),
+                idempotency_key: Some(key.to_owned()),
+                created_at: created_at.to_owned(),
+                updated_at: created_at.to_owned(),
+            },
+        )
+        .await
+        .expect("worklog creates");
+    }
+    TaskMediaRepo::create_media(
+        &*seed.db,
+        CreateTaskMedia {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            display_filename: "review-run.log".to_owned(),
+            content_type: "text/plain".to_owned(),
+            byte_size: 12,
+            storage_key: format!("task-media/{}.log", Uuid::new_v4()),
+            author_type: CommentAuthorType::Agent,
+            author_id: Some(seed.auditor_agent_id.clone()),
+            author_name: "reviewer".to_owned(),
+            created_at: "2026-09-25T12:06:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("reviewer evidence creates");
+
+    let reviewed = seed
+        .db
+        .review_source(&task_id, Some(&reviewer_execution_id))
+        .await
+        .expect("review source loads");
+    let evidence = &reviewed["task_scope"]["evidence"];
+    assert_eq!(evidence["worklog"].as_array().map(Vec::len), Some(1));
+    assert_eq!(evidence["worklog"][0]["content"], "coder-validation");
+    assert_eq!(evidence["media"].as_array().map(Vec::len), Some(0));
+
+    // Naming the candidate run instead keeps every record: the cutoff belongs
+    // to a reviewing execution only.
+    let candidate = seed
+        .db
+        .review_source(&task_id, Some(&seed.executor_execution_id.to_string()))
+        .await
+        .expect("candidate review source loads");
+    assert_eq!(
+        candidate["task_scope"]["evidence"]["worklog"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        candidate["task_scope"]["evidence"]["media"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+}

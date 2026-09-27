@@ -18,7 +18,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.267";
+const DEFAULT_CLAUDE_VERSION: &str = "2.1.282";
 // Router v3 replaced the `ccr code <claude args>` pass-through with
 // `ccr <profile> [-- <agent args>]`; adopting it needs an invocation rework,
 // so stay on the 2.x line until then.
@@ -278,7 +278,7 @@ impl ClaudeCodeAdapter {
         let worktree = Path::new(&ctx.worktree_path);
         let mut cmd =
             Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
-        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
+        crate::command::run_in_task_worktree(&mut cmd, &ctx);
         let run_started_at = std::time::SystemTime::now();
         let claude_home = dirs::home_dir();
 
@@ -446,6 +446,8 @@ impl CodingExecutorAdapter for ClaudeCodeAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![
+                "claude-fable-5-1".into(),
+                "claude-opus-5-5".into(),
                 "claude-fable-5".into(),
                 "claude-opus-5".into(),
                 "claude-sonnet-5".into(),
@@ -460,6 +462,8 @@ impl CodingExecutorAdapter for ClaudeCodeAdapter {
             cli_specific: serde_json::json!({
                 "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                 "model_reasoning_efforts": {
+                    "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max", "ultracode"],
+                    "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                     "claude-fable-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                     "claude-opus-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                     "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max", "ultracode"],
@@ -1230,8 +1234,8 @@ mod tests {
             args,
             vec![
                 "-y",
-                "--allow-scripts=@anthropic-ai/claude-code@2.1.267",
-                "@anthropic-ai/claude-code@2.1.267",
+                "--allow-scripts=@anthropic-ai/claude-code@2.1.282",
+                "@anthropic-ai/claude-code@2.1.282",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",
@@ -1257,6 +1261,8 @@ mod tests {
         assert_eq!(
             discovered.models,
             vec![
+                "claude-fable-5-1",
+                "claude-opus-5-5",
                 "claude-fable-5",
                 "claude-opus-5",
                 "claude-sonnet-5",
@@ -1265,6 +1271,10 @@ mod tests {
         );
         assert_eq!(
             discovered.cli_specific["model_reasoning_efforts"]["claude-fable-5"],
+            serde_json::json!(["low", "medium", "high", "xhigh", "max", "ultracode"])
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["claude-opus-5-5"],
             serde_json::json!(["low", "medium", "high", "xhigh", "max", "ultracode"])
         );
         assert_eq!(

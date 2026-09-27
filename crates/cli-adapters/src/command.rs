@@ -110,8 +110,33 @@ impl CommandBuilder {
 /// `getcwd()` — OpenCode resolves its project directory from it — would
 /// otherwise inherit the Forge server's own working directory and run the
 /// Task against the wrong checkout.
-pub fn run_in_worktree(command: &mut Command, worktree_path: &str) {
-    command.current_dir(worktree_path).env("PWD", worktree_path);
+///
+/// The child also learns its Task, execution, and outbox (see
+/// [`executors::execution_outbox_path`]); the outbox is created here so the
+/// harness can write to it without first discovering that it is missing.
+pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionContext) {
+    command
+        .current_dir(&ctx.worktree_path)
+        .env("PWD", &ctx.worktree_path)
+        .env("FORGE_TASK_ID", &ctx.task_id)
+        .env("FORGE_EXECUTION_ID", &ctx.execution_id);
+    let Some(outbox) = executors::execution_outbox_path(
+        std::path::Path::new(&ctx.worktree_path),
+        &ctx.execution_id,
+    ) else {
+        return;
+    };
+    match std::fs::create_dir_all(&outbox) {
+        Ok(()) => {
+            command.env(executors::FORGE_OUTBOX_ENV, &outbox);
+        }
+        Err(error) => tracing::warn!(
+            execution_id = %ctx.execution_id,
+            outbox = %outbox.display(),
+            %error,
+            "execution outbox could not be created; worklog and evidence will not be delivered"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -181,19 +206,44 @@ mod worktree_tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn worktree_children_see_the_worktree_as_pwd() {
+    fn worktree_children_see_the_worktree_as_pwd_and_their_outbox() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("task-1").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let ctx = executors::ExecutionContext {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config: serde_json::json!({}),
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
         let mut command = CommandBuilder::new("true").build();
-        run_in_worktree(&mut command, "/tmp/worktree");
+        run_in_task_worktree(&mut command, &ctx);
 
         let std_command = command.as_std();
-        assert_eq!(
-            std_command.get_current_dir(),
-            Some(std::path::Path::new("/tmp/worktree"))
+        assert_eq!(std_command.get_current_dir(), Some(worktree.as_path()));
+        let env = |name: &str| {
+            std_command
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_owned())
+        };
+        assert_eq!(env("PWD"), Some(worktree.clone().into_os_string()));
+        assert_eq!(env("FORGE_EXECUTION_ID"), Some("exec-1".into()));
+        let outbox = temp
+            .path()
+            .join("task-1")
+            .join(".forge-outbox")
+            .join("exec-1");
+        assert_eq!(env("FORGE_OUTBOX"), Some(outbox.clone().into_os_string()));
+        assert!(
+            outbox.is_dir(),
+            "the outbox exists before the harness starts"
         );
-        let pwd = std_command
-            .get_envs()
-            .find(|(key, _)| *key == OsStr::new("PWD"))
-            .and_then(|(_, value)| value);
-        assert_eq!(pwd, Some(OsStr::new("/tmp/worktree")));
     }
 }

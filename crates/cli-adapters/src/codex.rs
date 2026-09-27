@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.154.0";
+const DEFAULT_CODEX_VERSION: &str = "0.157.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
 const MANAGED_CONFIG: &str = "suppress_unstable_features_warning = true\n";
@@ -36,14 +36,13 @@ const MANAGED_RULES: &str = include_str!("../tests/fixtures/forge-task-boundary.
 
 const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-reserve",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex-spark",
     "codex-auto-review",
 ];
 
@@ -52,13 +51,11 @@ pub const CODEX_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh",
 #[must_use]
 pub fn codex_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     match model {
-        "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra" => CODEX_REASONING_EFFORTS,
-        "gpt-reserve" | "gpt-5.6-luna" | "codex-auto-review" => {
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => CODEX_REASONING_EFFORTS,
+        "gpt-6-luna" | "gpt-reserve" | "gpt-5.6-luna" | "codex-auto-review" => {
             &["low", "medium", "high", "xhigh", "max"]
         }
-        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex-spark" => {
-            &["low", "medium", "high", "xhigh"]
-        }
+        "gpt-5.5" => &["low", "medium", "high", "xhigh"],
         // Custom/newer models may use any effort currently advertised by the
         // Codex family. The provider remains authoritative for that model.
         _ => CODEX_REASONING_EFFORTS,
@@ -162,7 +159,7 @@ impl CodexAdapter {
         worktree_path: &str,
         runtime_scope: &Value,
         mcp_server_names: &[String],
-        managed_scratch_root: Option<&Path>,
+        managed_writable_roots: &[PathBuf],
     ) -> ThreadStartParams {
         let permission = config.permission_policy.clone().unwrap_or_default();
         let is_yolo = matches!(permission, PermissionPolicy::Yolo);
@@ -240,20 +237,25 @@ impl CodexAdapter {
                         .collect(),
                 ),
             );
-            if !managed_read_only {
-                let writable_roots = managed_scratch_root
-                    .map(|path| vec![Value::String(path.to_string_lossy().into_owned())])
-                    .unwrap_or_default();
-                config_overrides.insert(
-                    "sandbox_workspace_write".to_owned(),
-                    json!({
-                        "network_access": false,
-                        "exclude_slash_tmp": true,
-                        "exclude_tmpdir_env_var": true,
-                        "writable_roots": writable_roots,
-                    }),
-                );
-            }
+            // Both roles get the same workspace-write sandbox: verification
+            // (installing dependencies, building, running tests) needs network
+            // access and writable package caches. A read-only role still cannot
+            // deliver code — Forge fails any execution that leaves authored
+            // changes or moves HEAD, then resets the worktree (see the
+            // read-only gate in the task execution runner).
+            let writable_roots = managed_writable_roots
+                .iter()
+                .map(|path| Value::String(path.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>();
+            config_overrides.insert(
+                "sandbox_workspace_write".to_owned(),
+                json!({
+                    "network_access": true,
+                    "exclude_slash_tmp": true,
+                    "exclude_tmpdir_env_var": true,
+                    "writable_roots": writable_roots,
+                }),
+            );
         }
 
         let developer_instructions = if managed_task && !managed_read_only {
@@ -276,9 +278,7 @@ impl CodexAdapter {
             } else {
                 AskForApproval::from_config(config.ask_for_approval.as_deref(), fallback_approval)
             }),
-            sandbox: Some(if managed_read_only {
-                SandboxMode::ReadOnly
-            } else if managed_task {
+            sandbox: Some(if managed_task {
                 SandboxMode::WorkspaceWrite
             } else if is_yolo {
                 SandboxMode::DangerFullAccess
@@ -304,7 +304,7 @@ impl CodexAdapter {
         dynamic_tools: Vec<DynamicToolSpec>,
         mcp_server_names: &[String],
     ) -> ThreadStartParams {
-        let mut params = Self::thread_start_params(config, worktree_path, runtime_scope, &[], None);
+        let mut params = Self::thread_start_params(config, worktree_path, runtime_scope, &[], &[]);
         params.approval_policy = Some(AskForApproval::Never);
         params.sandbox = Some(SandboxMode::ReadOnly);
         params.dynamic_tools = Some(promote_payload_guidance(dynamic_tools));
@@ -549,7 +549,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             .as_ref()
             .map(|home| home.join("task-scratch"));
         let mut command = Self::build_command(&config, managed_codex_home.as_deref());
-        crate::command::run_in_worktree(&mut command, &ctx.worktree_path);
+        crate::command::run_in_task_worktree(&mut command, &ctx);
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {
@@ -652,7 +652,7 @@ impl CodexAdapter {
         ctx: &ExecutionContext,
         client: &mut C,
         mcp_server_names: &[String],
-        managed_scratch_root: Option<&Path>,
+        managed_writable_roots: &[PathBuf],
     ) -> Result<(String, Option<String>), ExecutorError>
     where
         C: CodexSessionClient + Send,
@@ -671,7 +671,7 @@ impl CodexAdapter {
                             &ctx.worktree_path,
                             &ctx.agent_config,
                             mcp_server_names,
-                            managed_scratch_root,
+                            managed_writable_roots,
                         ),
                     ))
                     .await
@@ -690,7 +690,7 @@ impl CodexAdapter {
                                 &ctx.worktree_path,
                                 &ctx.agent_config,
                                 mcp_server_names,
-                                managed_scratch_root,
+                                managed_writable_roots,
                             ))
                             .await?;
                         let thread_id =
@@ -718,7 +718,7 @@ impl CodexAdapter {
                 &ctx.worktree_path,
                 &ctx.agent_config,
                 mcp_server_names,
-                managed_scratch_root,
+                managed_writable_roots,
             );
             let forked_thread_id = match client
                 .thread_fork(ThreadForkParams::from_start(
@@ -754,7 +754,7 @@ impl CodexAdapter {
                 &ctx.worktree_path,
                 &ctx.agent_config,
                 mcp_server_names,
-                managed_scratch_root,
+                managed_writable_roots,
             );
             let response = client.thread_start(thread_params).await?;
             let thread_id = response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
@@ -827,11 +827,9 @@ impl CodexAdapter {
                 json!({
                     "type": "managed_execution_scope",
                     "task_role": role,
-                    "sandbox": if executors::is_worktree_read_only(&ctx.agent_config) {
-                        "read-only"
-                    } else {
-                        "workspace-write"
-                    },
+                    "sandbox": "workspace-write",
+                    "network_access": true,
+                    "worktree_read_only": executors::is_worktree_read_only(&ctx.agent_config),
                     "approval_policy": "never",
                     "isolated_codex_home": true,
                     "ambient_temp_roots_writable": false,
@@ -862,12 +860,30 @@ impl CodexAdapter {
             } else {
                 Vec::new()
             };
+            // Outside the worktree a managed Task may write only its scratch
+            // root, its outbox (worklog and evidence delivery), and the host's
+            // package-manager caches (so dependency installs and builds work).
+            let managed_writable_roots = if managed_task {
+                managed_scratch_root
+                    .iter()
+                    .cloned()
+                    .chain(executors::execution_outbox_path(
+                        Path::new(&ctx.worktree_path),
+                        &ctx.execution_id,
+                    ))
+                    .chain(dirs::home_dir().map_or_else(Vec::new, |home| {
+                        package_cache_roots(&home, |key| std::env::var_os(key))
+                    }))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             Self::start_codex_session(
                 &config,
                 &ctx,
                 &mut client,
                 &mcp_server_names,
-                managed_scratch_root.as_deref(),
+                &managed_writable_roots,
             )
             .await?
         };
@@ -1207,6 +1223,40 @@ fn ambient_codex_home() -> PathBuf {
         .unwrap_or_else(|| dirs_path("codex"))
 }
 
+/// Package-manager cache directories a managed Task may write so dependency
+/// installs and builds work inside the Codex sandbox. Paths honor the
+/// managers' own relocation variables and need not exist yet.
+fn package_cache_roots(
+    home: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let from_env = |key: &str| {
+        env(key)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let cargo_home = from_env("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    let go_mod_cache = from_env("GOMODCACHE").unwrap_or_else(|| {
+        from_env("GOPATH")
+            .unwrap_or_else(|| home.join("go"))
+            .join("pkg/mod")
+    });
+    let mut roots = vec![
+        from_env("npm_config_cache").unwrap_or_else(|| home.join(".npm")),
+        cargo_home.join("registry"),
+        cargo_home.join("git"),
+        go_mod_cache,
+        // XDG cache: pnpm, yarn, pip, go-build and others on Linux.
+        from_env("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache")),
+        home.join(".local/share/pnpm"),
+    ];
+    if cfg!(target_os = "macos") {
+        roots.push(home.join("Library/Caches"));
+        roots.push(home.join("Library/pnpm"));
+    }
+    roots
+}
+
 /// Build the smallest Codex home a managed Task needs. Authentication is the
 /// only shared state; personal configuration inputs are deliberately absent.
 /// The home lives beside Task logs, outside the worktree sandbox, so a Worker
@@ -1415,6 +1465,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn sub_agent_resume_target_falls_back_to_a_fresh_thread() {
+        let sub_agent = ExecutorError::Other(
+            "thread/resume failed: cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it (-32600)".to_owned(),
+        );
+        assert!(is_unresumable_codex_thread_error(&sub_agent));
+        assert!(!is_unresumable_codex_thread_error(&ExecutorError::Other(
+            "thread/resume failed: rate limited".to_owned()
+        )));
+    }
+
+    #[test]
     fn command_builder_uses_codex_default_app_server() {
         let config = CodexConfig {
             permission_policy: Some(PermissionPolicy::Supervised),
@@ -1434,7 +1495,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-y", "@openai/codex@0.154.0", "app-server", "--verbose"]
+            vec!["-y", "@openai/codex@0.157.0", "app-server", "--verbose"]
         );
     }
 
@@ -1449,14 +1510,13 @@ mod tests {
             discovered.models,
             vec![
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-reserve",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
                 "codex-auto-review",
             ]
         );
@@ -1466,6 +1526,14 @@ mod tests {
         );
         assert_eq!(
             discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-luna"],
+            json!(["low", "medium", "high", "xhigh", "max"])
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-6-sol"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        );
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-6-luna"],
             json!(["low", "medium", "high", "xhigh", "max"])
         );
         assert_eq!(
@@ -1492,7 +1560,7 @@ mod tests {
         };
 
         let params =
-            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], None);
+            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], &[]);
 
         assert_eq!(params.model.as_deref(), Some("gpt-5-codex"));
         assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
@@ -1520,7 +1588,7 @@ mod tests {
         };
 
         let params =
-            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], None);
+            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], &[]);
 
         assert!(matches!(
             params.sandbox,
@@ -1549,7 +1617,7 @@ mod tests {
             "/tmp/worktree",
             &runtime_scope,
             &["project-local".to_owned()],
-            Some(Path::new("/tmp/forge-task-scratch")),
+            &[PathBuf::from("/tmp/forge-task-scratch")],
         );
 
         assert!(matches!(params.sandbox, Some(SandboxMode::WorkspaceWrite)));
@@ -1576,7 +1644,7 @@ mod tests {
         assert_eq!(
             overrides["sandbox_workspace_write"],
             json!({
-                "network_access": false,
+                "network_access": true,
                 "exclude_slash_tmp": true,
                 "exclude_tmpdir_env_var": true,
                 "writable_roots": ["/tmp/forge-task-scratch"],
@@ -1589,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_read_only_role_stays_read_only() {
+    fn managed_read_only_role_gets_verification_sandbox_without_delivery_instructions() {
         let config = CodexConfig {
             permission_policy: Some(PermissionPolicy::Yolo),
             ..CodexConfig::default()
@@ -1598,14 +1666,63 @@ mod tests {
         executors::mark_task_role(&mut runtime_scope, "reviewer");
         executors::mark_worktree_read_only(&mut runtime_scope);
 
-        let params =
-            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &runtime_scope, &[], None);
+        let params = CodexAdapter::thread_start_params(
+            &config,
+            "/tmp/worktree",
+            &runtime_scope,
+            &[],
+            &[PathBuf::from("/home/u/.npm")],
+        );
 
-        assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
+        // Never full access: writes stay confined to the worktree and the
+        // declared roots, and Forge's post-run gate discards them.
+        assert!(matches!(params.sandbox, Some(SandboxMode::WorkspaceWrite)));
         assert!(matches!(
             params.approval_policy,
             Some(AskForApproval::Never)
         ));
+        let overrides = params.config.expect("managed overrides are present");
+        assert_eq!(
+            overrides["sandbox_workspace_write"]["network_access"],
+            json!(true)
+        );
+        assert_eq!(
+            overrides["sandbox_workspace_write"]["writable_roots"],
+            json!(["/home/u/.npm"])
+        );
+        assert_eq!(params.developer_instructions, None);
+    }
+
+    #[test]
+    fn package_cache_roots_honor_relocation_variables() {
+        let home = Path::new("/home/u");
+        let defaults = package_cache_roots(home, |_| None);
+        for expected in [
+            "/home/u/.npm",
+            "/home/u/.cargo/registry",
+            "/home/u/.cargo/git",
+            "/home/u/go/pkg/mod",
+            "/home/u/.cache",
+        ] {
+            assert!(defaults.contains(&PathBuf::from(expected)), "{expected}");
+        }
+
+        let relocated = package_cache_roots(home, |key| match key {
+            "CARGO_HOME" => Some("/opt/cargo".into()),
+            "GOMODCACHE" => Some("/opt/gomod".into()),
+            "npm_config_cache" => Some("/opt/npm".into()),
+            "XDG_CACHE_HOME" => Some(String::new().into()),
+            _ => None,
+        });
+        for expected in [
+            "/opt/npm",
+            "/opt/cargo/registry",
+            "/opt/cargo/git",
+            "/opt/gomod",
+            "/home/u/.cache",
+        ] {
+            assert!(relocated.contains(&PathBuf::from(expected)), "{expected}");
+        }
     }
 
     #[test]
@@ -2028,7 +2145,7 @@ mod tests {
         };
 
         let (thread_id, turn_id) =
-            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], &[])
                 .await
                 .expect("session starts");
 
@@ -2088,7 +2205,7 @@ mod tests {
         };
 
         let (thread_id, turn_id) =
-            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], &[])
                 .await
                 .expect("missing legacy session starts fresh");
 
@@ -2126,7 +2243,7 @@ mod tests {
         };
 
         let (thread_id, turn_id) =
-            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], &[])
                 .await
                 .expect("session starts");
 
@@ -2177,7 +2294,7 @@ mod tests {
         };
 
         let (thread_id, turn_id) =
-            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], &[])
                 .await
                 .expect("session starts");
 

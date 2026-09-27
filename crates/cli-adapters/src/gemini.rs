@@ -49,7 +49,7 @@ impl GeminiAdapter {
             || config.yolo.unwrap_or(false)
             || matches!(
                 config.permission_policy.as_ref(),
-                Some(PermissionPolicy::Auto)
+                Some(PermissionPolicy::Auto) | Some(PermissionPolicy::Supervised)
             );
 
         if unattended {
@@ -165,8 +165,10 @@ impl CodingExecutorAdapter for GeminiAdapter {
                 "pro".into(),
                 "flash".into(),
                 "flash-lite".into(),
+                "gemini-3.8-flash".into(),
                 "gemini-3.5-flash".into(),
                 "gemini-3.1-pro-preview".into(),
+                "gemini-3.5-flash-lite".into(),
                 "gemini-3.1-flash-lite".into(),
                 "gemini-3-pro-preview".into(),
                 "gemini-3-flash-preview".into(),
@@ -187,7 +189,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
             ctx.description.clone()
         };
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
+        crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;
 
@@ -537,6 +539,12 @@ mod tests {
             .expect("discovery should succeed");
 
         assert!(discovered.models.contains(&"auto".to_owned()));
+        assert!(discovered.models.contains(&"gemini-3.8-flash".to_owned()));
+        assert!(
+            discovered
+                .models
+                .contains(&"gemini-3.5-flash-lite".to_owned())
+        );
         assert!(discovered.models.contains(&"gemini-3.5-flash".to_owned()));
         assert!(
             discovered
@@ -605,7 +613,11 @@ mod tests {
 
     #[test]
     fn command_builder_maps_unattended_policies_to_yolo() {
-        for policy in [PermissionPolicy::Yolo, PermissionPolicy::Auto] {
+        for policy in [
+            PermissionPolicy::Yolo,
+            PermissionPolicy::Auto,
+            PermissionPolicy::Supervised,
+        ] {
             let config = GeminiConfig {
                 permission_policy: Some(policy),
                 command_overrides: CommandOverrides::default(),

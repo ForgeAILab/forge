@@ -13,7 +13,7 @@ const policyOptions = [
   {
     id: 'supervised',
     label: 'Supervised',
-    description: 'Ask before risky operations.',
+    description: 'Same as Auto in headless Task runs; nobody is there to approve prompts.',
     Icon: HandPalm,
   },
   {

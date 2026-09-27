@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use db::{
     now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo, TransitionLogRepo, WorkspaceRepo,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
@@ -186,7 +186,7 @@ impl HookAction for RunCiSteps {
                 };
             }
             return HookResult::Failed {
-                reason: format!("CI step {} failed", failed_step_index),
+                reason: ci_failure_summary(&review_details["ci_steps"], failed_step_index),
             };
         } else if had_review_passed && !reviewer_assigned && !user_approval_required {
             review_details["auditor"] = json!({
@@ -524,4 +524,67 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
     ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
+}
+
+/// One line naming what failed, for the transition log and Task history. The
+/// full output stays on the review; this line only has to tell a reader which
+/// command broke and how, without opening it.
+fn ci_failure_summary(ci_results: &Value, failed_step_index: usize) -> String {
+    const MAX_DETAIL_CHARS: usize = 240;
+    let step = ci_results.get(failed_step_index);
+    let command = step
+        .and_then(|step| step.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown command");
+    let exit_code = step
+        .and_then(|step| step.get("exit_code"))
+        .and_then(Value::as_i64)
+        .map_or_else(|| "?".to_owned(), |code| code.to_string());
+    let mut summary = format!("CI step {failed_step_index} failed (exit {exit_code}): `{command}`");
+    let detail = step
+        .and_then(|step| step.get("output_tail"))
+        .and_then(Value::as_str)
+        .and_then(|output| {
+            output
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        });
+    if let Some(detail) = detail {
+        let detail: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
+        summary.push_str(" -- ");
+        summary.push_str(&detail);
+    }
+    summary
+}
+
+#[cfg(test)]
+mod ci_failure_summary_tests {
+    use super::*;
+
+    #[test]
+    fn names_the_command_exit_code_and_last_output_line() {
+        let results = json!([
+            {"command": "cargo fmt --check", "exit_code": 0, "output_tail": ""},
+            {
+                "command": "python3 -m unittest discover -s tests",
+                "exit_code": 1,
+                "output_tail": "Traceback...\nTypeError: unsupported operand\n\nFAILED (errors=3)\n",
+            },
+        ]);
+        assert_eq!(
+            ci_failure_summary(&results, 1),
+            "CI step 1 failed (exit 1): `python3 -m unittest discover -s tests` -- FAILED (errors=3)"
+        );
+    }
+
+    #[test]
+    fn tolerates_missing_output() {
+        let results = json!([{"command": "make check", "exit_code": 2}]);
+        assert_eq!(
+            ci_failure_summary(&results, 0),
+            "CI step 0 failed (exit 2): `make check`"
+        );
+    }
 }

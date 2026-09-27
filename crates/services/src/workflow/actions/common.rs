@@ -453,7 +453,7 @@ pub(super) async fn block_task_with_annotation(
     Ok(())
 }
 
-pub(super) fn review_ci_steps(value: &Value) -> Result<Vec<String>, String> {
+pub(crate) fn review_ci_steps(value: &Value) -> Result<Vec<String>, String> {
     let value = value.get("review").unwrap_or(value);
     match value.get("ci_steps") {
         Some(steps) => {

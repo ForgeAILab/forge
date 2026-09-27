@@ -81,6 +81,39 @@ pub fn is_worktree_read_only(config: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Environment variable naming an execution's outbox directory.
+pub const FORGE_OUTBOX_ENV: &str = "FORGE_OUTBOX";
+/// Worklog entries a CLI harness appends to its outbox, one JSON object per line.
+pub const OUTBOX_WORKLOG_FILE: &str = "worklog.jsonl";
+/// Evidence a CLI harness registers in its outbox, one JSON object per line.
+pub const OUTBOX_EVIDENCE_FILE: &str = "evidence.jsonl";
+const OUTBOX_DIR_NAME: &str = ".forge-outbox";
+
+/// The directory a CLI harness writes worklog and evidence into.
+///
+/// A CLI harness has no Forge tool channel, so it reports through files that
+/// Forge ingests when the execution ends. The directory is a sibling of the
+/// Git worktree — inside the Task directory but outside the checkout — so
+/// nothing written there can be committed, and a read-only reviewer still has
+/// one place it may write. Both the server and the daemon derive it from the
+/// same two values, so no transport change is needed.
+#[must_use]
+pub fn execution_outbox_path(
+    worktree_path: &std::path::Path,
+    execution_id: &str,
+) -> Option<std::path::PathBuf> {
+    let safe_id = !execution_id.is_empty()
+        && execution_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !safe_id {
+        return None;
+    }
+    worktree_path
+        .parent()
+        .map(|task_dir| task_dir.join(OUTBOX_DIR_NAME).join(execution_id))
+}
+
 /// Context passed to an executor when running a task.
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {

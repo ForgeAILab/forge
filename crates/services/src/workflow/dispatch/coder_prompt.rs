@@ -3,9 +3,9 @@ use db::ReviewStatus;
 use crate::workflow::{
     default_roles, default_states,
     dispatch::{
-        default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_CODER_IMPLEMENTATION_V2, BUILDER_ID_CODER_MERGE_FIX_V2,
-        BUILDER_ID_CODER_REVIEW_FIX_V2, MANAGED_EXECUTION_CONTRACT,
+        default_tool_names, implementation_report_contract, required_checks_section,
+        AgentDispatchContext, AgentPrompt, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
+        BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
@@ -78,13 +78,6 @@ Merge-fix boundary:
 - Must not rewrite the feature or add unrelated cleanup.
 - Red flags: redesigns, formatting churn outside conflicted areas, unrelated fixes.";
 
-const CODER_WORKLOG_CONTRACT: &str = "\
-Worklog: append entries with `task.worklog` (append) as you work, so the reviewer reads what you actually did.
-Write one after a meaningful milestone -- your initial approach, a completed slice, validation results, a deviation, a blocker -- and not for every tool call or file edit.
-Use kind `progress`, `decision`, `validation`, or `blocker`. Forge derives the Task, execution, role, and identity from your session, and posts the final completion summary itself once the execution is accepted, so no separate handoff block is needed.
-Proof of behaviour is a captured artifact, not prose: when a change alters UI or runtime behaviour, capture it with `task.evidence` (capture) -- a screenshot or recording by `path`, or verbatim command output as `content` -- and say in the worklog what you captured. If you could not capture proof, say so and why.
-A worklog entry never moves the Task and never satisfies an acceptance check.";
-
 fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -> String {
     let has_plan = ctx
         .plan
@@ -100,10 +93,13 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
         system.push_str(extra_role_boundary);
     }
     system.push_str("\n\n");
-    system.push_str(CODER_WORKLOG_CONTRACT);
-    system.push_str("\n\nProof of work for app-touching changes: If your task modifies user-facing UI or runtime behavior, capture a screenshot (or short walkthrough video) demonstrating the change. Upload it with forge-ctl task media upload --task-id <id> --file <path> and post a comment with forge-ctl task media comment --task-id <id> --content validation-notes --media-url <url> before transitioning to review.");
+    system.push_str(implementation_report_contract(ctx.delivery));
+    if let Some(checks) = required_checks_section(ctx) {
+        system.push_str("\n\n");
+        system.push_str(&checks);
+    }
     if has_plan {
-        system.push_str(" A planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");
+        system.push_str("\n\nA planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");
     }
     if let Some(reason) = ctx.last_manual_bounce_reason.as_deref() {
         system.push_str("\n\nThis task was sent back with the following feedback: ");

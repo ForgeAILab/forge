@@ -93,12 +93,15 @@ impl SmithAdapter {
             ) {
                 (Some(approval), _) if approval.trim() == SMITH_APPROVAL_ASK => SMITH_APPROVAL_DENY,
                 (Some(approval), _) => approval.trim(),
-                (None, Some(PermissionPolicy::Yolo | PermissionPolicy::Auto)) => {
-                    SMITH_APPROVAL_ALLOW_ALL
-                }
-                (None, Some(PermissionPolicy::Supervised | PermissionPolicy::Plan)) => {
-                    SMITH_APPROVAL_DENY
-                }
+                (
+                    None,
+                    Some(
+                        PermissionPolicy::Yolo
+                        | PermissionPolicy::Auto
+                        | PermissionPolicy::Supervised,
+                    ),
+                ) => SMITH_APPROVAL_ALLOW_ALL,
+                (None, Some(PermissionPolicy::Plan)) => SMITH_APPROVAL_DENY,
                 (None, None) => SMITH_APPROVAL_ALLOW_ALL,
             };
             adapter_args.push("--approval".to_owned());
@@ -216,7 +219,7 @@ impl CodingExecutorAdapter for SmithAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
+        crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;
 
@@ -1304,14 +1307,13 @@ mod tests {
     }
 
     #[test]
-    fn supervised_policies_reject_instead_of_halting() {
-        for policy in [PermissionPolicy::Supervised, PermissionPolicy::Plan] {
-            let config = SmithConfig {
-                permission_policy: Some(policy),
-                ..SmithConfig::default()
-            };
-            assert_eq!(approval_flag(&config).as_deref(), Some("deny"));
-        }
+    fn plan_and_explicit_ask_reject_instead_of_halting() {
+        let plan = SmithConfig {
+            permission_policy: Some(PermissionPolicy::Plan),
+            ..SmithConfig::default()
+        };
+        assert_eq!(approval_flag(&plan).as_deref(), Some("deny"));
+
         let explicit_ask = SmithConfig {
             approval: Some("ask".to_owned()),
             ..SmithConfig::default()
@@ -1334,6 +1336,15 @@ mod tests {
             ..SmithConfig::default()
         };
         assert_eq!(approval_flag(&auto).as_deref(), Some("allow-all"));
+    }
+
+    #[test]
+    fn supervised_policy_runs_unattended() {
+        let supervised = SmithConfig {
+            permission_policy: Some(PermissionPolicy::Supervised),
+            ..SmithConfig::default()
+        };
+        assert_eq!(approval_flag(&supervised).as_deref(), Some("allow-all"));
     }
 
     #[test]

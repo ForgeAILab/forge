@@ -56,6 +56,23 @@ fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
     .to_string()
 }
 
+/// The checks `run_ci_steps` will execute when this Task next enters review,
+/// resolved from the same merged review-state config the hook reads. Empty
+/// when the workflow has no review state or the config names no steps.
+pub(crate) fn review_ci_steps_for_task(
+    workflow: &api_types::WorkflowDefinition,
+    project: Option<&db::Project>,
+    task_state_config_json: Option<&str>,
+) -> Vec<String> {
+    workflow
+        .states
+        .iter()
+        .find(|state| state.name == crate::workflow::default_states::REVIEW)
+        .map(|state| hooks::merged_state_config(state, project, task_state_config_json))
+        .and_then(|config| crate::workflow::actions::review_ci_steps(&config).ok())
+        .unwrap_or_default()
+}
+
 pub(crate) fn is_dispatch_failed_annotation(raw_annotation: Option<&str>) -> bool {
     raw_annotation
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())

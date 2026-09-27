@@ -8,7 +8,7 @@ use db::{
 use executors::{LogEntry, LogKind};
 use serde_json::Value;
 
-use crate::workflow::dispatch::EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD;
+use crate::workflow::dispatch::{TaskDelivery, EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD};
 use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
@@ -72,6 +72,13 @@ pub async fn load_agent_dispatch_context(
         capability_class.as_deref(),
     )?
     .is_read_only();
+    let delivery = role_delivery(&db, task_id, role).await?;
+    let project = db::ProjectRepo::get_by_id(&*db, &task.project_id).await?;
+    let review_ci_steps = crate::workflow::engine::review_ci_steps_for_task(
+        workflow,
+        project.as_ref(),
+        task.task_state_config.as_deref(),
+    );
 
     Ok(AgentDispatchContext {
         task,
@@ -91,7 +98,30 @@ pub async fn load_agent_dispatch_context(
         latest_review_execution_id: latest_review_context.execution_id,
         latest_review_logs_path: latest_review_context.logs_path,
         read_only_task,
+        delivery,
+        review_ci_steps,
     })
+}
+
+/// The delivery channel of the Agent assigned to `role`. An unassigned role
+/// keeps the native contract; whoever picks it up is resolved at launch.
+async fn role_delivery(db: &db::SqliteDb, task_id: &str, role: &str) -> Result<TaskDelivery> {
+    let backend_kind = sqlx::query_scalar::<_, String>(
+        "SELECT profile.backend_kind
+         FROM task_role_assignment assignment
+         JOIN agent_identity identity ON identity.id = assignment.assignee_id
+         JOIN agent_profile profile ON profile.id = identity.selected_profile_id
+         WHERE assignment.task_id = ? AND assignment.role_name = ?
+           AND assignment.assignee_type = 'agent'
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(role)
+    .fetch_optional(db.pool())
+    .await?;
+    Ok(backend_kind
+        .as_deref()
+        .map_or(TaskDelivery::NativeTools, TaskDelivery::for_backend_kind))
 }
 
 fn should_resume_latest_target_role_thread(execution_policy: Option<&str>) -> bool {
@@ -103,18 +133,26 @@ fn derive_last_manual_bounce_reason(
     state_name: &str,
     workflow: &WorkflowDefinition,
 ) -> Option<String> {
+    // Only an actor's deliberate move out of a gate carries feedback. Forge's
+    // own transitions (a gate skipped for an unassigned role, a cascade) are
+    // bookkeeping, and quoting them as "sent back" misleads the agent.
     transition_log
         .iter()
         .rev()
         .find(|entry| {
             entry.to_state == state_name
                 && !entry.rejection
+                && !is_system_actor(&entry.triggered_by)
                 && workflow
                     .states
                     .iter()
                     .any(|state| state.name == entry.from_state && state.kind == StateKind::Gate)
         })
         .map(|entry| entry.trigger_reason.clone())
+}
+
+fn is_system_actor(triggered_by: &str) -> bool {
+    triggered_by == "system" || triggered_by.starts_with("system:")
 }
 
 async fn load_sub_tasks(db: &db::SqliteDb, parent_task_id: &str) -> Result<Vec<db::Task>> {
@@ -415,6 +453,41 @@ mod tests {
         assert!(should_resume_latest_target_role_thread(Some(
             EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD
         )));
+    }
+
+    #[test]
+    fn manual_bounce_reason_ignores_system_gate_skips() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        let transition = |triggered_by: &str, reason: &str| db::TransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: "task".to_owned(),
+            from_state: "planning".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("accept".to_owned()),
+            triggered_by: triggered_by.to_owned(),
+            trigger_reason: reason.to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-09-25T20:46:22Z".to_owned(),
+        };
+
+        let skipped = [transition(
+            "system:workflow",
+            "gate skipped: no planner role assigned",
+        )];
+        assert_eq!(
+            derive_last_manual_bounce_reason(&skipped, "in_progress", &workflow),
+            None
+        );
+
+        let bounced = [
+            transition("user:api", "add tests for the error path"),
+            transition("system:workflow", "gate skipped: no planner role assigned"),
+        ];
+        assert_eq!(
+            derive_last_manual_bounce_reason(&bounced, "in_progress", &workflow).as_deref(),
+            Some("add tests for the error path")
+        );
     }
 
     #[test]
