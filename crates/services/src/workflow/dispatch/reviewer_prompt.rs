@@ -10,12 +10,12 @@ pub struct ReviewerPromptBuilder;
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
-- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, and produce structured findings using the frozen contract Forge appends at launch.
+- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, and report in the format of the frozen contract Forge appends at launch.
 - Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
-- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, contradictory assessments.";
+- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, a result that contradicts the review.";
 
 const REVIEWER_FINDINGS_CONTRACT: &str = "\
-Reviewer findings: Put findings in the JSON findings array. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings.";
+Reviewer findings: Write findings in your Markdown review. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings. If the environment (not the code) stopped you from verifying, say what is missing and use the \"blocked\" result.";
 
 impl PromptBuilder for ReviewerPromptBuilder {
     fn id(&self) -> &'static str {

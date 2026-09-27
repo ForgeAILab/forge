@@ -75,68 +75,35 @@ pub struct ReviewContract {
     pub digest: String,
 }
 
+/// The reviewer's one-word outcome.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
-pub enum ConformanceVerdict {
+pub enum ReviewResult {
     Pass,
     Fail,
+    /// The review environment, not the candidate, prevented a verdict (for
+    /// example the toolchain or dependencies are missing). Routed to the
+    /// owner instead of the coder.
+    Blocked,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export)]
-#[serde(rename_all = "snake_case")]
-pub enum RequirementDisposition {
-    Satisfied,
-    Violated,
-    Unverified,
-    OutsideTaskScope,
-}
-
+/// What Forge keeps from a reviewer's reply: the result block it ended with
+/// and the Markdown review written before it.
+///
+/// The reply is free Markdown ending in one small JSON object
+/// `{"result": "...", "reason": "..."}`. Unknown keys in that object are
+/// ignored so any model can produce an acceptable review; the hard guarantee
+/// comes from the required checks Forge runs itself, not from the reviewer's
+/// citations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-#[ts(tag = "kind", rename_all = "snake_case")]
-pub enum ReviewEvidenceRef {
-    File {
-        path: String,
-        commit_sha: String,
-        start_line: usize,
-        end_line: usize,
-    },
-    Check {
-        check_id: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct RequirementAssessment {
-    pub requirement_id: String,
-    pub disposition: RequirementDisposition,
-    pub rationale: String,
-    pub evidence: Vec<ReviewEvidenceRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ConformanceFinding {
-    pub blocking: bool,
-    pub expected: String,
-    pub actual: String,
-    pub evidence: Vec<ReviewEvidenceRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
 pub struct ReviewAssessment {
-    pub contract_digest: String,
-    pub verdict: ConformanceVerdict,
-    pub requirements: Vec<RequirementAssessment>,
-    pub findings: Vec<ConformanceFinding>,
+    pub result: ReviewResult,
+    pub reason: String,
+    /// The reviewer's Markdown review, without the result block.
+    #[serde(default)]
+    pub report: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -147,6 +114,9 @@ pub enum ConformanceStatus {
     NotAssessed,
     Passed,
     Failed,
+    /// The reviewer reported that the review environment prevented a
+    /// verdict. The owner resolves it; the coder is not asked to remediate.
+    Blocked,
     Unverified,
 }
 

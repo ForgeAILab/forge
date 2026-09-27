@@ -134,57 +134,23 @@ pub fn passing_review_assessment_for_contract(
     worktree_path: &Path,
 ) -> String {
     let evidence_path = first_text_file_at_commit(worktree_path, &contract.commit_sha);
-    let evidence = api_types::ReviewEvidenceRef::File {
-        path: evidence_path,
-        commit_sha: contract.commit_sha.clone(),
-        start_line: 1,
-        end_line: 1,
-    };
-    serde_json::to_string(&api_types::ReviewAssessment {
-        contract_digest: contract.digest,
-        verdict: api_types::ConformanceVerdict::Pass,
-        requirements: contract
-            .context
-            .requirements
-            .into_iter()
-            .map(|requirement| api_types::RequirementAssessment {
-                requirement_id: requirement.id,
-                disposition: api_types::RequirementDisposition::Satisfied,
-                rationale:
-                    "The test fixture verified the scoped implementation at the reviewed commit"
-                        .to_owned(),
-                evidence: vec![evidence.clone()],
-            })
-            .collect(),
-        findings: Vec::new(),
-    })
-    .expect("passing review assessment JSON")
+    format!(
+        "Each of the {} Task-scoped requirement(s) is implemented; see `{evidence_path}:1`.\n\n{}",
+        contract.context.requirements.len(),
+        serde_json::json!({
+            "result": "pass",
+            "reason": "The test fixture verified the scoped implementation at the reviewed commit",
+        })
+    )
 }
 
 pub fn failing_review_assessment(description: &str, reason: &str) -> String {
     let contract = review_contract_from_prompt(description);
-    serde_json::to_string(&api_types::ReviewAssessment {
-        contract_digest: contract.digest,
-        verdict: api_types::ConformanceVerdict::Fail,
-        requirements: contract
-            .context
-            .requirements
-            .into_iter()
-            .map(|requirement| api_types::RequirementAssessment {
-                requirement_id: requirement.id,
-                disposition: api_types::RequirementDisposition::Violated,
-                rationale: reason.to_owned(),
-                evidence: Vec::new(),
-            })
-            .collect(),
-        findings: vec![api_types::ConformanceFinding {
-            blocking: true,
-            expected: "The Task-scoped review requirements are satisfied".to_owned(),
-            actual: reason.to_owned(),
-            evidence: Vec::new(),
-        }],
-    })
-    .expect("failing review assessment JSON")
+    format!(
+        "Expected the {} Task-scoped requirement(s) satisfied; actual: {reason}\n\n{}",
+        contract.context.requirements.len(),
+        serde_json::json!({ "result": "fail", "reason": reason })
+    )
 }
 
 fn first_text_file_at_commit(worktree_path: &Path, commit_sha: &str) -> String {

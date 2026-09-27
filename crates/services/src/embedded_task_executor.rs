@@ -668,11 +668,10 @@ impl EmbeddedTaskExecutor {
         })
     }
 
-    /// Give a reviewer whose report Forge cannot parse up to
-    /// [`review_correction::MAX_REPORT_CORRECTIONS`] follow-up turns to fix
-    /// it, checked by the same parser the review cascade applies. Without a
-    /// frozen contract there is nothing to check against, so the report is
-    /// returned unchanged.
+    /// Give a reviewer whose reply has no readable result block up to
+    /// [`review_correction::MAX_REPORT_CORRECTIONS`] follow-up turns to add
+    /// one, checked by the same parser the review cascade applies. Only
+    /// review executions (those with a frozen contract) are corrected.
     async fn correct_review_report(
         &self,
         ctx: &ExecutionContext,
@@ -682,11 +681,12 @@ impl EmbeddedTaskExecutor {
         provider: ReviewCorrectionProvider<'_>,
         cancellation: &CancellationToken,
     ) -> forge_agent_host::AgentTurnOutput {
-        let contract =
-            match db::ReviewConformanceRepo::review_contract(&*self.db, &ctx.execution_id).await {
-                Ok(Some(contract)) => contract,
-                _ => return output,
-            };
+        if !matches!(
+            db::ReviewConformanceRepo::review_contract(&*self.db, &ctx.execution_id).await,
+            Ok(Some(_))
+        ) {
+            return output;
+        }
         // Keep the run cancellable while a correction turn is in flight.
         self.active.write().await.insert(
             ctx.execution_id.clone(),
@@ -695,11 +695,12 @@ impl EmbeddedTaskExecutor {
                 runtime_session_id: provider.runtime_session_id.to_owned(),
             },
         );
+        let original_text = output.text.clone();
         let corrected = review_correction::correct_report(
             output,
-            |text| ::review::contract::parse_assessment(text, &contract).err(),
+            |text| ::review::contract::parse_assessment(text).err(),
             |problem, report| {
-                let request = turn_request(review_correction::correction_prompt(&problem, &report));
+                let request = turn_request(review_correction::correction_prompt(&problem));
                 let log_sink = Arc::clone(log_sink);
                 async move {
                     let _ = log_sink
@@ -710,8 +711,8 @@ impl EmbeddedTaskExecutor {
                             LogKind::System,
                             serde_json::json!({
                                 "text": format!(
-                                    "Forge rejected this report before verification ({problem}) \
-                                     and asked the reviewer to correct it."
+                                    "Forge could not read this review's result ({problem}) \
+                                     and asked the reviewer for its result block."
                                 )
                             }),
                         )
@@ -735,6 +736,18 @@ impl EmbeddedTaskExecutor {
         )
         .await;
         self.active.write().await.remove(&ctx.execution_id);
+        if corrected.text != original_text {
+            // The review cascade reads the last assistant entry. Record the
+            // whole reply — the first turn's Markdown review plus the result
+            // block the correction supplied — so the review is not reduced
+            // to its block.
+            let _ = log_sink
+                .write(
+                    LogKind::Assistant,
+                    serde_json::json!({ "text": corrected.text }),
+                )
+                .await;
+        }
         corrected
     }
 

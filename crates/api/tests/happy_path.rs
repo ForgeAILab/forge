@@ -101,11 +101,8 @@ async fn forge_happy_path_end_to_end() {
             "review_config": { "ci_steps": ["test -f greeting.txt"], "review_prompt": r#"python3 - <<'PY'
 import json, os
 c = json.loads(os.environ['FORGE_REVIEW_CONTRACT'])
-print(json.dumps({'contract_digest': c['digest'], 'verdict': 'pass',
-  'requirements': [{'requirement_id': r['id'], 'disposition': 'satisfied',
-    'rationale': 'The configured check verifies the greeting deliverable',
-    'evidence': [{'kind': 'check', 'check_id': 'ci:0'}]} for r in c['context']['requirements']],
-  'findings': []}))
+print(f"All {len(c['context']['requirements'])} requirement(s) met; check ci:0 verifies the greeting.")
+print(json.dumps({'result': 'pass', 'reason': 'The configured check verifies the greeting deliverable'}))
 PY"# }
         }),
         StatusCode::OK,

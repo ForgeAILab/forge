@@ -100,11 +100,7 @@ fn export_typescript() {
     ConformanceCheck::export().expect("export ConformanceCheck");
     ReviewGoverningContext::export().expect("export ReviewGoverningContext");
     ReviewContract::export().expect("export ReviewContract");
-    ConformanceVerdict::export().expect("export ConformanceVerdict");
-    RequirementDisposition::export().expect("export RequirementDisposition");
-    ReviewEvidenceRef::export().expect("export ReviewEvidenceRef");
-    RequirementAssessment::export().expect("export RequirementAssessment");
-    ConformanceFinding::export().expect("export ConformanceFinding");
+    ReviewResult::export().expect("export ReviewResult");
     ReviewAssessment::export().expect("export ReviewAssessment");
     ConformanceStatus::export().expect("export ConformanceStatus");
     ConformanceCheckResult::export().expect("export ConformanceCheckResult");

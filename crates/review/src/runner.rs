@@ -224,16 +224,24 @@ impl ReviewRunner {
             &candidate_execution_id,
         );
         let ci_only_review = task.review_passed_at.is_some() && req.auditor_agent_id.is_none();
-        let state_config = read_review_state_config(task.task_state_config.as_deref())?;
         let review_source = self
             .db
             .review_source(&task_id, Some(&executor_execution_id))
             .await?;
-        let ci_steps = if crate::contract::task_scope_is_read_only(&review_source) {
-            Vec::new()
-        } else {
-            read_ci_steps(&state_config)?
-        };
+        // Run exactly the steps the review contract will require: workflow
+        // state config, then Project defaults, then Task overrides. Reading
+        // only the Task's own config left Project-level ci_steps required by
+        // the contract but never executed, so every review failed admission
+        // with "pre-review result for required check ci:0 is unavailable".
+        // The effective config already drops ci_steps for read-only Tasks.
+        let state_config =
+            crate::contract::effective_review_config(&review_source).map_err(|message| {
+                ReviewError::from(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                )))
+            })?;
+        let ci_steps = read_ci_steps(&state_config)?;
         let review_prompt = read_review_prompt(&state_config);
 
         let (mut review, reviewer_execution) = self
@@ -943,13 +951,27 @@ impl ReviewRunner {
             execution_id: auditor_execution.id.clone(),
             reason,
         })?;
-        if conformance.status == api_types::ConformanceStatus::Unverified {
-            return Err(ReviewError::Conformance {
-                execution_id: auditor_execution.id.clone(),
-                reason: conformance
-                    .reason
-                    .unwrap_or_else(|| "unverified review".into()),
-            });
+        // Neither an unusable reply nor an environment the reviewer could not
+        // work in is the coder's to fix; both take the reviewer failure path.
+        match conformance.status {
+            api_types::ConformanceStatus::Unverified => {
+                return Err(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason: conformance
+                        .reason
+                        .unwrap_or_else(|| "unverified review".into()),
+                });
+            }
+            api_types::ConformanceStatus::Blocked => {
+                return Err(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason: format!(
+                        "review blocked by its environment: {}",
+                        conformance.reason.as_deref().unwrap_or("no reason given")
+                    ),
+                });
+            }
+            _ => {}
         }
         let mut result = if conformance.status == api_types::ConformanceStatus::Passed {
             AuditorRunResult {
@@ -1849,26 +1871,6 @@ fn step_results_value(results: &[StepResult]) -> Value {
             })
             .collect(),
     )
-}
-
-fn read_review_state_config(task_state_config: Option<&str>) -> Result<Value, ReviewError> {
-    let Some(raw_config) = task_state_config else {
-        return Ok(json!({}));
-    };
-    if raw_config.trim().is_empty() {
-        return Ok(json!({}));
-    }
-
-    let value: Value = serde_json::from_str(raw_config)?;
-    let value = value.get("review").cloned().unwrap_or(value);
-    if !value.is_object() {
-        return Err(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "review configuration must be an object",
-        ))
-        .into());
-    }
-    Ok(value)
 }
 
 fn read_ci_steps(state_config: &Value) -> Result<Vec<String>, ReviewError> {

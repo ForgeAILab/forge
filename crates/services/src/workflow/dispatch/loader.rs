@@ -254,51 +254,33 @@ async fn exact_review_execution(
     }
 }
 
-/// Renders the frozen conformance assessment as coder-actionable feedback:
-/// every requirement the reviewer did not find satisfied, with its rationale
-/// and cited evidence, plus any blocking finding.
+/// The coder-actionable feedback from the frozen conformance record: the
+/// reviewer's reason followed by its Markdown review.
 async fn conformance_feedback(db: &db::SqliteDb, execution_id: &str) -> Result<Option<String>> {
     let Some(conformance) = db::ReviewConformanceRepo::review_conformance(db, execution_id).await?
     else {
         return Ok(None);
     };
-    let Some(assessment) = conformance.assessment else {
-        return Ok(conformance.reason);
+    let reason = conformance
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let report = conformance
+        .assessment
+        .as_ref()
+        .map(|assessment| assessment.report.trim())
+        .filter(|report| !report.is_empty());
+    let mut rendered = match (reason, report) {
+        (Some(reason), Some(report)) => format!("{reason}\n\n{report}"),
+        (Some(text), None) | (None, Some(text)) => text.to_owned(),
+        (None, None) => return Ok(None),
     };
-    let mut rendered = String::new();
-    for requirement in assessment.requirements.iter().filter(|requirement| {
-        requirement.disposition != api_types::RequirementDisposition::Satisfied
-    }) {
-        rendered.push_str(&format!(
-            "- [{:?}] {}\n  {}\n",
-            requirement.disposition, requirement.requirement_id, requirement.rationale
-        ));
-        for evidence in &requirement.evidence {
-            if let api_types::ReviewEvidenceRef::File {
-                path,
-                start_line,
-                end_line,
-                ..
-            } = evidence
-            {
-                rendered.push_str(&format!("  evidence: {path}:{start_line}-{end_line}\n"));
-            }
-        }
+    let mut end = rendered.len().min(REVIEW_FEEDBACK_LIMIT);
+    while !rendered.is_char_boundary(end) {
+        end -= 1;
     }
-    for finding in assessment
-        .findings
-        .iter()
-        .filter(|finding| finding.blocking)
-    {
-        rendered.push_str(&format!(
-            "- [blocking finding] expected: {}\n  actual: {}\n",
-            finding.expected, finding.actual
-        ));
-    }
-    if rendered.trim().is_empty() {
-        return Ok(conformance.reason);
-    }
-    rendered.truncate(REVIEW_FEEDBACK_LIMIT);
+    rendered.truncate(end);
     Ok(Some(rendered))
 }
 

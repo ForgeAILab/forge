@@ -159,6 +159,9 @@ pub enum FailureKind {
     CiFailed,
     ReviewGateFailed,
     ReviewBudgetExhausted,
+    /// The reviewer could not reach a verdict because of its environment
+    /// (missing toolchain, dependencies, or access). The owner resolves it.
+    ReviewBlocked,
     RetryExhausted,
     MergeFixBudgetExhausted,
     WorkflowGuardRejected,

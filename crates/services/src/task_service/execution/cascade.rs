@@ -1107,6 +1107,7 @@ impl TaskService {
             }
         };
         let passed = conformance.status == api_types::ConformanceStatus::Passed;
+        let blocked = conformance.status == api_types::ConformanceStatus::Blocked;
         let status = if passed && user_approval_required {
             ReviewStatus::AwaitingHuman
         } else if passed {
@@ -1114,7 +1115,10 @@ impl TaskService {
         } else {
             ReviewStatus::Failed
         };
-        let auditor_details = json!({ "verdict": if passed { "pass" } else { "fail" }, "reason": conformance.reason });
+        let auditor_details = json!({
+            "verdict": if passed { "pass" } else if blocked { "blocked" } else { "fail" },
+            "reason": conformance.reason,
+        });
         let comment = reviewer_comment(status.clone(), review.attempt_number, &conformance);
 
         let finished_at = now_rfc3339();
@@ -1226,6 +1230,18 @@ impl TaskService {
                 });
                 self.publish_reviewer_comment(execution, &task.id, comment)
                     .await?;
+                if blocked {
+                    // The coder cannot install a toolchain or grant access,
+                    // and another reviewer would hit the same wall: park the
+                    // Task for its owner instead of spending either budget.
+                    let reason = conformance
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "reviewer reported a blocked environment".to_owned());
+                    return self
+                        .block_task_for_review_environment(&task, execution, reason)
+                        .await;
+                }
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
                     .await?;
@@ -1237,6 +1253,86 @@ impl TaskService {
             _ => {}
         }
 
+        Ok(())
+    }
+
+    /// Park a Task whose reviewer reported that its environment, not the
+    /// candidate, prevented a verdict. Re-running the review is the recovery
+    /// once the owner has fixed the environment (for example by adding
+    /// review setup steps).
+    async fn block_task_for_review_environment(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        reason: String,
+    ) -> Result<()> {
+        let message = format!("review blocked by its environment: {reason}");
+        let annotation = api_types::TaskBlockingAnnotation {
+            annotation_type: api_types::FailureKind::ReviewBlocked,
+            blocking_reason: "review_blocked".to_owned(),
+            blocked_by: Some(
+                api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            ),
+            blocked_at: Some(now_rfc3339()),
+            blocked_execution_id: Some(execution.id.clone()),
+            artifact: Some(api_types::BlockingArtifact {
+                kind: "execution".to_owned(),
+                id: Some(execution.id.clone()),
+                log_path: execution.logs_path.clone(),
+            }),
+            message: Some(message.clone()),
+            hook: None,
+            recovery_actions: vec![
+                api_types::RecoveryAction::Reexecute,
+                api_types::RecoveryAction::OpenInteractive,
+                api_types::RecoveryAction::CancelTask,
+            ],
+        };
+        let annotation = serde_json::to_string(&annotation).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to serialize review-blocked annotation: {error}"
+            ))
+        })?;
+        let blocked_meta = json!({
+            "reason": message,
+            "created_at": now_rfc3339(),
+            "kind": api_types::FailureKind::ReviewBlocked,
+            "execution_id": execution.id,
+        });
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let updated = TaskRepo::update_status(
+            &*self.db,
+            UpdateTaskStatus {
+                id: current.id.clone(),
+                expected_version: current.version,
+                status: current.status.clone(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation)),
+                blocked_json: Some(Some(blocked_meta.to_string())),
+                failed_json: Some(None),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        self.publish_domain_event_by_dedupe(&format!(
+            "task-status-update:{}:{}",
+            updated.id, updated.version
+        ))
+        .await;
+        self.publish(ForgeEvent {
+            event_type: "task.blocked".to_owned(),
+            entity_id: updated.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskBlocked {
+                project_id: updated.project_id,
+                reason: message,
+                kind: Some(api_types::FailureKind::ReviewBlocked),
+                source: None,
+                execution_id: Some(execution.id.clone()),
+            },
+        });
         Ok(())
     }
 
@@ -1971,104 +2067,59 @@ fn execution_failure_reason(execution: &Execution) -> String {
         .unwrap_or_else(|| format!("ended with status {}", execution.status))
 }
 
-/// Render the reviewer's Task comment from the admitted assessment.
-///
-/// The first line keeps the `Review <outcome> (attempt N)` headline; below it
-/// every requirement and finding is one Markdown list item with a fixed shape
-/// (`**disposition** \`id\` — rationale · evidence`), so people and agents read
-/// the same structure the conformance record stores instead of reviewer prose.
+/// Upper bound on the reviewer's Markdown carried into its Task comment.
+const REVIEW_COMMENT_REPORT_LIMIT: usize = 32 * 1024;
+
+/// Render the reviewer's Task comment: a `Review <outcome> (attempt N)`
+/// headline (with the reviewer's reason when it did not pass), then its
+/// Markdown review.
 fn reviewer_comment(
     status: ReviewStatus,
     attempt_number: i64,
     conformance: &api_types::ReviewConformance,
 ) -> String {
-    let assessment = conformance.assessment.as_ref();
+    let reason = conformance
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty());
     let mut out = match status {
         ReviewStatus::AwaitingHuman => format!(
             "Review passed automated checks and is awaiting user approval (attempt {attempt_number})"
         ),
         ReviewStatus::Passed => format!("Review passed (attempt {attempt_number})"),
-        ReviewStatus::Failed => {
-            let reason = assessment
-                .and_then(|report| report.findings.iter().find(|f| f.blocking))
-                .map(|f| format!("Expected {}; actual {}", f.expected, f.actual))
-                .or_else(|| conformance.reason.clone())
-                .unwrap_or_else(|| "review conformance failed".to_owned());
-            format!("Review failed (attempt {attempt_number}): {reason}")
+        ReviewStatus::Failed if conformance.status == api_types::ConformanceStatus::Blocked => {
+            format!(
+                "Review blocked by its environment (attempt {attempt_number}): {}",
+                reason.unwrap_or("no reason given")
+            )
         }
+        ReviewStatus::Failed => format!(
+            "Review failed (attempt {attempt_number}): {}",
+            reason.unwrap_or("review conformance failed")
+        ),
         _ => format!("Review updated (attempt {attempt_number})"),
     };
-    let Some(report) = assessment else {
-        return out;
-    };
-    let verdict = match report.verdict {
-        api_types::ConformanceVerdict::Pass => "pass",
-        api_types::ConformanceVerdict::Fail => "fail",
-    };
-    out.push_str(&format!("\n\n**Verdict:** {verdict}"));
-    if !report.requirements.is_empty() {
-        out.push_str("\n\n**Requirements**\n");
-        for requirement in &report.requirements {
-            let disposition = match requirement.disposition {
-                api_types::RequirementDisposition::Satisfied => "satisfied",
-                api_types::RequirementDisposition::Violated => "violated",
-                api_types::RequirementDisposition::Unverified => "unverified",
-                api_types::RequirementDisposition::OutsideTaskScope => "outside task scope",
-            };
-            out.push_str(&format!(
-                "\n- **{disposition}** `{}` — {}{}",
-                requirement.requirement_id,
-                single_line(&requirement.rationale),
-                evidence_suffix(&requirement.evidence)
-            ));
-        }
-    }
-    if !report.findings.is_empty() {
-        out.push_str("\n\n**Findings**\n");
-        for finding in &report.findings {
-            let severity = if finding.blocking {
-                "blocking"
-            } else {
-                "non-blocking"
-            };
-            out.push_str(&format!(
-                "\n- **{severity}** Expected {}; actual {}{}",
-                single_line(&finding.expected),
-                single_line(&finding.actual),
-                evidence_suffix(&finding.evidence)
-            ));
-        }
+    let report = conformance
+        .assessment
+        .as_ref()
+        .map(|assessment| assessment.report.trim())
+        .unwrap_or_default();
+    if !report.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(truncate_on_char_boundary(
+            report,
+            REVIEW_COMMENT_REPORT_LIMIT,
+        ));
     }
     out
 }
 
-fn single_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn evidence_suffix(evidence: &[api_types::ReviewEvidenceRef]) -> String {
-    if evidence.is_empty() {
-        return String::new();
+fn truncate_on_char_boundary(value: &str, limit: usize) -> &str {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
     }
-    let refs = evidence
-        .iter()
-        .map(|reference| match reference {
-            api_types::ReviewEvidenceRef::File {
-                path,
-                start_line,
-                end_line,
-                ..
-            } if start_line == end_line => format!("`{path}:{start_line}`"),
-            api_types::ReviewEvidenceRef::File {
-                path,
-                start_line,
-                end_line,
-                ..
-            } => format!("`{path}:{start_line}-{end_line}`"),
-            api_types::ReviewEvidenceRef::Check { check_id } => format!("check `{check_id}`"),
-        })
-        .collect::<Vec<_>>();
-    format!(" · {}", refs.join(", "))
+    &value[..end]
 }
 
 #[cfg(test)]
@@ -2188,41 +2239,31 @@ mod reviewer_message_tests {
     }
 
     #[test]
-    fn reviewer_comment_renders_requirements_and_findings_as_structured_lines() {
+    fn reviewer_comment_is_the_headline_then_the_markdown_review() {
         let assessment = api_types::ReviewAssessment {
-            contract_digest: "digest".to_owned(),
-            verdict: api_types::ConformanceVerdict::Fail,
-            requirements: vec![api_types::RequirementAssessment {
-                requirement_id: "R1".to_owned(),
-                disposition: api_types::RequirementDisposition::Violated,
-                rationale: "export is\nmissing".to_owned(),
-                evidence: vec![api_types::ReviewEvidenceRef::File {
-                    path: "src/lib.rs".to_owned(),
-                    commit_sha: "abc".to_owned(),
-                    start_line: 3,
-                    end_line: 9,
-                }],
-            }],
-            findings: vec![api_types::ConformanceFinding {
-                blocking: true,
-                expected: "api exported".to_owned(),
-                actual: "not exported".to_owned(),
-                evidence: vec![api_types::ReviewEvidenceRef::Check {
-                    check_id: "ci-0".to_owned(),
-                }],
-            }],
+            result: api_types::ReviewResult::Fail,
+            reason: "api not exported".to_owned(),
+            report: "## R1\n\nExpected the api exported; `src/lib.rs:3` does not.".to_owned(),
         };
-
-        let comment = reviewer_comment(ReviewStatus::Failed, 2, &conformance(Some(assessment)));
+        let mut failed = conformance(Some(assessment.clone()));
+        failed.reason = Some("api not exported".to_owned());
 
         assert_eq!(
-            comment,
-            "Review failed (attempt 2): Expected api exported; actual not exported\n\n\
-             **Verdict:** fail\n\n\
-             **Requirements**\n\n\
-             - **violated** `R1` — export is missing · `src/lib.rs:3-9`\n\n\
-             **Findings**\n\n\
-             - **blocking** Expected api exported; actual not exported · check `ci-0`"
+            reviewer_comment(ReviewStatus::Failed, 2, &failed),
+            "Review failed (attempt 2): api not exported\n\n\
+             ## R1\n\nExpected the api exported; `src/lib.rs:3` does not."
+        );
+
+        let mut blocked = conformance(Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Blocked,
+            reason: "tsc not found".to_owned(),
+            report: String::new(),
+        }));
+        blocked.status = api_types::ConformanceStatus::Blocked;
+        blocked.reason = Some("tsc not found".to_owned());
+        assert_eq!(
+            reviewer_comment(ReviewStatus::Failed, 1, &blocked),
+            "Review blocked by its environment (attempt 1): tsc not found"
         );
     }
 

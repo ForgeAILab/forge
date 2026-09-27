@@ -6,6 +6,48 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.5] - 2026-09-26
+
+### Fixed
+
+- Reviews are no longer thrown away over response formatting. Live Codex
+  reviewers lost three full reviews in a row on one Task: two for adding an
+  unrequested key (`taxonomy`, `classification`) to a finding, one for a
+  commit SHA cut short by a character, which voided every citation. Each loss
+  re-ran the reviewer from scratch and finally parked the Task.
+- Project-level review `ci_steps` (`default_review_config`) now run before the
+  reviewer. The review runner read CI steps only from the Task's own config
+  while the review contract required the effective ones (workflow, then
+  Project defaults, then Task overrides), so a Project that configured
+  `ci_steps` failed every review admission with `pre-review result for
+  required check ci:0 is unavailable`.
+- A Codex Task whose previous session file is gone starts a fresh thread
+  again. Current Codex reports a missing thread as `no rollout found for thread
+  id`, which the fallback did not recognize, so every auditor fork and coder
+  resume on such a Task failed instead of starting fresh.
+
+### Breaking
+
+- The reviewer response contract is now free Markdown ending in one result
+  block, `{"result": "pass|fail|blocked", "reason": "..."}`, replacing the
+  single JSON object with `contract_digest`, `verdict`, per-requirement
+  dispositions, and file/commit evidence. The block is read leniently (unknown
+  keys ignored, `verdict` accepted for `result`, case-insensitive, fence
+  allowed), so any model can review; live reviewers were losing whole reviews to
+  an invented extra field or a truncated commit SHA. Forge's own setup steps and
+  required checks are the hard gate; reviewer citations are no longer verified.
+  `ReviewAssessment` is now `{result, reason, report}`, and
+  `ConformanceVerdict`, `RequirementDisposition`, `RequirementAssessment`,
+  `ConformanceFinding`, and `ReviewEvidenceRef` are removed from the API types.
+  Custom shell reviewers must print the new result block. Migration V145
+  rewrites stored assessments in place (the original JSON is kept as a fenced
+  block in `report`).
+- New `blocked` review result, conformance status `blocked`, and failure kind
+  `review_blocked`: when the reviewer reports that its environment (for example
+  a missing toolchain) prevented a verdict, the Review finishes failed and the
+  Task is parked for its owner with a `reexecute` recovery, instead of sending
+  the coder to fix something it cannot or retrying the reviewer.
+
 ## [0.13.4] - 2026-09-25
 
 ### Fixed

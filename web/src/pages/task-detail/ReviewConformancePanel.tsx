@@ -1,10 +1,12 @@
 import type { ReviewConformance } from '@/types/generated/bindings/ReviewConformance'
 import { Badge } from '@/components/ui/badge'
+import { ChatMarkdown } from '@/components/chat/chat-markdown'
 
 const STATUS_LABELS = {
   not_assessed: 'Not assessed',
   passed: 'Passed',
   failed: 'Failed',
+  blocked: 'Blocked by environment',
   unverified: 'Unverified',
 } as const
 
@@ -25,6 +27,12 @@ export function ReviewConformancePanel({ conformance }: { conformance?: ReviewCo
         </h3>
         <Badge variant="outline">{STATUS_LABELS[status]}</Badge>
       </div>
+      {status === 'blocked' && (
+        <p className="text-sm text-muted-foreground">
+          The reviewer could not reach a verdict in its environment. Fix the environment (for
+          example add review setup steps), then re-run the review.
+        </p>
+      )}
       {status === 'not_assessed' && (
         <p className="text-sm text-muted-foreground">
           This review has no recorded Charter assessment. Its review outcome is preserved.
@@ -68,7 +76,7 @@ export function ReviewConformancePanel({ conformance }: { conformance?: ReviewCo
       {contract && (
         <details className="group text-sm">
           <summary className="cursor-pointer rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-            Requirements and evidence
+            Review and evidence
           </summary>
           <div className="mt-3 space-y-3">
             <dl className="space-y-1 text-xs">
@@ -87,48 +95,11 @@ export function ReviewConformancePanel({ conformance }: { conformance?: ReviewCo
                 <dd className="break-all font-mono">{contract.digest}</dd>
               </div>
             </dl>
-            {conformance?.assessment?.requirements.map((item) => {
-              const requirement = contract.context.requirements.find(
-                (r) => r.id === item.requirement_id,
-              )
-              return (
-                <div key={item.requirement_id} className="space-y-1 border-t pt-3">
-                  <p className="break-words font-medium">
-                    {requirement?.text ?? item.requirement_id}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {item.disposition.replaceAll('_', ' ')}
-                  </p>
-                  <p className="break-words">{item.rationale}</p>
-                  <ul className="space-y-1 text-xs text-muted-foreground">
-                    {item.evidence.map((evidence) => (
-                      <li
-                        key={
-                          evidence.kind === 'file'
-                            ? `${evidence.commit_sha}:${evidence.path}:${evidence.start_line}:${evidence.end_line}`
-                            : evidence.check_id
-                        }
-                        className="break-all font-mono"
-                      >
-                        {evidence.kind === 'file'
-                          ? `${evidence.path}:${evidence.start_line}–${evidence.end_line} @ ${evidence.commit_sha.slice(0, 12)}`
-                          : `Check: ${evidence.check_id}`}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )
-            })}
-            {conformance?.assessment?.findings.map((finding) => (
-              <div
-                key={`${finding.blocking}:${finding.expected}:${finding.actual}`}
-                className="space-y-1 border-t pt-3"
-              >
-                <p className="font-medium">{finding.blocking ? 'Blocking finding' : 'Finding'}</p>
-                <p className="break-words">Expected: {finding.expected}</p>
-                <p className="break-words">Actual: {finding.actual}</p>
+            {conformance?.assessment?.report && (
+              <div className="min-w-0 border-t pt-3">
+                <ChatMarkdown text={conformance.assessment.report} />
               </div>
-            ))}
+            )}
             {conformance?.checks.map((check) => (
               <details key={check.check_id} className="border-t pt-3">
                 <summary className="cursor-pointer break-words">

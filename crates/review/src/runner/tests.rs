@@ -1,5 +1,4 @@
 use super::*;
-use crate::auditor::AuditorVerdict;
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CommentAuthorType, CreateAgent,
@@ -562,9 +561,23 @@ fn review_hard_deadline_uses_timeout_terminal_policy() {
     assert_eq!(policy.resume_policy, Some(db::ResumePolicy::Manual));
 }
 
-fn display_report(verdict: &str) -> String {
-    json!({"contract_digest":"digest", "verdict":verdict, "requirements":[],
-        "findings": if verdict == "fail" {json!([{"blocking":true,"expected":"persistence","actual":"missing","evidence":[]}])} else {json!([])}}).to_string()
+fn display_report(result: &str) -> String {
+    let reason = if result == "fail" {
+        "Expected persistence; actual missing"
+    } else {
+        "All requirements met"
+    };
+    format!(
+        "Review notes.\n\n{}",
+        json!({"result": result, "reason": reason})
+    )
+}
+
+/// The result and reason Forge reads from a reviewer's final message.
+fn verdict(message: &str) -> Option<(api_types::ReviewResult, String)> {
+    crate::contract::parse_assessment(message)
+        .ok()
+        .map(|assessment| (assessment.result, assessment.reason))
 }
 
 fn contract_from_prompt(prompt: &str) -> api_types::ReviewContract {
@@ -589,9 +602,10 @@ fn contract_from_prompt(prompt: &str) -> api_types::ReviewContract {
 
 fn valid_report(prompt: &str, path: &str) -> String {
     let contract = contract_from_prompt(prompt);
-    json!({"contract_digest":contract.digest,"verdict":"pass","requirements":contract.context.requirements.iter().map(|r|json!({
-        "requirement_id":r.id,"disposition":"satisfied","rationale":"Fixture implements the required boundary", "evidence":[{"kind":"file","path":path,"commit_sha":contract.commit_sha,"start_line":1,"end_line":1}]
-    })).collect::<Vec<_>>(),"findings":[]}).to_string()
+    format!(
+        "Every requirement is implemented; see `{path}`.\n\n{}",
+        json!({"result": "pass", "reason": format!("{} requirement(s) met", contract.context.requirements.len())})
+    )
 }
 
 struct MutatingAuditor;
@@ -631,18 +645,10 @@ impl TaskExecutor for CheckResultAwareAuditor {
         assert_eq!(contract.check_results[0].check_id, "ci:0");
         assert_eq!(contract.check_results[0].command, "true");
         assert_eq!(contract.check_results[0].exit_code, 0);
-        let report = json!({
-            "contract_digest": contract.digest,
-            "verdict": "pass",
-            "requirements": contract.context.requirements.iter().map(|requirement| json!({
-                "requirement_id": requirement.id,
-                "disposition": "satisfied",
-                "rationale": "Forge's recorded independent check passed",
-                "evidence": [{"kind":"check","check_id":"ci:0"}]
-            })).collect::<Vec<_>>(),
-            "findings": []
-        })
-        .to_string();
+        let report = format!(
+            "Forge's recorded check `ci:0` passed.\n\n{}",
+            json!({"result": "pass", "reason": "Forge's recorded independent check passed"})
+        );
         let mut writer = LogWriter::new(&ctx.logs_path, ctx.execution_id, MAX_LOG_BYTES);
         writer
             .write(LogKind::Assistant, LogStream::Main, json!({"text": report}))
@@ -656,6 +662,56 @@ impl TaskExecutor for CheckResultAwareAuditor {
     async fn cancel(&self, _: &str) -> Result<(), executors::ExecutorError> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn project_default_ci_steps_run_before_the_reviewer() {
+    // Live case: NK-1's Project set `default_review_config.ci_steps` and the
+    // Task had no review config of its own. The contract required `ci:0`, the
+    // runner only read the Task config, never ran the step, and every review
+    // failed admission with "pre-review result for required check ci:0 is
+    // unavailable".
+    let seed = seeded_review(Vec::new()).await;
+    sqlx::query("UPDATE task SET task_state_config = NULL WHERE id = ?")
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE project SET settings = ? WHERE id = (SELECT project_id FROM task WHERE id = ?)",
+    )
+    .bind(json!({"default_review_config": {"ci_steps": ["true"]}}).to_string())
+    .bind(seed.task_id.to_string())
+    .execute(seed.db.pool())
+    .await
+    .unwrap();
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(CheckResultAwareAuditor),
+    );
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert_eq!(details.conformance.checks[0].check_id, "ci:0");
 }
 
 #[tokio::test]
@@ -1254,7 +1310,10 @@ async fn shell_auditor_stdout_marker_parses_as_passed() {
         .await
         .unwrap();
 
-    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+    assert_eq!(
+        verdict(&message).map(|(result, _)| result),
+        Some(api_types::ReviewResult::Pass)
+    );
 }
 
 #[tokio::test]
@@ -1272,10 +1331,11 @@ async fn shell_auditor_stdout_fail_marker_keeps_its_reason() {
         .unwrap();
 
     assert_eq!(
-        auditor::parse_verdict(&message),
-        AuditorVerdict::Failed {
-            reason: "Expected persistence; actual missing".to_owned()
-        }
+        verdict(&message),
+        Some((
+            api_types::ReviewResult::Fail,
+            "Expected persistence; actual missing".to_owned()
+        ))
     );
 }
 
@@ -1297,12 +1357,7 @@ async fn stdout_lines_stay_separated_so_a_marker_cannot_be_glued_together() {
         .await
         .unwrap();
 
-    assert_eq!(
-        auditor::parse_verdict(&message),
-        AuditorVerdict::Failed {
-            reason: "structured review assessment missing".to_owned()
-        }
-    );
+    assert_eq!(verdict(&message), None);
 }
 
 #[tokio::test]
@@ -1322,7 +1377,10 @@ async fn assistant_entry_with_pass_marker_parses_as_passed() {
         .await
         .unwrap();
 
-    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+    assert_eq!(
+        verdict(&message).map(|(result, _)| result),
+        Some(api_types::ReviewResult::Pass)
+    );
 }
 
 #[tokio::test]
@@ -1349,7 +1407,10 @@ async fn claude_assistant_message_content_parses_as_passed() {
         .await
         .unwrap();
 
-    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+    assert_eq!(
+        verdict(&message).map(|(result, _)| result),
+        Some(api_types::ReviewResult::Pass)
+    );
 }
 
 #[tokio::test]
@@ -1372,7 +1433,10 @@ async fn claude_success_result_parses_as_passed() {
         .await
         .unwrap();
 
-    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+    assert_eq!(
+        verdict(&message).map(|(result, _)| result),
+        Some(api_types::ReviewResult::Pass)
+    );
 }
 
 #[tokio::test]
@@ -1393,12 +1457,7 @@ async fn assistant_delta_entries_alone_do_not_count_for_verdict_text() {
         .await
         .unwrap();
 
-    assert_eq!(
-        auditor::parse_verdict(&message),
-        AuditorVerdict::Failed {
-            reason: "structured review assessment missing".to_owned()
-        }
-    );
+    assert_eq!(verdict(&message), None);
 }
 
 #[tokio::test]
