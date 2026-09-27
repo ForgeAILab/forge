@@ -342,6 +342,12 @@ pub enum EventContext {
     },
     DomainEventCommitted {
         sequence: i64,
+        /// The committed row's own `event_type`; the frame's `event_type`
+        /// is always `domain_event.committed`.
+        domain_event_type: String,
+        /// The committed row's `entity_id`; the frame's `entity_id` is the
+        /// domain event's own id.
+        domain_entity_id: String,
         entity_type: String,
         scope_type: String,
         scope_id: String,

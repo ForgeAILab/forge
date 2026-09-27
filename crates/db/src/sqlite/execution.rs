@@ -739,6 +739,26 @@ impl ExecutionRepo for SqliteDb {
         let execution = execution_in_tx(&mut transaction, &input.execution_id)
             .await?
             .ok_or(DbError::NotFound)?;
+        // Semantic progress is a liveness watermark on the execution row,
+        // not a ledger entry: the live log stream already lives in the
+        // execution's JSONL file. Only progress that ends a warned stall
+        // epoch is durable, because it resolves that Attention item.
+        let warned_epoch_key = format!(
+            "execution-progress-warning:{}:{}",
+            execution.id,
+            current.last_progress_at.as_deref().unwrap_or("none")
+        );
+        let epoch_was_warned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM domain_event
+                            WHERE dedupe_key = ? AND event_type = 'execution.progress_warning')",
+        )
+        .bind(&warned_epoch_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !epoch_was_warned {
+            transaction.commit().await?;
+            return Ok(ExecutionLeaseMutation::Updated(execution));
+        }
         let project_id: Option<String> =
             sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
                 .bind(&execution.task_id)

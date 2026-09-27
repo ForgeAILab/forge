@@ -120,6 +120,8 @@ impl DomainEventService {
             timestamp: event.created_at.clone(),
             context: EventContext::DomainEventCommitted {
                 sequence: event.sequence,
+                domain_event_type: event.event_type.clone(),
+                domain_entity_id: event.entity_id.clone(),
                 entity_type: event.entity_type.clone(),
                 scope_type: event.scope_type.clone(),
                 scope_id: event.scope_id.clone(),

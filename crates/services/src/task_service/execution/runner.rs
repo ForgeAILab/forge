@@ -701,6 +701,7 @@ impl TaskService {
                 batch.clear();
             };
 
+            let mut last_progress_recorded_at: Option<tokio::time::Instant> = None;
             loop {
                 let next_entry = if let Some(deadline) = flush_deadline {
                     tokio::select! {
@@ -721,15 +722,23 @@ impl TaskService {
                     break;
                 };
 
-                if let Err(error) = progress_lease
-                    .record_progress(entry.timestamp.clone(), db::now_rfc3339())
-                    .await
-                {
-                    tracing::debug!(
-                        execution_id = %sse_execution_id,
-                        %error,
-                        "failed to record execution semantic progress"
-                    );
+                // CLI agents emit a log line per token burst; one liveness
+                // write per interval is enough, matching the native path.
+                let progress_due = last_progress_recorded_at.is_none_or(|last| {
+                    last.elapsed() >= crate::turn_log_sink::STREAM_PROGRESS_INTERVAL
+                });
+                if progress_due {
+                    last_progress_recorded_at = Some(tokio::time::Instant::now());
+                    if let Err(error) = progress_lease
+                        .record_progress(entry.timestamp.clone(), db::now_rfc3339())
+                        .await
+                    {
+                        tracing::debug!(
+                            execution_id = %sse_execution_id,
+                            %error,
+                            "failed to record execution semantic progress"
+                        );
+                    }
                 }
                 if entry.kind == executors::LogKind::Assistant {
                     assistant_turn_count = assistant_turn_count.saturating_add(1);

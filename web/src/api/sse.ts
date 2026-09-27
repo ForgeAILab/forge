@@ -31,10 +31,11 @@ import type { AgentChatTurn } from '@/features/agent-chat/types'
  * `domain_event` outbox rather than publishing a bespoke `event_type`
  * directly. `DomainEventBroadcastConsumer` (services crate) drains that
  * outbox after commit and republishes each row as `domain_event.committed`,
- * carrying `sequence`/`entity_type`/`scope_type`/`scope_id` but not the
- * row's own `event_type`. `routeDomainEventCommitted` below routes those by
- * `scope_type`/`entity_type` to the exact query keys that scope affects,
- * falling back to a full resync only for a scope it does not recognize.
+ * carrying `sequence`/`entity_type`/`scope_type`/`scope_id` plus the row's
+ * own `domain_event_type`/`domain_entity_id`. `routeDomainEventCommitted`
+ * below routes those by `scope_type`/`entity_type` to the exact query keys
+ * that scope affects, falling back to a full resync only for a scope it does
+ * not recognize. Execution liveness rows only refresh their own Task.
  */
 type SsePayload = {
   event_type: string
@@ -65,6 +66,8 @@ type SsePayload = {
   delta?: string
   // `domain_event.committed` fields (see the module comment above).
   sequence?: number
+  domain_event_type?: string
+  domain_entity_id?: string
   entity_type?: string
   scope_type?: string
   scope_id?: string
@@ -132,6 +135,69 @@ type TaskListInvalidationState = {
   pendingProjectIds: Set<string>
 }
 const taskListInvalidationStates = new WeakMap<QueryClient, TaskListInvalidationState>()
+
+type ProjectSummaryInvalidationState = {
+  lastRunAt: number | null
+  trailingTimer: ReturnType<typeof setTimeout> | null
+  pendingProjectIds: Set<string>
+}
+const projectSummaryInvalidationStates = new WeakMap<QueryClient, ProjectSummaryInvalidationState>()
+const PROJECT_SUMMARY_INVALIDATION_THROTTLE_MS = 500
+
+function runProjectSummaryInvalidation(
+  queryClient: QueryClient,
+  projectIds: Iterable<string>,
+): void {
+  // These keys are prefixes of every Project-owned query. Keep the summary
+  // invalidation exact, then target paginated Project lists explicitly.
+  for (const projectId of projectIds) {
+    void queryClient.invalidateQueries(
+      { queryKey: qk.project(projectId), exact: true },
+      { cancelRefetch: false },
+    )
+  }
+  void queryClient.invalidateQueries(
+    { queryKey: qk.projects, exact: true },
+    { cancelRefetch: false },
+  )
+  void queryClient.invalidateQueries({ queryKey: qk.projectPagesRoot }, { cancelRefetch: false })
+}
+
+function invalidateProjectSummaries(queryClient: QueryClient, projectId: string): void {
+  let state = projectSummaryInvalidationStates.get(queryClient)
+  if (!state) {
+    state = {
+      lastRunAt: null,
+      trailingTimer: null,
+      pendingProjectIds: new Set(),
+    }
+    projectSummaryInvalidationStates.set(queryClient, state)
+  }
+  state.pendingProjectIds.add(projectId)
+
+  const flush = () => {
+    state.trailingTimer = null
+    state.lastRunAt = Date.now()
+    const pendingProjectIds = [...state.pendingProjectIds]
+    state.pendingProjectIds.clear()
+    runProjectSummaryInvalidation(queryClient, pendingProjectIds)
+  }
+
+  const now = Date.now()
+  if (
+    state.lastRunAt === null ||
+    now - state.lastRunAt >= PROJECT_SUMMARY_INVALIDATION_THROTTLE_MS
+  ) {
+    if (state.trailingTimer) clearTimeout(state.trailingTimer)
+    flush()
+    return
+  }
+  if (state.trailingTimer) return
+  state.trailingTimer = setTimeout(
+    flush,
+    PROJECT_SUMMARY_INVALIDATION_THROTTLE_MS - (now - state.lastRunAt),
+  )
+}
 
 function runProjectTaskListInvalidation(queryClient: QueryClient, projectId?: string): void {
   if (projectId) {
@@ -248,9 +314,25 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
   const scopeType = payload.scope_type
   const entityType = payload.entity_type
 
+  // Execution liveness (`execution.progressed` / `execution.progress_warning`)
+  // concerns one running Task. Refresh only that Task's queries — they refetch
+  // only while its page is open — plus the throttled Project summary that
+  // carries attention counts. Board lists and analytics are unaffected.
+  if (
+    entityType === 'task' &&
+    payload.domain_event_type?.startsWith('execution.progress') &&
+    payload.domain_entity_id
+  ) {
+    void queryClient.invalidateQueries(
+      { queryKey: qk.task(payload.domain_entity_id) },
+      { cancelRefetch: false },
+    )
+    if (scopeType === 'project' && scopeId) invalidateProjectSummaries(queryClient, scopeId)
+    return
+  }
+
   if (scopeType === 'project' && scopeId) {
-    void queryClient.invalidateQueries({ queryKey: qk.project(scopeId) })
-    void queryClient.invalidateQueries({ queryKey: qk.projects })
+    invalidateProjectSummaries(queryClient, scopeId)
     invalidateAnalyticsQueries(queryClient, scopeId)
     if (entityType === 'milestone') {
       void queryClient.invalidateQueries({ queryKey: qk.projectOverview(scopeId) })
@@ -428,8 +510,7 @@ export function routeSsePayload(
   }
 
   if (eventType.startsWith('project.')) {
-    void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
-    void queryClient.invalidateQueries({ queryKey: qk.projects })
+    invalidateProjectSummaries(queryClient, payload.entity_id)
     invalidateProjectTaskDetails(queryClient, payload.entity_id)
     invalidateAnalyticsQueries(queryClient, payload.entity_id)
     if (eventType === 'project.deleted') {

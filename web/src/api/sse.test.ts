@@ -285,8 +285,9 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['projects', 'proj-1'] }],
-        [{ queryKey: ['projects'] }],
+        [{ exact: true, queryKey: ['projects', 'proj-1'] }, { cancelRefetch: false }],
+        [{ exact: true, queryKey: ['projects'] }, { cancelRefetch: false }],
+        [{ queryKey: ['projects', 'pages'] }, { cancelRefetch: false }],
         [{ queryKey: ['projects', 'proj-1', 'analytics'] }],
         [{ queryKey: ['analytics', 'usage'] }],
       ]),
@@ -364,8 +365,8 @@ describe('routeSsePayload', () => {
   // readiness/release) write their durable event inside a larger composite
   // transaction via the `domain_event` outbox. `DomainEventBroadcastConsumer`
   // relays each row after commit as `domain_event.committed`, carrying the
-  // row's `scope_type`/`entity_type`/`scope_id` — not its own `event_type` —
-  // so routing here keys off scope rather than a name.
+  // row's `scope_type`/`entity_type`/`scope_id`, so routing here keys off
+  // scope; only execution liveness rows are routed by `domain_event_type`.
   it('routes a project-scoped domain_event.committed to the Project queries', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
@@ -382,13 +383,114 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['projects', 'proj-1'] }],
-        [{ queryKey: ['projects'] }],
+        [{ exact: true, queryKey: ['projects', 'proj-1'] }, { cancelRefetch: false }],
+        [{ exact: true, queryKey: ['projects'] }, { cancelRefetch: false }],
+        [{ queryKey: ['projects', 'pages'] }, { cancelRefetch: false }],
         [{ queryKey: ['projects', 'proj-1', 'analytics'] }],
         [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
     expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('does not invalidate project-scoped board queries for a project domain event', () => {
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(qk.project('proj-1'), { id: 'proj-1' })
+    queryClient.setQueryData(qk.projectPages(50), { pages: [] })
+    queryClient.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    queryClient.setQueryData(qk.workflow('proj-1'), { states: [] })
+    queryClient.setQueryData(qk.projectMembers('proj-1'), { items: [] })
+    queryClient.setQueryData(qk.projectAgents('proj-1'), { items: [] })
+
+    routeSsePayload(
+      {
+        event_type: 'domain_event.committed',
+        entity_id: 'event-1',
+        timestamp: '2026-05-05T00:00:00Z',
+        scope_type: 'project',
+        scope_id: 'proj-1',
+        entity_type: 'project',
+      },
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+
+    expect(queryClient.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.projectPages(50))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.workflow('proj-1'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.projectMembers('proj-1'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.projectAgents('proj-1'))?.isInvalidated).toBe(false)
+  })
+
+  it('refreshes only the owning Task for an execution progress domain event', () => {
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(qk.task('task-1'), { id: 'task-1' })
+    queryClient.setQueryData(qk.executions('task-1'), { items: [] })
+    queryClient.setQueryData(qk.task('task-2'), { id: 'task-2' })
+    queryClient.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    queryClient.setQueryData(qk.projectAgents('proj-1'), { items: [] })
+    queryClient.setQueryData(['projects', 'proj-1', 'analytics'], {})
+    queryClient.setQueryData(qk.agents, { items: [] })
+
+    routeSsePayload(
+      {
+        event_type: 'domain_event.committed',
+        entity_id: 'event-1',
+        timestamp: '2026-05-05T00:00:00Z',
+        scope_type: 'project',
+        scope_id: 'proj-1',
+        entity_type: 'task',
+        domain_event_type: 'execution.progressed',
+        domain_entity_id: 'task-1',
+      },
+      queryClient,
+      { dispatch: vi.fn() },
+    )
+
+    expect(queryClient.getQueryState(qk.task('task-1'))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.executions('task-1'))?.isInvalidated).toBe(true)
+    expect(queryClient.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(false)
+    expect(queryClient.getQueryState(qk.projectAgents('proj-1'))?.isInvalidated).toBe(false)
+    expect(
+      queryClient.getQueryState(['projects', 'proj-1', 'analytics'])?.isInvalidated,
+    ).toBe(false)
+    expect(queryClient.getQueryState(qk.agents)?.isInvalidated).toBe(false)
+  })
+
+  it('coalesces bursts of project domain events', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-05T00:00:00.000Z'))
+    const { queryClient, invalidateQueries } = createMocks()
+    const payload = {
+      event_type: 'domain_event.committed',
+      entity_id: 'event-1',
+      timestamp: '2026-05-05T00:00:00Z',
+      scope_type: 'project',
+      scope_id: 'proj-1',
+      entity_type: 'project',
+    }
+
+    try {
+      routeSsePayload(payload, queryClient, { dispatch: vi.fn() })
+      routeSsePayload(payload, queryClient, { dispatch: vi.fn() })
+      routeSsePayload(payload, queryClient, { dispatch: vi.fn() })
+
+      const projectDetailCalls = () =>
+        invalidateQueries.mock.calls.filter(
+          ([options]) =>
+            options?.exact === true &&
+            options?.queryKey?.[0] === 'projects' &&
+            options?.queryKey?.[1] === 'proj-1',
+        )
+      expect(projectDetailCalls()).toHaveLength(1)
+
+      vi.advanceTimersByTime(500)
+      expect(projectDetailCalls()).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('also invalidates the Project Overview for a project-scoped milestone domain_event.committed', () => {
@@ -573,8 +675,14 @@ describe('useSSE', () => {
       }),
     )
 
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['projects', 'proj-1'] })
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['projects'] })
+    expect(invalidateSpy).toHaveBeenCalledWith(
+      { exact: true, queryKey: ['projects', 'proj-1'] },
+      { cancelRefetch: false },
+    )
+    expect(invalidateSpy).toHaveBeenCalledWith(
+      { exact: true, queryKey: ['projects'] },
+      { cancelRefetch: false },
+    )
   })
 
   // 8.4.3: "on stream open/reconnect/resync, invalidate active
