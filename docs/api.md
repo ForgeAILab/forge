@@ -1048,6 +1048,28 @@ idempotency key, so a retried turn appends once. Worklog entries flow into the
 next role's dispatch context. They never move a Task and never satisfy an
 acceptance check.
 
+A CLI harness (Smith, Codex, Claude Code, Gemini, Cursor, OpenCode) has no
+Forge tool channel, so it delivers the same two records through its
+execution outbox. Every CLI Task execution is launched with `FORGE_OUTBOX`,
+`FORGE_TASK_ID`, and `FORGE_EXECUTION_ID`; the outbox is
+`<task dir>/.forge-outbox/<execution_id>/`, a sibling of the Git worktree, so
+nothing written there can be committed and a read-only reviewer still has one
+place it may write. The harness appends one JSON object per line to
+`worklog.jsonl` (`{"kind","summary"}`, as `task.worklog`) and `evidence.jsonl`
+(`{"kind","caption"}` plus exactly one of `path` or `content`, as
+`task.evidence`; `path` is worktree-relative or an absolute path inside the
+outbox). When the execution ends — before it settles and before the next role
+is dispatched — Forge validates each entry exactly as the native operations
+do, stores it with provenance taken from the execution row (never from the
+files), records each captured artifact's caption as a `validation` worklog
+entry, and removes the outbox. Malformed entries are skipped and logged, never
+fatal; each file is bounded to 1 MiB and 200 entries. Dispatch prompts name
+the channel the assigned agent actually has: native agents get the
+`task.worklog`/`task.evidence` contract, CLI agents get the outbox contract,
+and the reviewer is told these reports are its only permitted writes. Every
+managed Codex Task, coder and reviewer alike, has the outbox added to its
+sandbox's writable roots.
+
 Project Agent evidence uses the typed `project.evidence` operation with two
 actions. An `attach` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `asset_id`, `caption`,
@@ -2130,13 +2152,14 @@ Task scope server-side, requires the normal assignment and Workspace lease,
 keeps Main/Project Agent Chats filesystem-denied, and reserves user-only
 approval, waiver, and release operations for the user.
 
-Codex currently advertises GPT-5.6 Sol, Terra, and Luna plus supported older
-picker models. Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and
-Haiku 4.5. The web client uses the per-model map so, for example, Codex
+Codex currently advertises GPT-6 Astra, Sol, and Luna, GPT-5.6 Sol, Terra,
+and Luna, and GPT-5.5. Claude Code advertises Claude Fable 5.1, Opus 5.5,
+Fable 5, Opus 5, Sonnet 5, and Haiku 4.5. The web client uses the per-model map so, for example, Codex
 `ultra` is not offered for Luna and reasoning controls are not offered for
 Claude Haiku 4.5. Clients may still submit a custom model id because providers
 and account entitlements can expose additional models. Gemini advertises its
-stable aliases plus the current visible Gemini 3.x and 2.5 CLI models; newly
+stable aliases plus the current visible Gemini 3.x (including 3.8 Flash and
+3.5 Flash-Lite) and 2.5 CLI models; newly
 configured Gemini API profiles default to `gemini-3.1-pro-preview`.
 
 Smith's options are not a fixed vendor list: they are discovered from the

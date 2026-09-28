@@ -6,9 +6,10 @@ use crate::workflow::{
         apply_prompt_overrides, build_effective_prompt, effective_prompt_selection,
         generic_prompt::GenericPromptBuilder, planner_prompt::PlannerPromptBuilder,
         resolve_prompt_builder, reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext,
-        AgentPrompt, DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
-        BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
-        BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2, BUILDER_ID_READ_ONLY_TASK_V1,
+        AgentPrompt, DispatchIntent, PromptBuilder, TaskDelivery,
+        BUILDER_ID_CODER_IMPLEMENTATION_V2, BUILDER_ID_CODER_MERGE_FIX_V2,
+        BUILDER_ID_CODER_REVIEW_FIX_V2, BUILDER_ID_GENERIC_DEFAULT_V2,
+        BUILDER_ID_PLANNER_DEFAULT_V2, BUILDER_ID_READ_ONLY_TASK_V1,
         BUILDER_ID_REVIEWER_CONFORMANCE_V1, BUILDER_ID_WORKER_AUTONOMOUS_V1,
         BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
     },
@@ -102,6 +103,8 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         latest_review_execution_id: None,
         latest_review_logs_path: None,
         read_only_task: false,
+        delivery: TaskDelivery::NativeTools,
+        review_ci_steps: Vec::new(),
     }
 }
 
@@ -518,12 +521,9 @@ fn coder_prompt_first_time_does_not_contain_rereview_directive() {
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&ctx);
 
     assert!(prompt.system.contains("implement code changes"));
-    assert!(prompt
-        .system
-        .contains("Proof of work for app-touching changes"));
-    assert!(prompt
-        .system
-        .contains("forge-ctl task media upload --task-id <id> --file <path>"));
+    // An executing agent holds no forge-ctl credential for this server;
+    // proof goes through its own delivery channel instead.
+    assert!(!prompt.system.contains("forge-ctl"));
     assert!(prompt.system.contains("planner agent already investigated"));
     assert!(prompt.system.contains("Treat the provided plan"));
     assert!(prompt.user.contains("Implementation objective:"));
@@ -552,6 +552,25 @@ fn reviewer_prompt_reads_ci_steps_from_review_config() {
     assert!(prompt.user.contains("cargo clippy -p services"));
     assert!(prompt.user.contains("Focus on prompt regressions."));
     assert!(prompt.user.contains("Attempt 1"));
+}
+
+#[test]
+fn reviewer_prompt_includes_ci_results_from_the_running_review() {
+    let mut ctx = fake_context(default_roles::REVIEWER);
+    ctx.state_name = default_states::REVIEW.to_string();
+    ctx.state_config = json!({ "review": { "ci_steps": ["npm test"] } });
+    let mut running = fake_review(2, db::ReviewStatus::Running);
+    running.step_results_json = json!({
+        "ci_steps": [{ "index": 0, "command": "npm test", "exit_code": 0, "output_tail": "12 passing\n" }]
+    })
+    .to_string();
+    ctx.prior_reviews = vec![fake_review(1, db::ReviewStatus::Failed), running];
+
+    let prompt = ReviewerPromptBuilder.build(&ctx);
+
+    assert!(prompt.user.contains("Forge already ran these checks"));
+    assert!(prompt.user.contains("- `npm test` exited 0"));
+    assert!(prompt.user.contains("12 passing"));
 }
 
 #[test]
@@ -932,4 +951,97 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         feedback.contains("tsvsort/src/main.rs:10-20"),
         "feedback carries the reviewer's Markdown review: {feedback}"
     );
+}
+
+#[test]
+fn cli_delivery_prompts_name_the_outbox_instead_of_native_tools() {
+    for (builder_id, role) in [
+        (BUILDER_ID_CODER_IMPLEMENTATION_V2, default_roles::CODER),
+        (BUILDER_ID_CODER_REVIEW_FIX_V2, default_roles::CODER),
+        (BUILDER_ID_REVIEWER_CONFORMANCE_V1, default_roles::REVIEWER),
+    ] {
+        let mut ctx = fake_context(role);
+        ctx.delivery = TaskDelivery::Outbox;
+        let system = resolve_prompt_builder(builder_id).build(&ctx).system;
+        assert!(system.contains("`FORGE_OUTBOX`"), "{builder_id}: {system}");
+        assert!(
+            system.contains("$FORGE_OUTBOX/worklog.jsonl"),
+            "{builder_id}"
+        );
+        assert!(
+            system.contains("$FORGE_OUTBOX/evidence.jsonl"),
+            "{builder_id}"
+        );
+        assert!(!system.contains("`task.worklog`"), "{builder_id}");
+        assert!(!system.contains("`task.evidence`"), "{builder_id}");
+    }
+
+    let mut reviewer = fake_context(default_roles::REVIEWER);
+    reviewer.delivery = TaskDelivery::Outbox;
+    let system = resolve_prompt_builder(BUILDER_ID_REVIEWER_CONFORMANCE_V1)
+        .build(&reviewer)
+        .system;
+    assert!(system.contains("the only place you may write"));
+}
+
+#[test]
+fn native_reviewer_prompt_reports_through_native_tools() {
+    let ctx = fake_context(default_roles::REVIEWER);
+    let system = resolve_prompt_builder(BUILDER_ID_REVIEWER_CONFORMANCE_V1)
+        .build(&ctx)
+        .system;
+    assert!(system.contains("`task.worklog`"));
+    assert!(system.contains("`task.evidence`"));
+    assert!(!system.contains("FORGE_OUTBOX"));
+}
+
+#[test]
+fn delivery_follows_the_agent_backend_kind() {
+    assert_eq!(
+        TaskDelivery::for_backend_kind("native"),
+        TaskDelivery::NativeTools
+    );
+    assert_eq!(TaskDelivery::for_backend_kind("cli"), TaskDelivery::Outbox);
+}
+
+#[test]
+fn implementation_prompts_list_the_checks_that_gate_review() {
+    for (builder_id, role) in [
+        (BUILDER_ID_CODER_IMPLEMENTATION_V2, default_roles::CODER),
+        (BUILDER_ID_CODER_REVIEW_FIX_V2, default_roles::CODER),
+        (BUILDER_ID_WORKER_AUTONOMOUS_V1, default_roles::WORKER),
+    ] {
+        let mut ctx = fake_context(role);
+        ctx.review_ci_steps = vec![
+            "python3 -m unittest discover -s tests -v".to_owned(),
+            "ruff check .".to_owned(),
+        ];
+        let system = resolve_prompt_builder(builder_id).build(&ctx).system;
+        assert!(
+            system.contains("Required checks:"),
+            "{builder_id}: {system}"
+        );
+        assert!(
+            system.contains("`bash -lc` from the worktree root"),
+            "{builder_id}"
+        );
+        assert!(
+            system.contains("- `python3 -m unittest discover -s tests -v`\n- `ruff check .`"),
+            "{builder_id}"
+        );
+    }
+
+    let mut read_only = fake_context(default_roles::CODER);
+    read_only.read_only_task = true;
+    read_only.review_ci_steps = vec!["make check".to_owned()];
+    let system = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2)
+        .build(&read_only)
+        .system;
+    assert!(!system.contains("Required checks:"));
+
+    let none = fake_context(default_roles::CODER);
+    let system = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2)
+        .build(&none)
+        .system;
+    assert!(!system.contains("Required checks:"));
 }

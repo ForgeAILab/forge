@@ -37,6 +37,85 @@ Managed execution:
 - Failure taxonomy: classify any blocker using exactly this taxonomy: transient | input_missing | environment | code_bug | design_gap | review_failed | systemic.
 - Never hide failed verification; report failures explicitly.";
 
+/// How the dispatched agent delivers worklog entries and evidence.
+///
+/// A native agent's Task session carries the `task.worklog` and
+/// `task.evidence` tools. A CLI harness has no Forge tool channel, so it
+/// writes to its execution outbox and Forge ingests the files when the run
+/// ends. Naming a tool the agent cannot call wastes its first turns hunting
+/// for it, so the prompt must describe the channel the agent actually has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskDelivery {
+    #[default]
+    NativeTools,
+    Outbox,
+}
+
+impl TaskDelivery {
+    #[must_use]
+    pub fn for_backend_kind(backend_kind: &str) -> Self {
+        if backend_kind == "native" {
+            Self::NativeTools
+        } else {
+            Self::Outbox
+        }
+    }
+}
+
+const NATIVE_WORKLOG_CONTRACT: &str = "\
+Worklog: append entries with `task.worklog` (append) as you work, so the reviewer reads what you actually did.
+Write one after a meaningful milestone -- your initial approach, a completed slice, validation results, a deviation, a blocker -- and not for every tool call or file edit.
+Use kind `progress`, `decision`, `validation`, or `blocker`. Forge derives the Task, execution, role, and identity from your session, and posts the final completion summary itself once the execution is accepted, so no separate handoff block is needed.
+Proof of behaviour is a captured artifact, not prose: when a change alters UI or runtime behaviour, capture it with `task.evidence` (capture) -- a screenshot or recording by `path`, or verbatim command output as `content` -- and say in the worklog what you captured. If you could not capture proof, say so and why.
+A worklog entry never moves the Task and never satisfies an acceptance check.";
+
+const OUTBOX_WORKLOG_CONTRACT: &str = "\
+Worklog and evidence: this harness has no Forge tools. Report through files in the directory named by the `FORGE_OUTBOX` environment variable; it sits outside the worktree, so nothing there is committed. Forge ingests it when this run ends, before review.
+Worklog: append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl`, for example {\"kind\":\"validation\",\"summary\":\"python3 -m unittest: 20 tests OK\"}, so the reviewer reads what you actually did.
+Write one after a meaningful milestone -- your initial approach, a completed slice, validation results, a deviation, a blocker -- and not for every tool call or file edit. `kind` is `progress`, `decision`, `validation`, or `blocker`. Forge records the Task, execution, role, and identity itself, and posts the final completion summary once the execution is accepted.
+Proof of behaviour is a captured artifact, not prose: when a change alters UI or runtime behaviour, append one object per artifact to `$FORGE_OUTBOX/evidence.jsonl` -- {\"kind\":\"screenshot\",\"caption\":\"...\",\"path\":\"shot.png\"} for a file (a worktree-relative path, or an absolute path to a file you wrote under `$FORGE_OUTBOX`), or {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}. `kind` is `screenshot`, `walkthrough_video`, `log`, `report`, or `other`. If you could not capture proof, say so in the worklog and why.
+A worklog entry never moves the Task and never satisfies an acceptance check.";
+
+const NATIVE_REVIEW_REPORT_CONTRACT: &str = "\
+Review report: record what you verified with `task.worklog` (append) entries -- kind `validation` for a check you ran, `blocker` for what stopped you -- and capture the command output or screenshot behind a finding with `task.evidence` (capture). These are the only writes you may make; the verdict itself still belongs in the findings JSON.";
+
+const OUTBOX_REVIEW_REPORT_CONTRACT: &str = "\
+Review report: this harness has no Forge tools. The directory named by the `FORGE_OUTBOX` environment variable is the only place you may write; Forge ingests it when this run ends. Append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl` for what you verified -- {\"kind\":\"validation\",\"summary\":\"...\"} for a check you ran, `blocker` for what stopped you -- and one per artifact to `$FORGE_OUTBOX/evidence.jsonl` for the output behind a finding -- {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}, or a `path` to a file you saved under `$FORGE_OUTBOX`. The verdict itself still belongs in the findings JSON.";
+
+/// Tell an implementing agent exactly which checks gate review and how they
+/// run. Without this the agent validates with whatever interpreter or command
+/// it prefers, passes locally, and learns the real gate only from a rejection.
+pub(crate) fn required_checks_section(ctx: &AgentDispatchContext) -> Option<String> {
+    if ctx.read_only_task || ctx.review_ci_steps.is_empty() {
+        return None;
+    }
+    let mut section = String::from(
+        "Required checks: when you finish, Forge runs each command below with `bash -lc` from the worktree root against your committed result. If any exits non-zero the Task comes back to you with its output. Run them yourself exactly that way -- `bash -lc '<command>'` from the worktree root, so the same shell, PATH, and interpreter versions apply -- and make every one pass before you finish:",
+    );
+    for step in &ctx.review_ci_steps {
+        section.push_str("\n- `");
+        section.push_str(step);
+        section.push('`');
+    }
+    Some(section)
+}
+
+/// The worklog and evidence contract for an agent that implements the Task.
+pub(crate) fn implementation_report_contract(delivery: TaskDelivery) -> &'static str {
+    match delivery {
+        TaskDelivery::NativeTools => NATIVE_WORKLOG_CONTRACT,
+        TaskDelivery::Outbox => OUTBOX_WORKLOG_CONTRACT,
+    }
+}
+
+/// The report contract for a read-only role, which may write nothing else.
+pub(crate) fn read_only_report_contract(delivery: TaskDelivery) -> &'static str {
+    match delivery {
+        TaskDelivery::NativeTools => NATIVE_REVIEW_REPORT_CONTRACT,
+        TaskDelivery::Outbox => OUTBOX_REVIEW_REPORT_CONTRACT,
+    }
+}
+
 pub const EXECUTION_POLICY_NEW_EXECUTION: &str = "new_execution";
 pub const EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD: &str =
     "resume_latest_target_role_thread";
@@ -60,6 +139,9 @@ pub struct AgentDispatchContext {
     pub latest_review_execution_id: Option<String>,
     pub latest_review_logs_path: Option<String>,
     pub read_only_task: bool,
+    pub delivery: TaskDelivery,
+    /// Checks Forge runs before review; see [`required_checks_section`].
+    pub review_ci_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

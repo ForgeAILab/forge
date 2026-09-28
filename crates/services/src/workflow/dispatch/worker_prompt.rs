@@ -3,8 +3,8 @@ use db::ReviewStatus;
 use crate::workflow::{
     default_roles, default_states,
     dispatch::{
-        default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_WORKER_AUTONOMOUS_V1, BUILDER_ID_WORKER_MERGE_FIX_V1,
+        default_tool_names, required_checks_section, AgentDispatchContext, AgentPrompt,
+        PromptBuilder, BUILDER_ID_WORKER_AUTONOMOUS_V1, BUILDER_ID_WORKER_MERGE_FIX_V1,
         BUILDER_ID_WORKER_REVIEW_FIX_V1, MANAGED_EXECUTION_CONTRACT,
     },
 };
@@ -104,6 +104,10 @@ fn worker_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) 
     system.push_str(STRUCTURED_BLOCKED_QUESTION);
     system.push_str("\n\n");
     system.push_str(WORKER_HANDOFF_CONTRACT);
+    if let Some(checks) = required_checks_section(ctx) {
+        system.push_str("\n\n");
+        system.push_str(&checks);
+    }
 
     if let Some(reason) = ctx.last_manual_bounce_reason.as_deref() {
         system.push_str("\n\nThis task was sent back with the following feedback: ");

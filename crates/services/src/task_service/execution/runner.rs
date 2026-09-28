@@ -1187,6 +1187,38 @@ impl TaskService {
                 Some(db::ResumePolicy::Manual),
             ),
         };
+        // A CLI harness reports worklog and evidence through its outbox. Take
+        // it in before the execution settles so the next role — the reviewer,
+        // or the coder after a failed review — reads it with the Task.
+        if let (Some(embedded), Some(agent_id)) = (
+            self.credential_env.as_ref(),
+            current_execution.agent_id.as_deref(),
+        ) {
+            let report = embedded
+                .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
+                    task_id: &task.id,
+                    execution_id: &execution_id,
+                    agent_id,
+                    role: Some(current_execution.role.as_str()),
+                    worktree_path: &workspace.worktree_path,
+                })
+                .await;
+            if report.worklog_entries > 0 || report.evidence_items > 0 {
+                tracing::info!(
+                    %execution_id,
+                    worklog_entries = report.worklog_entries,
+                    evidence_items = report.evidence_items,
+                    "execution outbox ingested"
+                );
+            }
+            if !report.rejected.is_empty() {
+                tracing::warn!(
+                    %execution_id,
+                    rejected = ?report.rejected,
+                    "execution outbox entries were not ingested"
+                );
+            }
+        }
         tracing::info!(
             %execution_id,
             task_id = %task.id,

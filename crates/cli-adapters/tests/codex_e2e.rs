@@ -239,7 +239,7 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
         return Ok(());
     }
 
-    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.154.0", "--version"]) {
+    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.157.0", "--version"]) {
         println!("skipping Codex E2E: @openai/codex npx package not available offline");
         return Ok(());
     }

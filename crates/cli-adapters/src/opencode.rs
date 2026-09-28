@@ -136,7 +136,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
+        crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;
 
@@ -402,7 +402,9 @@ async fn stream_run_output(
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {
     matches!(
         config.permission_policy.as_ref(),
-        Some(PermissionPolicy::Yolo) | Some(PermissionPolicy::Auto)
+        Some(PermissionPolicy::Yolo)
+            | Some(PermissionPolicy::Auto)
+            | Some(PermissionPolicy::Supervised)
     ) || config.auto_approve == Some(true)
 }
 
@@ -804,6 +806,16 @@ fn strip_ansi_codes(input: &str) -> String {
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+
+    #[test]
+    fn supervised_policy_skips_permissions() {
+        let config = OpencodeConfig {
+            permission_policy: Some(PermissionPolicy::Supervised),
+            ..OpencodeConfig::default()
+        };
+
+        assert!(should_skip_permissions(&config));
+    }
 
     #[test]
     fn command_builder_uses_run_cli_and_permission_env() {

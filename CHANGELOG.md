@@ -6,6 +6,61 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.8] - 2026-09-27
+
+### Changed
+
+- Managed Codex Task executions now run with network access, and the host's
+  package-manager caches (npm, Cargo, Go modules, XDG cache, pnpm, macOS
+  `~/Library/Caches`) are writable sandbox roots, so coders and reviewers can
+  install dependencies and run builds/tests. Read-only reviewers moved from
+  Codex's read-only sandbox to workspace-write; Forge's post-run gate still
+  fails any reviewer execution that changes a tracked file or moves HEAD and
+  resets the worktree. Reviewers can now also report through the outbox.
+- The `supervised` CLI permission policy now runs Gemini, Smith, and OpenCode
+  unattended, matching Claude Code and Cursor. Forge runs harnesses headless,
+  so a supervised agent previously stalled on approval prompts nobody could
+  answer. `plan` remains restricted and non-interactive.
+- The reviewer prompt includes the CI results Forge recorded before
+  dispatching it (command, exit code, and output tail) instead of only listing
+  the steps.
+- Managed CLI pins: Codex `0.154.0 -> 0.157.0`, Claude Code
+  `2.1.267 -> 2.1.282`.
+- Model catalogs add Claude `claude-fable-5-1` and `claude-opus-5-5`, Codex
+  `gpt-6-sol` and `gpt-6-luna`, and Gemini `gemini-3.8-flash` and
+  `gemini-3.5-flash-lite`.
+
+### Added
+
+- CLI Task executions can deliver worklog entries and evidence. Every CLI
+  harness (Smith, Codex, Claude Code, Gemini, Cursor, OpenCode) is launched
+  with `FORGE_OUTBOX`, `FORGE_TASK_ID`, and `FORGE_EXECUTION_ID`; it appends
+  `worklog.jsonl` / `evidence.jsonl` lines to the outbox, which Forge validates
+  and ingests into the Task when the execution ends. Reviewers may report
+  through the outbox too; it is their only permitted write.
+- Coder and worker prompts list the CI steps that gate review and tell the
+  agent to run them exactly as Forge does (`bash -lc` from the worktree root)
+  before finishing.
+
+### Fixed
+
+- A CI failure's transition reason (Task history and workflow log) now names
+  the failing step, exit code, command, and last output line instead of only
+  `CI step N failed`.
+- Dispatch prompts no longer tell CLI agents to call `task.worklog` /
+  `task.evidence` (native-only tools) or to upload proof with `forge-ctl`,
+  which holds no credential for the executing server. Each agent is given the
+  delivery channel its backend actually has.
+- A planner gate skipped because no planner is assigned is no longer quoted to
+  the coder as “sent back with the following feedback.” Only a non-system
+  actor's move out of a gate counts as a bounce.
+
+### Breaking
+
+- Codex no longer advertises `gpt-5.4`, `gpt-5.4-mini`, or
+  `gpt-5.3-codex-spark`, which Codex itself has dropped. Agents pinned to one
+  of them must be switched to a current model.
+
 ## [0.13.7] - 2026-09-27
 
 ### Fixed
@@ -64,7 +119,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   again. Current Codex reports a missing thread as `no rollout found for thread
   id`, which the fallback did not recognize, so every auditor fork and coder
   resume on such a Task failed instead of starting fresh.
-
 ### Breaking
 
 - The reviewer response contract is now free Markdown ending in one result
@@ -86,7 +140,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a missing toolchain) prevented a verdict, the Review finishes failed and the
   Task is parked for its owner with a `reexecute` recovery, instead of sending
   the coder to fix something it cannot or retrying the reviewer.
-
 ## [0.13.4] - 2026-09-25
 
 ### Fixed

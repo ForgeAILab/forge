@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::workflow::HookResult;
 
-pub(super) fn merged_state_config(
+pub(crate) fn merged_state_config(
     state: &StateDefinition,
     project: Option<&db::Project>,
     task_state_config_json: Option<&str>,

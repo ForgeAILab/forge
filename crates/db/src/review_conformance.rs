@@ -136,15 +136,34 @@ pub(crate) async fn review_source_in_tx(
     let reviewer = sqlx::query("SELECT assignee_type, assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer'")
         .bind(task_id).fetch_optional(&mut *conn).await?;
     let reviewer = reviewer.map(|r| Ok::<_, DbError>(json!({"type": r.try_get::<Option<String>,_>("assignee_type")?, "id": r.try_get::<Option<String>,_>("assignee_id")?}))).transpose()?;
+    // The reviewed evidence is what existed when the reviewing run started.
+    // Anything recorded after that is the reviewer's own report; counting it
+    // would change the frozen context under the reviewer and void every
+    // verdict that reports what it checked.
+    let evidence_cutoff: Option<String> = match execution_id {
+        Some(id) => {
+            sqlx::query_scalar(
+                "SELECT created_at FROM execution
+             WHERE id = ? AND role IN ('reviewer', 'auditor')",
+            )
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?
+        }
+        None => None,
+    };
     let worklog = sqlx::query(
         "SELECT id, author_type, author_id, author_name, content, execution_id, role,
                 worklog_kind, created_at
          FROM task_comment
          WHERE task_id = ? AND worklog_kind IS NOT NULL
+           AND (? IS NULL OR created_at < ?)
          ORDER BY created_at ASC, id ASC
          LIMIT 100",
     )
     .bind(task_id)
+    .bind(evidence_cutoff.as_deref())
+    .bind(evidence_cutoff.as_deref())
     .fetch_all(&mut *conn)
     .await?
     .into_iter()
@@ -167,10 +186,13 @@ pub(crate) async fn review_source_in_tx(
                 author_id, author_name, created_at
          FROM task_media
          WHERE task_id = ? AND deleted_at IS NULL
+           AND (? IS NULL OR created_at < ?)
          ORDER BY created_at ASC, id ASC
          LIMIT 100",
     )
     .bind(task_id)
+    .bind(evidence_cutoff.as_deref())
+    .bind(evidence_cutoff.as_deref())
     .fetch_all(&mut *conn)
     .await?
     .into_iter()

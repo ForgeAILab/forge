@@ -802,6 +802,33 @@ impl CoordinationToolProvider {
             .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
             .map_or(default_name, str::to_owned);
 
+        let stored = self
+            .store_task_evidence(actor_identity_id, &task_id, &filename, content_type, &bytes)
+            .await?;
+
+        Ok(json!({
+            "operation": TASK_EVIDENCE_OPERATION,
+            "task_id": task_id,
+            "media_id": stored.media_id,
+            "asset_id": stored.asset_id,
+            "checksum": stored.checksum,
+            "byte_size": stored.byte_size,
+            "kind": kind,
+            "caption": caption,
+            "domain_committed": true,
+        }))
+    }
+
+    /// Store one captured artifact as Task media with the checksum milestone
+    /// evidence attachment compares against.
+    async fn store_task_evidence(
+        &self,
+        actor_identity_id: &str,
+        task_id: &str,
+        filename: &str,
+        content_type: String,
+        bytes: &[u8],
+    ) -> Result<StoredEvidence, AgentHostError> {
         let media_root = self.media_root_handle().ok_or_else(|| {
             AgentHostError::Configuration("media storage is not configured".to_owned())
         })?;
@@ -813,7 +840,7 @@ impl CoordinationToolProvider {
                 AgentHostError::Runtime(format!("media storage is unavailable: {error}"))
             })?;
         }
-        std::fs::write(&destination, &bytes).map_err(|error| {
+        std::fs::write(&destination, bytes).map_err(|error| {
             AgentHostError::Runtime(format!("captured artifact could not be stored: {error}"))
         })?;
 
@@ -822,8 +849,8 @@ impl CoordinationToolProvider {
             &*self.db,
             db::CreateTaskMedia {
                 id: media_id.clone(),
-                task_id: task_id.clone(),
-                display_filename: filename.clone(),
+                task_id: task_id.to_owned(),
+                display_filename: filename.to_owned(),
                 content_type,
                 byte_size,
                 storage_key,
@@ -838,7 +865,7 @@ impl CoordinationToolProvider {
 
         // Milestone evidence attachment compares the caller's checksum against
         // this column; a Task artifact without one can never back a check.
-        let checksum = hex::encode(Sha256::digest(&bytes));
+        let checksum = hex::encode(Sha256::digest(bytes));
         db::SharedMediaRepo::set_media_asset_checksum(
             &*self.db,
             &created.id,
@@ -854,18 +881,224 @@ impl CoordinationToolProvider {
             .ok_or_else(|| {
                 AgentHostError::Runtime("captured artifact has no media asset".to_owned())
             })?;
+        Ok(StoredEvidence {
+            media_id: created.id,
+            asset_id: asset.id,
+            checksum,
+            byte_size,
+        })
+    }
 
-        Ok(json!({
-            "operation": TASK_EVIDENCE_OPERATION,
-            "task_id": task_id,
-            "media_id": created.id,
-            "asset_id": asset.id,
-            "checksum": checksum,
-            "byte_size": byte_size,
-            "kind": kind,
-            "caption": caption,
-            "domain_committed": true,
-        }))
+    /// Ingest the worklog and evidence a CLI harness wrote to its outbox.
+    ///
+    /// A CLI harness has no Forge tool channel, so this is its equivalent of
+    /// `task.worklog` and `task.evidence`, applied when the execution ends.
+    /// Every entry is validated exactly as the native tools validate it, and
+    /// provenance still comes from the execution row rather than the files.
+    /// A malformed entry is skipped and reported, never fatal: the run's real
+    /// outcome must not hinge on its bookkeeping. The outbox is removed once
+    /// read so a later completion pass cannot ingest it twice.
+    pub async fn ingest_execution_outbox(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+    ) -> ExecutionOutboxReport {
+        let mut report = ExecutionOutboxReport::default();
+        let worktree = Path::new(input.worktree_path);
+        let Some(outbox) = executors::execution_outbox_path(worktree, input.execution_id) else {
+            return report;
+        };
+        if !outbox.is_dir() {
+            return report;
+        }
+
+        let author_name = input.role.unwrap_or("agent").to_owned();
+        for (line_no, line) in
+            read_outbox_lines(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut report)
+        {
+            match self
+                .ingest_outbox_worklog(input, &author_name, line_no, &line)
+                .await
+            {
+                Ok(()) => report.worklog_entries += 1,
+                Err(reason) => report.rejected.push(format!(
+                    "{}:{line_no}: {reason}",
+                    executors::OUTBOX_WORKLOG_FILE
+                )),
+            }
+        }
+        for (line_no, line) in
+            read_outbox_lines(&outbox, executors::OUTBOX_EVIDENCE_FILE, &mut report)
+        {
+            match self
+                .ingest_outbox_evidence(input, &author_name, &outbox, line_no, &line)
+                .await
+            {
+                Ok(()) => report.evidence_items += 1,
+                Err(reason) => report.rejected.push(format!(
+                    "{}:{line_no}: {reason}",
+                    executors::OUTBOX_EVIDENCE_FILE
+                )),
+            }
+        }
+
+        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+            report.rejected.push(format!(
+                "outbox could not be removed after ingestion: {error}"
+            ));
+        }
+        report
+    }
+
+    async fn ingest_outbox_worklog(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        author_name: &str,
+        line_no: usize,
+        line: &str,
+    ) -> Result<(), String> {
+        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "progress" | "decision" | "validation" | "blocker"))
+            .ok_or("kind must be progress, decision, validation, or blocker")?;
+        let summary = entry
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("summary is required")?;
+        if summary.chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
+            return Err(format!(
+                "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
+            ));
+        }
+        self.append_outbox_worklog(
+            input,
+            author_name,
+            kind,
+            summary,
+            format!("outbox:{}:worklog:{line_no}", input.execution_id),
+        )
+        .await
+    }
+
+    async fn ingest_outbox_evidence(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        author_name: &str,
+        outbox: &Path,
+        line_no: usize,
+        line: &str,
+    ) -> Result<(), String> {
+        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
+                )
+            })
+            .ok_or("kind must be screenshot, walkthrough_video, log, report, or other")?;
+        let caption = entry
+            .get("caption")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("caption describing the artifact is required")?;
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let (bytes, filename, content_type) = match (path, content) {
+            (Some(path), None) => {
+                let resolved =
+                    resolve_outbox_artifact(Path::new(input.worktree_path), outbox, path)?;
+                let bytes = std::fs::read(&resolved)
+                    .map_err(|error| format!("captured artifact is unreadable: {error}"))?;
+                let name = resolved
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("artifact")
+                    .to_owned();
+                let content_type = content_type_for(&name, kind);
+                (bytes, name, content_type)
+            }
+            (None, Some(content)) => (
+                content.as_bytes().to_vec(),
+                format!("{kind}.txt"),
+                "text/plain".to_owned(),
+            ),
+            (Some(_), Some(_)) => return Err("supply either path or content, not both".to_owned()),
+            (None, None) => {
+                return Err("evidence requires either a path or inline content".to_owned());
+            }
+        };
+        if bytes.is_empty() {
+            return Err("captured artifact is empty".to_owned());
+        }
+        if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(format!(
+                "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
+            ));
+        }
+        self.store_task_evidence(
+            input.agent_id,
+            input.task_id,
+            &filename,
+            content_type,
+            &bytes,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        // The file has no response channel to report the stored asset back
+        // through, so the caption becomes the worklog line naming it.
+        self.append_outbox_worklog(
+            input,
+            author_name,
+            "validation",
+            &format!("Captured {kind} evidence `{filename}`: {caption}"),
+            format!("outbox:{}:evidence:{line_no}", input.execution_id),
+        )
+        .await
+    }
+
+    async fn append_outbox_worklog(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        author_name: &str,
+        kind: &str,
+        summary: &str,
+        idempotency_key: String,
+    ) -> Result<(), String> {
+        let now = db::now_rfc3339();
+        db::TaskCommentRepo::create_comment(
+            &*self.db,
+            db::CreateTaskComment {
+                id: db::new_uuid_v4(),
+                task_id: input.task_id.to_owned(),
+                author_type: db::CommentAuthorType::Agent,
+                author_id: Some(input.agent_id.to_owned()),
+                author_name: author_name.to_owned(),
+                content: summary.to_owned(),
+                execution_id: Some(input.execution_id.to_owned()),
+                role: input.role.map(str::to_owned),
+                worklog_kind: Some(kind.to_owned()),
+                idempotency_key: Some(idempotency_key),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
 
     async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
@@ -4381,6 +4614,104 @@ fn truncate(value: &str, limit: usize) -> String {
 
 /// A captured artifact is evidence, not a transfer channel: keep it small
 /// enough that a runaway capture cannot fill the media store.
+struct StoredEvidence {
+    media_id: String,
+    asset_id: String,
+    checksum: String,
+    byte_size: i64,
+}
+
+/// The execution whose outbox is ingested. Provenance comes from here, never
+/// from the files the harness wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionOutboxInput<'a> {
+    pub task_id: &'a str,
+    pub execution_id: &'a str,
+    pub agent_id: &'a str,
+    pub role: Option<&'a str>,
+    pub worktree_path: &'a str,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecutionOutboxReport {
+    pub worklog_entries: usize,
+    pub evidence_items: usize,
+    /// One human-readable reason per entry that was not ingested.
+    pub rejected: Vec<String>,
+}
+
+/// At most this many bytes of one outbox file are read.
+const MAX_OUTBOX_FILE_BYTES: u64 = 1024 * 1024;
+/// At most this many entries of one outbox file are ingested.
+const MAX_OUTBOX_ENTRIES: usize = 200;
+
+/// Non-empty lines of one outbox file, numbered from 1, within the size and
+/// entry bounds. Bounds violations are reported, not silently truncated.
+fn read_outbox_lines(
+    outbox: &Path,
+    file: &str,
+    report: &mut ExecutionOutboxReport,
+) -> Vec<(usize, String)> {
+    let path = outbox.join(file);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if !metadata.is_file() {
+        report.rejected.push(format!("{file}: not a regular file"));
+        return Vec::new();
+    }
+    if metadata.len() > MAX_OUTBOX_FILE_BYTES {
+        report.rejected.push(format!(
+            "{file}: exceeds the {MAX_OUTBOX_FILE_BYTES} byte outbox limit"
+        ));
+        return Vec::new();
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) => {
+            report.rejected.push(format!("{file}: unreadable: {error}"));
+            return Vec::new();
+        }
+    };
+    let lines = text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| (index + 1, line.to_owned()))
+        .collect::<Vec<_>>();
+    if lines.len() > MAX_OUTBOX_ENTRIES {
+        report.rejected.push(format!(
+            "{file}: only the first {MAX_OUTBOX_ENTRIES} of {} entries were ingested",
+            lines.len()
+        ));
+    }
+    lines.into_iter().take(MAX_OUTBOX_ENTRIES).collect()
+}
+
+/// Resolve an outbox evidence path: worktree-relative, or absolute inside the
+/// outbox (where a read-only role saves what it captured).
+fn resolve_outbox_artifact(worktree: &Path, outbox: &Path, path: &str) -> Result<PathBuf, String> {
+    if !Path::new(path).is_absolute() {
+        return resolve_workspace_artifact(worktree, path).map_err(|error| error.to_string());
+    }
+    let canonical_outbox = outbox
+        .canonicalize()
+        .map_err(|error| format!("outbox is unavailable: {error}"))?;
+    let canonical = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("captured artifact does not exist: {error}"))?;
+    if !canonical.starts_with(&canonical_outbox) {
+        return Err(
+            "an absolute evidence path must point inside the outbox; use a worktree-relative path otherwise"
+                .to_owned(),
+        );
+    }
+    if !canonical.is_file() {
+        return Err("captured artifact is not a file".to_owned());
+    }
+    Ok(canonical)
+}
+
 const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
 
 /// A worklog entry is a summary the next role reads, not a transcript.
@@ -4469,6 +4800,176 @@ fn content_type_for(filename: &str, kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_outbox_ingests_valid_entries_and_reports_the_rest() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        let project = db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: db::new_uuid_v4(),
+                name: "outbox".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        let task = db::TaskRepo::create(
+            &*db,
+            db::CreateTask {
+                id: db::new_uuid_v4(),
+                project_id: project.id.clone(),
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "outbox".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("task creates");
+        let now = db::now_rfc3339();
+        db::ExecutionRepo::create(
+            &*db,
+            db::CreateExecution {
+                id: "exec-1".to_owned(),
+                task_id: task.id.clone(),
+                agent_id: None,
+                role: "reviewer".to_owned(),
+                status: db::ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join(&task.id).join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(worktree.join("run.log"), "20 tests OK\n").expect("artifact");
+        let outbox = executors::execution_outbox_path(&worktree, "exec-1").expect("outbox path");
+        std::fs::create_dir_all(&outbox).expect("outbox");
+        std::fs::write(outbox.join("shot.png"), [0x89, b'P', b'N', b'G']).expect("shot");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_WORKLOG_FILE),
+            concat!(
+                r#"{"kind":"validation","summary":"unittest: 20 OK"}"#,
+                "\n\n",
+                r#"{"kind":"chatter","summary":"not a kind"}"#,
+                "\nnot json\n",
+            ),
+        )
+        .expect("worklog");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_EVIDENCE_FILE),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"kind":"log","caption":"inline","content":"OK"}"#,
+                r#"{"kind":"log","caption":"worktree file","path":"run.log"}"#,
+                serde_json::json!({
+                    "kind": "screenshot",
+                    "caption": "saved in the outbox",
+                    "path": outbox.join("shot.png"),
+                }),
+                r#"{"kind":"log","caption":"escape","path":"/etc/hosts"}"#,
+            ),
+        )
+        .expect("evidence");
+
+        let provider = CoordinationToolProvider::new(Arc::clone(&db));
+        provider.set_media_root(temp.path().join("media"));
+        let report = provider
+            .ingest_execution_outbox(&ExecutionOutboxInput {
+                task_id: &task.id,
+                execution_id: "exec-1",
+                agent_id: "agent-1",
+                role: Some("reviewer"),
+                worktree_path: &worktree.to_string_lossy(),
+            })
+            .await;
+
+        assert_eq!(report.worklog_entries, 1, "{report:?}");
+        assert_eq!(report.evidence_items, 3, "{report:?}");
+        assert_eq!(report.rejected.len(), 3, "{report:?}");
+        assert!(report.rejected[0].starts_with("worklog.jsonl:3: kind must be"));
+        assert!(report.rejected[1].starts_with("worklog.jsonl:4: "));
+        assert!(report.rejected[2].contains("evidence.jsonl:4: an absolute evidence path"));
+        assert!(!outbox.exists(), "the outbox is consumed");
+
+        let comments = db::TaskCommentRepo::list_comments(
+            &*db,
+            &task.id,
+            db::PageRequest {
+                cursor: None,
+                limit: 50,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Asc,
+            },
+        )
+        .await
+        .expect("comments list")
+        .items;
+        assert_eq!(comments.len(), 4);
+        assert!(comments.iter().all(|comment| {
+            comment.execution_id.as_deref() == Some("exec-1")
+                && comment.role.as_deref() == Some("reviewer")
+                && comment.author_id.as_deref() == Some("agent-1")
+        }));
+        assert_eq!(comments[0].worklog_kind.as_deref(), Some("validation"));
+        assert_eq!(comments[0].content, "unittest: 20 OK");
+        assert!(comments
+            .iter()
+            .any(|comment| comment.content.contains("`shot.png`: saved in the outbox")));
+
+        // A second completion pass finds nothing left to ingest.
+        let replay = provider
+            .ingest_execution_outbox(&ExecutionOutboxInput {
+                task_id: &task.id,
+                execution_id: "exec-1",
+                agent_id: "agent-1",
+                role: Some("reviewer"),
+                worktree_path: &worktree.to_string_lossy(),
+            })
+            .await;
+        assert_eq!(replay, ExecutionOutboxReport::default());
+    }
 
     #[test]
     fn argument_shape_rejections_are_correctable_validation_outcomes() {
