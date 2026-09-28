@@ -920,7 +920,8 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "task.adaptive — apply one bounded adaptive command to a Task in the bound Project. ",
             "Fields: action (required: \"split\", \"sequence\", or \"replace\"); ",
             "source_task_id, expected_task_version, expected_board_revision, and rationale ",
-            "(all required); split requires non-empty items of {title, description?, assignee_id?}; ",
+            "(all required; read both from work.read — the Task's version and the top-level ",
+            "board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; ",
             "split creates ordered direct children under a non-executing coordination root; children ",
             "share the root workspace but keep independent agents, executions, and lifecycles ",
             "and execute serially in the declared order. sequence manages that child order only and ",
@@ -1164,7 +1165,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         });
         properties["expected_board_revision"] = json!({
             "type": ["integer", "null"],
-            "description": "task.adaptive: Project board revision precondition."
+            "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision)."
         });
 
         properties["items"] = json!({

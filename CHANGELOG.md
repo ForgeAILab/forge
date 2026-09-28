@@ -6,6 +6,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- A native Project Agent chat no longer wedges permanently with "LCM context
+  cannot fit after bounded hard compaction" after one long tool loop. Leaf
+  compaction could only cut at user boundaries, so a single turn of ~50 tool
+  rounds could never be compacted and every retry failed. Agent Runtime now
+  takes such a turn whole as one leaf (runtime pin bump).
+- `task.adaptive` no longer sends a Project Agent guessing the board revision.
+  `work.read` now returns the Project `board_revision`, and a
+  `version_conflict` returns the current Task version and board revision as
+  retry arguments; previously the agent brute-forced revisions 0, 1, 2, … in
+  one turn until the context overflowed.
+- Retrying a failed native chat turn no longer appends the same user message
+  again. When the message is already unanswered at the end of the session
+  history, the retry sends a short continuation instead.
+
 ## [0.13.9] - 2026-09-28
 
 ### Breaking

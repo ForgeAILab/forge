@@ -1553,6 +1553,15 @@ from the checkpoint's copy, which the resume overlay would otherwise reinstate
 — leaving the coordinator to rebuild it from `agent_lcm_entry` /
 `agent_lcm_node`. Bump that constant with any change to those three policies.
 
+Leaf compaction only cuts at user boundaries, and an agentic turn is not
+bounded by one reply: a Project Agent tool loop can put tens of thousands of
+tokens into a single turn with no user message inside it. The runtime takes
+such an oldest turn whole as one oversized leaf, rather than returning no plan
+and failing every admission with "LCM context cannot fit". A failed turn's
+input and tool rounds stay in the persistent session history, so when a retry
+would re-send a message that already sits unanswered at the end of that
+history, the native host sends a short continuation instead of a second copy.
+
 Forge selects and authorizes domain context; Agent Runtime alone budgets and
 serializes final model context. `context_manifest` records the offered source
 IDs/revisions and selection reasons, links the runtime run-manifest fingerprint,

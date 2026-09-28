@@ -689,3 +689,82 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
         "the durable timeline the state was rebuilt from is intact"
     );
 }
+
+/// The live wedge from a Project Agent chat: one turn ran ~50 tool rounds
+/// (guessing a board revision) and died without replying. That single turn
+/// held no user boundary and far outgrew the leaf target, so the leaf
+/// planner could never commit a span and every retry failed with "LCM
+/// context cannot fit after bounded hard compaction". Each retry also
+/// re-sent the same message, stacking identical user turns on the timeline.
+///
+/// The retry must now compact the oversized turn whole and complete, and the
+/// durable timeline must carry a continuation instead of a second copy.
+#[tokio::test]
+async fn a_retry_after_an_oversized_unanswered_tool_loop_compacts_and_does_not_repeat_the_message()
+{
+    use agent_runtime::core::content::{ToolCall, ToolResultBlock};
+    use agent_runtime::core::ids::ToolCallId;
+
+    const ASK: &str = "this task is too big; break it down with good dependencies";
+
+    let fixture = chat_fixture().await;
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(text_only_provider(2));
+
+    let mut seed_history = vec![Message::user(ASK)];
+    for index in 0..40 {
+        let call_id = ToolCallId::new(format!("loop-call-{index}"));
+        seed_history.push(Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+            id: call_id.clone(),
+            name: "forge_scope_propose".to_owned(),
+            arguments: serde_json::json!({ "expected_board_revision": index }),
+        })]));
+        seed_history.push(Message::tool_result(ToolResultBlock {
+            call_id,
+            name: "forge_scope_propose".to_owned(),
+            content: vec![ContentPart::text(format!(
+                "version_conflict {index}: {}",
+                "the authorized resource changed; refresh and retry. ".repeat(20)
+            ))],
+            is_error: true,
+        }));
+    }
+
+    let output = backend
+        .run_turn(
+            fixture.turn_with_history(ASK, seed_history),
+            Arc::new(NoopSink),
+        )
+        .await
+        .expect("a retry behind an oversized tool-loop turn must compact and complete");
+    assert!(!output.text.trim().is_empty());
+    let timeline_id = output
+        .context_manifest
+        .expect("native turn links a runtime context manifest")
+        .lcm_timeline_id
+        .expect("manifest links the chat LCM timeline");
+    let (leaf, _) = lcm_node_counts(&fixture.db, &timeline_id).await;
+    assert!(leaf > 0, "the oversized turn must be compacted into a leaf");
+
+    let user_texts: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT content_json FROM agent_lcm_entry WHERE timeline_id = ? ORDER BY sequence",
+    )
+    .bind(&timeline_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("timeline entries")
+    .into_iter()
+    .map(|(json,)| serde_json::from_str::<Message>(&json).expect("canonical message"))
+    .filter(|message| message.role == forge_agent_host::Role::User)
+    .map(|message| message.joined_text())
+    .collect();
+    assert_eq!(
+        user_texts
+            .iter()
+            .filter(|text| text.as_str() == ASK)
+            .count(),
+        1,
+        "the retried message must not be appended a second time: {user_texts:?}"
+    );
+    assert_eq!(user_texts.len(), 2, "user entries: {user_texts:?}");
+}
