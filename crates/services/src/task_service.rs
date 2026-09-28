@@ -315,9 +315,9 @@ fn remote_execution_lease_is_active(
     let lease_is_live = lease_expires_at
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > now);
-    let hard_deadline_is_live = hard_deadline_at
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&Utc) > now);
+    let hard_deadline_is_live = hard_deadline_at.is_none_or(|value| {
+        DateTime::parse_from_rfc3339(value).is_ok_and(|deadline| deadline.with_timezone(&Utc) > now)
+    });
     lease_is_live && hard_deadline_is_live
 }
 
@@ -661,10 +661,8 @@ impl TaskService {
                 .unwrap_or("{}"),
         )
         .unwrap_or(Value::Null);
-        let hard_deadline_at = execution::rfc3339_after(
-            &input.updated_at,
-            i64::try_from(execution::execution_deadline_seconds(&snapshot)).unwrap_or(i64::MAX),
-        );
+        let hard_deadline_at = execution::execution_deadline_seconds(&snapshot)
+            .map(|seconds| execution::rfc3339_after(&input.updated_at, i64::from(seconds)));
         let remote_owner = if let Some(agent_id) = input.agent_id.as_deref() {
             AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
@@ -686,7 +684,7 @@ impl TaskService {
         let (owner, lease_expires_at) = match remote_owner {
             Some(owner) => (
                 owner,
-                execution::bounded_lease_expiry(&input.updated_at, &hard_deadline_at),
+                execution::bounded_lease_expiry(&input.updated_at, hard_deadline_at.as_deref()),
             ),
             None => (
                 format!("dispatch-pending:{}", input.id),

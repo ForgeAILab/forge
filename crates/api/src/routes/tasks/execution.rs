@@ -10,6 +10,7 @@ pub async fn claim_task(
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
         permission_policy: overrides.permission_policy,
+        hard_deadline_seconds: overrides.hard_deadline_seconds,
     });
     let claimed = state
         .task_service
@@ -29,6 +30,7 @@ pub async fn launch_task(
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
         permission_policy: overrides.permission_policy,
+        hard_deadline_seconds: overrides.hard_deadline_seconds,
     });
     let launched = state
         .task_service

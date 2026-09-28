@@ -245,7 +245,7 @@ fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
         expected_version: 1,
         owner: format!("dispatch-pending:{execution_id}"),
         lease_expires_at: now.to_owned(),
-        hard_deadline_at: "2099-01-01T00:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T00:00:00Z".to_owned()),
         now: now.to_owned(),
     }
 }
@@ -3436,7 +3436,7 @@ async fn running_execution_creation_is_rejected_after_project_pause() {
             expected_version: 1,
             owner: "embedded:paused-test".to_owned(),
             lease_expires_at: "2026-09-11T19:26:16Z".to_owned(),
-            hard_deadline_at: "2026-09-11T20:25:46Z".to_owned(),
+            hard_deadline_at: Some("2026-09-11T20:25:46Z".to_owned()),
             now: now.to_owned(),
         },
     )
@@ -3503,7 +3503,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         expected_version: 1,
         owner: "embedded:admission-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let occupant = new_uuid_v4();
@@ -3877,7 +3877,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             expected_version: 1,
             owner: "embedded:agent-profile-admission-test".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
@@ -4046,7 +4046,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
 
@@ -4280,7 +4280,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-1".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     ExecutionRepo::create_with_lease_and_admission(
@@ -4321,7 +4321,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-replacement".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut replacement_admission = make_admission(Some(first_parent_id.clone()));
@@ -4360,7 +4360,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-auditor".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut auditor_execution = make_execution(
@@ -4404,7 +4404,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-auditor-live-retry".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some({
@@ -4449,7 +4449,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-auditor-retry".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(auditor_retry_admission),
@@ -4517,7 +4517,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-terminal-review".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(terminal_admission),
@@ -4534,7 +4534,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-2".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut stale_execution =
@@ -4597,7 +4597,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:failed-candidate-binding".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(failed_binding_admission),
@@ -4631,7 +4631,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:failed-candidate-review".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now,
         },
         None,
@@ -4747,7 +4747,7 @@ async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unr
         expected_version: 1,
         owner: "embedded:root-review-candidate".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
 
@@ -5105,7 +5105,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         expected_version: 1,
         owner: "embedded:admission-edge-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
@@ -5298,7 +5298,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let first_id = new_uuid_v4();
@@ -5454,7 +5454,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let first_id = new_uuid_v4();
@@ -5612,7 +5612,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             expected_version: 1,
             owner: "embedded:test-owner".to_owned(),
             lease_expires_at: "2026-08-21T00:00:30Z".to_owned(),
-            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2026-08-21T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
     )
@@ -5631,7 +5631,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             expected_version: claimed.execution_version,
             owner: "remote:competing-owner".to_owned(),
             lease_expires_at: "2026-08-21T00:00:40Z".to_owned(),
-            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2026-08-21T01:00:00Z".to_owned()),
             now: "2026-08-21T00:00:10Z".to_owned(),
         },
     )
@@ -8105,7 +8105,7 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         expected_version: 1,
         owner: "embedded:daemon-cap-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.to_owned(),
     };
     let first_id = new_uuid_v4();
@@ -8183,7 +8183,7 @@ async fn paused_agent_is_rejected_at_running_execution_insert() {
             expected_version: 1,
             owner: "embedded:paused-agent-test".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
     )

@@ -585,7 +585,7 @@ async fn claim_remote_execution(
             expected_version: execution.execution_version,
             owner: execution_lease_owner(daemon_id, connection_id),
             lease_expires_at: (now + ChronoDuration::seconds(30)).to_rfc3339(),
-            hard_deadline_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            hard_deadline_at: Some((now + ChronoDuration::minutes(5)).to_rfc3339()),
             now: now.to_rfc3339(),
         },
     )

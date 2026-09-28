@@ -1,5 +1,6 @@
 use super::*;
 use crate::new_uuid_v4;
+use crate::repository::CreateManualReviewPass;
 
 struct TaskAuthorityUpdate {
     expected_version: i64,
@@ -565,6 +566,161 @@ impl ReviewRepo for SqliteDb {
             .ok_or(DbError::NotFound)
     }
 
+    async fn create_manual_pass_with_task_authority(
+        &self,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let source = sqlx::query("SELECT * FROM review WHERE id = ?")
+            .bind(&input.source_review_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(map_review)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        if source.task_id != input.task_id
+            || source.execution_id != input.candidate_execution_id
+            || source.status != ReviewStatus::Failed
+            || source.updated_at != input.source_review_updated_at
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        let latest_review_id: Option<String> = sqlx::query_scalar(
+            "SELECT id
+             FROM review
+             WHERE task_id = ?
+             ORDER BY attempt_number DESC, created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&input.task_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if latest_review_id.as_deref() != Some(source.id.as_str()) {
+            return Err(DbError::VersionConflict);
+        }
+
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.task_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let task = map_task(task_row)?;
+        if task.deleted_at.is_some()
+            || task.version != input.expected_task_version
+            || task.status != input.expected_task_status
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let project = sqlx::query("SELECT version, workflow_definition FROM project WHERE id = ?")
+            .bind(&task.project_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let project_version: i64 = project.try_get("version")?;
+        let workflow_definition: String = project.try_get("workflow_definition")?;
+        if project_version != input.expected_project_version
+            || workflow_definition != input.expected_workflow_definition
+        {
+            return Err(DbError::VersionConflict);
+        }
+        validate_review_candidate_in_tx(
+            &mut transaction,
+            &input.task_id,
+            &input.candidate_execution_id,
+        )
+        .await?;
+
+        let details: serde_json::Value =
+            serde_json::from_str(&input.step_results_json).map_err(|error| {
+                DbError::ReviewDetailsCorrupt {
+                    review_id: source.id.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        validate_review_details(&mut transaction, &source, &ReviewStatus::Passed, &details).await?;
+        let attempt_number = source.attempt_number + 1;
+        sqlx::query(
+            "INSERT INTO review (
+                id, task_id, execution_id, attempt_number, status,
+                step_results_json, started_at, finished_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'passed', ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.candidate_execution_id)
+        .bind(attempt_number)
+        .bind(&input.step_results_json)
+        .bind(&input.occurred_at)
+        .bind(&input.occurred_at)
+        .bind(&input.occurred_at)
+        .bind(&input.occurred_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        let task_update = sqlx::query(
+            "UPDATE task
+             SET review_passed_at = ?, updated_at = ?, version = version + 1
+             WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL",
+        )
+        .bind(&input.occurred_at)
+        .bind(&input.occurred_at)
+        .bind(&input.task_id)
+        .bind(input.expected_task_version)
+        .bind(&input.expected_task_status)
+        .execute(&mut *transaction)
+        .await?;
+        if task_update.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "review.status_changed".to_owned(),
+            entity_type: "review".to_owned(),
+            entity_id: input.id.clone(),
+            actor_type: "user".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: input.task_id.clone(),
+            correlation_id: input.task_id.clone(),
+            causation_id: Some(input.source_review_id.clone()),
+            causation_depth: 1,
+            dedupe_key: Some(format!(
+                "review-status:{}:{}:{}",
+                input.id,
+                ReviewStatus::Passed,
+                input.occurred_at
+            )),
+            payload_json: serde_json::json!({
+                "review_id": input.id,
+                "source_review_id": input.source_review_id,
+                "task_id": input.task_id,
+                "project_id": task.project_id,
+                "attempt_number": attempt_number,
+                "status": ReviewStatus::Passed.to_string(),
+                "finished": true,
+                "manual_override": true,
+            })
+            .to_string(),
+            created_at: input.occurred_at.clone(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+
+        let review_row = sqlx::query("SELECT * FROM review WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let review = map_review(review_row)?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.task_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let task = map_task(task_row)?;
+        transaction.commit().await?;
+        Ok((review, task))
+    }
+
     async fn create_attempt_with_execution_and_lease(
         &self,
         mut review: CreateReview,
@@ -572,11 +728,15 @@ impl ReviewRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<(Review, Execution)> {
+        let invalid_deadline = lease
+            .hard_deadline_at
+            .as_deref()
+            .is_some_and(|deadline| lease.lease_expires_at.as_str() > deadline);
         if execution.status != ExecutionStatus::Running
             || lease.execution_id != execution.id
             || lease.expected_version != 1
             || lease.owner.trim().is_empty()
-            || lease.lease_expires_at > lease.hard_deadline_at
+            || invalid_deadline
             || review.task_id != execution.task_id
             // A Review identifies the candidate execution being reviewed.
             // The newly-created reviewer execution is its child, so the two
@@ -584,7 +744,7 @@ impl ReviewRepo for SqliteDb {
             || execution.parent_execution_id.as_deref() != Some(review.execution_id.as_str())
         {
             return Err(DbError::Check(
-                "review attempt must match a running child execution, candidate, and bounded owner claim"
+                "review attempt must match a running child execution, candidate, and valid owner claim"
                     .to_owned(),
             ));
         }
@@ -596,7 +756,7 @@ impl ReviewRepo for SqliteDb {
         let lease_result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
-                 lease_expires_at = MIN(?, ?),
+                 lease_expires_at = MIN(?, COALESCE(?, ?)),
                  hard_deadline_at = ?,
                  last_heartbeat_at = ?,
                  execution_version = execution_version + 1,
@@ -606,8 +766,9 @@ impl ReviewRepo for SqliteDb {
         )
         .bind(&lease.owner)
         .bind(&lease.lease_expires_at)
-        .bind(&lease.hard_deadline_at)
-        .bind(&lease.hard_deadline_at)
+        .bind(lease.hard_deadline_at.as_deref())
+        .bind(&lease.lease_expires_at)
+        .bind(lease.hard_deadline_at.as_deref())
         .bind(&lease.now)
         .bind(&lease.now)
         .bind(&lease.execution_id)

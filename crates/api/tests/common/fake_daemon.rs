@@ -596,7 +596,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             expected_version: execution.execution_version,
             owner: services::execution_lease_owner(daemon_id, connection.id()),
             lease_expires_at: (now + ChronoDuration::seconds(30)).to_rfc3339(),
-            hard_deadline_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            hard_deadline_at: Some((now + ChronoDuration::minutes(5)).to_rfc3339()),
             now: now.to_rfc3339(),
         },
     )

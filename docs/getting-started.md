@@ -979,7 +979,9 @@ the configured checks. In human-required mode, either the user or the bound
 Project Agent may accept or reject. A Task may override the Project default. The
 execution record exposes owner health, lease expiry/hard deadline, heartbeat,
 and semantic progress separately. A quiet provider/tool call remains healthy
-while its owner lease is current, and a hard deadline still bounds it.
+while its owner lease is current. The hard deadline is `null` by default; set a
+positive `overrides.hard_deadline_seconds` when claiming, launching, or
+following up an execution only when that attempt needs a wall-clock bound.
 
 Terminal execution events—including explicit stops and cancellations—remain
 per-attempt audit records and may resolve a semantic progress warning; they do

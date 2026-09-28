@@ -77,7 +77,6 @@ const TURN_LEASE_SECONDS: i64 = 120;
 const MAX_ACTIVE_TURNS: usize = 32;
 const MAX_HISTORY: i64 = 100;
 const MAX_ERROR_CHARS: usize = 512;
-const MAX_CLI_ASSISTANT_CHARS: usize = 500;
 
 fn checked_duration_ms(duration: Duration) -> Result<i64> {
     i64::try_from(duration.as_millis()).map_err(|_| {
@@ -5633,11 +5632,7 @@ fn cli_result_content(result: ExecutionResult) -> Result<String> {
             },
         )),
     }?;
-    Ok(if content.chars().count() <= MAX_CLI_ASSISTANT_CHARS {
-        content
-    } else {
-        content.chars().take(MAX_CLI_ASSISTANT_CHARS).collect()
-    })
+    Ok(content)
 }
 
 fn cli_profile_execution_config(profile: &AgentProfile) -> Result<Value> {
@@ -5649,6 +5644,7 @@ fn cli_profile_execution_config(profile: &AgentProfile) -> Result<Value> {
             model_id: profile.model.clone(),
             reasoning_effort: profile.reasoning_effort.clone(),
             permission_policy: profile.permission_policy.clone(),
+            hard_deadline_seconds: None,
         },
     )?;
 
@@ -6051,14 +6047,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_assistant_output_is_bounded_before_persistence() {
+    fn cli_assistant_output_is_not_truncated_before_persistence() {
+        let assistant_output = "x".repeat(50_000);
         let content = cli_result_content(ExecutionResult {
             status: ExecutionOutcome::Completed,
-            assistant_output: Some("x".repeat(MAX_CLI_ASSISTANT_CHARS + 100)),
+            assistant_output: Some(assistant_output.clone()),
             ..Default::default()
         })
         .expect("completed CLI output is admitted");
-        assert_eq!(content.chars().count(), MAX_CLI_ASSISTANT_CHARS);
+        assert_eq!(content, assistant_output);
     }
 
     #[test]

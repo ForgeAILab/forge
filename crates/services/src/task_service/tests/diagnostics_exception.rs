@@ -572,7 +572,109 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
         })
         .collect::<Vec<_>>();
     assert_eq!(action_kinds, vec!["retry_hook", "mark_reviewed"]);
-    assert_eq!(exception.actions[1].label, "Pass Review");
+    assert_eq!(exception.actions[1].label, "Pass Review Manually");
+    assert!(exception.actions[1].requires_reason);
+    assert!(exception.actions[1].propagates);
+}
+
+#[tokio::test]
+async fn review_blocked_annotation_routes_guidance_and_offers_manual_pass() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        None,
+        crate::workflow::default_roles::REVIEWER,
+        ExecutionStatus::Failed,
+        Some("review-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let review = seed_failed_review(
+        &db,
+        &task.id,
+        &execution.id,
+        1,
+        json!({ "ci_steps": [], "conformance": { "status": "blocked" } }),
+    )
+    .await;
+    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ReviewBlocked,
+        blocking_reason: "review_blocked".to_owned(),
+        blocked_by: Some("system:workflow".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: Some(execution.id.clone()),
+        artifact: None,
+        message: Some("review environment is missing credentials".to_owned()),
+        hook: None,
+        // Deliberately model an annotation persisted before mark_reviewed was
+        // part of the explicit recovery contract.
+        recovery_actions: vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ],
+    });
+    let task = TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("annotation serializes"),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task annotation updates");
+
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &[],
+        Some(&review),
+        Some(&execution),
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+    let retry = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::Reexecute)
+        .expect("review retry exists");
+    assert_eq!(retry.label, "Retry Review with Guidance");
+    assert!(retry.requires_guidance);
+    assert!(retry.propagates);
+
+    let manual_pass = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::MarkReviewed)
+        .expect("manual pass is derived for a legacy annotation");
+    assert_eq!(manual_pass.label, "Pass Review Manually");
+    assert!(manual_pass.requires_reason);
+    assert!(manual_pass.propagates);
+
+    let side_session = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::OpenInteractive)
+        .expect("side session exists");
+    assert_eq!(side_session.label, "Open Side Session");
+    assert!(!side_session.propagates);
 }
 
 #[tokio::test]

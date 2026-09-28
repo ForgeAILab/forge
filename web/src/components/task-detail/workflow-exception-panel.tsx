@@ -318,7 +318,7 @@ export function WorkflowExceptionPanel({
                 disabled={!openInteractive.enabled || recoverPending}
                 onClick={() => requestAction(openInteractive)}
               >
-                Open Interactive
+                {openInteractive.label}
               </Button>
             ) : null}
             {standaloneActions.map((action, index) => {
@@ -368,6 +368,11 @@ export function WorkflowExceptionPanel({
             <DialogTitle>{confirmingAction?.label ?? 'Confirm Recovery'}</DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
+            {confirmingAction?.kind === 'mark_reviewed' ? (
+              <p className="rounded-md border border-amber-300 bg-amber-100/70 p-3 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-100">
+                This records a new, auditable manual pass. The failed review remains in history.
+              </p>
+            ) : null}
             {confirmingAction?.requires_reason ? (
               <div className="space-y-2">
                 <Label htmlFor="workflow-recovery-reason">Reason</Label>

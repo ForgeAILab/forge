@@ -14,8 +14,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskResponse, TransitionTaskResponse,
+    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionSummaryResponse,
+    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse, TransitionTaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -443,8 +443,8 @@ async fn set_auditor_review_config(harness: &TestHarness, task_id: &str, auditor
         .expect("task review config updates");
 }
 
-async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionResponse> {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionSummaryResponse> {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions?limit=20"),

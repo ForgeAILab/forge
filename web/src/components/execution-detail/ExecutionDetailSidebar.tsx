@@ -349,7 +349,7 @@ export function ExecutionDetailSidebar({
             </Tooltip>
           )}
           {actions?.onContinue && (
-            <Tooltip content="Resume with the same agent session context">
+            <Tooltip content="Resume the same agent context in a side session; this does not update task or review state">
               <Button
                 size="sm"
                 variant="outline"
@@ -362,7 +362,7 @@ export function ExecutionDetailSidebar({
                 ) : (
                   <Play className="h-3.5 w-3.5" />
                 )}
-                Continue Session
+                Continue Side Session
               </Button>
             </Tooltip>
           )}

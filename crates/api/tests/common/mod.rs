@@ -121,7 +121,13 @@ fn review_contract_from_prompt(description: &str) -> api_types::ReviewContract {
     let (_, contract) = description
         .rsplit_once(FROZEN_REVIEW_CONTRACT_PREFIX)
         .expect("review prompt carries a frozen contract");
-    serde_json::from_str(contract.trim()).expect("frozen review contract JSON")
+    // Later prompt sections (candidate diff, previous verdict) follow the
+    // contract, so read exactly one JSON value.
+    serde_json::Deserializer::from_str(contract.trim())
+        .into_iter::<api_types::ReviewContract>()
+        .next()
+        .expect("review prompt carries a frozen contract value")
+        .expect("frozen review contract JSON")
 }
 
 pub fn passing_review_assessment(description: &str, worktree_path: &Path) -> String {

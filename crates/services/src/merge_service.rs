@@ -46,9 +46,13 @@ pub enum MergeOutcome {
         branch: String,
         target_branch: String,
     },
+    /// Only an unreviewed-by-agent candidate (no review contract) takes the
+    /// plain merge path that can produce this; the caller rebases it onto
+    /// `target_branch` and hands any conflict back to the Worker.
     Conflict {
         details: String,
         conflict_paths: Vec<PathBuf>,
+        target_branch: String,
     },
     Dirty {
         files: Vec<String>,
@@ -273,6 +277,7 @@ impl MergeService {
                 Ok(MergeOutcome::Conflict {
                     details: stderr,
                     conflict_paths,
+                    target_branch,
                 })
             }
             Err(error) => Err(error.into()),
@@ -1104,7 +1109,9 @@ mod tests {
             MergeOutcome::Conflict {
                 details,
                 conflict_paths,
+                target_branch,
             } => {
+                assert_eq!(target_branch, "main");
                 assert!(details.contains("CONFLICT"));
                 assert_eq!(conflict_paths, vec![PathBuf::from("file.txt")]);
             }

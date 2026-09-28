@@ -7,51 +7,21 @@ const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 const EMBEDDED_EXECUTION_LEASE_SECONDS: i64 = 60;
 const EMBEDDED_EXECUTION_HEARTBEAT_SECONDS: u64 = 20;
-/// A bounded fallback is required for snapshots that predate explicit
-/// execution-time policy.  Provider/profile configuration may choose a
-/// shorter window, but no embedded execution is admitted without a deadline.
-const DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 30 * 60;
-const MAX_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 24 * 60 * 60;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddedLeaseSignal {
     OwnerLost,
     HardDeadline,
 }
 
-pub(crate) fn execution_deadline_seconds(snapshot: &Value) -> u64 {
-    const KEYS: &[&str] = &[
-        "hard_deadline_seconds",
-        "execution_hard_deadline_seconds",
-        "deadline_seconds",
-        "execution_deadline_seconds",
-        "max_duration_seconds",
-        "max_execution_seconds",
-        "max_execution_duration_seconds",
-        "timeout_seconds",
-    ];
-
-    let mut candidates = Vec::new();
-    for object in [
-        snapshot,
-        snapshot.get("config").unwrap_or(&Value::Null),
-        snapshot.get("capabilities").unwrap_or(&Value::Null),
-        snapshot.get("profile").unwrap_or(&Value::Null),
-        snapshot.get("policy").unwrap_or(&Value::Null),
-    ] {
-        for key in KEYS {
-            if let Some(seconds) = object.get(*key).and_then(Value::as_u64) {
-                if seconds > 0 {
-                    candidates.push(seconds);
-                }
-            }
-        }
-    }
-    candidates
-        .into_iter()
-        .min()
-        .unwrap_or(DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS)
-        .clamp(1, MAX_EXECUTION_HARD_DEADLINE_SECONDS)
+/// Resolve an explicitly configured execution deadline. Missing and zero
+/// values mean "no hard deadline"; Forge does not impose an implicit runtime
+/// ceiling on a Task execution.
+pub(crate) fn execution_deadline_seconds(snapshot: &Value) -> Option<u32> {
+    snapshot
+        .get("hard_deadline_seconds")
+        .and_then(Value::as_u64)
+        .and_then(|seconds| u32::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
 }
 
 pub(crate) fn rfc3339_after(now: &str, seconds: i64) -> String {
@@ -60,14 +30,13 @@ pub(crate) fn rfc3339_after(now: &str, seconds: i64) -> String {
         .unwrap_or_else(|_| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339())
 }
 
-pub(crate) fn bounded_lease_expiry(now: &str, hard_deadline_at: &str) -> String {
+pub(crate) fn bounded_lease_expiry(now: &str, hard_deadline_at: Option<&str>) -> String {
     let proposed = rfc3339_after(now, EMBEDDED_EXECUTION_LEASE_SECONDS);
-    match (
-        DateTime::parse_from_rfc3339(&proposed),
-        DateTime::parse_from_rfc3339(hard_deadline_at),
-    ) {
-        (Ok(proposed), Ok(deadline)) => proposed.min(deadline).to_rfc3339(),
-        _ => proposed,
+    match hard_deadline_at.and_then(|value| DateTime::parse_from_rfc3339(value).ok()) {
+        Some(deadline) => DateTime::parse_from_rfc3339(&proposed)
+            .map(|proposed| proposed.min(deadline).to_rfc3339())
+            .unwrap_or(proposed),
+        None => proposed,
     }
 }
 
@@ -143,7 +112,7 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 
 async fn embedded_execution_heartbeat(
     lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
-    hard_deadline_at: String,
+    hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
 ) {
@@ -159,7 +128,7 @@ async fn embedded_execution_heartbeat(
 
 async fn embedded_execution_heartbeat_with_clock(
     lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
-    hard_deadline_at: String,
+    hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
     now: Arc<dyn Fn() -> String + Send + Sync>,
@@ -172,8 +141,8 @@ async fn embedded_execution_heartbeat_with_clock(
             _ = stop.cancelled() => break,
             _ = ticker.tick() => {
                 let now = now();
-                let lease_expires_at = bounded_lease_expiry(&now, &hard_deadline_at);
-                if lease_expires_at <= now {
+                let lease_expires_at = bounded_lease_expiry(&now, hard_deadline_at.as_deref());
+                if hard_deadline_at.is_some() && lease_expires_at <= now {
                     let _ = signal_tx.send(EmbeddedLeaseSignal::HardDeadline);
                     break;
                 }
@@ -285,13 +254,10 @@ impl TaskService {
                         .is_none_or(|deadline| deadline > now);
                 if !preclaimed {
                     let lease_claimed_at = now_rfc3339();
-                    let hard_deadline_at = rfc3339_after(
-                        &lease_claimed_at,
-                        i64::try_from(execution_deadline_seconds(&params.executor_config))
-                            .unwrap_or(i64::MAX),
-                    );
+                    let hard_deadline_at = execution_deadline_seconds(&params.executor_config)
+                        .map(|seconds| rfc3339_after(&lease_claimed_at, i64::from(seconds)));
                     let lease_expires_at =
-                        bounded_lease_expiry(&lease_claimed_at, &hard_deadline_at);
+                        bounded_lease_expiry(&lease_claimed_at, hard_deadline_at.as_deref());
                     match ExecutionRepo::claim_lease(
                         &*self.db,
                         db::ClaimExecutionLease {
@@ -595,17 +561,18 @@ impl TaskService {
         // progress update, and terminal CAS then presents the same tuple.
         let deterministic_owner = format!("embedded-execution:{}", execution_before_launch.id);
         let lease_claimed_at = now_rfc3339();
-        let requested_hard_deadline_at = rfc3339_after(
-            &lease_claimed_at,
-            i64::try_from(execution_deadline_seconds(&agent_config)).unwrap_or(i64::MAX),
-        );
+        let requested_hard_deadline_at = execution_deadline_seconds(&agent_config)
+            .map(|seconds| rfc3339_after(&lease_claimed_at, i64::from(seconds)));
         let lease_execution = if execution_before_launch.lease_owner.as_deref()
             == Some(deterministic_owner.as_str())
-            && execution_before_launch.hard_deadline_at.is_some()
             && execution_before_launch
                 .lease_expires_at
                 .as_deref()
                 .is_some_and(|expires_at| expires_at > lease_claimed_at.as_str())
+            && execution_before_launch
+                .hard_deadline_at
+                .as_deref()
+                .is_none_or(|deadline| deadline > lease_claimed_at.as_str())
         {
             execution_before_launch.clone()
         } else {
@@ -617,7 +584,7 @@ impl TaskService {
                     owner: deterministic_owner,
                     lease_expires_at: bounded_lease_expiry(
                         &lease_claimed_at,
-                        &requested_hard_deadline_at,
+                        requested_hard_deadline_at.as_deref(),
                     ),
                     hard_deadline_at: requested_hard_deadline_at,
                     now: lease_claimed_at,
@@ -640,9 +607,7 @@ impl TaskService {
                 }
             }
         };
-        let hard_deadline_at = lease_execution.hard_deadline_at.clone().ok_or_else(|| {
-            ServiceError::invalid_operation("execution lease claim returned no hard deadline")
-        })?;
+        let hard_deadline_at = lease_execution.hard_deadline_at.clone();
         let lease_owner = lease_execution
             .lease_owner
             .clone()
@@ -861,7 +826,7 @@ impl TaskService {
                             hard_deadline_exceeded = true;
                             tracing::warn!(
                                 execution_id = %execution_id,
-                                hard_deadline_at = %hard_deadline_at,
+                                hard_deadline_at = ?hard_deadline_at,
                                 "embedded execution reached its hard deadline"
                             );
                         }
@@ -906,7 +871,11 @@ impl TaskService {
         if let Err(error) = heartbeat_task.await {
             tracing::debug!(%error, "embedded execution heartbeat task stopped with an error");
         }
-        if parse_rfc3339(&hard_deadline_at).is_some_and(|deadline| deadline <= Utc::now()) {
+        if hard_deadline_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .is_some_and(|deadline| deadline <= Utc::now())
+        {
             hard_deadline_exceeded = true;
         }
         crate::embedded_task_executor::unregister_execution_lease(&execution_id, &lease);
@@ -984,7 +953,10 @@ impl TaskService {
             Err(error) if hard_deadline_exceeded => executors::ExecutionResult {
                 status: ExecutionOutcome::Failed,
                 error: Some(format!(
-                    "execution hard deadline exceeded at {hard_deadline_at}: {error}"
+                    "execution hard deadline exceeded at {}: {error}",
+                    hard_deadline_at
+                        .as_deref()
+                        .unwrap_or("the configured deadline")
                 )),
                 failure_class: Some(executors::ExecutionFailureClass::TaskFailed),
                 ..executors::ExecutionResult::default()
@@ -1037,7 +1009,10 @@ impl TaskService {
         if hard_deadline_exceeded {
             result.status = ExecutionOutcome::Failed;
             result.error = Some(format!(
-                "execution hard deadline exceeded at {hard_deadline_at}"
+                "execution hard deadline exceeded at {}",
+                hard_deadline_at
+                    .as_deref()
+                    .unwrap_or("the configured deadline")
             ));
         }
         let uncommitted_worktree_failure = result.status == ExecutionOutcome::Failed
@@ -1624,7 +1599,7 @@ mod tests {
                 expected_version: 1,
                 owner: "embedded-heartbeat-test".to_owned(),
                 lease_expires_at: "2025-01-01T00:00:05+00:00".to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -1681,7 +1656,7 @@ mod tests {
         let (first_signal_tx, _first_signal_rx) = mpsc::unbounded_channel();
         let first_task = tokio::spawn(embedded_execution_heartbeat_with_clock(
             Arc::clone(&lease),
-            T20.to_owned(),
+            Some(T20.to_owned()),
             first_stop.clone(),
             first_signal_tx,
             Arc::new(|| T1.to_owned()),
@@ -1703,7 +1678,7 @@ mod tests {
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(embedded_execution_heartbeat_with_clock(
             Arc::clone(&lease),
-            T20.to_owned(),
+            Some(T20.to_owned()),
             stop.clone(),
             signal_tx,
             Arc::new(|| T20.to_owned()),
@@ -1729,17 +1704,25 @@ mod tests {
     }
 
     #[test]
-    fn execution_deadline_prefers_shortest_snapshot_policy_and_clamps_fallback() {
+    fn execution_deadline_uses_only_the_explicit_execution_setting() {
         let snapshot = serde_json::json!({
             "config": {"timeout_seconds": 900},
             "capabilities": {"max_execution_seconds": 120},
             "hard_deadline_seconds": 3600,
         });
-        assert_eq!(execution_deadline_seconds(&snapshot), 120);
+        assert_eq!(execution_deadline_seconds(&snapshot), Some(3600));
         assert_eq!(
-            execution_deadline_seconds(&serde_json::json!({"timeout_seconds": 0})),
-            DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS
+            execution_deadline_seconds(&serde_json::json!({
+                "config": {"timeout_seconds": 900},
+                "capabilities": {"max_execution_seconds": 120}
+            })),
+            None
         );
+        assert_eq!(
+            execution_deadline_seconds(&serde_json::json!({"hard_deadline_seconds": 0})),
+            None
+        );
+        assert_eq!(execution_deadline_seconds(&serde_json::json!({})), None);
     }
 
     #[tokio::test]

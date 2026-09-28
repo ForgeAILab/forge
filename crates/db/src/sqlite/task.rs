@@ -1333,14 +1333,20 @@ impl TaskRepo for SqliteDb {
             }
         }
         let initial_lease = &input.execution_lease;
+        let invalid_deadline = initial_lease
+            .hard_deadline_at
+            .as_deref()
+            .is_some_and(|deadline| {
+                initial_lease.lease_expires_at.as_str() > deadline
+                    || deadline <= initial_lease.now.as_str()
+            });
         if initial_lease.execution_id != input.execution.id
             || initial_lease.expected_version != 1
             || initial_lease.owner.trim().is_empty()
-            || initial_lease.lease_expires_at > initial_lease.hard_deadline_at
-            || initial_lease.hard_deadline_at <= initial_lease.now
+            || invalid_deadline
         {
             return Err(DbError::Check(
-                "task claim requires a valid bounded initial execution lease".to_owned(),
+                "task claim requires a valid initial execution lease".to_owned(),
             ));
         }
         // Claim and its Running execution are one transaction. Re-check the
@@ -1508,7 +1514,7 @@ impl TaskRepo for SqliteDb {
         let lease_result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
-                 lease_expires_at = MIN(?, ?),
+                 lease_expires_at = MIN(?, COALESCE(?, ?)),
                  hard_deadline_at = ?,
                  last_heartbeat_at = ?,
                  execution_version = execution_version + 1,
@@ -1518,8 +1524,9 @@ impl TaskRepo for SqliteDb {
         )
         .bind(&initial_lease.owner)
         .bind(&initial_lease.lease_expires_at)
-        .bind(&initial_lease.hard_deadline_at)
-        .bind(&initial_lease.hard_deadline_at)
+        .bind(initial_lease.hard_deadline_at.as_deref())
+        .bind(&initial_lease.lease_expires_at)
+        .bind(initial_lease.hard_deadline_at.as_deref())
         .bind(&initial_lease.now)
         .bind(&initial_lease.now)
         .bind(&initial_lease.execution_id)
@@ -1532,7 +1539,7 @@ impl TaskRepo for SqliteDb {
         execution.execution_version += 1;
         execution.lease_owner = Some(initial_lease.owner.clone());
         execution.lease_expires_at = Some(initial_lease.lease_expires_at.clone());
-        execution.hard_deadline_at = Some(initial_lease.hard_deadline_at.clone());
+        execution.hard_deadline_at = initial_lease.hard_deadline_at.clone();
         execution.last_heartbeat_at = Some(initial_lease.now.clone());
         execution.updated_at = initial_lease.now.clone();
         Ok(ClaimedTask { task, execution })

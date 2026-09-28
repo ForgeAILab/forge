@@ -1413,7 +1413,7 @@ fn execution_owner_lease_is_healthy(execution: &Execution, now: &str) -> bool {
     execution
         .hard_deadline_at
         .as_deref()
-        .is_some_and(|hard_deadline_at| rfc3339_is_after(hard_deadline_at, now))
+        .is_none_or(|hard_deadline_at| rfc3339_is_after(hard_deadline_at, now))
 }
 
 fn rfc3339_is_after(value: &str, other: &str) -> bool {
@@ -2417,7 +2417,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "quiet-owner".to_owned(),
                 lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -2536,7 +2536,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -2659,7 +2659,7 @@ mod tests {
                     expected_version: current.execution_version,
                     owner: "expired-review-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -2722,7 +2722,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "live-owner".to_owned(),
                 lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -2802,7 +2802,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "race-owner".to_owned(),
                 lease_expires_at: (now - ChronoDuration::minutes(1)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -3691,7 +3691,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -3795,7 +3795,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )

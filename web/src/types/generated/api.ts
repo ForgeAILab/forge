@@ -617,6 +617,8 @@ export interface Execution {
   resume_policy?: ResumePolicy | null
   stopped_at?: string | null
   executor_config_snapshot?: Record<string, unknown> | null
+  /** Present on collection projections when this run resumes a provider session. */
+  is_resume?: boolean
   workspace_id?: string | null
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
@@ -636,6 +638,23 @@ export interface Execution {
   updated_at: string
 }
 
+/** Compact execution projection returned by list and task-detail endpoints. */
+export interface ExecutionSummary {
+  id: string
+  task_id: string
+  agent_id: string | null
+  role: ExecutionRole
+  status: ExecutionStatus
+  parent_execution_id: string | null
+  agent_session_id: string | null
+  /** At most 500 Unicode characters. */
+  summary: string | null
+  is_resume: boolean
+  workspace_id: string | null
+  created_at: string
+  updated_at: string
+}
+
 export interface RecoverTaskRequest {
   action: RecoveryAction
   reason: string | null
@@ -646,7 +665,7 @@ export type ExecutionResponse = Execution
 
 /** The first execution page embedded in a Task detail bootstrap response. */
 export interface TaskDetailExecutionsPage {
-  items: Execution[]
+  items: ExecutionSummary[]
   next_cursor: string | null
   has_more: boolean
   total_count: number | null
@@ -965,6 +984,8 @@ export interface ClaimOverrides {
   model_id?: string
   reasoning_effort?: string
   permission_policy?: string
+  /** Optional wall-clock limit for this execution; omit for no limit. */
+  hard_deadline_seconds?: number
 }
 
 export interface ClaimTaskRequest {
@@ -1307,7 +1328,7 @@ export interface ReorderSubtasksRequest {
   ordered_ids: string[]
 }
 
-export type ExecutionsResponse = PaginatedResponse<Execution>
+export type ExecutionsResponse = PaginatedResponse<ExecutionSummary>
 export type AgentsResponse = PaginatedResponse<Agent>
 export type ProjectsResponse = PaginatedResponse<Project>
 export type TasksResponse = PaginatedResponse<Task> & { board_revision: number }

@@ -135,6 +135,7 @@ fn export_typescript() {
     ExecutionOwnerHealth::export().expect("export ExecutionOwnerHealth");
     ExecutionInterruptionResponse::export().expect("export ExecutionInterruptionResponse");
     ExecutionResponse::export().expect("export ExecutionResponse");
+    ExecutionSummaryResponse::export().expect("export ExecutionSummaryResponse");
     TaskDetailExecutionsPage::export().expect("export TaskDetailExecutionsPage");
     TaskDetailResponse::export().expect("export TaskDetailResponse");
     CoordinationState::export().expect("export CoordinationState");

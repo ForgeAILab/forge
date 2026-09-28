@@ -14,8 +14,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskResponse,
+    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse,
+    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -172,6 +172,13 @@ async fn task_review_budget_override_wins_over_project_setting() {
         .filter(|execution| execution.role == "coder")
         .max_by(|a, b| a.created_at.cmp(&b.created_at))
         .expect("latest coder execution exists");
+    let latest_coder: ExecutionResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", latest_coder.id),
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(
         latest_coder
             .executor_config_snapshot
@@ -462,8 +469,8 @@ async fn set_auditor_review_config_with_budget(
         .expect("task review config updates");
 }
 
-async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionResponse> {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionSummaryResponse> {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions?limit=20"),
@@ -477,19 +484,12 @@ async fn poll_until_coder_follow_up_count(
     app: &Router,
     task_id: &str,
     expected_count: usize,
-) -> Vec<ExecutionResponse> {
+) -> Vec<ExecutionSummaryResponse> {
     for _ in 0..200 {
         let executions = executions_for_task(app, task_id).await;
         let count = executions
             .iter()
-            .filter(|execution| {
-                execution.role == "coder"
-                    && execution
-                        .executor_config_snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                        == Some(FIRST_EXECUTOR_SESSION_ID)
-            })
+            .filter(|execution| execution.role == "coder" && execution.is_resume)
             .count();
         if count >= expected_count {
             return executions;

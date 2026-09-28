@@ -519,7 +519,7 @@ async fn review_source_keeps_execution_workspace_repository_after_project_resele
 }
 
 #[tokio::test]
-async fn reviewer_execution_is_owner_bound_at_creation() {
+async fn reviewer_execution_is_owner_bound_without_an_implicit_deadline() {
     let seed = seeded_review(Vec::new()).await;
     let runner = ReviewRunner::new(
         Arc::clone(&seed.db),
@@ -544,7 +544,7 @@ async fn reviewer_execution_is_owner_bound_at_creation() {
     assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.lease_owner.as_deref(), Some(owner.as_str()));
     assert!(execution.lease_expires_at.is_some());
-    assert!(execution.hard_deadline_at.is_some());
+    assert_eq!(execution.hard_deadline_at, None);
 }
 
 #[test]

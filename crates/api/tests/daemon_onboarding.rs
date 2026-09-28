@@ -11,8 +11,8 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonRegisterResponse,
-    DaemonResponse, ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse,
-    RepoResponse, TaskResponse,
+    DaemonResponse, ExecutionResponse, ExecutionStatus, ExecutionSummaryResponse,
+    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -209,6 +209,13 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     )
     .await;
     assert_eq!(completed_execution.status, ExecutionStatus::Completed);
+    let completed_execution: ExecutionResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", completed_execution.id),
+        StatusCode::OK,
+    )
+    .await;
     let snapshot = completed_execution
         .executor_config_snapshot
         .as_ref()
@@ -286,8 +293,8 @@ async fn create_project_and_repo(app: &Router) -> (String, String, common::TestD
     (project.id, repo.id, repo_dir)
 }
 
-async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionSummaryResponse {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions"),
@@ -303,10 +310,10 @@ async fn poll_execution_status(
     task_id: &str,
     execution_id: &str,
     expected_status: ExecutionStatus,
-) -> ExecutionResponse {
+) -> ExecutionSummaryResponse {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+        let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
             app,
             Method::GET,
             &format!("/api/v1/tasks/{task_id}/executions"),

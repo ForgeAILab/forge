@@ -6,6 +6,53 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-09-28
+
+### Breaking
+
+- `GET /api/v1/tasks/{id}/executions` and the execution page embedded by
+  `GET /api/v1/tasks/{id}/detail` now return compact `ExecutionSummaryResponse`
+  items. Prompts, executor config, usage, plan data, logs, errors, and owner
+  diagnostics remain available from `GET /api/v1/executions/{id}`.
+
+### Changed
+
+- Reviewers now verify by running the change — build, tests, and driving the
+  changed behavior programmatically or visually — instead of auditing code by
+  reading it, and must also check that changed behavior is tested and that the
+  delta stays inside the Task (unrelated changes fail the review). The reviewer
+  prompt drops the shared failure-taxonomy and restatement rules, which led
+  reviewers to invent extra result keys and spend turns narrating.
+- The reviewer prompt now carries the candidate diff, and on a re-review the
+  previous verdict, its report, and the diff since the commit it judged, so a
+  reviewer checks prior findings and new changes instead of re-auditing the
+  whole delta from scratch.
+
+### Added
+
+- Blocked reviews now offer an auditable **Pass Review Manually** recovery.
+  The owner must provide a reason; Forge preserves the failed attempt and
+  appends a new user-attributed passed Review before continuing the workflow.
+
+### Fixed
+
+- Smith, other CLI Task agents, direct/native agents, and reviewer executions
+  no longer receive Forge's implicit 30-minute wall-clock deadline (or its
+  hidden 24-hour ceiling). Executions are unlimited by default while their
+  owner lease is renewed; callers can opt a new attempt into an immutable
+  deadline with `overrides.hard_deadline_seconds`.
+- CLI-backed Agent Chat now persists the complete successful assistant response
+  instead of silently truncating Smith and other CLI output to 500 characters.
+- A merge conflict on a Task reviewed by a person (or with no reviewer) is now
+  rebased and handed back to the coder with committed conflict markers, the
+  same as an agent-reviewed Task whose target moved. It previously parked the
+  Task for manual worktree repair even though a coder was assigned. A
+  `merge_fix` retry budget of 0 still parks it.
+- Review follow-up guidance now goes through the authoritative review retry and
+  can advance Task state. Generic execution follow-ups are labeled as
+  non-propagating side sessions and are hidden from the Task's active recovery
+  surface, avoiding successful follow-ups that leave the same Review blocked.
+
 ## [0.13.8] - 2026-09-27
 
 ### Changed

@@ -362,7 +362,7 @@ pub fn resolve_execution_actions(
         ),
         action_with_target(
             ExecutionActionKind::SessionFollowUp,
-            "Continue Session Manually",
+            "Continue Side Session (does not update task)",
             !is_terminal
                 && !hard_failed
                 && latest_resumable_execution.is_some()

@@ -95,7 +95,9 @@ impl TaskService {
         }
         let annotation = self.recovery_annotation(&task);
         if let Ok(explicit) = &annotation {
-            if !explicit.recovery_actions.is_empty() {
+            if !explicit.recovery_actions.is_empty()
+                && action != api_types::RecoveryAction::MarkReviewed
+            {
                 // A non-empty annotation is the authoritative recovery
                 // contract shown to clients. State-derived actions may fill
                 // in old/empty annotations, but they must never widen an
@@ -1910,24 +1912,54 @@ impl TaskService {
             .auto_transition_target(&task.status)
             .unwrap_or(crate::workflow::default_states::MERGING)
             .to_owned();
-        let reason = optional_recovery_reason(reason, "mark_reviewed");
+        let reason = required_recovery_reason(reason, "mark_reviewed")?;
         let latest_review = self.latest_review_for_task(&task.id).await?;
+        if latest_review.status != ReviewStatus::Failed {
+            return Err(ServiceError::invalid_operation(
+                "mark_reviewed requires the latest review attempt to be failed",
+            ));
+        }
+        let active_review_execution = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .find(|execution| {
+                matches!(
+                    execution.role.as_str(),
+                    crate::workflow::default_roles::REVIEWER
+                        | crate::workflow::default_roles::AUDITOR
+                )
+            });
+        if let Some(execution) = active_review_execution {
+            return Err(ServiceError::invalid_operation(format!(
+                "cannot pass review manually while {} execution {} is running",
+                execution.role, execution.id
+            )));
+        }
         let finished_at = now_rfc3339();
         let mut details = strict_review_details(&latest_review)?;
         details["manual_override"] = json!({
             "action": "mark_reviewed",
             "reason": reason.clone(),
+            "actor_type": "user",
+            "source_review_id": latest_review.id,
+            "source_attempt_number": latest_review.attempt_number,
             "at": finished_at,
         });
-        let (review, task) = ReviewRepo::update_status_with_task_authority(
+        let (review, task) = ReviewRepo::create_manual_pass_with_task_authority(
             &*self.db,
-            &latest_review.id,
-            ReviewStatus::Passed,
-            details.to_string(),
-            Some(finished_at.clone()),
-            &finished_at,
-            task.version,
-            Some(finished_at.clone()),
+            db::CreateManualReviewPass {
+                id: new_uuid_v4(),
+                source_review_id: latest_review.id.clone(),
+                source_review_updated_at: latest_review.updated_at.clone(),
+                task_id: task.id.clone(),
+                candidate_execution_id: latest_review.execution_id.clone(),
+                step_results_json: details.to_string(),
+                expected_task_version: task.version,
+                expected_task_status: task.status.clone(),
+                expected_project_version: project.version,
+                expected_workflow_definition: project.workflow_definition.clone(),
+                occurred_at: finished_at.clone(),
+            },
         )
         .await?;
         self.publish_domain_event_by_dedupe(&format!(
@@ -1944,7 +1976,10 @@ impl TaskService {
         }
         self.create_system_comment(
             &task.id,
-            format!("Review passed manually (attempt {})", review.attempt_number),
+            format!(
+                "Review passed manually (attempt {}): {}",
+                review.attempt_number, reason
+            ),
         )
         .await?;
         self.publish(ForgeEvent {
@@ -1962,7 +1997,19 @@ impl TaskService {
             "recovery action mark_reviewed logged"
         );
         let transitioned = self
-            .transition(task.id.clone(), pass_target, task.version)
+            .transition(
+                task.id.clone(),
+                pass_target,
+                TransitionOptions {
+                    version: task.version,
+                    reason: Some(reason),
+                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
+                        api_types::RecoveryAction::MarkReviewed,
+                    )),
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
             .await?;
         Ok(transitioned.task)
     }

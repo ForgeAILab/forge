@@ -983,7 +983,32 @@ fn optional_overrides_param(
         model_id: optional_overrides_field(overrides, "model_id")?,
         reasoning_effort: optional_overrides_field(overrides, "reasoning_effort")?,
         permission_policy: optional_overrides_field(overrides, "permission_policy")?,
+        hard_deadline_seconds: optional_u32_overrides_field(overrides, "hard_deadline_seconds")?,
     }))
+}
+
+fn optional_u32_overrides_field(
+    overrides: &Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<u32>, McpToolError> {
+    match overrides.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                McpToolError::new(
+                    -32602,
+                    format!("overrides.{key} must be a positive integer"),
+                )
+            }),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(McpToolError::new(
+            -32602,
+            format!("overrides.{key} must be a positive integer"),
+        )),
+    }
 }
 
 fn optional_overrides_field(

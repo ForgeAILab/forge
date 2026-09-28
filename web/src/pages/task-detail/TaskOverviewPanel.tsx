@@ -348,8 +348,16 @@ export function TaskOverviewPanel({
     return action.disabled_reason ?? ''
   }
 
-  const visibleExecutionActions = terminal ? [] : (executionActions ?? [])
-  const showFallbackActions = !terminal && executionActions == null
+  // A workflow exception owns recovery. Generic execution follow-ups create a
+  // side session and cannot settle the task/review, so showing them beside the
+  // authoritative actions is both redundant and misleading. Keep only Stop
+  // while an execution is still live.
+  const visibleExecutionActions = terminal
+    ? []
+    : task?.workflow_exception
+      ? (executionActions ?? []).filter((action) => action.action === 'stop_execution')
+      : (executionActions ?? [])
+  const showFallbackActions = !terminal && !task?.workflow_exception && executionActions == null
   const showActionsSection = visibleExecutionActions.length > 0 || showFallbackActions
 
   const onTitleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -363,7 +371,7 @@ export function TaskOverviewPanel({
   }
 
   return (
-    <div className="px-8 py-6">
+    <div className="px-4 py-4 sm:px-6 sm:py-6 lg:px-8">
       <div className="max-w-[760px] space-y-6">
         {isLoading ? (
           <div className="space-y-3">

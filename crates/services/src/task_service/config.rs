@@ -236,6 +236,14 @@ pub(super) async fn build_executor_config_snapshot(
     agent: &Agent,
     overrides: Option<ExecutionOverrides>,
 ) -> Result<Option<String>> {
+    let hard_deadline_seconds = overrides
+        .as_ref()
+        .and_then(|overrides| overrides.hard_deadline_seconds);
+    if hard_deadline_seconds == Some(0) {
+        return Err(ServiceError::invalid_operation(
+            "hard_deadline_seconds must be greater than zero when set; omit it for no limit",
+        ));
+    }
     // Native profiles are hosted by Forge itself and deliberately have no
     // daemon authority.  CLI profiles retain the existing daemon resolution
     // and snapshot provenance.
@@ -283,6 +291,9 @@ pub(super) async fn build_executor_config_snapshot(
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
     });
+    if let Some(seconds) = hard_deadline_seconds {
+        snapshot["hard_deadline_seconds"] = json!(seconds);
+    }
     if let Some(routing) = routing_snapshot_value(kind, &snapshot["config"], &fallbacks)? {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;
     }

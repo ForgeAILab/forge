@@ -2088,9 +2088,8 @@ evidence before transition.
 
 ## Execution status and liveness
 
-`GET /api/v1/executions/{id}` and the execution items returned by
-`GET /api/v1/tasks/{id}/executions` include an owner-bound liveness projection
-in the `ExecutionResponse`. The fields intentionally distinguish the
+`GET /api/v1/executions/{id}` returns the full `ExecutionResponse`, including
+an owner-bound liveness projection. The fields intentionally distinguish the
 optimistic execution version and owner lease from semantic progress:
 
 ```json
@@ -2099,7 +2098,7 @@ optimistic execution version and owner lease from semantic progress:
   "lease_owner": "execution-owner:opaque-reference",
   "owner_health": "healthy",
   "lease_expires_at": "2026-08-21T16:00:30Z",
-  "hard_deadline_at": "2026-08-21T16:30:00Z",
+  "hard_deadline_at": null,
   "last_heartbeat_at": "2026-08-21T15:59:30Z",
   "last_progress_at": "2026-08-21T15:58:42Z",
   "liveness_warning": null,
@@ -2111,8 +2110,11 @@ optimistic execution version and owner lease from semantic progress:
 lease, `expired` when that lease is past its expiry, `unknown` when ownership
 cannot be verified, and `unowned` for terminal executions. A quiet provider or
 tool call can therefore remain `healthy` while `last_progress_at` is older;
-semantic output does not serve as the owner heartbeat. `hard_deadline_at` is a
-fixed capability/profile bound and cannot be extended by heartbeat renewal.
+semantic output does not serve as the owner heartbeat. `hard_deadline_at` is
+`null` by default, meaning Forge imposes no wall-clock limit while the owner
+keeps renewing its lease. When an execution is created with a positive
+`overrides.hard_deadline_seconds`, it is the resolved immutable timestamp and
+cannot be extended by heartbeat renewal.
 `liveness_warning` is a bounded owner/deadline recovery code such as
 `owner_lease_expired`, `owner_lease_unverified`, or `hard_deadline_reached`.
 Stale semantic progress is projected separately as a `progress_warning`
@@ -2125,7 +2127,42 @@ not an authentication credential, bearer token, provider secret, or connection
 handle. Clients must not use it to renew, cancel, or terminalize an execution;
 those operations remain authorized server-side CAS operations.
 
+`GET /api/v1/tasks/{id}/executions` returns
+`PaginatedResponse<ExecutionSummaryResponse>`. Each compact item contains only
+`id`, `task_id`, `agent_id`, `role`, `status`, `parent_execution_id`,
+`agent_session_id`, `summary`, `is_resume`, `workspace_id`, `created_at`, and
+`updated_at`. `summary` is a preview capped at 500 Unicode characters.
+`is_resume` preserves provider-session continuity without returning the full
+executor configuration. Fetch `GET /api/v1/executions/{id}` when a client needs
+the prompt, executor config, usage, plan data, logs path, errors, stop metadata,
+or owner/liveness diagnostics. Collection reads do not compute usage or plan
+projections per row.
+
 ## Agent execution options
+
+`POST /api/v1/tasks/{id}/claim`, `POST /api/v1/tasks/{id}/launch`, and
+`POST /api/v1/executions/{id}/follow-up` accept an optional execution override:
+
+```json
+{
+  "overrides": {
+    "hard_deadline_seconds": 7200
+  }
+}
+```
+
+The value must be a positive integer. Omit it for no execution wall-clock
+limit. Forge stores the resolved `hard_deadline_at` on the new execution; this
+setting is not forwarded to the provider or confused with executor-specific
+command/request timeouts. The same `overrides` object can carry `model_id`,
+`reasoning_effort`, and `permission_policy`.
+
+An execution follow-up always creates a non-propagating side session. It keeps
+the selected agent's session context, but it does not settle a Review or advance
+the Task. For an active `workflow_exception`, clients must use the typed action
+from `POST /api/v1/tasks/{id}/recover`. A review `reexecute` action that reports
+`requires_guidance: true` accepts the user's instructions in `context` and
+launches a new authoritative reviewer attempt.
 
 The two `discovered-options` endpoints return the adapter's selectable
 `models`, `permission_policies`, adapter-specific capability metadata under
@@ -2174,6 +2211,13 @@ it against the selected provider/model effort ladder and refuses an
 unsupported value. Agents that set no `reasoning_effort` emit no flag, leaving
 effort to the named Smith profile, `SMITH_REASONING_EFFORT`, or the model
 default. A `--effort` flag requires a Smith build that accepts it.
+
+Forge supplies no default max-turn or wall-clock flag to Smith. Smith's own
+unconfigured tool-step and turn-time values are unlimited, and Agent Chat
+persists the complete successful Smith response instead of truncating it to a
+short preview. Explicit Task/workflow `max_turns` and the per-execution
+`hard_deadline_seconds` override remain available when a bounded run is
+actually wanted.
 
 ## Task transitions
 
@@ -2232,7 +2276,13 @@ sets:
 `available_actions` contains workflow intents. `recovery_actions` is the closed,
 typed allowlist from the current blocking annotation. When that list is
 non-empty, `POST /api/v1/tasks/{id}/recover` rejects every action outside it
-without clearing or otherwise mutating the annotation.
+without clearing or otherwise mutating the annotation. `mark_reviewed` is the
+one state-derived exception for a Task in `review` whose latest Review is
+failed, including Tasks carrying an older `review_blocked` annotation that
+predates the action. It requires a non-empty `reason`, appends a new passed
+Review attempt with a user manual-override record, and preserves the failed
+attempt as immutable history. It is rejected while a reviewer or auditor
+execution is running.
 
 Task `workflow_health` also represents active non-agent work. A running
 interactive execution reports `kind: "running"`, label `Interactive`. A
@@ -2495,9 +2545,11 @@ individual attempt failure.
 
 `GET /api/v1/tasks/{id}/detail` returns a `TaskDetailResponse` with `task`
 (`TaskResponse`), `workflow` (the effective `WorkflowDefinition` for that
-Task), and `executions` (one `PaginatedResponse<ExecutionResponse>` shaped
-page). The execution page accepts the same `cursor`, `limit`, `include_total`,
-`sort_by`, and `sort_order` parameters as
+Task), and `executions` (one `PaginatedResponse<ExecutionSummaryResponse>`
+shaped page), matching `GET /api/v1/tasks/{id}/executions`; full records are
+loaded from `GET /api/v1/executions/{id}` when needed. The execution page
+accepts the same `cursor`, `limit`, `include_total`, `sort_by`, and `sort_order`
+parameters as
 `GET /api/v1/tasks/{id}/executions`. Its `next_cursor` can be passed to the
 execution-list endpoint for subsequent pages. Reviews, comments, diffs, and
 logs are loaded from their existing endpoints when needed.
@@ -3619,8 +3671,10 @@ setup step or required check makes the review `failed` whatever the reviewer
 said. Otherwise `pass` → `passed`, `fail` → `failed` (the reason and Markdown
 review become the coder's remediation feedback), and `blocked` → `blocked`,
 which finishes the Review as failed and parks the Task with a `review_blocked`
-blocking annotation for its owner (recovery: `reexecute` after fixing the
-environment); the coder is not dispatched. A `pass` is only as strong as the
+blocking annotation for its owner; the coder is not dispatched. The owner may
+retry with guidance after fixing the environment, or manually pass with a
+required reason. The latter creates a distinct passed Review attempt so the
+failed automated result remains auditable. A `pass` is only as strong as the
 checks Forge ran, so configure `setup_steps` and `conformance_checks` for any
 Task whose acceptance depends on a build or test.
 

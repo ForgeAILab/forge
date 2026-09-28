@@ -32,6 +32,10 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
         .claim_task(task.id, Assignee::Agent(agent_id), None)
         .await
         .expect("task claims");
+    assert_eq!(
+        claimed.execution.hard_deadline_at, None,
+        "Task executions have no wall-clock limit unless one is explicitly configured"
+    );
     ExecutionRepo::update(
         &*db,
         db::UpdateExecution {
@@ -2684,6 +2688,35 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
     )
     .await
     .expect("review workspace creates");
+    let candidate = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("candidate implementation".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("candidate execution creates");
     let execution = ExecutionRepo::create(
         &*db,
         db::CreateExecution {
@@ -2696,7 +2729,7 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            parent_execution_id: None,
+            parent_execution_id: Some(candidate.id.clone()),
             agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -2713,12 +2746,12 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
     )
     .await
     .expect("running reviewer execution creates");
-    ReviewRepo::create(
+    let review = ReviewRepo::create(
         &*db,
         db::CreateReview {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            execution_id: execution.id.clone(),
+            execution_id: candidate.id,
             attempt_number: 1,
             status: ReviewStatus::Running,
             step_results_json: json!({ "ci_steps": [] }).to_string(),
@@ -2729,6 +2762,12 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
     )
     .await
     .expect("running review creates");
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&execution.id)
+        .bind(&review.id)
+        .execute(db.pool())
+        .await
+        .expect("reviewer execution binds");
 
     ::review::contract::admit(&db, &execution.id, &task.id, repo_dir.path())
         .await
@@ -2904,6 +2943,83 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
     assert!(annotation
         .recovery_actions
         .contains(&api_types::RecoveryAction::Reexecute));
+    assert!(annotation
+        .recovery_actions
+        .contains(&api_types::RecoveryAction::MarkReviewed));
+
+    let missing_reason = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::MarkReviewed,
+            None,
+            None,
+        )
+        .await
+        .expect_err("manual pass requires a reason");
+    assert!(missing_reason
+        .to_string()
+        .contains("requires a recovery reason"));
+
+    let recovered = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::MarkReviewed,
+            Some("Provider check was verified manually".to_owned()),
+            None,
+        )
+        .await
+        .expect("manual review pass succeeds");
+    assert_ne!(recovered.status, crate::workflow::default_states::REVIEW);
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews reload");
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(reviews[0].id, review.id);
+    assert_eq!(reviews[0].status, ReviewStatus::Failed);
+    assert_eq!(reviews[0].step_results_json, review.step_results_json);
+    assert_eq!(reviews[1].status, ReviewStatus::Passed);
+    let override_details: serde_json::Value =
+        serde_json::from_str(&reviews[1].step_results_json).expect("override details parse");
+    assert_eq!(
+        override_details["manual_override"]["reason"],
+        "Provider check was verified manually"
+    );
+    assert_eq!(override_details["manual_override"]["actor_type"], "user");
+    assert_eq!(
+        override_details["manual_override"]["source_review_id"],
+        review.id
+    );
+
+    let comments = TaskCommentRepo::list_comments(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Asc,
+        },
+    )
+    .await
+    .expect("comments reload");
+    assert!(comments.items.iter().any(|comment| {
+        comment
+            .content
+            .contains("Review passed manually (attempt 2): Provider check was verified manually")
+    }));
+    let transitions = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("transitions reload");
+    let manual_transition = transitions
+        .iter()
+        .find(|transition| transition.from_state == crate::workflow::default_states::REVIEW)
+        .expect("manual pass transition is audited");
+    assert_eq!(
+        manual_transition.trigger_reason,
+        "Provider check was verified manually"
+    );
+    assert!(manual_transition.triggered_by.starts_with("user:"));
 }
 
 async fn assert_failed_reviewer_disposition(
@@ -6075,7 +6191,7 @@ async fn seed_completed_coder_execution(
 }
 
 #[tokio::test]
-async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
+async fn claim_task_records_execution_policy_overrides_in_snapshot() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -6105,6 +6221,7 @@ async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
                 model_id: None,
                 reasoning_effort: None,
                 permission_policy: Some("auto".to_owned()),
+                hard_deadline_seconds: Some(600),
             }),
         )
         .await
@@ -6122,6 +6239,8 @@ async fn claim_task_records_execution_permission_policy_override_in_snapshot() {
     .expect("snapshot parses");
 
     assert_eq!(snapshot["config"]["permission_policy"], "auto");
+    assert_eq!(snapshot["hard_deadline_seconds"], 600);
+    assert!(execution.hard_deadline_at.is_some());
     let execution_keys = snapshot["overrides_applied"]["execution"]
         .as_array()
         .expect("execution override keys are recorded");
@@ -6165,6 +6284,7 @@ async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
                 model_id: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: Some("high".to_owned()),
                 permission_policy: Some("auto".to_owned()),
+                hard_deadline_seconds: None,
             }),
         )
         .await

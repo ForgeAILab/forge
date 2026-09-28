@@ -2611,6 +2611,45 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     );
 }
 
+/// A candidate with no agent review contract (a human reviewer, or no
+/// reviewer) merges without a pinned object, so it meets a sibling's change as
+/// a plain merge conflict. That conflict is still the Worker's to reconcile.
+#[tokio::test]
+async fn plain_merge_conflict_is_handed_back_to_the_worker() {
+    let mut ctx = build_test_ctx(
+        "task-plain-merge-conflict",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+
+    let result = RunMerge.execute(&ctx).await;
+
+    let HookResult::Cascade { to, reason } = result else {
+        panic!("a plain merge conflict goes back to the Worker, got {result:?}");
+    };
+    assert_eq!(to, default_states::MERGE_FAILED);
+    assert!(
+        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        "{reason}"
+    );
+    let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
+    assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
+    let current = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert!(current.blocked_json.is_none(), "nothing parks for a human");
+    assert_eq!(current.review_passed_at, None);
+}
+
 #[tokio::test]
 async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
     let ctx = build_test_ctx(

@@ -59,6 +59,8 @@ pub struct ClaimOverrides {
     pub model_id: Option<String>,
     pub reasoning_effort: Option<String>,
     pub permission_policy: Option<String>,
+    /// Optional wall-clock limit for the new execution. Omit for no limit.
+    pub hard_deadline_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

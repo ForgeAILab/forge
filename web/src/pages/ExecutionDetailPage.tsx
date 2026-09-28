@@ -325,7 +325,7 @@ export function ExecutionDetailPage({
   const usageBreakdowns = execution?.usage ?? usageBreakdownsQuery.data ?? []
   const executionAgentSessionId = execution?.agent_session_id ?? null
   const showRecoveryAction = execution?.status === 'cancelled' || execution?.status === 'failed'
-  const recoveryActionLabel = executionAgentSessionId ? 'Continue Session' : 'Re-execute'
+  const recoveryActionLabel = executionAgentSessionId ? 'Continue Side Session' : 'Re-execute'
 
   const parentAgent = useMemo(
     () => (agentsQuery.data?.items ?? []).find((agent) => agent.id === execution?.agent_id),
@@ -601,6 +601,10 @@ export function ExecutionDetailPage({
               executorTypeConstraint={parentExecutorType}
               textareaRef={followUpTextareaRef}
             />
+            <p className="border-t bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              Follow-ups here continue a side session. They do not update the task or review state;
+              use the task Overview recovery actions to retry the workflow.
+            </p>
           </div>
         </Panel>
 

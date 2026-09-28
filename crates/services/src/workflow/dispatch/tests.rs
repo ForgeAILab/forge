@@ -146,7 +146,7 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             vec![
                 "Reviewer boundary:",
                 "Must remain read-only",
-                "Must not edit files, stage changes, commit changes",
+                "do not edit, stage, or commit tracked files",
             ],
         ),
         (
@@ -187,6 +187,14 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
     for (builder_id, role, role_lines) in cases {
         let prompt = resolve_prompt_builder(builder_id).build(&fake_context(role));
 
+        if builder_id == BUILDER_ID_REVIEWER_CONFORMANCE_V1 {
+            // The reviewer answers with a result block; the taxonomy and
+            // restatement rules made reviewers invent extra keys and spend
+            // turns narrating instead of verifying.
+            assert!(!prompt.system.contains(FAILURE_TAXONOMY_LINE));
+            assert!(!prompt.system.contains("Before acting, restate objective"));
+            continue;
+        }
         assert!(
             prompt.system.contains(FAILURE_TAXONOMY_LINE),
             "{builder_id} missing failure taxonomy"
@@ -295,8 +303,11 @@ fn reviewer_base_prompt_defers_the_frozen_contract_to_launch() {
         .contains("Reviewer findings: Write findings in your Markdown review."));
     assert!(prompt
         .system
-        .contains("Each BLOCKING finding must include evidence"));
+        .contains("Each BLOCKING finding must be reproducible"));
     assert!(prompt.system.contains("expected vs actual behavior"));
+    assert!(prompt
+        .system
+        .contains("Decide whether the change works by exercising it"));
     assert!(prompt
         .system
         .contains("Separate NON-BLOCKING findings from BLOCKING findings."));

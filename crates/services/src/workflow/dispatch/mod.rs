@@ -77,10 +77,10 @@ Proof of behaviour is a captured artifact, not prose: when a change alters UI or
 A worklog entry never moves the Task and never satisfies an acceptance check.";
 
 const NATIVE_REVIEW_REPORT_CONTRACT: &str = "\
-Review report: record what you verified with `task.worklog` (append) entries -- kind `validation` for a check you ran, `blocker` for what stopped you -- and capture the command output or screenshot behind a finding with `task.evidence` (capture). These are the only writes you may make; the verdict itself still belongs in the findings JSON.";
+Review report: record what you verified with `task.worklog` (append) entries -- kind `validation` for a check you ran, `blocker` for what stopped you -- and capture the command output or screenshot behind a finding with `task.evidence` (capture). These are your only Forge writes; the verdict itself belongs in the result block that ends your reply.";
 
 const OUTBOX_REVIEW_REPORT_CONTRACT: &str = "\
-Review report: this harness has no Forge tools. The directory named by the `FORGE_OUTBOX` environment variable is the only place you may write; Forge ingests it when this run ends. Append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl` for what you verified -- {\"kind\":\"validation\",\"summary\":\"...\"} for a check you ran, `blocker` for what stopped you -- and one per artifact to `$FORGE_OUTBOX/evidence.jsonl` for the output behind a finding -- {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}, or a `path` to a file you saved under `$FORGE_OUTBOX`. The verdict itself still belongs in the findings JSON.";
+Review report: this harness has no Forge tools. The directory named by the `FORGE_OUTBOX` environment variable is the only place you may write your report (build output and scratch files elsewhere are discarded with the worktree); Forge ingests it when this run ends. Append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl` for what you verified -- {\"kind\":\"validation\",\"summary\":\"...\"} for a check you ran, `blocker` for what stopped you -- and one per artifact to `$FORGE_OUTBOX/evidence.jsonl` for the output behind a finding -- {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}, or a `path` to a file you saved under `$FORGE_OUTBOX`, such as a screenshot. The verdict itself belongs in the result block that ends your reply.";
 
 /// Tell an implementing agent exactly which checks gate review and how they
 /// run. Without this the agent validates with whatever interpreter or command

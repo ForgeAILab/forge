@@ -689,11 +689,16 @@ current. A stale-progress scan can append a distinct, atomically revalidated
 `execution.progress_warning` Attention event; it does not fail a live lease or
 turn a warning into owner death.
 
-`hard_deadline_at` is derived from the admitted profile/capability snapshot
-and is a fixed upper bound. Heartbeats are clamped to it and cannot extend
-the deadline. The monitor treats an expired owner lease and a reached hard
-deadline as different recovery causes (`execution.stalled` with an
-`execution_lease_expired` reconciliation reason versus
+`hard_deadline_at` is optional execution policy. By default it is `NULL`, so
+Forge imposes no wall-clock ceiling: the owner can keep the attempt live by
+renewing its short lease. A caller can opt one new execution into a limit with
+the positive `overrides.hard_deadline_seconds` value; Forge records the
+resolved timestamp on that execution, and the first lease claim makes it
+immutable. Heartbeats are then clamped to the deadline and cannot extend it.
+Generic executor settings such as a shell command's `timeout_seconds` never
+become execution deadlines. The monitor treats an expired owner lease and a
+reached configured deadline as different recovery causes (`execution.stalled`
+with an `execution_lease_expired` reconciliation reason versus
 `execution.hard_deadline_exceeded`) and never treats semantic silence alone as
 expiry.
 
@@ -1429,14 +1434,24 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
+Forge does not configure Agent Runtime's tool-step or turn-time limits; their
+defaults are `None`. Task workflow `max_turns` is also optional and has no
+default. CLI Task execution, including Smith, receives no max-turn value unless
+the governing Task/workflow explicitly sets one. A per-execution wall-clock
+deadline is likewise opt-in through `hard_deadline_seconds`, as described in
+the liveness contract above.
+
 Agent Runtime terminal limits retain their typed cause across the host boundary:
 `provider_attempts`, `tool_steps`, `time`, or `output`. These are distinct from
-the Task workflow's optional `max_turns` policy. Exhausted provider attempts on
-a native Task are classified as `ExecutorUnavailable`, use the ordinary
-provider cooldown when no retry hint survives the runtime boundary, and defer
-every execution role (including planner/reviewer) without consuming the Task's
-execution retry budget. Output, tool-step, and runtime-time limits remain Task
-execution failures and preserve their exact limit in the execution error.
+the Task workflow's optional `max_turns` policy and optional execution hard
+deadline. Exhausted provider attempts on a native Task are classified as
+`ExecutorUnavailable`, use the ordinary provider cooldown when no retry hint
+survives the runtime boundary, and defer every execution role (including
+planner/reviewer) without consuming the Task's execution retry budget. Model
+context/output bounds and finite failed-provider retry policy remain intrinsic
+runtime safety constraints, not productive-work turn or wall-clock budgets.
+If an explicit runtime tool/time/output policy produces a limit, the failure
+preserves its exact typed cause in the execution error.
 
 Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
 scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
@@ -1831,8 +1846,8 @@ Remote output, reasoning, and tool notifications update semantic progress
 when accepted, but a quiet remote execution remains healthy while its lease is
 current. Stale semantic progress may create a separate
 `execution.progress_warning` Attention item. Only owner-lease expiry or the
-profile/capability hard deadline is an execution-liveness terminal condition;
-the hard deadline is not extended by heartbeat renewal.
+execution's explicitly configured hard deadline is an execution-liveness
+terminal condition; the hard deadline is not extended by heartbeat renewal.
 
 ### Task terminal sessions
 
@@ -1922,7 +1937,10 @@ plans internally, implements, self-tests, repairs ordinary unfinished-worktree
 failures, and reports verification evidence, so the preset has no planning
 state or plan-checklist gate. A real branch conflict goes back to the
 worker, but Forge does the Git part: managed agents cannot rebase or write
-linked Git metadata, so when the rebase onto a moved target conflicts Forge
+linked Git metadata, so when the rebase onto a moved target conflicts — or a
+candidate without an agent review contract (human reviewer, or no reviewer)
+hits a plain merge conflict, which Forge then rebases the same way unless the
+`merge_fix` budget is 0 — Forge
 commits each text-content conflict step with its conflict markers, finishes the
 rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
 the affected paths. The worker reconciles those files by editing and committing them, and the
@@ -2378,7 +2396,12 @@ supersedes any blocking annotation — `recover_task` only accepts
 actions are offered. The web UI renders one actionable recovery surface,
 `WorkflowExceptionPanel`, on both the task page and the board modal;
 `TaskBlockingBanner` is an informational fallback for interruption states
-without recovery actions.
+without recovery actions. Generic execution follow-ups remain non-propagating
+side sessions: they can preserve an agent conversation, but they cannot settle
+a Review or advance Task state and are not shown beside an active workflow
+exception. Review guidance is submitted through the exception's `reexecute`
+action so the replacement reviewer execution is bound to the authoritative
+Review attempt and may propagate its result.
 
 `transition_log` is the audit source of truth for state changes. The API
 exposes it via `GET /api/v1/tasks/{id}/transitions`.
@@ -2654,13 +2677,28 @@ Forge's own setup steps and required checks, not the reviewer's citations: a
 failing check fails the review whatever the reviewer said, and a `pass` on a
 Task with no configured checks rests on the reviewer's judgment alone.
 
+The server contract tells the reviewer to verify by exercising the change —
+build it, run its tests, and drive the changed behavior programmatically or
+visually — rather than by reading code, and to stop once it can answer three
+questions: does the change work, is the changed behavior tested, and does the
+delta stay inside the Task (unrelated refactors, churn, or new dependencies are
+a blocking finding). To save the reviewer's opening tool calls,
+`review::contract::prepare_prompt` appends the candidate diff (`git diff --stat`
+plus the full diff when it fits in 48 KiB) and, on a re-review, the latest
+earlier verdict with its reason, a bounded slice of its report, and the diff
+since the commit it judged when that commit is still an ancestor. These
+sections are best effort and stay inside the prepared-prompt byte limit.
+
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
 follows the review-remediation budget, with the reason and Markdown review as the
 coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
-with a `review_blocked` blocking annotation (recovery: `reexecute`) for its owner,
-because neither the coder nor another reviewer can install a missing toolchain.
+with a `review_blocked` blocking annotation for its owner, because neither the
+coder nor another reviewer can install a missing toolchain. The owner can retry
+the authoritative reviewer with required guidance (`reexecute` plus `context`),
+or manually pass with a required reason. A manual pass appends a new passed
+Review attempt with user provenance; it never rewrites the failed attempt.
 A reply with no readable result block, or a review whose context or commit
 changed underneath it, is `unverified`: it uses the bounded reviewer
 execution-retry path, eventually creates a durable execution blocker, and never

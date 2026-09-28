@@ -1,10 +1,11 @@
 use std::{collections::HashMap, str::FromStr};
 
 use api_types::{
-    parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, StateKind, StepResultEntry,
-    StepResultResponse, Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
-    TaskRoleAssignmentResponse, TaskType, UsageAggregate, WorkspaceResponse,
+    parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse,
+    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
+    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
+    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
+    UsageAggregate, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -1130,6 +1131,62 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
     }
 }
 
+const EXECUTION_SUMMARY_MAX_CHARS: usize = 500;
+const RESUME_EXECUTION_POLICY: &str = "resume_latest_target_role_thread";
+
+pub fn execution_summary_response(execution: Execution) -> ExecutionSummaryResponse {
+    let is_resume = execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .is_some_and(execution_snapshot_is_resume);
+    ExecutionSummaryResponse {
+        id: execution.id,
+        task_id: execution.task_id,
+        agent_id: execution.agent_id,
+        role: execution.role,
+        status: execution_status_response(execution.status),
+        parent_execution_id: execution.parent_execution_id,
+        agent_session_id: execution.agent_session_id,
+        summary: execution.summary.map(bounded_execution_summary),
+        is_resume,
+        workspace_id: execution.workspace_id,
+        created_at: execution.created_at,
+        updated_at: execution.updated_at,
+    }
+}
+
+fn bounded_execution_summary(summary: String) -> String {
+    let Some((end, _)) = summary.char_indices().nth(EXECUTION_SUMMARY_MAX_CHARS) else {
+        return summary;
+    };
+    summary[..end].to_owned()
+}
+
+fn execution_snapshot_is_resume(snapshot_json: &str) -> bool {
+    let Ok(snapshot) = serde_json::from_str::<Value>(snapshot_json) else {
+        return false;
+    };
+    let has_resume_policy = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("execution_policy"))
+            .and_then(Value::as_str)
+            == Some(RESUME_EXECUTION_POLICY)
+    };
+    if has_resume_policy("dispatch") || has_resume_policy("dispatch_metadata") {
+        return true;
+    }
+    let config = snapshot.get("config").and_then(Value::as_object);
+    config
+        .and_then(|value| value.get("resume_thread_in_place"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        || config
+            .and_then(|value| value.get("resume_session_id"))
+            .is_some_and(Value::is_string)
+}
+
 fn execution_owner_health(
     execution: &Execution,
     now: DateTime<Utc>,
@@ -1554,7 +1611,7 @@ mod idempotency_tests {
 
 #[cfg(test)]
 mod execution_liveness_response_tests {
-    use super::{execution_response, Execution};
+    use super::{execution_response, execution_summary_response, Execution};
     use chrono::{Duration, Utc};
 
     fn running_execution() -> Execution {
@@ -1651,6 +1708,20 @@ mod execution_liveness_response_tests {
         let interruption = response.interruption.expect("timeout interruption");
         assert_eq!(interruption.kind.as_deref(), Some("agent_timeout"));
         assert_eq!(interruption.reason, "agent_timeout");
+    }
+
+    #[test]
+    fn summary_bounds_unicode_and_projects_resume_without_exposing_snapshot() {
+        let mut execution = running_execution();
+        execution.summary = Some("界".repeat(600));
+        execution.executor_config_snapshot_json = Some(
+            r#"{"config":{"resume_session_id":"provider-session","private":"secret"}}"#.to_owned(),
+        );
+
+        let response = execution_summary_response(execution);
+
+        assert!(response.is_resume);
+        assert_eq!(response.summary.expect("summary").chars().count(), 500);
     }
 }
 

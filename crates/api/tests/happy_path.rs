@@ -6,7 +6,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
-    ExecutionResponse, ExecutionStatus, PaginatedResponse, ProjectResponse, RepoResponse,
+    ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse,
     TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
     TerminalSessionResponse, TerminalSessionStatus,
 };
@@ -826,8 +826,8 @@ async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResp
     panic!("task did not reach human review within timeout");
 }
 
-async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionSummaryResponse {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions"),
@@ -842,9 +842,9 @@ async fn poll_until_follow_up_execution(
     app: &Router,
     task_id: &str,
     parent_execution_id: &str,
-) -> ExecutionResponse {
+) -> ExecutionSummaryResponse {
     for _ in 0..100 {
-        let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+        let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
             app,
             Method::GET,
             &format!("/api/v1/tasks/{task_id}/executions"),

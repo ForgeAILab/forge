@@ -95,6 +95,9 @@ pub struct ExecutionOverrides {
     pub model_id: Option<String>,
     pub reasoning_effort: Option<String>,
     pub permission_policy: Option<String>,
+    /// Optional wall-clock limit for this execution attempt. This is server
+    /// policy metadata and is not forwarded as executor CLI configuration.
+    pub hard_deadline_seconds: Option<u32>,
 }
 
 /// Typed adapter trait for CLI-specific executor implementations.

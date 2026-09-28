@@ -22,6 +22,8 @@ function execution(overrides: Partial<Execution>): Execution {
 
 describe('execution utils', () => {
   it('detects resume executions from dispatch metadata and executor fallback config', () => {
+    expect(isResumeExecution(execution({ is_resume: true }))).toBe(true)
+
     expect(
       isResumeExecution(
         execution({

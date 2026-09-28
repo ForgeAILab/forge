@@ -606,10 +606,10 @@ pub fn derive_workflow_exception_with_running_interactive(
             if reviewer_execution_failed {
                 actions.push(action(
                     RecoveryAction::MarkReviewed,
-                    "Pass Review",
+                    "Pass Review Manually",
                     true,
                     None,
-                    false,
+                    true,
                     false,
                     true,
                     Some(
@@ -1308,12 +1308,18 @@ fn annotation_actions(
     open_interactive_target: Option<&Execution>,
     open_interactive_launch_authority: bool,
 ) -> Vec<WorkflowExceptionAction> {
-    annotation
+    let mut actions = annotation
         .recovery_actions
         .iter()
         .copied()
         .map(|kind| {
             let terminal = task_is_terminal(workflow, task);
+            let manual_review_pass = kind == RecoveryAction::MarkReviewed;
+            let manual_review_pass_available = task.status
+                == crate::workflow::default_states::REVIEW
+                && latest_failed_review(latest_review).is_some();
+            let guided_review_retry = kind == RecoveryAction::Reexecute
+                && task.status == crate::workflow::default_states::REVIEW;
             let terminal_review = matches!(kind, RecoveryAction::ResumeSession)
                 && annotation
                     .blocked_execution_id
@@ -1362,9 +1368,13 @@ fn annotation_actions(
                                     )
                             })
                     }));
-            let enabled = !terminal && !resume_unavailable;
+            let enabled = !terminal
+                && !resume_unavailable
+                && (!manual_review_pass || manual_review_pass_available);
             let disabled_reason = if terminal {
                 Some("Task is in terminal state".to_owned())
+            } else if manual_review_pass && !manual_review_pass_available {
+                Some("Manual pass requires a latest failed review attempt".to_owned())
             } else if terminal_review {
                 Some(
                     "The bound reviewer Review attempt is terminal; start a fresh review attempt"
@@ -1375,9 +1385,13 @@ fn annotation_actions(
             } else {
                 None
             };
-            let resume_target = matches!(kind, RecoveryAction::ResumeProcess)
-                .then(|| gate_reject_target(workflow, task))
-                .flatten();
+            let resume_target = if kind == RecoveryAction::ResumeProcess {
+                gate_reject_target(workflow, task)
+            } else if manual_review_pass {
+                review_pass_target(workflow, task)
+            } else {
+                None
+            };
             let resume_role = resume_target
                 .as_deref()
                 .and_then(|target| workflow_role(workflow, target));
@@ -1405,15 +1419,25 @@ fn annotation_actions(
             }
             action(
                 kind,
-                recovery_label(kind),
+                if guided_review_retry {
+                    "Retry Review with Guidance"
+                } else if manual_review_pass {
+                    "Pass Review Manually"
+                } else {
+                    recovery_label(kind)
+                },
                 enabled,
                 disabled_reason,
-                matches!(kind, RecoveryAction::ProceedOnce),
-                matches!(kind, RecoveryAction::ProceedOnce),
+                matches!(
+                    kind,
+                    RecoveryAction::ProceedOnce | RecoveryAction::MarkReviewed
+                ),
+                matches!(kind, RecoveryAction::ProceedOnce) || guided_review_retry,
                 matches!(
                     kind,
                     RecoveryAction::ResumeSession
                         | RecoveryAction::Reexecute
+                        | RecoveryAction::MarkReviewed
                         | RecoveryAction::ProceedOnce
                         | RecoveryAction::ResumeProcess
                         | RecoveryAction::RetryHook
@@ -1425,7 +1449,31 @@ fn annotation_actions(
                 target_execution_id,
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Older review-blocked annotations predate the manual override action.
+    // The action remains state-derived and self-validating so those persisted
+    // Tasks gain the safe recovery without rewriting historical annotations.
+    if task.status == crate::workflow::default_states::REVIEW
+        && latest_failed_review(latest_review).is_some()
+        && !actions
+            .iter()
+            .any(|action| action.kind == RecoveryAction::MarkReviewed)
+    {
+        actions.push(action(
+            RecoveryAction::MarkReviewed,
+            "Pass Review Manually",
+            true,
+            None,
+            true,
+            false,
+            true,
+            review_pass_target(workflow, task),
+            role,
+            None,
+        ));
+    }
+    actions
 }
 
 fn recovery_unavailable(
@@ -1497,7 +1545,7 @@ fn open_interactive_action(
     let has_running_interactive = running_interactive_execution.is_some();
     action(
         RecoveryAction::OpenInteractive,
-        "Open Interactive",
+        "Open Side Session",
         has_target && !has_running_interactive,
         if has_running_interactive {
             Some("An interactive execution is already running".to_owned())
@@ -1578,14 +1626,14 @@ fn recovery_label(kind: RecoveryAction) -> &'static str {
         RecoveryAction::Reexecute => "Re-execute",
         RecoveryAction::ResetToInitial => "Reset to Initial",
         RecoveryAction::CancelTask => "Cancel Task",
-        RecoveryAction::MarkReviewed => "Mark Reviewed",
+        RecoveryAction::MarkReviewed => "Pass Review Manually",
         RecoveryAction::RetryHook => "Retry Hook",
         RecoveryAction::ResumeProcess => "Resume Process",
         RecoveryAction::UpdateWorkspaceAndRetryHook => "Update Workspace and Retry Hook",
         RecoveryAction::SkipHookOnce => "Skip Hook Once",
         RecoveryAction::ResetRetryWindow => "Reset Retry Window",
         RecoveryAction::ProceedOnce => "Proceed Once",
-        RecoveryAction::OpenInteractive => "Open Interactive",
+        RecoveryAction::OpenInteractive => "Open Side Session",
     }
 }
 

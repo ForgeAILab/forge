@@ -112,10 +112,31 @@ pub struct TaskResponse {
     pub updated_at: String,
 }
 
+/// Compact execution projection used by collection and task-bootstrap
+/// endpoints. Large diagnostics remain available from `GET /executions/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExecutionSummaryResponse {
+    pub id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub role: ExecutionRole,
+    pub status: ExecutionStatus,
+    pub parent_execution_id: Option<String>,
+    pub agent_session_id: Option<String>,
+    /// A bounded preview of the execution summary (at most 500 characters).
+    pub summary: Option<String>,
+    /// Whether this execution resumed an existing provider session.
+    pub is_resume: bool,
+    pub workspace_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskDetailExecutionsPage {
-    pub items: Vec<ExecutionResponse>,
+    pub items: Vec<ExecutionSummaryResponse>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub total_count: Option<u64>,

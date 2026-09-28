@@ -12,7 +12,7 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
-    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
+    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -364,8 +364,8 @@ async fn poll_until_execution_status(
     panic!("execution did not reach {expected:?} within timeout");
 }
 
-async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionResponse {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionSummaryResponse {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions"),

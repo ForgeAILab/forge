@@ -1284,6 +1284,7 @@ impl TaskService {
             hook: None,
             recovery_actions: vec![
                 api_types::RecoveryAction::Reexecute,
+                api_types::RecoveryAction::MarkReviewed,
                 api_types::RecoveryAction::OpenInteractive,
                 api_types::RecoveryAction::CancelTask,
             ],

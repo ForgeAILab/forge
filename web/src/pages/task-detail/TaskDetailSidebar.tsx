@@ -98,8 +98,8 @@ export function TaskDetailSidebar({
   ]
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-r bg-background">
-      <div className="border-b px-4 py-3">
+    <aside className="flex w-full shrink-0 flex-col border-b bg-background md:w-60 md:border-r md:border-b-0">
+      <div className="hidden border-b px-4 py-3 md:block">
         <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
           Task
         </p>
@@ -120,14 +120,14 @@ export function TaskDetailSidebar({
           </>
         ) : null}
       </div>
-      <nav className="flex flex-1 flex-col gap-0.5 p-2">
+      <nav className="flex gap-0.5 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-visible">
         {navItems.map(({ id, label, Icon: NavIcon, badge }) => (
           <Link
             key={id}
             to={id === 'overview' ? '/tasks/$taskId' : '/tasks/$taskId/$tab'}
             params={{ taskId, tab: id }}
             className={cn(
-              'relative flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
+              'relative flex w-auto shrink-0 cursor-pointer items-center gap-2.5 whitespace-nowrap rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors md:w-full',
               activeTab === id
                 ? 'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary'
                 : 'text-sidebar-foreground hover:bg-accent/50 hover:text-foreground',

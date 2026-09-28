@@ -1270,7 +1270,8 @@ pub trait ExecutionRepo: Send + Sync {
     async fn update(&self, input: UpdateExecution) -> Result<Execution>;
     /// Claim or take over an execution lease through the execution-version
     /// compare-and-swap boundary.  A takeover is allowed only after the prior
-    /// lease has expired; a first claim fixes the hard deadline.
+    /// lease has expired. A first claim fixes an explicitly configured hard
+    /// deadline; without one, the renewable owner lease is the only clock.
     async fn claim_lease(&self, input: ClaimExecutionLease) -> Result<ExecutionLeaseMutation>;
     /// Renew an owner-bound lease without consulting streamed output.  The
     /// returned mutation is typed so a caller can distinguish a concurrent
@@ -1669,6 +1670,14 @@ pub trait ReviewRepo: Send + Sync {
         expected_workflow_definition: Option<&str>,
         expected_candidate_execution_id: Option<&str>,
     ) -> Result<Review>;
+    /// Atomically record a user override of the latest failed Review as a new
+    /// passed attempt and update the Task review projection. The failed source
+    /// row remains immutable and all authority checks run under one writer
+    /// transaction.
+    async fn create_manual_pass_with_task_authority(
+        &self,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)>;
     /// Atomically reserve the next Review attempt with its Running execution
     /// and initial lease. The attempt number is allocated under the same
     /// writer transaction as both inserts, so a failed Review insert cannot
@@ -3221,6 +3230,21 @@ pub struct CreateReview {
     pub started_at: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateManualReviewPass {
+    pub id: String,
+    pub source_review_id: String,
+    pub source_review_updated_at: String,
+    pub task_id: String,
+    pub candidate_execution_id: String,
+    pub step_results_json: String,
+    pub expected_task_version: i64,
+    pub expected_task_status: String,
+    pub expected_project_version: i64,
+    pub expected_workflow_definition: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
