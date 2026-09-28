@@ -27,7 +27,7 @@ use config::PublicSearchConfig;
 use db::{
     AgentAction, AgentActionListQuery, AgentActionPolicyResult, AgentActionRepo,
     AgentCommitmentListQuery, AgentCommitmentRepo, AgentInboxListQuery, AgentInboxRepo,
-    CommandReceiptRepo, MemoryScopeGrant, SqliteDb,
+    CommandReceiptRepo, MemoryScopeGrant, SqliteDb, TaskBoardRepo,
 };
 use forge_agent_host::{
     contains_adaptive_authority_override, contains_authority_override, operation_contract,
@@ -1899,7 +1899,17 @@ impl CoordinationToolProvider {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({"items": items}))
+        // `task.adaptive` requires `expected_board_revision`; this read is the
+        // only place a Project Agent can learn it without a failed command.
+        let board_revision = match project_scope_id.as_deref() {
+            Some(project_id) => Some(
+                TaskBoardRepo::board_revision(&*self.db, project_id)
+                    .await
+                    .map_err(|_| AgentHostError::ProtectedPersistence)?,
+            ),
+            None => None,
+        };
+        Ok(json!({"board_revision": board_revision, "items": items}))
     }
 
     async fn read_events(
@@ -3996,7 +4006,7 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
     if let Some(version) = current.version {
         let field = match operation {
             _ if current.resource_type == "project" => "expected_project_version",
-            TASK_CANCEL_OPERATION => "expected_task_version",
+            TASK_CANCEL_OPERATION | TASK_ADAPTIVE_OPERATION => "expected_task_version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
@@ -4005,6 +4015,13 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
             _ => "expected_version",
         };
         retry.arguments.insert(field.to_owned(), json!(version));
+    }
+    if let Some(revision) = current.revision {
+        if matches!(operation, TASK_ADAPTIVE_OPERATION) {
+            retry
+                .arguments
+                .insert("expected_board_revision".to_owned(), json!(revision));
+        }
     }
     if let Some(revision_id) = current.revision_id.as_deref() {
         if matches!(operation, PROJECT_DOCUMENT_OPERATION) {
