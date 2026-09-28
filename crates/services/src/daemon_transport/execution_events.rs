@@ -206,7 +206,7 @@ impl ServerExecutionEventSink {
                 .hard_deadline_at
                 .as_deref()
                 .and_then(parse_rfc3339)
-                .is_none_or(|deadline| deadline <= now);
+                .is_some_and(|deadline| deadline <= now);
             if lease_expired || hard_deadline_reached {
                 tracing::debug!(
                     sending_daemon = %daemon_id,

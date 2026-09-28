@@ -141,22 +141,36 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     .await;
     assert_eq!(reject.code, "internal_error");
 
-    let mark_reviewed: ErrorResponse = common::json_request(
-        &harness.app,
-        Method::POST,
-        &format!("/api/v1/tasks/{task_id}/recover"),
-        json!({ "action": "mark_reviewed" }),
-        StatusCode::INTERNAL_SERVER_ERROR,
-    )
-    .await;
-    assert_eq!(mark_reviewed.code, "internal_error");
-
     let review = ReviewRepo::get_by_id(&*harness.state.db, &review_id)
         .await
         .expect("fixture review lookup")
         .expect("fixture review exists");
     assert_eq!(review.status, ReviewStatus::AwaitingHuman);
     assert_eq!(review.step_results_json, "{not-json");
+
+    // A manual pass only applies to a failed review, so it needs its own
+    // failed fixture to reach the persisted details.
+    let (failed_review_id, failed_task_id) = seed_review_with_status(
+        &harness.state.db,
+        "{not-json".to_owned(),
+        ReviewStatus::Failed,
+    )
+    .await;
+    let mark_reviewed: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{failed_task_id}/recover"),
+        json!({ "action": "mark_reviewed", "reason": "owner verified the change" }),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(mark_reviewed.code, "internal_error");
+    let failed_review = ReviewRepo::get_by_id(&*harness.state.db, &failed_review_id)
+        .await
+        .expect("failed fixture review lookup")
+        .expect("failed fixture review exists");
+    assert_eq!(failed_review.status, ReviewStatus::Failed);
+    assert_eq!(failed_review.step_results_json, "{not-json");
 }
 
 #[tokio::test]

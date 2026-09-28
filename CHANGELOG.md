@@ -36,6 +36,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Unbounded remote executions (no `hard_deadline_at`, the new default) no
+  longer drop every daemon notification. A missing deadline was treated as
+  already reached, so logs and progress were rejected; progress CAS and
+  stall warnings also required a deadline.
+
 - Smith, other CLI Task agents, direct/native agents, and reviewer executions
   no longer receive Forge's implicit 30-minute wall-clock deadline (or its
   hidden 24-hour ceiling). Executions are unlimited by default while their

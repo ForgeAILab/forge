@@ -10342,3 +10342,119 @@ async fn project_delete_survives_immutable_rows_that_reference_a_sibling() {
         assert_eq!(count, 0, "{table} row survived Project teardown");
     }
 }
+
+/// Unbounded executions (the default since Task runs lost their implicit wall
+/// clock) carry no `hard_deadline_at`. Progress must still commit — a NULL
+/// deadline failed the SQL guard and `None <= Some(now)` then misreported it
+/// as a reached deadline, so every remote log/progress update was rejected —
+/// and a stalled unbounded run must still be able to raise a warning.
+#[tokio::test]
+async fn unbounded_execution_records_progress_and_progress_warnings() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Unbounded execution progress",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let execution_id = new_uuid_v4();
+    let now = "2026-08-21T00:00:00Z";
+    let claimed = ExecutionRepo::create_with_lease(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "remote:unbounded-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:30Z".to_owned(),
+            hard_deadline_at: None,
+            now: now.to_owned(),
+        },
+    )
+    .await
+    .expect("unbounded lease claim commits");
+    assert_eq!(claimed.hard_deadline_at, None);
+
+    let progressed = match ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:05Z".to_owned(),
+            now: "2026-08-21T00:00:05Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress call succeeds")
+    {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("an unbounded execution must accept progress: {other:?}"),
+    };
+    assert_eq!(
+        progressed.last_progress_at.as_deref(),
+        Some("2026-08-21T00:00:05Z")
+    );
+
+    let stale = ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:06Z".to_owned(),
+            now: "2026-08-21T00:00:06Z".to_owned(),
+        },
+    )
+    .await
+    .expect("stale progress call succeeds");
+    assert!(
+        matches!(stale, ExecutionLeaseMutation::Concurrent { .. }),
+        "a stale version is a concurrent write, not a reached deadline: {stale:?}"
+    );
+
+    let warning = ExecutionRepo::record_progress_warning(
+        &db,
+        crate::RecordExecutionProgressWarning {
+            execution_id: execution_id.clone(),
+            expected_version: progressed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            expected_last_progress_at: progressed.last_progress_at.clone(),
+            stale_before: "2026-08-21T00:00:10Z".to_owned(),
+            now: "2026-08-21T00:00:20Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress warning call succeeds");
+    assert!(
+        matches!(warning, ExecutionProgressWarningOutcome::Committed { .. }),
+        "a stalled unbounded execution must raise a warning: {warning:?}"
+    );
+}

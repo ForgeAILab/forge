@@ -698,7 +698,10 @@ impl ExecutionRepo for SqliteDb {
         });
         if !eligible {
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -732,7 +735,7 @@ impl ExecutionRepo for SqliteDb {
                AND execution_version = ?
                AND lease_owner = ?
                AND lease_expires_at > ?
-               AND hard_deadline_at > ?",
+               AND (hard_deadline_at IS NULL OR hard_deadline_at > ?)",
         )
         .bind(&input.progress_at)
         .bind(&input.now)
@@ -746,7 +749,10 @@ impl ExecutionRepo for SqliteDb {
         if result.rows_affected() != 1 {
             let current = execution_in_tx(&mut transaction, &input.execution_id).await?;
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -845,7 +851,7 @@ impl ExecutionRepo for SqliteDb {
                 && execution
                     .hard_deadline_at
                     .as_deref()
-                    .is_some_and(|deadline| deadline > input.now.as_str())
+                    .is_none_or(|deadline| deadline > input.now.as_str())
                 && match (
                     execution.last_progress_at.as_deref(),
                     input.expected_last_progress_at.as_deref(),

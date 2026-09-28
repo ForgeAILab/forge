@@ -2878,8 +2878,9 @@ async fn a_reply_without_a_result_uses_bounded_reviewer_execution_retry() {
         )
         .await
         .expect("coder executions load"),
-        0,
-        "unverified reviewer evidence must never dispatch coder remediation"
+        1,
+        "unverified reviewer evidence must never dispatch coder remediation \
+         (the one coder execution is the seeded review candidate)"
     );
 }
 
