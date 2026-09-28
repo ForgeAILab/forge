@@ -927,7 +927,10 @@ Its closed payload is one of `split`, `sequence`, or `replace`, and always
 includes `source_task_id`, `expected_task_version`,
 `expected_board_revision`, and `rationale`; the action-specific fields are a
 non-empty child `items` list, an ordered Task-id list, or replacement
-`title`/optional `description`. Project, scope, actor, permission,
+`title`/optional `description`. The Project Agent reads the current Task
+`version` and the Project `board_revision` from `work.read`; a
+`version_conflict` returns both in `current_version_or_revision` and as
+`expected_task_version`/`expected_board_revision` retry arguments. Project, scope, actor, permission,
 governance and fixed-boundary values are derived from the authenticated
 binding and Task traceability; unknown or override fields are rejected. All three verbs are available under the current Charter. The
 adapter calls the shared Task command directly, creates no `AgentAction`, and

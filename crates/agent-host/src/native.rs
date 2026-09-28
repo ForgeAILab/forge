@@ -10,7 +10,7 @@ use agent_runtime::{
     core::{
         cancel::CancelReason,
         catalog::{ModelLimits, ResolvedModelProfile},
-        content::{ContentPart, Role, UserInput},
+        content::{ContentPart, Message, Role, UserInput},
         error::RuntimeError,
         event::{RuntimeEvent, TurnFinish},
         ids::{SessionId, ToolCallId},
@@ -275,7 +275,9 @@ fn conversation_budget_tokens(
 ///   "LCM context cannot fit after bounded hard compaction" with the
 ///   frontier permanently stuck in front of the oversized turn. Scale the
 ///   target with the profile's output cap so one leaf can always swallow a
-///   full turn pair.
+///   full turn pair. An agentic turn is not bounded by one reply — its tool
+///   loop can outgrow any target — so the runtime also takes an oversized
+///   oldest turn whole as one leaf rather than returning no plan.
 /// - `max_rounds`: 3 rounds cannot walk a chat back under budget once it has
 ///   drifted deep past hard pressure. Sixteen rounds cover a full
 ///   provider-window overrun in one attempt; each round is a cheap local
@@ -300,6 +302,43 @@ fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::
         hard_threshold_percent: 85,
         ..agent_runtime::lcm::LcmPressurePolicy::default()
     }
+}
+
+/// Sent in place of a retried message that is already in the durable
+/// session history without a reply.
+const RETRY_CONTINUATION_INPUT: &str = "Your previous attempt to answer the message above \
+ended in an error before you replied. Continue from where you left off; do not repeat \
+work that already succeeded.";
+
+/// A failed turn keeps its user input (and any tool rounds it ran) in the
+/// persistent session history, and every retry of the same chat message sends
+/// that text again, so the model saw the identical request once per attempt.
+/// When the most recent real user message in history is this input and no
+/// final assistant reply follows it, send a short continuation instead.
+fn retry_aware_input(history: &[Message], input: String) -> String {
+    for message in history.iter().rev() {
+        match message.role {
+            Role::Assistant
+                if message.tool_calls().next().is_none()
+                    && !message.joined_text().trim().is_empty() =>
+            {
+                return input;
+            }
+            Role::User => {
+                let text = message.joined_text();
+                if text == RETRY_CONTINUATION_INPUT {
+                    continue;
+                }
+                return if text == input {
+                    RETRY_CONTINUATION_INPUT.to_owned()
+                } else {
+                    input
+                };
+            }
+            _ => {}
+        }
+    }
+    input
 }
 
 fn task_structural_compactor(max_input_tokens: u32) -> StructuralCompactor {
@@ -584,8 +623,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             active: Arc::clone(&self.active),
             finished: false,
         };
+        let input = session.with_history(|history| retry_aware_input(history, request.input));
         let turn = session
-            .send(UserInput::text(request.input))
+            .send(UserInput::text(input))
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         let turn_id = turn.id().clone();
         let mut last_turn_error: Option<String> = None;
@@ -1237,6 +1277,66 @@ mod workspace_tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_input_tests {
+    use super::*;
+    use agent_runtime::core::content::{ToolCall, ToolResultBlock};
+
+    const ASK: &str = "break the task down with good dependencies";
+
+    fn tool_round(id: &str) -> [Message; 2] {
+        [
+            Message::assistant(vec![ContentPart::ToolCall(ToolCall {
+                id: ToolCallId::new(id),
+                name: "propose".into(),
+                arguments: serde_json::json!({}),
+            })]),
+            Message::tool_result(ToolResultBlock {
+                call_id: ToolCallId::new(id),
+                name: "propose".into(),
+                content: vec![ContentPart::text("version_conflict")],
+                is_error: true,
+            }),
+        ]
+    }
+
+    #[test]
+    fn a_first_attempt_sends_the_message() {
+        let history = vec![
+            Message::user("earlier"),
+            Message::assistant(vec![ContentPart::text("done")]),
+        ];
+        assert_eq!(retry_aware_input(&history, ASK.to_owned()), ASK);
+        assert_eq!(retry_aware_input(&[], ASK.to_owned()), ASK);
+    }
+
+    #[test]
+    fn a_retry_after_an_unanswered_tool_loop_continues_instead_of_repeating() {
+        let mut history = vec![Message::user(ASK)];
+        history.extend(tool_round("call-1"));
+        history.extend(tool_round("call-2"));
+        assert_eq!(
+            retry_aware_input(&history, ASK.to_owned()),
+            RETRY_CONTINUATION_INPUT
+        );
+        // A later retry skips the continuation it already sent.
+        history.push(Message::user(RETRY_CONTINUATION_INPUT));
+        assert_eq!(
+            retry_aware_input(&history, ASK.to_owned()),
+            RETRY_CONTINUATION_INPUT
+        );
+    }
+
+    #[test]
+    fn an_answered_message_sent_again_is_a_new_request() {
+        let history = vec![
+            Message::user(ASK),
+            Message::assistant(vec![ContentPart::text("here is the plan")]),
+        ];
+        assert_eq!(retry_aware_input(&history, ASK.to_owned()), ASK);
     }
 }
 
