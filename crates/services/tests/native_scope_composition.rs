@@ -36,7 +36,7 @@ use forge_agent_host::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
     TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
@@ -1167,10 +1167,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
 
     // The remaining migrated contracts are asserted by composition exposure
     // rather than by invocation. `project.observations` and `task.recover` are
-    // Project-scoped; `task.worklog` and `task.evidence` are Task-scoped and
-    // need a leased Task session this fixture does not build. Exposure is the
-    // property this test is named for: every migrated contract must be
-    // surfaced by scope composition in a scope that supports it.
+    // Project-scoped; `task.plan`, `task.worklog`, and `task.evidence` are
+    // Task-scoped and need a leased Task session this fixture does not build.
+    // Exposure is the property this test is named for: every migrated contract
+    // must be surfaced by scope composition in a scope that supports it.
     let project_read = project
         .tools()
         .into_iter()
@@ -1252,7 +1252,11 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .as_array()
         .expect("Task propose operation enum")
         .clone();
-    for operation in [TASK_WORKLOG_OPERATION, TASK_EVIDENCE_OPERATION] {
+    for operation in [
+        TASK_PLAN_OPERATION,
+        TASK_WORKLOG_OPERATION,
+        TASK_EVIDENCE_OPERATION,
+    ] {
         assert!(
             task_propose_operations
                 .iter()

@@ -12,17 +12,13 @@ pub(crate) fn prompt_password() -> Result<String> {
         bail!("cannot prompt for a password because stdin is not a terminal; use --password-stdin");
     }
 
+    // Do not make the prompt observable until terminal echo is disabled. A
+    // fast reader can respond as soon as the prompt is flushed; enabling raw
+    // mode afterward would briefly expose the password in the terminal.
+    let mut terminal = TerminalGuard::enter()?;
     let mut stderr = io::stderr().lock();
     write!(stderr, "Password: ").context("write password prompt")?;
     stderr.flush().context("flush password prompt")?;
-
-    let mut terminal = match TerminalGuard::enter() {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let _ = writeln!(stderr);
-            return Err(error);
-        }
-    };
     let password_result = read_hidden_password(&mut io::stdin().lock());
     let restore_result = terminal.restore();
     let newline_result = writeln!(stderr).context("finish password prompt");

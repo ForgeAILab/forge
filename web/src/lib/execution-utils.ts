@@ -1,6 +1,7 @@
 import type { Execution } from '@/types/generated'
 
 export function isResumeExecution(execution: Execution): boolean {
+  if (execution.is_resume === true) return true
   const snapshot = execution.executor_config_snapshot
   if (!snapshot) return false
   const dispatch = snapshot.dispatch as Record<string, unknown> | undefined

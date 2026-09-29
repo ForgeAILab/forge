@@ -361,6 +361,7 @@ async fn adapter_propose(
         &fixture.provider,
         AGENT_ID,
         &fixture.scope,
+        "plan04-test-session",
         operation,
         json!({
             "payload": payload,
@@ -1264,4 +1265,63 @@ async fn plan04_replace_is_allowed_even_when_the_optional_plan_lists_only_split(
         0,
         "a normal replacement must create no reconciliation row"
     );
+}
+
+/// A Project Agent that guesses `expected_board_revision` must be able to
+/// recover in one retry: `work.read` exposes the board revision, and the
+/// conflict outcome carries the current Task version and board revision as
+/// retry arguments. Without either, a live agent brute-forced 0, 1, 2, …
+/// until its single turn overflowed the context window.
+#[tokio::test]
+async fn plan04_adaptive_board_revision_conflict_carries_the_current_revision() {
+    let fixture = adapter_fixture().await;
+    let actual = board_revision(&fixture.db).await;
+
+    let work = ForgeToolProvider::read(
+        &fixture.provider,
+        AGENT_ID,
+        &fixture.scope,
+        "work.read",
+        json!({"limit": 20}),
+    )
+    .await
+    .expect("work read");
+    assert_eq!(work["board_revision"], actual, "work: {work}");
+
+    let stale = adapter_propose(
+        &fixture,
+        TASK_ADAPTIVE_OPERATION,
+        adaptive_split_payload(actual + 7),
+        "plan04-guessed-board-revision",
+    )
+    .await
+    .expect_err("a guessed board revision must conflict");
+    let AgentHostError::StructuredOutcome(outcome) = stale else {
+        panic!("expected a structured outcome, got {stale:?}");
+    };
+    assert_eq!(outcome.code.as_str(), "version_conflict");
+    let current = outcome
+        .current_version_or_revision
+        .as_ref()
+        .expect("conflict names the current state");
+    assert_eq!(current.resource_id, ROOT_TASK_ID);
+    assert_eq!(current.revision, Some(actual));
+    let retry = outcome.retry.as_ref().expect("retry instruction");
+    assert_eq!(retry.arguments["expected_board_revision"], actual);
+    assert_eq!(
+        retry.arguments["expected_task_version"],
+        json!(current.version)
+    );
+
+    let mut corrected = adaptive_split_payload(actual);
+    corrected["expected_task_version"] = retry.arguments["expected_task_version"].clone();
+    let outcome = adapter_propose(
+        &fixture,
+        TASK_ADAPTIVE_OPERATION,
+        corrected,
+        "plan04-corrected-board-revision",
+    )
+    .await
+    .expect("retry with the returned arguments succeeds");
+    assert_native_success(&outcome, TASK_ADAPTIVE_OPERATION);
 }

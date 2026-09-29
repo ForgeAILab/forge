@@ -1,8 +1,10 @@
-use crate::plan_artifact::PLAN_ARTIFACT_AGENT_INSTRUCTION;
+use crate::plan_artifact::{
+    OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION, PLAN_ARTIFACT_AGENT_INSTRUCTION,
+};
 use crate::workflow::{
     default_roles,
     dispatch::{
-        default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
+        default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder, TaskDelivery,
         BUILDER_ID_PLANNER_DEFAULT_V2, MANAGED_EXECUTION_CONTRACT,
     },
 };
@@ -49,7 +51,10 @@ impl PromptBuilder for PlannerPromptBuilder {
         }
 
         user.push_str("\nPlanning output:\n");
-        user.push_str(PLAN_ARTIFACT_AGENT_INSTRUCTION);
+        user.push_str(match ctx.delivery {
+            TaskDelivery::NativeTools => PLAN_ARTIFACT_AGENT_INSTRUCTION,
+            TaskDelivery::Outbox => OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION,
+        });
         user.push('\n');
 
         AgentPrompt {

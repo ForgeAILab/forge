@@ -206,7 +206,7 @@ impl ServerExecutionEventSink {
                 .hard_deadline_at
                 .as_deref()
                 .and_then(parse_rfc3339)
-                .is_none_or(|deadline| deadline <= now);
+                .is_some_and(|deadline| deadline <= now);
             if lease_expired || hard_deadline_reached {
                 tracing::debug!(
                     sending_daemon = %daemon_id,
@@ -635,19 +635,23 @@ impl ServerExecutionEventSink {
                 replayed,
                 ..
             } => {
-                // A durable receipt replay is already fully committed. Do
-                // not publish/cascade/remove mutable transport state again;
-                // the only required side effect is the transport ACK.
-                if replayed {
-                    return Ok(DaemonTerminalDisposition::Acknowledge);
+                if !replayed {
+                    self.writers.lock().await.remove(&notification.execution_id);
                 }
-                self.remember_terminal(daemon_id, notification)?;
-                self.writers.lock().await.remove(&notification.execution_id);
+                // A receipt proves the row commit, not that the process lived
+                // long enough to cascade it. The TaskService has replayed the
+                // outbox/post-commit effects; now reconcile the workflow too.
                 if execution.status != ExecutionStatus::Running {
                     task_service
                         .maybe_cascade_executor_completion(&notification.execution_id)
                         .await?;
                 }
+                // Promote this call's Pending reservation only after every
+                // durable post-commit effect has succeeded. If cascade fails,
+                // the outer error path releases Pending so an exact retry can
+                // replay the receipt and finish the work. Once promoted, a
+                // lost ACK is safe to answer from the committed record.
+                self.remember_terminal(daemon_id, notification)?;
                 Ok(DaemonTerminalDisposition::Acknowledge)
             }
             db::ExecutionTerminalOutcome::Concurrent { .. } => {
@@ -754,6 +758,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::{
+        new_uuid_v4, now_rfc3339, run_migrations, AgentStatus, ClaimExecutionLease, CreateAgent,
+        CreateExecution, CreateProject, CreateTask, CreateTaskRoleAssignment,
+        ExecutionLeaseMutation, ProjectRepo, TaskRoleAssignmentRepo,
+    };
     use serde_json::json;
 
     fn notification() -> api_types::ExecutionTerminalNotification {
@@ -799,5 +808,284 @@ mod tests {
             terminal_record_disposition(&record, "different-daemon", &fingerprint),
             DaemonTerminalDisposition::Conflict
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_replay_retries_cascade_before_acknowledging() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("SQLite pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let event_bus = Arc::new(EventBus::new(16));
+        let now = now_rfc3339();
+        let daemon_id = "terminal-replay-daemon";
+        let connection_id = 41;
+        let project_id = new_uuid_v4();
+        let task_id = new_uuid_v4();
+        let agent_id = new_uuid_v4();
+        let execution_id = new_uuid_v4();
+
+        let workflow = json!({
+            "roles": [{
+                "name": "coder",
+                "display_name": "Coder",
+                "description": "Executes the test work state"
+            }],
+            "states": [
+                {
+                    "name": "work",
+                    "kind": "active",
+                    "column": "Working",
+                    "display_name": "Work",
+                    "role": "coder",
+                    "hooks": {},
+                    "gate_config": null,
+                    "triggers": {"accept": {"to": "done", "dispatch": null}},
+                    "config": {}
+                },
+                {
+                    "name": "done",
+                    "kind": "terminal",
+                    "column": "Done",
+                    "display_name": "Done",
+                    "role": null,
+                    "hooks": {},
+                    "gate_config": null,
+                    "triggers": {},
+                    "config": {}
+                }
+            ],
+            "configuration": [],
+            "cancellation_state": null
+        })
+        .to_string();
+        let project = ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Terminal replay cascade".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: workflow,
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        AgentRepo::create(
+            &*db,
+            CreateAgent {
+                id: agent_id.clone(),
+                name: "Terminal replay worker".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: Some(daemon_id.to_owned()),
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Busy,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("agent creates");
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id,
+                parent_task_id: None,
+                assignee_type: Some("agent".to_owned()),
+                assignee_id: Some(agent_id.clone()),
+                title: "Retry terminal cascade".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "work".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task creates");
+        TaskRoleAssignmentRepo::assign(
+            &*db,
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                role_name: "coder".to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(agent_id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("coder assignment creates");
+        let execution = ExecutionRepo::create(
+            &*db,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: Some(agent_id),
+                role: "coder".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(
+                    json!({
+                        "executor_type": "shell",
+                        "config": {},
+                        "project_version": project.version,
+                    })
+                    .to_string(),
+                ),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+        let lease_now = Utc::now();
+        let claimed = ExecutionRepo::claim_lease(
+            &*db,
+            ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: execution_lease_owner(daemon_id, connection_id),
+                lease_expires_at: (lease_now + ChronoDuration::minutes(1)).to_rfc3339(),
+                hard_deadline_at: Some((lease_now + ChronoDuration::minutes(5)).to_rfc3339()),
+                now: lease_now.to_rfc3339(),
+            },
+        )
+        .await
+        .expect("remote lease claims");
+        assert!(matches!(claimed, ExecutionLeaseMutation::Updated(_)));
+
+        let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+        let sink = ServerExecutionEventSink::new(
+            Arc::clone(&db),
+            event_bus,
+            std::env::temp_dir().join("forge-terminal-replay-cascade"),
+        );
+        sink.set_task_service(Arc::downgrade(&task_service));
+
+        sqlx::query(
+            "CREATE TRIGGER fail_terminal_cascade_once
+             BEFORE UPDATE OF status ON task
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced terminal cascade failure');
+             END",
+        )
+        .execute(db.pool())
+        .await
+        .expect("cascade failure trigger installs");
+
+        let mut notification = notification();
+        notification.execution_id = execution_id.clone();
+        notification.terminal_report_id = "terminal-report-cascade-replay".to_owned();
+        notification.ts = now_rfc3339();
+
+        let first_error = sink
+            .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
+            .await
+            .expect_err("the injected first cascade must fail");
+        assert!(
+            first_error
+                .to_string()
+                .contains("forced terminal cascade failure"),
+            "unexpected first-attempt error: {first_error}"
+        );
+        assert!(
+            ExecutionRepo::get_execution_terminal_receipt(&*db, &notification.terminal_report_id)
+                .await
+                .expect("terminal receipt lookup succeeds")
+                .is_some(),
+            "terminal receipt must commit before the cascade fails"
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution_id)
+                .await
+                .expect("execution lookup succeeds")
+                .expect("execution exists")
+                .status,
+            ExecutionStatus::Completed
+        );
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task_id, false)
+                .await
+                .expect("task lookup succeeds")
+                .expect("task exists")
+                .status,
+            "work"
+        );
+        assert!(
+            !lock(&sink.terminal_reports).contains_key(&notification.terminal_report_id),
+            "a failed cascade must release its Pending reservation"
+        );
+
+        sqlx::query("DROP TRIGGER fail_terminal_cascade_once")
+            .execute(db.pool())
+            .await
+            .expect("cascade failure trigger drops");
+
+        let second = sink
+            .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
+            .await
+            .expect("exact durable replay succeeds");
+        assert_eq!(second, DaemonTerminalDisposition::Acknowledge);
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task_id, false)
+                .await
+                .expect("task lookup succeeds")
+                .expect("task exists")
+                .status,
+            "done",
+            "the replay must complete the cascade before ACK"
+        );
+        assert!(matches!(
+            lock(&sink.terminal_reports).get(&notification.terminal_report_id),
+            Some(TerminalReportRecord::Committed { .. })
+        ));
+
+        db.pool().close().await;
+        let third = sink
+            .handle_terminal_with_ack(daemon_id, connection_id, notification)
+            .await
+            .expect("committed in-memory replay does not consult the closed database");
+        assert_eq!(third, DaemonTerminalDisposition::Acknowledge);
     }
 }

@@ -33,6 +33,7 @@ fn typed_execution_overrides_are_translated_to_config_keys_and_recorded() {
         model_id: Some("gpt-5-codex".to_owned()),
         reasoning_effort: Some("high".to_owned()),
         permission_policy: Some("auto".to_owned()),
+        hard_deadline_seconds: None,
     }))
     .expect("execution overrides translate");
     let (config, applied) = merge_config_layers(

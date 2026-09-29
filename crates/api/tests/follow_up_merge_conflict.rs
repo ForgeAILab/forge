@@ -11,8 +11,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse,
+    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionSummaryResponse,
+    PaginatedResponse, ProjectResponse, RepoResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -32,7 +32,7 @@ use tower::ServiceExt;
 const EXECUTOR_SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
 
 #[tokio::test]
-async fn merge_conflict_parks_the_worktree_for_manual_repair() {
+async fn merge_conflict_is_handed_back_to_the_coder() {
     let repo_dir = common::TestDir::new("forge-merge-conflict-repo");
     let repo_path = setup_git_repo(repo_dir.path());
 
@@ -100,13 +100,11 @@ async fn merge_conflict_parks_the_worktree_for_manual_repair() {
         .transition(task_id.clone(), "merging".to_owned(), seeded_task.version)
         .await
         .expect("merge transition runs");
-    // A real conflict is not managed work: a coder agent cannot rebase or
-    // write linked git metadata, so integration parks the worktree for a
-    // human instead of dispatching a follow-up it cannot complete. What the
-    // Task must never do is sit in `merging` with nothing recorded, which is
-    // what a swallowed version conflict in the merge bookkeeping used to
-    // leave behind.
-    assert_eq!(transition.task.status, "merging".to_owned());
+    // A real conflict is the coder's to reconcile. Forge rebases the branch
+    // onto the target itself (a managed agent cannot write linked git
+    // metadata), commits the conflict with its markers, and hands the Task
+    // back through `merge_failed` so the coder only has to edit files.
+    assert_eq!(transition.task.status, "merge_failed".to_owned());
 
     let task: api_types::TaskResponse = empty_request(
         &harness.app,
@@ -115,60 +113,29 @@ async fn merge_conflict_parks_the_worktree_for_manual_repair() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(task.status, "merging".to_owned());
-    let blocked = task
-        .blocked
-        .as_ref()
-        .expect("merge conflict blocks the Task");
-    assert_eq!(blocked.kind, Some(api_types::FailureKind::MergeConflict));
     assert!(
-        blocked
-            .reason
-            .contains("manual task-worktree repair is required"),
-        "the blocker must say what the human has to do: {}",
-        blocked.reason
+        task.blocked.is_none(),
+        "a conflict must not park for a human: {:?}",
+        task.blocked
     );
-    let annotation = match task
-        .error_annotation
-        .as_ref()
-        .expect("merge conflict records an error annotation")
-    {
-        api_types::TaskAnnotation::Blocking(annotation) => annotation,
-        other => panic!("expected a blocking annotation, got {other:?}"),
-    };
-    assert_eq!(
-        annotation.annotation_type,
-        api_types::FailureKind::MergeConflict
-    );
-    assert_eq!(
-        annotation.blocked_by.as_deref(),
-        Some("manual_workspace_repair")
+    let file = std::fs::read_to_string(worktree_path.join("file.txt")).expect("file reads");
+    assert!(
+        file.contains("<<<<<<< ") && file.contains(">>>>>>> "),
+        "the conflict is committed with markers for the coder: {file}"
     );
     assert!(
-        annotation
-            .recovery_actions
-            .contains(&api_types::RecoveryAction::RetryHook),
-        "a repaired worktree has to be retryable: {:?}",
-        annotation.recovery_actions
+        run_git(&worktree_path, &["status", "--porcelain"]).is_empty(),
+        "the rebased worktree is clean"
     );
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let coder_executions: PaginatedResponse<ExecutionResponse> = empty_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/executions?limit=20"),
-        StatusCode::OK,
-    )
-    .await;
-    let coder_executions = coder_executions
-        .items
-        .iter()
-        .filter(|execution| execution.role == "coder")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        coder_executions.len(),
-        1,
-        "a parked conflict must not dispatch a follow-up coder"
+    let executions = poll_until_role_follow_up(&harness.app, &task_id, "coder").await;
+    assert!(
+        executions
+            .iter()
+            .filter(|execution| execution.role == "coder")
+            .count()
+            >= 2,
+        "the conflict dispatches a coder follow-up: {executions:?}"
     );
 
     let events = drain_events(&mut events_rx).await;
@@ -178,15 +145,7 @@ async fn merge_conflict_parks_the_worktree_for_manual_repair() {
             EventContext::MergeFailed { task_id: event_task_id, .. }
                 if event_task_id == &task_id
         )),
-        "the parked conflict is announced: {events:?}"
-    );
-    assert!(
-        !events.iter().any(|event| matches!(
-            &event.context,
-            EventContext::FollowUpDispatched { task_id: event_task_id, .. }
-                if event_task_id == &task_id
-        )),
-        "no follow-up is dispatched for a conflict a managed agent cannot fix: {events:?}"
+        "the conflict is announced: {events:?}"
     );
 }
 
@@ -516,8 +475,8 @@ async fn create_agent(app: &Router, name: &str, daemon_id: &str) -> AgentRespons
     agent
 }
 
-async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionResponse> {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionSummaryResponse> {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions?limit=20"),
@@ -531,17 +490,13 @@ async fn poll_until_role_follow_up(
     app: &Router,
     task_id: &str,
     role: &str,
-) -> Vec<ExecutionResponse> {
+) -> Vec<ExecutionSummaryResponse> {
     for _ in 0..100 {
         let executions = executions_for_task(app, task_id).await;
-        if executions.iter().any(|execution| {
-            execution.role == role
-                && execution
-                    .executor_config_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
-        }) {
+        if executions
+            .iter()
+            .any(|execution| execution.role == role && execution.is_resume)
+        {
             return executions;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

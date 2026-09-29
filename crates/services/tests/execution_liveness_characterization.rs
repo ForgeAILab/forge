@@ -335,7 +335,7 @@ async fn d1_silent_provider_wait_renews_until_hard_deadline_without_progress() {
                 expected_version: 1,
                 owner: owner.to_owned(),
                 lease_expires_at: T5.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -455,7 +455,7 @@ async fn d2_dead_owner_expires_once_and_stale_owner_cannot_renew_or_progress() {
                 expected_version: 1,
                 owner: owner.to_owned(),
                 lease_expires_at: T5.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -470,7 +470,7 @@ async fn d2_dead_owner_expires_once_and_stale_owner_cannot_renew_or_progress() {
             expected_version: claimed.execution_version,
             owner: "wrong-daemon:stale-connection".to_owned(),
             lease_expires_at: T8.to_owned(),
-            hard_deadline_at: T20.to_owned(),
+            hard_deadline_at: Some(T20.to_owned()),
             now: T1.to_owned(),
         },
     )
@@ -500,7 +500,7 @@ async fn d2_dead_owner_expires_once_and_stale_owner_cannot_renew_or_progress() {
                 expected_version: claimed.execution_version,
                 owner: replacement_owner.to_owned(),
                 lease_expires_at: T8.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T6.to_owned(),
             },
         )
@@ -648,7 +648,7 @@ async fn d3_completion_and_monitor_race_has_one_terminal_event_and_lease_disposi
                 expected_version: 1,
                 owner: owner.to_owned(),
                 lease_expires_at: T5.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -719,7 +719,7 @@ async fn d3_cancellation_and_completion_race_has_one_terminal_event_and_lease_di
                 expected_version: 1,
                 owner: owner.to_owned(),
                 lease_expires_at: T5.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -790,7 +790,7 @@ async fn d3_late_runner_result_cannot_overwrite_monitor_winner() {
                 expected_version: 1,
                 owner: owner.to_owned(),
                 lease_expires_at: T5.to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )

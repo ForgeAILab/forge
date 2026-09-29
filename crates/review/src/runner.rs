@@ -1254,7 +1254,6 @@ async fn cancel_review_if_unchanged(db: &SqliteDb, review: &Review, reason: &str
 }
 
 const REVIEW_LEASE_SECONDS: i64 = 30;
-const REVIEW_HARD_DEADLINE_SECONDS: i64 = 30 * 60;
 const REVIEW_HEARTBEAT_SECONDS: u64 = 10;
 
 /// Review and auditor executions are ordinary running executions.  Keep an
@@ -1285,8 +1284,6 @@ impl ReviewExecutionLease {
         let now = Utc::now();
         let now_text = now.to_rfc3339();
         let lease_expires_at = (now + ChronoDuration::seconds(REVIEW_LEASE_SECONDS)).to_rfc3339();
-        let hard_deadline_at =
-            (now + ChronoDuration::seconds(REVIEW_HARD_DEADLINE_SECONDS)).to_rfc3339();
         ReviewLeaseClaim {
             owner: owner.clone(),
             claim: ClaimExecutionLease {
@@ -1294,7 +1291,7 @@ impl ReviewExecutionLease {
                 expected_version: 1,
                 owner,
                 lease_expires_at,
-                hard_deadline_at,
+                hard_deadline_at: None,
                 now: now_text,
             },
         }

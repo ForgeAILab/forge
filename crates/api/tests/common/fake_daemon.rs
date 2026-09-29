@@ -21,8 +21,8 @@ use db::{
     CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, CreateWorkspace,
     CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionLeaseMutation,
     ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateDaemonReport, UpdateProject, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, UserRepo, WorkMode,
+    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -596,7 +596,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
             expected_version: execution.execution_version,
             owner: services::execution_lease_owner(daemon_id, connection.id()),
             lease_expires_at: (now + ChronoDuration::seconds(30)).to_rfc3339(),
-            hard_deadline_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            hard_deadline_at: Some((now + ChronoDuration::minutes(5)).to_rfc3339()),
             now: now.to_rfc3339(),
         },
     )
@@ -682,7 +682,7 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update_at_version(
+    let project = ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id: project_id.clone(),
@@ -753,6 +753,20 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("agent creates");
+    TaskRoleAssignmentRepo::assign(
+        &*state.db,
+        CreateTaskRoleAssignment {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.clone(),
+            role_name: services::workflow::default_roles::CODER.to_owned(),
+            assignee_type: Some(AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("coder role assignment creates");
     WorkspaceRepo::create(
         &*state.db,
         CreateWorkspace {
@@ -769,6 +783,13 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("workspace creates");
+    let state_entry_token = TransitionLogRepo::list_by_task(&*state.db, &task_id)
+        .await
+        .expect("task transition log loads")
+        .into_iter()
+        .rev()
+        .find(|entry| entry.to_state == task.status)
+        .map(|entry| entry.id);
     let execution = ExecutionRepo::create(
         &*state.db,
         CreateExecution {
@@ -791,7 +812,14 @@ pub async fn seed_startable_execution_for_daemon(
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                serde_json::json!({ "executor_type": "shell", "config": {} }).to_string(),
+                serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "task_state": task.status,
+                    "state_entry_token": state_entry_token,
+                    "project_version": project.version,
+                })
+                .to_string(),
             ),
             workspace_id: Some(workspace_id),
             created_at: now.clone(),

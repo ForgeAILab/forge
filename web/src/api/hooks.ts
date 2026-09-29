@@ -69,6 +69,7 @@ import type {
   CreateTaskRequest,
   Daemon,
   Execution,
+  ExecutionSummary,
   UsageBreakdown,
   ExecutorType,
   FollowUpRequest,
@@ -1396,7 +1397,7 @@ export function useExecutionsQuery(taskId: string, options: { enabled?: boolean 
   return useQuery({
     queryKey: qk.executions(taskId),
     queryFn: ({ signal }) =>
-      apiFetch<PaginatedResponse<Execution>>(`/tasks/${taskId}/executions`, { signal }),
+      apiFetch<PaginatedResponse<ExecutionSummary>>(`/tasks/${taskId}/executions`, { signal }),
     enabled: Boolean(taskId) && (options.enabled ?? true),
   })
 }

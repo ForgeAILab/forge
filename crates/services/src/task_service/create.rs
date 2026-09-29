@@ -286,28 +286,8 @@ impl TaskService {
             // Creating the first child atomically converts its parent into a
             // coordination container. Preserve only aggregate-review roles;
             // implementation/planning assignments belong on child Tasks.
-            let implementation_role = project_workflow
-                .states
-                .iter()
-                .find(|state| state.name == default_states::IN_PROGRESS)
-                .and_then(crate::workflow::effective_role)
-                .or_else(|| {
-                    project_workflow
-                        .states
-                        .iter()
-                        .find(|state| state.kind == api_types::StateKind::Active)
-                        .and_then(crate::workflow::effective_role)
-                });
-            let aggregate_review_roles = project_workflow
-                .states
-                .iter()
-                .filter(|state| {
-                    state.kind == api_types::StateKind::Gate
-                        && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-                })
-                .filter_map(|state| state.role.as_deref())
-                .filter(|role| Some(*role) != implementation_role)
-                .collect::<HashSet<_>>();
+            let root_role_policy =
+                crate::task_hierarchy::RootRolePolicy::for_workflow(&project_workflow);
             let parent_roles = sqlx::query_scalar::<_, String>(
                 "SELECT role_name FROM task_role_assignment WHERE task_id = ?",
             )
@@ -316,7 +296,7 @@ impl TaskService {
             .await?;
             let mut removed_parent_role = false;
             for role_name in parent_roles {
-                if !aggregate_review_roles.contains(role_name.as_str()) {
+                if !root_role_policy.allows_assignment(&role_name) {
                     sqlx::query(
                         "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
                     )

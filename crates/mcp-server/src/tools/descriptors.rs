@@ -256,7 +256,13 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                     "properties": {
                         "model_id": { "type": "string" },
                         "reasoning_effort": { "type": "string" },
-                        "permission_policy": { "type": "string" }
+                        "permission_policy": { "type": "string" },
+                        "hard_deadline_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 4294967295_u64,
+                            "description": "Optional wall-clock limit for the new execution; omit for no limit"
+                        }
                     }
                 }
             }),

@@ -70,6 +70,8 @@ impl TaskService {
             return Ok(replayed);
         }
 
+        super::execution::ensure_plan_publication_transition_authority(&source_task, None)?;
+
         if source_task.version != request.task_version {
             return Err(DbError::TaskVersionConflict {
                 expected: request.task_version,
@@ -126,7 +128,7 @@ impl TaskService {
                 .await;
         }
 
-        super::subtask::ensure_coordination_root_target_ready(
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
             &self.db,
             &source_task,
             &workflow,
@@ -135,7 +137,7 @@ impl TaskService {
         .await?;
 
         if target_state.kind != api_types::StateKind::Terminal {
-            super::subtask::ensure_subtask_dispatch_order(&self.db, &source_task).await?;
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &source_task).await?;
         }
 
         self.ensure_planning_plan_ready_before_leaving(
@@ -171,7 +173,7 @@ impl TaskService {
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
+            task_service: self.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
             terminal_activity: self.terminal_activity.clone(),
@@ -197,6 +199,7 @@ impl TaskService {
                 Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;

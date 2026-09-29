@@ -18,6 +18,14 @@ pub trait TaskRepo: Send + Sync {
         include_deleted: bool,
     ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
+    /// List non-deleted Tasks in a Project whose metadata contains `key`.
+    /// Recovery uses this narrow query for durable claims that must be found
+    /// independently of the current workflow's state classification.
+    async fn list_by_project_with_metadata_key(
+        &self,
+        project_id: &str,
+        key: &str,
+    ) -> Result<Vec<Task>>;
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>>;
     async fn list_subtasks_ordered(&self, parent_task_id: &str) -> Result<Vec<Task>>;
     async fn next_subtask_order(&self, parent_task_id: &str) -> Result<i64>;
@@ -138,6 +146,47 @@ pub trait TaskRepo: Send + Sync {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task>;
+    /// Apply key-level metadata mutations under a Task version CAS and bump
+    /// that version when anything changes. Use this for metadata that grants
+    /// exclusive authority over a subsequent side effect: an already-started
+    /// Task transition must lose its stale version after the claim commits.
+    async fn mutate_metadata_and_bump_version(
+        &self,
+        id: &str,
+        expected_version: i64,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Task>;
+    /// Version-bumping metadata mutation that also pins the Project revision.
+    /// Used when metadata settlement authorizes an external side effect that
+    /// was prepared under a particular workflow/governance snapshot.
+    async fn mutate_metadata_and_bump_version_with_project_authority(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_project_version: i64,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Task>;
+    /// Apply a version-bumping metadata effect only while the named terminal
+    /// execution is still the newest canonical-role attempt under the same
+    /// Project and assignment authority.
+    async fn mutate_metadata_and_bump_version_for_latest_execution(
+        &self,
+        id: &str,
+        expected_version: i64,
+        authority: LatestExecutionAuthority,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Option<Task>>;
+    /// Install an exclusive Task metadata claim only while the named
+    /// execution is still the newest attempt for its canonical role. The
+    /// latest-attempt check, Project revision check, metadata write, and Task
+    /// version bump share one SQLite writer transaction.
+    async fn claim_metadata_for_latest_execution(
+        &self,
+        input: LatestExecutionMetadataClaim,
+    ) -> Result<Task>;
     /// Clear a Task's dispatch disposition/deferred marker and advance its
     /// version in one write transaction. The version bump fences off a stale
     /// dispatcher snapshot that could otherwise re-record the marker.
@@ -172,6 +221,14 @@ pub trait TaskRepo: Send + Sync {
         input: ClaimTask,
     ) -> Result<ClaimedTask>;
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task>;
+    /// Status/blocking projection guarded by the same latest-attempt boundary
+    /// as terminal metadata effects. `None` means a newer attempt or changed
+    /// governance won and the stale effect was intentionally ignored.
+    async fn update_status_for_latest_execution(
+        &self,
+        input: UpdateTaskStatus,
+        authority: LatestExecutionAuthority,
+    ) -> Result<Option<Task>>;
     /// Update a Task's status and append a recovery boundary in the same
     /// write transaction. This closes the reset-to-initial marker race where
     /// a later transition could commit between two independent writes.
@@ -187,6 +244,25 @@ pub trait TaskRepo: Send + Sync {
 /// Metadata is a shared extension point.  A whole-document read/modify/write
 /// is not safe when independent dispatcher, recovery, and workflow paths each
 /// own a different key, so those paths use this operation instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestExecutionAuthority {
+    pub execution_id: String,
+    pub role: String,
+    pub agent_id: Option<String>,
+    pub execution_updated_at: String,
+    pub expected_project_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestExecutionMetadataClaim {
+    pub task_id: String,
+    pub expected_task_version: i64,
+    pub authority: LatestExecutionAuthority,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskMetadataMutation {
     Set {
@@ -1270,7 +1346,8 @@ pub trait ExecutionRepo: Send + Sync {
     async fn update(&self, input: UpdateExecution) -> Result<Execution>;
     /// Claim or take over an execution lease through the execution-version
     /// compare-and-swap boundary.  A takeover is allowed only after the prior
-    /// lease has expired; a first claim fixes the hard deadline.
+    /// lease has expired. A first claim fixes an explicitly configured hard
+    /// deadline; without one, the renewable owner lease is the only clock.
     async fn claim_lease(&self, input: ClaimExecutionLease) -> Result<ExecutionLeaseMutation>;
     /// Renew an owner-bound lease without consulting streamed output.  The
     /// returned mutation is typed so a caller can distinguish a concurrent
@@ -1669,6 +1746,14 @@ pub trait ReviewRepo: Send + Sync {
         expected_workflow_definition: Option<&str>,
         expected_candidate_execution_id: Option<&str>,
     ) -> Result<Review>;
+    /// Atomically record a user override of the latest failed Review as a new
+    /// passed attempt and update the Task review projection. The failed source
+    /// row remains immutable and all authority checks run under one writer
+    /// transaction.
+    async fn create_manual_pass_with_task_authority(
+        &self,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)>;
     /// Atomically reserve the next Review attempt with its Running execution
     /// and initial lease. The attempt number is allocated under the same
     /// writer transaction as both inserts, so a failed Review insert cannot
@@ -3221,6 +3306,21 @@ pub struct CreateReview {
     pub started_at: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateManualReviewPass {
+    pub id: String,
+    pub source_review_id: String,
+    pub source_review_updated_at: String,
+    pub task_id: String,
+    pub candidate_execution_id: String,
+    pub step_results_json: String,
+    pub expected_task_version: i64,
+    pub expected_task_status: String,
+    pub expected_project_version: i64,
+    pub expected_workflow_definition: String,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

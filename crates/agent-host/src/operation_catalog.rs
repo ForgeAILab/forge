@@ -88,6 +88,10 @@ pub const TASK_DEPENDENCY_OPERATION: &str = "task.dependency";
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
 /// for, and without this the only reachable remedy is a duplicate Task.
 pub const TASK_RECOVER_OPERATION: &str = "task.recover";
+/// Write the current execution's plan candidate. Forge publishes the
+/// candidate only after the execution completes successfully; this operation
+/// never edits the Task's canonical plan directly.
+pub const TASK_PLAN_OPERATION: &str = "task.plan";
 /// Capture one artifact a Task run actually produced as authoritative
 /// evidence. This lives in the Task scope on purpose: only a Task session has
 /// a workspace and a process to observe, so it is the only place an
@@ -151,9 +155,11 @@ pub enum OperationPermission {
     ProposeDiscovery,
     ProposeProject,
     ProposeTask,
-    /// Recording an artifact a Task run produced. Gated on the Task read
-    /// permission so both the Worker and the reviewer can capture what they
-    /// observed; it writes no repository content and mutates no Task state.
+    /// Task-scoped execution records are gated on the Task read permission.
+    /// Role-specific tool composition narrows the individual operations:
+    /// Workers and reviewers may capture observations, while only planners
+    /// and Workers may write an execution-scoped plan candidate. None of
+    /// these operations writes repository content or mutates Task workflow.
     CaptureTaskEvidence,
 }
 
@@ -577,6 +583,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: TASK_PLAN_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: TASK_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::CaptureTaskEvidence,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: TASK_WORKLOG_OPERATION,
         surface: OperationSurface::Coordination,
         exposure: OperationExposure::TypedProposal,
@@ -783,9 +800,9 @@ pub fn operation_permission(
 /// runtime with a message that named nothing. The catalog row already carries
 /// every fact the decision needs — a coordination surface, the generic
 /// proposal exposure, a direct classification, and the permission — so ask it
-/// instead. Typed-proposal coordination operations (`task.worklog`,
-/// `task.evidence`) execute through their own dedicated path and are
-/// deliberately not admitted here.
+/// instead. Typed-proposal coordination operations (`task.plan`,
+/// `task.worklog`, `task.evidence`) execute through their own dedicated path
+/// and are deliberately not admitted here.
 #[must_use]
 pub fn is_coordination_direct_command(operation: &str, requested_permission: &str) -> bool {
     is_coordination_generic_proposal(operation)
@@ -1069,7 +1086,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_command_admission_is_derived_and_still_excludes_the_typed_pair() {
+    fn direct_command_admission_is_derived_and_still_excludes_typed_task_proposals() {
         // The set the policy layer used to hand-list. Pinning it here means a
         // new coordination command is admitted the moment its catalog row
         // exists, while a change that would widen admission by accident — a
@@ -1091,9 +1108,14 @@ mod tests {
             ]
         );
 
-        // These two are coordination direct commands as well, but they run
-        // through their own capture path and must not be admitted here.
-        for typed in [TASK_WORKLOG_OPERATION, TASK_EVIDENCE_OPERATION] {
+        // These are coordination direct commands as well, but they run
+        // through their own Task-scoped proposal path and must not be
+        // admitted through the Project coordination envelope.
+        for typed in [
+            TASK_PLAN_OPERATION,
+            TASK_WORKLOG_OPERATION,
+            TASK_EVIDENCE_OPERATION,
+        ] {
             assert!(!is_coordination_direct_command(typed, "propose_task"));
             assert!(!is_coordination_direct_command(typed, "task_read"));
         }
@@ -1275,6 +1297,57 @@ mod tests {
             .iter()
             .any(|operation| operation == TASK_ADAPTIVE_OPERATION)
         );
+    }
+
+    #[test]
+    fn task_plan_is_a_task_scoped_typed_direct_command() {
+        let contract = operation_contract(TASK_PLAN_OPERATION).expect("Task plan contract");
+        assert_eq!(contract.surface, OperationSurface::Coordination);
+        assert_eq!(contract.exposure, OperationExposure::TypedProposal);
+        assert_eq!(contract.input, OperationInputContract::ProposalEnvelope);
+        assert_eq!(contract.setup, OperationSetupExposure::ReadyOnly);
+        assert_eq!(contract.supported_scopes, TASK_SCOPES);
+        assert_eq!(
+            contract.classification,
+            OperationClassification::DirectCommand
+        );
+        assert_eq!(
+            contract.permission,
+            OperationPermission::CaptureTaskEvidence
+        );
+        assert_eq!(
+            operation_contract_permission(CanonicalScopeType::Task, TASK_PLAN_OPERATION),
+            Some("task_read")
+        );
+        assert!(
+            operation_names_for_surface(
+                OperationSurface::Coordination,
+                false,
+                OperationExposure::TypedProposal,
+            )
+            .iter()
+            .any(|operation| operation == TASK_PLAN_OPERATION)
+        );
+        assert!(
+            !operation_names_for_surface(
+                OperationSurface::Coordination,
+                true,
+                OperationExposure::TypedProposal,
+            )
+            .iter()
+            .any(|operation| operation == TASK_PLAN_OPERATION)
+        );
+        for scope in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::AgentChat,
+        ] {
+            assert!(!operation_supported_in_scope(TASK_PLAN_OPERATION, scope));
+            assert_eq!(
+                operation_contract_permission(scope, TASK_PLAN_OPERATION),
+                None
+            );
+        }
     }
 
     #[test]

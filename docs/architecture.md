@@ -474,8 +474,47 @@ its only writable roots are one freshly reset Forge-owned `task-scratch`
 directory, the execution outbox, and the host's package-manager caches
 (`~/.npm`, Cargo `registry`/`git`, the Go module cache, the XDG cache, pnpm's
 store, and `~/Library/Caches` on macOS, each honoring its relocation
-variable). A read-only role still cannot deliver code: Forge skips its
-finalization, fails any execution that changed a tracked file or moved HEAD,
+variable). The Task directory that contains the worktree is not writable by
+the sandbox. CLI planning and implementation executions (`planner`, `worker`,
+`coder`, and `executor`) instead receive a role-scoped `FORGE_PLAN_PATH` inside
+their execution outbox. Forge seeds that private file from the canonical Task
+plan for implementation turns. This outbox file is the supported plan-delivery
+contract for every CLI adapter.
+Forge enforces the surrounding Task directory as non-writable for managed
+Codex runs; a CLI adapter without an OS sandbox may still have ambient
+filesystem access to sibling files, so Forge does not claim universal
+filesystem confinement for those processes. Writing a sibling directly is
+outside the supported contract.
+
+Native planning and implementation Task sessions use the typed `task.plan`
+operation with `{"action":"write","content":"<full Markdown checklist>"}`
+instead of receiving a canonical plan path. The tool surface names those roles
+Planner and Worker; the Worker session covers `worker`, `coder`, and `executor`
+execution roles. The host takes the runtime session from the invocation context
+and requires it to bind the Task, identity, role, and ready Workspace to exactly
+one `Running` execution. It writes that candidate to the same
+execution-private outbox; reviewers are not offered the operation. Each call
+replaces the full private checklist candidate, so an implementation role can
+keep completion marks current during its run.
+
+Neither `$FORGE_PLAN_PATH` nor `task.plan` publishes the canonical plan
+directly. Before terminal settlement, Forge validates the candidate and freezes
+its exact bytes in a host-owned staging area outside the agent-writable outbox;
+later outbox changes cannot affect publication. A durable compare-and-swap
+claim binds publication to the exact execution, Task state entry, and Project
+version. On Unix, the frozen file replaces the canonical sibling `plan.md` by
+atomic same-directory rename, and Forge rejects files with additional hard
+links. Other platforms use a portable replacement fallback and do not promise
+those two Unix properties. Reviewer and stale execution output cannot publish a
+plan. Non-regular files, symlinks, invalid UTF-8, oversized content, and plans
+without a checklist are rejected; a rejected candidate is retained in its
+execution outbox for diagnosis. After successful staging, Forge removes the
+agent-writable outbox and settles from the frozen copy. This broker shares the
+managed-daemon filesystem requirement: the API server and execution host must
+see the Task directory at the same absolute path through a shared workspace
+mount; separate-filesystem daemon sync is not implemented. A read-only role
+still cannot deliver code: Forge skips
+its finalization, fails any execution that changed a tracked file or moved HEAD,
 and resets the worktree afterwards. An unexpected authority-bearing input in that managed home
 fails execution closed. Codex-generated trust configuration and system-skill
 cache are discarded before each attempt and replaced with canonical Forge
@@ -716,11 +755,16 @@ current. A stale-progress scan can append a distinct, atomically revalidated
 `execution.progress_warning` Attention event; it does not fail a live lease or
 turn a warning into owner death.
 
-`hard_deadline_at` is derived from the admitted profile/capability snapshot
-and is a fixed upper bound. Heartbeats are clamped to it and cannot extend
-the deadline. The monitor treats an expired owner lease and a reached hard
-deadline as different recovery causes (`execution.stalled` with an
-`execution_lease_expired` reconciliation reason versus
+`hard_deadline_at` is optional execution policy. By default it is `NULL`, so
+Forge imposes no wall-clock ceiling: the owner can keep the attempt live by
+renewing its short lease. A caller can opt one new execution into a limit with
+the positive `overrides.hard_deadline_seconds` value; Forge records the
+resolved timestamp on that execution, and the first lease claim makes it
+immutable. Heartbeats are then clamped to the deadline and cannot extend it.
+Generic executor settings such as a shell command's `timeout_seconds` never
+become execution deadlines. The monitor treats an expired owner lease and a
+reached configured deadline as different recovery causes (`execution.stalled`
+with an `execution_lease_expired` reconciliation reason versus
 `execution.hard_deadline_exceeded`) and never treats semantic silence alone as
 expiry.
 
@@ -1456,14 +1500,24 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
+Forge does not configure Agent Runtime's tool-step or turn-time limits; their
+defaults are `None`. Task workflow `max_turns` is also optional and has no
+default. CLI Task execution, including Smith, receives no max-turn value unless
+the governing Task/workflow explicitly sets one. A per-execution wall-clock
+deadline is likewise opt-in through `hard_deadline_seconds`, as described in
+the liveness contract above.
+
 Agent Runtime terminal limits retain their typed cause across the host boundary:
 `provider_attempts`, `tool_steps`, `time`, or `output`. These are distinct from
-the Task workflow's optional `max_turns` policy. Exhausted provider attempts on
-a native Task are classified as `ExecutorUnavailable`, use the ordinary
-provider cooldown when no retry hint survives the runtime boundary, and defer
-every execution role (including planner/reviewer) without consuming the Task's
-execution retry budget. Output, tool-step, and runtime-time limits remain Task
-execution failures and preserve their exact limit in the execution error.
+the Task workflow's optional `max_turns` policy and optional execution hard
+deadline. Exhausted provider attempts on a native Task are classified as
+`ExecutorUnavailable`, use the ordinary provider cooldown when no retry hint
+survives the runtime boundary, and defer every execution role (including
+planner/reviewer) without consuming the Task's execution retry budget. Model
+context/output bounds and finite failed-provider retry policy remain intrinsic
+runtime safety constraints, not productive-work turn or wall-clock budgets.
+If an explicit runtime tool/time/output policy produces a limit, the failure
+preserves its exact typed cause in the execution error.
 
 Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
 scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
@@ -1498,6 +1552,15 @@ drops superseded LCM component state on load — from the session snapshot and
 from the checkpoint's copy, which the resume overlay would otherwise reinstate
 — leaving the coordinator to rebuild it from `agent_lcm_entry` /
 `agent_lcm_node`. Bump that constant with any change to those three policies.
+
+Leaf compaction only cuts at user boundaries, and an agentic turn is not
+bounded by one reply: a Project Agent tool loop can put tens of thousands of
+tokens into a single turn with no user message inside it. The runtime takes
+such an oldest turn whole as one oversized leaf, rather than returning no plan
+and failing every admission with "LCM context cannot fit". A failed turn's
+input and tool rounds stay in the persistent session history, so when a retry
+would re-send a message that already sits unanswered at the end of that
+history, the native host sends a short continuation instead of a second copy.
 
 Forge selects and authorizes domain context; Agent Runtime alone budgets and
 serializes final model context. `context_manifest` records the offered source
@@ -1608,8 +1671,10 @@ terminal workflow state under the same transaction as wake budgeting, so
 recovery, cancellation, or deletion after projection suppresses the stale wake.
 Observation belongs to the run that made it. A Task session holds a worktree
 and a process and captures what its own run did (`task.evidence`,
-`task.worklog`; a CLI harness writes the same records to its execution outbox,
-which Forge ingests when the run ends — see
+`task.worklog`; an authorized planning or implementation session also keeps an
+execution-private plan candidate with `task.plan`). A CLI harness writes the
+same records and plan candidate to its execution outbox, which Forge ingests
+when the run ends — see
 [api.md](api.md#commitments-inbox-and-typed-actions)). The Project Agent holds its own verification workspace — a
 durable `forge/` plus a disposable `checkout/` of the repository — and every
 Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
@@ -1858,8 +1923,8 @@ Remote output, reasoning, and tool notifications update semantic progress
 when accepted, but a quiet remote execution remains healthy while its lease is
 current. Stale semantic progress may create a separate
 `execution.progress_warning` Attention item. Only owner-lease expiry or the
-profile/capability hard deadline is an execution-liveness terminal condition;
-the hard deadline is not extended by heartbeat renewal.
+execution's explicitly configured hard deadline is an execution-liveness
+terminal condition; the hard deadline is not extended by heartbeat renewal.
 
 ### Task terminal sessions
 
@@ -1911,11 +1976,12 @@ terminated when it observes the terminal lifecycle event.
 ## Task state machine
 
 ```
-todo ──────────────► in_progress ──────► review ──────► merging ──────► done
- │                      │                  │              │
- └──► cancelled ◄───────┴──────────────────┴──────────────┘
-                                           │
-                                      merge_failed ──► blocked
+backlog ──► todo ──► planning ──► in_progress ──► review ──► merging ──► done
+   ▲          │                           ▲           │          │
+   └──────────┘                           └───────────┘          ▼
+                                                       merge_failed ──► blocked
+
+                         any non-terminal state ──► cancelled
 ```
 
 All non-terminal states can transition to `cancelled`. Terminal states: `done`,
@@ -1930,6 +1996,16 @@ The built-in workflow choices are:
 - `no-review` — required checks run and the Task continues without a reviewer execution.
 - `human-required` — the user or bound Project Agent accepts or rejects.
 - `autonomous_v1` — the single-worker compatibility preset with hard validation and human review.
+
+In the default workflow, a completed planner may leave `planning` only after
+Forge can read a valid checklist plan. The planning gate then advances to
+`in_progress` automatically; it is not a human approval boundary. A custom
+workflow that sets `requires_user_approval` on that gate remains in planning
+with `awaiting_human` until the user approves it, and the dispatcher will not
+start or relaunch another non-reviewer role while that marker is present. A
+missing or invalid plan is handled by the normal bounded execution-guard retry
+path and becomes a durable blocker when the budget is exhausted, rather than
+causing an unbounded sequence of fresh planner runs.
 
 The `autonomous_v1` preset lives in
 `crates/services/src/workflow/default_autonomous_workflow.rs`. It is a
@@ -1949,7 +2025,10 @@ plans internally, implements, self-tests, repairs ordinary unfinished-worktree
 failures, and reports verification evidence, so the preset has no planning
 state or plan-checklist gate. A real branch conflict goes back to the
 worker, but Forge does the Git part: managed agents cannot rebase or write
-linked Git metadata, so when the rebase onto a moved target conflicts Forge
+linked Git metadata, so when the rebase onto a moved target conflicts — or a
+candidate without an agent review contract (human reviewer, or no reviewer)
+hits a plain merge conflict, which Forge then rebases the same way unless the
+`merge_fix` budget is 0 — Forge
 commits each text-content conflict step with its conflict markers, finishes the
 rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
 the affected paths. The worker reconciles those files by editing and committing them, and the
@@ -1973,7 +2052,10 @@ execution. The bound Project Agent can create, sequence, assign, and observe
 those children, but Forge never sends the root's implementation prompt to one
 Agent as a proxy for all child work. Converting a Task into a coordination root
 clears its non-review role assignments; only its aggregate review role remains
-assignable at root level.
+assignable at root level, and the same role is the only one that may execute on
+the root, and only while the root is in its review state. That role is whatever
+the workflow's review gate declares, not the built-in `reviewer` name.
+`services::task_hierarchy::RootRolePolicy` owns both decisions.
 
 Each subtask is an independent Task with its own implementation-role
 assignment, status, execution record, session, logs, retry state, comments,
@@ -2159,10 +2241,23 @@ capability without creating another reviewer execution.
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
-barrier until those hooks settle. Task responses derive `awaiting_human` from
-the same Task snapshot as the returned optimistic `version`; a running barrier
-therefore cannot expose a gate decision using a version that the barrier-clear
-write is about to invalidate.
+barrier until those hooks and the target state's inline `on_enter` dispatch
+settle. Keeping the barrier through dispatch prevents the periodic dispatcher
+from claiming the role before an inline continuation (such as resuming the
+latest worker thread) records its execution. Task responses derive
+`awaiting_human` from the same Task snapshot as the returned optimistic
+`version`; a running barrier therefore cannot expose a gate decision using a
+version that the barrier-clear write is about to invalidate.
+
+Terminal execution settlement is serialized per Task. If two executions for
+the same Task finish while one completion is cascading the workflow, the later
+completion waits and re-evaluates its authority after the first cascade instead
+of being acknowledged and dropped. Workflow hook dispatch clones the
+originating `TaskService`, so nested roles share that coordinator and the same
+provider/outbox dependencies. Recovery treats a terminal workflow-role result
+whose immutable Project revision is missing or superseded as unsettled and
+dispatches a replacement under current authority; it never converts the
+cascade's intentional no-op into a reconciliation receipt.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
@@ -2405,13 +2500,19 @@ supersedes any blocking annotation — `recover_task` only accepts
 actions are offered. The web UI renders one actionable recovery surface,
 `WorkflowExceptionPanel`, on both the task page and the board modal;
 `TaskBlockingBanner` is an informational fallback for interruption states
-without recovery actions.
+without recovery actions. Generic execution follow-ups remain non-propagating
+side sessions: they can preserve an agent conversation, but they cannot settle
+a Review or advance Task state and are not shown beside an active workflow
+exception. Review guidance is submitted through the exception's `reexecute`
+action so the replacement reviewer execution is bound to the authoritative
+Review attempt and may propagate its result.
 
 `transition_log` is the audit source of truth for state changes. The API
 exposes it via `GET /api/v1/tasks/{id}/transitions`.
 
 ### Files of interest
 
+- `crates/services/src/task_hierarchy.rs` — root-Task and ordered-subtask policy
 - `crates/services/src/workflow/engine/mod.rs` — lifecycle
 - `crates/services/src/workflow/actions/` — curated hook actions
 - `crates/services/src/workflow/default_workflow.rs` — built-in graph
@@ -2681,13 +2782,28 @@ Forge's own setup steps and required checks, not the reviewer's citations: a
 failing check fails the review whatever the reviewer said, and a `pass` on a
 Task with no configured checks rests on the reviewer's judgment alone.
 
+The server contract tells the reviewer to verify by exercising the change —
+build it, run its tests, and drive the changed behavior programmatically or
+visually — rather than by reading code, and to stop once it can answer three
+questions: does the change work, is the changed behavior tested, and does the
+delta stay inside the Task (unrelated refactors, churn, or new dependencies are
+a blocking finding). To save the reviewer's opening tool calls,
+`review::contract::prepare_prompt` appends the candidate diff (`git diff --stat`
+plus the full diff when it fits in 48 KiB) and, on a re-review, the latest
+earlier verdict with its reason, a bounded slice of its report, and the diff
+since the commit it judged when that commit is still an ancestor. These
+sections are best effort and stay inside the prepared-prompt byte limit.
+
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
 follows the review-remediation budget, with the reason and Markdown review as the
 coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
-with a `review_blocked` blocking annotation (recovery: `reexecute`) for its owner,
-because neither the coder nor another reviewer can install a missing toolchain.
+with a `review_blocked` blocking annotation for its owner, because neither the
+coder nor another reviewer can install a missing toolchain. The owner can retry
+the authoritative reviewer with required guidance (`reexecute` plus `context`),
+or manually pass with a required reason. A manual pass appends a new passed
+Review attempt with user provenance; it never rewrites the failed attempt.
 A reply with no readable result block, or a review whose context or commit
 changed underneath it, is `unverified`: it uses the bounded reviewer
 execution-retry path, eventually creates a durable execution blocker, and never

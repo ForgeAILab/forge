@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::task_hierarchy::{is_root_task, is_subtask, root_for};
 
 #[tokio::test]
 async fn subtask_helpers_resolve_root_and_subtask() {

@@ -565,7 +565,7 @@ export function TaskDetailPage({
 
   return (
     <>
-      <div className="flex h-full gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+      <div className="flex h-full flex-col gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card md:flex-row">
         <TaskDetailSidebar
           task={task}
           isLoading={taskDetailQuery.isLoading}
@@ -577,7 +577,7 @@ export function TaskDetailPage({
           showReviewTab={showReviewTab}
         />
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="min-w-0 flex-1 overflow-y-auto">
           {taskDetailQuery.isError && !taskDetailQuery.data && initialTab !== 'overview' ? (
             <div className="p-6">
               <ErrorBanner

@@ -83,6 +83,7 @@ export type { RetryProvisioningRequest } from './bindings/RetryProvisioningReque
 export type { ExecutionInterruptionResponse } from './bindings/ExecutionInterruptionResponse'
 export type { ExecutionOwnerHealth } from './bindings/ExecutionOwnerHealth'
 export type { ExecutionResponse } from './bindings/ExecutionResponse'
+export type { ExecutionSummaryResponse } from './bindings/ExecutionSummaryResponse'
 export type { ExecutionStatus } from './bindings/ExecutionStatus'
 export type { MissionControlCoordinationActivity } from './bindings/MissionControlCoordinationActivity'
 export type { ProtectedInteractionAnswerRequest } from './bindings/ProtectedInteractionAnswerRequest'

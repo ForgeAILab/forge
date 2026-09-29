@@ -321,6 +321,72 @@ async fn create_claim_and_transition_task() {
 }
 
 #[tokio::test]
+async fn claimed_execution_snapshot_uses_atomic_target_state_authority() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
+    let task = service
+        .create_task(
+            project_id.clone(),
+            "Bind a direct claim to its target state entry",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("Project loads")
+        .expect("Project exists");
+
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    let snapshot: Value = serde_json::from_str(
+        claimed
+            .execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("agent claim records an execution snapshot"),
+    )
+    .expect("execution snapshot parses");
+    let state_entry_token = snapshot["state_entry_token"]
+        .as_str()
+        .expect("claim snapshot records its state-entry token");
+
+    assert_eq!(snapshot["task_state"], claimed.task.status);
+    assert_eq!(snapshot["project_version"], project.version);
+    let transition_log = TransitionLogRepo::list_by_task(&*db, &claimed.task.id)
+        .await
+        .expect("transition log loads");
+    let claim_entry = transition_log
+        .iter()
+        .find(|entry| entry.id == state_entry_token)
+        .expect("claim token names an atomically persisted state entry");
+    assert_eq!(claim_entry.from_state, task.status);
+    assert_eq!(claim_entry.to_state, claimed.task.status);
+    assert!(
+        crate::task_service::execution::execution_belongs_to_current_state_entry(
+            &db,
+            &claimed.task,
+            &claimed.execution,
+        )
+        .await
+        .expect("state-entry authority resolves"),
+        "crash recovery must recognize the direct-claim execution as belonging to the target state"
+    );
+}
+
+#[tokio::test]
 async fn claim_assigns_implicit_assignee_and_uses_claim_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

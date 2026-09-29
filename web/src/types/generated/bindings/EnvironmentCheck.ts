@@ -3,7 +3,7 @@
 /**
  * A cheap probe run with `bash -lc` in the worktree before an execution.
  */
-export type EnvironmentCheck = { name: string, command: string, 
+export type EnvironmentCheck = { name: string, command: string,
 /**
  * Execution roles the check gates (`coder`, `reviewer`, ...). Empty
  * gates every role.

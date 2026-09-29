@@ -453,6 +453,13 @@ async fn build_role_dispatch_harness(
         .find(|state| state.name == to_state)
         .and_then(|state| state.gate_config.clone());
     let (tx, rx) = mpsc::unbounded_channel();
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     DispatchHarness {
         ctx: HookContext {
@@ -461,7 +468,7 @@ async fn build_role_dispatch_harness(
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: Some(project.version),
@@ -470,12 +477,12 @@ async fn build_role_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,
@@ -507,6 +514,13 @@ async fn build_no_repo_dispatch_harness(
         .find(|state| state.name == default_states::IN_PROGRESS)
         .and_then(|state| state.gate_config.clone());
     let (tx, rx) = mpsc::unbounded_channel();
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     DispatchHarness {
         ctx: HookContext {
@@ -515,7 +529,7 @@ async fn build_no_repo_dispatch_harness(
             from_state: default_states::TODO.to_owned(),
             to_state: default_states::IN_PROGRESS.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: None,
@@ -524,12 +538,12 @@ async fn build_no_repo_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,
@@ -611,6 +625,8 @@ async fn build_test_ctx(
         .await
         .expect("project reloads")
         .expect("project exists");
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
 
     HookContext {
         task_id: task_id.to_owned(),
@@ -618,7 +634,7 @@ async fn build_test_ctx(
         from_state: from_state.to_owned(),
         to_state: to_state.to_owned(),
         db,
-        event_bus: Arc::new(EventBus::new(16)),
+        event_bus,
         gate_config,
         workflow,
         project_version: Some(project.version),
@@ -627,7 +643,7 @@ async fn build_test_ctx(
         review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
-        task_executor: None,
+        task_service,
         daemon_connections: None,
         workspace_exec_locks: None,
         terminal_activity: None,
@@ -2611,6 +2627,45 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     );
 }
 
+/// A candidate with no agent review contract (a human reviewer, or no
+/// reviewer) merges without a pinned object, so it meets a sibling's change as
+/// a plain merge conflict. That conflict is still the Worker's to reconcile.
+#[tokio::test]
+async fn plain_merge_conflict_is_handed_back_to_the_worker() {
+    let mut ctx = build_test_ctx(
+        "task-plain-merge-conflict",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+
+    let result = RunMerge.execute(&ctx).await;
+
+    let HookResult::Cascade { to, reason } = result else {
+        panic!("a plain merge conflict goes back to the Worker, got {result:?}");
+    };
+    assert_eq!(to, default_states::MERGE_FAILED);
+    assert!(
+        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        "{reason}"
+    );
+    let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
+    assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
+    let current = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert!(current.blocked_json.is_none(), "nothing parks for a human");
+    assert_eq!(current.review_passed_at, None);
+}
+
 #[tokio::test]
 async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
     let ctx = build_test_ctx(
@@ -2915,6 +2970,13 @@ async fn build_reviewer_dispatch_harness(
         .await
         .expect("project reloads")
         .expect("project exists");
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     let mut harness = DispatchHarness {
         ctx: HookContext {
@@ -2923,7 +2985,7 @@ async fn build_reviewer_dispatch_harness(
             from_state: default_states::IN_PROGRESS.to_owned(),
             to_state: default_states::REVIEW.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: Some(project.version),
@@ -2932,12 +2994,12 @@ async fn build_reviewer_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,

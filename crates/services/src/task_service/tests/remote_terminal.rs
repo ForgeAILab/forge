@@ -121,7 +121,7 @@ fn remote_terminal_fixture_preserves_owner_and_deadline_for_terminal_cas() {
 }
 
 #[test]
-fn remote_terminal_authorization_requires_both_live_lease_and_hard_deadline() {
+fn remote_terminal_authorization_requires_a_live_lease_and_an_unexpired_hard_deadline() {
     let owner = "daemon:opaque-daemon-id:connection:42";
     let now = Utc::now();
     let live_lease = (now + Duration::minutes(1)).to_rfc3339();
@@ -140,7 +140,8 @@ fn remote_terminal_authorization_requires_both_live_lease_and_hard_deadline() {
         owner,
         now,
     ));
-    assert!(!remote_execution_lease_is_active(
+    // An unbounded run has no hard deadline; the live lease alone authorizes it.
+    assert!(remote_execution_lease_is_active(
         Some(owner),
         Some(&live_lease),
         None,

@@ -116,6 +116,7 @@ async fn task_proposal_rest_and_native_share_command_receipts_mcp_is_direct_task
         &provider,
         &fixture.native_identity_id,
         &scope,
+        "adapter-parity-session",
         "task.propose",
         json!({
             "payload": {
@@ -284,6 +285,7 @@ async fn task_proposal_rest_and_native_share_command_receipts_mcp_is_direct_task
         &provider,
         &fixture.native_identity_id,
         &scope,
+        "adapter-parity-session",
         "task.propose",
         json!({
             "payload": { "description": "missing title" },

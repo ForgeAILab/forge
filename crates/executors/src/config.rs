@@ -628,6 +628,7 @@ mod tests {
             model_id: Some("o3-mini".to_owned()),
             reasoning_effort: None,
             permission_policy: Some("supervised".to_owned()),
+            hard_deadline_seconds: None,
         };
 
         let resolved =
@@ -644,6 +645,7 @@ mod tests {
             model_id: None,
             reasoning_effort: Some("high".to_owned()),
             permission_policy: None,
+            hard_deadline_seconds: None,
         };
 
         let codex = resolve_config_value(ExecutorKind::Codex, &serde_json::json!({}), &overrides)
@@ -664,6 +666,7 @@ mod tests {
             model_id: None,
             reasoning_effort: None,
             permission_policy: Some("auto".to_owned()),
+            hard_deadline_seconds: None,
         };
 
         let resolved =

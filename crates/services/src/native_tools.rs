@@ -8,6 +8,8 @@
 
 use std::{
     collections::BTreeSet,
+    fs::{self, File},
+    io::Read,
     net::{IpAddr, Ipv6Addr},
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
@@ -27,7 +29,7 @@ use config::PublicSearchConfig;
 use db::{
     AgentAction, AgentActionListQuery, AgentActionPolicyResult, AgentActionRepo,
     AgentCommitmentListQuery, AgentCommitmentRepo, AgentInboxListQuery, AgentInboxRepo,
-    CommandReceiptRepo, MemoryScopeGrant, SqliteDb,
+    CommandReceiptRepo, MemoryScopeGrant, SqliteDb, TaskBoardRepo,
 };
 use forge_agent_host::{
     contains_adaptive_authority_override, contains_authority_override, operation_contract,
@@ -42,8 +44,8 @@ use forge_agent_host::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
     PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
-    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION,
-    TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -759,8 +761,17 @@ impl CoordinationToolProvider {
             (Some(path), None) => {
                 let root = self.task_workspace_root(&task_id).await?;
                 let resolved = resolve_workspace_artifact(&root, path)?;
-                let bytes = std::fs::read(&resolved).map_err(|error| {
+                let bytes = read_bounded_regular_file(
+                    &resolved,
+                    &root,
+                    MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    false,
+                )
+                .map_err(|error| {
                     AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                })?
+                .ok_or_else(|| {
+                    AgentHostError::Runtime("captured artifact does not exist".to_owned())
                 })?;
                 let name = resolved
                     .file_name()
@@ -819,6 +830,113 @@ impl CoordinationToolProvider {
         }))
     }
 
+    async fn execute_task_plan_write(
+        &self,
+        actor_identity_id: &str,
+        runtime_session_id: &str,
+        scope: &CanonicalScope,
+        payload: &Value,
+    ) -> Result<Value, AgentHostError> {
+        if scope.scope_type != CanonicalScopeType::Task {
+            return Err(AgentHostError::Authority(
+                "a plan candidate belongs to a Task session".to_owned(),
+            ));
+        }
+        if payload.get("action").and_then(Value::as_str) != Some("write") {
+            return Err(invalid_arguments(
+                "task.plan action must be write".to_owned(),
+            ));
+        }
+        let content = payload
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| invalid_arguments("plan content is required".to_owned()))?;
+        let executions: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, e.role, e.workspace_id
+             FROM agent_session AS s
+             JOIN agent_context_scope AS scope ON scope.id = s.context_scope_id
+             JOIN execution AS e
+               ON e.task_id = scope.task_id AND e.agent_id = s.identity_id
+             WHERE s.runtime_session_id = ? AND s.identity_id = ?
+               AND scope.scope_type = 'task' AND scope.scope_id = ?
+               AND scope.task_id = ? AND e.status = 'running'
+               AND (
+                    (scope.task_role = 'planner' AND e.role = 'planner')
+                    OR (scope.task_role = 'worker' AND e.role IN ('worker', 'coder', 'executor'))
+               )
+             ORDER BY e.created_at DESC, e.id DESC LIMIT 2",
+        )
+        .bind(runtime_session_id)
+        .bind(actor_identity_id)
+        .bind(&scope.scope_id)
+        .bind(&scope.scope_id)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let [(execution_id, role, workspace_id)] = executions.as_slice() else {
+            return Err(AgentHostError::Authority(
+                "task.plan requires one exact running execution for this native session".to_owned(),
+            ));
+        };
+        let execution_id = execution_id.clone();
+        let role = role.clone();
+        let workspace_id = workspace_id.clone();
+        if !executors::task_role_can_write_plan(Some(&role)) {
+            return Err(AgentHostError::Authority(
+                "task.plan is available only to planner and implementation roles".to_owned(),
+            ));
+        }
+        let workspace_id = workspace_id.ok_or_else(|| {
+            AgentHostError::Authority(
+                "task.plan requires an execution-bound Task workspace".to_owned(),
+            )
+        })?;
+        let worktree_path: Option<String> = sqlx::query_scalar(
+            "SELECT worktree_path FROM workspace WHERE id = ? AND status = 'ready'",
+        )
+        .bind(workspace_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let worktree_path = worktree_path.ok_or_else(|| {
+            AgentHostError::Runtime(
+                "this execution has no active workspace for its plan candidate".to_owned(),
+            )
+        })?;
+        match crate::plan_artifact::write_execution_outbox_plan(
+            Path::new(&worktree_path),
+            &execution_id,
+            content,
+        ) {
+            Ok(()) => {}
+            Err(
+                crate::plan_artifact::PlanArtifactError::MissingChecklist { .. }
+                | crate::plan_artifact::PlanArtifactError::FileTooLarge { .. },
+            ) => {
+                return Err(invalid_arguments(
+                    "plan content must be a Markdown checklist no larger than 1 MiB".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(AgentHostError::Runtime(
+                    "Forge could not store this execution's plan candidate".to_owned(),
+                ));
+            }
+        }
+        let checklist_items = crate::plan_artifact::parse_plan_markdown(content)
+            .items
+            .len();
+        Ok(json!({
+            "operation": TASK_PLAN_OPERATION,
+            "task_id": scope.scope_id,
+            "execution_id": execution_id,
+            "role": role,
+            "checklist_items": checklist_items,
+            "domain_committed": true,
+        }))
+    }
+
     /// Store one captured artifact as Task media with the checksum milestone
     /// evidence attachment compares against.
     async fn store_task_evidence(
@@ -829,11 +947,57 @@ impl CoordinationToolProvider {
         content_type: String,
         bytes: &[u8],
     ) -> Result<StoredEvidence, AgentHostError> {
+        self.store_task_evidence_with_id(
+            actor_identity_id,
+            task_id,
+            filename,
+            content_type,
+            bytes,
+            db::new_uuid_v4(),
+        )
+        .await
+    }
+
+    /// Store Task evidence under a caller-selected durable identity.
+    ///
+    /// CLI outbox ingestion derives this identity from the execution and JSONL
+    /// line. If the process stops after the media row commits but before its
+    /// caption comment is appended, replay resolves the same media instead of
+    /// creating another asset.
+    async fn store_task_evidence_with_id(
+        &self,
+        actor_identity_id: &str,
+        task_id: &str,
+        filename: &str,
+        content_type: String,
+        bytes: &[u8],
+        media_id: String,
+    ) -> Result<StoredEvidence, AgentHostError> {
         let media_root = self.media_root_handle().ok_or_else(|| {
             AgentHostError::Configuration("media storage is not configured".to_owned())
         })?;
-        let media_id = db::new_uuid_v4();
         let storage_key = format!("{task_id}/{media_id}__{filename}");
+        let byte_size = bytes.len() as i64;
+        let checksum = hex::encode(Sha256::digest(bytes));
+
+        if let Some(existing) = db::TaskMediaRepo::get_media_by_id(&*self.db, &media_id, true)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+        {
+            return self
+                .resolve_task_evidence_receipt(
+                    existing,
+                    actor_identity_id,
+                    task_id,
+                    filename,
+                    &content_type,
+                    &storage_key,
+                    byte_size,
+                    &checksum,
+                )
+                .await;
+        }
+
         let destination = safe_media_destination(&media_root, &storage_key)?;
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -844,47 +1008,103 @@ impl CoordinationToolProvider {
             AgentHostError::Runtime(format!("captured artifact could not be stored: {error}"))
         })?;
 
-        let byte_size = bytes.len() as i64;
         let created = db::TaskMediaRepo::create_media(
             &*self.db,
             db::CreateTaskMedia {
                 id: media_id.clone(),
                 task_id: task_id.to_owned(),
                 display_filename: filename.to_owned(),
-                content_type,
+                content_type: content_type.clone(),
                 byte_size,
-                storage_key,
+                storage_key: storage_key.clone(),
                 author_type: db::CommentAuthorType::Agent,
                 author_id: Some(actor_identity_id.to_owned()),
                 author_name: "Agent".to_owned(),
                 created_at: db::now_rfc3339(),
             },
         )
+        .await;
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                // A concurrent replay may have won the deterministic media
+                // insert after the lookup above. Resolve that exact receipt;
+                // do not turn its unique-key win into a second artifact.
+                match db::TaskMediaRepo::get_media_by_id(&*self.db, &media_id, true).await {
+                    Ok(Some(existing)) => existing,
+                    Ok(None) => {
+                        let _ = std::fs::remove_file(&destination);
+                        return Err(AgentHostError::Runtime(error.to_string()));
+                    }
+                    Err(lookup_error) => {
+                        return Err(AgentHostError::Runtime(format!(
+                            "{error}; evidence receipt lookup failed: {lookup_error}"
+                        )));
+                    }
+                }
+            }
+        };
+
+        self.resolve_task_evidence_receipt(
+            created,
+            actor_identity_id,
+            task_id,
+            filename,
+            &content_type,
+            &storage_key,
+            byte_size,
+            &checksum,
+        )
         .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_task_evidence_receipt(
+        &self,
+        media: db::TaskMedia,
+        actor_identity_id: &str,
+        task_id: &str,
+        filename: &str,
+        content_type: &str,
+        storage_key: &str,
+        byte_size: i64,
+        checksum: &str,
+    ) -> Result<StoredEvidence, AgentHostError> {
+        if media.task_id != task_id
+            || media.display_filename != filename
+            || media.content_type != content_type
+            || media.byte_size != byte_size
+            || media.storage_key != storage_key
+            || media.author_type != db::CommentAuthorType::Agent
+            || media.author_id.as_deref() != Some(actor_identity_id)
+            || media.deleted_at.is_some()
+        {
+            return Err(AgentHostError::Runtime(
+                "outbox evidence receipt conflicts with the persisted artifact".to_owned(),
+            ));
+        }
 
         // Milestone evidence attachment compares the caller's checksum against
         // this column; a Task artifact without one can never back a check.
-        let checksum = hex::encode(Sha256::digest(bytes));
         db::SharedMediaRepo::set_media_asset_checksum(
             &*self.db,
-            &created.id,
+            &media.id,
             byte_size,
-            &checksum,
+            checksum,
             &db::now_rfc3339(),
         )
         .await
         .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        let asset = db::SharedMediaRepo::get_media_asset_for_task_media(&*self.db, &created.id)
+        let asset = db::SharedMediaRepo::get_media_asset_for_task_media(&*self.db, &media.id)
             .await
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?
             .ok_or_else(|| {
                 AgentHostError::Runtime("captured artifact has no media asset".to_owned())
             })?;
         Ok(StoredEvidence {
-            media_id: created.id,
+            media_id: media.id,
             asset_id: asset.id,
-            checksum,
+            checksum: checksum.to_owned(),
             byte_size,
         })
     }
@@ -896,20 +1116,25 @@ impl CoordinationToolProvider {
     /// Every entry is validated exactly as the native tools validate it, and
     /// provenance still comes from the execution row rather than the files.
     /// A malformed entry is skipped and reported, never fatal: the run's real
-    /// outcome must not hinge on its bookkeeping. The outbox is removed once
-    /// read so a later completion pass cannot ingest it twice.
+    /// outcome must not hinge on its bookkeeping. An authorized plan candidate
+    /// is frozen into a bounded host-owned stage before the outbox is removed;
+    /// only the terminal-CAS winner may publish that exact snapshot.
     pub async fn ingest_execution_outbox(
         &self,
         input: &ExecutionOutboxInput<'_>,
     ) -> ExecutionOutboxReport {
         let mut report = ExecutionOutboxReport::default();
         let worktree = Path::new(input.worktree_path);
-        let Some(outbox) = executors::execution_outbox_path(worktree, input.execution_id) else {
-            return report;
+        let outbox = match executors::existing_execution_outbox(worktree, input.execution_id) {
+            Ok(Some(outbox)) => outbox,
+            Ok(None) => return report,
+            Err(error) => {
+                report
+                    .rejected
+                    .push(format!("execution outbox is unsafe: {error}"));
+                return report;
+            }
         };
-        if !outbox.is_dir() {
-            return report;
-        }
 
         let author_name = input.role.unwrap_or("agent").to_owned();
         for (line_no, line) in
@@ -941,10 +1166,32 @@ impl CoordinationToolProvider {
             }
         }
 
-        if let Err(error) = std::fs::remove_dir_all(&outbox) {
-            report.rejected.push(format!(
-                "outbox could not be removed after ingestion: {error}"
-            ));
+        if executors::task_role_can_write_plan(input.role) {
+            match crate::plan_artifact::stage_execution_outbox_plan(
+                &outbox,
+                std::path::Path::new(input.worktree_path),
+                input.execution_id,
+            ) {
+                Ok(true) => {
+                    report.plan_candidate = true;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    report.plan_rejected = true;
+                    report.rejected.push(format!("plan.md: {error}"));
+                }
+            }
+        }
+
+        // A staging failure may be transient (for example a process exited
+        // during the prior no-replace install). Keep the source until the
+        // terminal cascade either recovers it or settles the failure path.
+        if !report.plan_rejected {
+            if let Err(error) = executors::remove_execution_outbox(worktree, input.execution_id) {
+                report.rejected.push(format!(
+                    "outbox could not be removed after ingestion: {error}"
+                ));
+            }
         }
         report
     }
@@ -991,6 +1238,14 @@ impl CoordinationToolProvider {
         line_no: usize,
         line: &str,
     ) -> Result<(), String> {
+        let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
+        if self
+            .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
+            .await?
+        {
+            return Ok(());
+        }
+
         let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
         let kind = entry
             .get("kind")
@@ -1019,10 +1274,15 @@ impl CoordinationToolProvider {
             .filter(|value| !value.trim().is_empty());
         let (bytes, filename, content_type) = match (path, content) {
             (Some(path), None) => {
-                let resolved =
+                let (resolved, allowed_root, require_single_link) =
                     resolve_outbox_artifact(Path::new(input.worktree_path), outbox, path)?;
-                let bytes = std::fs::read(&resolved)
-                    .map_err(|error| format!("captured artifact is unreadable: {error}"))?;
+                let bytes = read_bounded_regular_file(
+                    &resolved,
+                    &allowed_root,
+                    MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    require_single_link,
+                )?
+                .ok_or("captured artifact does not exist")?;
                 let name = resolved
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -1049,25 +1309,60 @@ impl CoordinationToolProvider {
                 "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
             ));
         }
-        self.store_task_evidence(
+        self.store_task_evidence_with_id(
             input.agent_id,
             input.task_id,
             &filename,
             content_type,
             &bytes,
+            outbox_evidence_media_id(input.execution_id, line_no),
         )
         .await
         .map_err(|error| error.to_string())?;
         // The file has no response channel to report the stored asset back
         // through, so the caption becomes the worklog line naming it.
-        self.append_outbox_worklog(
-            input,
-            author_name,
-            "validation",
-            &format!("Captured {kind} evidence `{filename}`: {caption}"),
-            format!("outbox:{}:evidence:{line_no}", input.execution_id),
+        let appended = self
+            .append_outbox_worklog(
+                input,
+                author_name,
+                "validation",
+                &format!("Captured {kind} evidence `{filename}`: {caption}"),
+                idempotency_key.clone(),
+            )
+            .await;
+        match appended {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if self
+                    .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
+                    .await?
+                {
+                    // Concurrent ingestion may lose the unique idempotency-key
+                    // insert after storing the same deterministic media receipt.
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn outbox_worklog_receipt_exists(
+        &self,
+        task_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, String> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_comment
+                 WHERE task_id = ? AND idempotency_key = ?
+             )",
         )
+        .bind(task_id)
+        .bind(idempotency_key)
+        .fetch_one(self.db.pool())
         .await
+        .map_err(|error| error.to_string())
     }
 
     async fn append_outbox_worklog(
@@ -1211,8 +1506,17 @@ impl CoordinationToolProvider {
                     .project_verify_workspace_root(actor_identity_id, scope)
                     .await?;
                 let resolved = resolve_workspace_artifact(&root, path)?;
-                let bytes = std::fs::read(&resolved).map_err(|error| {
+                let bytes = read_bounded_regular_file(
+                    &resolved,
+                    &root,
+                    MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    false,
+                )
+                .map_err(|error| {
                     AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                })?
+                .ok_or_else(|| {
+                    AgentHostError::Runtime("captured artifact does not exist".to_owned())
                 })?;
                 let name = resolved
                     .file_name()
@@ -1899,7 +2203,17 @@ impl CoordinationToolProvider {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({"items": items}))
+        // `task.adaptive` requires `expected_board_revision`; this read is the
+        // only place a Project Agent can learn it without a failed command.
+        let board_revision = match project_scope_id.as_deref() {
+            Some(project_id) => Some(
+                TaskBoardRepo::board_revision(&*self.db, project_id)
+                    .await
+                    .map_err(|_| AgentHostError::ProtectedPersistence)?,
+            ),
+            None => None,
+        };
+        Ok(json!({"board_revision": board_revision, "items": items}))
     }
 
     async fn read_events(
@@ -2061,6 +2375,7 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
+        runtime_session_id: &str,
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
@@ -2137,6 +2452,11 @@ impl CoordinationToolProvider {
         if operation == TASK_EVIDENCE_OPERATION {
             return self
                 .execute_task_evidence_capture(actor_identity_id, scope, &payload)
+                .await;
+        }
+        if operation == TASK_PLAN_OPERATION {
+            return self
+                .execute_task_plan_write(actor_identity_id, runtime_session_id, scope, &payload)
                 .await;
         }
         // `project.evidence` capture stores the artifact the Project Agent's
@@ -3790,6 +4110,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
+        runtime_session_id: &str,
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
@@ -3804,7 +4125,13 @@ impl ForgeToolProvider for CoordinationToolProvider {
             })
             .unwrap_or(false);
         let result = self
-            .propose(actor_identity_id, scope, operation, arguments.clone())
+            .propose(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments.clone(),
+            )
             .await;
         if operation_contract(operation).is_some() {
             match result {
@@ -3996,7 +4323,7 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
     if let Some(version) = current.version {
         let field = match operation {
             _ if current.resource_type == "project" => "expected_project_version",
-            TASK_CANCEL_OPERATION => "expected_task_version",
+            TASK_CANCEL_OPERATION | TASK_ADAPTIVE_OPERATION => "expected_task_version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
@@ -4005,6 +4332,13 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
             _ => "expected_version",
         };
         retry.arguments.insert(field.to_owned(), json!(version));
+    }
+    if let Some(revision) = current.revision {
+        if matches!(operation, TASK_ADAPTIVE_OPERATION) {
+            retry
+                .arguments
+                .insert("expected_board_revision".to_owned(), json!(revision));
+        }
     }
     if let Some(revision_id) = current.revision_id.as_deref() {
         if matches!(operation, PROJECT_DOCUMENT_OPERATION) {
@@ -4221,7 +4555,22 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
             "Forge proposal payload must be an object".to_owned(),
         ));
     }
-    if serde_json::to_vec(payload)
+    if operation == TASK_PLAN_OPERATION {
+        let object = payload.as_object().expect("payload object checked above");
+        let content = object.get("content").and_then(Value::as_str);
+        let exact_shape = object.len() == 2
+            && object.get("action").and_then(Value::as_str) == Some("write")
+            && content.is_some_and(|content| {
+                !content.trim().is_empty()
+                    && content.len() as u64 <= crate::plan_artifact::MAX_PLAN_ARTIFACT_SIZE_BYTES
+            });
+        if !exact_shape {
+            return Err(AgentHostError::Authority(
+                "task.plan requires only action=write and non-empty content no larger than 1 MiB"
+                    .to_owned(),
+            ));
+        }
+    } else if serde_json::to_vec(payload)
         .map(|bytes| bytes.len() > 64 * 1024)
         .unwrap_or(true)
     {
@@ -4638,12 +4987,22 @@ pub struct ExecutionOutboxReport {
     pub evidence_items: usize,
     /// One human-readable reason per entry that was not ingested.
     pub rejected: Vec<String>,
+    pub(crate) plan_candidate: bool,
+    pub(crate) plan_rejected: bool,
 }
 
 /// At most this many bytes of one outbox file are read.
 const MAX_OUTBOX_FILE_BYTES: u64 = 1024 * 1024;
 /// At most this many entries of one outbox file are ingested.
 const MAX_OUTBOX_ENTRIES: usize = 200;
+
+fn outbox_evidence_media_id(execution_id: &str, line_no: usize) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("forge:execution:{execution_id}:outbox-evidence:{line_no}").as_bytes(),
+    )
+    .to_string()
+}
 
 /// Non-empty lines of one outbox file, numbered from 1, within the size and
 /// entry bounds. Bounds violations are reported, not silently truncated.
@@ -4653,23 +5012,20 @@ fn read_outbox_lines(
     report: &mut ExecutionOutboxReport,
 ) -> Vec<(usize, String)> {
     let path = outbox.join(file);
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-        return Vec::new();
-    };
-    if !metadata.is_file() {
-        report.rejected.push(format!("{file}: not a regular file"));
-        return Vec::new();
-    }
-    if metadata.len() > MAX_OUTBOX_FILE_BYTES {
-        report.rejected.push(format!(
-            "{file}: exceeds the {MAX_OUTBOX_FILE_BYTES} byte outbox limit"
-        ));
-        return Vec::new();
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match read_bounded_regular_file(&path, outbox, MAX_OUTBOX_FILE_BYTES, true) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Vec::new(),
         Err(error) => {
             report.rejected.push(format!("{file}: unreadable: {error}"));
+            return Vec::new();
+        }
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            report
+                .rejected
+                .push(format!("{file}: unreadable: content is not valid UTF-8"));
             return Vec::new();
         }
     };
@@ -4690,9 +5046,15 @@ fn read_outbox_lines(
 
 /// Resolve an outbox evidence path: worktree-relative, or absolute inside the
 /// outbox (where a read-only role saves what it captured).
-fn resolve_outbox_artifact(worktree: &Path, outbox: &Path, path: &str) -> Result<PathBuf, String> {
+fn resolve_outbox_artifact(
+    worktree: &Path,
+    outbox: &Path,
+    path: &str,
+) -> Result<(PathBuf, PathBuf, bool), String> {
     if !Path::new(path).is_absolute() {
-        return resolve_workspace_artifact(worktree, path).map_err(|error| error.to_string());
+        return resolve_workspace_artifact(worktree, path)
+            .map(|path| (path, worktree.to_path_buf(), false))
+            .map_err(|error| error.to_string());
     }
     let canonical_outbox = outbox
         .canonicalize()
@@ -4709,7 +5071,75 @@ fn resolve_outbox_artifact(worktree: &Path, outbox: &Path, path: &str) -> Result
     if !canonical.is_file() {
         return Err("captured artifact is not a file".to_owned());
     }
-    Ok(canonical)
+    Ok((PathBuf::from(path), outbox.to_path_buf(), true))
+}
+
+/// Open and read a regular file within one allowed root while enforcing the
+/// byte limit on the opened handle. The metadata comparison prevents a leaf
+/// replacement between validation and open from being accepted, and outbox
+/// callers also require a single link so a hard link cannot turn the outbox
+/// into a read channel for another file.
+fn read_bounded_regular_file(
+    path: &Path,
+    allowed_root: &Path,
+    max_bytes: u64,
+    require_single_link: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    let leaf_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !leaf_metadata.file_type().is_file() {
+        return Err("not a regular file".to_owned());
+    }
+
+    let canonical_root = fs::canonicalize(allowed_root).map_err(|error| error.to_string())?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("path escapes its allowed root".to_owned());
+    }
+    let path_metadata = fs::symlink_metadata(&canonical_path).map_err(|error| error.to_string())?;
+    if !path_metadata.file_type().is_file() {
+        return Err("not a regular file".to_owned());
+    }
+    let file = File::open(&canonical_path).map_err(|error| error.to_string())?;
+    let opened_metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !same_open_file(&path_metadata, &opened_metadata) {
+        return Err("file changed while it was being opened".to_owned());
+    }
+    #[cfg(unix)]
+    if require_single_link {
+        use std::os::unix::fs::MetadataExt;
+        if opened_metadata.nlink() != 1 {
+            return Err("file must not be a hard link".to_owned());
+        }
+    }
+    if opened_metadata.len() > max_bytes {
+        return Err(format!("exceeds the {max_bytes} byte limit"));
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("exceeds the {max_bytes} byte limit"));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn same_open_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_open_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
@@ -4741,6 +5171,22 @@ fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, Ag
         ));
     }
     let joined = root.join(candidate);
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| {
+        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+    })?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(AgentHostError::Authority(
+            "Task workspace must be a real directory".to_owned(),
+        ));
+    }
+    let leaf_metadata = fs::symlink_metadata(&joined).map_err(|error| {
+        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
+    })?;
+    if !leaf_metadata.file_type().is_file() {
+        return Err(AgentHostError::Authority(
+            "captured artifact must be a regular file, not a symlink".to_owned(),
+        ));
+    }
     let canonical_root = root.canonicalize().map_err(|error| {
         AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
     })?;
@@ -4757,7 +5203,7 @@ fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, Ag
             "captured artifact is not a file".to_owned(),
         ));
     }
-    Ok(canonical)
+    Ok(joined)
 }
 
 /// Build the on-disk destination for a storage key without letting the key
@@ -4800,6 +5246,494 @@ fn content_type_for(filename: &str, kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NativePlanFixture {
+        db: Arc<db::SqliteDb>,
+        provider: CoordinationToolProvider,
+        _temp: tempfile::TempDir,
+        agent_id: String,
+        runtime_session_id: String,
+        task_id: String,
+        execution_id: String,
+        workspace_id: String,
+        worktree: PathBuf,
+        scope: CanonicalScope,
+    }
+
+    async fn native_plan_fixture(task_role: &str, execution_role: &str) -> NativePlanFixture {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        let project_id = db::new_uuid_v4();
+        let repo_id = db::new_uuid_v4();
+        let task_id = db::new_uuid_v4();
+        let workspace_id = db::new_uuid_v4();
+        let execution_id = db::new_uuid_v4();
+        let agent_id = db::new_uuid_v4();
+        let profile_id = db::new_uuid_v4();
+        let context_scope_id = db::new_uuid_v4();
+        let runtime_session_id = db::new_uuid_v4();
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let worktree = temp.path().join(&task_id).join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree creates");
+
+        let project = db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: project_id.clone(),
+                name: "Native plan project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        db::RepoRepo::create(
+            &*db,
+            db::CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "repo".to_owned(),
+                remote_url: "https://example.invalid/repo.git".to_owned(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("repo creates");
+        db::ProjectRepo::update_at_version(
+            &*db,
+            db::UpdateProject {
+                id: project_id.clone(),
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(repo_id.clone())),
+                paused_at: None,
+                updated_at: now.clone(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .expect("primary repo binds");
+        db::TaskRepo::create(
+            &*db,
+            db::CreateTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Write a native plan".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "planning".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task creates");
+        db::WorkspaceRepo::create(
+            &*db,
+            db::CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task_id.clone(),
+                repo_id,
+                worktree_path: worktree.to_string_lossy().into_owned(),
+                branch: workspace::task_branch_name(&task_id),
+                status: db::WorkspaceStatus::Ready,
+                before_sha: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("workspace creates");
+        db::AgentRepo::create_identity_with_profile(
+            &*db,
+            db::CreateAgentIdentity {
+                id: agent_id.clone(),
+                name: "native-plan-agent".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Busy,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            db::CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: agent_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: "native".to_owned(),
+                provider: None,
+                model: Some("test-model".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("agent identity creates");
+        db::AgentContextScopeRepo::create_context_scope(
+            &*db,
+            db::CreateAgentContextScope {
+                id: context_scope_id.clone(),
+                identity_id: agent_id.clone(),
+                scope_type: "task".to_owned(),
+                scope_id: task_id.clone(),
+                project_id: Some(project_id),
+                task_id: Some(task_id.clone()),
+                task_role: Some(task_role.to_owned()),
+                workspace_access: "task_write".to_owned(),
+                authority_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("context scope creates");
+        db::AgentSessionRepo::create_agent_session(
+            &*db,
+            db::CreateAgentSession {
+                id: db::new_uuid_v4(),
+                identity_id: agent_id.clone(),
+                profile_id,
+                context_scope_id,
+                backend_kind: "native".to_owned(),
+                runtime_session_id: Some(runtime_session_id.clone()),
+                status: "running".to_owned(),
+                capabilities_json: "{}".to_owned(),
+                connection_status: "healthy".to_owned(),
+                predecessor_session_id: None,
+                last_activity_at: Some(now.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("agent session creates");
+        db::ExecutionRepo::create(
+            &*db,
+            db::CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: Some(agent_id.clone()),
+                role: execution_role.to_owned(),
+                status: db::ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: Some(runtime_session_id.clone()),
+                agent_message_id: None,
+                last_activity_at: Some(now.clone()),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(
+                    r#"{"executor_type":"native","plan_delivery":"execution_outbox"}"#.to_owned(),
+                ),
+                workspace_id: Some(workspace_id.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        let provider = CoordinationToolProvider::new(Arc::clone(&db));
+        NativePlanFixture {
+            db,
+            provider,
+            _temp: temp,
+            agent_id,
+            runtime_session_id,
+            task_id: task_id.clone(),
+            execution_id,
+            workspace_id,
+            worktree,
+            scope: CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: task_id,
+                workspace_access: WorkspaceAccess::TaskWrite,
+            },
+        }
+    }
+
+    fn assert_correctable_plan_validation(error: AgentHostError) {
+        match error {
+            AgentHostError::StructuredOutcome(outcome) => {
+                assert_eq!(outcome.code, OutcomeCode::ValidationError);
+                assert_eq!(outcome.status, OutcomeStatus::Failed);
+                assert_eq!(
+                    outcome.retry.as_ref().map(|retry| retry.action),
+                    Some(RetryAction::CorrectInput)
+                );
+                assert!(outcome.safe_message.contains("Markdown checklist"));
+            }
+            other => panic!("invalid plan input must be correctable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_task_plan_writes_only_the_owning_execution_outbox() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        let result = fixture
+            .provider
+            .execute_task_plan_write(
+                &fixture.agent_id,
+                &fixture.runtime_session_id,
+                &fixture.scope,
+                &json!({"action": "write", "content": "# Plan\n\n- [ ] implement it\n"}),
+            )
+            .await
+            .expect("owning planner session writes a plan candidate");
+
+        assert_eq!(result["task_id"], fixture.task_id);
+        assert_eq!(result["execution_id"], fixture.execution_id);
+        assert_eq!(result["checklist_items"], 1);
+        let outbox = executors::execution_outbox_path(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox path");
+        assert_eq!(
+            std::fs::read_to_string(outbox.join("plan.md")).expect("outbox plan reads"),
+            "# Plan\n\n- [ ] implement it\n"
+        );
+        assert!(
+            !fixture
+                .worktree
+                .parent()
+                .expect("Task directory")
+                .join("plan.md")
+                .exists(),
+            "the native tool must not write the canonical Task plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_task_plan_denies_a_reviewer_session() {
+        let fixture = native_plan_fixture("reviewer", "reviewer").await;
+        let error = fixture
+            .provider
+            .execute_task_plan_write(
+                &fixture.agent_id,
+                &fixture.runtime_session_id,
+                &fixture.scope,
+                &json!({"action": "write", "content": "- [ ] must not publish\n"}),
+            )
+            .await
+            .expect_err("reviewer session has no plan-write authority");
+
+        assert!(matches!(error, AgentHostError::Authority(_)));
+        let outbox = executors::execution_outbox_path(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox path");
+        assert!(!outbox.exists());
+    }
+
+    #[tokio::test]
+    async fn native_task_plan_fails_closed_for_duplicate_running_executions() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        let now = db::now_rfc3339();
+        // Reproduce a legacy/corrupt duplicate directly: current admission
+        // prevents creating two live rows for one workspace, while this tool
+        // still has to fail closed if an upgraded database already has them.
+        sqlx::query(
+            "INSERT INTO execution (
+                 id, task_id, agent_id, role, status, agent_session_id,
+                 workspace_id, created_at, updated_at
+             ) VALUES (?, ?, ?, 'planner', 'running', ?, ?, ?, ?)",
+        )
+        .bind(db::new_uuid_v4())
+        .bind(&fixture.task_id)
+        .bind(&fixture.agent_id)
+        .bind(&fixture.runtime_session_id)
+        .bind(&fixture.workspace_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(fixture.db.pool())
+        .await
+        .expect("duplicate running execution creates");
+
+        let error = fixture
+            .provider
+            .execute_task_plan_write(
+                &fixture.agent_id,
+                &fixture.runtime_session_id,
+                &fixture.scope,
+                &json!({"action": "write", "content": "- [ ] ambiguous\n"}),
+            )
+            .await
+            .expect_err("ambiguous execution authority fails closed");
+        assert!(matches!(error, AgentHostError::Authority(_)));
+        let outbox = executors::execution_outbox_path(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox path");
+        assert!(!outbox.exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_native_task_plan_preserves_the_previous_candidate() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        let original = "# Plan\n\n- [ ] keep this candidate\n";
+        fixture
+            .provider
+            .execute_task_plan_write(
+                &fixture.agent_id,
+                &fixture.runtime_session_id,
+                &fixture.scope,
+                &json!({"action": "write", "content": original}),
+            )
+            .await
+            .expect("initial plan candidate writes");
+        let outbox = executors::execution_outbox_path(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox path");
+        let plan_path = outbox.join("plan.md");
+        let before = std::fs::read(&plan_path).expect("initial candidate reads");
+
+        let error = fixture
+            .provider
+            .execute_task_plan_write(
+                &fixture.agent_id,
+                &fixture.runtime_session_id,
+                &fixture.scope,
+                &json!({"action": "write", "content": "# Plan without a checklist\n"}),
+            )
+            .await
+            .expect_err("a checklist-free plan is invalid");
+
+        assert_correctable_plan_validation(error);
+        assert_eq!(
+            std::fs::read(plan_path).expect("preserved candidate reads"),
+            before,
+            "validation must happen before replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_invalid_plan_outbox_replays_evidence_exactly_once() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        let media_root = fixture._temp.path().join("media");
+        fixture.provider.set_media_root(media_root.clone());
+        let outbox = executors::execution_outbox_path(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox path");
+        std::fs::create_dir_all(&outbox).expect("outbox creates");
+        std::fs::write(outbox.join("plan.md"), "# Plan without checklist\n")
+            .expect("invalid plan writes");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_EVIDENCE_FILE),
+            concat!(
+                r#"{"kind":"log","caption":"focused tests passed","content":"OK"}"#,
+                "\n",
+            ),
+        )
+        .expect("evidence writes");
+
+        // Reproduce a stop after the media commit but before the caption
+        // comment. The next ingestion must resolve this durable identity.
+        let media_id = outbox_evidence_media_id(&fixture.execution_id, 1);
+        fixture
+            .provider
+            .store_task_evidence_with_id(
+                &fixture.agent_id,
+                &fixture.task_id,
+                "log.txt",
+                "text/plain".to_owned(),
+                b"OK",
+                media_id.clone(),
+            )
+            .await
+            .expect("interrupted media commit creates");
+
+        let worktree_path = fixture.worktree.to_string_lossy().into_owned();
+        let input = ExecutionOutboxInput {
+            task_id: &fixture.task_id,
+            execution_id: &fixture.execution_id,
+            agent_id: &fixture.agent_id,
+            role: Some("planner"),
+            worktree_path: &worktree_path,
+        };
+        let first = fixture.provider.ingest_execution_outbox(&input).await;
+        assert_eq!(first.evidence_items, 1, "{first:?}");
+        assert!(first.plan_rejected, "{first:?}");
+        assert!(outbox.exists(), "the rejected plan retains its outbox");
+
+        let replay = fixture.provider.ingest_execution_outbox(&input).await;
+        assert_eq!(replay.evidence_items, 1, "{replay:?}");
+        assert!(replay.plan_rejected, "{replay:?}");
+        assert!(outbox.exists(), "the rejected plan remains diagnosable");
+
+        let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("media lists");
+        assert_eq!(media.len(), 1, "replay must not create another media row");
+        assert_eq!(media[0].id, media_id);
+        assert!(
+            media_root.join(&media[0].storage_key).is_file(),
+            "the single media row keeps one stored artifact"
+        );
+        let asset_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_asset WHERE legacy_task_media_id = ?")
+                .bind(&media_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .expect("asset count");
+        assert_eq!(asset_count, 1, "replay must not create another media asset");
+
+        let comments = db::TaskCommentRepo::list_comments(
+            &*fixture.db,
+            &fixture.task_id,
+            db::PageRequest {
+                cursor: None,
+                limit: 10,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Asc,
+            },
+        )
+        .await
+        .expect("comments list")
+        .items;
+        assert_eq!(comments.len(), 1, "replay must not append another caption");
+        let receipt_key = format!("outbox:{}:evidence:1", fixture.execution_id);
+        assert_eq!(
+            comments[0].idempotency_key.as_deref(),
+            Some(receipt_key.as_str())
+        );
+    }
 
     #[tokio::test]
     async fn execution_outbox_ingests_valid_entries_and_reports_the_rest() {
@@ -4885,6 +5819,8 @@ mod tests {
         std::fs::write(worktree.join("run.log"), "20 tests OK\n").expect("artifact");
         let outbox = executors::execution_outbox_path(&worktree, "exec-1").expect("outbox path");
         std::fs::create_dir_all(&outbox).expect("outbox");
+        std::fs::write(outbox.join("plan.md"), "- [ ] reviewer must not publish\n")
+            .expect("reviewer plan");
         std::fs::write(outbox.join("shot.png"), [0x89, b'P', b'N', b'G']).expect("shot");
         std::fs::write(
             outbox.join(executors::OUTBOX_WORKLOG_FILE),
@@ -4931,6 +5867,14 @@ mod tests {
         assert!(report.rejected[1].starts_with("worklog.jsonl:4: "));
         assert!(report.rejected[2].contains("evidence.jsonl:4: an absolute evidence path"));
         assert!(!outbox.exists(), "the outbox is consumed");
+        assert!(
+            !worktree
+                .parent()
+                .expect("task dir")
+                .join("plan.md")
+                .exists(),
+            "a reviewer cannot publish a plan"
+        );
 
         let comments = db::TaskCommentRepo::list_comments(
             &*db,
@@ -4969,6 +5913,60 @@ mod tests {
             })
             .await;
         assert_eq!(replay, ExecutionOutboxReport::default());
+
+        let planner_outbox =
+            executors::execution_outbox_path(&worktree, "planner-exec").expect("planner outbox");
+        std::fs::create_dir_all(&planner_outbox).expect("planner outbox creates");
+        std::fs::write(planner_outbox.join("plan.md"), "- [ ] implement\n").expect("planner plan");
+        let planner_report = provider
+            .ingest_execution_outbox(&ExecutionOutboxInput {
+                task_id: &task.id,
+                execution_id: "planner-exec",
+                agent_id: "agent-1",
+                role: Some("planner"),
+                worktree_path: &worktree.to_string_lossy(),
+            })
+            .await;
+        assert!(planner_report.plan_candidate, "{planner_report:?}");
+        assert!(
+            !planner_outbox.exists(),
+            "the agent-writable outbox is removed after staging"
+        );
+        assert!(
+            crate::plan_artifact::publish_staged_execution_plan(&worktree, "planner-exec")
+                .expect("planner plan publishes")
+        );
+        crate::plan_artifact::discard_staged_execution_plan(&worktree, "planner-exec")
+            .expect("settled planner stage removes");
+        assert_eq!(
+            std::fs::read_to_string(worktree.parent().expect("task dir").join("plan.md"))
+                .expect("canonical plan reads"),
+            "- [ ] implement\n"
+        );
+
+        let coder_outbox =
+            executors::execution_outbox_path(&worktree, "coder-exec").expect("coder outbox");
+        std::fs::create_dir_all(&coder_outbox).expect("coder outbox creates");
+        std::fs::write(coder_outbox.join("plan.md"), "- [x] implement\n").expect("coder plan");
+        let coder_report = provider
+            .ingest_execution_outbox(&ExecutionOutboxInput {
+                task_id: &task.id,
+                execution_id: "coder-exec",
+                agent_id: "agent-1",
+                role: Some("coder"),
+                worktree_path: &worktree.to_string_lossy(),
+            })
+            .await;
+        assert!(coder_report.plan_candidate, "{coder_report:?}");
+        assert!(
+            crate::plan_artifact::publish_staged_execution_plan(&worktree, "coder-exec")
+                .expect("coder plan publishes")
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.parent().expect("task dir").join("plan.md"))
+                .expect("updated plan reads"),
+            "- [x] implement\n"
+        );
     }
 
     #[test]
@@ -5284,6 +6282,70 @@ mod tests {
         assert!(!is_blocked_public_address(
             "2001:4860:4860::8888".parse().expect("public IPv6")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_line_reader_rejects_symlinks_and_hard_links() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let outbox = temp.path().join("outbox");
+        fs::create_dir(&outbox).expect("outbox creates");
+        let outside_log = outside.path().join("worklog.jsonl");
+        fs::write(
+            &outside_log,
+            "{\"kind\":\"progress\",\"summary\":\"secret\"}\n",
+        )
+        .expect("outside log writes");
+
+        symlink(&outside_log, outbox.join(executors::OUTBOX_WORKLOG_FILE))
+            .expect("log symlink creates");
+        let mut symlink_report = ExecutionOutboxReport::default();
+        assert!(
+            read_outbox_lines(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut symlink_report)
+                .is_empty()
+        );
+        assert!(symlink_report
+            .rejected
+            .iter()
+            .any(|reason| reason.contains("not a regular file")));
+
+        fs::remove_file(outbox.join(executors::OUTBOX_WORKLOG_FILE)).expect("log symlink removes");
+        fs::hard_link(&outside_log, outbox.join(executors::OUTBOX_WORKLOG_FILE))
+            .expect("log hard link creates");
+        let mut hard_link_report = ExecutionOutboxReport::default();
+        assert!(read_outbox_lines(
+            &outbox,
+            executors::OUTBOX_WORKLOG_FILE,
+            &mut hard_link_report
+        )
+        .is_empty());
+        assert!(hard_link_report
+            .rejected
+            .iter()
+            .any(|reason| reason.contains("hard link")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_artifact_reader_rejects_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        fs::write(outside.path().join("secret"), "secret").expect("outside file writes");
+        symlink(
+            outside.path().join("secret"),
+            workspace.path().join("capture"),
+        )
+        .expect("capture symlink creates");
+
+        let error = resolve_workspace_artifact(workspace.path(), "capture")
+            .expect_err("leaf symlink fails closed");
+
+        assert!(matches!(error, AgentHostError::Authority(_)));
     }
 
     #[tokio::test]

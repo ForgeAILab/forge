@@ -11,7 +11,7 @@ use db::{
     ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, MarkUsageInvocationUnsettled,
     PageRequest, Project, ProjectRepo, RecordExecutionProgressWarning, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, TerminalizeExecution,
-    UpdateAgent, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo,
+    UpdateAgent, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -25,6 +25,41 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
+
+async fn discard_execution_plan_artifacts(db: &SqliteDb, execution: &Execution) {
+    let Some(workspace_id) = execution.workspace_id.as_deref() else {
+        return;
+    };
+    let workspace = match WorkspaceRepo::get_by_id(db, workspace_id).await {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "failed to resolve workspace while cleaning terminal plan artifacts"
+            );
+            return;
+        }
+    };
+    let worktree = std::path::Path::new(&workspace.worktree_path);
+    if let Some(outbox) = executors::execution_outbox_path(worktree, &execution.id) {
+        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    path = %outbox.display(),
+                    %error,
+                    "failed to remove terminal execution outbox"
+                );
+            }
+        }
+    }
+    crate::task_service::execution::discard_execution_plan_stage(
+        &workspace.worktree_path,
+        &execution.id,
+    );
+}
 
 #[derive(Clone)]
 pub struct CrashRecovery {
@@ -615,6 +650,8 @@ impl HeartbeatMonitor {
                 continue;
             };
 
+            discard_execution_plan_artifacts(&self.db, &updated).await;
+
             if let Some(task_executor) = self.task_executor.as_ref() {
                 // Agents without a daemon binding run in-process, so only a
                 // definitively remote-owned execution skips the embedded
@@ -966,6 +1003,8 @@ async fn expire_workspace_leases(
             // downstream recovery side effect for this expired grant.
             continue;
         };
+
+        discard_execution_plan_artifacts(db, &updated).await;
 
         expired_count += 1;
 
@@ -1391,6 +1430,7 @@ async fn cancel_running_executions_for_recovery(
             ..
         } = outcome
         {
+            discard_execution_plan_artifacts(db, &cancelled_execution).await;
             cancelled.push(CancelledExecution {
                 execution_id: cancelled_execution.id,
                 agent_session_id: execution.agent_session_id.clone(),
@@ -1413,7 +1453,7 @@ fn execution_owner_lease_is_healthy(execution: &Execution, now: &str) -> bool {
     execution
         .hard_deadline_at
         .as_deref()
-        .is_some_and(|hard_deadline_at| rfc3339_is_after(hard_deadline_at, now))
+        .is_none_or(|hard_deadline_at| rfc3339_is_after(hard_deadline_at, now))
 }
 
 fn rfc3339_is_after(value: &str, other: &str) -> bool {
@@ -1573,6 +1613,8 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         // stale daemon observation must not emit a second failure.
         return Ok(None);
     };
+
+    discard_execution_plan_artifacts(db, &updated).await;
 
     event_bus.publish(ForgeEvent {
         event_type: "execution.daemon_disconnected".to_owned(),
@@ -1998,6 +2040,16 @@ mod tests {
         agent_session_id: Option<String>,
         workspace_id: Option<String>,
     ) -> db::Execution {
+        let project_version: i64 = sqlx::query_scalar(
+            "SELECT project.version
+             FROM project
+             JOIN task ON task.project_id = project.id
+             WHERE task.id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("execution Project version loads");
         let now = now_rfc3339();
         ExecutionRepo::create(
             db,
@@ -2021,7 +2073,12 @@ mod tests {
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                    json!({
+                        "executor_type": "shell",
+                        "config": {},
+                        "project_version": project_version,
+                    })
+                    .to_string(),
                 ),
                 workspace_id,
                 created_at: now.clone(),
@@ -2417,7 +2474,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "quiet-owner".to_owned(),
                 lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -2536,7 +2593,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -2614,6 +2671,21 @@ mod tests {
             Some(agent_id.clone()),
         )
         .await;
+        let assignment_now = now_rfc3339();
+        TaskRoleAssignmentRepo::assign(
+            &*db,
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: default_roles::REVIEWER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(agent_id.clone()),
+                created_at: assignment_now.clone(),
+                updated_at: assignment_now,
+            },
+        )
+        .await
+        .expect("reviewer role assignment creates");
         sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
             .bind(r#"{"retry_budgets":{"execution":3}}"#)
             .bind(r#"{"execution_retry_count":0}"#)
@@ -2659,7 +2731,7 @@ mod tests {
                     expected_version: current.execution_version,
                     owner: "expired-review-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -2722,7 +2794,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "live-owner".to_owned(),
                 lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -2802,7 +2874,7 @@ mod tests {
                 expected_version: execution.execution_version,
                 owner: "race-owner".to_owned(),
                 lease_expires_at: (now - ChronoDuration::minutes(1)).to_rfc3339(),
-                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 now: now_text.clone(),
             },
         )
@@ -3691,7 +3763,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )
@@ -3795,7 +3867,7 @@ mod tests {
                     expected_version: execution_for_claim.execution_version,
                     owner: "expired-owner".to_owned(),
                     lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
-                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    hard_deadline_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),),
                     now,
                 },
             )

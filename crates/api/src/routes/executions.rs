@@ -4,27 +4,28 @@ use std::{
     path::{Path as StdPath, PathBuf},
 };
 
-use api_types::{ExecutionResponse, FollowUpRequest, LaunchExecutionResponse, PaginatedResponse};
+use api_types::{
+    ExecutionResponse, ExecutionSummaryResponse, FollowUpRequest, LaunchExecutionResponse,
+    PaginatedResponse,
+};
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
 use db::ExecutionRepo;
 use executors::{ExecutionOverrides, LogReader};
-use futures_util::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use services::ServiceError;
 
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, execution_response_with_plan, execution_response_with_usage,
-        page_request, task_response, workspace_response, ListParams,
+        execution_response, execution_response_with_plan, execution_summary_response, page_request,
+        task_response, workspace_response, ListParams,
     },
     state::AppState,
 };
 
-const EXECUTION_USAGE_CONCURRENCY: usize = 8;
 const DEFAULT_HOOK_LOG_LIMIT: usize = 500;
 const MAX_HOOK_LOG_LIMIT: usize = 5_000;
 const DEFAULT_HOOK_LOG_BYTES: usize = 1024 * 1024;
@@ -36,18 +37,13 @@ pub async fn list_executions(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
     Query(params): Query<ListParams>,
-) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
+) -> ApiResult<Json<PaginatedResponse<ExecutionSummaryResponse>>> {
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
-    // A maximum page is larger than the SQLite pool. Keep enough parallelism
-    // to hide individual projection latency without queueing one query per row.
-    let items = stream::iter(
-        page.items
-            .into_iter()
-            .map(|execution| execution_response_with_usage(&state.db, execution)),
-    )
-    .buffered(EXECUTION_USAGE_CONCURRENCY)
-    .try_collect::<Vec<_>>()
-    .await?;
+    let items = page
+        .items
+        .into_iter()
+        .map(execution_summary_response)
+        .collect();
     let has_more = page.next_cursor.is_some();
     Ok(Json(PaginatedResponse {
         items,
@@ -251,6 +247,7 @@ pub async fn follow_up_execution(
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
         permission_policy: overrides.permission_policy,
+        hard_deadline_seconds: overrides.hard_deadline_seconds,
     });
     let launched = state
         .task_service

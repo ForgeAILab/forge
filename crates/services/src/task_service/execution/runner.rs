@@ -7,51 +7,44 @@ const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
 const EMBEDDED_EXECUTION_LEASE_SECONDS: i64 = 60;
 const EMBEDDED_EXECUTION_HEARTBEAT_SECONDS: u64 = 20;
-/// A bounded fallback is required for snapshots that predate explicit
-/// execution-time policy.  Provider/profile configuration may choose a
-/// shorter window, but no embedded execution is admitted without a deadline.
-const DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 30 * 60;
-const MAX_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 24 * 60 * 60;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddedLeaseSignal {
     OwnerLost,
     HardDeadline,
 }
 
-pub(crate) fn execution_deadline_seconds(snapshot: &Value) -> u64 {
-    const KEYS: &[&str] = &[
-        "hard_deadline_seconds",
-        "execution_hard_deadline_seconds",
-        "deadline_seconds",
-        "execution_deadline_seconds",
-        "max_duration_seconds",
-        "max_execution_seconds",
-        "max_execution_duration_seconds",
-        "timeout_seconds",
-    ];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionOutboxDisposition {
+    /// This runner won terminal settlement and may persist the execution's
+    /// private output.
+    Ingest,
+    /// Another completion path already won. Keep its private output for that
+    /// winner's inline cascade or dispatcher recovery.
+    Preserve,
+    /// No successful completion owns the output, so it must not be ingested.
+    Discard,
+}
 
-    let mut candidates = Vec::new();
-    for object in [
-        snapshot,
-        snapshot.get("config").unwrap_or(&Value::Null),
-        snapshot.get("capabilities").unwrap_or(&Value::Null),
-        snapshot.get("profile").unwrap_or(&Value::Null),
-        snapshot.get("policy").unwrap_or(&Value::Null),
-    ] {
-        for key in KEYS {
-            if let Some(seconds) = object.get(*key).and_then(Value::as_u64) {
-                if seconds > 0 {
-                    candidates.push(seconds);
-                }
-            }
-        }
+fn execution_outbox_disposition(
+    status: &ExecutionStatus,
+    won_terminal_cas: bool,
+) -> ExecutionOutboxDisposition {
+    match (status, won_terminal_cas) {
+        (ExecutionStatus::Completed, true) => ExecutionOutboxDisposition::Ingest,
+        (ExecutionStatus::Completed, false) => ExecutionOutboxDisposition::Preserve,
+        _ => ExecutionOutboxDisposition::Discard,
     }
-    candidates
-        .into_iter()
-        .min()
-        .unwrap_or(DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS)
-        .clamp(1, MAX_EXECUTION_HARD_DEADLINE_SECONDS)
+}
+
+/// Resolve an explicitly configured execution deadline. Missing and zero
+/// values mean "no hard deadline"; Forge does not impose an implicit runtime
+/// ceiling on a Task execution.
+pub(crate) fn execution_deadline_seconds(snapshot: &Value) -> Option<u32> {
+    snapshot
+        .get("hard_deadline_seconds")
+        .and_then(Value::as_u64)
+        .and_then(|seconds| u32::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
 }
 
 pub(crate) fn rfc3339_after(now: &str, seconds: i64) -> String {
@@ -60,14 +53,13 @@ pub(crate) fn rfc3339_after(now: &str, seconds: i64) -> String {
         .unwrap_or_else(|_| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339())
 }
 
-pub(crate) fn bounded_lease_expiry(now: &str, hard_deadline_at: &str) -> String {
+pub(crate) fn bounded_lease_expiry(now: &str, hard_deadline_at: Option<&str>) -> String {
     let proposed = rfc3339_after(now, EMBEDDED_EXECUTION_LEASE_SECONDS);
-    match (
-        DateTime::parse_from_rfc3339(&proposed),
-        DateTime::parse_from_rfc3339(hard_deadline_at),
-    ) {
-        (Ok(proposed), Ok(deadline)) => proposed.min(deadline).to_rfc3339(),
-        _ => proposed,
+    match hard_deadline_at.and_then(|value| DateTime::parse_from_rfc3339(value).ok()) {
+        Some(deadline) => DateTime::parse_from_rfc3339(&proposed)
+            .map(|proposed| proposed.min(deadline).to_rfc3339())
+            .unwrap_or(proposed),
+        None => proposed,
     }
 }
 
@@ -143,7 +135,7 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 
 async fn embedded_execution_heartbeat(
     lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
-    hard_deadline_at: String,
+    hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
 ) {
@@ -159,7 +151,7 @@ async fn embedded_execution_heartbeat(
 
 async fn embedded_execution_heartbeat_with_clock(
     lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
-    hard_deadline_at: String,
+    hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
     now: Arc<dyn Fn() -> String + Send + Sync>,
@@ -172,8 +164,8 @@ async fn embedded_execution_heartbeat_with_clock(
             _ = stop.cancelled() => break,
             _ = ticker.tick() => {
                 let now = now();
-                let lease_expires_at = bounded_lease_expiry(&now, &hard_deadline_at);
-                if lease_expires_at <= now {
+                let lease_expires_at = bounded_lease_expiry(&now, hard_deadline_at.as_deref());
+                if hard_deadline_at.is_some() && lease_expires_at <= now {
                     let _ = signal_tx.send(EmbeddedLeaseSignal::HardDeadline);
                     break;
                 }
@@ -285,13 +277,10 @@ impl TaskService {
                         .is_none_or(|deadline| deadline > now);
                 if !preclaimed {
                     let lease_claimed_at = now_rfc3339();
-                    let hard_deadline_at = rfc3339_after(
-                        &lease_claimed_at,
-                        i64::try_from(execution_deadline_seconds(&params.executor_config))
-                            .unwrap_or(i64::MAX),
-                    );
+                    let hard_deadline_at = execution_deadline_seconds(&params.executor_config)
+                        .map(|seconds| rfc3339_after(&lease_claimed_at, i64::from(seconds)));
                     let lease_expires_at =
-                        bounded_lease_expiry(&lease_claimed_at, &hard_deadline_at);
+                        bounded_lease_expiry(&lease_claimed_at, hard_deadline_at.as_deref());
                     match ExecutionRepo::claim_lease(
                         &*self.db,
                         db::ClaimExecutionLease {
@@ -320,6 +309,27 @@ impl TaskService {
                         }
                     }
                 }
+
+                let plan_writing_role =
+                    executors::task_role_can_write_plan(Some(execution.role.as_str()));
+                if plan_writing_role {
+                    let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("task", execution.task_id.clone())
+                        })?;
+                    crate::plan_artifact::prepare_execution_plan_outbox(
+                        std::path::Path::new(&params.workspace_path),
+                        &execution.id,
+                        matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                        task.plan.as_deref(),
+                    )
+                    .map_err(|error| {
+                        ServiceError::invalid_operation(format!(
+                            "failed to prepare the remote execution plan outbox: {error}"
+                        ))
+                    })?;
+                }
             }
             provider.start(params).await
         }
@@ -328,6 +338,18 @@ impl TaskService {
         match result {
             Ok(result) => Ok(result),
             Err(error) => {
+                if let Some(workspace_id) = execution.workspace_id.as_deref() {
+                    if let Ok(Some(workspace)) =
+                        WorkspaceRepo::get_by_id(&*self.db, workspace_id).await
+                    {
+                        if let Some(outbox) = executors::execution_outbox_path(
+                            std::path::Path::new(&workspace.worktree_path),
+                            &execution.id,
+                        ) {
+                            let _ = std::fs::remove_dir_all(outbox);
+                        }
+                    }
+                }
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
                     .fail_execution_before_dispatch(&execution.id, failure_message)
@@ -604,23 +626,26 @@ impl TaskService {
             }
         };
 
+        let plan_writing_role = executors::task_role_can_write_plan(Some(execution.role.as_str()));
+
         // The scheduler owns the execution lease. Creation normally installs
         // the deterministic embedded owner atomically; older/ownerless rows
         // are claimed here immediately before launch. Every heartbeat,
         // progress update, and terminal CAS then presents the same tuple.
         let deterministic_owner = format!("embedded-execution:{}", execution_before_launch.id);
         let lease_claimed_at = now_rfc3339();
-        let requested_hard_deadline_at = rfc3339_after(
-            &lease_claimed_at,
-            i64::try_from(execution_deadline_seconds(&agent_config)).unwrap_or(i64::MAX),
-        );
+        let requested_hard_deadline_at = execution_deadline_seconds(&agent_config)
+            .map(|seconds| rfc3339_after(&lease_claimed_at, i64::from(seconds)));
         let lease_execution = if execution_before_launch.lease_owner.as_deref()
             == Some(deterministic_owner.as_str())
-            && execution_before_launch.hard_deadline_at.is_some()
             && execution_before_launch
                 .lease_expires_at
                 .as_deref()
                 .is_some_and(|expires_at| expires_at > lease_claimed_at.as_str())
+            && execution_before_launch
+                .hard_deadline_at
+                .as_deref()
+                .is_none_or(|deadline| deadline > lease_claimed_at.as_str())
         {
             execution_before_launch.clone()
         } else {
@@ -632,7 +657,7 @@ impl TaskService {
                     owner: deterministic_owner,
                     lease_expires_at: bounded_lease_expiry(
                         &lease_claimed_at,
-                        &requested_hard_deadline_at,
+                        requested_hard_deadline_at.as_deref(),
                     ),
                     hard_deadline_at: requested_hard_deadline_at,
                     now: lease_claimed_at,
@@ -655,9 +680,7 @@ impl TaskService {
                 }
             }
         };
-        let hard_deadline_at = lease_execution.hard_deadline_at.clone().ok_or_else(|| {
-            ServiceError::invalid_operation("execution lease claim returned no hard deadline")
-        })?;
+        let hard_deadline_at = lease_execution.hard_deadline_at.clone();
         let lease_owner = lease_execution
             .lease_owner
             .clone()
@@ -672,6 +695,30 @@ impl TaskService {
             execution_before_launch.id.clone(),
             Arc::clone(&lease),
         );
+
+        // Create the agent-writable broker only after this runner owns the
+        // execution lease. Planners always start with a fresh candidate;
+        // coders receive a private copy of the canonical checklist when one
+        // exists.
+        if plan_writing_role {
+            if let Err(error) = crate::plan_artifact::prepare_execution_plan_outbox(
+                std::path::Path::new(&workspace.worktree_path),
+                &execution_id,
+                matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                task.plan.as_deref(),
+            ) {
+                if let Some(outbox) = executors::execution_outbox_path(
+                    std::path::Path::new(&workspace.worktree_path),
+                    &execution_id,
+                ) {
+                    let _ = std::fs::remove_dir_all(outbox);
+                }
+                let reason = format!("failed to prepare the execution plan outbox: {error}");
+                self.fail_execution_before_dispatch(&execution.id, reason.clone())
+                    .await?;
+                return Err(ServiceError::invalid_operation(reason));
+            }
+        }
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -876,7 +923,7 @@ impl TaskService {
                             hard_deadline_exceeded = true;
                             tracing::warn!(
                                 execution_id = %execution_id,
-                                hard_deadline_at = %hard_deadline_at,
+                                hard_deadline_at = ?hard_deadline_at,
                                 "embedded execution reached its hard deadline"
                             );
                         }
@@ -921,7 +968,11 @@ impl TaskService {
         if let Err(error) = heartbeat_task.await {
             tracing::debug!(%error, "embedded execution heartbeat task stopped with an error");
         }
-        if parse_rfc3339(&hard_deadline_at).is_some_and(|deadline| deadline <= Utc::now()) {
+        if hard_deadline_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .is_some_and(|deadline| deadline <= Utc::now())
+        {
             hard_deadline_exceeded = true;
         }
         crate::embedded_task_executor::unregister_execution_lease(&execution_id, &lease);
@@ -999,7 +1050,10 @@ impl TaskService {
             Err(error) if hard_deadline_exceeded => executors::ExecutionResult {
                 status: ExecutionOutcome::Failed,
                 error: Some(format!(
-                    "execution hard deadline exceeded at {hard_deadline_at}: {error}"
+                    "execution hard deadline exceeded at {}: {error}",
+                    hard_deadline_at
+                        .as_deref()
+                        .unwrap_or("the configured deadline")
                 )),
                 failure_class: Some(executors::ExecutionFailureClass::TaskFailed),
                 ..executors::ExecutionResult::default()
@@ -1052,7 +1106,10 @@ impl TaskService {
         if hard_deadline_exceeded {
             result.status = ExecutionOutcome::Failed;
             result.error = Some(format!(
-                "execution hard deadline exceeded at {hard_deadline_at}"
+                "execution hard deadline exceeded at {}",
+                hard_deadline_at
+                    .as_deref()
+                    .unwrap_or("the configured deadline")
             ));
         }
         let uncommitted_worktree_failure = result.status == ExecutionOutcome::Failed
@@ -1110,6 +1167,17 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if current_execution.status != ExecutionStatus::Running {
+            // A completed row may be the winner of an earlier terminal CAS
+            // whose process died before its completion cascade consumed the
+            // outbox. Preserve that winner's exact plan/worklog/evidence for
+            // the dispatcher recovery pass. Failed and cancelled attempts
+            // have no publication authority and must leave no private output
+            // for a later cascade to ingest.
+            if execution_outbox_disposition(&current_execution.status, false)
+                == ExecutionOutboxDisposition::Discard
+            {
+                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+            }
             if current_execution.status == ExecutionStatus::Cancelled {
                 let late_reports = result.usage_reports.clone();
                 if !late_reports.is_empty() {
@@ -1202,46 +1270,6 @@ impl TaskService {
                 Some(db::ResumePolicy::Manual),
             ),
         };
-        // A CLI harness reports worklog and evidence through its outbox. Take
-        // it in before the execution settles so the next role — the reviewer,
-        // or the coder after a failed review — reads it with the Task.
-        if let (Some(embedded), Some(agent_id)) = (
-            self.credential_env.as_ref(),
-            current_execution.agent_id.as_deref(),
-        ) {
-            let report = embedded
-                .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
-                    task_id: &task.id,
-                    execution_id: &execution_id,
-                    agent_id,
-                    role: Some(current_execution.role.as_str()),
-                    worktree_path: &workspace.worktree_path,
-                })
-                .await;
-            if report.worklog_entries > 0 || report.evidence_items > 0 {
-                tracing::info!(
-                    %execution_id,
-                    worklog_entries = report.worklog_entries,
-                    evidence_items = report.evidence_items,
-                    "execution outbox ingested"
-                );
-            }
-            if !report.rejected.is_empty() {
-                tracing::warn!(
-                    %execution_id,
-                    rejected = ?report.rejected,
-                    "execution outbox entries were not ingested"
-                );
-            }
-        }
-        tracing::info!(
-            %execution_id,
-            task_id = %task.id,
-            status = %status,
-            logs_path = %logs_path,
-            "execution dispatch completed"
-        );
-
         let usage_settlements = super::ledger::build_task_usage_settlements(
             &self.db,
             &execution_id,
@@ -1327,6 +1355,15 @@ impl TaskService {
         let updated = match terminal {
             db::ExecutionTerminalOutcome::Committed { execution, .. } => execution,
             db::ExecutionTerminalOutcome::Concurrent { current } => {
+                if current.as_ref().is_none_or(|execution| {
+                    execution_outbox_disposition(&execution.status, false)
+                        == ExecutionOutboxDisposition::Discard
+                }) {
+                    discard_execution_outbox_and_plan_stage(
+                        &workspace.worktree_path,
+                        &execution_id,
+                    );
+                }
                 let current = current
                     .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
                 append_late_terminal_diagnostic(
@@ -1347,6 +1384,58 @@ impl TaskService {
                 return Ok(current);
             }
         };
+
+        match execution_outbox_disposition(&updated.status, true) {
+            ExecutionOutboxDisposition::Ingest => {
+                // Outbox files are untrusted execution output. Persist their
+                // worklog/evidence and freeze their plan only after this
+                // process wins the terminal owner/version CAS. A crash here
+                // is safe: the completed row and untouched outbox let
+                // dispatcher recovery run the same idempotent ingestion later.
+                if let (Some(embedded), Some(agent_id)) =
+                    (self.credential_env.as_ref(), updated.agent_id.as_deref())
+                {
+                    let report = embedded
+                        .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
+                            task_id: &task.id,
+                            execution_id: &execution_id,
+                            agent_id,
+                            role: Some(updated.role.as_str()),
+                            worktree_path: &workspace.worktree_path,
+                        })
+                        .await;
+                    if report.worklog_entries > 0 || report.evidence_items > 0 {
+                        tracing::info!(
+                            %execution_id,
+                            worklog_entries = report.worklog_entries,
+                            evidence_items = report.evidence_items,
+                            "execution outbox ingested after terminal CAS"
+                        );
+                    }
+                    if !report.rejected.is_empty() {
+                        tracing::warn!(
+                            %execution_id,
+                            rejected = ?report.rejected,
+                            "execution outbox entries were not ingested"
+                        );
+                    }
+                }
+            }
+            ExecutionOutboxDisposition::Discard => {
+                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+            }
+            ExecutionOutboxDisposition::Preserve => {
+                unreachable!("this runner won terminal settlement")
+            }
+        }
+
+        tracing::info!(
+            %execution_id,
+            task_id = %task.id,
+            status = %status,
+            logs_path = %logs_path,
+            "execution dispatch completed"
+        );
 
         super::publish_terminal_execution_event(self, &updated);
 
@@ -1369,32 +1458,25 @@ impl TaskService {
             let reviewer_outcome_pending = updated.role == crate::workflow::default_roles::REVIEWER
                 || updated.role == crate::workflow::default_roles::AUDITOR;
             if !reviewer_outcome_pending {
-                if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to clear execution retry metadata"
-                    );
-                }
-            }
-            if updated.role == crate::workflow::default_roles::PLANNER
-                && task.status == crate::workflow::default_states::PLANNING
-            {
-                if let Err(error) = super::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to mark planning awaiting review"
-                    );
+                let project_version = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .map(|project| project.version);
+                if let Some(project_version) = project_version {
+                    if let Err(error) = super::clear_execution_retry_metadata_for_latest_execution(
+                        &self.db,
+                        &task,
+                        &updated,
+                        project_version,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            execution_id = %updated.id,
+                            %error,
+                            "failed to clear execution retry metadata"
+                        );
+                    }
                 }
             }
         } else if updated.status == ExecutionStatus::Failed && max_turns_exceeded {
@@ -1488,6 +1570,37 @@ impl TaskService {
 
         Ok(updated)
     }
+}
+
+pub(crate) fn discard_execution_plan_stage(worktree_path: &str, execution_id: &str) {
+    if let Err(error) = crate::plan_artifact::discard_staged_execution_plan(
+        std::path::Path::new(worktree_path),
+        execution_id,
+    ) {
+        tracing::warn!(
+            %execution_id,
+            %error,
+            "execution plan stage could not be discarded"
+        );
+    }
+}
+
+fn discard_execution_outbox_and_plan_stage(worktree_path: &str, execution_id: &str) {
+    if let Some(outbox) =
+        executors::execution_outbox_path(std::path::Path::new(worktree_path), execution_id)
+    {
+        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %execution_id,
+                    path = %outbox.display(),
+                    %error,
+                    "failed to remove outbox for a non-completed execution"
+                );
+            }
+        }
+    }
+    discard_execution_plan_stage(worktree_path, execution_id);
 }
 
 #[cfg(test)]
@@ -1639,7 +1752,7 @@ mod tests {
                 expected_version: 1,
                 owner: "embedded-heartbeat-test".to_owned(),
                 lease_expires_at: "2025-01-01T00:00:05+00:00".to_owned(),
-                hard_deadline_at: T20.to_owned(),
+                hard_deadline_at: Some(T20.to_owned()),
                 now: T0.to_owned(),
             },
         )
@@ -1696,7 +1809,7 @@ mod tests {
         let (first_signal_tx, _first_signal_rx) = mpsc::unbounded_channel();
         let first_task = tokio::spawn(embedded_execution_heartbeat_with_clock(
             Arc::clone(&lease),
-            T20.to_owned(),
+            Some(T20.to_owned()),
             first_stop.clone(),
             first_signal_tx,
             Arc::new(|| T1.to_owned()),
@@ -1718,7 +1831,7 @@ mod tests {
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(embedded_execution_heartbeat_with_clock(
             Arc::clone(&lease),
-            T20.to_owned(),
+            Some(T20.to_owned()),
             stop.clone(),
             signal_tx,
             Arc::new(|| T20.to_owned()),
@@ -1744,17 +1857,81 @@ mod tests {
     }
 
     #[test]
-    fn execution_deadline_prefers_shortest_snapshot_policy_and_clamps_fallback() {
+    fn execution_deadline_uses_only_the_explicit_execution_setting() {
         let snapshot = serde_json::json!({
             "config": {"timeout_seconds": 900},
             "capabilities": {"max_execution_seconds": 120},
             "hard_deadline_seconds": 3600,
         });
-        assert_eq!(execution_deadline_seconds(&snapshot), 120);
+        assert_eq!(execution_deadline_seconds(&snapshot), Some(3600));
         assert_eq!(
-            execution_deadline_seconds(&serde_json::json!({"timeout_seconds": 0})),
-            DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS
+            execution_deadline_seconds(&serde_json::json!({
+                "config": {"timeout_seconds": 900},
+                "capabilities": {"max_execution_seconds": 120}
+            })),
+            None
         );
+        assert_eq!(
+            execution_deadline_seconds(&serde_json::json!({"hard_deadline_seconds": 0})),
+            None
+        );
+        assert_eq!(execution_deadline_seconds(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn only_the_terminal_cas_winner_may_ingest_a_completed_outbox() {
+        assert_eq!(
+            execution_outbox_disposition(&ExecutionStatus::Completed, true),
+            ExecutionOutboxDisposition::Ingest
+        );
+        assert_eq!(
+            execution_outbox_disposition(&ExecutionStatus::Completed, false),
+            ExecutionOutboxDisposition::Preserve
+        );
+        for status in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+        ] {
+            assert_eq!(
+                execution_outbox_disposition(&status, true),
+                ExecutionOutboxDisposition::Discard
+            );
+            assert_eq!(
+                execution_outbox_disposition(&status, false),
+                ExecutionOutboxDisposition::Discard
+            );
+        }
+    }
+
+    #[test]
+    fn non_completed_execution_discards_outbox_and_frozen_plan() {
+        let root = tempfile::tempdir().expect("temporary root creates");
+        let worktree = root.path().join("task").join("forge");
+        std::fs::create_dir_all(&worktree).expect("worktree creates");
+        let outbox = executors::prepare_execution_outbox(&worktree, "exec-1")
+            .expect("execution outbox creates");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_PLAN_FILE),
+            "- [ ] private plan\n",
+        )
+        .expect("plan candidate writes");
+        assert!(
+            crate::plan_artifact::stage_execution_outbox_plan(&outbox, &worktree, "exec-1")
+                .expect("plan candidate stages")
+        );
+        let stage = worktree
+            .parent()
+            .expect("Task root exists")
+            .join(".forge-plan-staging")
+            .join("exec-1.md");
+        assert!(outbox.exists());
+        assert!(stage.exists());
+
+        discard_execution_outbox_and_plan_stage(&worktree.to_string_lossy(), "exec-1");
+
+        assert!(!outbox.exists());
+        assert!(!stage.exists());
     }
 
     #[tokio::test]

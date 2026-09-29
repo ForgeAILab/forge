@@ -3,7 +3,7 @@ use std::sync::Arc;
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
     ExecutionRepo, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo, TaskRepo,
-    TransitionLogRepo,
+    TransitionLogRepo, WorkspaceRepo,
 };
 use executors::{LogEntry, LogKind};
 use serde_json::Value;
@@ -59,7 +59,26 @@ pub async fn load_agent_dispatch_context(
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
-    let plan = task.plan.clone();
+    let plan = if matches!(
+        role,
+        crate::workflow::default_roles::WORKER | crate::workflow::default_roles::CODER
+    ) {
+        let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(task_id);
+        match WorkspaceRepo::get_by_task_id(&*db, workspace_task_id).await? {
+            Some(workspace) => crate::plan_artifact::read_canonical_plan_text(
+                std::path::Path::new(&workspace.worktree_path),
+            )
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "canonical plan artifact is unreadable: {error}"
+                ))
+            })?
+            .or_else(|| task.plan.clone()),
+            None => task.plan.clone(),
+        }
+    } else {
+        task.plan.clone()
+    };
     let capability_class = sqlx::query_scalar::<_, Option<String>>(
         "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
     )
@@ -156,7 +175,7 @@ fn is_system_actor(triggered_by: &str) -> bool {
 }
 
 async fn load_sub_tasks(db: &db::SqliteDb, parent_task_id: &str) -> Result<Vec<db::Task>> {
-    Ok(TaskRepo::list_subtasks_ordered(db, parent_task_id).await?)
+    crate::task_hierarchy::ordered_children(db, parent_task_id).await
 }
 
 async fn latest_terminal_execution_for_role(

@@ -12,15 +12,11 @@ impl TaskService {
         role: &str,
     ) -> Result<()> {
         if task.parent_task_id.is_none() {
-            if !super::super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+            if !crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await? {
                 return Ok(());
             }
 
-            if task.blocked_json.is_some()
-                || task.failed_json.is_some()
-                || task.error_annotation.is_some()
-                || task.entry_barrier_json.is_some()
-            {
+            if crate::task_hierarchy::root_blocked(task) {
                 return Err(ServiceError::invalid_operation(format!(
                     "coordination root {} is blocked or has an error",
                     task.id
@@ -42,22 +38,16 @@ impl TaskService {
                     task.id
                 )));
             }
-            let expected_role = workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-                .and_then(crate::workflow::effective_role);
-            if expected_role != Some(role) {
+            if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
+                .allows_execution(&task.status, role)
+            {
                 return Err(ServiceError::invalid_operation(
                     "root tasks with subtasks are coordination containers; only their aggregate review role may execute",
                 ));
             }
 
-            let subtasks = TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?;
-            if let Some(next) = subtasks
-                .iter()
-                .find(|candidate| !super::super::subtask::subtask_is_terminal(candidate, &workflow))
-            {
+            let subtasks = crate::task_hierarchy::ordered_children(&self.db, &task.id).await?;
+            if let Some(next) = crate::task_hierarchy::next_incomplete_child(&subtasks, &workflow) {
                 return Err(ServiceError::invalid_operation(format!(
                     "coordination-root review is not ready; subtask {} is still incomplete",
                     next.id
@@ -73,11 +63,7 @@ impl TaskService {
         let parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
-        if parent.blocked_json.is_some()
-            || parent.failed_json.is_some()
-            || parent.error_annotation.is_some()
-            || parent.entry_barrier_json.is_some()
-        {
+        if crate::task_hierarchy::root_blocked(&parent) {
             return Err(ServiceError::invalid_operation(format!(
                 "subtask {} cannot execute while coordination root {} is blocked or has an error",
                 task.id, parent.id
@@ -104,7 +90,7 @@ impl TaskService {
             )));
         }
 
-        super::super::subtask::ensure_subtask_dispatch_order(&self.db, task).await
+        crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, task).await
     }
 
     pub(super) async fn wait_for_agent_active_before_dispatch(

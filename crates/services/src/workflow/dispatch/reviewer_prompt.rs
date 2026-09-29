@@ -2,7 +2,7 @@ use crate::workflow::{
     default_roles,
     dispatch::{
         default_tool_names, read_only_report_contract, AgentDispatchContext, AgentPrompt,
-        PromptBuilder, BUILDER_ID_REVIEWER_CONFORMANCE_V1, MANAGED_EXECUTION_CONTRACT,
+        PromptBuilder, BUILDER_ID_REVIEWER_CONFORMANCE_V1,
     },
 };
 
@@ -10,13 +10,16 @@ pub struct ReviewerPromptBuilder;
 
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
-- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, and report in the format of the frozen contract Forge appends at launch.
-- Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
-- May install dependencies and produce build output (network and package caches are available); Forge discards the worktree afterwards and fails the run if any tracked file changed.
-- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, a result that contradicts the review.";
+- Must remain read-only toward the repository: do not edit, stage, or commit tracked files.
+- May install dependencies, build, start the app or its services, and write scratch scripts, logs, or screenshots outside tracked files; Forge discards the worktree afterwards and fails the run if any tracked file changed.
+- Start from the context Forge supplies -- the candidate diff, the coder's worklog and evidence, check results, and the previous review -- before exploring the repository yourself.
+- Must not provide vague fail reasons, fail on style preferences, or fail on problems that already existed at base_sha.
+- Never hide a failed verification. If the environment, not the code, stops you, say what is missing and use the \"blocked\" result.
+- Report in the format of the frozen contract Forge appends at launch.
+- Red flags: tracked-file mutations, a verdict backed only by reading code, blocking findings without expected vs actual behavior, a result that contradicts the review.";
 
 const REVIEWER_FINDINGS_CONTRACT: &str = "\
-Reviewer findings: Write findings in your Markdown review. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings. If the environment (not the code) stopped you from verifying, say what is missing and use the \"blocked\" result.";
+Reviewer findings: Write findings in your Markdown review. Each BLOCKING finding must be reproducible: the command you ran or the steps you took, what you expected, and what actually happened (with output or a screenshot), plus file/line when it helps the coder. Separate NON-BLOCKING findings from BLOCKING findings.";
 
 impl PromptBuilder for ReviewerPromptBuilder {
     fn id(&self) -> &'static str {
@@ -123,7 +126,7 @@ impl PromptBuilder for ReviewerPromptBuilder {
 
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
+                "You are the reviewer agent for this Forge workflow task. Decide whether the change works by exercising it: build it, run its tests, and drive the changed behavior programmatically or visually the way a user or caller would. Reading code tells you what to run and explains a failure you observed; it does not prove correctness on its own. If you fail the review, your feedback goes to the coder agent to fix in a follow-up attempt.\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
                 read_only_report_contract(ctx.delivery)
             ),
             user,

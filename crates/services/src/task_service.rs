@@ -85,11 +85,7 @@ pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };
 pub(crate) use repository_authority::resolve_task_repository_authority;
-pub(crate) use subtask::{
-    coordination_review_pending, coordination_root_has_subtasks,
-    coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
-};
-pub use subtask::{is_root_task, is_subtask, root_for};
+pub(crate) use subtask::coordination_review_pending;
 
 /// Decode persisted review details before any endpoint or workflow mutates the
 /// row. Legacy CI-only arrays are still readable, but every other malformed
@@ -242,6 +238,22 @@ const REMOTE_TERMINAL_DIAGNOSTIC_MAX_CHARS: usize = 256;
 const REMOTE_TERMINAL_DIAGNOSTIC_REDACTED: &str = "[redacted]";
 const REMOTE_TERMINAL_MAX_CAS_RETRIES: u8 = 2;
 
+/// Project revision that admitted a workflow-role execution.
+///
+/// Running executions created by Forge have carried this immutable snapshot
+/// since the scheduler began fencing dispatch against Project edits.  A
+/// missing, malformed, or non-integer value cannot safely authorize terminal
+/// workflow effects: interpreting an old completion under the current
+/// workflow could spend retry budget, block the Task, or advance the wrong
+/// state.
+pub(crate) fn execution_dispatch_project_version(execution: &Execution) -> Option<i64> {
+    execution
+        .executor_config_snapshot_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|snapshot| snapshot.get("project_version").and_then(Value::as_i64))
+}
+
 const REMOTE_TERMINAL_SECRET_MARKERS: &[&str] = &[
     "api_key",
     "api-key",
@@ -315,9 +327,9 @@ fn remote_execution_lease_is_active(
     let lease_is_live = lease_expires_at
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > now);
-    let hard_deadline_is_live = hard_deadline_at
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .is_some_and(|deadline| deadline.with_timezone(&Utc) > now);
+    let hard_deadline_is_live = hard_deadline_at.is_none_or(|value| {
+        DateTime::parse_from_rfc3339(value).is_ok_and(|deadline| deadline.with_timezone(&Utc) > now)
+    });
     lease_is_live && hard_deadline_is_live
 }
 
@@ -404,11 +416,14 @@ pub struct TaskService {
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Executions whose completion cascade is running right now. Shared by
-    /// every clone, so the inline completion path and the dispatcher's
-    /// terminal-execution reconciliation never settle the same execution
-    /// twice at once.
+    /// Task IDs whose completion cascade is running right now. Shared by
+    /// every clone, so competing terminal completions cannot apply effects
+    /// to the same Task at once.
     completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Wakes completion cascades that arrived while another execution for
+    /// the same Task was settling. Waiters retry the Task slot after every
+    /// release, so a successor completion is never silently dropped.
+    completion_cascade_released: Arc<tokio::sync::Notify>,
     credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
 }
 
@@ -486,6 +501,7 @@ impl TaskService {
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
+            completion_cascade_released: Arc::default(),
             credential_env: None,
         }
     }
@@ -661,10 +677,8 @@ impl TaskService {
                 .unwrap_or("{}"),
         )
         .unwrap_or(Value::Null);
-        let hard_deadline_at = execution::rfc3339_after(
-            &input.updated_at,
-            i64::try_from(execution::execution_deadline_seconds(&snapshot)).unwrap_or(i64::MAX),
-        );
+        let hard_deadline_at = execution::execution_deadline_seconds(&snapshot)
+            .map(|seconds| execution::rfc3339_after(&input.updated_at, i64::from(seconds)));
         let remote_owner = if let Some(agent_id) = input.agent_id.as_deref() {
             AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
@@ -686,7 +700,7 @@ impl TaskService {
         let (owner, lease_expires_at) = match remote_owner {
             Some(owner) => (
                 owner,
-                execution::bounded_lease_expiry(&input.updated_at, &hard_deadline_at),
+                execution::bounded_lease_expiry(&input.updated_at, hard_deadline_at.as_deref()),
             ),
             None => (
                 format!("dispatch-pending:{}", input.id),
@@ -853,7 +867,7 @@ impl TaskService {
 
     pub(crate) async fn create_running_execution_with_admission(
         &self,
-        input: CreateExecution,
+        mut input: CreateExecution,
         workspace_created_by_attempt: bool,
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
@@ -870,6 +884,49 @@ impl TaskService {
                 "repository execution requires a scheduler WorkspaceLease-backed workspace",
             ));
         };
+
+        // The snapshot and INSERT must carry one authority snapshot. Config
+        // resolution happens earlier and resume/follow-up paths may clone an
+        // older snapshot, so overwrite every workflow field immediately
+        // before the authoritative admission transaction.
+        if input.status == ExecutionStatus::Running {
+            if let Some(snapshot_json) = input.executor_config_snapshot_json.as_deref() {
+                let snapshot_value: Value =
+                    serde_json::from_str(snapshot_json).map_err(|error| {
+                        ServiceError::invalid_operation(format!(
+                            "invalid executor config snapshot: {error}"
+                        ))
+                    })?;
+                let brokered = snapshot_value.get("plan_delivery").and_then(Value::as_str)
+                    == Some("execution_outbox");
+                let admitted = admission.as_ref().and_then(|admission| {
+                    admission.expected_project_version.map(|project_version| {
+                        (admission.expected_task_status.as_str(), project_version)
+                    })
+                });
+                if brokered && admitted.is_none() {
+                    return Err(ServiceError::invalid_operation(
+                        "brokered execution requires admitted Task and Project authority",
+                    ));
+                }
+                if let Some((task_state, project_version)) = admitted {
+                    let state_entry_token = self::action_resolver::latest_state_entry_authority(
+                        &self.db,
+                        &input.task_id,
+                        task_state,
+                    )
+                    .await?
+                    .map(|entry| entry.id);
+                    input.executor_config_snapshot_json =
+                        Some(self::config::stamp_executor_snapshot_authority(
+                            snapshot_json,
+                            task_state,
+                            state_entry_token.as_deref(),
+                            project_version,
+                        )?);
+                }
+            }
+        }
 
         let create_result = if input.status == ExecutionStatus::Running {
             let lease = self.initial_execution_lease(&input).await?;
@@ -1035,9 +1092,11 @@ impl TaskService {
             return Ok(());
         };
         let terminal_event_id: String = terminal_event.try_get("id")?;
-        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? else {
+            // The durable receipt remains acknowledgeable after later Task
+            // deletion; there is no mutable Task outcome left to repair.
+            return Ok(());
+        };
         let event_id = new_uuid_v4();
         let dedupe_key = format!(
             "execution-late-terminal:{}:{}:{}",
@@ -1255,18 +1314,20 @@ impl TaskService {
             None
         };
         if let Some(receipt) = durable_receipt {
-            // The receipt and its event were committed by the previous
-            // terminal attempt. Return that stored outcome immediately: no
-            // mutable route metadata, pricing reads, invocation materializa-
-            // tion, or post-commit cascade should run on an exact replay.
-            return self
+            // The receipt and terminal row are durable, but the process may
+            // have exited before consuming the outbox or applying Task-level
+            // retry/block effects. Replay those idempotent post-commit steps
+            // before acknowledging the daemon again.
+            let outcome = self
                 .terminal_outcome_from_receipt(&receipt, current_execution)
-                .await;
+                .await?;
+            if let ExecutionTerminalOutcome::Committed { execution, .. } = &outcome {
+                self.settle_remote_terminal_postcommit(execution, &notification, false)
+                    .await?;
+            }
+            return Ok(outcome);
         }
 
-        let task = TaskRepo::get_by_id(&*self.db, &current_execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", current_execution.task_id.clone()))?;
         let signal = notification
             .signal
             .as_deref()
@@ -1514,103 +1575,206 @@ impl TaskService {
                 outcome => break outcome,
             }
         };
-        let updated = match &terminal_outcome {
-            ExecutionTerminalOutcome::Committed { execution, .. } => execution.clone(),
+        let (updated, replayed) = match &terminal_outcome {
+            ExecutionTerminalOutcome::Committed {
+                execution,
+                replayed,
+                ..
+            } => (execution, *replayed),
             ExecutionTerminalOutcome::Concurrent { .. } => return Ok(terminal_outcome),
         };
+        self.settle_remote_terminal_postcommit(updated, &notification, !replayed)
+            .await?;
 
-        // The composite boundary may observe a receipt committed by a
-        // concurrent delivery after the read-side lookup above.  Its durable
-        // replay marker is authoritative: return the stored outcome without
-        // publishing a second SSE event or rerunning memory/retry/block
-        // cascades.
-        if matches!(
-            terminal_outcome,
-            ExecutionTerminalOutcome::Committed { replayed: true, .. }
-        ) {
-            return Ok(terminal_outcome);
+        Ok(terminal_outcome)
+    }
+
+    async fn settle_remote_terminal_postcommit(
+        &self,
+        execution: &Execution,
+        notification: &api_types::ExecutionTerminalNotification,
+        publish_terminal_event: bool,
+    ) -> Result<()> {
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? else {
+            return Ok(());
+        };
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(());
+        };
+        if execution.role != crate::workflow::default_roles::INTERACTIVE
+            && execution_dispatch_project_version(execution) != Some(project.version)
+        {
+            tracing::info!(
+                task_id = %task.id,
+                execution_id = %execution.id,
+                execution_role = %execution.role,
+                dispatch_project_version = ?execution_dispatch_project_version(execution),
+                current_project_version = project.version,
+                "ignoring terminal post-commit effects from a superseded Project revision"
+            );
+            return Ok(());
         }
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
+            None => WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?,
+        };
 
-        execution::publish_terminal_execution_event(self, &updated);
+        if execution.status != ExecutionStatus::Completed {
+            if let Some(workspace) = workspace.as_ref() {
+                execution::discard_execution_plan_stage(&workspace.worktree_path, &execution.id);
+            }
+        }
 
         if let Err(error) = self
             .memory_service
-            .record_execution_summary_if_present(&task.project_id, &updated)
+            .record_execution_summary_if_present(&task.project_id, execution)
             .await
         {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
 
-        if updated.status == ExecutionStatus::Completed {
-            if let Err(error) = execution::clear_execution_retry_metadata(&self.db, &task).await {
-                tracing::warn!(
-                    task_id = %task.id,
-                    execution_id = %updated.id,
-                    %error,
-                    "failed to clear execution retry metadata"
-                );
-            }
-            if updated.role == crate::workflow::default_roles::PLANNER
-                && task.status == crate::workflow::default_states::PLANNING
-            {
-                if let Err(error) = execution::set_planning_awaiting_review_metadata(
+        if task.deleted_at.is_some()
+            || !self
+                .execution_owns_current_role_attempt(&task, execution)
+                .await?
+        {
+            return Ok(());
+        }
+
+        if execution.status == ExecutionStatus::Completed {
+            let reviewer_outcome_pending =
+                matches!(execution.role.as_str(), "reviewer" | "auditor");
+            if !reviewer_outcome_pending
+                && !execution::clear_execution_retry_metadata_for_latest_execution(
                     &self.db,
                     &task,
-                    Some(&updated.id),
-                    true,
+                    execution,
+                    project.version,
                 )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to mark planning awaiting review"
-                    );
-                }
+                .await?
+            {
+                return Ok(());
             }
-        } else if updated.status == ExecutionStatus::Failed
-            && executor_unavailable
-            && execution::should_block_task_for_failed_execution(&updated)
+        } else if execution.status == ExecutionStatus::Failed
+            && notification.failure_class
+                == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable)
         {
             let attempts = serde_json::Value::Array(
-                route_outcome
-                    .attempts
+                notification
+                    .route_attempts
+                    .as_deref()
+                    .unwrap_or_default()
                     .iter()
-                    .map(|(candidate_key, outcome)| {
-                        serde_json::json!({"candidate_key": candidate_key, "outcome": outcome})
+                    .map(|attempt| {
+                        serde_json::json!({
+                            "candidate_key": attempt.candidate_key,
+                            "outcome": attempt.outcome,
+                        })
                     })
                     .collect(),
             );
-            if let Err(error) = self
-                .annotate_executor_unavailable_block(
-                    &updated,
-                    notification.retry_at.clone(),
-                    attempts,
-                )
-                .await
-            {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    task_id = %updated.task_id,
-                    %error,
-                    "failed to handle executor-unavailable daemon execution"
-                );
-            }
-        } else if updated.status == ExecutionStatus::Failed
-            && execution::should_block_task_for_failed_execution(&updated)
+            self.annotate_executor_unavailable_block(
+                execution,
+                notification.retry_at.clone(),
+                attempts,
+            )
+            .await?;
+        } else if execution.status == ExecutionStatus::Failed
+            && execution::should_block_task_for_failed_execution(execution)
         {
-            if let Err(error) = self.annotate_executor_failure_block(&updated).await {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    task_id = %updated.task_id,
-                    %error,
-                    "failed to block task after daemon execution failure"
-                );
-            }
+            self.annotate_executor_failure_block(execution).await?;
         }
 
-        Ok(terminal_outcome)
+        if publish_terminal_event {
+            execution::publish_terminal_execution_event(self, execution);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn execution_owns_current_role_attempt(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<bool> {
+        if !execution::execution_belongs_to_current_state_entry(&self.db, task, execution).await? {
+            return Ok(false);
+        }
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(false);
+        };
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::Workflow),
+        );
+        let current_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role);
+        let role_matches = execution.role == "interactive"
+            || current_role == Some(execution.role.as_str())
+            || (current_role == Some(crate::workflow::default_roles::CODER)
+                && execution.role == "executor");
+        if !role_matches {
+            return Ok(false);
+        }
+        if execution.role != "interactive" {
+            let assignment_role = if execution.role == "executor" {
+                crate::workflow::default_roles::CODER
+            } else {
+                execution.role.as_str()
+            };
+            let assignment =
+                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
+                    .await?;
+            if let Some(assignment) = assignment {
+                if assignment.assignee_type.as_ref() != Some(&db::AssigneeKind::Agent)
+                    || assignment.assignee_id.as_deref() != execution.agent_id.as_deref()
+                {
+                    return Ok(false);
+                }
+                if chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
+                    .ok()
+                    .zip(chrono::DateTime::parse_from_rfc3339(&execution.updated_at).ok())
+                    .is_some_and(|(assignment, execution)| assignment > execution)
+                {
+                    return Ok(false);
+                }
+            } else if execution.agent_id.is_some() {
+                return Ok(false);
+            }
+        }
+        let roles: &[&str] = if matches!(execution.role.as_str(), "coder" | "executor") {
+            &["coder", "executor"]
+        } else {
+            &[execution.role.as_str()]
+        };
+        let mut latest: Option<Execution> = None;
+        for role in roles {
+            let page = ExecutionRepo::list_by_task_and_role(
+                &*self.db,
+                &task.id,
+                role,
+                db::PageRequest {
+                    cursor: None,
+                    limit: 1,
+                    include_total: false,
+                    sort_by: db::SortBy::CreatedAt,
+                    sort_order: db::SortOrder::Desc,
+                },
+            )
+            .await?;
+            if let Some(candidate) = page.items.into_iter().next() {
+                let replace = latest.as_ref().is_none_or(|current| {
+                    (&candidate.created_at, &candidate.id) > (&current.created_at, &current.id)
+                });
+                if replace {
+                    latest = Some(candidate);
+                }
+            }
+        }
+        Ok(latest.is_some_and(|latest| latest.id == execution.id))
     }
 }
 

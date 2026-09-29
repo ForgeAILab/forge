@@ -66,6 +66,16 @@ Worker boundary:
 - When a safe decision cannot be inferred, stop and ask one structured question instead of guessing.
 - Red flags: unrelated refactors, skipped verification, hidden failures, or completion claims without evidence.";
 
+const NATIVE_WORKER_PLAN_CONTRACT: &str = "\
+Plan delivery: keep the complete Markdown checklist current with the typed `task.plan` operation.
+Call `task.plan` with `{\"action\":\"write\",\"content\":\"<full Markdown checklist>\"}` whenever the plan or an item's status changes. `content` is the entire checklist, not a patch or one item; mark completed items `- [x]`.
+This writes an execution-private candidate. Forge publishes it as the canonical Task plan only after this execution completes successfully.";
+
+const OUTBOX_WORKER_PLAN_CONTRACT: &str = "\
+Plan delivery: this CLI harness has no `task.plan` tool. Keep the complete Markdown checklist in the file named by `$FORGE_PLAN_PATH` inside the execution outbox.
+Read that file when present, then create or replace it with the entire checklist whenever the plan or an item's status changes; do not write a patch or one item, and mark completed items `- [x]`.
+Forge publishes this execution-private candidate as the canonical Task plan only after this execution completes successfully.";
+
 const REVIEW_FIX_ROLE_BOUNDARY: &str = "\
 Review-fix boundary:
 - Address every actionable review or validation finding precisely, preserving the task contract and implementation direction.
@@ -96,6 +106,11 @@ fn worker_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) 
     system.push_str(MANAGED_EXECUTION_CONTRACT);
     system.push_str("\n\n");
     system.push_str(WORKER_ROLE_BOUNDARY);
+    system.push_str("\n\n");
+    system.push_str(match ctx.delivery {
+        super::TaskDelivery::NativeTools => NATIVE_WORKER_PLAN_CONTRACT,
+        super::TaskDelivery::Outbox => OUTBOX_WORKER_PLAN_CONTRACT,
+    });
     if let Some(extra_role_boundary) = extra_role_boundary {
         system.push_str("\n\n");
         system.push_str(extra_role_boundary);

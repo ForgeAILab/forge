@@ -9,16 +9,8 @@ pub(crate) async fn latest_executor_execution_for_task(
     db: &SqliteDb,
     task: &Task,
 ) -> Result<Option<Execution>> {
-    let task_ids = if task.parent_task_id.is_none() {
-        let subtasks = TaskRepo::list_subtasks_ordered(db, &task.id).await?;
-        if subtasks.is_empty() {
-            vec![task.id.clone()]
-        } else {
-            subtasks.into_iter().map(|subtask| subtask.id).collect()
-        }
-    } else {
-        vec![task.id.clone()]
-    };
+    let children = crate::task_hierarchy::children_if_root(db, task).await?;
+    let task_ids = crate::task_hierarchy::child_ids_or_self(task, &children);
 
     let mut latest = None;
     for task_id in task_ids {
@@ -202,9 +194,15 @@ impl TaskService {
     }
 
     pub async fn reset_task_workspace(&self, task_id: &str) -> Result<Workspace> {
+        let Some(_settlement_slot) = self.claim_completion_cascade(task_id) else {
+            return Err(ServiceError::Conflict(
+                "task completion settlement is in progress; retry the workspace reset".to_owned(),
+            ));
+        };
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         reset_workspace(
             &self.db,
             &self.workspace_root,

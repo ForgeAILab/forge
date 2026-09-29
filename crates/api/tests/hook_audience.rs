@@ -188,13 +188,14 @@ async fn assign_role(db: &SqliteDb, task_id: &str, role_name: &str) {
 }
 
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
+    let task_service = services::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     WorkflowEngine {
         db,
         event_bus,
         review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
-        task_executor: None,
+        task_service,
         daemon_connections: None,
         workspace_exec_locks: None,
         terminal_activity: None,

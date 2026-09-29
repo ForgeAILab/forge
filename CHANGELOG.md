@@ -6,16 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-### Added
+## [0.13.9] - 2026-09-28
 
-- Project environment (`settings.environment`): declare host environment
-  variables, git-ignored assets to copy into every worktree, and per-role
-  preflight checks once per Project. Variables reach every executor process,
-  review step, conformance check, and lifecycle hook; assets are copied into
-  worktrees and the clean review checkout; a failing check parks the Task as
-  the new `environment_not_ready` failure kind before any agent run is spent,
-  instead of a reviewer burning a full run to report `blocked`. See
-  `docs/api.md#project-environment`.
+### Breaking
+
+- `GET /api/v1/tasks/{id}/executions` and the execution page embedded by
+  `GET /api/v1/tasks/{id}/detail` now return compact `ExecutionSummaryResponse`
+  items. Prompts, executor config, usage, plan data, logs, errors, and owner
+  diagnostics remain available from `GET /api/v1/executions/{id}`.
 
 ### Changed
 
@@ -26,6 +24,110 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `$HOME` (Chromium, Playwright, Godot editor state) no longer come back
   `blocked` by the sandbox. This is full host authority; Forge's reviewer
   cleanup protects only the Task worktree, not side effects elsewhere.
+- Root-Task and ordered-subtask rules (coordination-root detection, ordered
+  child completion, dispatch readiness, root blocking, and root role
+  assignment/execution policy) now live in one module,
+  `services::task_hierarchy`. No REST, MCP, CLI, event, or schema change.
+- Reviewers now verify by running the change — build, tests, and driving the
+  changed behavior programmatically or visually — instead of auditing code by
+  reading it, and must also check that changed behavior is tested and that the
+  delta stays inside the Task (unrelated changes fail the review). The reviewer
+  prompt drops the shared failure-taxonomy and restatement rules, which led
+  reviewers to invent extra result keys and spend turns narrating.
+- The reviewer prompt now carries the candidate diff, and on a re-review the
+  previous verdict, its report, and the diff since the commit it judged, so a
+  reviewer checks prior findings and new changes instead of re-auditing the
+  whole delta from scratch.
+
+### Added
+
+- Project environment (`settings.environment`): declare host environment
+  variables, git-ignored assets to copy into every worktree, and per-role
+  preflight checks once per Project. Variables reach every executor process,
+  review step, conformance check, and lifecycle hook; assets are copied into
+  worktrees and the clean review checkout; a failing check parks the Task as
+  the new `environment_not_ready` failure kind before any agent run is spent,
+  instead of a reviewer burning a full run to report `blocked`. See
+  `docs/api.md#project-environment`.
+- Blocked reviews now offer an auditable **Pass Review Manually** recovery.
+  The owner must provide a reason; Forge preserves the failed attempt and
+  appends a new user-attributed passed Review before continuing the workflow.
+
+### Fixed
+
+- A native Project Agent chat no longer wedges permanently with "LCM context
+  cannot fit after bounded hard compaction" after one long tool loop. Leaf
+  compaction could only cut at user boundaries, so a single turn of ~50 tool
+  rounds could never be compacted and every retry failed. Agent Runtime now
+  takes such a turn whole as one leaf (runtime pin bump).
+- `task.adaptive` no longer sends a Project Agent guessing the board revision.
+  `work.read` now returns the Project `board_revision`, and a
+  `version_conflict` returns the current Task version and board revision as
+  retry arguments; previously the agent brute-forced revisions 0, 1, 2, … in
+  one turn until the context overflowed.
+- Retrying a failed native chat turn no longer appends the same user message
+  again. When the message is already unanswered at the end of the session
+  history, the retry sends a short continuation instead.
+- Coordination roots in custom workflows whose aggregate review gate uses a
+  role other than `reviewer` now get their aggregate review dispatched. The
+  dispatcher and the dispatch hook previously only admitted the built-in
+  `reviewer` role on a root, while execution admission accepted the workflow's
+  review role, so such roots never started their review automatically.
+- Unbounded remote executions (no `hard_deadline_at`, the new default) no
+  longer drop every daemon notification. A missing deadline was treated as
+  already reached, so logs and progress were rejected; progress CAS and
+  stall warnings also required a deadline.
+- Smith, other CLI Task agents, direct/native agents, and reviewer executions
+  no longer receive Forge's implicit 30-minute wall-clock deadline (or its
+  hidden 24-hour ceiling). Executions are unlimited by default while their
+  owner lease is renewed; callers can opt a new attempt into an immutable
+  deadline with `overrides.hard_deadline_seconds`.
+- CLI-backed Agent Chat now persists the complete successful assistant response
+  instead of silently truncating Smith and other CLI output to 500 characters.
+- A merge conflict on a Task reviewed by a person (or with no reviewer) is now
+  rebased and handed back to the coder with committed conflict markers, the
+  same as an agent-reviewed Task whose target moved. It previously parked the
+  Task for manual worktree repair even though a coder was assigned. A
+  `merge_fix` retry budget of 0 still parks it.
+- Review follow-up guidance now goes through the authoritative review retry and
+  can advance Task state. Generic execution follow-ups are labeled as
+  non-propagating side sessions and are hidden from the Task's active recovery
+  surface, avoiding successful follow-ups that leave the same Review blocked.
+- A Task with an assigned planner no longer re-plans forever. The default
+  planning gate stopped being a human approval boundary in 0.9.0, but a
+  finished planner never advanced the Task: it was marked awaiting plan review
+  and the dispatcher relaunched the planner after each completion. A completed
+  planner now advances planning → in progress on its own (approval-gated
+  workflows still wait), and the dispatcher never starts or relaunches a
+  non-reviewer role while its Task awaits a human. A missing or invalid plan
+  uses bounded execution-guard retries and then creates a durable blocker
+  instead of starting an unlimited series of fresh planner runs.
+- CLI planning and implementation roles (`planner`, `worker`, `coder`, and
+  `executor`) now receive a private `$FORGE_PLAN_PATH` in their execution
+  outbox, while native Planner/Worker sessions use typed `task.plan` with
+  `{action: "write", content: "<full checklist>"}`, bound to exactly one
+  running execution by its runtime session. Neither path directly publishes
+  the canonical plan: terminal handling freezes the candidate outside the
+  agent-writable outbox, then a durable execution/state-entry claim controls
+  publication while settling the owning completed execution. On Unix the
+  frozen file replaces the canonical plan by atomic same-directory rename and
+  multi-linked files are rejected; other platforms use the portable replacement
+  fallback without those Unix guarantees. Reviewer, stale, non-regular,
+  symlinked, oversized, and invalid UTF-8 output cannot replace the canonical
+  plan. Managed Codex cannot write the surrounding Task directory; direct
+  sibling writes by less-confined CLI adapters remain outside the supported
+  contract.
+- Concurrent terminal executions for one Task no longer lose the later
+  workflow cascade. Forge serializes their settlement and keeps a target
+  state's entry barrier active through inline dispatch, so a periodic scan
+  cannot steal a rejected review's worker continuation or discard a fast
+  reviewer completion. Workflow-dispatched runs keep that same shared
+  settlement coordinator and provider/outbox context. Recovery also replaces
+  terminal role executions from a superseded Project revision instead of
+  treating their intentionally ignored effects as reconciled.
+- Interactive password input now disables terminal echo before displaying the
+  prompt, closing a scheduling race that could echo a fast response into the
+  terminal transcript.
 
 ## [0.13.8] - 2026-09-27
 

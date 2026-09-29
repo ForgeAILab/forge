@@ -15,7 +15,7 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
-    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
+    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -119,18 +119,23 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
     assert_eq!(reviewer_execution.role, "reviewer");
 
     let executions = poll_until_executor_attempts(&harness.app, &created_task.id, 2).await;
-    let follow_up_execution = executions
+    let follow_up_execution_id = executions
         .iter()
         .find(|execution| {
             execution.role == "coder"
                 && execution.parent_execution_id.is_some()
-                && execution
-                    .executor_config_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(FIRST_EXECUTOR_SESSION_ID)
+                && execution.is_resume
         })
-        .expect("coder follow-up execution with session continuity exists");
+        .expect("coder follow-up execution with session continuity exists")
+        .id
+        .clone();
+    let follow_up_execution: ExecutionResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{follow_up_execution_id}"),
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(follow_up_execution.status, ExecutionStatus::Running);
     let follow_up_snapshot = follow_up_execution
         .executor_config_snapshot
@@ -464,7 +469,7 @@ async fn poll_until_executor_attempts(
     app: &Router,
     task_id: &str,
     expected_executor_count: usize,
-) -> Vec<ExecutionResponse> {
+) -> Vec<ExecutionSummaryResponse> {
     for _ in 0..100 {
         let executions = executions_for_task(app, task_id).await;
         let executor_count = executions
@@ -488,7 +493,7 @@ async fn poll_until_reused_execution_running(
     task_id: &str,
     role: &str,
     execution_id: &str,
-) -> Vec<ExecutionResponse> {
+) -> Vec<ExecutionSummaryResponse> {
     let mut last = Vec::new();
     for _ in 0..100 {
         let executions = executions_for_task(app, task_id).await;
@@ -497,11 +502,7 @@ async fn poll_until_reused_execution_running(
             execution.role == role
                 && execution.id == execution_id
                 && execution.status == ExecutionStatus::Running
-                && execution
-                    .executor_config_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(FIRST_EXECUTOR_SESSION_ID)
+                && execution.is_resume
         }) {
             return executions;
         }
@@ -512,8 +513,8 @@ async fn poll_until_reused_execution_running(
     );
 }
 
-async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionResponse> {
-    let executions: PaginatedResponse<ExecutionResponse> = empty_request(
+async fn executions_for_task(app: &Router, task_id: &str) -> Vec<ExecutionSummaryResponse> {
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
         app,
         Method::GET,
         &format!("/api/v1/tasks/{task_id}/executions?limit=20"),

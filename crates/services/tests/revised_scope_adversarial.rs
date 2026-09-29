@@ -15,6 +15,8 @@ use services::{
     SetMainAgentBindingInput, TaskService,
 };
 
+const RUNTIME_SESSION_ID: &str = "revised-scope-adversarial-runtime-session";
+
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
@@ -467,6 +469,7 @@ async fn main_provider_cannot_submit_task_mutation() {
         .propose(
             "main-identity",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -526,6 +529,7 @@ async fn main_provider_global_catalog_operations_are_bounded_and_live() {
         .propose(
             "main-global-agent",
             &scope,
+            RUNTIME_SESSION_ID,
             "web.search",
             json!({
                 "payload": {"query":"bounded discovery query", "limit": 5},
@@ -540,6 +544,7 @@ async fn main_provider_global_catalog_operations_are_bounded_and_live() {
         .propose(
             "main-global-agent",
             &scope,
+            RUNTIME_SESSION_ID,
             "project.lifecycle",
             json!({
                 "payload": {"action":"pause", "project_id":"not-owned"},
@@ -632,6 +637,7 @@ async fn project_proposal_target_is_derived_from_scope() {
         .propose(
             "project-agent-a",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {"title":"bounded", "review_requirement_ids": []},
@@ -705,6 +711,7 @@ async fn implementation_proposal_without_plan_item_uses_charter_authority() {
         .propose(
             "project-agent-a",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -753,6 +760,7 @@ async fn duplicate_plan_item_proposal_is_rejected() {
         .propose(
             "project-agent-a",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -798,6 +806,7 @@ async fn planning_proposal_and_cancelled_plan_items_stay_proposable() {
         .propose(
             "project-agent-a",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -826,6 +835,7 @@ async fn planning_proposal_and_cancelled_plan_items_stay_proposable() {
         .propose(
             "project-agent-a",
             &scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -1129,6 +1139,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
         .propose(
             "project-agent-a",
             &project_scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -1182,6 +1193,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
         .propose(
             "project-agent-a",
             &project_scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {
@@ -1218,6 +1230,7 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
                 scope_id: "user-1".to_owned(),
                 workspace_access: WorkspaceAccess::Deny,
             },
+            RUNTIME_SESSION_ID,
             "task.propose",
             json!({
                 "payload": {

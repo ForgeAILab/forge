@@ -2066,7 +2066,7 @@ async fn actionable_task_interruption_wakes_the_project_agent_end_to_end() {
             expected_version: 1,
             owner: "embedded:wake-turn-test".to_owned(),
             lease_expires_at: "9999-01-01T00:00:00+00:00".to_owned(),
-            hard_deadline_at: "9999-01-01T00:00:00+00:00".to_owned(),
+            hard_deadline_at: Some("9999-01-01T00:00:00+00:00".to_owned()),
             now: now.clone(),
         },
     )

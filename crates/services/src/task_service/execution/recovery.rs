@@ -69,6 +69,7 @@ impl TaskService {
                 }));
             }
         }
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         if task.failed_json.is_some()
             && !matches!(
                 action,
@@ -95,7 +96,9 @@ impl TaskService {
         }
         let annotation = self.recovery_annotation(&task);
         if let Ok(explicit) = &annotation {
-            if !explicit.recovery_actions.is_empty() {
+            if !explicit.recovery_actions.is_empty()
+                && action != api_types::RecoveryAction::MarkReviewed
+            {
                 // A non-empty annotation is the authoritative recovery
                 // contract shown to clients. State-derived actions may fill
                 // in old/empty annotations, but they must never widen an
@@ -823,6 +826,7 @@ impl TaskService {
         task: Task,
         context: Option<String>,
     ) -> Result<Task> {
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1440,6 +1444,7 @@ impl TaskService {
         reason: String,
         actor: &api_types::Actor,
     ) -> Result<Task> {
+        super::ensure_plan_publication_transition_authority(task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1456,7 +1461,7 @@ impl TaskService {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
+                task_service: self.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -1475,6 +1480,7 @@ impl TaskService {
                     Some(crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     }),
                 )
                 .await?
@@ -1910,24 +1916,54 @@ impl TaskService {
             .auto_transition_target(&task.status)
             .unwrap_or(crate::workflow::default_states::MERGING)
             .to_owned();
-        let reason = optional_recovery_reason(reason, "mark_reviewed");
+        let reason = required_recovery_reason(reason, "mark_reviewed")?;
         let latest_review = self.latest_review_for_task(&task.id).await?;
+        if latest_review.status != ReviewStatus::Failed {
+            return Err(ServiceError::invalid_operation(
+                "mark_reviewed requires the latest review attempt to be failed",
+            ));
+        }
+        let active_review_execution = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .find(|execution| {
+                matches!(
+                    execution.role.as_str(),
+                    crate::workflow::default_roles::REVIEWER
+                        | crate::workflow::default_roles::AUDITOR
+                )
+            });
+        if let Some(execution) = active_review_execution {
+            return Err(ServiceError::invalid_operation(format!(
+                "cannot pass review manually while {} execution {} is running",
+                execution.role, execution.id
+            )));
+        }
         let finished_at = now_rfc3339();
         let mut details = strict_review_details(&latest_review)?;
         details["manual_override"] = json!({
             "action": "mark_reviewed",
             "reason": reason.clone(),
+            "actor_type": "user",
+            "source_review_id": latest_review.id,
+            "source_attempt_number": latest_review.attempt_number,
             "at": finished_at,
         });
-        let (review, task) = ReviewRepo::update_status_with_task_authority(
+        let (review, task) = ReviewRepo::create_manual_pass_with_task_authority(
             &*self.db,
-            &latest_review.id,
-            ReviewStatus::Passed,
-            details.to_string(),
-            Some(finished_at.clone()),
-            &finished_at,
-            task.version,
-            Some(finished_at.clone()),
+            db::CreateManualReviewPass {
+                id: new_uuid_v4(),
+                source_review_id: latest_review.id.clone(),
+                source_review_updated_at: latest_review.updated_at.clone(),
+                task_id: task.id.clone(),
+                candidate_execution_id: latest_review.execution_id.clone(),
+                step_results_json: details.to_string(),
+                expected_task_version: task.version,
+                expected_task_status: task.status.clone(),
+                expected_project_version: project.version,
+                expected_workflow_definition: project.workflow_definition.clone(),
+                occurred_at: finished_at.clone(),
+            },
         )
         .await?;
         self.publish_domain_event_by_dedupe(&format!(
@@ -1944,7 +1980,10 @@ impl TaskService {
         }
         self.create_system_comment(
             &task.id,
-            format!("Review passed manually (attempt {})", review.attempt_number),
+            format!(
+                "Review passed manually (attempt {}): {}",
+                review.attempt_number, reason
+            ),
         )
         .await?;
         self.publish(ForgeEvent {
@@ -1962,7 +2001,19 @@ impl TaskService {
             "recovery action mark_reviewed logged"
         );
         let transitioned = self
-            .transition(task.id.clone(), pass_target, task.version)
+            .transition(
+                task.id.clone(),
+                pass_target,
+                TransitionOptions {
+                    version: task.version,
+                    reason: Some(reason),
+                    triggered_by: api_types::Actor::user(api_types::UserActionSource::Recovery(
+                        api_types::RecoveryAction::MarkReviewed,
+                    )),
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
             .await?;
         Ok(transitioned.task)
     }
@@ -2025,7 +2076,7 @@ impl TaskService {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
+                task_service: self.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -2042,6 +2093,7 @@ impl TaskService {
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     },
                 )
                 .await?
@@ -2076,6 +2128,7 @@ impl TaskService {
         reason: Option<String>,
     ) -> Result<Task> {
         let reason = optional_recovery_reason(reason, "retry_hook");
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         let cleared = self.clear_blocking_metadata(&task.id).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &cleared.project_id)
             .await?
@@ -2091,7 +2144,7 @@ impl TaskService {
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
+            task_service: self.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
             terminal_activity: self.terminal_activity.clone(),
@@ -2110,6 +2163,7 @@ impl TaskService {
                 Some(crate::workflow::engine::WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?
@@ -2381,7 +2435,7 @@ impl TaskService {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
+                task_service: self.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -2398,6 +2452,7 @@ impl TaskService {
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     },
                 )
                 .await?

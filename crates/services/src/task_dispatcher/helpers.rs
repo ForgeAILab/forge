@@ -90,6 +90,73 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     )
 }
 
+pub(super) fn awaiting_human(task: &db::Task) -> bool {
+    task.metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|metadata| metadata.get("awaiting_human").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Human-wait metadata suppresses dispatch only when it belongs to a real
+/// approval boundary in the Task's current workflow. Older Forge versions
+/// wrote `plan_review` on the default auto-advancing planning gate; treating
+/// that stale marker as authoritative would preserve the planner loop fix by
+/// turning it into a permanent stall instead.
+pub(super) fn awaiting_human_is_authoritative(
+    task: &db::Task,
+    state: &api_types::StateDefinition,
+    role_name: &str,
+) -> bool {
+    let Some(metadata) = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    else {
+        return false;
+    };
+    if metadata.get("awaiting_human").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if metadata
+        .get("awaiting_human_reason")
+        .and_then(Value::as_str)
+        != Some("plan_review")
+    {
+        return true;
+    }
+
+    task.status == crate::workflow::default_states::PLANNING
+        && role_name == crate::workflow::default_roles::PLANNER
+        && state.kind == StateKind::Gate
+        && state
+            .gate_config
+            .as_ref()
+            .is_some_and(|config| config.requires_user_approval())
+}
+
+pub(super) async fn execution_superseded_by_role_assignment(
+    db: &db::SqliteDb,
+    task_id: &str,
+    canonical_role: &str,
+    execution: &db::Execution,
+) -> Result<bool> {
+    let assignment =
+        TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, canonical_role).await?;
+    Ok(assignment.is_some_and(|assignment| {
+        let Ok(assignment_updated_at) =
+            chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
+        else {
+            return false;
+        };
+        let Ok(execution_updated_at) = chrono::DateTime::parse_from_rfc3339(&execution.updated_at)
+        else {
+            return false;
+        };
+        assignment_updated_at > execution_updated_at
+    }))
+}
+
 pub(super) fn auto_cascades_on_unassigned_role(state: &api_types::StateDefinition) -> bool {
     if !state
         .gate_config

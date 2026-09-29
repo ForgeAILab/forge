@@ -878,6 +878,14 @@ impl CodexAdapter {
                     ))
                     .chain(dirs::home_dir().map_or_else(Vec::new, |home| {
                         package_cache_roots(&home, |key| std::env::var_os(key))
+                            .into_iter()
+                            .filter(|root| {
+                                cache_root_is_disjoint_from_task(
+                                    root,
+                                    Path::new(&ctx.worktree_path),
+                                )
+                            })
+                            .collect()
                     }))
                     .collect::<Vec<_>>()
             } else {
@@ -1260,6 +1268,63 @@ fn package_cache_roots(
         roots.push(home.join("Library/pnpm"));
     }
     roots
+}
+
+/// A relocated package cache must never widen the sandbox back over the Task
+/// directory that contains the host-owned canonical plan and staging area.
+/// Compare resolved paths in both directions: a cache inside the Task root and
+/// an ancestor cache that contains the Task root are equally unsafe.
+fn cache_root_is_disjoint_from_task(cache_root: &Path, worktree: &Path) -> bool {
+    let task_root = worktree.parent().unwrap_or(worktree);
+    let cache_root = resolve_path_for_overlap(cache_root);
+    let task_root = resolve_path_for_overlap(task_root);
+    !cache_root.starts_with(&task_root) && !task_root.starts_with(&cache_root)
+}
+
+fn resolve_path_for_overlap(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let normalized = lexical_normalize(&absolute);
+    let mut existing = normalized.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return suffix
+                .into_iter()
+                .rev()
+                .fold(canonical, |path, component| path.join(component));
+        }
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalized;
+        };
+        existing = parent;
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 /// Build the smallest Codex home a managed Task needs. Authentication is the
@@ -1762,6 +1827,24 @@ mod tests {
         ] {
             assert!(relocated.contains(&PathBuf::from(expected)), "{expected}");
         }
+    }
+
+    #[test]
+    fn package_cache_roots_cannot_overlap_task_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        let task_root = tempdir.path().join("task");
+        let worktree = task_root.join("repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+
+        assert!(!cache_root_is_disjoint_from_task(
+            &task_root.join("cache"),
+            &worktree,
+        ));
+        assert!(!cache_root_is_disjoint_from_task(tempdir.path(), &worktree,));
+        assert!(cache_root_is_disjoint_from_task(
+            &tempdir.path().join("sibling-cache"),
+            &worktree,
+        ));
     }
 
     #[test]

@@ -1832,16 +1832,18 @@ pub enum ResumePolicy {
     None,
 }
 
-/// Scheduler-owned lease claim.  A claim is valid only for the expected
-/// execution version and either an unowned/expired lease.  The first claim
-/// establishes the immutable hard deadline for the attempt.
+/// Scheduler-owned lease claim. A claim is valid only for the expected
+/// execution version and either an unowned/expired lease. When policy supplies
+/// a hard deadline, the first claim establishes that immutable deadline for
+/// the attempt; `None` leaves the execution bounded only by its renewable
+/// owner lease and explicit cancellation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimExecutionLease {
     pub execution_id: String,
     pub expected_version: i64,
     pub owner: String,
     pub lease_expires_at: String,
-    pub hard_deadline_at: String,
+    pub hard_deadline_at: Option<String>,
     pub now: String,
 }
 

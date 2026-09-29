@@ -207,7 +207,7 @@ impl HookAction for RequirePlanChecklistComplete {
                 };
             }
         };
-        match crate::task_service::coordination_root_has_subtasks(&ctx.db, &task).await {
+        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &task).await {
             Ok(true) => {
                 return HookResult::Skipped {
                     reason: "coordination root is governed by ordered subtask completion"
@@ -263,7 +263,7 @@ impl HookAction for RequirePlanChecklistComplete {
 
         HookResult::Failed {
             reason: format!(
-                "Plan checklist incomplete: {} unchecked item(s) remain in ../plan.md. Continue working on the unchecked items, then update completed items to `- [x]` before stopping.",
+                "Plan checklist incomplete: {} unchecked item(s) remain. Continue working on the unchecked items, then update completed items to `- [x]` using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness before stopping.",
                 summary.remaining
             ),
         }

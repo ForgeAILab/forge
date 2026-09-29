@@ -959,6 +959,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         .propose(
             &fixture.project_identity_id,
             &scope,
+            "v076-document-proposal-session",
             forge_agent_host::PROJECT_DOCUMENT_OPERATION,
             json!({
                 "payload": {
@@ -1105,6 +1106,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         .propose(
             &fixture.project_identity_id,
             &scope,
+            "v076-decision-proposal-session",
             forge_agent_host::PROJECT_DECISION_OPERATION,
             json!({
                 "payload": {

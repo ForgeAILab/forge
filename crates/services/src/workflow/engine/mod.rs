@@ -10,7 +10,6 @@ use db::{
     TransitionLogRepo, UpdateTask,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
-use executors::TaskExecutor;
 use sqlx::{query, Row};
 use tracing::Instrument;
 use workspace::RepoCacheLockManager;
@@ -201,7 +200,10 @@ pub struct WorkflowEngine {
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    pub task_executor: Option<Arc<dyn TaskExecutor>>,
+    /// Single authority for execution dispatch dependencies. A separate
+    /// executor on the engine could let hook dispatch observe a stale or
+    /// differently configured service clone.
+    pub task_service: crate::TaskService,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
@@ -233,6 +235,11 @@ pub struct BoardMoveRequest {
 pub struct WorkflowAuthority {
     pub project_version: i64,
     pub workflow_definition: String,
+    /// Clear stale review authority in the same transaction as this status
+    /// change. Plan publication uses this when a completed implementation
+    /// enters review; a separate pre-transition write would survive if the
+    /// project workflow changed before the status CAS.
+    pub clear_review_passed_at_on_commit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +505,10 @@ impl WorkflowEngine {
         rejection: bool,
         authority: Option<WorkflowAuthority>,
     ) -> crate::Result<TransitionResult> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)?;
         self.transition_inner(
             task_id.to_string(),
             target_state.to_string(),
@@ -538,6 +549,7 @@ impl WorkflowEngine {
             WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
             },
         )
         .await
@@ -653,7 +665,7 @@ impl WorkflowEngine {
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
+            task_service: self.task_service.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
             terminal_activity: self.terminal_activity.clone(),
@@ -753,17 +765,6 @@ impl WorkflowEngine {
         }
 
         if cascade.is_none() {
-            let cleared_at = now_rfc3339();
-            task = TaskRepo::set_entry_barrier_with_workflow_authority(
-                &*self.db,
-                task_id,
-                task.version,
-                None,
-                &cleared_at,
-                authority.project_version,
-                authority.workflow_definition.clone(),
-            )
-            .await?;
             task = TaskRepo::update_with_workflow_authority(
                 &*self.db,
                 UpdateTask {
@@ -803,6 +804,20 @@ impl WorkflowEngine {
                     break;
                 }
             }
+        }
+
+        if cascade.is_none() {
+            let cleared_at = now_rfc3339();
+            task = TaskRepo::set_entry_barrier_with_workflow_authority(
+                &*self.db,
+                task_id,
+                task.version,
+                None,
+                &cleared_at,
+                authority.project_version,
+                authority.workflow_definition.clone(),
+            )
+            .await?;
         }
 
         if cascade.is_none() {
@@ -1226,7 +1241,7 @@ impl WorkflowEngine {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
+                task_service: self.task_service.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -1258,7 +1273,7 @@ impl WorkflowEngine {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
+                task_service: self.task_service.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
                 terminal_activity: self.terminal_activity.clone(),
@@ -1570,12 +1585,16 @@ impl WorkflowEngine {
                             return Err(db::DbError::VersionConflict.into());
                         }
                     }
+                    let clear_review_passed_at = authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
                     let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
                     )
                     .bind(&target_state)
                     .bind(&updated_at)
                     .bind(entry_barrier_json.as_deref())
+                    .bind(clear_review_passed_at)
                     .bind(&task_id)
                     .bind(version)
                     .execute(&mut *transaction)
@@ -1820,8 +1839,6 @@ impl WorkflowEngine {
             }
 
             if board_move_outcome.is_none() && cascade.is_none() && !review_refresh_bridge {
-                let mut before_enter_blocked = false;
-                let mut before_enter_barrier_resolved = false;
                 for hook in &to_state.hooks.before_enter {
                     if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
@@ -1924,7 +1941,6 @@ impl WorkflowEngine {
                                                 authority.as_ref(),
                                             )
                                             .await?;
-                                            before_enter_blocked = true;
                                             skip_target_enter_hooks = true;
                                         } else {
                                             let clear_updated_at = now_rfc3339();
@@ -1936,7 +1952,6 @@ impl WorkflowEngine {
                                                 authority.as_ref(),
                                             )
                                             .await?;
-                                            before_enter_barrier_resolved = true;
                                             before_enter_rejection_cascade = true;
                                             cascade = Some((reject_target, error));
                                         }
@@ -1958,7 +1973,6 @@ impl WorkflowEngine {
                                             authority.as_ref(),
                                         )
                                         .await?;
-                                        before_enter_blocked = true;
                                         skip_target_enter_hooks = true;
                                     }
                                 } else {
@@ -1979,7 +1993,6 @@ impl WorkflowEngine {
                                         authority.as_ref(),
                                     )
                                     .await?;
-                                    before_enter_blocked = true;
                                     skip_target_enter_hooks = true;
                                 }
                                 break;
@@ -1994,24 +2007,6 @@ impl WorkflowEngine {
                         }
                         HookResult::Ok | HookResult::Skipped { .. } => {}
                     }
-                }
-
-                if has_blocking_before_enter
-                    && !before_enter_blocked
-                    && !before_enter_barrier_resolved
-                {
-                    let clear_updated_at = now_rfc3339();
-                    let cleared_task = self.set_entry_barrier_with_authority(
-                        &task_id,
-                        task.version,
-                        None,
-                        &clear_updated_at,
-                        authority.as_ref(),
-                    )
-                    .await?;
-                    task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", cleared_task.id))?;
                 }
             }
 
@@ -2211,6 +2206,30 @@ impl WorkflowEngine {
                         HookResult::Skipped { .. } => {}
                     }
                 }
+            }
+
+            // Keep the entry barrier through target-state dispatch. The
+            // periodic dispatcher treats a running barrier as authoritative,
+            // so clearing it before `on_enter` creates a window where it can
+            // launch a fresh execution before an inline continuation dispatch
+            // (for example ResumeLatestTargetRoleThread) has claimed the role.
+            // Cascades retain the barrier until their transition replaces it;
+            // blocked entry hooks retain their explicit blocked barrier.
+            if has_blocking_before_enter
+                && cascade.is_none()
+                && !skip_target_enter_hooks
+                && task.entry_barrier_is_running()
+            {
+                let clear_updated_at = now_rfc3339();
+                task = self
+                    .set_entry_barrier_with_authority(
+                        &task_id,
+                        task.version,
+                        None,
+                        &clear_updated_at,
+                        authority.as_ref(),
+                    )
+                    .await?;
             }
 
             if cascade.is_none() && !skip_target_enter_hooks {

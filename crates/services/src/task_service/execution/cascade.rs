@@ -3,11 +3,14 @@ use super::*;
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
-/// Holds one execution's slot in `TaskService::completion_cascades` and frees
-/// it on drop, including when the cascade returns early or errors.
+/// Holds one Task's slot in `TaskService::completion_cascades` and frees it on
+/// drop, including when the cascade returns early or errors. Serializing by
+/// Task prevents two completed same-role executions from publishing different
+/// plan snapshots before only one workflow transition wins its CAS.
 pub(crate) struct CompletionCascadeSlot {
     in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
-    execution_id: String,
+    released: Arc<tokio::sync::Notify>,
+    task_id: String,
 }
 
 impl Drop for CompletionCascadeSlot {
@@ -15,7 +18,8 @@ impl Drop for CompletionCascadeSlot {
         self.in_flight
             .lock()
             .expect("completion cascade set lock")
-            .remove(&self.execution_id);
+            .remove(&self.task_id);
+        self.released.notify_waiters();
     }
 }
 
@@ -23,31 +27,44 @@ impl TaskService {
     /// Settle one terminal execution. The inline completion path and the
     /// dispatcher's reconciliation of terminal executions both call this, and
     /// a reviewer's cascade can run for seconds (the clean-checkout setup and
-    /// checks). A second caller that arrives meanwhile returns at once: the
-    /// cascade in flight settles the execution, and running it twice spent
-    /// the retry budget twice and re-froze the review assessment.
+    /// checks). A second caller for the same Task waits for that cascade, then
+    /// retries against current authority. This keeps duplicate delivery
+    /// idempotent without dropping a successor role's terminal completion.
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
-        let Some(_slot) = self.claim_completion_cascade(execution_id) else {
-            tracing::debug!(
-                execution_id,
-                "completion cascade already in flight; leaving it to the running one"
-            );
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
             return Ok(());
         };
-        self.cascade_executor_completion(execution_id).await
+
+        loop {
+            // Register before checking the slot. Otherwise its owner could
+            // release and notify between a failed claim and `notified()`,
+            // leaving this terminal completion asleep forever.
+            let released = self.completion_cascade_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+
+            if let Some(_slot) = self.claim_completion_cascade(&execution.task_id) {
+                return self.cascade_executor_completion(execution_id).await;
+            }
+
+            tracing::debug!(
+                execution_id,
+                task_id = %execution.task_id,
+                "Task completion cascade already in flight; waiting to retry"
+            );
+            released.await;
+        }
     }
 
-    pub(crate) fn claim_completion_cascade(
-        &self,
-        execution_id: &str,
-    ) -> Option<CompletionCascadeSlot> {
+    pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
         self.completion_cascades
             .lock()
             .expect("completion cascade set lock")
-            .insert(execution_id.to_owned())
+            .insert(task_id.to_owned())
             .then(|| CompletionCascadeSlot {
                 in_flight: Arc::clone(&self.completion_cascades),
-                execution_id: execution_id.to_owned(),
+                released: Arc::clone(&self.completion_cascade_released),
+                task_id: task_id.to_owned(),
             })
     }
 
@@ -56,28 +73,108 @@ impl TaskService {
             Some(execution) => execution,
             None => return Ok(()),
         };
+        let task_snapshot = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await?;
         if execution.role == crate::workflow::default_roles::REVIEWER {
             if execution.status == ExecutionStatus::Running {
                 return Ok(());
             }
+            if let Some(task) = task_snapshot.as_ref() {
+                let project_version = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .map(|project| project.version);
+                if super::super::execution_dispatch_project_version(&execution) != project_version {
+                    tracing::info!(
+                        task_id = %task.id,
+                        execution_id = %execution.id,
+                        dispatch_project_version = ?super::super::execution_dispatch_project_version(&execution),
+                        current_project_version = ?project_version,
+                        "ignoring reviewer terminal effects from a superseded Project revision"
+                    );
+                    return Ok(());
+                }
+            }
             return self.maybe_cascade_reviewer_completion(&execution).await;
         }
         if execution.status != ExecutionStatus::Completed {
+            self.discard_brokered_execution_plan_stage(&execution)
+                .await?;
             return Ok(());
         }
 
         if execution.role == "interactive" {
+            if let Some(task) = task_snapshot.as_ref() {
+                self.ingest_terminal_execution_outbox(task, &execution)
+                    .await?;
+            }
             return Ok(());
         }
 
-        let mut task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
+        let mut task = match task_snapshot {
             Some(task) => task,
-            None => return Ok(()),
+            None => {
+                self.discard_brokered_execution_plan_stage(&execution)
+                    .await?;
+                return Ok(());
+            }
         };
+        if super::active_plan_publication_claim_owner(&task)?.as_deref()
+            == Some(execution.id.as_str())
+            && !super::plan_publication_matches_current_state_entry(&self.db, &task, &execution.id)
+                .await?
+        {
+            // The transition authorized by this claim already committed, but
+            // cleanup crashed and the Task later re-entered the same named
+            // state. The published plan is authoritative; remove only the old
+            // claim/private bytes and never roll the canonical file back.
+            self.discard_brokered_execution_plan_stage(&execution)
+                .await?;
+            super::clear_settled_plan_publication(&self.db, &task.id, &execution.id, &task.status)
+                .await?;
+            return Ok(());
+        }
         let project = match ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
             Some(project) => project,
-            None => return Ok(()),
+            None => {
+                self.abandon_brokered_plan_authority(&task, &execution)
+                    .await?;
+                return Ok(());
+            }
         };
+        let brokered_plan = super::execution_uses_brokered_plan(&execution);
+        let dispatch_project_version = if brokered_plan {
+            super::brokered_plan_dispatch_project_version(&execution)
+        } else {
+            super::super::execution_dispatch_project_version(&execution)
+        };
+        if dispatch_project_version != Some(project.version) {
+            // Every workflow-role terminal effect is interpreted under the
+            // immutable Project revision that admitted the execution. Missing
+            // or malformed authority is intentionally fail-closed; only a
+            // brokered plan has private publication state to roll back here.
+            if brokered_plan {
+                self.abandon_brokered_plan_authority(&task, &execution)
+                    .await?;
+            }
+            tracing::info!(
+                task_id = %task.id,
+                execution_id = %execution.id,
+                ?dispatch_project_version,
+                current_project_version = project.version,
+                "ignoring terminal effects from a superseded Project revision"
+            );
+            return Ok(());
+        }
+        if super::execution_completion_settled_for_current_state_entry(&self.db, &task, &execution)
+            .await?
+        {
+            if super::pending_plan_publication_cleanup_owner(&task)?.as_deref()
+                == Some(execution.id.as_str())
+            {
+                super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id).await?;
+                super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+            }
+            return Ok(());
+        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -88,37 +185,336 @@ impl TaskService {
             .iter()
             .find(|state| state.name == task.status)
         else {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
             return Ok(());
         };
         let Some(effective_role) = crate::workflow::effective_role(current_state) else {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
             return Ok(());
         };
         let role_matches = execution.role == effective_role
             || (effective_role == crate::workflow::default_roles::CODER
                 && execution.role == "executor");
         if !role_matches {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
             return Ok(());
         }
-        if workflow.state_kind(&task.status) != Some(api_types::StateKind::Active) {
+        if !self
+            .execution_owns_current_role_attempt(&task, &execution)
+            .await?
+        {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
             return Ok(());
         }
+        // Only a successful terminal CAS that still owns the current role
+        // attempt and Project revision can publish agent output. Superseded
+        // attempts leave their outbox private and are cleaned up by the
+        // brokered-plan path above.
+        let outbox_report = self
+            .ingest_terminal_execution_outbox(&task, &execution)
+            .await?;
         let Some(target) = workflow
             .auto_transition_target(&task.status)
             .map(str::to_owned)
         else {
+            self.abandon_brokered_plan_authority(&task, &execution)
+                .await?;
             return Ok(());
         };
-        if task.review_passed_at.is_some()
-            && workflow.canonical_phase_for_state(&target) == api_types::CanonicalPhase::Review
-        {
-            task = TaskRepo::set_review_passed_at_cas(
-                &*self.db,
-                &task.id,
-                task.version,
-                None,
-                &now_rfc3339(),
-            )
-            .await?;
+
+        let is_planning_gate = task.status == crate::workflow::default_states::PLANNING
+            && execution.role == crate::workflow::default_roles::PLANNER
+            && current_state.kind == api_types::StateKind::Gate;
+        let gate_requires_user_approval = is_planning_gate
+            && current_state
+                .gate_config
+                .as_ref()
+                .is_some_and(|gate_config| gate_config.requires_user_approval());
+
+        let planning_marker_matches_execution = if is_planning_gate {
+            let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid task metadata for {}: {error}",
+                    task.id
+                ))
+            })?;
+            metadata
+                .extra
+                .get("awaiting_human")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && metadata
+                    .extra
+                    .get("awaiting_human_reason")
+                    .and_then(Value::as_str)
+                    == Some("plan_review")
+                && metadata
+                    .extra
+                    .get("planning_execution_id")
+                    .and_then(Value::as_str)
+                    == Some(execution.id.as_str())
+        } else {
+            false
+        };
+
+        if brokered_plan && !planning_marker_matches_execution {
+            // Remote terminal settlement may have committed immediately
+            // before a process exit. Recovery freezes that winning outbox
+            // above before deciding that its plan candidate is missing.
+            if outbox_report.plan_rejected {
+                // The agent-writable outbox is the only diagnostic copy of a
+                // candidate that failed validation. Keep it intact while the
+                // bounded guard path retries or records the terminal blocker.
+                return self
+                    .handle_executor_completion_guard_rejection(
+                        &execution,
+                        &task,
+                        current_state,
+                        "planning_plan_ready",
+                        "Forge could not freeze this execution's plan candidate safely",
+                    )
+                    .await;
+            }
+        }
+        let brokered_workspace = if brokered_plan && !planning_marker_matches_execution {
+            match execution.workspace_id.as_deref() {
+                Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
+                None => {
+                    let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+                    WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?
+                }
+            }
+        } else {
+            None
+        };
+        if brokered_plan && !planning_marker_matches_execution && brokered_workspace.is_none() {
+            let result = self
+                .handle_executor_completion_guard_rejection(
+                    &execution,
+                    &task,
+                    current_state,
+                    "planning_plan_ready",
+                    "this completed execution's workspace is no longer available",
+                )
+                .await;
+            if result.is_ok() {
+                self.discard_brokered_execution_plan_stage(&execution)
+                    .await?;
+            }
+            return result;
+        }
+        if brokered_plan && !planning_marker_matches_execution {
+            match super::claim_plan_publication(&self.db, &task, &execution, project.version)
+                .await?
+            {
+                super::PlanPublicationClaimOutcome::Claimed(claimed_task) => {
+                    task = *claimed_task;
+                }
+                super::PlanPublicationClaimOutcome::VersionRace => {
+                    // Preserve the only frozen bytes. The next dispatcher pass
+                    // retries the claim from the newer Task snapshot.
+                    return Ok(());
+                }
+                super::PlanPublicationClaimOutcome::OwnedByOther => {
+                    // A durable same-state owner proves this candidate lost.
+                    self.discard_brokered_execution_plan_stage(&execution)
+                        .await?;
+                    return Ok(());
+                }
+                super::PlanPublicationClaimOutcome::StaleWorkflowAuthority => {
+                    self.abandon_brokered_plan_authority(&task, &execution)
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // A CLI candidate was frozen outside the agent-writable outbox before
+        // terminal settlement. Publish only after this completed execution is
+        // still the effective role for the current state. Keep the stage until
+        // the transition/approval marker commits so a crash can replay this
+        // exact snapshot instead of accepting an older canonical plan.
+        if brokered_plan && !planning_marker_matches_execution {
+            let workspace = brokered_workspace
+                .as_ref()
+                .expect("brokered workspace checked before plan publication");
+            let worktree = std::path::Path::new(&workspace.worktree_path);
+            match crate::plan_artifact::publish_staged_execution_plan(worktree, &execution.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let candidate_required = execution.role
+                        == crate::workflow::default_roles::PLANNER
+                        || task.plan.as_deref().is_some_and(|plan| {
+                            !crate::plan_artifact::parse_plan_markdown(plan)
+                                .items
+                                .is_empty()
+                        })
+                        || crate::plan_artifact::read_canonical_plan_text(worktree)
+                            .map_err(|error| {
+                                ServiceError::invalid_operation(format!(
+                                    "canonical plan artifact is unreadable: {error}"
+                                ))
+                            })?
+                            .is_some();
+                    if candidate_required {
+                        self.discard_brokered_execution_plan_stage(&execution)
+                            .await?;
+                        task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(
+                            |error| {
+                                ServiceError::invalid_operation(format!(
+                                    "invalid task metadata for {}: {error}",
+                                    task.id
+                                ))
+                            },
+                        )?;
+                        if metadata
+                            .extra
+                            .get("awaiting_human_reason")
+                            .and_then(Value::as_str)
+                            == Some("plan_review")
+                        {
+                            task = super::set_planning_awaiting_review_metadata(
+                                &self.db, &task, None, false,
+                            )
+                            .await?;
+                        }
+                        return self
+                            .handle_executor_completion_guard_rejection(
+                                &execution,
+                                &task,
+                                current_state,
+                                "planning_plan_ready",
+                                "this execution did not produce its required checklist plan candidate",
+                            )
+                            .await;
+                    }
+                    // Planning may be optional, so a coder can legitimately
+                    // run without a plan. If a canonical plan exists, its
+                    // private seeded copy is required above.
+                }
+                Err(error) => {
+                    let reason =
+                        format!("Forge could not publish this execution's plan candidate: {error}");
+                    return Err(ServiceError::invalid_operation(reason));
+                }
+            }
+        }
+
+        // Planning's required artifact is a completion contract, including
+        // for workflows that put a human approval boundary after the planner.
+        // Route a missing, unreadable, or checklist-free plan through the
+        // existing bounded guard-retry machinery; exhaustion leaves one
+        // visible blocker instead of an approval marker that can never pass.
+        if task.status == crate::workflow::default_states::PLANNING {
+            match self
+                .ensure_planning_plan_ready_before_leaving(&task, &target, &workflow, false)
+                .await
+            {
+                Ok(()) => {}
+                Err(ServiceError::InvalidOperation { message }) => {
+                    if brokered_plan && !planning_marker_matches_execution {
+                        self.restore_brokered_execution_plan(&task, &execution)
+                            .await?;
+                        self.discard_brokered_execution_plan_stage(&execution)
+                            .await?;
+                        task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                    }
+                    let metadata =
+                        TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+                            ServiceError::invalid_operation(format!(
+                                "invalid task metadata for {}: {error}",
+                                task.id
+                            ))
+                        })?;
+                    if metadata
+                        .extra
+                        .get("awaiting_human_reason")
+                        .and_then(Value::as_str)
+                        == Some("plan_review")
+                    {
+                        task = super::set_planning_awaiting_review_metadata(
+                            &self.db, &task, None, false,
+                        )
+                        .await?;
+                    }
+                    let result = self
+                        .handle_executor_completion_guard_rejection(
+                            &execution,
+                            &task,
+                            current_state,
+                            "planning_plan_ready",
+                            &message,
+                        )
+                        .await;
+                    return result;
+                }
+                Err(error) => return Err(error),
+            }
+
+            if gate_requires_user_approval {
+                if !planning_marker_matches_execution {
+                    if brokered_plan {
+                        match super::settle_plan_publication_for_review(&self.db, &task, &execution)
+                            .await
+                        {
+                            Ok(settled_task) => task = settled_task,
+                            Err(ServiceError::Db(DbError::VersionConflict)) => {
+                                self.abandon_brokered_plan_if_project_authority_stale(
+                                    &task.id, &execution,
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        super::set_planning_awaiting_review_metadata(
+                            &self.db,
+                            &task,
+                            Some(&execution.id),
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+                if brokered_plan {
+                    self.discard_brokered_execution_plan_stage(&execution)
+                        .await?;
+                    super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+                }
+                return Ok(());
+            }
+        }
+
+        // Preserve existing custom-Gate semantics. This automatic Gate
+        // completion contract is specific to the built-in planning role.
+        let auto_advances = matches!(current_state.kind, api_types::StateKind::Active)
+            || (is_planning_gate && !gate_requires_user_approval);
+        if !auto_advances {
+            if brokered_plan && !planning_marker_matches_execution {
+                match super::settle_plan_publication_without_transition(&self.db, &task, &execution)
+                    .await
+                {
+                    Ok(settled_task) => task = settled_task,
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        self.abandon_brokered_plan_if_project_authority_stale(&task.id, &execution)
+                            .await?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if brokered_plan {
+                self.discard_brokered_execution_plan_stage(&execution)
+                    .await?;
+                super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+            }
+            return Ok(());
         }
         if let Some(summary) = execution.summary.as_deref().map(str::trim) {
             if !summary.is_empty() {
@@ -134,11 +530,30 @@ impl TaskService {
 
         let from = task.status.clone();
         match self
-            .transition(task.id.clone(), target.clone(), task.version)
+            .transition_with_plan_publication(
+                task.id.clone(),
+                target.clone(),
+                task.version,
+                &execution.id,
+            )
             .await
         {
             Ok(_) => {
-                if let Err(error) = self.clear_workflow_guard_retry_metadata(&task.id).await {
+                if brokered_plan {
+                    self.discard_brokered_execution_plan_stage(&execution)
+                        .await?;
+                    if let Err(error) = super::clear_settled_plan_publication(
+                        &self.db,
+                        &task.id,
+                        &execution.id,
+                        &from,
+                    )
+                    .await
+                    {
+                        tracing::warn!(task_id = %task.id, %error, "failed to clear settled plan publication claim");
+                    }
+                }
+                if let Err(error) = self.clear_workflow_guard_retry_metadata(&task).await {
                     tracing::warn!(
                         task_id = %task.id,
                         %error,
@@ -163,20 +578,211 @@ impl TaskService {
                     task_id = %task.id,
                     "executor completion cascade version conflict"
                 );
+                let current = TaskRepo::get_by_id(&*self.db, &task.id, false).await?;
+                if current
+                    .as_ref()
+                    .is_none_or(|current| current.status != task.status)
+                {
+                    self.discard_brokered_execution_plan_stage(&execution)
+                        .await?;
+                    if let Err(error) = super::clear_settled_plan_publication(
+                        &self.db,
+                        &task.id,
+                        &execution.id,
+                        &task.status,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            %error,
+                            "failed to clear superseded plan publication claim"
+                        );
+                    }
+                } else {
+                    self.abandon_brokered_plan_if_project_authority_stale(&task.id, &execution)
+                        .await?;
+                }
                 Ok(())
             }
             Err(ServiceError::GuardRejection { guard, reason }) => {
-                self.handle_executor_completion_guard_rejection(
-                    &execution,
-                    &task,
-                    current_state,
-                    &guard,
-                    &reason,
-                )
-                .await
+                if brokered_plan {
+                    self.restore_brokered_execution_plan(&task, &execution)
+                        .await?;
+                    self.discard_brokered_execution_plan_stage(&execution)
+                        .await?;
+                    task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                }
+                let result = self
+                    .handle_executor_completion_guard_rejection(
+                        &execution,
+                        &task,
+                        current_state,
+                        &guard,
+                        &reason,
+                    )
+                    .await;
+                result
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn discard_brokered_execution_plan_stage(&self, execution: &Execution) -> Result<()> {
+        if !super::execution_uses_brokered_plan(execution) {
+            return Ok(());
+        }
+        if let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? {
+            return super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id)
+                .await;
+        }
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(workspace) = WorkspaceRepo::get_by_id(&*self.db, workspace_id).await? else {
+            return Ok(());
+        };
+        crate::plan_artifact::discard_staged_execution_plan(
+            std::path::Path::new(&workspace.worktree_path),
+            &execution.id,
+        )
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to remove settled execution plan stage: {error}"
+            ))
+        })?;
+        if let Some(outbox) = executors::execution_outbox_path(
+            std::path::Path::new(&workspace.worktree_path),
+            &execution.id,
+        ) {
+            match std::fs::remove_dir_all(&outbox) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ServiceError::invalid_operation(format!(
+                        "failed to remove settled execution plan outbox: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn abandon_brokered_plan_authority(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<()> {
+        if super::execution_uses_brokered_plan(execution)
+            && super::active_plan_publication_claim_owner(task)?.as_deref()
+                == Some(execution.id.as_str())
+        {
+            self.restore_brokered_execution_plan(task, execution)
+                .await?;
+            self.discard_brokered_execution_plan_stage(execution)
+                .await?;
+            super::release_plan_publication(&self.db, task, execution).await?;
+            return Ok(());
+        }
+        self.discard_brokered_execution_plan_stage(execution)
+            .await?;
+        if super::pending_plan_publication_cleanup_owner(task)?.as_deref()
+            == Some(execution.id.as_str())
+        {
+            super::clear_plan_publication_cleanup(&self.db, task, &execution.id).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn abandon_plan_publication_claim(
+        &self,
+        task: &Task,
+        execution_id: &str,
+    ) -> Result<()> {
+        if super::active_plan_publication_claim_owner(task)?.as_deref() != Some(execution_id) {
+            return Ok(());
+        }
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id).await?;
+        let workspace = match execution
+            .as_ref()
+            .and_then(|execution| execution.workspace_id.as_deref())
+        {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
+            None => {
+                let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+                WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?
+            }
+        };
+        if let Some(workspace) = workspace.as_ref() {
+            crate::plan_artifact::restore_plan_before_abandon(
+                std::path::Path::new(&workspace.worktree_path),
+                execution_id,
+            )
+            .map_err(|_| {
+                ServiceError::invalid_operation(
+                    "failed to restore the prior plan while abandoning an invalid publication claim",
+                )
+            })?;
+        }
+        super::cleanup_execution_plan_private_files(&self.db, task, execution_id).await?;
+        super::release_plan_publication_for_execution_id(&self.db, task, execution_id).await?;
+        Ok(())
+    }
+
+    async fn abandon_brokered_plan_if_project_authority_stale(
+        &self,
+        task_id: &str,
+        execution: &Execution,
+    ) -> Result<bool> {
+        let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+            self.discard_brokered_execution_plan_stage(execution)
+                .await?;
+            return Ok(true);
+        };
+        let Some(claim_project_version) =
+            super::plan_publication_project_version(&task, &execution.id)?
+        else {
+            return Ok(false);
+        };
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id).await?;
+        if project
+            .as_ref()
+            .is_some_and(|project| project.version == claim_project_version)
+        {
+            return Ok(false);
+        }
+        self.abandon_brokered_plan_authority(&task, execution)
+            .await?;
+        Ok(true)
+    }
+
+    async fn restore_brokered_execution_plan(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<()> {
+        if !super::execution_uses_brokered_plan(execution) {
+            return Ok(());
+        }
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
+            None => {
+                let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+                WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?
+            }
+        };
+        if let Some(workspace) = workspace {
+            crate::plan_artifact::restore_plan_before_abandon(
+                std::path::Path::new(&workspace.worktree_path),
+                &execution.id,
+            )
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "failed to restore the prior plan after losing publication authority: {error}"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     async fn handle_executor_completion_guard_rejection(
@@ -187,10 +793,25 @@ impl TaskService {
         guard: &str,
         reason: &str,
     ) -> Result<()> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(());
+        };
+        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+            return Ok(());
+        }
         if guard == "subtask_sequence_complete"
-            && super::super::subtask::coordination_root_has_subtasks(&self.db, task).await?
+            && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await?
         {
-            self.clear_workflow_guard_retry_metadata(&task.id).await?;
+            if !self
+                .clear_workflow_guard_retry_metadata_for_latest_execution(
+                    task,
+                    execution,
+                    project.version,
+                )
+                .await?
+            {
+                return Ok(());
+            }
             self.wake_next_ordered_subtask(
                 &task.id,
                 "coordination root is waiting for its next ordered subtask",
@@ -228,10 +849,11 @@ impl TaskService {
         }
 
         let now = now_rfc3339();
-        let updated_task = TaskRepo::mutate_metadata(
+        let Some(updated_task) = TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
             &*self.db,
             &task.id,
-            Some(task.version),
+            task.version,
+            super::latest_execution_authority(execution, project.version),
             vec![
                 db::TaskMetadataMutation::Increment {
                     key: "workflow_guard_retry_count".to_owned(),
@@ -249,10 +871,17 @@ impl TaskService {
                     key: "last_workflow_guard_reason".to_owned(),
                     value: Value::String(reason.to_owned()),
                 },
+                db::TaskMetadataMutation::Set {
+                    key: "last_workflow_guard_execution_id".to_owned(),
+                    value: Value::String(execution.id.clone()),
+                },
             ],
             &now,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
         let updated_metadata =
             TaskMetadata::parse(updated_task.metadata_json.as_deref()).map_err(|error| {
                 ServiceError::invalid_operation(format!(
@@ -374,6 +1003,12 @@ impl TaskService {
         guard: &str,
         reason: &str,
     ) -> Result<()> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(());
+        };
+        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+            return Ok(());
+        }
         let mut recovery_actions = vec![
             api_types::RecoveryAction::Reexecute,
             api_types::RecoveryAction::CancelTask,
@@ -413,7 +1048,7 @@ impl TaskService {
             "source": guard,
             "execution_id": execution.id,
         });
-        let updated = TaskRepo::update_status(
+        let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
             UpdateTaskStatus {
                 id: task.id.clone(),
@@ -425,8 +1060,12 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
+            super::latest_execution_authority(execution, project.version),
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         self.publish_domain_event_by_dedupe(&format!(
             "task-status-update:{}:{}",
@@ -449,10 +1088,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn clear_workflow_guard_retry_metadata(&self, task_id: &str) -> Result<()> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+    async fn clear_workflow_guard_retry_metadata(&self, task: &Task) -> Result<()> {
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "invalid task metadata for {}: {error}",
@@ -482,12 +1118,69 @@ impl TaskService {
                     db::TaskMetadataMutation::Remove {
                         key: "last_workflow_guard_reason".to_owned(),
                     },
+                    db::TaskMetadataMutation::Remove {
+                        key: "last_workflow_guard_execution_id".to_owned(),
+                    },
                 ],
             }],
             &now_rfc3339(),
         )
         .await?;
         Ok(())
+    }
+
+    async fn clear_workflow_guard_retry_metadata_for_latest_execution(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        project_version: i64,
+    ) -> Result<bool> {
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "invalid task metadata for {}: {error}",
+                task.id
+            ))
+        })?;
+        let mutations = metadata
+            .extra
+            .get("workflow_guard_retry_count")
+            .cloned()
+            .map(|expected_count| {
+                vec![db::TaskMetadataMutation::CompareAndMutate {
+                    key: "workflow_guard_retry_count".to_owned(),
+                    expected: expected_count,
+                    mutations: vec![
+                        db::TaskMetadataMutation::Remove {
+                            key: "workflow_guard_retry_count".to_owned(),
+                        },
+                        db::TaskMetadataMutation::Remove {
+                            key: "last_workflow_guard_rejection_at".to_owned(),
+                        },
+                        db::TaskMetadataMutation::Remove {
+                            key: "last_workflow_guard_name".to_owned(),
+                        },
+                        db::TaskMetadataMutation::Remove {
+                            key: "last_workflow_guard_reason".to_owned(),
+                        },
+                        db::TaskMetadataMutation::Remove {
+                            key: "last_workflow_guard_execution_id".to_owned(),
+                        },
+                    ],
+                }]
+            })
+            .unwrap_or_default();
+        Ok(
+            TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
+                &*self.db,
+                &task.id,
+                task.version,
+                super::latest_execution_authority(execution, project_version),
+                mutations,
+                &now_rfc3339(),
+            )
+            .await?
+            .is_some(),
+        )
     }
 
     pub(crate) async fn annotate_executor_failure_block(
@@ -523,6 +1216,9 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+            return Ok(());
+        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -532,17 +1228,46 @@ impl TaskService {
             return Ok(());
         }
 
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "invalid task metadata for {}: {error}",
+                task.id
+            ))
+        })?;
+
         if execution.role != "interactive" {
             if let Some(retry_at) = retry_at.as_deref() {
                 let dispatch_at = executor_unavailable_dispatch_time(retry_at, &task.id);
-                crate::deferred_dispatch::set(
-                    &self.db,
-                    &task,
-                    &task.status,
-                    &dispatch_at,
-                    "executor unavailable; retrying when usage recovers",
-                )
-                .await?;
+                let already_recorded = metadata
+                    .extra
+                    .get("executor_unavailable_execution_id")
+                    .and_then(Value::as_str)
+                    == Some(execution.id.as_str());
+                if already_recorded {
+                    if !self
+                        .latest_execution_authority_is_current(&task, execution, project.version)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                } else {
+                    if !crate::deferred_dispatch::set_with_mutations_for_latest_execution(
+                        &self.db,
+                        &task,
+                        super::latest_execution_authority(execution, project.version),
+                        &task.status,
+                        &dispatch_at,
+                        "executor unavailable; retrying when usage recovers",
+                        vec![db::TaskMetadataMutation::Set {
+                            key: "executor_unavailable_execution_id".to_owned(),
+                            value: Value::String(execution.id.clone()),
+                        }],
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
                 ExecutionRepo::update(
                     &*self.db,
                     db::UpdateExecution {
@@ -573,6 +1298,10 @@ impl TaskService {
                 );
                 return Ok(());
             }
+        }
+
+        if task_blocked_by_execution(&task, &execution.id) {
+            return Ok(());
         }
 
         let annotation = api_types::TaskBlockingAnnotation {
@@ -620,7 +1349,7 @@ impl TaskService {
             },
         });
 
-        let updated = TaskRepo::update_status(
+        let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
             UpdateTaskStatus {
                 id: task.id.clone(),
@@ -632,8 +1361,12 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
+            super::latest_execution_authority(execution, project.version),
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         self.publish_domain_event_by_dedupe(&format!(
             "task-status-update:{}:{}",
@@ -674,6 +1407,9 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+            return Ok(());
+        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -697,11 +1433,15 @@ impl TaskService {
         if !execution_still_owns_current_role {
             return Ok(());
         }
+        if task_blocked_by_execution(&task, &execution.id) {
+            return Ok(());
+        }
         if allow_retry
             && self
                 .maybe_schedule_execution_retry(
                     execution,
                     &task,
+                    project.version,
                     Some(&current_state.config),
                     current_state.gate_config.as_ref(),
                 )
@@ -719,6 +1459,12 @@ impl TaskService {
         task: &Task,
         execution: &Execution,
     ) -> Result<()> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(());
+        };
+        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+            return Ok(());
+        }
         let mut recovery_actions = vec![
             api_types::RecoveryAction::Reexecute,
             api_types::RecoveryAction::ResetToInitial,
@@ -769,7 +1515,7 @@ impl TaskService {
             "execution_id": execution.id,
         });
 
-        let updated = TaskRepo::update_status(
+        let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
             UpdateTaskStatus {
                 id: task.id.clone(),
@@ -781,8 +1527,12 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
+            super::latest_execution_authority(execution, project.version),
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
 
         self.publish_domain_event_by_dedupe(&format!(
             "task-status-update:{}:{}",
@@ -856,11 +1606,15 @@ impl TaskService {
         &self,
         execution: &Execution,
         task: &Task,
+        project_version: i64,
         state_config: Option<&Value>,
         gate_config: Option<&api_types::GateConfig>,
     ) -> Result<bool> {
         if execution.role == "interactive" {
             // Interactive runs are user-prompted and do not have a durable dispatcher target yet.
+            return Ok(false);
+        }
+        if super::super::execution_dispatch_project_version(execution) != Some(project_version) {
             return Ok(false);
         }
 
@@ -885,15 +1639,59 @@ impl TaskService {
             .get("execution_retry_count")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let already_recorded = metadata
+            .extra
+            .get("last_execution_failure_execution_id")
+            .and_then(Value::as_str)
+            == Some(execution.id.as_str());
+        if already_recorded {
+            if !self
+                .latest_execution_authority_is_current(task, execution, project_version)
+                .await?
+            {
+                return Ok(false);
+            }
+            ExecutionRepo::update(
+                &*self.db,
+                db::UpdateExecution {
+                    id: execution.id.clone(),
+                    status: None,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: Some(Some(db::ResumePolicy::Auto)),
+                    stopped_at: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+            return Ok(true);
+        }
         if retry_count >= budget as u64 {
             return Ok(false);
         }
 
         let now = now_rfc3339();
-        let task = TaskRepo::mutate_metadata(
-            &*self.db,
-            &task.id,
-            Some(task.version),
+        let attempt = retry_count + 1;
+        let delay_seconds = (10_u64
+            .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1) as u32)))
+        .min(300);
+        let next_dispatch_at = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
+        if !crate::deferred_dispatch::set_with_mutations_for_latest_execution(
+            &self.db,
+            task,
+            super::latest_execution_authority(execution, project_version),
+            &task.status,
+            &next_dispatch_at.to_rfc3339(),
+            &format!("execution retry (attempt {attempt})"),
             vec![
                 db::TaskMetadataMutation::Increment {
                     key: "execution_retry_count".to_owned(),
@@ -903,42 +1701,16 @@ impl TaskService {
                     key: "last_execution_failure_at".to_owned(),
                     value: Value::String(now.clone()),
                 },
+                db::TaskMetadataMutation::Set {
+                    key: "last_execution_failure_execution_id".to_owned(),
+                    value: Value::String(execution.id.clone()),
+                },
             ],
-            &now,
         )
-        .await?;
-        let updated_metadata =
-            TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "invalid task metadata for {}: {error}",
-                    task.id
-                ))
-            })?;
-        let attempt = updated_metadata
-            .extra
-            .get("execution_retry_count")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "execution retry counter missing for task {}",
-                    task.id
-                ))
-            })?;
-        if attempt > budget as u64 {
+        .await?
+        {
             return Ok(false);
         }
-        let delay_seconds = (10_u64
-            .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1) as u32)))
-        .min(300);
-        let next_dispatch_at = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
-        crate::deferred_dispatch::set(
-            &self.db,
-            &task,
-            &task.status,
-            &next_dispatch_at.to_rfc3339(),
-            &format!("execution retry (attempt {attempt})"),
-        )
-        .await?;
         ExecutionRepo::update(
             &*self.db,
             db::UpdateExecution {
@@ -985,6 +1757,26 @@ impl TaskService {
         Ok(true)
     }
 
+    async fn latest_execution_authority_is_current(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        project_version: i64,
+    ) -> Result<bool> {
+        Ok(
+            TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
+                &*self.db,
+                &task.id,
+                task.version,
+                super::latest_execution_authority(execution, project_version),
+                Vec::new(),
+                &now_rfc3339(),
+            )
+            .await?
+            .is_some(),
+        )
+    }
+
     async fn maybe_cascade_reviewer_completion(&self, execution: &Execution) -> Result<()> {
         let task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
             Some(task) => task,
@@ -1018,6 +1810,10 @@ impl TaskService {
                 "ignoring reviewer completion bound to a superseded review attempt"
             );
             return Ok(());
+        }
+        if execution.status == ExecutionStatus::Completed {
+            self.ingest_terminal_execution_outbox(&task, execution)
+                .await?;
         }
 
         // Reuse the exact Review attempt on duplicate terminal delivery. No
@@ -1284,6 +2080,7 @@ impl TaskService {
             hook: None,
             recovery_actions: vec![
                 api_types::RecoveryAction::Reexecute,
+                api_types::RecoveryAction::MarkReviewed,
                 api_types::RecoveryAction::OpenInteractive,
                 api_types::RecoveryAction::CancelTask,
             ],
@@ -1446,6 +2243,7 @@ impl TaskService {
             .maybe_schedule_execution_retry(
                 execution,
                 task,
+                project.version,
                 current_state.map(|state| &state.config),
                 current_state.and_then(|state| state.gate_config.as_ref()),
             )
@@ -1851,7 +2649,7 @@ impl TaskService {
         }
     }
 
-    async fn gate_requires_user_approval(&self, task: &Task) -> Result<bool> {
+    pub(crate) async fn gate_requires_user_approval(&self, task: &Task) -> Result<bool> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1931,9 +2729,28 @@ fn render_workflow_guard_follow_up_prompt(
     attempt: u64,
     budget: u64,
 ) -> String {
+    let checklist_instruction = if guard == "planning_plan_ready" {
+        "Write a valid Markdown checklist using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness."
+    } else {
+        "Make sure you complete all tasks and fix what is needed for this guard. Update completed checklist items to `- [x]` using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness; you do not need to commit if all implementation work is already complete."
+    };
     format!(
-        "Your previous execution completed, but Forge could not move the task to the next workflow state.\n\nWorkflow guard failed: {guard}\n\nFailure:\n{reason}\n\nMake sure you complete all tasks and Fix what is needed for this guard, update any completed checklist items to `- [x]`, you dont need to commit anything if all tasks are complete.\n\nRetry {attempt}/{budget}."
+        "Your previous execution completed, but Forge could not move the task to the next workflow state.\n\nWorkflow guard failed: {guard}\n\nFailure:\n{reason}\n\n{checklist_instruction}\n\nRetry {attempt}/{budget}."
     )
+}
+
+fn task_blocked_by_execution(task: &Task, execution_id: &str) -> bool {
+    task.blocked_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("execution_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(execution_id)
 }
 
 fn render_automatic_review_recovery_prompt(

@@ -19,14 +19,15 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
     AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, ApplyProjectReviewConfigCommand,
     CommandReceipt, CommandReceiptRepo, CreateAgentActionExecution, CreateCommandReceipt,
-    ProjectOrchestrationRepo, ProjectRepo, ProjectReviewConfigCommandRepo, SqliteDb, TaskRepo,
+    ProjectOrchestrationRepo, ProjectRepo, ProjectReviewConfigCommandRepo, SqliteDb, TaskBoardRepo,
+    TaskRepo,
 };
 use forge_agent_host::{
     is_allowed_project_direct_payload, is_project_orchestration_operation,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_CANCEL_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -140,6 +141,25 @@ impl ProjectOrchestrationActionService {
                 }
                 let mut current = CurrentVersionOrRevision::new("task", task.id);
                 current.version = Some(task.version);
+                Ok(Some(current))
+            }
+            // `task.adaptive` is guarded by both the source Task's version and
+            // the Project board revision; return both so the agent can retry
+            // instead of guessing the board revision.
+            TASK_ADAPTIVE_OPERATION => {
+                let Some(task_id) = payload.get("source_task_id").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+                    return Ok(None);
+                };
+                if task.project_id != project.id {
+                    return Ok(None);
+                }
+                let mut current = CurrentVersionOrRevision::new("task", task.id);
+                current.version = Some(task.version);
+                current.revision =
+                    Some(TaskBoardRepo::board_revision(&*self.db, &project.id).await?);
                 Ok(Some(current))
             }
             PROJECT_DOCUMENT_OPERATION => {

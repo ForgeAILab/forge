@@ -146,7 +146,7 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             vec![
                 "Reviewer boundary:",
                 "Must remain read-only",
-                "Must not edit files, stage changes, commit changes",
+                "do not edit, stage, or commit tracked files",
             ],
         ),
         (
@@ -187,6 +187,14 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
     for (builder_id, role, role_lines) in cases {
         let prompt = resolve_prompt_builder(builder_id).build(&fake_context(role));
 
+        if builder_id == BUILDER_ID_REVIEWER_CONFORMANCE_V1 {
+            // The reviewer answers with a result block; the taxonomy and
+            // restatement rules made reviewers invent extra keys and spend
+            // turns narrating instead of verifying.
+            assert!(!prompt.system.contains(FAILURE_TAXONOMY_LINE));
+            assert!(!prompt.system.contains("Before acting, restate objective"));
+            continue;
+        }
         assert!(
             prompt.system.contains(FAILURE_TAXONOMY_LINE),
             "{builder_id} missing failure taxonomy"
@@ -295,8 +303,11 @@ fn reviewer_base_prompt_defers_the_frozen_contract_to_launch() {
         .contains("Reviewer findings: Write findings in your Markdown review."));
     assert!(prompt
         .system
-        .contains("Each BLOCKING finding must include evidence"));
+        .contains("Each BLOCKING finding must be reproducible"));
     assert!(prompt.system.contains("expected vs actual behavior"));
+    assert!(prompt
+        .system
+        .contains("Decide whether the change works by exercising it"));
     assert!(prompt
         .system
         .contains("Separate NON-BLOCKING findings from BLOCKING findings."));
@@ -608,6 +619,73 @@ fn planner_prompt_includes_parent_task_context() {
     assert!(prompt
         .user
         .contains("Parent description for planning context."));
+}
+
+#[test]
+fn cli_plan_writers_use_the_brokered_plan_path() {
+    let mut planner = fake_context(default_roles::PLANNER);
+    planner.delivery = TaskDelivery::Outbox;
+    let planner_prompt = PlannerPromptBuilder.build(&planner);
+    assert!(planner_prompt.user.contains("$FORGE_PLAN_PATH"));
+    assert!(!planner_prompt.user.contains("`../plan.md`"));
+
+    let mut coder = fake_context(default_roles::CODER);
+    coder.delivery = TaskDelivery::Outbox;
+    let coder_prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&coder);
+    assert!(coder_prompt.system.contains("$FORGE_PLAN_PATH"));
+    assert!(coder_prompt.system.contains("Forge has copied"));
+
+    for builder_id in [
+        BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    ] {
+        let mut worker = fake_context(default_roles::WORKER);
+        worker.delivery = TaskDelivery::Outbox;
+        let worker_prompt = resolve_prompt_builder(builder_id).build(&worker);
+        assert!(
+            worker_prompt.system.contains("$FORGE_PLAN_PATH"),
+            "{builder_id} missing brokered plan path"
+        );
+        assert!(
+            worker_prompt.system.contains("entire checklist"),
+            "{builder_id} missing full-checklist contract"
+        );
+        assert!(
+            !worker_prompt.system.contains("typed `task.plan` operation"),
+            "{builder_id} names the unavailable native plan tool"
+        );
+    }
+}
+
+#[test]
+fn native_worker_plan_writers_use_the_typed_full_checklist_contract() {
+    for builder_id in [
+        BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    ] {
+        let worker_prompt =
+            resolve_prompt_builder(builder_id).build(&fake_context(default_roles::WORKER));
+        assert!(
+            worker_prompt.system.contains("typed `task.plan` operation"),
+            "{builder_id} missing native plan tool"
+        );
+        assert!(
+            worker_prompt
+                .system
+                .contains(r#"{"action":"write","content":"<full Markdown checklist>"}"#),
+            "{builder_id} missing write-full-checklist payload"
+        );
+        assert!(
+            worker_prompt.system.contains("entire checklist"),
+            "{builder_id} missing replacement semantics"
+        );
+        assert!(
+            !worker_prompt.system.contains("$FORGE_PLAN_PATH"),
+            "{builder_id} names the unavailable CLI plan path"
+        );
+    }
 }
 
 #[test]

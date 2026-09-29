@@ -28,14 +28,18 @@ impl ExecutionRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
+        let invalid_deadline = lease
+            .hard_deadline_at
+            .as_deref()
+            .is_some_and(|deadline| lease.lease_expires_at.as_str() > deadline);
         if input.status != ExecutionStatus::Running
             || lease.execution_id != input.id
             || lease.expected_version != 1
             || lease.owner.trim().is_empty()
-            || lease.lease_expires_at > lease.hard_deadline_at
+            || invalid_deadline
         {
             return Err(DbError::Check(
-                "initial execution lease must match a running execution and bounded owner claim"
+                "initial execution lease must match a running execution and valid owner claim"
                     .to_owned(),
             ));
         }
@@ -50,7 +54,7 @@ impl ExecutionRepo for SqliteDb {
         let result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
-                 lease_expires_at = MIN(?, ?),
+                 lease_expires_at = MIN(?, COALESCE(?, ?)),
                  hard_deadline_at = ?,
                  last_heartbeat_at = ?,
                  execution_version = execution_version + 1,
@@ -60,8 +64,9 @@ impl ExecutionRepo for SqliteDb {
         )
         .bind(&lease.owner)
         .bind(&lease.lease_expires_at)
-        .bind(&lease.hard_deadline_at)
-        .bind(&lease.hard_deadline_at)
+        .bind(lease.hard_deadline_at.as_deref())
+        .bind(&lease.lease_expires_at)
+        .bind(lease.hard_deadline_at.as_deref())
         .bind(&lease.now)
         .bind(&lease.now)
         .bind(&lease.execution_id)
@@ -544,17 +549,24 @@ impl ExecutionRepo for SqliteDb {
                 "execution lease claim requires a positive version and owner".to_owned(),
             ));
         }
-        if input.lease_expires_at > input.hard_deadline_at {
-            return Err(DbError::Check(
-                "execution lease expiry cannot exceed its hard deadline".to_owned(),
-            ));
+        if let Some(hard_deadline_at) = input.hard_deadline_at.as_deref() {
+            if input.lease_expires_at.as_str() > hard_deadline_at {
+                return Err(DbError::Check(
+                    "execution lease expiry cannot exceed its hard deadline".to_owned(),
+                ));
+            }
+            if hard_deadline_at <= input.now.as_str() {
+                return Err(DbError::Check(
+                    "execution hard deadline must be after the claim time".to_owned(),
+                ));
+            }
         }
 
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
-                 lease_expires_at = MIN(?, COALESCE(hard_deadline_at, ?)),
+                 lease_expires_at = MIN(?, COALESCE(hard_deadline_at, ?, ?)),
                  hard_deadline_at = COALESCE(hard_deadline_at, ?),
                  last_heartbeat_at = ?,
                  execution_version = execution_version + 1,
@@ -567,8 +579,9 @@ impl ExecutionRepo for SqliteDb {
         )
         .bind(&input.owner)
         .bind(&input.lease_expires_at)
-        .bind(&input.hard_deadline_at)
-        .bind(&input.hard_deadline_at)
+        .bind(input.hard_deadline_at.as_deref())
+        .bind(&input.lease_expires_at)
+        .bind(input.hard_deadline_at.as_deref())
         .bind(&input.now)
         .bind(&input.now)
         .bind(&input.execution_id)
@@ -580,7 +593,10 @@ impl ExecutionRepo for SqliteDb {
         if result.rows_affected() != 1 {
             let current = execution_in_tx(&mut transaction, &input.execution_id).await?;
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -620,7 +636,7 @@ impl ExecutionRepo for SqliteDb {
                AND execution_version = ?
                AND lease_owner = ?
                AND lease_expires_at > ?
-               AND hard_deadline_at > ?",
+               AND (hard_deadline_at IS NULL OR hard_deadline_at > ?)",
         )
         .bind(&input.lease_expires_at)
         .bind(&input.lease_expires_at)
@@ -636,7 +652,10 @@ impl ExecutionRepo for SqliteDb {
         if result.rows_affected() != 1 {
             let current = execution_in_tx(&mut transaction, &input.execution_id).await?;
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -675,11 +694,14 @@ impl ExecutionRepo for SqliteDb {
                 && execution
                     .hard_deadline_at
                     .as_deref()
-                    .is_some_and(|deadline| deadline > input.now.as_str())
+                    .is_none_or(|deadline| deadline > input.now.as_str())
         });
         if !eligible {
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -713,7 +735,7 @@ impl ExecutionRepo for SqliteDb {
                AND execution_version = ?
                AND lease_owner = ?
                AND lease_expires_at > ?
-               AND hard_deadline_at > ?",
+               AND (hard_deadline_at IS NULL OR hard_deadline_at > ?)",
         )
         .bind(&input.progress_at)
         .bind(&input.now)
@@ -727,7 +749,10 @@ impl ExecutionRepo for SqliteDb {
         if result.rows_affected() != 1 {
             let current = execution_in_tx(&mut transaction, &input.execution_id).await?;
             let outcome = if current.as_ref().is_some_and(|execution| {
-                execution.hard_deadline_at.as_deref() <= Some(input.now.as_str())
+                execution
+                    .hard_deadline_at
+                    .as_deref()
+                    .is_some_and(|deadline| deadline <= input.now.as_str())
             }) {
                 ExecutionLeaseMutation::HardDeadline { current }
             } else {
@@ -826,7 +851,7 @@ impl ExecutionRepo for SqliteDb {
                 && execution
                     .hard_deadline_at
                     .as_deref()
-                    .is_some_and(|deadline| deadline > input.now.as_str())
+                    .is_none_or(|deadline| deadline > input.now.as_str())
                 && match (
                     execution.last_progress_at.as_deref(),
                     input.expected_last_progress_at.as_deref(),
@@ -1259,10 +1284,10 @@ impl ExecutionRepo for SqliteDb {
                 query.push_bind(&terminal.updated_at);
                 query.push(")");
                 query.push(
-                    " AND hard_deadline_at IS NOT NULL AND julianday(hard_deadline_at) > julianday(",
+                    " AND (hard_deadline_at IS NULL OR julianday(hard_deadline_at) > julianday(",
                 );
                 query.push_bind(&terminal.updated_at);
-                query.push(")");
+                query.push("))");
             }
         }
 
@@ -1815,7 +1840,7 @@ impl ExecutionRepo for SqliteDb {
              WHERE status = 'running'
                AND lease_owner IS NOT NULL
                AND lease_expires_at > ?
-               AND hard_deadline_at > ?
+               AND (hard_deadline_at IS NULL OR hard_deadline_at > ?)
                AND (
                     (last_progress_at IS NULL AND created_at < ?)
                     OR (last_progress_at IS NOT NULL AND last_progress_at < ?)

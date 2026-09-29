@@ -129,6 +129,7 @@ impl HookAction for RunMerge {
             Ok(MergeOutcome::Conflict {
                 details,
                 conflict_paths,
+                target_branch,
             }) => {
                 let conflict_summary = if conflict_paths.is_empty() {
                     "unknown".to_string()
@@ -173,11 +174,53 @@ impl HookAction for RunMerge {
                         reason: details.clone(),
                     },
                 });
-                merge_failure_result(
+                // A conflict is the Worker's to reconcile, not a human's: the
+                // candidate is rebased onto the target and any conflict is
+                // committed with markers and handed back, exactly as when the
+                // target moves under an agent-reviewed candidate. A merge-fix
+                // budget of 0 opts the Project out of automatic merge repair.
+                match runtime_retry_budget(
+                    &task,
+                    RetryBudgetKind::MergeFix,
+                    Some(&ctx.state_config),
+                    ctx.gate_config.as_ref(),
+                ) {
+                    Ok(0) => {
+                        return merge_failure_result(
+                            ctx,
+                            &task,
+                            format!("merge conflict: {details}"),
+                            api_types::FailureKind::MergeConflict,
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+                if let Err(error) = db::TaskRepo::set_review_passed_at_cas(
+                    &*ctx.db,
+                    &task.id,
+                    task.version,
+                    None,
+                    &db::now_rfc3339(),
+                )
+                .await
+                .map(|updated| {
+                    task = updated;
+                }) {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                target_moved_result(
                     ctx,
                     &task,
-                    format!("merge conflict: {details}"),
-                    api_types::FailureKind::MergeConflict,
+                    &format!("merge into {target_branch} conflicted on {conflict_summary}"),
+                    &target_branch,
                 )
                 .await
             }
@@ -456,7 +499,7 @@ pub(super) async fn target_moved_result(
         Err(git::GitError::MergeConflict { stderr, .. }) => {
             // Coordination roots aggregate subtask branches and keep the
             // manual-repair path; everything else goes back to its Worker.
-            match crate::task_service::coordination_root_has_subtasks(&ctx.db, task).await {
+            match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
                 Ok(false) => {}
                 Ok(true) => {
                     let _ = git::abort_rebase(worktree_path).await;
@@ -632,7 +675,7 @@ pub(super) async fn merge_failure_result(
         }
     }
 
-    match crate::task_service::coordination_root_has_subtasks(&ctx.db, &task).await {
+    match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &task).await {
         Ok(true) => {
             let block_reason = format!(
                 "coordination root requires manual workspace repair before integration can continue: {reason}"

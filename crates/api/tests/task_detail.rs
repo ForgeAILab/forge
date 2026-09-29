@@ -2,8 +2,8 @@
 mod common;
 
 use api_types::{
-    ExecutionResponse, PaginatedResponse, ProjectResponse, TaskDetailResponse,
-    TaskRelationsResponse, TaskResponse,
+    ExecutionResponse, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse,
+    TaskDetailResponse, TaskRelationsResponse, TaskResponse,
 };
 use axum::http::{Method, StatusCode};
 use db::{CreateExecution, ExecutionRepo, ExecutionStatus, TaskDependencyRepo};
@@ -52,6 +52,19 @@ async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {
         create_completed_execution(&harness.state.db, &task.id, "2026-09-21T00:00:00Z").await;
     let newer =
         create_completed_execution(&harness.state.db, &task.id, "2026-09-22T00:00:00Z").await;
+    let oversized_summary = "界".repeat(600);
+    sqlx::query(
+        "UPDATE execution SET prompt = ?, summary = ?, executor_config_snapshot_json = ? WHERE id = ?",
+    )
+    .bind("large private prompt")
+    .bind(&oversized_summary)
+    .bind(
+        r#"{"executor_type":"codex","config":{"resume_thread_in_place":true,"private":"large config"}}"#,
+    )
+    .bind(&newer.id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("newer execution carries full-only fields");
 
     let standalone_task: TaskResponse = common::empty_request(
         &harness.app,
@@ -70,7 +83,7 @@ async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {
         StatusCode::OK,
     )
     .await;
-    let executions: PaginatedResponse<ExecutionResponse> = common::empty_request(
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = common::empty_request(
         &harness.app,
         Method::GET,
         &format!(
@@ -106,6 +119,64 @@ async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {
     assert_eq!(detail.executions.next_cursor, executions.next_cursor);
     assert_eq!(detail.executions.total_count, executions.total_count);
     assert_ne!(detail.executions.items[0].id, older.id);
+    assert!(detail.executions.items[0].is_resume);
+    assert_eq!(
+        detail.executions.items[0]
+            .summary
+            .as_deref()
+            .expect("summary preview")
+            .chars()
+            .count(),
+        500
+    );
+
+    let raw_page: serde_json::Value = common::parse_response(
+        common::raw_empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}/executions?limit=1", task.id),
+        )
+        .await,
+        StatusCode::OK,
+    )
+    .await;
+    let raw_item = &raw_page["items"][0];
+    for full_only_field in [
+        "prompt",
+        "executor_config_snapshot",
+        "usage",
+        "logs_path",
+        "error",
+        "lease_owner",
+        "last_progress_at",
+    ] {
+        assert!(
+            raw_item.get(full_only_field).is_none(),
+            "collection item must omit {full_only_field}"
+        );
+    }
+
+    let full_execution: ExecutionResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/executions/{}", newer.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        full_execution.prompt.as_deref(),
+        Some("large private prompt")
+    );
+    assert_eq!(
+        full_execution
+            .summary
+            .as_deref()
+            .expect("full summary")
+            .chars()
+            .count(),
+        600
+    );
+    assert!(full_execution.executor_config_snapshot.is_some());
 }
 
 #[tokio::test]

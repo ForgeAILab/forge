@@ -7,9 +7,9 @@ use crate::{
     CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
     CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
     CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
-    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace,
-    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
-    ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog,
+    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
+    DomainEventRepo, ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, MemoryAccessQuery,
     MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
     MemorySourceType, MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery,
@@ -19,9 +19,10 @@ use crate::{
     RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo, SortBy, SortOrder,
     SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
-    UpdateAgent, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
-    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TransitionLogRepo, UpdateAgent, UpdateExecution, UpdateProject,
+    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
@@ -245,7 +246,7 @@ fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
         expected_version: 1,
         owner: format!("dispatch-pending:{execution_id}"),
         lease_expires_at: now.to_owned(),
-        hard_deadline_at: "2099-01-01T00:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T00:00:00Z".to_owned()),
         now: now.to_owned(),
     }
 }
@@ -3436,7 +3437,7 @@ async fn running_execution_creation_is_rejected_after_project_pause() {
             expected_version: 1,
             owner: "embedded:paused-test".to_owned(),
             lease_expires_at: "2026-09-11T19:26:16Z".to_owned(),
-            hard_deadline_at: "2026-09-11T20:25:46Z".to_owned(),
+            hard_deadline_at: Some("2026-09-11T20:25:46Z".to_owned()),
             now: now.to_owned(),
         },
     )
@@ -3503,7 +3504,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         expected_version: 1,
         owner: "embedded:admission-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let occupant = new_uuid_v4();
@@ -3674,6 +3675,176 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
             execution_id,
         }) if scope == "interactive" && execution_id == interactive_occupant
     ));
+}
+
+#[tokio::test]
+async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "State-entry-scoped plan publication claim",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let agent = AgentRepo::get_by_id(&db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+
+    let claimed_entry_id = new_uuid_v4();
+    TransitionLogRepo::insert(
+        &db,
+        CreateTransitionLog {
+            id: claimed_entry_id.clone(),
+            task_id: task_id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:test".to_owned(),
+            trigger_reason: "first entry".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("claimed state entry records");
+    sqlx::query(
+        "UPDATE task
+         SET metadata_json = ?, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(
+        serde_json::json!({
+            "plan_publication_claim": {
+                "execution_id": new_uuid_v4(),
+                "state": "in_progress",
+                "state_entry_token": claimed_entry_id,
+                "project_version": project.version,
+            }
+        })
+        .to_string(),
+    )
+    .bind(now_rfc3339())
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("plan publication claim records");
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let now = now_rfc3339();
+    let make_execution = |id: String| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:state-entry-claim-test".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
+        now: now.clone(),
+    };
+    let make_admission = || ExecutionAdmission {
+        expected_project_version: Some(project.version),
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(agent.max_concurrent_tasks),
+        expected_agent_version: Some(agent.version),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(assignment.id.clone()),
+        expected_assignment_updated_at: Some(assignment.updated_at.clone()),
+        expected_workflow_definition: Some(project.workflow_definition.clone()),
+    };
+
+    let blocked_id = new_uuid_v4();
+    let blocked = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(blocked_id.clone()),
+        make_lease(blocked_id.clone()),
+        Some(make_admission()),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(DbError::VersionConflict)),
+        "a claim for the current state entry must block admission: {blocked:?}"
+    );
+    assert!(ExecutionRepo::get_by_id(&db, &blocked_id)
+        .await
+        .expect("blocked execution lookup succeeds")
+        .is_none());
+
+    TransitionLogRepo::insert(
+        &db,
+        CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:test".to_owned(),
+            trigger_reason: "later re-entry".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:01Z".to_owned(),
+        },
+    )
+    .await
+    .expect("later same-state entry records");
+
+    let admitted_id = new_uuid_v4();
+    let admitted = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(admitted_id.clone()),
+        make_lease(admitted_id.clone()),
+        Some(make_admission()),
+    )
+    .await
+    .expect("claim from an older entry no longer blocks admission");
+    assert_eq!(admitted.id, admitted_id);
 }
 
 #[tokio::test]
@@ -3877,7 +4048,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             expected_version: 1,
             owner: "embedded:agent-profile-admission-test".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
@@ -4046,7 +4217,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
 
@@ -4280,7 +4451,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-1".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     ExecutionRepo::create_with_lease_and_admission(
@@ -4321,7 +4492,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-replacement".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut replacement_admission = make_admission(Some(first_parent_id.clone()));
@@ -4360,7 +4531,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-auditor".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut auditor_execution = make_execution(
@@ -4404,7 +4575,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-auditor-live-retry".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some({
@@ -4449,7 +4620,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-auditor-retry".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(auditor_retry_admission),
@@ -4517,7 +4688,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:review-admission-terminal-review".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(terminal_admission),
@@ -4534,7 +4705,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
         expected_version: 1,
         owner: "embedded:review-admission-2".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let mut stale_execution =
@@ -4597,7 +4768,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:failed-candidate-binding".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.clone(),
         },
         Some(failed_binding_admission),
@@ -4631,7 +4802,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
             expected_version: 1,
             owner: "embedded:failed-candidate-review".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now,
         },
         None,
@@ -4747,7 +4918,7 @@ async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unr
         expected_version: 1,
         owner: "embedded:root-review-candidate".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
 
@@ -5105,7 +5276,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         expected_version: 1,
         owner: "embedded:admission-edge-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
@@ -5298,7 +5469,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let first_id = new_uuid_v4();
@@ -5454,7 +5625,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_version: 1,
         owner: owner.to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.clone(),
     };
     let first_id = new_uuid_v4();
@@ -5612,7 +5783,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             expected_version: 1,
             owner: "embedded:test-owner".to_owned(),
             lease_expires_at: "2026-08-21T00:00:30Z".to_owned(),
-            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2026-08-21T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
     )
@@ -5631,7 +5802,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             expected_version: claimed.execution_version,
             owner: "remote:competing-owner".to_owned(),
             lease_expires_at: "2026-08-21T00:00:40Z".to_owned(),
-            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2026-08-21T01:00:00Z".to_owned()),
             now: "2026-08-21T00:00:10Z".to_owned(),
         },
     )
@@ -8105,7 +8276,7 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         expected_version: 1,
         owner: "embedded:daemon-cap-test".to_owned(),
         lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
         now: now.to_owned(),
     };
     let first_id = new_uuid_v4();
@@ -8183,7 +8354,7 @@ async fn paused_agent_is_rejected_at_running_execution_insert() {
             expected_version: 1,
             owner: "embedded:paused-agent-test".to_owned(),
             lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
-            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
             now: now.to_owned(),
         },
     )
@@ -10341,4 +10512,120 @@ async fn project_delete_survives_immutable_rows_that_reference_a_sibling() {
             .unwrap_or_else(|error| panic!("{table} count: {error}"));
         assert_eq!(count, 0, "{table} row survived Project teardown");
     }
+}
+
+/// Unbounded executions (the default since Task runs lost their implicit wall
+/// clock) carry no `hard_deadline_at`. Progress must still commit — a NULL
+/// deadline failed the SQL guard and `None <= Some(now)` then misreported it
+/// as a reached deadline, so every remote log/progress update was rejected —
+/// and a stalled unbounded run must still be able to raise a warning.
+#[tokio::test]
+async fn unbounded_execution_records_progress_and_progress_warnings() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Unbounded execution progress",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let execution_id = new_uuid_v4();
+    let now = "2026-08-21T00:00:00Z";
+    let claimed = ExecutionRepo::create_with_lease(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "remote:unbounded-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:30Z".to_owned(),
+            hard_deadline_at: None,
+            now: now.to_owned(),
+        },
+    )
+    .await
+    .expect("unbounded lease claim commits");
+    assert_eq!(claimed.hard_deadline_at, None);
+
+    let progressed = match ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:05Z".to_owned(),
+            now: "2026-08-21T00:00:05Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress call succeeds")
+    {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("an unbounded execution must accept progress: {other:?}"),
+    };
+    assert_eq!(
+        progressed.last_progress_at.as_deref(),
+        Some("2026-08-21T00:00:05Z")
+    );
+
+    let stale = ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:06Z".to_owned(),
+            now: "2026-08-21T00:00:06Z".to_owned(),
+        },
+    )
+    .await
+    .expect("stale progress call succeeds");
+    assert!(
+        matches!(stale, ExecutionLeaseMutation::Concurrent { .. }),
+        "a stale version is a concurrent write, not a reached deadline: {stale:?}"
+    );
+
+    let warning = ExecutionRepo::record_progress_warning(
+        &db,
+        crate::RecordExecutionProgressWarning {
+            execution_id: execution_id.clone(),
+            expected_version: progressed.execution_version,
+            owner: "remote:unbounded-owner".to_owned(),
+            expected_last_progress_at: progressed.last_progress_at.clone(),
+            stale_before: "2026-08-21T00:00:10Z".to_owned(),
+            now: "2026-08-21T00:00:20Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress warning call succeeds");
+    assert!(
+        matches!(warning, ExecutionProgressWarningOutcome::Committed { .. }),
+        "a stalled unbounded execution must raise a warning: {warning:?}"
+    );
 }

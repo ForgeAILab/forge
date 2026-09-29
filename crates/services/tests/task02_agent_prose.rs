@@ -24,6 +24,7 @@ const AGENT_ID: &str = "task02-prose-project-agent";
 const PROFILE_ID: &str = "task02-prose-project-agent-profile";
 const PROJECT_ID: &str = "task02-prose-project";
 const TASK_ID: &str = "task02-prose-task";
+const RUNTIME_SESSION_ID: &str = "task02-prose-runtime-session";
 const NOW: &str = "2026-08-21T00:00:00.000Z";
 const CLAIM: &str =
     "I edited the repository, tested it, merged the change, deployed it, and validated the result.";
@@ -344,6 +345,7 @@ async fn project_agent_prose_stays_pending_and_reads_are_sanitized() {
         .propose(
             AGENT_ID,
             &fixture.scope,
+            RUNTIME_SESSION_ID,
             "message.send",
             proposal_arguments(claim_prose_payload(), "task02-message-claim"),
         )
@@ -362,6 +364,7 @@ async fn project_agent_prose_stays_pending_and_reads_are_sanitized() {
         .propose(
             AGENT_ID,
             &fixture.scope,
+            RUNTIME_SESSION_ID,
             "review.request",
             proposal_arguments(
                 json!({
@@ -403,6 +406,7 @@ async fn project_agent_prose_stays_pending_and_reads_are_sanitized() {
         .propose(
             AGENT_ID,
             &fixture.scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             proposal_arguments(
                 json!({

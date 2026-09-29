@@ -35,6 +35,7 @@ const TASK_CHARTER_ID: &str = "direct-classification-task-charter";
 const TASK_CHARTER_REVISION_ID: &str = "direct-classification-task-charter-revision";
 const MILESTONE_ID: &str = "direct-classification-milestone";
 const MILESTONE_REVISION_ID: &str = "direct-classification-milestone-revision";
+const RUNTIME_SESSION_ID: &str = "direct-classification-runtime-session";
 const NOW: &str = "2026-08-21T00:00:00.000Z";
 
 struct Fixture {
@@ -519,6 +520,7 @@ async fn named_native_operations_return_stable_success_envelopes() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             direct_arguments.clone(),
         )
@@ -540,6 +542,7 @@ async fn named_native_operations_return_stable_success_envelopes() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             "project.release.request",
             approval_arguments.clone(),
         )
@@ -692,6 +695,7 @@ async fn allowed_project_write_and_task_proposal_use_direct_receipts_without_act
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             document_arguments("direct-document-key"),
         )
@@ -764,6 +768,7 @@ async fn allowed_project_write_and_task_proposal_use_direct_receipts_without_act
         .propose(
             AGENT_ID,
             &fixture.task_project_scope,
+            RUNTIME_SESSION_ID,
             "task.propose",
             task_arguments("direct-task-key"),
         )
@@ -834,6 +839,7 @@ async fn direct_command_retry_returns_frozen_result_without_duplicate_effect() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             document_arguments("direct-replay-key"),
         )
@@ -873,6 +879,7 @@ async fn direct_command_retry_returns_frozen_result_without_duplicate_effect() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             document_arguments("direct-replay-key"),
         )
@@ -928,6 +935,7 @@ async fn approval_required_release_candidate_stays_pending_without_domain_result
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             "project.release.request",
             approval_required_release_arguments("approval-required-release-key"),
         )
@@ -1015,6 +1023,7 @@ async fn denied_operation_is_not_admitted_and_cannot_mutate() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             document_arguments("denied-document-key"),
         )
@@ -1079,6 +1088,7 @@ async fn authorized_stale_milestone_returns_typed_version_correction() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_MILESTONE_OPERATION,
             arguments.clone(),
         )
@@ -1126,6 +1136,7 @@ async fn idempotency_mismatch_has_no_current_state_disclosure() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             first_arguments,
         )
@@ -1139,6 +1150,7 @@ async fn idempotency_mismatch_has_no_current_state_disclosure() {
         .propose(
             AGENT_ID,
             &fixture.project_scope,
+            RUNTIME_SESSION_ID,
             PROJECT_DOCUMENT_OPERATION,
             changed_arguments,
         )

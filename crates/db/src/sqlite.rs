@@ -36,11 +36,12 @@ use crate::{
     EventConsumerCutover, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome,
     ExecutionTerminalReceipt, ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn,
-    FailAgentChatTurnWithUsage, IntegrationRepo, MarkUsageInvocationPendingSettlement, MediaAsset,
-    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, ParkAgentChatTurn,
-    ParkAgentChatTurnWithUsage, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo,
-    Project, ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo, ProjectAgentBinding,
-    ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectBindingCommandRepo, ProjectDeletionPaths,
+    FailAgentChatTurnWithUsage, IntegrationRepo, LatestExecutionAuthority,
+    MarkUsageInvocationPendingSettlement, MediaAsset, Notification, NotificationListQuery,
+    NotificationRepo, Page, PageRequest, ParkAgentChatTurn, ParkAgentChatTurnWithUsage, PrMetadata,
+    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAdmissionReceipt,
+    ProjectAdmissionReceiptRepo, ProjectAgentBinding, ProjectAgentBindingRepo,
+    ProjectAnalyticsRepo, ProjectBindingCommandRepo, ProjectDeletionPaths,
     ProjectDeletionRepositoryPath, ProjectExecutionSetupCommandRepo, ProjectHookRun,
     ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment,
     ProjectMediaTombstone, ProjectProvisioningCheckpoint, ProjectProvisioningError,
@@ -1023,7 +1024,8 @@ impl SqliteDb {
     ) -> Result<()> {
         let task_id = &input.task_id;
         let row = sqlx::query(
-            "SELECT t.version, t.status, t.parent_task_id, p.version AS project_version,
+            "SELECT t.version, t.status, t.parent_task_id, t.metadata_json,
+                    p.version AS project_version,
                     p.workflow_definition
              FROM task AS t
              JOIN project AS p ON p.id = t.project_id
@@ -1039,6 +1041,34 @@ impl SqliteDb {
             || actual_status != admission.expected_task_status
         {
             return Err(DbError::VersionConflict);
+        }
+        let metadata_json: Option<String> = row.try_get("metadata_json")?;
+        let metadata = TaskMetadata::parse(metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if let Some(claim) = metadata.extra.get("plan_publication_claim") {
+            let claim_state = claim
+                .get("state")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(DbError::VersionConflict)?;
+            let claim_state_entry_token = match claim.get("state_entry_token") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(token)) if !token.is_empty() => Some(token.as_str()),
+                _ => return Err(DbError::VersionConflict),
+            };
+            if claim_state == actual_status {
+                let current_state_entry_token = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM transition_log
+                     WHERE task_id = ? AND to_state = ?
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                )
+                .bind(task_id)
+                .bind(&actual_status)
+                .fetch_optional(&mut **transaction)
+                .await?;
+                if claim_state_entry_token == current_state_entry_token.as_deref() {
+                    return Err(DbError::VersionConflict);
+                }
+            }
         }
         if let Some(expected_project_version) = admission.expected_project_version {
             let actual_project_version: i64 = row.try_get("project_version")?;
