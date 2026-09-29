@@ -2040,6 +2040,16 @@ mod tests {
         agent_session_id: Option<String>,
         workspace_id: Option<String>,
     ) -> db::Execution {
+        let project_version: i64 = sqlx::query_scalar(
+            "SELECT project.version
+             FROM project
+             JOIN task ON task.project_id = project.id
+             WHERE task.id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("execution Project version loads");
         let now = now_rfc3339();
         ExecutionRepo::create(
             db,
@@ -2063,7 +2073,12 @@ mod tests {
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: Some(
-                    r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                    json!({
+                        "executor_type": "shell",
+                        "config": {},
+                        "project_version": project_version,
+                    })
+                    .to_string(),
                 ),
                 workspace_id,
                 created_at: now.clone(),
@@ -2656,6 +2671,21 @@ mod tests {
             Some(agent_id.clone()),
         )
         .await;
+        let assignment_now = now_rfc3339();
+        TaskRoleAssignmentRepo::assign(
+            &*db,
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: default_roles::REVIEWER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(agent_id.clone()),
+                created_at: assignment_now.clone(),
+                updated_at: assignment_now,
+            },
+        )
+        .await
+        .expect("reviewer role assignment creates");
         sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
             .bind(r#"{"retry_budgets":{"execution":3}}"#)
             .bind(r#"{"execution_retry_count":0}"#)

@@ -763,17 +763,6 @@ impl WorkflowEngine {
         }
 
         if cascade.is_none() {
-            let cleared_at = now_rfc3339();
-            task = TaskRepo::set_entry_barrier_with_workflow_authority(
-                &*self.db,
-                task_id,
-                task.version,
-                None,
-                &cleared_at,
-                authority.project_version,
-                authority.workflow_definition.clone(),
-            )
-            .await?;
             task = TaskRepo::update_with_workflow_authority(
                 &*self.db,
                 UpdateTask {
@@ -813,6 +802,20 @@ impl WorkflowEngine {
                     break;
                 }
             }
+        }
+
+        if cascade.is_none() {
+            let cleared_at = now_rfc3339();
+            task = TaskRepo::set_entry_barrier_with_workflow_authority(
+                &*self.db,
+                task_id,
+                task.version,
+                None,
+                &cleared_at,
+                authority.project_version,
+                authority.workflow_definition.clone(),
+            )
+            .await?;
         }
 
         if cascade.is_none() {
@@ -1834,8 +1837,6 @@ impl WorkflowEngine {
             }
 
             if board_move_outcome.is_none() && cascade.is_none() && !review_refresh_bridge {
-                let mut before_enter_blocked = false;
-                let mut before_enter_barrier_resolved = false;
                 for hook in &to_state.hooks.before_enter {
                     if !hook_audience_matches(hook.applies_to, &actor) {
                         log_hook_skipped_by_audience(
@@ -1938,7 +1939,6 @@ impl WorkflowEngine {
                                                 authority.as_ref(),
                                             )
                                             .await?;
-                                            before_enter_blocked = true;
                                             skip_target_enter_hooks = true;
                                         } else {
                                             let clear_updated_at = now_rfc3339();
@@ -1950,7 +1950,6 @@ impl WorkflowEngine {
                                                 authority.as_ref(),
                                             )
                                             .await?;
-                                            before_enter_barrier_resolved = true;
                                             before_enter_rejection_cascade = true;
                                             cascade = Some((reject_target, error));
                                         }
@@ -1972,7 +1971,6 @@ impl WorkflowEngine {
                                             authority.as_ref(),
                                         )
                                         .await?;
-                                        before_enter_blocked = true;
                                         skip_target_enter_hooks = true;
                                     }
                                 } else {
@@ -1993,7 +1991,6 @@ impl WorkflowEngine {
                                         authority.as_ref(),
                                     )
                                     .await?;
-                                    before_enter_blocked = true;
                                     skip_target_enter_hooks = true;
                                 }
                                 break;
@@ -2008,24 +2005,6 @@ impl WorkflowEngine {
                         }
                         HookResult::Ok | HookResult::Skipped { .. } => {}
                     }
-                }
-
-                if has_blocking_before_enter
-                    && !before_enter_blocked
-                    && !before_enter_barrier_resolved
-                {
-                    let clear_updated_at = now_rfc3339();
-                    let cleared_task = self.set_entry_barrier_with_authority(
-                        &task_id,
-                        task.version,
-                        None,
-                        &clear_updated_at,
-                        authority.as_ref(),
-                    )
-                    .await?;
-                    task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", cleared_task.id))?;
                 }
             }
 
@@ -2225,6 +2204,30 @@ impl WorkflowEngine {
                         HookResult::Skipped { .. } => {}
                     }
                 }
+            }
+
+            // Keep the entry barrier through target-state dispatch. The
+            // periodic dispatcher treats a running barrier as authoritative,
+            // so clearing it before `on_enter` creates a window where it can
+            // launch a fresh execution before an inline continuation dispatch
+            // (for example ResumeLatestTargetRoleThread) has claimed the role.
+            // Cascades retain the barrier until their transition replaces it;
+            // blocked entry hooks retain their explicit blocked barrier.
+            if has_blocking_before_enter
+                && cascade.is_none()
+                && !skip_target_enter_hooks
+                && task.entry_barrier_is_running()
+            {
+                let clear_updated_at = now_rfc3339();
+                task = self
+                    .set_entry_barrier_with_authority(
+                        &task_id,
+                        task.version,
+                        None,
+                        &clear_updated_at,
+                        authority.as_ref(),
+                    )
+                    .await?;
             }
 
             if cascade.is_none() && !skip_target_enter_hooks {

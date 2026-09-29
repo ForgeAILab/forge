@@ -89,6 +89,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   plan. Managed Codex cannot write the surrounding Task directory; direct
   sibling writes by less-confined CLI adapters remain outside the supported
   contract.
+- Concurrent terminal executions for one Task no longer lose the later
+  workflow cascade. Forge serializes their settlement and keeps a target
+  state's entry barrier active through inline dispatch, so a periodic scan
+  cannot steal a rejected review's worker continuation or discard a fast
+  reviewer completion.
 - Interactive password input now disables terminal echo before displaying the
   prompt, closing a scheduling race that could echo a fast response into the
   terminal transcript.

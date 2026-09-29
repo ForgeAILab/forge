@@ -9,6 +9,7 @@ const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review r
 /// plan snapshots before only one workflow transition wins its CAS.
 pub(crate) struct CompletionCascadeSlot {
     in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
+    released: Arc<tokio::sync::Notify>,
     task_id: String,
 }
 
@@ -18,6 +19,7 @@ impl Drop for CompletionCascadeSlot {
             .lock()
             .expect("completion cascade set lock")
             .remove(&self.task_id);
+        self.released.notify_waiters();
     }
 }
 
@@ -25,22 +27,33 @@ impl TaskService {
     /// Settle one terminal execution. The inline completion path and the
     /// dispatcher's reconciliation of terminal executions both call this, and
     /// a reviewer's cascade can run for seconds (the clean-checkout setup and
-    /// checks). A second caller that arrives meanwhile returns at once: the
-    /// cascade in flight settles the execution, and running it twice spent
-    /// the retry budget twice and re-froze the review assessment.
+    /// checks). A second caller for the same Task waits for that cascade, then
+    /// retries against current authority. This keeps duplicate delivery
+    /// idempotent without dropping a successor role's terminal completion.
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
             return Ok(());
         };
-        let Some(_slot) = self.claim_completion_cascade(&execution.task_id) else {
+
+        loop {
+            // Register before checking the slot. Otherwise its owner could
+            // release and notify between a failed claim and `notified()`,
+            // leaving this terminal completion asleep forever.
+            let released = self.completion_cascade_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+
+            if let Some(_slot) = self.claim_completion_cascade(&execution.task_id) {
+                return self.cascade_executor_completion(execution_id).await;
+            }
+
             tracing::debug!(
                 execution_id,
                 task_id = %execution.task_id,
-                "Task completion cascade already in flight; leaving it to the running one"
+                "Task completion cascade already in flight; waiting to retry"
             );
-            return Ok(());
-        };
-        self.cascade_executor_completion(execution_id).await
+            released.await;
+        }
     }
 
     pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
@@ -50,6 +63,7 @@ impl TaskService {
             .insert(task_id.to_owned())
             .then(|| CompletionCascadeSlot {
                 in_flight: Arc::clone(&self.completion_cascades),
+                released: Arc::clone(&self.completion_cascade_released),
                 task_id: task_id.to_owned(),
             })
     }

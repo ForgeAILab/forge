@@ -7,9 +7,9 @@ use crate::{
     CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
     CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
     CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
-    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace,
-    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
-    ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog,
+    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
+    DomainEventRepo, ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, MemoryAccessQuery,
     MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
     MemorySourceType, MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery,
@@ -19,9 +19,10 @@ use crate::{
     RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo, SortBy, SortOrder,
     SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
-    UpdateAgent, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
-    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    TransitionLogRepo, UpdateAgent, UpdateExecution, UpdateProject,
+    UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
@@ -3674,6 +3675,176 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
             execution_id,
         }) if scope == "interactive" && execution_id == interactive_occupant
     ));
+}
+
+#[tokio::test]
+async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "State-entry-scoped plan publication claim",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let agent = AgentRepo::get_by_id(&db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+
+    let claimed_entry_id = new_uuid_v4();
+    TransitionLogRepo::insert(
+        &db,
+        CreateTransitionLog {
+            id: claimed_entry_id.clone(),
+            task_id: task_id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:test".to_owned(),
+            trigger_reason: "first entry".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("claimed state entry records");
+    sqlx::query(
+        "UPDATE task
+         SET metadata_json = ?, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(
+        serde_json::json!({
+            "plan_publication_claim": {
+                "execution_id": new_uuid_v4(),
+                "state": "in_progress",
+                "state_entry_token": claimed_entry_id,
+                "project_version": project.version,
+            }
+        })
+        .to_string(),
+    )
+    .bind(now_rfc3339())
+    .bind(&task_id)
+    .execute(db.pool())
+    .await
+    .expect("plan publication claim records");
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let now = now_rfc3339();
+    let make_execution = |id: String| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:state-entry-claim-test".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
+        now: now.clone(),
+    };
+    let make_admission = || ExecutionAdmission {
+        expected_project_version: Some(project.version),
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(agent.max_concurrent_tasks),
+        expected_agent_version: Some(agent.version),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(assignment.id.clone()),
+        expected_assignment_updated_at: Some(assignment.updated_at.clone()),
+        expected_workflow_definition: Some(project.workflow_definition.clone()),
+    };
+
+    let blocked_id = new_uuid_v4();
+    let blocked = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(blocked_id.clone()),
+        make_lease(blocked_id.clone()),
+        Some(make_admission()),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(DbError::VersionConflict)),
+        "a claim for the current state entry must block admission: {blocked:?}"
+    );
+    assert!(ExecutionRepo::get_by_id(&db, &blocked_id)
+        .await
+        .expect("blocked execution lookup succeeds")
+        .is_none());
+
+    TransitionLogRepo::insert(
+        &db,
+        CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "user:test".to_owned(),
+            trigger_reason: "later re-entry".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:01Z".to_owned(),
+        },
+    )
+    .await
+    .expect("later same-state entry records");
+
+    let admitted_id = new_uuid_v4();
+    let admitted = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(admitted_id.clone()),
+        make_lease(admitted_id.clone()),
+        Some(make_admission()),
+    )
+    .await
+    .expect("claim from an older entry no longer blocks admission");
+    assert_eq!(admitted.id, admitted_id);
 }
 
 #[tokio::test]

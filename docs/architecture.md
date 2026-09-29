@@ -2205,10 +2205,18 @@ capability without creating another reviewer execution.
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
-barrier until those hooks settle. Task responses derive `awaiting_human` from
-the same Task snapshot as the returned optimistic `version`; a running barrier
-therefore cannot expose a gate decision using a version that the barrier-clear
-write is about to invalidate.
+barrier until those hooks and the target state's inline `on_enter` dispatch
+settle. Keeping the barrier through dispatch prevents the periodic dispatcher
+from claiming the role before an inline continuation (such as resuming the
+latest worker thread) records its execution. Task responses derive
+`awaiting_human` from the same Task snapshot as the returned optimistic
+`version`; a running barrier therefore cannot expose a gate decision using a
+version that the barrier-clear write is about to invalidate.
+
+Terminal execution settlement is serialized per Task. If two executions for
+the same Task finish while one completion is cascading the workflow, the later
+completion waits and re-evaluates its authority after the first cascade instead
+of being acknowledged and dropped.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails

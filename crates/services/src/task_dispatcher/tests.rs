@@ -410,6 +410,16 @@ async fn seed_completed_reviewer_execution(
     agent_id: &str,
     parent_execution_id: Option<&str>,
 ) -> db::Execution {
+    let project_version: i64 = sqlx::query_scalar(
+        "SELECT project.version
+         FROM project
+         JOIN task ON task.project_id = project.id
+         WHERE task.id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("reviewer execution Project version loads");
     let now = now_rfc3339();
     ExecutionRepo::create(
         db,
@@ -433,7 +443,12 @@ async fn seed_completed_reviewer_execution(
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "project_version": project_version,
+                })
+                .to_string(),
             ),
             workspace_id: None,
             created_at: now.clone(),

@@ -2398,7 +2398,7 @@ async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
 }
 
 #[tokio::test]
-async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
+async fn reviewer_completion_cascade_waits_for_an_in_flight_task_cascade() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -2499,16 +2499,25 @@ async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
     .await
     .expect("review outcome commits");
 
-    // The dispatcher's reconciliation arriving while the inline completion
-    // path is still settling this execution must not settle it again.
+    // A successor completion may arrive while the prior role's inline
+    // cascade is still transitioning this Task. It must wait for the Task
+    // slot and retry automatically, not depend on a later dispatcher scan.
     let in_flight = service
         .claim_completion_cascade(&task.id)
         .expect("first claim succeeds");
     assert!(service.claim_completion_cascade(&task.id).is_none());
-    service
-        .maybe_cascade_executor_completion(&reviewer.id)
-        .await
-        .expect("concurrent delivery is a no-op");
+    let waiting_service = service.clone();
+    let reviewer_id = reviewer.id.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_service
+            .maybe_cascade_executor_completion(&reviewer_id)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "successor completion waits while the Task slot is held"
+    );
     let untouched = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -2517,10 +2526,11 @@ async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
     assert_eq!(untouched.version, task.version);
 
     drop(in_flight);
-    service
-        .maybe_cascade_executor_completion(&reviewer.id)
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
         .await
-        .expect("delivery after the slot frees settles");
+        .expect("queued completion wakes after the Task slot frees")
+        .expect("queued completion task joins")
+        .expect("queued completion settles");
     let settled = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -3244,6 +3254,13 @@ async fn assert_failed_reviewer_disposition(
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        Some(&agent_id),
+    )
+    .await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
         .bind(json!({ "retry_budgets": { "execution": budget } }).to_string())
         .bind(json!({ "execution_retry_count": retry_count }).to_string())
@@ -6357,11 +6374,10 @@ async fn subtask_sequence_guard_rejection_never_resumes_root_coder() {
     let result = service
         .maybe_cascade_executor_completion(&execution.id)
         .await;
-    assert!(matches!(
-        result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("cannot enter aggregate review")
-    ));
+    assert!(
+        result.is_ok(),
+        "a coder completion without coordination-root role authority is inert"
+    );
 
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -6421,6 +6437,13 @@ async fn executor_completion_guard_rejection_blocks_when_retry_budget_exhausted(
     )
     .await
     .expect("task config updates");
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
     let workspace =
         seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
     let execution =
@@ -6449,6 +6472,13 @@ async fn executor_completion_comment_uses_execution_agent() {
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
