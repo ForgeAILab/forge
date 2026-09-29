@@ -99,7 +99,7 @@ impl TaskService {
         };
         let reviewer_parent_execution_id = admission.expected_reviewer_parent_execution_id.clone();
         let coordination_root =
-            super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await?;
+            crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
         self.ensure_ordered_execution_admission(&task, role).await?;
         if coordination_root || role == crate::workflow::default_roles::REVIEWER {
             self.ensure_task_reviewable(&task).await?;
@@ -193,7 +193,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
+        if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
             return Err(ServiceError::invalid_operation(
                 "root tasks with subtasks are coordination containers; launch a subtask instead",
             ));

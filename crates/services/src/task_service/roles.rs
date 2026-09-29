@@ -209,8 +209,16 @@ impl TaskService {
         )
         .await?;
         if is_coder_role && !cancel_active_execution {
+            let root_role_allowed = self
+                .root_role_assignment_allowed(&task, &input.role_name)
+                .await?;
             let (previous, assignment, changed) = self
-                .assign_coder_role_if_idle(input, previous.as_ref(), task.version)
+                .assign_coder_role_if_idle(
+                    input,
+                    previous.as_ref(),
+                    task.version,
+                    root_role_allowed,
+                )
                 .await?;
             if changed {
                 self.publish_role_reassigned(
@@ -530,38 +538,23 @@ impl TaskService {
         task: &Task,
         role_name: &str,
     ) -> Result<()> {
-        if !super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+        if !crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await? {
             return Ok(());
         }
+        if self.root_role_assignment_allowed(task, role_name).await? {
+            return Ok(());
+        }
+        Err(crate::task_hierarchy::root_assignment_denied())
+    }
+
+    /// Resolve whether `role_name` could be assigned if `task` is, or becomes,
+    /// a coordination root.
+    async fn root_role_assignment_allowed(&self, task: &Task, role_name: &str) -> Result<bool> {
         let workflow = self.workflow_for_task(task).await?;
-        let implementation_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == default_states::IN_PROGRESS)
-            .and_then(crate::workflow::effective_role)
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.kind == api_types::StateKind::Active)
-                    .and_then(crate::workflow::effective_role)
-            });
-        if implementation_role == Some(role_name) {
-            return Err(ServiceError::invalid_operation(
-                "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
-            ));
-        }
-        let aggregate_review_role = workflow.states.iter().any(|state| {
-            state.role.as_deref() == Some(role_name)
-                && state.kind == api_types::StateKind::Gate
-                && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-        });
-        if aggregate_review_role {
-            return Ok(());
-        }
-        Err(ServiceError::invalid_operation(
-            "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
-        ))
+        Ok(
+            crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
+                .allows_assignment(role_name),
+        )
     }
 
     /// Assignment writes share SQLite's immediate transaction boundary with
@@ -574,27 +567,14 @@ impl TaskService {
         input: CreateTaskRoleAssignment,
         expected_previous: Option<&TaskRoleAssignment>,
         expected_task_version: i64,
+        root_role_allowed: bool,
     ) -> Result<(Option<TaskRoleAssignment>, TaskRoleAssignment, bool)> {
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let is_coordination_root = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM task AS root
-                 JOIN task AS child ON child.parent_task_id = root.id
-                 WHERE root.id = ?
-                   AND root.parent_task_id IS NULL
-                   AND root.deleted_at IS NULL
-                   AND child.deleted_at IS NULL
-             )",
-        )
-        .bind(&input.task_id)
-        .fetch_one(&mut *transaction)
-        .await?
-            != 0;
-        if is_coordination_root {
-            return Err(ServiceError::invalid_operation(
-                "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
-            ));
+        let is_coordination_root =
+            crate::task_hierarchy::is_coordination_root_tx(&mut transaction, &input.task_id)
+                .await?;
+        if is_coordination_root && !root_role_allowed {
+            return Err(crate::task_hierarchy::root_assignment_denied());
         }
         let previous_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at

@@ -144,9 +144,9 @@ impl TaskDispatcher {
                 continue;
             }
             let is_coordination_root =
-                crate::task_service::coordination_root_has_subtasks(&self.db, &task).await?;
+                crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
             let sequence_complete = is_coordination_root
-                && crate::task_service::coordination_root_sequence_complete(
+                && crate::task_hierarchy::coordination_root_sequence_complete(
                     &self.db, &task, workflow,
                 )
                 .await?;
@@ -274,12 +274,13 @@ impl TaskDispatcher {
         } else {
             self.task_service.ensure_task_runnable(task).await?;
         }
-        if crate::task_service::coordination_root_has_subtasks(&self.db, task).await?
-            && role_name != crate::workflow::default_roles::REVIEWER
+        if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await?
+            && !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                .allows_execution(&state.name, role_name)
         {
             return Ok(false);
         }
-        if !crate::task_service::subtask_dispatch_ready(&self.db, task).await? {
+        if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, task).await? {
             return Ok(false);
         }
         let reviewer_reconciliation = if role_name == crate::workflow::default_roles::REVIEWER {

@@ -499,7 +499,7 @@ pub(super) async fn target_moved_result(
         Err(git::GitError::MergeConflict { stderr, .. }) => {
             // Coordination roots aggregate subtask branches and keep the
             // manual-repair path; everything else goes back to its Worker.
-            match crate::task_service::coordination_root_has_subtasks(&ctx.db, task).await {
+            match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
                 Ok(false) => {}
                 Ok(true) => {
                     let _ = git::abort_rebase(worktree_path).await;
@@ -675,7 +675,7 @@ pub(super) async fn merge_failure_result(
         }
     }
 
-    match crate::task_service::coordination_root_has_subtasks(&ctx.db, &task).await {
+    match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &task).await {
         Ok(true) => {
             let block_reason = format!(
                 "coordination root requires manual workspace repair before integration can continue: {reason}"

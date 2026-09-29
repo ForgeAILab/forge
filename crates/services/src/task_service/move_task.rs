@@ -126,7 +126,7 @@ impl TaskService {
                 .await;
         }
 
-        super::subtask::ensure_coordination_root_target_ready(
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
             &self.db,
             &source_task,
             &workflow,
@@ -135,7 +135,7 @@ impl TaskService {
         .await?;
 
         if target_state.kind != api_types::StateKind::Terminal {
-            super::subtask::ensure_subtask_dispatch_order(&self.db, &source_task).await?;
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &source_task).await?;
         }
 
         self.ensure_planning_plan_ready_before_leaving(

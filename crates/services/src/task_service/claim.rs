@@ -17,12 +17,12 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
+        if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
             return Err(ServiceError::invalid_operation(
                 "root tasks with subtasks are coordination containers; assign and run their subtasks",
             ));
         }
-        super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
+        crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;

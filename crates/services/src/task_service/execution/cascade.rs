@@ -188,7 +188,7 @@ impl TaskService {
         reason: &str,
     ) -> Result<()> {
         if guard == "subtask_sequence_complete"
-            && super::super::subtask::coordination_root_has_subtasks(&self.db, task).await?
+            && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await?
         {
             self.clear_workflow_guard_retry_metadata(&task.id).await?;
             self.wake_next_ordered_subtask(

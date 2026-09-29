@@ -25,7 +25,7 @@ impl TaskService {
             &project.workflow_definition,
             &options.triggered_by,
         );
-        super::subtask::ensure_coordination_root_target_ready(
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
             &self.db,
             &task,
             &workflow,
@@ -43,7 +43,7 @@ impl TaskService {
             // cancellation remains available for later queued children, but
             // no later sibling may enter work/review before the first
             // incomplete child settles.
-            super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
         }
         if workflow.state_kind(&new_status) == Some(api_types::StateKind::Active) {
             // Direct transitions must obey the same admission boundary as
@@ -381,7 +381,7 @@ impl TaskService {
         workflow: &api_types::WorkflowDefinition,
         rejection: bool,
     ) -> Result<()> {
-        if super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+        if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, task).await? {
             return Ok(());
         }
         if task.status != crate::workflow::default_states::PLANNING
@@ -694,11 +694,7 @@ impl TaskService {
             .as_deref()
             .unwrap_or("cancelled")
             .to_owned();
-        let child_tasks = if task.parent_task_id.is_none() {
-            TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?
-        } else {
-            Vec::new()
-        };
+        let child_tasks = crate::task_hierarchy::children_if_root(&self.db, &task).await?;
         if task.status == cancel_target {
             // A prior cancellation may have committed while a child was
             // still starting. Re-check and stop every active child even when
@@ -764,14 +760,11 @@ impl TaskService {
         reason: &str,
         actor: Actor,
     ) -> Result<()> {
-        if root.parent_task_id.is_some() {
-            return Ok(());
-        }
-        let children = TaskRepo::list_subtasks_ordered(&*self.db, &root.id).await?;
+        let children = crate::task_hierarchy::children_if_root(&self.db, root).await?;
         for child in children {
             self.cancel_running_executions_for_task(&child, reason, actor.clone())
                 .await?;
-            if !super::subtask::subtask_is_terminal(&child, workflow) {
+            if !crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
                 Box::pin(self.cancel_task_as(child.id, actor.clone())).await?;
             }
         }
@@ -793,13 +786,15 @@ impl TaskService {
             &Actor::user(UserActionSource::ManualAdvance),
         );
         let target = next_workflow_state(&workflow, &task.status)?;
-        super::subtask::ensure_coordination_root_target_ready(&self.db, &task, &workflow, &target)
-            .await?;
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
+            &self.db, &task, &workflow, &target,
+        )
+        .await?;
         if !matches!(
             workflow.state_kind(&target),
             Some(api_types::StateKind::Terminal)
         ) {
-            super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
         }
 
         self.cancel_running_executions_for_manual_advance(&task)

@@ -9,16 +9,8 @@ pub(crate) async fn latest_executor_execution_for_task(
     db: &SqliteDb,
     task: &Task,
 ) -> Result<Option<Execution>> {
-    let task_ids = if task.parent_task_id.is_none() {
-        let subtasks = TaskRepo::list_subtasks_ordered(db, &task.id).await?;
-        if subtasks.is_empty() {
-            vec![task.id.clone()]
-        } else {
-            subtasks.into_iter().map(|subtask| subtask.id).collect()
-        }
-    } else {
-        vec![task.id.clone()]
-    };
+    let children = crate::task_hierarchy::children_if_root(db, task).await?;
+    let task_ids = crate::task_hierarchy::child_ids_or_self(task, &children);
 
     let mut latest = None;
     for task_id in task_ids {

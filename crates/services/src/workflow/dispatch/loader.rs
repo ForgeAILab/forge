@@ -156,7 +156,7 @@ fn is_system_actor(triggered_by: &str) -> bool {
 }
 
 async fn load_sub_tasks(db: &db::SqliteDb, parent_task_id: &str) -> Result<Vec<db::Task>> {
-    Ok(TaskRepo::list_subtasks_ordered(db, parent_task_id).await?)
+    crate::task_hierarchy::ordered_children(db, parent_task_id).await
 }
 
 async fn latest_terminal_execution_for_role(

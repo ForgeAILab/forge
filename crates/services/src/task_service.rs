@@ -85,11 +85,7 @@ pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };
 pub(crate) use repository_authority::resolve_task_repository_authority;
-pub(crate) use subtask::{
-    coordination_review_pending, coordination_root_has_subtasks,
-    coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
-};
-pub use subtask::{is_root_task, is_subtask, root_for};
+pub(crate) use subtask::coordination_review_pending;
 
 /// Decode persisted review details before any endpoint or workflow mutates the
 /// row. Legacy CI-only arrays are still readable, but every other malformed

@@ -119,13 +119,13 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            if !crate::task_service::subtask_dispatch_ready(&self.db, &task).await? {
+            if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
                 continue;
             }
-            if crate::task_service::coordination_root_has_subtasks(&self.db, &task).await? {
+            if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
                 // The Project Agent coordinates this root through its child
                 // records. Only children receive implementation dispatches.
-                let sequence_complete = crate::task_service::coordination_root_sequence_complete(
+                let sequence_complete = crate::task_hierarchy::coordination_root_sequence_complete(
                     &self.db, &task, workflow,
                 )
                 .await?;

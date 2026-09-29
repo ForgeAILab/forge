@@ -1964,7 +1964,10 @@ execution. The bound Project Agent can create, sequence, assign, and observe
 those children, but Forge never sends the root's implementation prompt to one
 Agent as a proxy for all child work. Converting a Task into a coordination root
 clears its non-review role assignments; only its aggregate review role remains
-assignable at root level.
+assignable at root level, and the same role is the only one that may execute on
+the root, and only while the root is in its review state. That role is whatever
+the workflow's review gate declares, not the built-in `reviewer` name.
+`services::task_hierarchy::RootRolePolicy` owns both decisions.
 
 Each subtask is an independent Task with its own implementation-role
 assignment, status, execution record, session, logs, retry state, comments,
@@ -2408,6 +2411,7 @@ exposes it via `GET /api/v1/tasks/{id}/transitions`.
 
 ### Files of interest
 
+- `crates/services/src/task_hierarchy.rs` — root-Task and ordered-subtask policy
 - `crates/services/src/workflow/engine/mod.rs` — lifecycle
 - `crates/services/src/workflow/actions/` — curated hook actions
 - `crates/services/src/workflow/default_workflow.rs` — built-in graph

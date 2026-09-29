@@ -85,6 +85,7 @@ pub mod solo_bootstrap;
 pub mod solo_session;
 pub mod task_diagnostics;
 pub mod task_dispatcher;
+pub mod task_hierarchy;
 pub mod task_service;
 pub mod terminal_service;
 pub mod turn_log_sink;

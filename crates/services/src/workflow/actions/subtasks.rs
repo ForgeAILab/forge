@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use db::{TaskDependencyRepo, TaskRepo};
+use db::TaskDependencyRepo;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::workflow::{default_states, HookAction, HookContext, HookResult};
@@ -58,7 +58,7 @@ impl HookAction for SubtaskSequenceComplete {
             };
         }
 
-        let subtasks = match TaskRepo::list_subtasks_ordered(&*ctx.db, &ctx.task_id).await {
+        let subtasks = match crate::task_hierarchy::ordered_children(&ctx.db, &ctx.task_id).await {
             Ok(subtasks) => subtasks,
             Err(error) => {
                 return HookResult::Failed {
@@ -66,11 +66,7 @@ impl HookAction for SubtaskSequenceComplete {
                 };
             }
         };
-        let incomplete = subtasks
-            .into_iter()
-            .filter(|subtask| !crate::task_service::subtask_is_terminal(subtask, &ctx.workflow))
-            .map(|subtask| subtask.id)
-            .collect::<Vec<_>>();
+        let incomplete = crate::task_hierarchy::incomplete_child_ids(&subtasks, &ctx.workflow);
 
         if incomplete.is_empty() {
             HookResult::Ok
@@ -87,7 +83,7 @@ pub struct PropagateDoneToSubtasks;
 #[async_trait]
 impl HookAction for PropagateDoneToSubtasks {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let subtasks = match TaskRepo::list_subtasks_ordered(&*ctx.db, &ctx.task_id).await {
+        let subtasks = match crate::task_hierarchy::ordered_children(&ctx.db, &ctx.task_id).await {
             Ok(subtasks) => subtasks,
             Err(error) => {
                 return HookResult::Failed {
@@ -96,11 +92,7 @@ impl HookAction for PropagateDoneToSubtasks {
             }
         };
 
-        let incomplete = subtasks
-            .into_iter()
-            .filter(|subtask| !crate::task_service::subtask_is_terminal(subtask, &ctx.workflow))
-            .map(|subtask| subtask.id)
-            .collect::<Vec<_>>();
+        let incomplete = crate::task_hierarchy::incomplete_child_ids(&subtasks, &ctx.workflow);
         if !incomplete.is_empty() {
             return HookResult::Failed {
                 reason: format!("SUBTASK_SEQUENCE_NOT_COMPLETE: {}", incomplete.join(",")),
@@ -116,7 +108,7 @@ pub struct CancelPendingSubtasks;
 #[async_trait]
 impl HookAction for CancelPendingSubtasks {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let subtasks = match TaskRepo::list_subtasks_ordered(&*ctx.db, &ctx.task_id).await {
+        let subtasks = match crate::task_hierarchy::ordered_children(&ctx.db, &ctx.task_id).await {
             Ok(subtasks) => subtasks,
             Err(error) => {
                 return HookResult::Failed {
@@ -126,7 +118,7 @@ impl HookAction for CancelPendingSubtasks {
         };
 
         for subtask in subtasks {
-            if crate::task_service::subtask_is_terminal(&subtask, &ctx.workflow) {
+            if crate::task_hierarchy::subtask_is_terminal(&subtask, &ctx.workflow) {
                 continue;
             }
             if let Err(reason) = cancel_subtask_with_effective_workflow(ctx, subtask).await {
@@ -145,7 +137,7 @@ mod subtask_hook_test_support {
     use super::*;
     use db::{
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
-        CreateTask, ProjectRepo, RepoRepo, SqliteDb, UpdateProject,
+        CreateTask, ProjectRepo, RepoRepo, SqliteDb, TaskRepo, UpdateProject,
     };
     use events::EventBus;
     use serde_json::json;

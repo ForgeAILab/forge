@@ -17,6 +17,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Root-Task and ordered-subtask rules (coordination-root detection, ordered
+  child completion, dispatch readiness, root blocking, and root role
+  assignment/execution policy) now live in one module,
+  `services::task_hierarchy`. No REST, MCP, CLI, event, or schema change.
 - Reviewers now verify by running the change — build, tests, and driving the
   changed behavior programmatically or visually — instead of auditing code by
   reading it, and must also check that changed behavior is tested and that the
@@ -36,6 +40,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Coordination roots in custom workflows whose aggregate review gate uses a
+  role other than `reviewer` now get their aggregate review dispatched. The
+  dispatcher and the dispatch hook previously only admitted the built-in
+  `reviewer` role on a root, while execution admission accepted the workflow's
+  review role, so such roots never started their review automatically.
 - Unbounded remote executions (no `hard_deadline_at`, the new default) no
   longer drop every daemon notification. A missing deadline was treated as
   already reached, so logs and progress were rejected; progress CAS and

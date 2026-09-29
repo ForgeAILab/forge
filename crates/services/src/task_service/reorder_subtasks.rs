@@ -10,7 +10,7 @@ impl TaskService {
         let parent = TaskRepo::get_by_id(&*self.db, &parent_task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.clone()))?;
-        if !subtask::is_root_task(&self.db, &parent_task_id).await? {
+        if !crate::task_hierarchy::is_root_task(&self.db, &parent_task_id).await? {
             return Err(ServiceError::invalid_operation(format!(
                 "task {parent_task_id} is not a root task"
             )));

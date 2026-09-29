@@ -207,7 +207,7 @@ impl HookAction for RequirePlanChecklistComplete {
                 };
             }
         };
-        match crate::task_service::coordination_root_has_subtasks(&ctx.db, &task).await {
+        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &task).await {
             Ok(true) => {
                 return HookResult::Skipped {
                     reason: "coordination root is governed by ordered subtask completion"
