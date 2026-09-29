@@ -284,8 +284,9 @@ impl TaskService {
         let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
         if let Some(parent_task_id) = task.parent_task_id.as_deref() {
             // Creating the first child atomically converts its parent into a
-            // coordination container. Preserve only aggregate-review roles;
-            // implementation/planning assignments belong on child Tasks.
+            // coordination container. Preserve the coder as its default
+            // worker plus aggregate-review roles; other implementation and
+            // planning assignments belong on child Tasks.
             let root_role_policy =
                 crate::task_hierarchy::RootRolePolicy::for_workflow(&project_workflow);
             let parent_roles = sqlx::query_scalar::<_, String>(

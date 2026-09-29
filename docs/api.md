@@ -2140,6 +2140,14 @@ response-build time from the project's resolved workflow and the task's current
 `status`; it is not persisted. The value is one of `backlog`, `ready`,
 `working`, `review`, or `done`. Cancelled workflow states map to `done`.
 
+`TaskResponse.effective_coder` is the resolved `TaskRoleAssignmentResponse` for
+the Task's coder, or `null`. `effective_coder_source` is `own`,
+`inherited_from_root`, or `null`. For a subtask, its own `coder` row wins; when
+that row is absent, the response returns the coordination root's `coder` row
+with source `inherited_from_root` (and therefore the assignment's `task_id`
+continues to name the root). `role_assignments` remains the Task's persisted
+rows only; inherited defaults are never copied into that array or into storage.
+
 `repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
 and generated clients omit it. For work that has already run, repository
 identity is read from the execution's Workspace or Workspace lease; review,
@@ -2155,7 +2163,9 @@ and dispatch rechecks the same boundary before issuing the exact Task-scoped
 Workspace lease. Native runtime context is isolated by Task role, so reusing an
 identity does not reuse Worker capabilities in a reviewer session. A successful
 assignment, including confirming the current
-assignment, wakes a Task parked on a stale dispatch blocker. When that role
+assignment, wakes a Task parked on a stale dispatch blocker. Changing or
+removing a coordination root's `coder` also wakes children without an own
+`coder`. When that role
 selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `POST /resume` action.
@@ -2166,12 +2176,17 @@ separate `POST /resume` action.
 direct child of a root coordination Task, inherits the root's shared workspace,
 and receives a `subtask_order` position. A root with one or more children is a
 non-executing coordination container: the root's implementation prompt is not
-dispatched, its non-review role assignments are cleared, and new implementation
-assignments must target children. Each child has its own lifecycle, assignment,
-execution, retry history, and logs. Children may be assigned to different Agents, but Forge
-dispatches only the first incomplete child and runs the ordered sequence
-serially in the root workspace. When all children are terminal, the root moves
-through its aggregate review/merge path.
+dispatched. Its `coder` assignment is retained as the default worker, while
+other non-review role assignments are removed. A child with its own `coder`
+uses that override; otherwise dispatch and claim resolve the root default
+without creating a child assignment row. Changing or removing the default
+wakes parked unstarted children, while an already-running child execution is
+unchanged. Each child has its own lifecycle, execution, retry history, and logs.
+Children may be assigned to different Agents, but Forge dispatches only the
+first incomplete child and runs the ordered sequence serially in the root
+workspace. When all children are terminal, the root moves through its aggregate
+review/merge path. The root itself may receive only its aggregate-review
+execution, never a `coder` execution.
 
 Dependency IDs describe a separate prerequisite DAG. They gate dispatch until
 each named prerequisite reaches `done`; they do not create parent/child
@@ -3573,8 +3588,9 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 create an Execution, or bypass Project pause. When the Project resumes, the
 scheduler dispatches the assigned work. It rejects a changed assignment while
 that implementation role has a running Execution; stop the Execution first.
-For a root Task with ordered children, assign each subtask independently; only
-the first incomplete sibling is eligible to run.
+For a root Task with ordered children, a child may carry its own `coder`
+override; otherwise it uses the root's `coder` default worker. Only the first
+incomplete sibling is eligible to run.
 
 Task hierarchy and dependency fields retain separate meanings in every MCP
 tool. `parent_task_id` identifies the coordination root and shared workspace;
@@ -3617,7 +3633,8 @@ The exact response fields for the graph/subtask helpers are:
 ```
 
 Each subtask element contains the normal Task fields plus its persisted
-`role_assignments`, so callers can verify per-child agent selection directly.
+`role_assignments`. These helpers do not materialize the root default into that
+array, so an absent child `coder` may mean the effective coder is inherited.
 
 `forge_list_task_dependencies` uses `depends_on_ids`, not the retired
 `depends_on` response field. The REST dependency responses remain arrays of

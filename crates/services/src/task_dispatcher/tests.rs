@@ -255,6 +255,40 @@ async fn seed_task(
     .expect("task creates")
 }
 
+async fn seed_subtask(
+    db: &db::SqliteDb,
+    root: &Task,
+    title: &str,
+    status: &str,
+    subtask_order: i64,
+) -> Task {
+    let now = now_rfc3339();
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: root.project_id.clone(),
+            parent_task_id: Some(root.id.clone()),
+            subtask_order: Some(subtask_order),
+            assignee_type: None,
+            assignee_id: None,
+            title: title.to_owned(),
+            description: Some("echo subtask".to_owned()),
+            task_type: "sub_task".to_owned(),
+            status: status.to_owned(),
+            is_automation: false,
+            priority: root.priority,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("subtask creates")
+}
+
 async fn assign_role(db: &db::SqliteDb, task_id: &str, role_name: &str, agent_id: &str) {
     let now = now_rfc3339();
     TaskRoleAssignmentRepo::assign(
@@ -1183,6 +1217,205 @@ async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
     .expect("assignment loads")
     .expect("unassigned Task received the Project's default coder");
     assert_eq!(coder.assignee_id.as_deref(), Some(agent_id.as_str()));
+}
+
+#[tokio::test]
+async fn dispatcher_inherits_root_default_coder_without_copying_it_to_subtask() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let next_agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let root = seed_task(&db, &project_id, "root", "todo", 1).await;
+    let child = seed_subtask(&db, &root, "child", "todo", 0).await;
+    assign_role(
+        &db,
+        &root.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(execution_ctx.task_id, child.id);
+    let execution = ExecutionRepo::latest_agent_execution_by_task(&*db, &child.id)
+        .await
+        .expect("execution loads")
+        .expect("child execution exists");
+    assert_eq!(execution.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert!(
+        TaskRoleAssignmentRepo::get_by_task_and_role(
+            &*db,
+            &child.id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await
+        .expect("child assignment loads")
+        .is_none(),
+        "inherited dispatch must not materialize a child assignment"
+    );
+
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &next_agent_id,
+        &next_agent_id,
+    )
+    .await;
+    let now = now_rfc3339();
+    dispatcher
+        .task_service
+        .reassign_role(
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: root.id.clone(),
+                role_name: crate::workflow::default_roles::CODER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(next_agent_id.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("root default worker changes while child runs");
+    let running_child = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .expect("child reloads")
+        .expect("child exists");
+    assert!(
+        dispatcher
+            .task_service
+            .execution_owns_current_role_attempt(&running_child, &execution)
+            .await
+            .expect("execution ownership resolves"),
+        "a root default change must not supersede the admitted child execution"
+    );
+    assert_eq!(
+        ExecutionRepo::latest_agent_execution_by_task(&*db, &child.id)
+            .await
+            .expect("execution reloads")
+            .expect("child execution still exists")
+            .agent_id
+            .as_deref(),
+        Some(agent_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_prefers_subtask_coder_over_root_default() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let root_agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let child_agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let root = seed_task(&db, &project_id, "root", "todo", 1).await;
+    let child = seed_subtask(&db, &root, "child", "todo", 0).await;
+    assign_role(
+        &db,
+        &root.id,
+        crate::workflow::default_roles::CODER,
+        &root_agent,
+    )
+    .await;
+    assign_role(
+        &db,
+        &child.id,
+        crate::workflow::default_roles::CODER,
+        &child_agent,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(execution_ctx.task_id, child.id);
+    let execution = ExecutionRepo::latest_agent_execution_by_task(&*db, &child.id)
+        .await
+        .expect("execution loads")
+        .expect("child execution exists");
+    assert_eq!(execution.agent_id.as_deref(), Some(child_agent.as_str()));
+}
+
+#[tokio::test]
+async fn changing_root_default_wakes_and_dispatches_unstarted_subtask() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let first_agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let next_agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let root = seed_task(&db, &project_id, "root", "todo", 1).await;
+    let child = seed_subtask(&db, &root, "child", "todo", 0).await;
+    assign_role(
+        &db,
+        &root.id,
+        crate::workflow::default_roles::CODER,
+        &first_agent,
+    )
+    .await;
+    deferred_dispatch::record_dispatch_disposition(
+        &db,
+        &child,
+        crate::workflow::default_roles::CODER,
+        "waiting for a usable default worker",
+    )
+    .await
+    .expect("child dispatch parks");
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &next_agent,
+        &next_agent,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    let now = now_rfc3339();
+    dispatcher
+        .task_service
+        .reassign_role(
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: root.id.clone(),
+                role_name: crate::workflow::default_roles::CODER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(next_agent.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            false,
+            false,
+        )
+        .await
+        .expect("root default worker changes");
+
+    let woken_child = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .expect("child reloads")
+        .expect("child exists");
+    assert!(deferred_dispatch::dispatch_disposition_for_test(&woken_child).is_none());
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(execution_ctx.task_id, child.id);
+    let execution = ExecutionRepo::latest_agent_execution_by_task(&*db, &child.id)
+        .await
+        .expect("execution loads")
+        .expect("child execution exists");
+    assert_eq!(execution.agent_id.as_deref(), Some(next_agent.as_str()));
 }
 
 #[tokio::test]

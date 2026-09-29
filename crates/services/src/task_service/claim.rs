@@ -2,7 +2,6 @@ use super::workspace::prepare_workspace_owned;
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
 use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
-use sqlx::Row;
 
 impl TaskService {
     pub async fn claim_task(
@@ -96,7 +95,7 @@ impl TaskService {
         }
         if let Some(claiming_agent_id) = agent.as_ref().map(|agent| agent.id.as_str()) {
             if let Some(role_name) = target_role.as_deref() {
-                self.ensure_claim_role_available(&task.id, role_name, claiming_agent_id)
+                self.ensure_claim_role_available(&task, role_name, claiming_agent_id)
                     .await?;
             }
         }
@@ -111,8 +110,9 @@ impl TaskService {
             } else {
                 claim_execution_role.as_str()
             };
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, assignment_role)
                 .await?
+                .map(|resolved| resolved.assignment)
         } else {
             None
         };
@@ -273,49 +273,9 @@ impl TaskService {
                 return Err(error.into());
             }
         };
-        if let (Some(role_name), Some(claiming_agent_id)) =
-            (target_role.as_deref(), agent_id.as_deref())
-        {
-            let role_now = now_rfc3339();
-            sqlx::query(
-                "INSERT INTO task_role_assignment
-                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
-                 VALUES (?, ?, ?, 'agent', ?, ?, ?)
-                 ON CONFLICT(task_id, role_name) DO NOTHING",
-            )
-            .bind(new_uuid_v4())
-            .bind(&claimed.task.id)
-            .bind(role_name)
-            .bind(claiming_agent_id)
-            .bind(&role_now)
-            .bind(&role_now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            let assignment = sqlx::query(
-                "SELECT assignee_type, assignee_id
-                 FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-            )
-            .bind(&claimed.task.id)
-            .bind(role_name)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(DbError::from)?;
-            if assignment
-                .get::<Option<String>, _>("assignee_type")
-                .as_deref()
-                != Some("agent")
-                || assignment
-                    .get::<Option<String>, _>("assignee_id")
-                    .as_deref()
-                    != Some(claiming_agent_id)
-            {
-                return Err(ServiceError::conflict(format!(
-                    "role '{}' is assigned to a different agent",
-                    role_name
-                )));
-            }
-        }
+        // `TaskRepo::claim` verifies (and, only when truly absent, creates)
+        // the effective assignment inside this same write transaction. Do not
+        // materialize a root default on the child after that guarded insert.
         // Human claims remain user-managed work and do not mint repository
         // authority. Only a scheduler-dispatched Agent Worker/reviewer gets
         // an execution-scoped WorkspaceLease.
@@ -516,12 +476,13 @@ impl TaskService {
 
     async fn ensure_claim_role_available(
         &self,
-        task_id: &str,
+        task: &Task,
         role_name: &str,
         claiming_agent_id: &str,
     ) -> Result<()> {
-        let existing =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
+        let existing = crate::task_hierarchy::effective_role_assignment(&self.db, task, role_name)
+            .await?
+            .map(|resolved| resolved.assignment);
         if existing.as_ref().is_some_and(|assignment| {
             assignment.assignee_type != Some(AssigneeKind::Agent)
                 || assignment.assignee_id.as_deref() != Some(claiming_agent_id)

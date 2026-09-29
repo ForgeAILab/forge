@@ -618,7 +618,7 @@ async fn claim_rejects_conflicting_implicit_assignee_assignment() {
 }
 
 #[tokio::test]
-async fn claim_allows_first_subtask_in_root_workspace() {
+async fn claim_uses_inherited_root_coder_without_copying_assignment() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -629,9 +629,15 @@ async fn claim_allows_first_subtask_in_root_workspace() {
     let agent_id = seed_agent(&db).await;
     let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
+    TaskRoleAssignmentRepo::assign(
+        &*db,
+        role_assignment_input(&root.id, default_roles::CODER, Some(agent_id.clone()), None),
+    )
+    .await
+    .expect("root default worker assigns");
 
     let claimed = service
-        .claim_task(subtask.id.clone(), Assignee::Agent(agent_id), None)
+        .claim_task(subtask.id.clone(), Assignee::Agent(agent_id.clone()), None)
         .await
         .expect("first subtask claims");
 
@@ -643,6 +649,17 @@ async fn claim_allows_first_subtask_in_root_workspace() {
     assert_eq!(
         claimed.execution.workspace_id.as_deref(),
         Some(workspace.id.as_str())
+    );
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_id.as_str())
+    );
+    assert!(
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &subtask.id, default_roles::CODER)
+            .await
+            .expect("child assignment loads")
+            .is_none(),
+        "claim must not copy the root default onto the subtask"
     );
 }
 

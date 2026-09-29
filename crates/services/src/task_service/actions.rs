@@ -4,7 +4,6 @@ use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger}
 use db::{
     Agent, AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest,
     ProjectAgentBindingRepo, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskRepo,
-    TaskRoleAssignmentRepo,
 };
 
 /// Whether `task` is parked at a review gate only a user may decide.
@@ -792,7 +791,9 @@ impl TaskService {
             .and_then(crate::workflow::effective_role)
         {
             if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
+                    .await?
+                    .map(|resolved| resolved.assignment)
             {
                 if assignment.assignee_type == Some(AssigneeKind::Agent) {
                     if let Some(agent_id) = assignment.assignee_id {
@@ -815,7 +816,9 @@ impl TaskService {
             .next();
         if let Some(role) = first_work_role {
             if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
+                    .await?
+                    .map(|resolved| resolved.assignment)
             {
                 if assignment.assignee_type == Some(AssigneeKind::Agent) {
                     if let Some(agent_id) = assignment.assignee_id {

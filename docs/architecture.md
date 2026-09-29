@@ -2069,20 +2069,27 @@ the hierarchy/workspace relationship, not a prerequisite edge. A root Task
 with direct children is a non-executing coordination container, not a worker
 execution. The bound Project Agent can create, sequence, assign, and observe
 those children, but Forge never sends the root's implementation prompt to one
-Agent as a proxy for all child work. Converting a Task into a coordination root
-clears its non-review role assignments; only its aggregate review role remains
-assignable at root level, and the same role is the only one that may execute on
-the root, and only while the root is in its review state. That role is whatever
-the workflow's review gate declares, not the built-in `reviewer` name.
-`services::task_hierarchy::RootRolePolicy` owns both decisions.
+Agent as a proxy for all child work. A `coder` assignment on the root is the
+default worker for children that have no own `coder`; converting a Task into a
+coordination root keeps that assignment and removes other non-review roles.
+The root's aggregate review role also remains assignable and is the only role
+that may execute on the root, only while the root is in its review state. The
+root `coder` never executes there. The review role is whatever the workflow's
+review gate declares, not the built-in `reviewer` name.
+`services::task_hierarchy::RootRolePolicy` owns these assignment and execution
+decisions.
 
-Each subtask is an independent Task with its own implementation-role
-assignment, status, execution record, session, logs, retry state, comments,
-and completion event. Siblings reuse the root-owned workspace so their commits
-accumulate on one delivery branch. Workspace ownership does not imply Agent
-ownership: the workspace execution lock serializes access, and the dispatcher
-admits only the first incomplete sibling, so ordered children execute one at a
-time even when different Agents are assigned. Execution admission repeats that
+Each subtask is an independent Task with its own status, execution record,
+session, logs, retry state, comments, and completion event. Its effective coder
+is its own `coder` row when present, otherwise the root's `coder`, otherwise
+none. Resolution happens at scheduling, claim, and execution admission; Forge
+does not copy the inherited row onto the child. Changing the root default wakes
+parked children without replacing an already-running execution. Siblings reuse
+the root-owned workspace so their commits accumulate on one delivery branch.
+Workspace ownership does not imply Agent ownership: the workspace execution
+lock serializes access, and the dispatcher admits only the first incomplete
+sibling, so ordered children execute one at a time even when different Agents
+are assigned. Execution admission repeats both assignment resolution and the
 single-run check transactionally against the shared workspace, so remote daemon
 workers cannot bypass serialization. Reordering is transactional as well: the
 terminal prefix and current first incomplete child remain fixed, and only the
@@ -2398,6 +2405,10 @@ not a per-Task allowlist. An explicit Task role may name any enabled, available,
 Project-usable Task execution identity, including the same identity for Worker
 and reviewer. Assignment and dispatch both recheck effective availability,
 account/Project scope, coordinator exclusion, and the exact Task-scoped lease.
+On a coordination root, `coder` is a default rather than an executable root
+role: a child without its own `coder` inherits that root row, while an own row
+overrides it. Task responses expose the resolved row and whether its source is
+`own` or `inherited_from_root`.
 Changing or confirming a Task role clears any stale deferred-dispatch
 disposition so a previously blocked Task is reconsidered. When the role choice
 is newer than a stopped attempt for that role, it is also the explicit retry

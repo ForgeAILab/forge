@@ -121,9 +121,9 @@ impl TaskService {
         let Some(role_name) = self.active_work_role(&task).await? else {
             return Ok(None);
         };
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, &role_name)
+        crate::task_hierarchy::effective_role_assignment(&self.db, &task, &role_name)
             .await
-            .map_err(Into::into)
+            .map(|resolved| resolved.map(|resolved| resolved.assignment))
     }
 
     /// Assign an Agent to the Task's implementation role without claiming or
@@ -230,9 +230,9 @@ impl TaskService {
                     RoleReassignmentEventFlags::default(),
                 );
             }
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 if changed {
                     "task role assignment changed"
                 } else {
@@ -250,9 +250,9 @@ impl TaskService {
             let assignment =
                 TaskRoleAssignmentRepo::assign_if_unchanged(&*self.db, input, Some(previous))
                     .await?;
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment confirmed",
             )
             .await?;
@@ -277,9 +277,9 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment changed",
             )
             .await?;
@@ -307,9 +307,9 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(
-                &self.db,
+            self.wake_role_dispatch(
                 &assignment.task_id,
+                &assignment.role_name,
                 "task role assignment changed",
             )
             .await?;
@@ -373,9 +373,9 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
-        crate::wake_task_dispatch(
-            &self.db,
+        self.wake_role_dispatch(
             &assignment.task_id,
+            &assignment.role_name,
             "task role assignment changed",
         )
         .await?;
@@ -413,7 +413,8 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+            self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+                .await?;
             return Ok(());
         }
 
@@ -433,7 +434,8 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
-            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+            self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+                .await?;
             return Ok(());
         };
 
@@ -483,7 +485,41 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
-        crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
+        self.wake_role_dispatch(task_id, role_name, "task role assignment removed")
+            .await?;
+        Ok(())
+    }
+
+    /// Wake the Task whose assignment changed and every child whose effective
+    /// coder depends on that row. Children with an own coder are independent
+    /// overrides and keep any parked disposition they own.
+    async fn wake_role_dispatch(&self, task_id: &str, role_name: &str, reason: &str) -> Result<()> {
+        crate::wake_task_dispatch(&self.db, task_id, reason).await?;
+        if role_name != crate::workflow::default_roles::CODER {
+            return Ok(());
+        }
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        if task.parent_task_id.is_some() {
+            return Ok(());
+        }
+        for child in crate::task_hierarchy::ordered_children(&self.db, task_id).await? {
+            let own_coder = TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &child.id,
+                crate::workflow::default_roles::CODER,
+            )
+            .await?;
+            if own_coder.is_none() {
+                crate::wake_task_dispatch(
+                    &self.db,
+                    &child.id,
+                    "root default worker assignment changed",
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 

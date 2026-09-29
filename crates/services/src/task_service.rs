@@ -178,8 +178,9 @@ pub(crate) async fn execution_admission_for_task(
             role
         };
         Some(
-            TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, assignment_role)
+            crate::task_hierarchy::effective_role_assignment(db, task, assignment_role)
                 .await?
+                .map(|resolved| resolved.assignment)
                 .ok_or_else(|| {
                     ServiceError::conflict(format!(
                         "task {} has no assignment for workflow role {}",
@@ -1741,6 +1742,14 @@ impl TaskService {
                 {
                     return Ok(false);
                 }
+            } else if assignment_role == crate::workflow::default_roles::CODER
+                && task.parent_task_id.is_some()
+            {
+                // An inherited root assignment is admission authority, not
+                // live ownership of an already-running child. Root default
+                // changes intentionally affect only children that have not
+                // started, so an admitted child with no own coder keeps its
+                // current role attempt through completion.
             } else if execution.agent_id.is_some() {
                 return Ok(false);
             }

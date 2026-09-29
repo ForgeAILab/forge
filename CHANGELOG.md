@@ -6,6 +6,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Assigning `coder` on a coordination root now sets the default worker for
+  subtasks instead of returning an error; converting a Task into a
+  coordination root keeps its `coder` assignment instead of deleting it.
+
 ## [0.13.11] - 2026-09-30
 
 ### Added

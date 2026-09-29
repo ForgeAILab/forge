@@ -1589,8 +1589,9 @@ impl TaskService {
         };
 
         if let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &execution.role)
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, &execution.role)
                 .await?
+                .map(|resolved| resolved.assignment)
         {
             return Ok(assignment.assignee_type == Some(AssigneeKind::Agent)
                 && assignment.assignee_id.as_deref() == Some(agent_id));

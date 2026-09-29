@@ -168,18 +168,24 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let role_assignment = match execution.role.as_str() {
-            "executor" | crate::workflow::default_roles::CODER => {
-                self.coder_assignment(&task.id).await?
-            }
-            role => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?,
-        };
-        if !matches!(
-            role_assignment.as_ref(),
+        let resolved_assignment =
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, &execution.role)
+                .await?;
+        let assignment_matches = matches!(
+            resolved_assignment.as_ref().map(|resolved| &resolved.assignment),
             Some(assignment)
                 if assignment.assignee_type == Some(AssigneeKind::Agent)
                     && assignment.assignee_id.as_deref() == Some(&agent.id)
-        ) {
+        );
+        let admitted_inherited_attempt = matches!(
+            execution.role.as_str(),
+            "executor" | crate::workflow::default_roles::CODER
+        ) && task.parent_task_id.is_some()
+            && !resolved_assignment
+                .as_ref()
+                .is_some_and(|resolved| resolved.source == api_types::EffectiveCoderSource::Own)
+            && execution.agent_id.as_deref() == Some(&agent.id);
+        if !assignment_matches && !admitted_inherited_attempt {
             return Ok(false);
         }
         Ok(running_count <= agent.max_concurrent_tasks)

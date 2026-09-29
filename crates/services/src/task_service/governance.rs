@@ -1223,7 +1223,9 @@ impl TaskService {
         .fetch_one(self.db.pool())
         .await?;
         if let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role.trim()).await?
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, role.trim())
+                .await?
+                .map(|resolved| resolved.assignment)
         {
             if assignment.assignee_type != Some(db::AssigneeKind::Agent)
                 || assignment.assignee_id.as_deref() != Some(principal_id)

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use api_types::{Actor, StateDefinition, StateKind, SystemComponent, WorkflowDefinition};
 use db::{
     AgentRepo, DbError, ExecutionRepo, ExecutionStatus, PageRequest, Project, ReviewRepo, SortBy,
-    SortOrder, Task, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo,
+    SortOrder, Task, TaskRepo, TransitionLogRepo,
 };
 
 use crate::{
@@ -629,8 +629,9 @@ impl TaskDispatcher {
         }
         if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
             let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, role_name)
+                    .await?
+                    .map(|resolved| resolved.assignment);
             if helpers::role_assignment_unassigned(assignment.as_ref()) {
                 let Some(target) = self.resolve_initial_schedule_target(workflow, task).await?
                 else {
@@ -646,7 +647,9 @@ impl TaskDispatcher {
             return Ok(false);
         }
         let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, role_name)
+                .await?
+                .map(|resolved| resolved.assignment)
         else {
             return Ok(false);
         };

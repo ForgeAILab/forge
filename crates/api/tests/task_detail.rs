@@ -2,12 +2,95 @@
 mod common;
 
 use api_types::{
-    ExecutionResponse, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse,
-    TaskDetailResponse, TaskRelationsResponse, TaskResponse,
+    EffectiveCoderSource, ExecutionResponse, ExecutionSummaryResponse, PaginatedResponse,
+    ProjectResponse, TaskDetailResponse, TaskRelationsResponse, TaskResponse,
 };
 use axum::http::{Method, StatusCode};
-use db::{CreateExecution, ExecutionRepo, ExecutionStatus, TaskDependencyRepo};
+use db::{
+    new_uuid_v4, now_rfc3339, AssigneeKind, CreateExecution, CreateTaskRoleAssignment,
+    ExecutionRepo, ExecutionStatus, TaskDependencyRepo, TaskRoleAssignmentRepo,
+};
 use serde_json::json;
+
+#[tokio::test]
+async fn task_response_exposes_inherited_and_own_effective_coder_sources() {
+    let workspace_root = common::TestDir::new("task-effective-coder");
+    let harness = common::test_app(workspace_root.path(), "task-effective-coder").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Task effective coder" }),
+        StatusCode::OK,
+    )
+    .await;
+    let root = create_task(&harness.app, &project.id, "Root", None).await;
+    let child = create_task(&harness.app, &project.id, "Child", Some(root.id.clone())).await;
+    let now = now_rfc3339();
+    TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: root.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(AssigneeKind::User),
+            assignee_id: Some("root-worker".to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("root default worker assigns");
+
+    let inherited: TaskResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", child.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(inherited.role_assignments.is_empty());
+    assert_eq!(
+        inherited.effective_coder_source,
+        Some(EffectiveCoderSource::InheritedFromRoot)
+    );
+    let inherited_coder = inherited
+        .effective_coder
+        .expect("effective coder is present");
+    assert_eq!(inherited_coder.task_id, root.id);
+    assert_eq!(inherited_coder.assignee_id.as_deref(), Some("root-worker"));
+
+    let now = now_rfc3339();
+    TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: child.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(AssigneeKind::User),
+            assignee_id: Some("child-worker".to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("child override assigns");
+
+    let overridden: TaskResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", child.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        overridden.effective_coder_source,
+        Some(EffectiveCoderSource::Own)
+    );
+    let own_coder = overridden.effective_coder.expect("own coder is present");
+    assert_eq!(own_coder.task_id, child.id);
+    assert_eq!(own_coder.assignee_id.as_deref(), Some("child-worker"));
+}
 
 #[tokio::test]
 async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {

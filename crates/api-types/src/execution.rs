@@ -59,6 +59,15 @@ pub struct TaskActionsResponse {
     pub recovery_actions: Vec<RecoveryAction>,
 }
 
+/// Identifies where a Task's effective coder assignment is stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EffectiveCoderSource {
+    Own,
+    InheritedFromRoot,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {
@@ -79,6 +88,8 @@ pub struct TaskResponse {
     pub subtask_order: Option<i64>,
     #[serde(default)]
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
+    pub effective_coder: Option<TaskRoleAssignmentResponse>,
+    pub effective_coder_source: Option<EffectiveCoderSource>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
     pub remaining_retries: std::collections::HashMap<String, i64>,

@@ -859,8 +859,9 @@ impl TaskService {
         self.ensure_ordered_execution_admission(&task, role_name)
             .await?;
         let assignment =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, role_name)
                 .await?
+                .map(|resolved| resolved.assignment)
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(format!(
                         "task has no assignment for role {role_name}"
@@ -1694,8 +1695,9 @@ impl TaskService {
     ) -> Result<String> {
         if let Some(role_name) = self.current_effective_role_name(task).await? {
             if let Some(assignment) =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &role_name)
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, &role_name)
                     .await?
+                    .map(|resolved| resolved.assignment)
             {
                 if assignment.assignee_type == Some(AssigneeKind::Agent) {
                     if let Some(agent_id) = assignment.assignee_id {

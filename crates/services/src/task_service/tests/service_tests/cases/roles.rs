@@ -952,7 +952,7 @@ async fn reassign_subtask_coder_is_independent() {
 }
 
 #[tokio::test]
-async fn reassign_parent_coder_is_rejected_for_coordination_root() {
+async fn reassign_parent_coder_changes_coordination_root_default_worker() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -970,14 +970,34 @@ async fn reassign_parent_coder_is_rejected_for_coordination_root() {
         .expect("root coder assignment succeeds");
     seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
-    let result = service
+    let assignment = service
         .reassign_role(
-            role_assignment_input(&root.id, "coder", Some(agent_b), None),
+            role_assignment_input(&root.id, "coder", Some(agent_b.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("coordination root default worker changes");
+    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_b.as_str()));
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*db, &root.id, "coder")
+            .await
+            .expect("root execution count loads"),
+        0,
+        "changing the default worker must not execute the root"
+    );
+
+    let planner_result = service
+        .reassign_role(
+            role_assignment_input(&root.id, "planner", Some(agent_b), None),
             false,
             false,
         )
         .await;
-    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
+    assert!(matches!(
+        planner_result,
+        Err(ServiceError::InvalidOperation { .. })
+    ));
 }
 
 #[tokio::test]

@@ -171,7 +171,7 @@ async fn target_role_agent_id(ctx: &HookContext) -> Option<String> {
         .iter()
         .find(|state| state.name == ctx.to_state)?;
     let role = effective_role(state)?;
-    db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+    super::common::get_role_assignment(ctx, role)
         .await
         .ok()
         .flatten()
