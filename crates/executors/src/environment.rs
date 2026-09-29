@@ -6,8 +6,10 @@
 //! before an execution launches so an agent never spends a run rediscovering
 //! a missing toolchain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use api_types::{EnvironmentAsset, EnvironmentCheck, ProjectEnvironment};
@@ -20,6 +22,9 @@ pub const TASK_ENVIRONMENT_CONFIG_KEY: &str = "_forge_task_environment";
 
 /// Bytes of check output kept for the blocking annotation.
 const CHECK_OUTPUT_TAIL_BYTES: usize = 4096;
+
+/// Makes sibling staging paths unique within this Forge process.
+static ASSET_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Stamp the Project environment variables onto an in-memory executor config.
 pub fn mark_task_environment(config: &mut serde_json::Value, env: &BTreeMap<String, String>) {
@@ -54,10 +59,12 @@ pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<
         if !valid {
             return Err(format!("environment variable name {key:?} is not valid"));
         }
-        if key.starts_with("FORGE_") || key == "PWD" {
+        let uppercase = key.to_ascii_uppercase();
+        if uppercase.starts_with("FORGE_") || uppercase == "PWD" {
             return Err(format!("environment variable {key} is reserved by Forge"));
         }
     }
+    let mut targets: Vec<(String, Vec<String>)> = Vec::new();
     for asset in &environment.assets {
         if !Path::new(&asset.source).is_absolute() {
             return Err(format!(
@@ -65,11 +72,25 @@ pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<
                 asset.source
             ));
         }
-        worktree_relative(&asset.target)?;
+        let normalized = worktree_relative(&asset.target)?;
+        let key = normalized
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>();
+        if let Some((other, _)) = targets
+            .iter()
+            .find(|(_, candidate)| key.starts_with(candidate) || candidate.starts_with(&key))
+        {
+            return Err(format!(
+                "asset targets {:?} and {:?} overlap",
+                other, asset.target
+            ));
+        }
+        targets.push((asset.target.clone(), key));
     }
-    let mut names = std::collections::BTreeSet::new();
+    let mut names = BTreeSet::new();
     for check in &environment.checks {
-        if check.name.trim().is_empty() {
+        if check.name.trim().is_empty() || check.name.trim() != check.name {
             return Err("every environment check needs a name".to_owned());
         }
         if check.command.trim().is_empty() {
@@ -87,24 +108,45 @@ pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<
                 check.name
             ));
         }
+        let mut roles = BTreeSet::new();
+        for role in &check.roles {
+            if role.trim().is_empty() || role.trim() != role {
+                return Err(format!(
+                    "environment check {} has an invalid role",
+                    check.name
+                ));
+            }
+            if !roles.insert(role) {
+                return Err(format!(
+                    "environment check {} declares role {role} twice",
+                    check.name
+                ));
+            }
+        }
     }
     Ok(())
 }
 
 fn worktree_relative(target: &str) -> Result<PathBuf, String> {
     let path = Path::new(target);
-    let escapes = path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    });
-    if target.trim().is_empty() || escapes {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "asset target {target:?} must be a path inside the worktree"
+                ));
+            }
+        }
+    }
+    if target.trim().is_empty() || normalized.as_os_str().is_empty() {
         return Err(format!(
             "asset target {target:?} must be a path inside the worktree"
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(normalized)
 }
 
 /// Copy each asset whose target is absent into the worktree.
@@ -118,24 +160,66 @@ pub async fn materialize_assets(
     let worktree = worktree.to_path_buf();
     let assets = assets.to_vec();
     tokio::task::spawn_blocking(move || {
+        let canonical_worktree = worktree.canonicalize().map_err(|error| {
+            format!("failed to resolve worktree {}: {error}", worktree.display())
+        })?;
         for asset in &assets {
-            let target = worktree.join(worktree_relative(&asset.target)?);
-            if target.symlink_metadata().is_ok() {
-                continue;
-            }
             let source = Path::new(&asset.source);
-            if !source.exists() {
+            let source_metadata = source.symlink_metadata().map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    format!(
+                        "asset source {} does not exist on the Forge host",
+                        asset.source
+                    )
+                } else {
+                    format!("failed to inspect asset source {}: {error}", asset.source)
+                }
+            })?;
+            if source_metadata.file_type().is_symlink() {
                 return Err(format!(
-                    "asset source {} does not exist on the Forge host",
+                    "asset source {} must not be a symbolic link",
                     asset.source
                 ));
             }
-            copy_recursively(source, &target).map_err(|error| {
-                format!(
+            let canonical_source = source.canonicalize().map_err(|error| {
+                format!("failed to resolve asset source {}: {error}", asset.source)
+            })?;
+            if canonical_source.starts_with(&canonical_worktree)
+                || canonical_worktree.starts_with(&canonical_source)
+            {
+                return Err(format!(
+                    "asset source {} must be outside the worktree and must not contain it",
+                    asset.source
+                ));
+            }
+
+            let relative_target = worktree_relative(&asset.target)?;
+            let target = canonical_worktree.join(&relative_target);
+            ensure_safe_target_parent(&canonical_worktree, &relative_target)?;
+            match target.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!("asset target {} is a symbolic link", asset.target));
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "failed to inspect asset target {}: {error}",
+                        asset.target
+                    ));
+                }
+            }
+
+            let staging = staging_path(&target)?;
+            let copy_result = copy_recursively(&canonical_source, &staging)
+                .and_then(|()| std::fs::rename(&staging, &target));
+            if let Err(error) = copy_result {
+                remove_staging_path(&staging);
+                return Err(format!(
                     "failed to copy asset {} to {}: {error}",
                     asset.source, asset.target
-                )
-            })?;
+                ));
+            }
         }
         Ok(())
     })
@@ -144,18 +228,132 @@ pub async fn materialize_assets(
 }
 
 fn copy_recursively(source: &Path, target: &Path) -> std::io::Result<()> {
-    if source.is_dir() {
-        std::fs::create_dir_all(target)?;
+    let metadata = source.symlink_metadata()?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("symbolic link in asset source: {}", source.display()),
+        ));
+    }
+    if metadata.is_dir() {
+        std::fs::create_dir(target)?;
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
             copy_recursively(&entry.path(), &target.join(entry.file_name()))?;
         }
         return Ok(());
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported asset source type: {}", source.display()),
+        ));
     }
     std::fs::copy(source, target).map(|_| ())
+}
+
+fn ensure_safe_target_parent(worktree: &Path, target: &Path) -> Result<(), String> {
+    let mut current = worktree.to_path_buf();
+    let parent = target.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        let Component::Normal(part) = component else {
+            return Err(format!(
+                "asset target {:?} must be a path inside the worktree",
+                target.display()
+            ));
+        };
+        current.push(part);
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "asset target parent {} is a symbolic link",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "asset target parent {} is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| {
+                    format!(
+                        "failed to create asset target parent {}: {error}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect asset target parent {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn staging_path(target: &Path) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("asset target {} has no parent", target.display()))?;
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| format!("asset target {} has no file name", target.display()))?
+        .to_string_lossy();
+    for _ in 0..100 {
+        let nonce = ASSET_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging = parent.join(format!(
+            ".{file_name}.forge-asset-{}-{nonce}",
+            std::process::id()
+        ));
+        match staging.symlink_metadata() {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(staging),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect asset staging path {}: {error}",
+                    staging.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not allocate a staging path for asset target {}",
+        target.display()
+    ))
+}
+
+fn remove_staging_path(path: &Path) {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return;
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Redact declared environment values before command output is persisted.
+///
+/// Project settings are not a secret store, but this prevents an accidental
+/// `echo "$TOKEN"` from copying a configured value into durable logs and
+/// blocking annotations.
+#[must_use]
+pub fn redact_environment_values(text: &str, environment: &BTreeMap<String, String>) -> String {
+    let mut values = environment
+        .values()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values.into_iter().fold(text.to_owned(), |redacted, value| {
+        redacted.replace(value, "[REDACTED]")
+    })
 }
 
 /// A preflight check that did not pass.
@@ -217,6 +415,7 @@ pub async fn run_environment_checks(
             Ok(Ok(output)) if !output.status.success() => {
                 let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
                 text.push_str(&String::from_utf8_lossy(&output.stderr));
+                let text = redact_environment_values(&text, env);
                 return Some(failure(output.status.code(), false, output_tail(&text)));
             }
             Ok(Ok(_)) => {}
@@ -288,6 +487,37 @@ mod tests {
             ..ProjectEnvironment::default()
         };
         assert!(validate_project_environment(&duplicate).is_err());
+
+        let overlapping = ProjectEnvironment {
+            assets: vec![
+                EnvironmentAsset {
+                    source: "/srv/art".to_owned(),
+                    target: "vendor".to_owned(),
+                },
+                EnvironmentAsset {
+                    source: "/srv/models".to_owned(),
+                    target: "vendor/models".to_owned(),
+                },
+            ],
+            ..ProjectEnvironment::default()
+        };
+        assert!(validate_project_environment(&overlapping)
+            .expect_err("overlapping targets fail")
+            .contains("overlap"));
+
+        let duplicate_role = ProjectEnvironment {
+            checks: vec![check("browser", "true", &["reviewer", "reviewer"])],
+            ..ProjectEnvironment::default()
+        };
+        assert!(validate_project_environment(&duplicate_role).is_err());
+
+        for key in ["forge_task_id", "pwd"] {
+            let environment = ProjectEnvironment {
+                env: BTreeMap::from([(key.to_owned(), "x".to_owned())]),
+                ..ProjectEnvironment::default()
+            };
+            assert!(validate_project_environment(&environment).is_err(), "{key}");
+        }
     }
 
     #[tokio::test]
@@ -334,6 +564,76 @@ mod tests {
         assert!(error.contains("does not exist"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assets_refuse_symlink_escape_and_remove_partial_copies() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join("worktree");
+        let outside = dir.path().join("outside");
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::create_dir_all(&source).expect("source");
+        std::fs::write(source.join("a.txt"), "copied first").expect("source file");
+        symlink(&outside, worktree.join("escape")).expect("target symlink");
+
+        let escape = [EnvironmentAsset {
+            source: source.to_string_lossy().into_owned(),
+            target: "escape/asset".to_owned(),
+        }];
+        let error = materialize_assets(&worktree, &escape)
+            .await
+            .expect_err("target symlink is refused");
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(!outside.join("asset").exists());
+
+        std::fs::write(outside.join("secret.txt"), "secret").expect("outside file");
+        symlink(outside.join("secret.txt"), source.join("z-link")).expect("source symlink");
+        let partial = [EnvironmentAsset {
+            source: source.to_string_lossy().into_owned(),
+            target: "vendor".to_owned(),
+        }];
+        let error = materialize_assets(&worktree, &partial)
+            .await
+            .expect_err("source symlink is refused");
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(
+            !worktree.join("vendor").exists(),
+            "a failed copy must not leave a target that future runs skip"
+        );
+        assert!(
+            std::fs::read_dir(&worktree)
+                .expect("worktree reads")
+                .all(|entry| !entry
+                    .expect("entry reads")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("forge-asset")),
+            "staging paths are cleaned after failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_source_cannot_contain_or_live_in_the_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let worktree = dir.path().join("worktree");
+        let source_inside = worktree.join("source");
+        std::fs::create_dir_all(&source_inside).expect("worktree source");
+
+        for source in [dir.path(), source_inside.as_path()] {
+            let assets = [EnvironmentAsset {
+                source: source.to_string_lossy().into_owned(),
+                target: "vendor".to_owned(),
+            }];
+            let error = materialize_assets(&worktree, &assets)
+                .await
+                .expect_err("recursive source is refused");
+            assert!(error.contains("outside the worktree"), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn checks_gate_their_roles_and_see_project_env() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -371,5 +671,17 @@ mod tests {
             .expect("times out");
         assert!(failure.timed_out);
         assert!(failure.message().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn check_output_redacts_declared_environment_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = BTreeMap::from([("ACCESS_TOKEN".to_owned(), "very-secret".to_owned())]);
+        let checks = [check("token", "printf '%s' \"$ACCESS_TOKEN\"; exit 1", &[])];
+        let failure = run_environment_checks(dir.path(), &env, &checks, "coder")
+            .await
+            .expect("check fails");
+        assert!(!failure.output_tail.contains("very-secret"));
+        assert!(failure.output_tail.contains("[REDACTED]"));
     }
 }

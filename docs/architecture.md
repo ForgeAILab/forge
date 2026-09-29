@@ -447,7 +447,9 @@ configuration to `workspace-write` with network access, always with approvals
 set to `never`, unless the agent's permission policy is `yolo`: then the role
 runs with `danger-full-access` so real-browser QA, GUI toolchains, and local
 servers probed across commands work. The post-run read-only gate still
-discards a reviewer's authored changes.
+discards a reviewer's authored changes in the Task worktree, but it does not
+constrain or audit filesystem writes, processes, credentials, or network side
+effects elsewhere on the host. `yolo` is full host authority.
 Forge runs CLI harnesses headless, so nobody can answer a per-tool prompt:
 `supervised` maps to the same unattended mode as `auto` (Claude Code
 `bypassPermissions`, Gemini/Smith `--yolo`, Cursor `--force`, OpenCode
@@ -636,8 +638,10 @@ like the Task role, carried through fallback-candidate normalization
 (`executors::adapter::apply_runtime_scope`) but never part of candidate
 identity — and `cli_adapters::command::run_in_task_worktree` and the shell
 executor set it on the child process before Forge's own variables. Assets are
-copied only when the target is absent. A failing check terminalizes the
-execution through `fail_execution_before_dispatch` and parks the Task with a
+copied through a sibling staging path and atomically renamed only when the
+target is absent; symlink traversal and recursive/overlapping declarations are
+refused. A failing check terminalizes the execution through the dedicated
+pre-dispatch environment failure path and parks the Task with a
 `FailureKind::EnvironmentNotReady` annotation (`reexecute`, `cancel_task`),
 so no agent run or retry budget is spent. Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks

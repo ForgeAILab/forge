@@ -198,6 +198,10 @@ async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
         }),
     )
     .await;
+    let before = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads before dispatch")
+        .expect("task exists before dispatch");
 
     let registry = Arc::new(cli_adapters::default_registry());
     let executor = executors::AdapterExecutor::new(registry);
@@ -217,6 +221,11 @@ async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
         .await
         .expect("task loads")
         .expect("task exists");
+    assert_eq!(
+        current.version,
+        before.version + 1,
+        "the typed environment block is the only Task projection"
+    );
     let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
         current
             .error_annotation

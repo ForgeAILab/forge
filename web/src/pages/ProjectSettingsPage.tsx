@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useReducer, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import type { Icon } from '@phosphor-icons/react'
@@ -35,17 +35,18 @@ import { ErrorBanner } from '@/components/error-banner'
 import { McpInstallControls } from '@/components/mcp-install-controls'
 import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
+import { EnvironmentTab } from '@/components/settings/EnvironmentTab'
 import {
-  EnvironmentTab,
-  environmentTextFromSettings,
   parseEnvironmentText,
-} from '@/components/settings/EnvironmentTab'
+  useProjectEnvironmentText,
+} from '@/components/settings/environment-utils'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
 import { MembersTab } from '@/components/settings/MembersTab'
 import { RepoDialog } from '@/components/settings/RepoDialog'
 import { ReposTab } from '@/components/settings/ReposTab'
 import { SettingsSection } from '@/components/settings/SettingsSection'
+import type { ProjectSettingsTab } from '@/components/settings/project-settings-tabs'
 import { WorkflowTab } from '@/components/settings/WorkflowTab'
 import {
   ciStepsFromReviewConfig,
@@ -70,17 +71,6 @@ import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
 
-export type ProjectSettingsTab =
-  | 'general'
-  | 'repos'
-  | 'members'
-  | 'mcp'
-  | 'hooks'
-  | 'environment'
-  | 'analytics'
-  | 'workflow'
-  | 'danger'
-
 const SETTINGS_TABS: Array<{
   id: ProjectSettingsTab
   label: string
@@ -98,8 +88,29 @@ const SETTINGS_TABS: Array<{
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
 ]
 
-export function isProjectSettingsTab(value: string | undefined): value is ProjectSettingsTab {
-  return SETTINGS_TABS.some((tab) => tab.id === value)
+interface ProjectFormState {
+  name: string
+  ciSteps: string[]
+  lifecycleHooks: LifecycleHooks
+  defaultRoleSelections: Record<string, string>
+  automaticRecoveryEnabled: boolean
+  automaticRecoveryAgentId: string
+}
+
+const EMPTY_PROJECT_FORM: ProjectFormState = {
+  name: '',
+  ciSteps: [],
+  lifecycleHooks: {},
+  defaultRoleSelections: {},
+  automaticRecoveryEnabled: false,
+  automaticRecoveryAgentId: '',
+}
+
+function mergeProjectForm(
+  state: ProjectFormState,
+  patch: Partial<ProjectFormState>,
+): ProjectFormState {
+  return { ...state, ...patch }
 }
 
 export function ProjectSettingsPage({
@@ -122,26 +133,24 @@ export function ProjectSettingsPage({
 
   const [deletingProject, setDeletingProject] = useState(false)
 
-  // Form state (all needed by saveProject)
-  const [name, setName] = useState('')
-  const [ciSteps, setCiSteps] = useState<string[]>([])
-  const [lifecycleHooks, setLifecycleHooks] = useState<LifecycleHooks>({})
-  const [defaultRoleSelections, setDefaultRoleSelections] = useState<Record<string, string>>({})
-  const [automaticRecoveryEnabled, setAutomaticRecoveryEnabled] = useState(false)
-  const [automaticRecoveryAgentId, setAutomaticRecoveryAgentId] = useState('')
-  const [environmentText, setEnvironmentText] = useState('')
-
+  // The general/hooks form initializes atomically from one Project revision.
+  const [form, updateForm] = useReducer(mergeProjectForm, EMPTY_PROJECT_FORM)
+  const {
+    name,
+    ciSteps,
+    lifecycleHooks,
+    defaultRoleSelections,
+    automaticRecoveryEnabled,
+    automaticRecoveryAgentId,
+  } = form
   const project = projectQuery.data
   const roles = workflowQuery.data?.roles ?? []
   const agents = agentsQuery.data?.items ?? []
+  const [environmentText, setEnvironmentText] = useProjectEnvironmentText(project?.settings)
 
   useEffect(() => {
     if (!project) return
     const timeout = window.setTimeout(() => {
-      setName(project.name)
-      setCiSteps(ciStepsFromReviewConfig(project.default_review_config))
-      setLifecycleHooks(lifecycleHooksFromSettings(project.settings))
-      setEnvironmentText(environmentTextFromSettings(project.settings))
       const rawAssignments = project.settings?.default_role_assignments
       const assignments: DefaultRoleAssignment[] = Array.isArray(rawAssignments)
         ? rawAssignments
@@ -156,14 +165,18 @@ export function ProjectSettingsPage({
           selections[a.role_name] = `user:${a.assignee_id}`
         }
       }
-      setDefaultRoleSelections(selections)
       const rawRecovery = isRecord(project.settings?.automatic_recovery)
         ? project.settings.automatic_recovery
         : {}
-      setAutomaticRecoveryEnabled(rawRecovery.enabled === true)
-      setAutomaticRecoveryAgentId(
-        typeof rawRecovery.agent_id === 'string' ? rawRecovery.agent_id : '',
-      )
+      updateForm({
+        name: project.name,
+        ciSteps: ciStepsFromReviewConfig(project.default_review_config),
+        lifecycleHooks: lifecycleHooksFromSettings(project.settings),
+        defaultRoleSelections: selections,
+        automaticRecoveryEnabled: rawRecovery.enabled === true,
+        automaticRecoveryAgentId:
+          typeof rawRecovery.agent_id === 'string' ? rawRecovery.agent_id : '',
+      })
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [project])
@@ -190,11 +203,6 @@ export function ProjectSettingsPage({
     }
     if (automaticRecoveryEnabled && !automaticRecoveryAgentId) {
       toast.error('Automatic recovery requires an agent')
-      return
-    }
-    const environment = parseEnvironmentText(environmentText)
-    if (!environment.ok) {
-      toast.error(environment.error)
       return
     }
     const settingsWithoutRolePrompts: Record<string, unknown> = {
@@ -233,7 +241,6 @@ export function ProjectSettingsPage({
         agent_id: automaticRecoveryEnabled ? automaticRecoveryAgentId : null,
         max_attempts: 1,
       },
-      environment: environment.value ?? { env: {}, assets: [], checks: [] },
     }
     updateProject.mutate(
       {
@@ -251,6 +258,31 @@ export function ProjectSettingsPage({
       {
         onError: (error) => toast.error(settingsErrorMessage(error, 'Project update failed')),
         onSuccess: () => toast.success('Project settings saved'),
+      },
+    )
+  }
+
+  const saveEnvironment = () => {
+    if (!project || updateProject.isPending) return
+    const environment = parseEnvironmentText(environmentText)
+    if (!environment.ok) {
+      toast.error(environment.error)
+      return
+    }
+    updateProject.mutate(
+      {
+        projectId,
+        body: {
+          version: project.version,
+          settings: {
+            ...(isRecord(project.settings) ? project.settings : {}),
+            environment: environment.value ?? { env: {}, assets: [], checks: [] },
+          },
+        },
+      },
+      {
+        onError: (error) => toast.error(settingsErrorMessage(error, 'Environment update failed')),
+        onSuccess: () => toast.success('Project environment saved'),
       },
     )
   }
@@ -346,12 +378,18 @@ export function ProjectSettingsPage({
               agentsIsError={agentsQuery.isError}
               automaticRecoveryEnabled={automaticRecoveryEnabled}
               automaticRecoveryAgentId={automaticRecoveryAgentId}
-              onNameChange={setName}
+              onNameChange={(name) => updateForm({ name })}
               onTogglePaused={toggleProjectPaused}
-              onCiStepsChange={setCiSteps}
-              onDefaultRoleSelectionsChange={setDefaultRoleSelections}
-              onAutomaticRecoveryEnabledChange={setAutomaticRecoveryEnabled}
-              onAutomaticRecoveryAgentIdChange={setAutomaticRecoveryAgentId}
+              onCiStepsChange={(ciSteps) => updateForm({ ciSteps })}
+              onDefaultRoleSelectionsChange={(defaultRoleSelections) =>
+                updateForm({ defaultRoleSelections })
+              }
+              onAutomaticRecoveryEnabledChange={(automaticRecoveryEnabled) =>
+                updateForm({ automaticRecoveryEnabled })
+              }
+              onAutomaticRecoveryAgentIdChange={(automaticRecoveryAgentId) =>
+                updateForm({ automaticRecoveryAgentId })
+              }
               onSave={saveProject}
             />
           )}
@@ -370,7 +408,7 @@ export function ProjectSettingsPage({
               canSave={Boolean(project)}
               isSaving={updateProject.isPending}
               lifecycleHooks={lifecycleHooks}
-              onLifecycleHooksChange={setLifecycleHooks}
+              onLifecycleHooksChange={(lifecycleHooks) => updateForm({ lifecycleHooks })}
               onSave={saveProject}
             />
           )}
@@ -382,7 +420,7 @@ export function ProjectSettingsPage({
               isSaving={updateProject.isPending}
               environmentText={environmentText}
               onEnvironmentTextChange={setEnvironmentText}
-              onSave={saveProject}
+              onSave={saveEnvironment}
             />
           )}
 

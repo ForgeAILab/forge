@@ -118,7 +118,7 @@ fn default_environment_check_timeout() -> u64 {
 /// must pass or the Task is parked as `environment_not_ready` without
 /// spending an agent run.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct ProjectEnvironment {
     #[serde(default)]
@@ -139,7 +139,7 @@ impl ProjectEnvironment {
 /// fixtures) that every worktree needs. Copied only when `target` is absent,
 /// so a tracked or already-present path is never overwritten.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct EnvironmentAsset {
     /// Absolute path on the Forge host.
@@ -150,7 +150,7 @@ pub struct EnvironmentAsset {
 
 /// A cheap probe run with `bash -lc` in the worktree before an execution.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct EnvironmentCheck {
     pub name: String,

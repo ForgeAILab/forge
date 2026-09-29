@@ -194,6 +194,20 @@ async fn the_project_environment_is_validated() {
             json!({ "checks": [{ "name": "slow", "command": "true", "timeout_seconds": 0 }] }),
             "positive timeout",
         ),
+        (
+            json!({ "checks": [{ "name": "browser", "command": "true", "roles": ["reviewre"] }] }),
+            "unknown role",
+        ),
+        (
+            json!({
+                "assets": [
+                    { "source": "/srv/art", "target": "vendor" },
+                    { "source": "/srv/models", "target": "vendor/models" }
+                ]
+            }),
+            "overlap",
+        ),
+        (json!({ "enb": { "TOOL": "path" } }), "unknown field"),
     ] {
         let error = validate_project_settings(
             &db,

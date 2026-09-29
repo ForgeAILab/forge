@@ -24,7 +24,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `workspace-write`. The recorded execution policy already claimed full access;
   the sandbox now matches it. Reviewers that need a real browser or a writable
   `$HOME` (Chromium, Playwright, Godot editor state) no longer come back
-  `blocked` by the sandbox.
+  `blocked` by the sandbox. This is full host authority; Forge's reviewer
+  cleanup protects only the Task worktree, not side effects elsewhere.
 
 ## [0.13.8] - 2026-09-27
 

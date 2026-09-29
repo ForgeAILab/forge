@@ -867,8 +867,14 @@ pub(super) async fn run_ci_steps_in_worktree(
             .await
             .map_err(|error| error.to_string())?;
         let finished_at = now_rfc3339();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = executors::environment::redact_environment_values(
+            &String::from_utf8_lossy(&output.stderr),
+            env,
+        );
+        let stdout = executors::environment::redact_environment_values(
+            &String::from_utf8_lossy(&output.stdout),
+            env,
+        );
         let output_tail = if stdout.is_empty() {
             stderr.clone()
         } else if stderr.is_empty() {

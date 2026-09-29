@@ -275,6 +275,25 @@ export interface ProjectSettings {
   default_role_assignments: DefaultRoleAssignment[]
   lifecycle_hooks: LifecycleHooks
   automatic_recovery: AutomaticRecoverySettings
+  environment: ProjectEnvironment
+}
+
+export interface ProjectEnvironment {
+  env: Record<string, string>
+  assets: EnvironmentAsset[]
+  checks: EnvironmentCheck[]
+}
+
+export interface EnvironmentAsset {
+  source: string
+  target: string
+}
+
+export interface EnvironmentCheck {
+  name: string
+  command: string
+  roles: string[]
+  timeout_seconds: number
 }
 
 export interface AutomaticRecoverySettings {

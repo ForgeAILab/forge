@@ -1964,11 +1964,16 @@ ten-minute review at a time:
 - `env` is set on every executor process (all CLI harnesses and the shell
   executor), on review `setup_steps`/`ci_steps`/required checks, and on
   lifecycle hooks. Forge's own `FORGE_*` variables and `PWD` are reserved and
-  always win. Remote daemons receive `env` with the start command.
+  always win. Remote daemons receive `env` with the start command. Project
+  settings are stored as plain text and readable through the API: `env` is
+  configuration, not a secret store. Use the executor's credential provider
+  for tokens and passwords.
 - `assets` copy a host file or directory (absolute `source`) to a
   worktree-relative `target` immediately before each local execution, and into
   the clean checkout that runs review checks. A target that already exists is
   never overwritten, so tracked content and earlier copies are left alone.
+  Copies are staged and renamed atomically; symbolic links, overlapping
+  targets, and sources inside (or containing) the worktree are refused.
 - `checks` run with `bash -lc` in the worktree, in order, immediately before a
   local execution whose role is listed in `roles` (empty means every role).
   `timeout_seconds` defaults to 120. The first failing check fails the
@@ -1979,8 +1984,9 @@ ten-minute review at a time:
 
 `PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
 invalid or reserved, whose asset source is not absolute or whose target
-escapes the worktree, or whose checks are unnamed, duplicated, empty, or have
-a zero timeout.
+escapes/overlaps another target, or whose checks are unnamed, duplicated,
+empty, use unknown or duplicate roles, or have a zero timeout. Unknown fields
+in the environment document are refused instead of being ignored.
 
 A ready Project Agent can configure the independent checks without receiving
 general settings authority through the typed native `project.review_config`

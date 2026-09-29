@@ -17,7 +17,7 @@ import { AppShell } from '@/components/app-shell'
 import type { ExecutionViewerMode } from '@/components/execution-viewer'
 import type { AccountTab } from '@/pages/AccountPage'
 import type { ForgeSettingsTab } from '@/pages/ForgeSettingsPage'
-import type { ProjectSettingsTab } from '@/pages/ProjectSettingsPage'
+import { isProjectSettingsTab } from '@/components/settings/project-settings-tabs'
 import type { TaskDetailTab } from '@/pages/TaskDetailPage'
 import type { TaskListSortBy, TaskListSortOrder } from '@/pages/TaskListPage'
 import type { PaginatedResponse, Project } from '@/types/generated'
@@ -85,16 +85,6 @@ const TaskListPage = lazy(() =>
 
 const accountTabs = new Set<AccountTab>(['profile', 'tokens', 'analytics'])
 const forgeSettingsTabs = new Set<ForgeSettingsTab>(['server', 'agent', 'paths'])
-const projectSettingsTabs = new Set<ProjectSettingsTab>([
-  'general',
-  'repos',
-  'members',
-  'mcp',
-  'hooks',
-  'analytics',
-  'workflow',
-  'danger',
-])
 const taskDetailTabs = new Set<TaskDetailTab>([
   'overview',
   'executions',
@@ -111,10 +101,6 @@ function isAccountTab(value: string | undefined): value is AccountTab {
 
 function isForgeSettingsTab(value: string | undefined): value is ForgeSettingsTab {
   return value !== undefined && forgeSettingsTabs.has(value as ForgeSettingsTab)
-}
-
-function isProjectSettingsTab(value: string | undefined): value is ProjectSettingsTab {
-  return value !== undefined && projectSettingsTabs.has(value as ProjectSettingsTab)
 }
 
 function isTaskDetailTab(value: string | undefined): value is TaskDetailTab {

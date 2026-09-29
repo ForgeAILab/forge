@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { environmentTextFromSettings, parseEnvironmentText } from './EnvironmentTab'
+import {
+  ENVIRONMENT_EXAMPLE,
+  environmentTextFromSettings,
+  parseEnvironmentText,
+} from './environment-utils'
 
 describe('environment settings text', () => {
   it('shows nothing for an empty or missing environment', () => {
@@ -23,5 +27,9 @@ describe('environment settings text', () => {
     expect(parseEnvironmentText('  ')).toEqual({ ok: true, value: null })
     expect(parseEnvironmentText('[]')).toMatchObject({ ok: false })
     expect(parseEnvironmentText('{ nope')).toMatchObject({ ok: false })
+  })
+
+  it('does not recommend disabling the browser sandbox', () => {
+    expect(ENVIRONMENT_EXAMPLE).not.toContain('--no-sandbox')
   })
 })

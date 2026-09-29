@@ -281,6 +281,29 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
+        self.fail_execution_before_dispatch_inner(execution_id, error, true)
+            .await
+    }
+
+    /// Terminalize a pre-dispatch execution while leaving its Task projection
+    /// to the caller. Environment failures use their own typed blocking
+    /// annotation and must not briefly publish the generic executor-failed
+    /// projection first.
+    pub(super) async fn fail_execution_before_dispatch_without_task_block(
+        &self,
+        execution_id: &str,
+        error: String,
+    ) -> Result<db::Execution> {
+        self.fail_execution_before_dispatch_inner(execution_id, error, false)
+            .await
+    }
+
+    async fn fail_execution_before_dispatch_inner(
+        &self,
+        execution_id: &str,
+        error: String,
+        block_task: bool,
+    ) -> Result<db::Execution> {
         // A WorkspaceLease or optimistic-version mismatch here is the
         // in-transition dispatch race: the lease was pinned to the Task
         // version observed inside the transition and the commit moved it.
@@ -366,7 +389,7 @@ impl TaskService {
         match outcome {
             ExecutionTerminalOutcome::Committed { execution, .. } => {
                 super::publish_terminal_execution_event(self, &execution);
-                if should_block_task_for_failed_execution(&execution) {
+                if block_task && should_block_task_for_failed_execution(&execution) {
                     if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
                         tracing::warn!(
                             execution_id = %execution.id,

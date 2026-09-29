@@ -65,7 +65,7 @@ impl TaskService {
             "execution parked before launch by a Project environment check"
         );
         let failed = self
-            .fail_execution_before_dispatch(&execution.id, message.clone())
+            .fail_execution_before_dispatch_without_task_block(&execution.id, message.clone())
             .await?;
         self.block_task_for_environment(task, execution, message)
             .await?;
@@ -112,6 +112,21 @@ impl TaskService {
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, &current.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", current.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &current,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Dispatch),
+        );
+        if workflow.state_kind(&current.status) == Some(api_types::StateKind::Terminal)
+            || !ExecutionRepo::list_running_by_task(&*self.db, &current.id)
+                .await?
+                .is_empty()
+        {
+            return Ok(());
+        }
         let updated = TaskRepo::update_status(
             &*self.db,
             UpdateTaskStatus {

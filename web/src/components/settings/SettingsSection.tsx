@@ -14,7 +14,7 @@ export function SettingsSection({
 }) {
   return (
     <section className="border-b py-6 last:border-b-0">
-      <div className="grid grid-cols-[220px_1fr] items-start gap-8">
+      <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-[220px_minmax(0,1fr)] sm:gap-8">
         <div>
           <h3
             className={cn(
@@ -28,7 +28,7 @@ export function SettingsSection({
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
           )}
         </div>
-        <div>{children}</div>
+        <div className="min-w-0">{children}</div>
       </div>
     </section>
   )

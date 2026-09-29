@@ -642,8 +642,12 @@ impl ReviewRunner {
         let mut writer =
             LogWriter::new(&req.logs_path, reviewer_execution.id.clone(), MAX_LOG_BYTES);
         let mut step_results = Vec::new();
-        let environment =
-            crate::contract::project_environment(&self.db, &req.task_id.to_string()).await;
+        let environment = crate::contract::project_environment(&self.db, &req.task_id.to_string())
+            .await
+            .map_err(|reason| ReviewError::Conformance {
+                execution_id: reviewer_execution.id.clone(),
+                reason,
+            })?;
 
         for (index, step) in ci_steps.iter().enumerate() {
             let started_at = now_rfc3339();
@@ -656,8 +660,14 @@ impl ReviewRunner {
                 .await?;
             let finished_at = now_rfc3339();
 
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let stdout = executors::environment::redact_environment_values(
+                &String::from_utf8_lossy(&output.stdout),
+                &environment.env,
+            );
+            let stderr = executors::environment::redact_environment_values(
+                &String::from_utf8_lossy(&output.stderr),
+                &environment.env,
+            );
             let combined_output = combined_output(&stdout, &stderr);
             let exit_code = exit_code(output.status);
             let result = StepResult {
