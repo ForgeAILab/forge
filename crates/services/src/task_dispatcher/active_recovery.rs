@@ -174,7 +174,8 @@ impl TaskDispatcher {
             if let Some(role_name) = effective_role(state) {
                 let reconciliation_result = if role_name == crate::workflow::default_roles::REVIEWER
                 {
-                    self.reconcile_terminal_reviewer_execution(&task.id).await
+                    self.reconcile_terminal_reviewer_execution(&task.id, project.version)
+                        .await
                 } else {
                     self.reconcile_terminal_role_execution(&task, role_name, project.version)
                         .await
@@ -374,10 +375,8 @@ impl TaskDispatcher {
             return Ok(ReviewerReconciliation::None);
         }
         let superseded_project_authority =
-            crate::task_service::execution::execution_uses_brokered_plan(&execution)
-                && crate::task_service::execution::brokered_plan_dispatch_project_version(
-                    &execution,
-                ) != Some(project_version);
+            crate::task_service::execution_dispatch_project_version(&execution)
+                != Some(project_version);
         if claimed_execution_id.is_none()
             && crate::task_service::execution::execution_completion_settled_for_current_state_entry(
                 &self.db, task, &execution,
@@ -399,9 +398,9 @@ impl TaskDispatcher {
             .maybe_cascade_executor_completion(&execution.id)
             .await?;
         Ok(if superseded_project_authority {
-            // Cascade discarded any private candidate/claim. The immutable
-            // dispatch revision proves this execution cannot settle the
-            // current workflow, so continue to normal replacement dispatch.
+            // Cascade ignored this superseded execution (and discarded any
+            // private plan authority it owned). Continue to normal replacement
+            // dispatch under the current workflow revision.
             ReviewerReconciliation::None
         } else {
             ReviewerReconciliation::Reconciled
@@ -470,7 +469,8 @@ impl TaskDispatcher {
             return Ok(false);
         }
         let reviewer_reconciliation = if role_name == crate::workflow::default_roles::REVIEWER {
-            self.reconcile_terminal_reviewer_execution(&task.id).await?
+            self.reconcile_terminal_reviewer_execution(&task.id, project.version)
+                .await?
         } else {
             self.reconcile_terminal_role_execution(task, role_name, project.version)
                 .await?
@@ -735,6 +735,7 @@ impl TaskDispatcher {
     async fn reconcile_terminal_reviewer_execution(
         &self,
         task_id: &str,
+        project_version: i64,
     ) -> Result<ReviewerReconciliation> {
         let page = ExecutionRepo::list_by_task_and_role(
             &*self.db,
@@ -753,6 +754,15 @@ impl TaskDispatcher {
             return Ok(ReviewerReconciliation::None);
         };
         if execution.status == ExecutionStatus::Running {
+            return Ok(ReviewerReconciliation::None);
+        }
+        if crate::task_service::execution_dispatch_project_version(&execution)
+            != Some(project_version)
+        {
+            // The completion cascade intentionally ignores terminal effects
+            // admitted by an older Project revision. That inert success is
+            // not reconciliation: let normal recovery launch a replacement
+            // reviewer under the current workflow authority.
             return Ok(ReviewerReconciliation::None);
         }
         let reviews = ReviewRepo::list_by_task(&*self.db, task_id).await?;

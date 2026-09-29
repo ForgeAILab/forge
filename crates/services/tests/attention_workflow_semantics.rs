@@ -185,13 +185,16 @@ impl Fixture {
         let actor = Actor::user(UserActionSource::Api);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, &actor);
+        let event_bus = Arc::new(events::EventBus::new(16));
+        let task_service = services::TaskService::new(Arc::clone(&self.db), Arc::clone(&event_bus));
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
-            event_bus: Arc::new(events::EventBus::new(16)),
+            event_bus,
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
             task_executor: None,
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,

@@ -163,6 +163,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         merge_service: ctx.merge_service.clone(),
         cleanup_scheduler: ctx.cleanup_scheduler.clone(),
         task_executor: ctx.task_executor.clone(),
+        task_service: ctx.task_service.clone(),
         daemon_connections: ctx.daemon_connections.clone(),
         workspace_exec_locks: ctx.workspace_exec_locks.clone(),
         terminal_activity: ctx.terminal_activity.clone(),

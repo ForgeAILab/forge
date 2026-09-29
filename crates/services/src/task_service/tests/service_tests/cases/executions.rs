@@ -1381,7 +1381,7 @@ async fn planner_completion_advances_default_planning_gate() {
     let task = seed_task_with_status(
         &db,
         &project_id,
-        crate::workflow::default_states::PLANNING.to_owned(),
+        crate::workflow::default_states::TODO.to_owned(),
     )
     .await;
     seed_role_assignment(
@@ -1392,15 +1392,38 @@ async fn planner_completion_advances_default_planning_gate() {
     )
     .await;
 
-    let execution = service
-        .dispatch_initial_role_execution(
-            &task.id,
-            &agent_id,
-            crate::workflow::default_roles::PLANNER,
-            "plan the task".to_owned(),
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after role assignment")
+        .expect("task exists");
+    let in_flight = service
+        .claim_completion_cascade(&task.id)
+        .expect("originating service claims the Task completion slot");
+    service
+        .transition(
+            task.id.clone(),
+            crate::workflow::default_states::PLANNING.to_owned(),
+            task.version,
         )
         .await
-        .expect("planner dispatch succeeds");
+        .expect("workflow transition dispatches the planner");
+    let execution = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("planner executions load")
+    .items
+    .into_iter()
+    .find(|execution| execution.role == crate::workflow::default_roles::PLANNER)
+    .expect("the workflow hook creates a planner execution");
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
@@ -1416,6 +1439,46 @@ async fn planner_completion_advances_default_planning_gate() {
     })
     .await
     .expect("planner execution completes");
+
+    let early_settlement = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        loop {
+            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+                .await
+                .expect("transition logs load while completion slot is held");
+            if logs.iter().any(|log| {
+                log.from_state == crate::workflow::default_states::PLANNING
+                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
+            }) || workspace_root
+                .path()
+                .join(&task.id)
+                .join("plan.md")
+                .exists()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        early_settlement.is_err(),
+        "the workflow-dispatched runner must wait on the originating service's completion slot"
+    );
+    let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads while completion slot is held")
+        .expect("task exists");
+    assert_eq!(
+        waiting.status,
+        crate::workflow::default_states::PLANNING,
+        "the workflow-dispatched runner must share the originating service's completion slot"
+    );
+    let plan_path = workspace_root.path().join(&task.id).join("plan.md");
+    assert!(
+        !plan_path.exists(),
+        "plan publication waits for the shared completion slot"
+    );
+    drop(in_flight);
 
     // The default planning gate is not a human approval boundary: the
     // finished planner advances the Task instead of leaving a plan-review
@@ -1444,8 +1507,7 @@ async fn planner_completion_advances_default_planning_gate() {
     assert!(metadata.extra.get("awaiting_human").is_none());
     assert!(metadata.extra.get("awaiting_human_reason").is_none());
     assert_eq!(
-        std::fs::read_to_string(workspace_root.path().join(&task.id).join("plan.md"))
-            .expect("the terminal-CAS winner publishes the plan"),
+        std::fs::read_to_string(plan_path).expect("the terminal-CAS winner publishes the plan"),
         "- [ ] implement the plan\n"
     );
     let outbox = executors::execution_outbox_path(

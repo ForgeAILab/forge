@@ -265,6 +265,8 @@ mod subtask_hook_test_support {
             .await
             .expect("project reloads")
             .expect("project exists");
+        let event_bus = Arc::new(EventBus::new(16));
+        let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
 
         (
             HookContext {
@@ -273,7 +275,7 @@ mod subtask_hook_test_support {
                 from_state: from_state.to_owned(),
                 to_state: to_state.to_owned(),
                 db,
-                event_bus: Arc::new(EventBus::new(16)),
+                event_bus,
                 gate_config: None,
                 workflow: Arc::new(default_workflow::default_workflow()),
                 project_version: Some(project.version),
@@ -283,6 +285,7 @@ mod subtask_hook_test_support {
                 merge_service: None,
                 cleanup_scheduler: None,
                 task_executor: None,
+                task_service,
                 daemon_connections: None,
                 workspace_exec_locks: None,
                 terminal_activity: None,

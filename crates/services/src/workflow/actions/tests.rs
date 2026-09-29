@@ -453,6 +453,13 @@ async fn build_role_dispatch_harness(
         .find(|state| state.name == to_state)
         .and_then(|state| state.gate_config.clone());
     let (tx, rx) = mpsc::unbounded_channel();
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     DispatchHarness {
         ctx: HookContext {
@@ -461,7 +468,7 @@ async fn build_role_dispatch_harness(
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: Some(project.version),
@@ -470,12 +477,13 @@ async fn build_role_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_executor: Some(task_executor),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,
@@ -507,6 +515,13 @@ async fn build_no_repo_dispatch_harness(
         .find(|state| state.name == default_states::IN_PROGRESS)
         .and_then(|state| state.gate_config.clone());
     let (tx, rx) = mpsc::unbounded_channel();
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     DispatchHarness {
         ctx: HookContext {
@@ -515,7 +530,7 @@ async fn build_no_repo_dispatch_harness(
             from_state: default_states::TODO.to_owned(),
             to_state: default_states::IN_PROGRESS.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: None,
@@ -524,12 +539,13 @@ async fn build_no_repo_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_executor: Some(task_executor),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,
@@ -611,6 +627,8 @@ async fn build_test_ctx(
         .await
         .expect("project reloads")
         .expect("project exists");
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
 
     HookContext {
         task_id: task_id.to_owned(),
@@ -618,7 +636,7 @@ async fn build_test_ctx(
         from_state: from_state.to_owned(),
         to_state: to_state.to_owned(),
         db,
-        event_bus: Arc::new(EventBus::new(16)),
+        event_bus,
         gate_config,
         workflow,
         project_version: Some(project.version),
@@ -628,6 +646,7 @@ async fn build_test_ctx(
         merge_service: None,
         cleanup_scheduler: None,
         task_executor: None,
+        task_service,
         daemon_connections: None,
         workspace_exec_locks: None,
         terminal_activity: None,
@@ -2954,6 +2973,13 @@ async fn build_reviewer_dispatch_harness(
         .await
         .expect("project reloads")
         .expect("project exists");
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_executor: Arc<dyn TaskExecutor> = Arc::new(PendingExecutor { sender: tx });
+    let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::clone(&task_executor))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::clone(&repo_cache_locks));
 
     let mut harness = DispatchHarness {
         ctx: HookContext {
@@ -2962,7 +2988,7 @@ async fn build_reviewer_dispatch_harness(
             from_state: default_states::IN_PROGRESS.to_owned(),
             to_state: default_states::REVIEW.to_owned(),
             db,
-            event_bus: Arc::new(EventBus::new(16)),
+            event_bus,
             gate_config,
             workflow,
             project_version: Some(project.version),
@@ -2971,12 +2997,13 @@ async fn build_reviewer_dispatch_harness(
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: Some(Arc::new(PendingExecutor { sender: tx })),
+            task_executor: Some(task_executor),
+            task_service,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
             workspace_root: workspace_root.path().to_path_buf(),
-            repo_cache_locks: Some(Arc::new(RepoCacheLockManager::default())),
+            repo_cache_locks: Some(repo_cache_locks),
             workspace_id: None,
             agent_id: None,
             execution_id: None,

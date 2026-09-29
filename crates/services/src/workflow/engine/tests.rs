@@ -219,6 +219,7 @@ impl TaskExecutor for PendingExecutor {
 }
 
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
+    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     WorkflowEngine {
         db,
         event_bus,
@@ -226,6 +227,7 @@ fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
         merge_service: None,
         cleanup_scheduler: None,
         task_executor: None,
+        task_service,
         daemon_connections: None,
         workspace_exec_locks: None,
         terminal_activity: None,

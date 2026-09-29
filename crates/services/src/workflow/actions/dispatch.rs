@@ -6,7 +6,6 @@ use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     agent_capacity::has_running_execution_capacity,
-    task_service::TaskService,
     workflow::{
         dispatch::{
             build_effective_prompt, dispatch_intent_from_workflow_dispatch,
@@ -383,39 +382,7 @@ impl HookAction for DispatchRoleAgent {
                 };
                 if let Some(parent_execution_id) = dispatch_ctx.continuation_of_execution_id.clone()
                 {
-                    let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
-                        return HookResult::Failed {
-                            reason: "task executor is not configured for follow-up dispatch"
-                                .to_string(),
-                        };
-                    };
-                    // Follow-up executions continue the workflow lifecycle, so the
-                    // service used by the spawned run must keep the hook dependencies.
-                    let mut service =
-                        TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
-                            .with_task_executor(task_executor);
-                    if let Some(review_runner) = ctx.review_runner.as_ref().cloned() {
-                        service = service.with_review_runner(review_runner);
-                    }
-                    if let Some(merge_service) = ctx.merge_service.as_ref().cloned() {
-                        service = service.with_merge_service(merge_service);
-                    }
-                    if let Some(cleanup_scheduler) = ctx.cleanup_scheduler.as_ref().cloned() {
-                        service = service.with_cleanup_scheduler(cleanup_scheduler);
-                    }
-                    service = service.with_workspace_root(ctx.workspace_root.clone());
-                    if let Some(repo_cache_locks) = ctx.repo_cache_locks.as_ref().cloned() {
-                        service = service.with_repo_cache_locks(repo_cache_locks);
-                    }
-                    if let Some(daemon_connections) = ctx.daemon_connections.as_ref().cloned() {
-                        service = service.with_daemon_connections(daemon_connections);
-                    }
-                    if let Some(workspace_exec_locks) = ctx.workspace_exec_locks.as_ref().cloned() {
-                        service = service.with_workspace_exec_locks(workspace_exec_locks);
-                    }
-                    if let Some(terminal_activity) = ctx.terminal_activity.as_ref().cloned() {
-                        service = service.with_terminal_activity_tracker(terminal_activity);
-                    }
+                    let service = ctx.task_service.clone();
                     let trigger = follow_up_trigger(ctx);
                     let follow_up_result = if let Some(admission) = reviewer_admission.clone() {
                         service
@@ -457,36 +424,7 @@ impl HookAction for DispatchRoleAgent {
                     };
                 }
 
-                let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
-                    return HookResult::Failed {
-                        reason: "task executor is not configured for initial role dispatch"
-                            .to_string(),
-                    };
-                };
-                let mut service = TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
-                    .with_task_executor(task_executor)
-                    .with_workspace_root(ctx.workspace_root.clone());
-                if let Some(review_runner) = ctx.review_runner.as_ref().cloned() {
-                    service = service.with_review_runner(review_runner);
-                }
-                if let Some(merge_service) = ctx.merge_service.as_ref().cloned() {
-                    service = service.with_merge_service(merge_service);
-                }
-                if let Some(cleanup_scheduler) = ctx.cleanup_scheduler.as_ref().cloned() {
-                    service = service.with_cleanup_scheduler(cleanup_scheduler);
-                }
-                if let Some(repo_cache_locks) = ctx.repo_cache_locks.as_ref().cloned() {
-                    service = service.with_repo_cache_locks(repo_cache_locks);
-                }
-                if let Some(daemon_connections) = ctx.daemon_connections.as_ref().cloned() {
-                    service = service.with_daemon_connections(daemon_connections);
-                }
-                if let Some(workspace_exec_locks) = ctx.workspace_exec_locks.as_ref().cloned() {
-                    service = service.with_workspace_exec_locks(workspace_exec_locks);
-                }
-                if let Some(terminal_activity) = ctx.terminal_activity.as_ref().cloned() {
-                    service = service.with_terminal_activity_tracker(terminal_activity);
-                }
+                let service = ctx.task_service.clone();
 
                 let dispatch_result = match reviewer_admission {
                     Some(admission) => {

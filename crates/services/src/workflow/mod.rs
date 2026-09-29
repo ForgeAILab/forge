@@ -37,6 +37,9 @@ pub struct HookContext {
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     pub task_executor: Option<Arc<dyn TaskExecutor>>,
+    /// Originating service clone for nested dispatch. Cloning preserves the
+    /// shared terminal-cascade coordination and every runtime dependency.
+    pub task_service: crate::TaskService,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     pub terminal_activity: Option<Arc<TerminalActivityTracker>>,

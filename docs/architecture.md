@@ -2243,7 +2243,12 @@ version that the barrier-clear write is about to invalidate.
 Terminal execution settlement is serialized per Task. If two executions for
 the same Task finish while one completion is cascading the workflow, the later
 completion waits and re-evaluates its authority after the first cascade instead
-of being acknowledged and dropped.
+of being acknowledged and dropped. Workflow hook dispatch clones the
+originating `TaskService`, so nested roles share that coordinator and the same
+provider/outbox dependencies. Recovery treats a terminal workflow-role result
+whose immutable Project revision is missing or superseded as unsettled and
+dispatches a replacement under current authority; it never converts the
+cascade's intentional no-op into a reconciliation receipt.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
