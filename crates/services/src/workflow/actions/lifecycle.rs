@@ -127,6 +127,7 @@ impl HookAction for RunBeforeWorkHooks {
             .join(&task.id)
             .join("hooks");
         let hook_ctx = LifecycleHookContext {
+            env: settings.environment.env.clone(),
             event: api_types::LifecycleEvent::BeforeWork,
             task_id: task.id.clone(),
             task_title: task.title.clone(),

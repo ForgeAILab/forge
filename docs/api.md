@@ -1930,6 +1930,58 @@ the rules in `project.project_hooks_json`; saving rules does not run hook
 actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
 empty array clears all rules.
 
+### Project environment
+
+`settings.environment` declares what every Task execution in the Project needs
+from the Forge host, so agents stop rediscovering a missing toolchain one
+ten-minute review at a time:
+
+```json
+{
+  "settings": {
+    "environment": {
+      "env": { "GODOT_BIN": "/home/bot/opt/godot/4.7.2/godot" },
+      "assets": [
+        {
+          "source": "/home/bot/assets/limezu",
+          "target": "apps/renderer-spikes/godot/assets/vendor/limezu"
+        }
+      ],
+      "checks": [
+        { "name": "godot", "command": "\"$GODOT_BIN\" --headless --version" },
+        {
+          "name": "browser",
+          "command": "chromium --headless --dump-dom about:blank >/dev/null",
+          "roles": ["reviewer"],
+          "timeout_seconds": 60
+        }
+      ]
+    }
+  }
+}
+```
+
+- `env` is set on every executor process (all CLI harnesses and the shell
+  executor), on review `setup_steps`/`ci_steps`/required checks, and on
+  lifecycle hooks. Forge's own `FORGE_*` variables and `PWD` are reserved and
+  always win. Remote daemons receive `env` with the start command.
+- `assets` copy a host file or directory (absolute `source`) to a
+  worktree-relative `target` immediately before each local execution, and into
+  the clean checkout that runs review checks. A target that already exists is
+  never overwritten, so tracked content and earlier copies are left alone.
+- `checks` run with `bash -lc` in the worktree, in order, immediately before a
+  local execution whose role is listed in `roles` (empty means every role).
+  `timeout_seconds` defaults to 120. The first failing check fails the
+  execution before any provider call and parks the Task with an
+  `environment_not_ready` blocking annotation whose message names the check,
+  its exit status, and the tail of its output. `reexecute` retries once the
+  host or the settings are fixed; `cancel_task` is the other recovery.
+
+`PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
+invalid or reserved, whose asset source is not absolute or whose target
+escapes the worktree, or whose checks are unnamed, duplicated, empty, or have
+a zero timeout.
+
 A ready Project Agent can configure the independent checks without receiving
 general settings authority through the typed native `project.review_config`
 operation. Its only action is `set_ci_steps`; the payload requires the Project

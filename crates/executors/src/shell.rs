@@ -109,6 +109,7 @@ impl TaskExecutor for ShellExecutor {
         command
             .args(&plan.args)
             .current_dir(&plan.cwd)
+            .envs(crate::environment::task_environment(&ctx.agent_config))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for key in &plan.env_remove {

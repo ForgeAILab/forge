@@ -99,14 +99,21 @@ impl HookAction for RunCiSteps {
             .as_ref()
             .is_some_and(|assignment| assignment.assignee_id.is_some());
 
-        let (ci_results, failed_step_index) =
-            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps).await {
-                Ok(result) => result,
-                Err(reason) => {
-                    cancel_review_after_authority_loss(ctx, &review, &reason).await;
-                    return HookResult::Failed { reason };
-                }
-            };
+        let (ci_results, failed_step_index) = match run_ci_steps_in_worktree(
+            &workspace.worktree_path,
+            &ci_steps,
+            &::review::contract::project_environment(&ctx.db, &ctx.task_id)
+                .await
+                .env,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(reason) => {
+                cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                return HookResult::Failed { reason };
+            }
+        };
         let mut review_details = json!({ "ci_steps": ci_results });
         let now = now_rfc3339();
 

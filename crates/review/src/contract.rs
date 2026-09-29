@@ -1057,6 +1057,21 @@ pub async fn evaluate(
     Ok(result)
 }
 
+/// The Project environment of `task_id` (default when the Task, Project, or
+/// settings cannot be read, so a review is never refused for it).
+pub async fn project_environment(db: &SqliteDb, task_id: &str) -> ProjectEnvironment {
+    use db::{ProjectRepo, TaskRepo};
+    let Ok(Some(task)) = TaskRepo::get_by_id(db, task_id, false).await else {
+        return ProjectEnvironment::default();
+    };
+    let Ok(Some(project)) = ProjectRepo::get_by_id(db, &task.project_id).await else {
+        return ProjectEnvironment::default();
+    };
+    serde_json::from_str::<ProjectSettings>(&project.settings)
+        .map(|settings| settings.environment)
+        .unwrap_or_default()
+}
+
 async fn evaluate_inner(
     db: &SqliteDb,
     path: &Path,
@@ -1100,11 +1115,18 @@ async fn evaluate_inner(
         .await?;
         git_read(&checkout, &["checkout", "--detach", &contract.commit_sha]).await?;
     }
+    let environment = project_environment(db, &contract.context.task_id).await;
+    if !contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty() {
+        // The clean checkout has none of the git-ignored assets the
+        // Project declares; the checks need them as much as the agent did.
+        executors::environment::materialize_assets(&checkout, &environment.assets).await?;
+    }
     let mut setup_failed = false;
     for (index, setup) in contract.context.setup_steps.iter().enumerate() {
         let mut command = Command::new("bash");
         command
             .args(["-lc", setup])
+            .envs(&environment.env)
             .current_dir(&checkout)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -1134,6 +1156,7 @@ async fn evaluate_inner(
         let mut command = Command::new("bash");
         command
             .args(["-lc", &check.command])
+            .envs(&environment.env)
             .current_dir(&checkout)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")

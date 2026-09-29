@@ -551,6 +551,21 @@ impl TaskService {
             }
         };
 
+        // The workspace lock is held, so asset copies cannot race another
+        // execution in this worktree. A failed check parks the Task before
+        // any provider call.
+        if let Some(parked) = self
+            .prepare_execution_environment(
+                &task,
+                &execution_before_launch,
+                &workspace.worktree_path,
+                &mut agent_config,
+            )
+            .await?
+        {
+            return Ok(parked);
+        }
+
         // Freeze one pricing selection for every candidate before handing
         // control to an executor. The neutral executor hook below starts an
         // invocation only at the exact provider-call boundary.
@@ -1874,6 +1889,11 @@ impl TaskService {
             executors::mark_worktree_read_only(&mut executor_config);
         }
         executors::mark_task_role(&mut executor_config, &execution.role);
+        // A remote daemon receives the Project environment variables; asset
+        // copies and checks run only for local executions, whose worktree is
+        // on this host (see `prepare_execution_environment`).
+        let environment = self.project_environment(&task.project_id).await?;
+        executors::environment::mark_task_environment(&mut executor_config, &environment.env);
         let executor_type = executor_config
             .get("executor_type")
             .and_then(Value::as_str)

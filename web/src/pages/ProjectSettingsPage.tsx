@@ -13,6 +13,7 @@ import {
   Lightning,
   Pause,
   Plugs,
+  Terminal,
   Users,
   WarningOctagon,
 } from '@phosphor-icons/react'
@@ -34,6 +35,11 @@ import { ErrorBanner } from '@/components/error-banner'
 import { McpInstallControls } from '@/components/mcp-install-controls'
 import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
+import {
+  EnvironmentTab,
+  environmentTextFromSettings,
+  parseEnvironmentText,
+} from '@/components/settings/EnvironmentTab'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
 import { MembersTab } from '@/components/settings/MembersTab'
@@ -70,6 +76,7 @@ export type ProjectSettingsTab =
   | 'members'
   | 'mcp'
   | 'hooks'
+  | 'environment'
   | 'analytics'
   | 'workflow'
   | 'danger'
@@ -85,6 +92,7 @@ const SETTINGS_TABS: Array<{
   { id: 'members', label: 'Members', icon: Users },
   { id: 'mcp', label: 'MCP', icon: Plugs },
   { id: 'hooks', label: 'Hooks', icon: Lightning },
+  { id: 'environment', label: 'Environment', icon: Terminal },
   { id: 'analytics', label: 'Analytics', icon: ChartBar },
   { id: 'workflow', label: 'Workflow', icon: FlowArrow },
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
@@ -121,6 +129,7 @@ export function ProjectSettingsPage({
   const [defaultRoleSelections, setDefaultRoleSelections] = useState<Record<string, string>>({})
   const [automaticRecoveryEnabled, setAutomaticRecoveryEnabled] = useState(false)
   const [automaticRecoveryAgentId, setAutomaticRecoveryAgentId] = useState('')
+  const [environmentText, setEnvironmentText] = useState('')
 
   const project = projectQuery.data
   const roles = workflowQuery.data?.roles ?? []
@@ -132,6 +141,7 @@ export function ProjectSettingsPage({
       setName(project.name)
       setCiSteps(ciStepsFromReviewConfig(project.default_review_config))
       setLifecycleHooks(lifecycleHooksFromSettings(project.settings))
+      setEnvironmentText(environmentTextFromSettings(project.settings))
       const rawAssignments = project.settings?.default_role_assignments
       const assignments: DefaultRoleAssignment[] = Array.isArray(rawAssignments)
         ? rawAssignments
@@ -182,6 +192,11 @@ export function ProjectSettingsPage({
       toast.error('Automatic recovery requires an agent')
       return
     }
+    const environment = parseEnvironmentText(environmentText)
+    if (!environment.ok) {
+      toast.error(environment.error)
+      return
+    }
     const settingsWithoutRolePrompts: Record<string, unknown> = {
       ...(isRecord(project.settings) ? project.settings : {}),
     }
@@ -218,6 +233,7 @@ export function ProjectSettingsPage({
         agent_id: automaticRecoveryEnabled ? automaticRecoveryAgentId : null,
         max_attempts: 1,
       },
+      environment: environment.value ?? { env: {}, assets: [], checks: [] },
     }
     updateProject.mutate(
       {
@@ -355,6 +371,17 @@ export function ProjectSettingsPage({
               isSaving={updateProject.isPending}
               lifecycleHooks={lifecycleHooks}
               onLifecycleHooksChange={setLifecycleHooks}
+              onSave={saveProject}
+            />
+          )}
+
+          {initialTab === 'environment' && (
+            <EnvironmentTab
+              projectIsLoading={projectQuery.isLoading}
+              canSave={Boolean(project)}
+              isSaving={updateProject.isPending}
+              environmentText={environmentText}
+              onEnvironmentTextChange={setEnvironmentText}
               onSave={saveProject}
             />
           )}

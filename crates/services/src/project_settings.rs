@@ -116,6 +116,9 @@ pub async fn validate_project_settings(
         }
     }
 
+    executors::environment::validate_project_environment(&settings.environment)
+        .map_err(|reason| ServiceError::invalid_operation(format!("environment: {reason}")))?;
+
     for (event, hooks) in &settings.lifecycle_hooks {
         for hook in hooks {
             let LifecycleHookDef::Script {

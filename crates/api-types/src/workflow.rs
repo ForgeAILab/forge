@@ -101,6 +101,72 @@ pub struct ProjectSettings {
     pub lifecycle_hooks: LifecycleHooks,
     #[serde(default)]
     pub automatic_recovery: AutomaticRecoverySettings,
+    #[serde(default)]
+    pub environment: ProjectEnvironment,
+}
+
+fn default_environment_check_timeout() -> u64 {
+    120
+}
+
+/// What every Task execution in a Project needs from its host, declared once
+/// instead of being rediscovered by each agent run.
+///
+/// Forge applies it immediately before an execution launches: `env` is set on
+/// the executor process (and on review steps and lifecycle hooks), `assets`
+/// are copied into the worktree, and the `checks` for the execution's role
+/// must pass or the Task is parked as `environment_not_ready` without
+/// spending an agent run.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub struct ProjectEnvironment {
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub assets: Vec<EnvironmentAsset>,
+    #[serde(default)]
+    pub checks: Vec<EnvironmentCheck>,
+}
+
+impl ProjectEnvironment {
+    pub fn is_empty(&self) -> bool {
+        self.env.is_empty() && self.assets.is_empty() && self.checks.is_empty()
+    }
+}
+
+/// A host file or directory kept out of git (licensed art, model weights,
+/// fixtures) that every worktree needs. Copied only when `target` is absent,
+/// so a tracked or already-present path is never overwritten.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub struct EnvironmentAsset {
+    /// Absolute path on the Forge host.
+    pub source: String,
+    /// Path relative to the worktree root.
+    pub target: String,
+}
+
+/// A cheap probe run with `bash -lc` in the worktree before an execution.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub struct EnvironmentCheck {
+    pub name: String,
+    pub command: String,
+    /// Execution roles the check gates (`coder`, `reviewer`, ...). Empty
+    /// gates every role.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default = "default_environment_check_timeout")]
+    pub timeout_seconds: u64,
+}
+
+impl EnvironmentCheck {
+    pub fn applies_to(&self, role: &str) -> bool {
+        self.roles.is_empty() || self.roles.iter().any(|candidate| candidate == role)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -129,6 +195,7 @@ impl Default for ProjectSettings {
             default_role_assignments: Vec::new(),
             lifecycle_hooks: std::collections::HashMap::new(),
             automatic_recovery: AutomaticRecoverySettings::default(),
+            environment: ProjectEnvironment::default(),
         }
     }
 }

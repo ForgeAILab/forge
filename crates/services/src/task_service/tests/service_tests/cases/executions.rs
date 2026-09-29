@@ -86,6 +86,160 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     }));
 }
 
+/// Claim a shell-harness Task whose command is `command` in a Project whose
+/// settings declare `environment`, and return the claimed execution.
+async fn claim_shell_task_with_environment(
+    db: &Arc<SqliteDb>,
+    service: &TaskService,
+    command: &str,
+    environment: Value,
+) -> (Task, db::Execution, db::Workspace) {
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(db).await;
+    // The repository directory must outlive the test's executions.
+    std::mem::forget(repo_dir);
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(json!({ "environment": environment }).to_string())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("environment sets");
+    let agent_id = seed_agent(db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Needs its environment",
+            Some(command.to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    let workspace =
+        WorkspaceRepo::get_by_id(&**db, claimed.execution.workspace_id.as_deref().unwrap())
+            .await
+            .expect("workspace loads")
+            .expect("workspace exists");
+    std::fs::create_dir_all(&workspace.worktree_path).expect("workspace dir creates");
+    (task, claimed.execution, workspace)
+}
+
+#[tokio::test]
+async fn run_execution_applies_the_project_environment() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let assets = tempfile::tempdir().expect("asset dir");
+    std::fs::write(assets.path().join("fountain.png"), "art").expect("asset writes");
+    let (_task, execution, workspace) = claim_shell_task_with_environment(
+        &db,
+        &service,
+        "printf \"$PROJECT_TOOL:\"; cat vendor/fountain.png",
+        json!({
+            "env": { "PROJECT_TOOL": "godot-4.7.2" },
+            "assets": [{
+                "source": assets.path().to_string_lossy(),
+                "target": "vendor",
+            }],
+            "checks": [{ "name": "tool", "command": "test -n \"$PROJECT_TOOL\"" }],
+        }),
+    )
+    .await;
+
+    let registry = Arc::new(cli_adapters::default_registry());
+    let executor = executors::AdapterExecutor::new(registry);
+    let execution = service
+        .run_execution(execution.id, &executor)
+        .await
+        .expect("execution runs");
+
+    assert_eq!(execution.status, ExecutionStatus::Completed);
+    assert!(std::path::Path::new(&workspace.worktree_path)
+        .join("vendor/fountain.png")
+        .exists());
+    let logs = executors::LogReader::read(
+        std::path::Path::new(&execution.logs_path.expect("logs path recorded")),
+        0,
+        100,
+    )
+    .await
+    .expect("logs read");
+    assert!(
+        logs.entries.iter().any(|entry| {
+            entry.payload.get("line").and_then(|line| line.as_str()) == Some("godot-4.7.2:art")
+        }),
+        "the executor sees the Project env and the copied asset: {:?}",
+        logs.entries
+            .iter()
+            .filter_map(|entry| entry.payload.get("line"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (task, execution, workspace) = claim_shell_task_with_environment(
+        &db,
+        &service,
+        "touch agent-ran",
+        json!({
+            "checks": [{
+                "name": "browser",
+                "command": "echo chromium is not installed >&2; exit 4",
+            }],
+        }),
+    )
+    .await;
+
+    let registry = Arc::new(cli_adapters::default_registry());
+    let executor = executors::AdapterExecutor::new(registry);
+    let execution = service
+        .run_execution(execution.id, &executor)
+        .await
+        .expect("dispatch settles");
+
+    assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert!(
+        !std::path::Path::new(&workspace.worktree_path)
+            .join("agent-ran")
+            .exists(),
+        "no agent run is spent on a known-broken environment"
+    );
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        current
+            .error_annotation
+            .as_deref()
+            .expect("the Task is parked for its owner"),
+    )
+    .expect("annotation parses");
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::EnvironmentNotReady
+    );
+    let message = annotation.message.expect("message is set");
+    assert!(message.contains("'browser' exited 4"), "{message}");
+    assert!(message.contains("chromium is not installed"), "{message}");
+    assert_eq!(
+        annotation.blocked_execution_id.as_deref(),
+        Some(execution.id.as_str())
+    );
+    assert!(annotation
+        .recovery_actions
+        .contains(&api_types::RecoveryAction::Reexecute));
+}
+
 #[tokio::test]
 async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
     let db = Arc::new(sqlite_db().await);

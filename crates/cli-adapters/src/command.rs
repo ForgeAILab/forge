@@ -115,6 +115,9 @@ impl CommandBuilder {
 /// [`executors::execution_outbox_path`]); the outbox is created here so the
 /// harness can write to it without first discovering that it is missing.
 pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionContext) {
+    // The Project environment goes first so Forge's own variables below
+    // always win.
+    command.envs(executors::environment::task_environment(&ctx.agent_config));
     command
         .current_dir(&ctx.worktree_path)
         .env("PWD", &ctx.worktree_path)
@@ -215,7 +218,11 @@ mod worktree_tests {
             execution_id: "exec-1".to_owned(),
             worktree_path: worktree.to_string_lossy().into_owned(),
             description: String::new(),
-            agent_config: serde_json::json!({}),
+            agent_config: serde_json::json!({
+                executors::environment::TASK_ENVIRONMENT_CONFIG_KEY: {
+                    "GODOT_BIN": "/opt/godot",
+                },
+            }),
             logs_path: String::new(),
             heartbeat_interval_seconds: 30,
             max_turns: None,
@@ -235,6 +242,7 @@ mod worktree_tests {
         };
         assert_eq!(env("PWD"), Some(worktree.clone().into_os_string()));
         assert_eq!(env("FORGE_EXECUTION_ID"), Some("exec-1".into()));
+        assert_eq!(env("GODOT_BIN"), Some("/opt/godot".into()));
         let outbox = temp
             .path()
             .join("task-1")

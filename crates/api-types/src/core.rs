@@ -162,6 +162,10 @@ pub enum FailureKind {
     /// The reviewer could not reach a verdict because of its environment
     /// (missing toolchain, dependencies, or access). The owner resolves it.
     ReviewBlocked,
+    /// A Project environment check failed before an execution launched, so
+    /// no agent run was spent. The owner fixes the host or the Project's
+    /// `environment` settings and re-executes.
+    EnvironmentNotReady,
     RetryExhausted,
     MergeFixBudgetExhausted,
     WorkflowGuardRejected,

@@ -642,12 +642,15 @@ impl ReviewRunner {
         let mut writer =
             LogWriter::new(&req.logs_path, reviewer_execution.id.clone(), MAX_LOG_BYTES);
         let mut step_results = Vec::new();
+        let environment =
+            crate::contract::project_environment(&self.db, &req.task_id.to_string()).await;
 
         for (index, step) in ci_steps.iter().enumerate() {
             let started_at = now_rfc3339();
             let output = Command::new("bash")
                 .arg("-lc")
                 .arg(step)
+                .envs(&environment.env)
                 .current_dir(&req.workspace_path)
                 .output()
                 .await?;

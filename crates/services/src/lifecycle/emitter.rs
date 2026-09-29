@@ -282,6 +282,7 @@ impl LifecycleEventEmitter {
         let log_dir = resolve_log_dir(execution.as_ref(), resolved_execution_id.as_deref());
 
         let ctx = LifecycleHookContext {
+            env: crate::lifecycle::project_env(&project.settings),
             event,
             task_id: task.id.clone(),
             task_title: task.title.clone(),

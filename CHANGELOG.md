@@ -6,6 +6,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Project environment (`settings.environment`): declare host environment
+  variables, git-ignored assets to copy into every worktree, and per-role
+  preflight checks once per Project. Variables reach every executor process,
+  review step, conformance check, and lifecycle hook; assets are copied into
+  worktrees and the clean review checkout; a failing check parks the Task as
+  the new `environment_not_ready` failure kind before any agent run is spent,
+  instead of a reviewer burning a full run to report `blocked`. See
+  `docs/api.md#project-environment`.
+
+### Changed
+
+- A managed Codex Task execution whose agent uses the `yolo` permission policy
+  now runs with `danger-full-access` instead of being forced to
+  `workspace-write`. The recorded execution policy already claimed full access;
+  the sandbox now matches it. Reviewers that need a real browser or a writable
+  `$HOME` (Chromium, Playwright, Godot editor state) no longer come back
+  `blocked` by the sandbox.
+
 ## [0.13.8] - 2026-09-27
 
 ### Changed

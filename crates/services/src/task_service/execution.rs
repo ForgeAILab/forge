@@ -7,6 +7,7 @@ use crate::workflow::dispatch::{
 use db::{UpdateTask, UpdateTaskStatus};
 
 mod cascade;
+mod environment;
 mod follow_up;
 mod guards;
 mod hooks;

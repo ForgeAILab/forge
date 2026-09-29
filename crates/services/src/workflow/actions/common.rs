@@ -849,6 +849,7 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
 pub(super) async fn run_ci_steps_in_worktree(
     worktree_path: &str,
     ci_steps: &[String],
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Vec<Value>, Option<usize>), String> {
     let mut results = Vec::with_capacity(ci_steps.len());
 
@@ -860,6 +861,7 @@ pub(super) async fn run_ci_steps_in_worktree(
         let output = Command::new("bash")
             .arg("-lc")
             .arg(step)
+            .envs(env)
             .current_dir(worktree_path)
             .output()
             .await

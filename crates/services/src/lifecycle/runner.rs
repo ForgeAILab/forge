@@ -143,6 +143,7 @@ impl LifecycleHookRunner {
             .arg("-lc")
             .arg(command)
             .current_dir(&working_dir)
+            .envs(&ctx.env)
             .env("FORGE_EVENT", event_name(&ctx.event))
             .env("FORGE_TASK_ID", &ctx.task_id)
             .env("FORGE_TASK_TITLE", &ctx.task_title)
@@ -626,6 +627,7 @@ mod tests {
 
     fn ctx(worktree_path: &std::path::Path) -> LifecycleHookContext {
         LifecycleHookContext {
+            env: std::collections::BTreeMap::new(),
             event: api_types::LifecycleEvent::BeforeWork,
             task_id: "task-1".to_owned(),
             task_title: "Test task".to_owned(),

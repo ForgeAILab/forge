@@ -171,6 +171,7 @@ export type FailureKind =
   | 'review_gate_failed'
   | 'review_budget_exhausted'
   | 'review_blocked'
+  | 'environment_not_ready'
   | 'retry_exhausted'
   | 'merge_fix_budget_exhausted'
   | 'workflow_guard_rejected'

@@ -442,9 +442,12 @@ Task Worker/reviewer executions in their Task Workspaces.
 
 The CLI permission policy includes an explicit high-risk `yolo` value. It maps
 to an adapter's strongest local execution mode only where that cannot cross a
-Forge-owned role boundary. Managed Codex Task executions are the deliberate
-exception: every managed role overrides profile configuration to
-`workspace-write` with network access, always with approvals set to `never`.
+Forge-owned role boundary. Managed Codex Task executions override profile
+configuration to `workspace-write` with network access, always with approvals
+set to `never`, unless the agent's permission policy is `yolo`: then the role
+runs with `danger-full-access` so real-browser QA, GUI toolchains, and local
+servers probed across commands work. The post-run read-only gate still
+discards a reviewer's authored changes.
 Forge runs CLI harnesses headless, so nobody can answer a per-tool prompt:
 `supervised` maps to the same unattended mode as `auto` (Claude Code
 `bypassPermissions`, Gemini/Smith `--yolo`, Cursor `--force`, OpenCode
@@ -621,6 +624,26 @@ Agent—including Main, Project, or the same Agent in both Task roles—may be
 assigned explicitly. Read-only planning/discovery and write-capable
 implementation both derive authority from the current Charter and their Task
 workflow.
+
+#### Project environment
+
+`ProjectSettings.environment` (`env`, `assets`, `checks`) is applied at the
+single local launch point, `TaskService::run_execution`, after the workspace
+lock and the final WorkspaceLease verification and before ledger admission
+(`task_service/execution/environment.rs`). The env map is stamped onto the
+in-memory executor config under `_forge_task_environment` — runtime authority
+like the Task role, carried through fallback-candidate normalization
+(`executors::adapter::apply_runtime_scope`) but never part of candidate
+identity — and `cli_adapters::command::run_in_task_worktree` and the shell
+executor set it on the child process before Forge's own variables. Assets are
+copied only when the target is absent. A failing check terminalizes the
+execution through `fail_execution_before_dispatch` and parks the Task with a
+`FailureKind::EnvironmentNotReady` annotation (`reexecute`, `cancel_task`),
+so no agent run or retry budget is spent. Review steps and conformance checks
+(`review::contract::project_environment`) and lifecycle hooks
+(`LifecycleHookContext.env`) receive the same env; the clean conformance
+checkout also receives the assets. `execution_start_params` stamps only `env`
+for remote daemons, whose worktrees are not on this host.
 
 #### Canonical execution blocker and capability-aware review
 
