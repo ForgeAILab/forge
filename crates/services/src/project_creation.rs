@@ -122,7 +122,14 @@ pub async fn create_project_from_charter_approval(
                 Err(ServiceError::Conflict(message))
             }
         }
-        Err(error @ ServiceError::Db(db::DbError::IdempotencyConflict)) => {
+        // The losing submission can fail any of the winner's CAS writes, not
+        // only the receipt insert; replay whenever the winner's receipt for
+        // this exact command is durable.
+        Err(
+            error @ ServiceError::Db(
+                db::DbError::IdempotencyConflict | db::DbError::VersionConflict,
+            ),
+        ) => {
             if concurrent_create_receipt_committed(&db, &retry_input).await? {
                 create_project_from_charter_approval_attempt(db, retry_input).await
             } else {
