@@ -169,3 +169,55 @@ async fn structural_rules_apply_even_without_a_project_to_check_against() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_project_environment_is_validated() {
+    let db = fixture().await;
+    let valid = json!({
+        "environment": {
+            "env": { "GODOT_BIN": "/opt/godot/4.7.2/godot" },
+            "assets": [{ "source": "/srv/limezu", "target": "assets/vendor/limezu" }],
+            "checks": [{ "name": "godot", "command": "\"$GODOT_BIN\" --version", "roles": ["reviewer"] }],
+        }
+    });
+    validate_project_settings(&db, &valid, &workflow(), Some(PROJECT), None)
+        .await
+        .expect("a well-formed environment is accepted");
+
+    for (environment, expected) in [
+        (json!({ "env": { "FORGE_TASK_ID": "x" } }), "reserved"),
+        (
+            json!({ "assets": [{ "source": "/srv/art", "target": "../escape" }] }),
+            "inside the worktree",
+        ),
+        (
+            json!({ "checks": [{ "name": "slow", "command": "true", "timeout_seconds": 0 }] }),
+            "positive timeout",
+        ),
+        (
+            json!({ "checks": [{ "name": "browser", "command": "true", "roles": ["reviewre"] }] }),
+            "unknown role",
+        ),
+        (
+            json!({
+                "assets": [
+                    { "source": "/srv/art", "target": "vendor" },
+                    { "source": "/srv/models", "target": "vendor/models" }
+                ]
+            }),
+            "overlap",
+        ),
+        (json!({ "enb": { "TOOL": "path" } }), "unknown field"),
+    ] {
+        let error = validate_project_settings(
+            &db,
+            &json!({ "environment": environment }),
+            &workflow(),
+            Some(PROJECT),
+            None,
+        )
+        .await
+        .expect_err("an unsafe environment is refused");
+        assert!(error.to_string().contains(expected), "{expected}: {error}");
+    }
+}

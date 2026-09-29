@@ -1229,6 +1229,34 @@ pub async fn evaluate(
     Ok(result)
 }
 
+/// The Project environment of `task_id`.
+///
+/// Review evidence must use the same declared environment as the candidate
+/// execution. Missing or malformed authority therefore fails closed instead
+/// of silently running checks in an empty environment.
+pub async fn project_environment(
+    db: &SqliteDb,
+    task_id: &str,
+) -> Result<ProjectEnvironment, String> {
+    use db::{ProjectRepo, TaskRepo};
+    let task = TaskRepo::get_by_id(db, task_id, false)
+        .await
+        .map_err(|error| format!("failed to load Task environment authority: {error}"))?
+        .ok_or_else(|| format!("Task {task_id} was not found while loading review environment"))?;
+    let project = ProjectRepo::get_by_id(db, &task.project_id)
+        .await
+        .map_err(|error| format!("failed to load Project environment authority: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "Project {} was not found while loading review environment",
+                task.project_id
+            )
+        })?;
+    serde_json::from_str::<ProjectSettings>(&project.settings)
+        .map(|settings| settings.environment)
+        .map_err(|error| format!("invalid Project environment settings: {error}"))
+}
+
 async fn evaluate_inner(
     db: &SqliteDb,
     path: &Path,
@@ -1272,11 +1300,18 @@ async fn evaluate_inner(
         .await?;
         git_read(&checkout, &["checkout", "--detach", &contract.commit_sha]).await?;
     }
+    let environment = project_environment(db, &contract.context.task_id).await?;
+    if !contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty() {
+        // The clean checkout has none of the git-ignored assets the
+        // Project declares; the checks need them as much as the agent did.
+        executors::environment::materialize_assets(&checkout, &environment.assets).await?;
+    }
     let mut setup_failed = false;
     for (index, setup) in contract.context.setup_steps.iter().enumerate() {
         let mut command = Command::new("bash");
         command
             .args(["-lc", setup])
+            .envs(&environment.env)
             .current_dir(&checkout)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -1285,6 +1320,7 @@ async fn evaluate_inner(
         let output = bounded_output(&mut command, 120, MAX_EVIDENCE_BYTES).await?;
         let mut text = String::from_utf8_lossy(&output.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let text = executors::environment::redact_environment_values(&text, &environment.env);
         let exit_code = output.status.code().unwrap_or(-1);
         result.checks.push(ConformanceCheckResult {
             check_id: format!("setup:{index}"),
@@ -1306,6 +1342,7 @@ async fn evaluate_inner(
         let mut command = Command::new("bash");
         command
             .args(["-lc", &check.command])
+            .envs(&environment.env)
             .current_dir(&checkout)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -1314,6 +1351,7 @@ async fn evaluate_inner(
         let output = bounded_output(&mut command, 120, MAX_EVIDENCE_BYTES).await?;
         let mut text = String::from_utf8_lossy(&output.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let text = executors::environment::redact_environment_values(&text, &environment.env);
         result.checks.push(ConformanceCheckResult {
             check_id: check.id.clone(),
             command: check.command.clone(),
@@ -1399,6 +1437,21 @@ mod tests {
             "task_charter_revision_id":"charter-r1", "task_scope":{"title":"Parser", "description":"Implement Rust parsing", "config":{}, "allocations":{}},
             "documents":[], "workflow":{}, "project_settings":{}})
     }
+
+    #[tokio::test]
+    async fn project_environment_fails_closed_without_task_authority() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = SqliteDb::new(pool);
+
+        let error = project_environment(&db, "missing-task")
+            .await
+            .expect_err("missing authority must stop review evidence");
+        assert!(error.contains("was not found"), "{error}");
+    }
+
     #[test]
     fn task_scope_defers_unassigned_project_outcomes_but_keeps_typed_universal_invariants() {
         let mut s = source();

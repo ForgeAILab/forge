@@ -99,8 +99,18 @@ impl HookAction for RunCiSteps {
             .as_ref()
             .is_some_and(|assignment| assignment.assignee_id.is_some());
 
+        let environment = match ::review::contract::project_environment(&ctx.db, &ctx.task_id).await
+        {
+            Ok(environment) => environment,
+            Err(reason) => {
+                cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                return HookResult::Failed { reason };
+            }
+        };
         let (ci_results, failed_step_index) =
-            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps).await {
+            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps, &environment.env)
+                .await
+            {
                 Ok(result) => result,
                 Err(reason) => {
                     cancel_review_after_authority_loss(ctx, &review, &reason).await;

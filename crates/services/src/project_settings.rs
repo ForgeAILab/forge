@@ -116,6 +116,21 @@ pub async fn validate_project_settings(
         }
     }
 
+    executors::environment::validate_project_environment(&settings.environment)
+        .map_err(|reason| ServiceError::invalid_operation(format!("environment: {reason}")))?;
+    for check in &settings.environment.checks {
+        for role in &check.roles {
+            if !role_names.contains(role.as_str())
+                && !matches!(role.as_str(), "executor" | "interactive" | "auditor")
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "environment check '{}' names unknown role: {role}",
+                    check.name
+                )));
+            }
+        }
+    }
+
     for (event, hooks) in &settings.lifecycle_hooks {
         for hook in hooks {
             let LifecycleHookDef::Script {

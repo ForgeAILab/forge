@@ -143,6 +143,7 @@ impl LifecycleHookRunner {
             .arg("-lc")
             .arg(command)
             .current_dir(&working_dir)
+            .envs(&ctx.env)
             .env("FORGE_EVENT", event_name(&ctx.event))
             .env("FORGE_TASK_ID", &ctx.task_id)
             .env("FORGE_TASK_TITLE", &ctx.task_title)
@@ -218,8 +219,14 @@ impl LifecycleHookRunner {
         {
             Ok(Ok(output)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-                let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+                let stdout = truncate_output(&executors::environment::redact_environment_values(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &ctx.env,
+                ));
+                let stderr = truncate_output(&executors::environment::redact_environment_values(
+                    &String::from_utf8_lossy(&output.stderr),
+                    &ctx.env,
+                ));
                 let exit_code = output.status.code();
                 let success = exit_code == Some(0);
 
@@ -626,6 +633,7 @@ mod tests {
 
     fn ctx(worktree_path: &std::path::Path) -> LifecycleHookContext {
         LifecycleHookContext {
+            env: std::collections::BTreeMap::new(),
             event: api_types::LifecycleEvent::BeforeWork,
             task_id: "task-1".to_owned(),
             task_title: "Test task".to_owned(),
@@ -715,6 +723,26 @@ mod tests {
         assert!(!run.environment_preview.is_empty());
         let log_path = run.log_path.as_deref().expect("log path");
         assert!(std::path::Path::new(log_path).exists());
+    }
+
+    #[tokio::test]
+    async fn script_hook_output_redacts_project_environment_values_before_truncating() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut context = ctx(temp.path());
+        context
+            .env
+            .insert("ACCESS_TOKEN".to_owned(), "very-secret".to_owned());
+        let run = LifecycleHookRunner::test_script_hook(
+            &context,
+            0,
+            "printf '%010235d%s' 0 \"$ACCESS_TOKEN\"",
+            5,
+        )
+        .await;
+
+        assert_eq!(run.status, "success");
+        assert!(!run.stdout.contains("very-"), "{}", run.stdout);
+        assert!(run.stdout.contains("[REDA"), "{}", run.stdout);
     }
 
     #[tokio::test]

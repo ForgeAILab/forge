@@ -853,6 +853,7 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
 pub(super) async fn run_ci_steps_in_worktree(
     worktree_path: &str,
     ci_steps: &[String],
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Vec<Value>, Option<usize>), String> {
     let mut results = Vec::with_capacity(ci_steps.len());
 
@@ -864,13 +865,20 @@ pub(super) async fn run_ci_steps_in_worktree(
         let output = Command::new("bash")
             .arg("-lc")
             .arg(step)
+            .envs(env)
             .current_dir(worktree_path)
             .output()
             .await
             .map_err(|error| error.to_string())?;
         let finished_at = now_rfc3339();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = executors::environment::redact_environment_values(
+            &String::from_utf8_lossy(&output.stderr),
+            env,
+        );
+        let stdout = executors::environment::redact_environment_values(
+            &String::from_utf8_lossy(&output.stdout),
+            env,
+        );
         let output_tail = if stdout.is_empty() {
             stderr.clone()
         } else if stderr.is_empty() {

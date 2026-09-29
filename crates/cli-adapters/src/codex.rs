@@ -278,10 +278,15 @@ impl CodexAdapter {
             } else {
                 AskForApproval::from_config(config.ask_for_approval.as_deref(), fallback_approval)
             }),
-            sandbox: Some(if managed_task {
-                SandboxMode::WorkspaceWrite
-            } else if is_yolo {
+            // `yolo` is the owner's explicit opt-out of the sandbox and wins for
+            // managed Tasks too: real-browser QA, GUI toolchains, and servers
+            // probed across commands cannot run under workspace-write. The
+            // read-only gate in the task runner still discards a read-only
+            // role's authored changes.
+            sandbox: Some(if is_yolo {
                 SandboxMode::DangerFullAccess
+            } else if managed_task {
+                SandboxMode::WorkspaceWrite
             } else {
                 SandboxMode::from_config(config.sandbox.as_deref(), fallback_sandbox)
             }),
@@ -1666,9 +1671,11 @@ mod tests {
     }
 
     #[test]
-    fn managed_task_scope_overrides_yolo_and_profile_approval_settings() {
+    fn managed_task_scope_overrides_sandbox_and_profile_approval_settings() {
+        // A raw `sandbox` setting cannot widen a managed Task; only the
+        // explicit `yolo` permission policy does.
         let config = CodexConfig {
-            permission_policy: Some(PermissionPolicy::Yolo),
+            permission_policy: Some(PermissionPolicy::Auto),
             sandbox: Some("danger-full-access".to_owned()),
             ask_for_approval: Some("on-request".to_owned()),
             profile: Some("ambient-profile".to_owned()),
@@ -1724,7 +1731,7 @@ mod tests {
     #[test]
     fn managed_read_only_role_gets_verification_sandbox_without_delivery_instructions() {
         let config = CodexConfig {
-            permission_policy: Some(PermissionPolicy::Yolo),
+            permission_policy: Some(PermissionPolicy::Auto),
             ..CodexConfig::default()
         };
         let mut runtime_scope = json!({});
@@ -1739,8 +1746,8 @@ mod tests {
             &[PathBuf::from("/home/u/.npm")],
         );
 
-        // Never full access: writes stay confined to the worktree and the
-        // declared roots, and Forge's post-run gate discards them.
+        // Without yolo, writes stay confined to the worktree and the declared
+        // roots, and Forge's post-run gate discards them.
         assert!(matches!(params.sandbox, Some(SandboxMode::WorkspaceWrite)));
         assert!(matches!(
             params.approval_policy,
@@ -1756,6 +1763,38 @@ mod tests {
             json!(["/home/u/.npm"])
         );
         assert_eq!(params.developer_instructions, None);
+    }
+
+    #[test]
+    fn managed_yolo_role_gets_full_access() {
+        let config = CodexConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            ..CodexConfig::default()
+        };
+        for read_only in [false, true] {
+            let mut runtime_scope = json!({});
+            executors::mark_task_role(&mut runtime_scope, "reviewer");
+            if read_only {
+                executors::mark_worktree_read_only(&mut runtime_scope);
+            }
+
+            let params = CodexAdapter::thread_start_params(
+                &config,
+                "/tmp/worktree",
+                &runtime_scope,
+                &[],
+                &[],
+            );
+
+            assert!(matches!(
+                params.sandbox,
+                Some(SandboxMode::DangerFullAccess)
+            ));
+            assert!(matches!(
+                params.approval_policy,
+                Some(AskForApproval::Never)
+            ));
+        }
     }
 
     #[test]

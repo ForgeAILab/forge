@@ -111,6 +111,10 @@ fn export_typescript() {
     LifecycleEvent::export().expect("export LifecycleEvent");
     LifecycleHookDef::export().expect("export LifecycleHookDef");
     ProjectSettings::export().expect("export ProjectSettings");
+    ProjectEnvironment::export().expect("export ProjectEnvironment");
+    EnvironmentAsset::export().expect("export EnvironmentAsset");
+    EnvironmentCheck::export().expect("export EnvironmentCheck");
+    FailureKind::export().expect("export FailureKind");
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");

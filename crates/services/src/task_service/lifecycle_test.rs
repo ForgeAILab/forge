@@ -66,6 +66,7 @@ impl TaskService {
             .join(&task.id)
             .join("hooks");
         let hook_ctx = LifecycleHookContext {
+            env: crate::lifecycle::project_env(&project.settings),
             event,
             task_id: task.id.clone(),
             task_title: task.title.clone(),

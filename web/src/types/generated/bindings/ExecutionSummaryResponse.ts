@@ -5,11 +5,11 @@ import type { ExecutionStatus } from "./ExecutionStatus";
  * Compact execution projection used by collection and task-bootstrap
  * endpoints. Large diagnostics remain available from `GET /executions/{id}`.
  */
-export type ExecutionSummaryResponse = { id: string, task_id: string, agent_id: string | null, role: string, status: ExecutionStatus, parent_execution_id: string | null, agent_session_id: string | null, 
+export type ExecutionSummaryResponse = { id: string, task_id: string, agent_id: string | null, role: string, status: ExecutionStatus, parent_execution_id: string | null, agent_session_id: string | null,
 /**
  * A bounded preview of the execution summary (at most 500 characters).
  */
-summary: string | null, 
+summary: string | null,
 /**
  * Whether this execution resumed an existing provider session.
  */
