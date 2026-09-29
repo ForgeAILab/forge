@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-09-29
+
 ### Fixed
 
 - Domain-event consumers (agent wake delivery, Agent Chat memory indexing,
