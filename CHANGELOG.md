@@ -6,6 +6,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Completing an approval-gated planning run no longer invalidates the Task
+  version while removing Forge's private plan-cleanup marker. A human can now
+  approve the plan using the version returned with the review-ready Task
+  instead of intermittently receiving a version conflict.
+
 ## [0.13.9] - 2026-09-28
 
 ### Breaking
