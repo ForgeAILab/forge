@@ -1519,6 +1519,53 @@ async fn planner_completion_advances_default_planning_gate() {
 }
 
 #[tokio::test]
+async fn plan_publication_cleanup_release_preserves_public_task_version() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::PLANNING.to_owned(),
+    )
+    .await;
+    let execution_id = "execution-with-private-plan-cleanup";
+    let cleanup = json!({
+        "execution_id": execution_id,
+        "state": task.status,
+        "state_entry_token": null,
+        "project_version": 0,
+    });
+    let marked = TaskRepo::mutate_metadata(
+        &*db,
+        &task.id,
+        Some(task.version),
+        vec![db::TaskMetadataMutation::Set {
+            key: "plan_publication_cleanup".to_owned(),
+            value: cleanup,
+        }],
+        &now_rfc3339(),
+    )
+    .await
+    .expect("cleanup marker writes");
+
+    let cleared =
+        crate::task_service::execution::clear_plan_publication_cleanup(&db, &marked, execution_id)
+            .await
+            .expect("cleanup marker clears");
+
+    assert_eq!(
+        cleared.version, marked.version,
+        "host-private cleanup must not invalidate a client-visible Task version"
+    );
+    assert!(cleared
+        .metadata()
+        .expect("metadata parses")
+        .extra
+        .get("plan_publication_cleanup")
+        .is_none());
+}
+
+#[tokio::test]
 async fn approval_gated_planner_completion_waits_for_human() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

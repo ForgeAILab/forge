@@ -535,10 +535,14 @@ pub(crate) async fn clear_plan_publication_cleanup(
     if cleanup.execution_id != execution_id {
         return Ok(task.clone());
     }
-    let updated = TaskRepo::mutate_metadata_and_bump_version(
+    // The private files have already been removed before this marker is
+    // retired. Its exact value is sufficient CAS authority for housekeeping;
+    // advancing the public Task version here can invalidate the version a
+    // client just read with an `awaiting_human` planning decision.
+    TaskRepo::mutate_metadata(
         db,
         &task.id,
-        task.version,
+        None,
         vec![db::TaskMetadataMutation::CompareAndMutate {
             key: PLAN_PUBLICATION_CLEANUP_KEY.to_owned(),
             expected: cleanup.value(),
@@ -548,13 +552,8 @@ pub(crate) async fn clear_plan_publication_cleanup(
         }],
         &now_rfc3339(),
     )
-    .await?;
-    if updated.version == task.version {
-        return Err(ServiceError::invalid_operation(
-            "plan publication cleanup marker was lost before release",
-        ));
-    }
-    Ok(updated)
+    .await
+    .map_err(Into::into)
 }
 
 pub(super) async fn clear_settled_plan_publication(
