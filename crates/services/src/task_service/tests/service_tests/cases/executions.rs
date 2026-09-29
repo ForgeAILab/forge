@@ -1198,12 +1198,19 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
 }
 
 #[tokio::test]
-async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
+async fn planner_completion_advances_default_planning_gate() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let embedded = Arc::new(crate::EmbeddedAgentService::new(
+        Arc::clone(&db),
+        b"planner-outbox-test-key",
+    ));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(NoDiffExecutor))
+        .with_task_executor(Arc::new(OutboxPlanExecutor {
+            plan: "- [ ] implement the plan\n",
+        }))
+        .with_provider_credential_env(embedded)
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -1232,87 +1239,278 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         .await
         .expect("planner dispatch succeeds");
 
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             let current = ExecutionRepo::get_by_id(&*db, &execution.id)
                 .await
                 .expect("execution loads")
                 .expect("execution exists");
             if current.status == ExecutionStatus::Completed {
-                break current;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("planner execution completes");
-    let task = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+
+    // The default planning gate is not a human approval boundary: the
+    // finished planner advances the Task instead of leaving a plan-review
+    // marker the dispatcher would keep relaunching the planner against.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+                .await
+                .expect("transition logs load");
+            if logs.iter().any(|log| {
+                log.from_state == crate::workflow::default_states::PLANNING
+                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner completion advances the planning gate");
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = task.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("awaiting_human").is_none());
+    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+    assert_eq!(
+        std::fs::read_to_string(workspace_root.path().join(&task.id).join("plan.md"))
+            .expect("the terminal-CAS winner publishes the plan"),
+        "- [ ] implement the plan\n"
+    );
+    let outbox = executors::execution_outbox_path(
+        &workspace_root.path().join(&task.id).join("forge"),
+        &execution.id,
+    )
+    .expect("outbox path");
+    assert!(!outbox.exists(), "published execution outbox is consumed");
+}
+
+#[tokio::test]
+async fn approval_gated_planner_completion_waits_for_human() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let embedded = Arc::new(crate::EmbeddedAgentService::new(
+        Arc::clone(&db),
+        b"approval-gated-planner-test-key",
+    ));
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(Arc::new(OutboxPlanExecutor {
+            plan: "- [ ] approved implementation\n",
+        }))
+        .with_provider_credential_env(embedded)
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == crate::workflow::default_states::PLANNING)
+        .and_then(|state| state.gate_config.as_mut())
+        .expect("planning gate config")
+        .requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).expect("workflow serializes"))
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project workflow updates");
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::PLANNING.to_owned(),
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&agent_id),
+    )
+    .await;
+
+    let execution = service
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::PLANNER,
+            "plan the approval-gated task".to_owned(),
+        )
+        .await
+        .expect("planner dispatch succeeds");
+
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let current = TaskRepo::get_by_id(&*db, &task.id, false)
                 .await
                 .expect("task loads")
                 .expect("task exists");
-            let metadata = task.metadata().expect("metadata parses");
+            let metadata = current.metadata().expect("metadata parses");
             if metadata
                 .extra
                 .get("awaiting_human_reason")
                 .and_then(Value::as_str)
                 == Some("plan_review")
             {
-                break task;
+                break current;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("planner completion marks task awaiting plan review");
-    let metadata = task.metadata().expect("metadata parses");
+    .expect("planner completion marks the approval gate awaiting human");
+    assert_eq!(waiting.status, crate::workflow::default_states::PLANNING);
     assert_eq!(
-        metadata
-            .extra
-            .get("awaiting_human_reason")
-            .and_then(Value::as_str),
-        Some("plan_review")
-    );
-    assert_eq!(
-        metadata
+        waiting
+            .metadata()
+            .expect("metadata parses")
             .extra
             .get("planning_execution_id")
             .and_then(Value::as_str),
-        Some(completed.id.as_str())
+        Some(execution.id.as_str())
     );
-    assert!(service
-        .is_awaiting_human(task.id.clone())
+    assert_eq!(
+        std::fs::read_to_string(workspace_root.path().join(&task.id).join("plan.md"))
+            .expect("approved plan publishes before review"),
+        "- [ ] approved implementation\n"
+    );
+    assert!(!TransitionLogRepo::list_by_task(&*db, &task.id)
         .await
-        .expect("awaiting human resolves"));
-
-    let workspace = WorkspaceRepo::get_by_id(
-        &*db,
-        completed
-            .workspace_id
-            .as_deref()
-            .expect("execution has workspace"),
-    )
-    .await
-    .expect("workspace loads")
-    .expect("workspace exists");
-    let plan_path = std::path::Path::new(&workspace.worktree_path)
-        .parent()
-        .expect("worktree has workspace parent")
-        .join("plan.md");
-    std::fs::write(plan_path, "- [x] verify plan\n").expect("plan writes");
+        .expect("transition logs load")
+        .iter()
+        .any(
+            |log| log.from_state == crate::workflow::default_states::PLANNING
+                && log.to_state == crate::workflow::default_states::IN_PROGRESS
+        ));
 
     let approved = service
         .transition(
             task.id.clone(),
             crate::workflow::default_states::IN_PROGRESS.to_owned(),
-            task.version,
+            waiting.version,
         )
         .await
-        .expect("planning approval succeeds");
-    let metadata = approved.task.metadata().expect("metadata parses");
-    assert!(metadata.extra.get("awaiting_human").is_none());
-    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+        .expect("explicit approval advances planning");
+    assert_eq!(
+        approved.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+}
+
+#[tokio::test]
+async fn approval_gated_planner_without_a_valid_plan_retries_instead_of_waiting() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_task_executor(Arc::new(SessionNoPlanExecutor))
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == crate::workflow::default_states::PLANNING)
+        .and_then(|state| state.gate_config.as_mut())
+        .expect("planning gate config")
+        .requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).expect("workflow serializes"))
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project workflow updates");
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::PLANNING.to_owned(),
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&agent_id),
+    )
+    .await;
+
+    service
+        .dispatch_initial_role_execution(
+            &task.id,
+            &agent_id,
+            crate::workflow::default_roles::PLANNER,
+            "plan but omit the artifact".to_owned(),
+        )
+        .await
+        .expect("planner dispatch succeeds");
+
+    let blocked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let current = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+            if current.blocked_json.is_some() {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("missing plan exhausts its bounded retry budget");
+    assert_eq!(blocked.status, crate::workflow::default_states::PLANNING);
+    assert!(blocked.error_annotation.is_some());
+    let blocked_metadata = blocked.metadata().expect("metadata parses");
+    assert!(
+        blocked_metadata.extra.get("awaiting_human").is_none(),
+        "an approval gate cannot wait on a missing plan"
+    );
+    assert_eq!(
+        blocked
+            .blocked_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| value.get("source").cloned())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .as_deref(),
+        Some("planning_plan_ready")
+    );
+    let attempts = ExecutionRepo::count_by_task_and_role(
+        &*db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+    )
+    .await
+    .expect("planner attempt count loads");
+    assert!(attempts > 1, "a resumable planner receives a bounded retry");
+    assert!(
+        attempts < 10,
+        "the retry budget must prevent an unbounded loop"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::PLANNER,
+        )
+        .await
+        .expect("stable planner attempt count loads"),
+        attempts,
+        "a blocked plan contract must not launch another planner"
+    );
 }
 
 #[tokio::test]
@@ -2145,7 +2343,9 @@ async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2255,7 +2455,9 @@ async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2300,9 +2502,9 @@ async fn reviewer_completion_cascade_runs_once_while_one_is_in_flight() {
     // The dispatcher's reconciliation arriving while the inline completion
     // path is still settling this execution must not settle it again.
     let in_flight = service
-        .claim_completion_cascade(&reviewer.id)
+        .claim_completion_cascade(&task.id)
         .expect("first claim succeeds");
-    assert!(service.claim_completion_cascade(&reviewer.id).is_none());
+    assert!(service.claim_completion_cascade(&task.id).is_none());
     service
         .maybe_cascade_executor_completion(&reviewer.id)
         .await
@@ -2384,7 +2586,9 @@ async fn duplicate_parent_bound_reviewer_delivery_reconciles_without_new_review_
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2474,7 +2678,9 @@ async fn old_reviewer_cannot_settle_newer_review_sharing_its_candidate() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -2627,7 +2833,7 @@ async fn unbound_legacy_reviewer_cannot_settle_a_newer_review() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                workflow_execution_snapshot(&db, &project_id).await,
             ),
             workspace_id: None,
             created_at: "2026-01-01T00:00:01Z".to_owned(),
@@ -2738,7 +2944,9 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: Some(workspace.id),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -3076,7 +3284,9 @@ async fn assert_failed_reviewer_disposition(
             before_sha: None,
             after_sha: None,
             error: Some("claude-code exited with status exit status: 1".to_owned()),
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -3258,7 +3468,9 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(
+                workflow_execution_snapshot(&db, &project_id).await,
+            ),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -4049,7 +4261,7 @@ async fn follow_up_execution_rejects_running_parent() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                workflow_execution_snapshot(&db, &project_id).await,
             ),
             workspace_id: None,
             created_at: now.clone(),
@@ -5814,6 +6026,7 @@ async fn merge_fix_completion_invalidates_cached_review_before_reentering_review
         .await
         .expect("cached review authority seeds");
     let now = now_rfc3339();
+    let execution_snapshot = workflow_execution_snapshot(&db, &project_id).await;
     let execution = ExecutionRepo::create(
         &*db,
         db::CreateExecution {
@@ -5835,7 +6048,7 @@ async fn merge_fix_completion_invalidates_cached_review_before_reentering_review
             before_sha: None,
             after_sha: None,
             error: None,
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(execution_snapshot),
             workspace_id: None,
             created_at: now.clone(),
             updated_at: now,
@@ -5944,6 +6157,187 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
     let metadata = task.metadata().expect("metadata parses");
     assert_eq!(metadata.extra["workflow_guard_retry_count"], json!(1));
     assert!(task.blocked_json.is_none());
+}
+
+#[tokio::test]
+async fn superseded_project_revision_cannot_apply_completed_coder_guard_effects() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let workspace =
+        seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
+    let execution =
+        seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
+
+    sqlx::query("UPDATE project SET version = version + 1 WHERE id = ?")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project revision advances");
+
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .expect("superseded completion is inert");
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, "in_progress");
+    let metadata = current.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("workflow_guard_retry_count").is_none());
+    assert!(current.blocked_json.is_none());
+    let executions = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 20,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("executions load");
+    assert_eq!(executions.items.len(), 1, "no follow-up may be launched");
+}
+
+#[tokio::test]
+async fn superseded_project_revision_cannot_schedule_failed_execution_retry_or_block() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
+    let execution = seed_completed_coder_execution(&db, &task, &agent_id, None).await;
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'failed', error = 'executor failed', resume_policy = 'manual'
+         WHERE id = ?",
+    )
+    .bind(&execution.id)
+    .execute(db.pool())
+    .await
+    .expect("execution fails");
+    let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+
+    sqlx::query("UPDATE project SET version = version + 1 WHERE id = ?")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project revision advances");
+
+    service
+        .annotate_executor_failure_block(&execution)
+        .await
+        .expect("superseded failure is inert");
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = current.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("execution_retry_count").is_none());
+    assert!(metadata.extra.get("deferred_dispatch").is_none());
+    assert!(current.blocked_json.is_none());
+    assert!(current.error_annotation.is_none());
+}
+
+#[tokio::test]
+async fn superseded_execution_cannot_mutate_workflow_guard_retry_count() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let project_version = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let workspace =
+        seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
+    let old = seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
+    ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(old.id.clone()),
+            agent_session_id: Some("newer-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "project_version": project_version,
+                })
+                .to_string(),
+            ),
+            workspace_id: Some(workspace.id),
+            created_at: "9999-01-01T00:00:00Z".to_owned(),
+            updated_at: "9999-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("newer execution creates");
+
+    service
+        .maybe_cascade_executor_completion(&old.id)
+        .await
+        .expect("superseded completion is inert");
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = current.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("workflow_guard_retry_count").is_none());
+    assert!(current.blocked_json.is_none());
 }
 
 #[tokio::test]
@@ -6078,7 +6472,7 @@ async fn executor_completion_comment_uses_execution_agent() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                workflow_execution_snapshot(&db, &project_id).await,
             ),
             workspace_id: None,
             created_at: now.clone(),
@@ -6158,6 +6552,11 @@ async fn seed_completed_coder_execution(
     workspace_id: Option<&str>,
 ) -> Execution {
     let now = now_rfc3339();
+    let project_version = ProjectRepo::get_by_id(db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
     ExecutionRepo::create(
         db,
         db::CreateExecution {
@@ -6180,7 +6579,12 @@ async fn seed_completed_coder_execution(
             after_sha: None,
             error: None,
             executor_config_snapshot_json: Some(
-                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+                json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "project_version": project_version,
+                })
+                .to_string(),
             ),
             workspace_id: workspace_id.map(str::to_owned),
             created_at: now.clone(),
@@ -6189,6 +6593,20 @@ async fn seed_completed_coder_execution(
     )
     .await
     .expect("execution creates")
+}
+
+async fn workflow_execution_snapshot(db: &SqliteDb, project_id: &str) -> String {
+    let project_version = ProjectRepo::get_by_id(db, project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
+    json!({
+        "executor_type": "shell",
+        "config": {},
+        "project_version": project_version,
+    })
+    .to_string()
 }
 
 #[tokio::test]

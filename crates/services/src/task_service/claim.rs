@@ -17,6 +17,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
             return Err(ServiceError::invalid_operation(
                 "root tasks with subtasks are coordination containers; assign and run their subtasks",

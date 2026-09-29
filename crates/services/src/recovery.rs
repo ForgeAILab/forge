@@ -11,7 +11,7 @@ use db::{
     ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, MarkUsageInvocationUnsettled,
     PageRequest, Project, ProjectRepo, RecordExecutionProgressWarning, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, TerminalizeExecution,
-    UpdateAgent, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo,
+    UpdateAgent, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -25,6 +25,41 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
+
+async fn discard_execution_plan_artifacts(db: &SqliteDb, execution: &Execution) {
+    let Some(workspace_id) = execution.workspace_id.as_deref() else {
+        return;
+    };
+    let workspace = match WorkspaceRepo::get_by_id(db, workspace_id).await {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                execution_id = %execution.id,
+                %error,
+                "failed to resolve workspace while cleaning terminal plan artifacts"
+            );
+            return;
+        }
+    };
+    let worktree = std::path::Path::new(&workspace.worktree_path);
+    if let Some(outbox) = executors::execution_outbox_path(worktree, &execution.id) {
+        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    path = %outbox.display(),
+                    %error,
+                    "failed to remove terminal execution outbox"
+                );
+            }
+        }
+    }
+    crate::task_service::execution::discard_execution_plan_stage(
+        &workspace.worktree_path,
+        &execution.id,
+    );
+}
 
 #[derive(Clone)]
 pub struct CrashRecovery {
@@ -615,6 +650,8 @@ impl HeartbeatMonitor {
                 continue;
             };
 
+            discard_execution_plan_artifacts(&self.db, &updated).await;
+
             if let Some(task_executor) = self.task_executor.as_ref() {
                 // Agents without a daemon binding run in-process, so only a
                 // definitively remote-owned execution skips the embedded
@@ -966,6 +1003,8 @@ async fn expire_workspace_leases(
             // downstream recovery side effect for this expired grant.
             continue;
         };
+
+        discard_execution_plan_artifacts(db, &updated).await;
 
         expired_count += 1;
 
@@ -1391,6 +1430,7 @@ async fn cancel_running_executions_for_recovery(
             ..
         } = outcome
         {
+            discard_execution_plan_artifacts(db, &cancelled_execution).await;
             cancelled.push(CancelledExecution {
                 execution_id: cancelled_execution.id,
                 agent_session_id: execution.agent_session_id.clone(),
@@ -1573,6 +1613,8 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         // stale daemon observation must not emit a second failure.
         return Ok(None);
     };
+
+    discard_execution_plan_artifacts(db, &updated).await;
 
     event_bus.publish(ForgeEvent {
         event_type: "execution.daemon_disconnected".to_owned(),

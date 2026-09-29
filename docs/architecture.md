@@ -469,8 +469,47 @@ its only writable roots are one freshly reset Forge-owned `task-scratch`
 directory, the execution outbox, and the host's package-manager caches
 (`~/.npm`, Cargo `registry`/`git`, the Go module cache, the XDG cache, pnpm's
 store, and `~/Library/Caches` on macOS, each honoring its relocation
-variable). A read-only role still cannot deliver code: Forge skips its
-finalization, fails any execution that changed a tracked file or moved HEAD,
+variable). The Task directory that contains the worktree is not writable by
+the sandbox. CLI planning and implementation executions (`planner`, `worker`,
+`coder`, and `executor`) instead receive a role-scoped `FORGE_PLAN_PATH` inside
+their execution outbox. Forge seeds that private file from the canonical Task
+plan for implementation turns. This outbox file is the supported plan-delivery
+contract for every CLI adapter.
+Forge enforces the surrounding Task directory as non-writable for managed
+Codex runs; a CLI adapter without an OS sandbox may still have ambient
+filesystem access to sibling files, so Forge does not claim universal
+filesystem confinement for those processes. Writing a sibling directly is
+outside the supported contract.
+
+Native planning and implementation Task sessions use the typed `task.plan`
+operation with `{"action":"write","content":"<full Markdown checklist>"}`
+instead of receiving a canonical plan path. The tool surface names those roles
+Planner and Worker; the Worker session covers `worker`, `coder`, and `executor`
+execution roles. The host takes the runtime session from the invocation context
+and requires it to bind the Task, identity, role, and ready Workspace to exactly
+one `Running` execution. It writes that candidate to the same
+execution-private outbox; reviewers are not offered the operation. Each call
+replaces the full private checklist candidate, so an implementation role can
+keep completion marks current during its run.
+
+Neither `$FORGE_PLAN_PATH` nor `task.plan` publishes the canonical plan
+directly. Before terminal settlement, Forge validates the candidate and freezes
+its exact bytes in a host-owned staging area outside the agent-writable outbox;
+later outbox changes cannot affect publication. A durable compare-and-swap
+claim binds publication to the exact execution, Task state entry, and Project
+version. On Unix, the frozen file replaces the canonical sibling `plan.md` by
+atomic same-directory rename, and Forge rejects files with additional hard
+links. Other platforms use a portable replacement fallback and do not promise
+those two Unix properties. Reviewer and stale execution output cannot publish a
+plan. Non-regular files, symlinks, invalid UTF-8, oversized content, and plans
+without a checklist are rejected; a rejected candidate is retained in its
+execution outbox for diagnosis. After successful staging, Forge removes the
+agent-writable outbox and settles from the frozen copy. This broker shares the
+managed-daemon filesystem requirement: the API server and execution host must
+see the Task directory at the same absolute path through a shared workspace
+mount; separate-filesystem daemon sync is not implemented. A read-only role
+still cannot deliver code: Forge skips
+its finalization, fails any execution that changed a tracked file or moved HEAD,
 and resets the worktree afterwards. An unexpected authority-bearing input in that managed home
 fails execution closed. Codex-generated trust configuration and system-skill
 cache are discarded before each attempt and replaced with canonical Forge
@@ -1596,8 +1635,10 @@ terminal workflow state under the same transaction as wake budgeting, so
 recovery, cancellation, or deletion after projection suppresses the stale wake.
 Observation belongs to the run that made it. A Task session holds a worktree
 and a process and captures what its own run did (`task.evidence`,
-`task.worklog`; a CLI harness writes the same records to its execution outbox,
-which Forge ingests when the run ends — see
+`task.worklog`; an authorized planning or implementation session also keeps an
+execution-private plan candidate with `task.plan`). A CLI harness writes the
+same records and plan candidate to its execution outbox, which Forge ingests
+when the run ends — see
 [api.md](api.md#commitments-inbox-and-typed-actions)). The Project Agent holds its own verification workspace — a
 durable `forge/` plus a disposable `checkout/` of the repository — and every
 Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
@@ -1899,11 +1940,12 @@ terminated when it observes the terminal lifecycle event.
 ## Task state machine
 
 ```
-todo ──────────────► in_progress ──────► review ──────► merging ──────► done
- │                      │                  │              │
- └──► cancelled ◄───────┴──────────────────┴──────────────┘
-                                           │
-                                      merge_failed ──► blocked
+backlog ──► todo ──► planning ──► in_progress ──► review ──► merging ──► done
+   ▲          │                           ▲           │          │
+   └──────────┘                           └───────────┘          ▼
+                                                       merge_failed ──► blocked
+
+                         any non-terminal state ──► cancelled
 ```
 
 All non-terminal states can transition to `cancelled`. Terminal states: `done`,
@@ -1918,6 +1960,16 @@ The built-in workflow choices are:
 - `no-review` — required checks run and the Task continues without a reviewer execution.
 - `human-required` — the user or bound Project Agent accepts or rejects.
 - `autonomous_v1` — the single-worker compatibility preset with hard validation and human review.
+
+In the default workflow, a completed planner may leave `planning` only after
+Forge can read a valid checklist plan. The planning gate then advances to
+`in_progress` automatically; it is not a human approval boundary. A custom
+workflow that sets `requires_user_approval` on that gate remains in planning
+with `awaiting_human` until the user approves it, and the dispatcher will not
+start or relaunch another non-reviewer role while that marker is present. A
+missing or invalid plan is handled by the normal bounded execution-guard retry
+path and becomes a durable blocker when the budget is exhausted, rather than
+causing an unbounded sequence of fresh planner runs.
 
 The `autonomous_v1` preset lives in
 `crates/services/src/workflow/default_autonomous_workflow.rs`. It is a

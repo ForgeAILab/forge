@@ -1,5 +1,5 @@
 use super::*;
-use crate::{AssigneeKind, CreateTransitionLog, TaskRoleAssignment};
+use crate::{AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, TaskRoleAssignment};
 use std::collections::HashSet;
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
@@ -39,6 +39,87 @@ async fn check_project_workflow_authority_in_tx(
         return Err(DbError::VersionConflict);
     }
     Ok(())
+}
+
+async fn latest_execution_authority_matches_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task: &Task,
+    authority: &LatestExecutionAuthority,
+) -> Result<bool> {
+    let project_version = sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+        .bind(&task.project_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    if project_version != authority.expected_project_version {
+        return Ok(false);
+    }
+
+    let latest_execution_id = if matches!(authority.role.as_str(), "coder" | "executor") {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM execution
+             WHERE task_id = ? AND role IN ('coder', 'executor')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    } else if matches!(authority.role.as_str(), "reviewer" | "auditor") {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM execution
+             WHERE task_id = ? AND role IN ('reviewer', 'auditor')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM execution
+             WHERE task_id = ? AND role = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .bind(&authority.role)
+        .fetch_optional(&mut **transaction)
+        .await?
+    };
+    if latest_execution_id.as_deref() != Some(authority.execution_id.as_str()) {
+        return Ok(false);
+    }
+
+    if authority.role != "interactive" {
+        let assignment_role = match authority.role.as_str() {
+            "executor" => "coder",
+            "auditor" => "reviewer",
+            role => role,
+        };
+        let assignment = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
+            "SELECT assignee_type, assignee_id, updated_at
+             FROM task_role_assignment
+             WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&task.id)
+        .bind(assignment_role)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some((assignee_type, assignee_id, assignment_updated_at)) = assignment {
+            let assignment_supersedes_execution =
+                chrono::DateTime::parse_from_rfc3339(&assignment_updated_at)
+                    .ok()
+                    .zip(chrono::DateTime::parse_from_rfc3339(&authority.execution_updated_at).ok())
+                    .is_some_and(|(assignment, execution)| assignment > execution);
+            if assignee_type.as_deref() != Some("agent")
+                || assignee_id.as_deref() != authority.agent_id.as_deref()
+                || assignment_supersedes_execution
+            {
+                return Ok(false);
+            }
+        } else if authority.agent_id.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn set_review_passed_at_inner(
@@ -810,6 +891,27 @@ impl TaskRepo for SqliteDb {
         page_from_items(items, &query.page, offset, total)
     }
 
+    async fn list_by_project_with_metadata_key(
+        &self,
+        project_id: &str,
+        key: &str,
+    ) -> Result<Vec<Task>> {
+        let path = format!("$.{key}");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM task
+             WHERE project_id = ? AND deleted_at IS NULL
+               AND json_valid(metadata_json)
+               AND json_type(metadata_json, ?) IS NOT NULL
+             ORDER BY created_at ASC, id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(project_id)
+            .bind(path)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(map_task).collect()
+    }
+
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>> {
         let offset = decode_offset(&query.page.cursor)?;
         let mut where_parts =
@@ -1117,6 +1219,233 @@ impl TaskRepo for SqliteDb {
         Ok(task)
     }
 
+    async fn mutate_metadata_and_bump_version(
+        &self,
+        id: &str,
+        expected_version: i64,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Task> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
+        if task.deleted_at.is_some() {
+            return Err(DbError::NotFound);
+        }
+        if task.version != expected_version {
+            return Err(DbError::VersionConflict);
+        }
+
+        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let mut changed = false;
+        for mutation in mutations {
+            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+        }
+        if !changed {
+            transaction.commit().await?;
+            return Ok(task);
+        }
+
+        let metadata_json = metadata.to_json();
+        let result = sqlx::query(
+            "UPDATE task
+             SET metadata_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+        )
+        .bind(metadata_json.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        task.metadata_json = metadata_json;
+        task.version += 1;
+        task.updated_at = updated_at.to_owned();
+        transaction.commit().await?;
+        Ok(task)
+    }
+
+    async fn mutate_metadata_and_bump_version_with_project_authority(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_project_version: i64,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Task> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
+        if task.deleted_at.is_some() {
+            return Err(DbError::NotFound);
+        }
+        if task.version != expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        let project_version =
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(&task.project_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
+        if project_version != expected_project_version {
+            return Err(DbError::VersionConflict);
+        }
+
+        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let mut changed = false;
+        for mutation in mutations {
+            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+        }
+        if !changed {
+            transaction.commit().await?;
+            return Ok(task);
+        }
+
+        let metadata_json = metadata.to_json();
+        let result = sqlx::query(
+            "UPDATE task
+             SET metadata_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+        )
+        .bind(metadata_json.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        task.metadata_json = metadata_json;
+        task.version += 1;
+        task.updated_at = updated_at.to_owned();
+        transaction.commit().await?;
+        Ok(task)
+    }
+
+    async fn mutate_metadata_and_bump_version_for_latest_execution(
+        &self,
+        id: &str,
+        expected_version: i64,
+        authority: LatestExecutionAuthority,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Option<Task>> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
+        if task.deleted_at.is_some() {
+            return Err(DbError::NotFound);
+        }
+        if task.version != expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        if !latest_execution_authority_matches_in_tx(&mut transaction, &task, &authority).await? {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+
+        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let mut changed = false;
+        for mutation in mutations {
+            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+        }
+        if !changed {
+            transaction.commit().await?;
+            return Ok(Some(task));
+        }
+        let metadata_json = metadata.to_json();
+        let result = sqlx::query(
+            "UPDATE task
+             SET metadata_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+        )
+        .bind(metadata_json.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        task.metadata_json = metadata_json;
+        task.version += 1;
+        task.updated_at = updated_at.to_owned();
+        transaction.commit().await?;
+        Ok(Some(task))
+    }
+
+    async fn claim_metadata_for_latest_execution(
+        &self,
+        input: LatestExecutionMetadataClaim,
+    ) -> Result<Task> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.task_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
+        if task.deleted_at.is_some() {
+            return Err(DbError::NotFound);
+        }
+        if task.version != input.expected_task_version {
+            return Err(DbError::VersionConflict);
+        }
+        if !latest_execution_authority_matches_in_tx(&mut transaction, &task, &input.authority)
+            .await?
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if metadata.extra.contains_key(&input.key) {
+            return Err(DbError::VersionConflict);
+        }
+        metadata.extra.insert(input.key, input.value);
+        let metadata_json = metadata.to_json();
+        let result = sqlx::query(
+            "UPDATE task
+             SET metadata_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND deleted_at IS NULL",
+        )
+        .bind(metadata_json.as_deref())
+        .bind(&input.updated_at)
+        .bind(&input.task_id)
+        .bind(input.expected_task_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        task.metadata_json = metadata_json;
+        task.version += 1;
+        task.updated_at = input.updated_at;
+        transaction.commit().await?;
+        Ok(task)
+    }
+
     async fn wake_dispatch_for_task(&self, id: &str, updated_at: &str) -> Result<Task> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
@@ -1295,7 +1624,7 @@ impl TaskRepo for SqliteDb {
     async fn claim(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
-        input: ClaimTask,
+        mut input: ClaimTask,
     ) -> Result<ClaimedTask> {
         let sql = format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL");
         let row = sqlx::query(&sql)
@@ -1316,21 +1645,24 @@ impl TaskRepo for SqliteDb {
         if input.execution.status != ExecutionStatus::Running {
             return Err(DbError::InvalidTransition);
         }
-        if input.expected_project_version.is_some() || input.expected_workflow_definition.is_some()
-        {
-            let project_authority = sqlx::query_as::<_, (i64, String)>(
-                "SELECT version, workflow_definition FROM project WHERE id = ?",
-            )
-            .bind(&task.project_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            if input.expected_project_version != Some(project_authority.0)
+        // Read the Project authority inside the writer transaction even for
+        // low-level callers that omit an expected revision. The execution
+        // snapshot is stamped from this exact row below; a pre-transaction
+        // Task/Project read must never become completion authority.
+        let project_authority = sqlx::query_as::<_, (i64, String)>(
+            "SELECT version, workflow_definition FROM project WHERE id = ?",
+        )
+        .bind(&task.project_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        if (input.expected_project_version.is_some()
+            || input.expected_workflow_definition.is_some())
+            && (input.expected_project_version != Some(project_authority.0)
                 || input.expected_workflow_definition.as_deref()
-                    != Some(project_authority.1.as_str())
-            {
-                return Err(DbError::VersionConflict);
-            }
+                    != Some(project_authority.1.as_str()))
+        {
+            return Err(DbError::VersionConflict);
         }
         let initial_lease = &input.execution_lease;
         let invalid_deadline = initial_lease
@@ -1376,6 +1708,54 @@ impl TaskRepo for SqliteDb {
             }
             _ => return Err(DbError::InvalidTransition),
         };
+        let claim_triggered_by = match input.assignee_type.as_str() {
+            "agent" => format!(
+                "agent:{}",
+                input
+                    .execution
+                    .agent_id
+                    .as_deref()
+                    .ok_or(DbError::InvalidTransition)?
+            ),
+            "user" => format!(
+                "user:{}",
+                input
+                    .assignee_id
+                    .as_deref()
+                    .ok_or(DbError::InvalidTransition)?
+            ),
+            _ => return Err(DbError::InvalidTransition),
+        };
+
+        // A claim is itself the state-entry boundary for the execution it
+        // creates. Mint the token and stamp the immutable execution snapshot
+        // under the same SQLite writer transaction as the source -> target
+        // Task CAS. This prevents a direct claim from retaining the source
+        // state/token captured while its executor configuration was built.
+        let state_entry_token = new_uuid_v4();
+        if let Some(raw_snapshot) = input.execution.executor_config_snapshot_json.as_deref() {
+            let mut snapshot: serde_json::Value = serde_json::from_str(raw_snapshot)
+                .map_err(|error| DbError::Check(format!("invalid execution snapshot: {error}")))?;
+            let snapshot = snapshot.as_object_mut().ok_or_else(|| {
+                DbError::Check("execution snapshot must be a JSON object".to_owned())
+            })?;
+            snapshot.insert(
+                "task_state".to_owned(),
+                serde_json::Value::String(input.target_status.clone()),
+            );
+            snapshot.insert(
+                "state_entry_token".to_owned(),
+                serde_json::Value::String(state_entry_token.clone()),
+            );
+            snapshot.insert(
+                "project_version".to_owned(),
+                serde_json::Value::Number(project_authority.0.into()),
+            );
+            input.execution.executor_config_snapshot_json =
+                Some(serde_json::to_string(snapshot).map_err(|error| {
+                    DbError::Check(format!("invalid execution snapshot: {error}"))
+                })?);
+        }
 
         let unsatisfied_dependencies =
             Self::unsatisfied_dependencies_in_tx(transaction, &input.task_id).await?;
@@ -1426,6 +1806,23 @@ impl TaskRepo for SqliteDb {
         task.entry_barrier_json = None;
         task.version += 1;
         task.updated_at = input.claimed_at;
+
+        insert_recovery_marker_in_tx(
+            transaction,
+            &CreateTransitionLog {
+                id: state_entry_token,
+                task_id: task.id.clone(),
+                from_state: input.source_status.clone(),
+                to_state: task.status.clone(),
+                trigger_name: None,
+                triggered_by: claim_triggered_by,
+                trigger_reason: "task claimed".to_owned(),
+                hook_results_json: None,
+                rejection: false,
+                created_at: task.updated_at.clone(),
+            },
+        )
+        .await?;
 
         // The Task status changes from the source state to the claim target
         // in this transaction. Validate the execution admission against that
@@ -1546,7 +1943,17 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
-        update_task_status_inner(self, input, None).await
+        update_task_status_inner(self, input, None, None)
+            .await?
+            .ok_or(DbError::VersionConflict)
+    }
+
+    async fn update_status_for_latest_execution(
+        &self,
+        input: UpdateTaskStatus,
+        authority: LatestExecutionAuthority,
+    ) -> Result<Option<Task>> {
+        update_task_status_inner(self, input, None, Some(&authority)).await
     }
 
     async fn update_status_with_recovery_marker(
@@ -1554,7 +1961,9 @@ impl TaskRepo for SqliteDb {
         input: UpdateTaskStatus,
         marker: CreateTransitionLog,
     ) -> Result<Task> {
-        update_task_status_inner(self, input, Some(&marker)).await
+        update_task_status_inner(self, input, Some(&marker), None)
+            .await?
+            .ok_or(DbError::VersionConflict)
     }
 }
 
@@ -1562,7 +1971,8 @@ async fn update_task_status_inner(
     db: &SqliteDb,
     input: UpdateTaskStatus,
     recovery_marker: Option<&CreateTransitionLog>,
-) -> Result<Task> {
+    latest_execution_authority: Option<&LatestExecutionAuthority>,
+) -> Result<Option<Task>> {
     if recovery_marker.is_some_and(|marker| marker.task_id != input.id) {
         return Err(DbError::InvalidTransition);
     }
@@ -1578,6 +1988,12 @@ async fn update_task_status_inner(
     }
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);
+    }
+    if let Some(authority) = latest_execution_authority {
+        if !latest_execution_authority_matches_in_tx(&mut transaction, &task, authority).await? {
+            transaction.commit().await?;
+            return Ok(None);
+        }
     }
     let previous_status = task.status.clone();
     let previous_error_annotation = task.error_annotation.clone();
@@ -1682,7 +2098,7 @@ async fn update_task_status_inner(
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
     }
     transaction.commit().await?;
-    Ok(task)
+    Ok(Some(task))
 }
 
 fn interruption_fields_changed(

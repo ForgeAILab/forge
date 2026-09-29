@@ -30,6 +30,9 @@ pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
@@ -83,11 +86,46 @@ pub fn is_worktree_read_only(config: &serde_json::Value) -> bool {
 
 /// Environment variable naming an execution's outbox directory.
 pub const FORGE_OUTBOX_ENV: &str = "FORGE_OUTBOX";
+/// Environment variable naming the per-execution plan file that Forge may publish.
+pub const FORGE_PLAN_PATH_ENV: &str = "FORGE_PLAN_PATH";
 /// Worklog entries a CLI harness appends to its outbox, one JSON object per line.
 pub const OUTBOX_WORKLOG_FILE: &str = "worklog.jsonl";
 /// Evidence a CLI harness registers in its outbox, one JSON object per line.
 pub const OUTBOX_EVIDENCE_FILE: &str = "evidence.jsonl";
+/// Plan candidate produced by an authorized CLI planning or implementation role.
+pub const OUTBOX_PLAN_FILE: &str = "plan.md";
 const OUTBOX_DIR_NAME: &str = ".forge-outbox";
+
+/// A Task execution outbox could not be resolved without crossing the Task
+/// directory boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutionOutboxError {
+    #[error("execution id is not safe for an outbox path")]
+    InvalidExecutionId,
+    #[error("Task worktree has no parent directory: {0}")]
+    MissingTaskRoot(PathBuf),
+    #[error("execution outbox path is not a real directory: {0}")]
+    InvalidDirectory(PathBuf),
+    #[error("execution outbox path escapes the Task directory: {0}")]
+    PathEscape(PathBuf),
+    #[error("execution outbox I/O failed: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// Whether a Task role may publish or update the canonical plan artifact.
+#[must_use]
+pub fn task_role_can_write_plan(role: Option<&str>) -> bool {
+    matches!(role, Some("planner" | "worker" | "coder" | "executor"))
+}
+
+/// Whether an execution id is safe to use as exactly one path component.
+#[must_use]
+pub fn execution_id_is_path_safe(execution_id: &str) -> bool {
+    !execution_id.is_empty()
+        && execution_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 /// The directory a CLI harness writes worklog and evidence into.
 ///
@@ -98,20 +136,151 @@ const OUTBOX_DIR_NAME: &str = ".forge-outbox";
 /// one place it may write. Both the server and the daemon derive it from the
 /// same two values, so no transport change is needed.
 #[must_use]
-pub fn execution_outbox_path(
-    worktree_path: &std::path::Path,
-    execution_id: &str,
-) -> Option<std::path::PathBuf> {
-    let safe_id = !execution_id.is_empty()
-        && execution_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !safe_id {
-        return None;
+pub fn execution_outbox_path(worktree_path: &Path, execution_id: &str) -> Option<PathBuf> {
+    let (_, outbox_root, outbox) = outbox_components(worktree_path, execution_id).ok()?;
+    let canonical_task_root = validate_task_root(worktree_path).ok()?;
+    if let Some(canonical_outbox_root) =
+        validate_optional_child_directory(&outbox_root, &canonical_task_root).ok()?
+    {
+        validate_optional_child_directory(&outbox, &canonical_outbox_root).ok()?;
     }
-    worktree_path
+    Some(outbox)
+}
+
+/// Create and validate the two outbox directories without ever using a
+/// recursive create through agent-controlled path components.
+///
+/// Both `.forge-outbox` and the execution directory must be real, direct
+/// children of their expected parent. Symlinks and other file types fail
+/// closed. Callers should use the returned path instead of reconstructing it.
+pub fn prepare_execution_outbox(
+    worktree_path: &Path,
+    execution_id: &str,
+) -> Result<PathBuf, ExecutionOutboxError> {
+    let (_, outbox_root, outbox) = outbox_components(worktree_path, execution_id)?;
+    let canonical_task_root = validate_task_root(worktree_path)?;
+    let canonical_outbox_root = ensure_child_directory(&outbox_root, &canonical_task_root)?;
+    ensure_child_directory(&outbox, &canonical_outbox_root)?;
+    Ok(outbox)
+}
+
+/// Resolve an already-created execution outbox, returning `None` when it is
+/// absent and an error when any component is a symlink, a non-directory, or
+/// resolves outside the Task directory.
+pub fn existing_execution_outbox(
+    worktree_path: &Path,
+    execution_id: &str,
+) -> Result<Option<PathBuf>, ExecutionOutboxError> {
+    let (_, outbox_root, outbox) = outbox_components(worktree_path, execution_id)?;
+    let canonical_task_root = validate_task_root(worktree_path)?;
+    let Some(canonical_outbox_root) =
+        validate_optional_child_directory(&outbox_root, &canonical_task_root)?
+    else {
+        return Ok(None);
+    };
+    let Some(_) = validate_optional_child_directory(&outbox, &canonical_outbox_root)? else {
+        return Ok(None);
+    };
+    Ok(Some(outbox))
+}
+
+/// Remove one execution's outbox only after validating both directory
+/// components against the Task root. `remove_dir_all` itself does not follow
+/// a leaf symlink; the checks here also reject a symlinked intermediate root.
+pub fn remove_execution_outbox(
+    worktree_path: &Path,
+    execution_id: &str,
+) -> Result<(), ExecutionOutboxError> {
+    let Some(outbox) = existing_execution_outbox(worktree_path, execution_id)? else {
+        return Ok(());
+    };
+    match fs::remove_dir_all(outbox) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ExecutionOutboxError::Io(error)),
+    }
+}
+
+fn outbox_components(
+    worktree_path: &Path,
+    execution_id: &str,
+) -> Result<(PathBuf, PathBuf, PathBuf), ExecutionOutboxError> {
+    if !execution_id_is_path_safe(execution_id) {
+        return Err(ExecutionOutboxError::InvalidExecutionId);
+    }
+    let task_root = worktree_path
         .parent()
-        .map(|task_dir| task_dir.join(OUTBOX_DIR_NAME).join(execution_id))
+        .ok_or_else(|| ExecutionOutboxError::MissingTaskRoot(worktree_path.to_path_buf()))?
+        .to_path_buf();
+    let outbox_root = task_root.join(OUTBOX_DIR_NAME);
+    let outbox = outbox_root.join(execution_id);
+    Ok((task_root, outbox_root, outbox))
+}
+
+fn validate_task_root(worktree_path: &Path) -> Result<PathBuf, ExecutionOutboxError> {
+    let task_root = worktree_path
+        .parent()
+        .ok_or_else(|| ExecutionOutboxError::MissingTaskRoot(worktree_path.to_path_buf()))?;
+    ensure_real_directory(task_root)?;
+    ensure_real_directory(worktree_path)?;
+    let canonical_task_root = fs::canonicalize(task_root)?;
+    let canonical_worktree = fs::canonicalize(worktree_path)?;
+    if canonical_worktree.parent() != Some(canonical_task_root.as_path()) {
+        return Err(ExecutionOutboxError::PathEscape(canonical_worktree));
+    }
+    Ok(canonical_task_root)
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), ExecutionOutboxError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(ExecutionOutboxError::InvalidDirectory(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn validate_optional_child_directory(
+    path: &Path,
+    canonical_parent: &Path,
+) -> Result<Option<PathBuf>, ExecutionOutboxError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(ExecutionOutboxError::InvalidDirectory(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ExecutionOutboxError::Io(error)),
+    }
+    let canonical = fs::canonicalize(path)?;
+    if canonical.parent() != Some(canonical_parent) {
+        return Err(ExecutionOutboxError::PathEscape(canonical));
+    }
+    Ok(Some(canonical))
+}
+
+fn ensure_child_directory(
+    path: &Path,
+    canonical_parent: &Path,
+) -> Result<PathBuf, ExecutionOutboxError> {
+    if let Some(canonical) = validate_optional_child_directory(path, canonical_parent)? {
+        return Ok(canonical);
+    }
+
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(ExecutionOutboxError::Io(error)),
+    }
+    validate_optional_child_directory(path, canonical_parent)?.ok_or_else(|| {
+        ExecutionOutboxError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "execution outbox directory disappeared during creation",
+        ))
+    })
 }
 
 /// Context passed to an executor when running a task.
@@ -155,6 +324,95 @@ mod worktree_policy_tests {
 
         assert!(is_worktree_read_only(&config));
         assert_eq!(config["executor_type"], "claude_code");
+    }
+}
+
+#[cfg(test)]
+mod outbox_path_tests {
+    use super::*;
+
+    #[test]
+    fn outbox_requires_a_real_direct_child_worktree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("task").join("repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+
+        let outbox = prepare_execution_outbox(&worktree, "exec-1").expect("outbox creates");
+
+        assert_eq!(
+            outbox,
+            temp.path()
+                .join("task")
+                .join(".forge-outbox")
+                .join("exec-1")
+        );
+        assert_eq!(
+            existing_execution_outbox(&worktree, "exec-1").expect("outbox validates"),
+            Some(outbox.clone())
+        );
+        remove_execution_outbox(&worktree, "exec-1").expect("outbox removes");
+        assert!(!outbox.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whole_outbox_root_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let worktree = temp.path().join("task").join("repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        fs::write(outside.path().join("keep"), "untouched").expect("outside marker");
+        symlink(
+            outside.path(),
+            temp.path().join("task").join(OUTBOX_DIR_NAME),
+        )
+        .expect("outbox-root symlink creates");
+
+        assert!(execution_outbox_path(&worktree, "exec-1").is_none());
+        assert!(matches!(
+            prepare_execution_outbox(&worktree, "exec-1"),
+            Err(ExecutionOutboxError::InvalidDirectory(_))
+        ));
+        assert!(matches!(
+            remove_execution_outbox(&worktree, "exec-1"),
+            Err(ExecutionOutboxError::InvalidDirectory(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("keep")).expect("outside marker reads"),
+            "untouched"
+        );
+        assert!(!outside.path().join("exec-1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn per_execution_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let worktree = temp.path().join("task").join("repo");
+        let outbox_root = temp.path().join("task").join(OUTBOX_DIR_NAME);
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        fs::create_dir(&outbox_root).expect("outbox root creates");
+        fs::write(outside.path().join("keep"), "untouched").expect("outside marker");
+        symlink(outside.path(), outbox_root.join("exec-1")).expect("execution symlink creates");
+
+        assert!(execution_outbox_path(&worktree, "exec-1").is_none());
+        assert!(matches!(
+            prepare_execution_outbox(&worktree, "exec-1"),
+            Err(ExecutionOutboxError::InvalidDirectory(_))
+        ));
+        assert!(matches!(
+            remove_execution_outbox(&worktree, "exec-1"),
+            Err(ExecutionOutboxError::InvalidDirectory(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("keep")).expect("outside marker reads"),
+            "untouched"
+        );
     }
 }
 

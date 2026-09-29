@@ -186,6 +186,7 @@ impl TaskService {
         cancel_active_execution: bool,
     ) -> Result<TaskRoleAssignment> {
         let mut task = self.validate_reassignable_task(&input.task_id).await?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         self.ensure_coordination_root_role_allowed(&task, &input.role_name)
             .await?;
         if input.assignee_type == Some(AssigneeKind::Agent) {
@@ -389,6 +390,7 @@ impl TaskService {
         reset_worktree: bool,
     ) -> Result<()> {
         let mut task = self.validate_reassignable_task(task_id).await?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let previous =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
         let Some(previous) = previous else {
@@ -529,6 +531,7 @@ impl TaskService {
             WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
             },
         ))
     }

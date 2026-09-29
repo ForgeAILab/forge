@@ -14,12 +14,19 @@ async fn project_in_use_counts(
 ) -> Result<(i64, i64)> {
     sqlx::query_as(
         "SELECT
-            (SELECT COUNT(*) FROM execution e
+            ((SELECT COUNT(*) FROM execution e
                JOIN task t ON t.id = e.task_id
-              WHERE t.project_id = ? AND e.status = 'running'),
+              WHERE t.project_id = ? AND e.status = 'running')
+             +
+             (SELECT COUNT(*) FROM task t
+              WHERE t.project_id = ? AND t.deleted_at IS NULL
+                AND json_valid(t.metadata_json)
+                AND (json_type(t.metadata_json, '$.plan_publication_claim') IS NOT NULL
+                  OR json_type(t.metadata_json, '$.plan_publication_cleanup') IS NOT NULL))),
             (SELECT COUNT(*) FROM workspace_lease wl
               WHERE wl.project_id = ? AND wl.status = 'active')",
     )
+    .bind(project_id)
     .bind(project_id)
     .bind(project_id)
     .fetch_one(&mut **transaction)

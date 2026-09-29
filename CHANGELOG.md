@@ -49,7 +49,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer drop every daemon notification. A missing deadline was treated as
   already reached, so logs and progress were rejected; progress CAS and
   stall warnings also required a deadline.
-
 - Smith, other CLI Task agents, direct/native agents, and reviewer executions
   no longer receive Forge's implicit 30-minute wall-clock deadline (or its
   hidden 24-hour ceiling). Executions are unlimited by default while their
@@ -66,6 +65,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   can advance Task state. Generic execution follow-ups are labeled as
   non-propagating side sessions and are hidden from the Task's active recovery
   surface, avoiding successful follow-ups that leave the same Review blocked.
+- A Task with an assigned planner no longer re-plans forever. The default
+  planning gate stopped being a human approval boundary in 0.9.0, but a
+  finished planner never advanced the Task: it was marked awaiting plan review
+  and the dispatcher relaunched the planner after each completion. A completed
+  planner now advances planning → in progress on its own (approval-gated
+  workflows still wait), and the dispatcher never starts or relaunches a
+  non-reviewer role while its Task awaits a human. A missing or invalid plan
+  uses bounded execution-guard retries and then creates a durable blocker
+  instead of starting an unlimited series of fresh planner runs.
+- CLI planning and implementation roles (`planner`, `worker`, `coder`, and
+  `executor`) now receive a private `$FORGE_PLAN_PATH` in their execution
+  outbox, while native Planner/Worker sessions use typed `task.plan` with
+  `{action: "write", content: "<full checklist>"}`, bound to exactly one
+  running execution by its runtime session. Neither path directly publishes
+  the canonical plan: terminal handling freezes the candidate outside the
+  agent-writable outbox, then a durable execution/state-entry claim controls
+  publication while settling the owning completed execution. On Unix the
+  frozen file replaces the canonical plan by atomic same-directory rename and
+  multi-linked files are rejected; other platforms use the portable replacement
+  fallback without those Unix guarantees. Reviewer, stale, non-regular,
+  symlinked, oversized, and invalid UTF-8 output cannot replace the canonical
+  plan. Managed Codex cannot write the surrounding Task directory; direct
+  sibling writes by less-confined CLI adapters remain outside the supported
+  contract.
+- Interactive password input now disables terminal echo before displaying the
+  prompt, closing a scheduling race that could echo a fast response into the
+  terminal transcript.
 
 ## [0.13.8] - 2026-09-27
 

@@ -272,8 +272,19 @@ pub(super) async fn build_executor_config_snapshot(
     let normalized_config =
         resolve_config_value(kind.clone(), &merged_config, &ExecutionOverrides::default())?;
     let overrides_applied = overrides_applied.retain_config_keys(&normalized_config);
+    let state_entry_token = crate::task_service::action_resolver::latest_state_entry_authority(
+        db,
+        &task.id,
+        &task.status,
+    )
+    .await?
+    .map(|entry| entry.id);
     let mut snapshot = json!({
         "agent_id": agent.id,
+        "backend_kind": agent.backend_kind,
+        "task_state": task.status,
+        "state_entry_token": state_entry_token,
+        "plan_delivery": "execution_outbox",
         // Native execution consumes this immutable profile reference from the
         // Task snapshot.  Provider credentials remain behind the protected
         // profile/store boundary and are never copied into public execution
@@ -307,6 +318,49 @@ pub(super) async fn build_executor_config_snapshot(
     serde_json::to_string(&snapshot)
         .map(Some)
         .map_err(|error| ServiceError::invalid_operation(format!("invalid JSON snapshot: {error}")))
+}
+
+/// Bind an executor snapshot to the exact Task state entry and Project
+/// revision admitted for the Running execution. Callers must stamp this at
+/// the persistence boundary: profile/config resolution happens earlier and
+/// must not become workflow authority by winning a separate read race.
+pub(super) fn stamp_executor_snapshot_authority(
+    snapshot_json: &str,
+    task_state: &str,
+    state_entry_token: Option<&str>,
+    project_version: i64,
+) -> Result<String> {
+    let mut snapshot: Value = serde_json::from_str(snapshot_json).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
+    })?;
+    let object = snapshot.as_object_mut().ok_or_else(|| {
+        ServiceError::invalid_operation("executor config snapshot must be a JSON object")
+    })?;
+    object.insert(
+        "task_state".to_owned(),
+        Value::String(task_state.to_owned()),
+    );
+    object.insert(
+        "state_entry_token".to_owned(),
+        state_entry_token.map_or(Value::Null, |value| Value::String(value.to_owned())),
+    );
+    object.insert("project_version".to_owned(), Value::from(project_version));
+    serde_json::to_string(&snapshot).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
+    })
+}
+
+/// Classify immutable execution snapshots across the v0.13.8 upgrade
+/// boundary. New snapshots name the backend explicitly; older CLI snapshots
+/// are distinguishable from native ones by their resolved daemon binding.
+pub(super) fn snapshot_uses_cli_backend(snapshot: &Value) -> bool {
+    match snapshot.get("backend_kind") {
+        Some(value) => value.as_str() == Some("cli"),
+        None => snapshot
+            .get("resolved_daemon_id")
+            .and_then(Value::as_str)
+            .is_some(),
+    }
 }
 
 /// Remove and return the authored `fallbacks` entries from an agent config.

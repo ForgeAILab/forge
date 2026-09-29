@@ -52,8 +52,8 @@ use crate::{
         MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
         PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
         PROJECT_OBSERVATIONS_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_WORKLOG_OPERATION,
-        operation_names_for_surface,
+        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+        TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -140,10 +140,14 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
     /// Persists one already-scope-bound proposal envelope.  The provider is
     /// responsible for applying Forge's policy intersection and for keeping
     /// proposals separate from authoritative Task/workflow mutation.
+    /// `runtime_session_id` comes from the invocation context, never model
+    /// arguments, so execution-scoped commands can bind to the exact
+    /// protected session that invoked them.
     async fn propose(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
+        runtime_session_id: &str,
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
@@ -1206,7 +1210,7 @@ fn orchestration_descriptor(
     }
 }
 
-fn task_operations(_role: TaskToolRole) -> (Vec<String>, Vec<String>) {
+fn task_operations(role: TaskToolRole) -> (Vec<String>, Vec<String>) {
     let read = vec![
         "task.summary".to_owned(),
         "work.read".to_owned(),
@@ -1222,15 +1226,18 @@ fn task_operations(_role: TaskToolRole) -> (Vec<String>, Vec<String>) {
     // Task mutation or workflow path; the reviewer receives read/validation
     // only, while Worker writes through the bounded worktree tools above.
     //
-    // Evidence capture is the one exception, and it is not a second mutation
-    // path: it records an artifact this run already produced. It belongs here
-    // because the Task session is the only scope with a workspace and a
-    // process, so it is the only place an observation can be made rather than
-    // described.
-    let propose = vec![
+    // Task-scoped execution records are the exception. Evidence and worklog
+    // capture what this run observed; task.plan stages an execution-scoped
+    // candidate outside the repository and becomes canonical only after
+    // successful settlement. Reviewers may record observations but cannot
+    // author or replace the implementation plan.
+    let mut propose = vec![
         TASK_EVIDENCE_OPERATION.to_owned(),
         TASK_WORKLOG_OPERATION.to_owned(),
     ];
+    if matches!(role, TaskToolRole::Planner | TaskToolRole::Worker) {
+        propose.push(TASK_PLAN_OPERATION.to_owned());
+    }
     (read, propose)
 }
 
@@ -1921,13 +1928,15 @@ impl Tool for ForgeScopeProposeTool {
     async fn invoke(
         &self,
         prepared: PreparedToolCall,
-        _ctx: &InvocationContext,
+        ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
+        let runtime_session_id = ctx.session.to_string();
         provider_result_to_tool_outcome(
             self.provider
                 .propose(
                     &self.actor_identity_id,
                     &self.scope,
+                    &runtime_session_id,
                     required_string(prepared.arguments(), "operation")?,
                     prepared.arguments().clone(),
                 )
@@ -3267,6 +3276,107 @@ mod tests {
             .await
             .expect_err("an enveloped call missing dedupe_key is refused in prepare");
         assert!(refused.to_string().contains("dedupe_key"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn task_plan_schema_is_visible_null_tolerant_and_lifts_flat_payload_fields() {
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "planner-1",
+            scope(CanonicalScopeType::Task, WorkspaceAccess::TaskRead),
+            Some("planner"),
+            Some("/tmp/forge/task-plan-schema"),
+            &all_permissions(),
+            Some(Arc::new(TestProvider::default())),
+        )
+        .expect("planner composition");
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_propose")
+            .expect("Task proposal tool");
+        let spec = tool.spec();
+
+        let operations = spec.input_schema["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("Task operation enum");
+        assert!(operations.iter().any(|value| value == TASK_PLAN_OPERATION));
+
+        let guidance = spec.input_schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("Task payload guidance");
+        for visible_contract in ["task.plan", "action", "content", "checklist", "1 MiB"] {
+            assert!(
+                guidance.contains(visible_contract),
+                "Task plan guidance must visibly name {visible_contract}: {guidance}"
+            );
+        }
+        assert!(
+            spec.input_schema["properties"]["action"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("task.plan") && description.contains("write")
+                }),
+            "the provider-visible flat action alias must describe task.plan/write"
+        );
+        assert!(
+            spec.input_schema["properties"]["content"]["description"]
+                .as_str()
+                .is_some_and(|description| {
+                    description.contains("task.plan") && description.contains("checklist")
+                }),
+            "the provider-visible flat content alias must describe the plan checklist"
+        );
+
+        let validator = jsonschema::validator_for(&spec.input_schema).expect("Task tool schema");
+        let explicit_null_envelope = json!({
+            "parameters": {
+                "operation": TASK_PLAN_OPERATION,
+                "payload": null,
+                "dedupe_key": null,
+                "correlation_id": null,
+                "action": null,
+                "content": null
+            }
+        });
+        assert!(
+            validator.validate(&explicit_null_envelope).is_ok(),
+            "Gemini-style explicit nulls must reach prepare for an in-turn correction"
+        );
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: "<none>".to_owned(),
+        });
+        let refusal = tool
+            .prepare(
+                explicit_null_envelope,
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect_err("prepare rejects the missing idempotency key in-turn");
+        assert!(refusal.to_string().contains("dedupe_key"), "{refusal}");
+
+        let flat = json!({
+            "operation": TASK_PLAN_OPERATION,
+            "payload": null,
+            "action": "write",
+            "content": "# Plan\n\n- [ ] Implement the fix\n",
+            "dedupe_key": "task-plan-1",
+            "correlation_id": "task-plan-1"
+        });
+        assert!(
+            validator.validate(&flat).is_ok(),
+            "provider-facing schema must admit flat task.plan fields"
+        );
+        let prepared = tool
+            .prepare(flat, &command_preparation_context(workspace))
+            .await
+            .expect("flat task.plan call prepares");
+        assert_eq!(prepared.arguments()["payload"]["action"], "write");
+        assert_eq!(
+            prepared.arguments()["payload"]["content"],
+            "# Plan\n\n- [ ] Implement the fix\n"
+        );
+        assert!(prepared.arguments().get("action").is_none());
+        assert!(prepared.arguments().get("content").is_none());
     }
 
     #[tokio::test]
@@ -4677,6 +4787,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forge_scope_propose_forwards_the_exact_runtime_session() {
+        let provider = Arc::new(TestProvider::default());
+        let tool = ForgeScopeProposeTool::new(
+            "identity-1".to_owned(),
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
+            vec!["message.send".to_owned()],
+            provider.clone(),
+        );
+        let prepared = tool
+            .prepare(
+                json!({
+                    "operation":"message.send",
+                    "payload": null,
+                    "dedupe_key":"dedupe-session",
+                    "correlation_id":"corr-session"
+                }),
+                &test_preparation_context("session-call"),
+            )
+            .await
+            .expect("proposal prepares");
+        assert!(prepared.arguments().get("runtime_session_id").is_none());
+        let mut invocation = test_invocation_context("session-call");
+        invocation.session = agent_runtime::core::ids::SessionId::new("runtime-session-42");
+
+        tool.invoke(prepared, &invocation)
+            .await
+            .expect("proposal reaches provider");
+
+        assert_eq!(
+            *provider
+                .proposal_sessions
+                .lock()
+                .expect("proposal session log"),
+            vec!["runtime-session-42".to_owned()]
+        );
+    }
+
+    #[tokio::test]
     async fn forge_scope_read_keeps_already_structured_success_json_unchanged() {
         let tool = ForgeScopeReadTool::new(
             "identity-1".to_owned(),
@@ -4779,6 +4927,7 @@ mod tests {
             &self,
             _actor_identity_id: &str,
             _scope: &CanonicalScope,
+            _runtime_session_id: &str,
             _operation: &str,
             _arguments: Value,
         ) -> Result<Value, AgentHostError> {
@@ -4813,6 +4962,7 @@ mod tests {
             &self,
             _actor_identity_id: &str,
             _scope: &CanonicalScope,
+            _runtime_session_id: &str,
             _operation: &str,
             _arguments: Value,
         ) -> Result<Value, AgentHostError> {
@@ -4823,6 +4973,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestProvider {
         observations: std::sync::Mutex<Vec<CommandObservation>>,
+        proposal_sessions: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -4854,9 +5005,14 @@ mod tests {
             &self,
             _actor_identity_id: &str,
             scope: &CanonicalScope,
+            runtime_session_id: &str,
             operation: &str,
             _arguments: Value,
         ) -> Result<Value, AgentHostError> {
+            self.proposal_sessions
+                .lock()
+                .expect("proposal session log")
+                .push(runtime_session_id.to_owned());
             Ok(json!({"scope": scope.scope_id, "operation": operation}))
         }
     }
@@ -4880,6 +5036,7 @@ mod tests {
             &self,
             _actor_identity_id: &str,
             _scope: &CanonicalScope,
+            _runtime_session_id: &str,
             _operation: &str,
             _arguments: Value,
         ) -> Result<Value, AgentHostError> {

@@ -41,6 +41,55 @@ impl TaskExecutor for NoDiffExecutor {
     }
 }
 
+struct OutboxPlanExecutor {
+    plan: &'static str,
+}
+
+#[async_trait]
+impl TaskExecutor for OutboxPlanExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        let outbox = executors::execution_outbox_path(
+            std::path::Path::new(&ctx.worktree_path),
+            &ctx.execution_id,
+        )
+        .ok_or_else(|| ExecutorError::Other("execution outbox unavailable".to_owned()))?;
+        tokio::fs::create_dir_all(&outbox).await?;
+        tokio::fs::write(outbox.join(executors::OUTBOX_PLAN_FILE), self.plan).await?;
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            agent_session_id: Some(format!("session-{}", ctx.execution_id)),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+struct SessionNoPlanExecutor;
+
+#[async_trait]
+impl TaskExecutor for SessionNoPlanExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            agent_session_id: Some(format!("session-{}", ctx.execution_id)),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 struct HostFinalizingExecutor;
 
 #[async_trait]

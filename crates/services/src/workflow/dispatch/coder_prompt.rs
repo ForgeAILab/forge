@@ -100,6 +100,14 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
     }
     if has_plan {
         system.push_str("\n\nA planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");
+        match ctx.delivery {
+            super::TaskDelivery::NativeTools => system.push_str(
+                " Keep the checklist current with `task.plan` (`write`) and mark each completed item `- [x]` as you work.",
+            ),
+            super::TaskDelivery::Outbox => system.push_str(
+                " Forge has copied the canonical checklist to `$FORGE_PLAN_PATH`; update that file and mark each completed item `- [x]` as you work. Forge publishes it only after this execution completes successfully.",
+            ),
+        }
     }
     if let Some(reason) = ctx.last_manual_bounce_reason.as_deref() {
         system.push_str("\n\nThis task was sent back with the following feedback: ");

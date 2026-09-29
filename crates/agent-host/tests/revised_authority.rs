@@ -33,6 +33,7 @@ impl ForgeToolProvider for NoopProvider {
         &self,
         _actor_identity_id: &str,
         _scope: &CanonicalScope,
+        _runtime_session_id: &str,
         _operation: &str,
         _arguments: Value,
     ) -> Result<Value, AgentHostError> {
@@ -236,6 +237,36 @@ fn evidence_capture_is_exposed_to_task_roles_and_withheld_from_project_scope() {
             .any(|operation| operation == "task.worklog"),
         "the Task worklog belongs to the run that did the work"
     );
+}
+
+#[test]
+fn task_plan_is_exposed_to_planner_and_worker_but_not_reviewer() {
+    let provider = Arc::new(NoopProvider);
+    for (role, access, expected) in [
+        ("worker", WorkspaceAccess::TaskWrite, true),
+        ("planner", WorkspaceAccess::TaskRead, true),
+        ("reviewer", WorkspaceAccess::TaskRead, false),
+    ] {
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "identity-task",
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "task-1".to_owned(),
+                workspace_access: access,
+            },
+            Some(role),
+            Some("/tmp/forge-plan-workspace"),
+            &broad_permissions(),
+            Some(provider.clone()),
+        )
+        .expect("Task tool composition is valid");
+        let operations = advertised_operations(&composition, "forge_scope_propose");
+        assert_eq!(
+            operations.iter().any(|operation| operation == "task.plan"),
+            expected,
+            "task.plan exposure must follow the Task role for {role}: {operations:?}"
+        );
+    }
 }
 
 #[test]

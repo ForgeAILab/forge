@@ -1048,27 +1048,76 @@ idempotency key, so a retried turn appends once. Worklog entries flow into the
 next role's dispatch context. They never move a Task and never satisfy an
 acceptance check.
 
+Native planning and implementation Task sessions write the complete plan
+candidate with the typed `task.plan` operation. It is exposed through the
+Planner and Worker tool roles; Worker covers `worker`, `coder`, and `executor`
+execution roles:
+
+```json
+{
+  "action": "write",
+  "content": "# Plan\n- [ ] Implement the change\n- [ ] Verify it"
+}
+```
+
+`content` must be a non-empty Markdown checklist no larger than 1 MiB. The
+runtime session identifier comes from the invocation context, not from this
+payload. Forge requires that session, its identity, Task scope and role to
+resolve to exactly one `Running` execution with a ready Workspace, then writes
+the candidate to that execution's private outbox. Repeating `write` replaces
+the entire private checklist candidate, rather than patching one item. The
+operation is not exposed to reviewers and does not itself replace the canonical
+plan.
+
 A CLI harness (Smith, Codex, Claude Code, Gemini, Cursor, OpenCode) has no
 Forge tool channel, so it delivers the same two records through its
 execution outbox. Every CLI Task execution is launched with `FORGE_OUTBOX`,
-`FORGE_TASK_ID`, and `FORGE_EXECUTION_ID`; the outbox is
+`FORGE_TASK_ID`, and `FORGE_EXECUTION_ID`; planning and implementation
+executions (`planner`, `worker`, `coder`, and `executor`) additionally receive
+`FORGE_PLAN_PATH`, which names `$FORGE_OUTBOX/plan.md`. The outbox is
 `<task dir>/.forge-outbox/<execution_id>/`, a sibling of the Git worktree, so
 nothing written there can be committed and a read-only reviewer still has one
 place it may write. The harness appends one JSON object per line to
 `worklog.jsonl` (`{"kind","summary"}`, as `task.worklog`) and `evidence.jsonl`
 (`{"kind","caption"}` plus exactly one of `path` or `content`, as
 `task.evidence`; `path` is worktree-relative or an absolute path inside the
-outbox). When the execution ends — before it settles and before the next role
-is dispatched — Forge validates each entry exactly as the native operations
-do, stores it with provenance taken from the execution row (never from the
-files), records each captured artifact's caption as a `validation` worklog
-entry, and removes the outbox. Malformed entries are skipped and logged, never
-fatal; each file is bounded to 1 MiB and 200 entries. Dispatch prompts name
+outbox). Before an implementation execution starts, Forge copies the canonical
+Task plan into its private plan path. `$FORGE_PLAN_PATH` is the supported
+plan-write contract for CLI agents. Managed Codex cannot write the surrounding
+Task directory; a CLI adapter without an OS sandbox may still have ambient
+filesystem ability to edit sibling files, so universal confinement is not
+claimed and direct sibling writes are outside this contract. The file broker
+also has the existing managed-daemon filesystem constraint: the API server and
+execution host must see the Task directory at the same absolute path through a
+shared workspace mount. Forge does not yet sync plan files to a daemon on a
+separate filesystem.
+
+When the execution ends — before it settles and before the next role is
+dispatched — Forge validates each report entry exactly as the native operations
+do and stores it with provenance taken from the execution row (never from the
+files). For either the native `task.plan` path or the CLI outbox path, Forge
+validates the plan candidate and freezes the exact bytes in host-owned staging
+before terminal settlement. Later outbox changes cannot alter that frozen
+candidate. A durable compare-and-swap claim tied to the execution, Task state
+entry, and Project version then controls whether it may replace the canonical
+Task `plan.md`. On Unix, publication uses an atomic same-directory rename and
+Forge rejects candidates with additional hard links; on other platforms it
+uses the portable replacement fallback and does not promise those two Unix
+properties. Neither agent interface publishes the canonical file directly.
+Stale, failed, cancelled, reviewer, symlinked, non-regular, oversized, or
+invalid UTF-8 candidates cannot replace it. A rejected plan remains in that
+execution's outbox for diagnosis; after successful staging and report
+ingestion, Forge removes the agent-writable outbox before settlement. Captured
+artifact captions become `validation` worklog entries. Malformed report entries
+are skipped and logged, never fatal; each report file is bounded to 1 MiB and
+200 entries.
+Dispatch prompts name
 the channel the assigned agent actually has: native agents get the
-`task.worklog`/`task.evidence` contract, CLI agents get the outbox contract,
-and the reviewer is told these reports are its only permitted writes. Every
-managed Codex Task, coder and reviewer alike, has the outbox added to its
-sandbox's writable roots.
+`task.worklog`/`task.evidence` contract plus `task.plan` for Planner and Worker
+tool roles, CLI agents get the outbox contract, and the reviewer is told these
+reports are its only permitted writes. Every managed Codex Task role has the
+outbox added to its sandbox's writable roots. The surrounding Task directory
+is not writable.
 
 Project Agent evidence uses the typed `project.evidence` operation with two
 actions. An `attach` payload must include the current positive
@@ -2234,7 +2283,12 @@ until its entry barrier settles: Task responses keep `awaiting_human = false`
 for that Task snapshot, and an early decision returns HTTP 409 with
 `code: "validation_error"`. The response's `awaiting_human` value and `version`
 are derived from the same Task snapshot so a barrier-clear write cannot expose
-readiness paired with the version it just invalidated.
+readiness paired with the version it just invalidated. The default planning
+gate does not require this decision: after a successful planner execution has
+delivered a valid checklist, Forge advances the Task to implementation. A
+workflow whose planning gate sets `requires_user_approval` keeps the Task in
+planning with `awaiting_human = true`; the dispatcher does not start or
+relaunch a non-reviewer role while that human decision is outstanding.
 
 ## Task intent actions
 

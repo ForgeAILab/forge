@@ -194,9 +194,15 @@ impl TaskService {
     }
 
     pub async fn reset_task_workspace(&self, task_id: &str) -> Result<Workspace> {
+        let Some(_settlement_slot) = self.claim_completion_cascade(task_id) else {
+            return Err(ServiceError::Conflict(
+                "task completion settlement is in progress; retry the workspace reset".to_owned(),
+            ));
+        };
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         reset_workspace(
             &self.db,
             &self.workspace_root,

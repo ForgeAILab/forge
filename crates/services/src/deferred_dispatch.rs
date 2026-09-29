@@ -35,22 +35,58 @@ pub(crate) async fn set(
     not_before: &str,
     reason: &str,
 ) -> Result<()> {
-    TaskRepo::mutate_metadata(
-        db,
-        &task.id,
-        Some(task.version),
-        vec![TaskMetadataMutation::Set {
-            key: METADATA_KEY.to_owned(),
-            value: json!({
-                "not_before": not_before,
-                "reason": reason,
-                "target_state": target_state,
-            }),
-        }],
-        &now_rfc3339(),
-    )
-    .await?;
+    set_with_mutations(db, task, target_state, not_before, reason, Vec::new()).await
+}
+
+pub(crate) async fn set_with_mutations(
+    db: &db::SqliteDb,
+    task: &Task,
+    target_state: &str,
+    not_before: &str,
+    reason: &str,
+    mut mutations: Vec<TaskMetadataMutation>,
+) -> Result<()> {
+    mutations.push(TaskMetadataMutation::Set {
+        key: METADATA_KEY.to_owned(),
+        value: json!({
+            "not_before": not_before,
+            "reason": reason,
+            "target_state": target_state,
+        }),
+    });
+    TaskRepo::mutate_metadata(db, &task.id, Some(task.version), mutations, &now_rfc3339()).await?;
     Ok(())
+}
+
+pub(crate) async fn set_with_mutations_for_latest_execution(
+    db: &db::SqliteDb,
+    task: &Task,
+    authority: db::LatestExecutionAuthority,
+    target_state: &str,
+    not_before: &str,
+    reason: &str,
+    mut mutations: Vec<TaskMetadataMutation>,
+) -> Result<bool> {
+    mutations.push(TaskMetadataMutation::Set {
+        key: METADATA_KEY.to_owned(),
+        value: json!({
+            "not_before": not_before,
+            "reason": reason,
+            "target_state": target_state,
+        }),
+    });
+    Ok(
+        TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
+            db,
+            &task.id,
+            task.version,
+            authority,
+            mutations,
+            &now_rfc3339(),
+        )
+        .await?
+        .is_some(),
+    )
 }
 
 pub(crate) async fn clear(db: &db::SqliteDb, task: &Task) -> Result<()> {

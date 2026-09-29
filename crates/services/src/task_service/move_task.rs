@@ -70,6 +70,8 @@ impl TaskService {
             return Ok(replayed);
         }
 
+        super::execution::ensure_plan_publication_transition_authority(&source_task, None)?;
+
         if source_task.version != request.task_version {
             return Err(DbError::TaskVersionConflict {
                 expected: request.task_version,
@@ -197,6 +199,7 @@ impl TaskService {
                 Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;

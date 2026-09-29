@@ -10,16 +10,52 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        let task_id = task_id.into();
-        let options = options.into();
+        self.transition_inner(task_id.into(), new_status, options.into(), None)
+            .await
+    }
+
+    pub(super) async fn transition_with_plan_publication(
+        &self,
+        task_id: impl Into<String>,
+        new_status: TaskStatus,
+        options: impl Into<TransitionOptions>,
+        execution_id: &str,
+    ) -> Result<TransitionResult> {
+        self.transition_inner(
+            task_id.into(),
+            new_status,
+            options.into(),
+            Some(execution_id),
+        )
+        .await
+    }
+
+    async fn transition_inner(
+        &self,
+        task_id: String,
+        new_status: TaskStatus,
+        options: TransitionOptions,
+        plan_publication_execution_id: Option<&str>,
+    ) -> Result<TransitionResult> {
         let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(
+            &task,
+            plan_publication_execution_id,
+        )?;
         let previous_status = task.status.clone();
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if let Some(execution_id) = plan_publication_execution_id {
+            if super::execution::plan_publication_project_version(&task, execution_id)?
+                .is_some_and(|claim_version| claim_version != project.version)
+            {
+                return Err(ServiceError::Db(DbError::VersionConflict));
+            }
+        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -99,6 +135,9 @@ impl TaskService {
             .defer_dispatch_seconds
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
         let preserve_deferred_dispatch = defer_dispatch_until.is_some();
+        let clear_review_passed_at_on_commit = plan_publication_execution_id.is_some()
+            && task.review_passed_at.is_some()
+            && workflow.canonical_phase_for_state(&new_status) == api_types::CanonicalPhase::Review;
         let result = engine
             .transition_with_deferred_dispatch_and_authority(
                 &task_id,
@@ -112,6 +151,7 @@ impl TaskService {
                 Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit,
                 }),
             )
             .await?;
@@ -240,6 +280,7 @@ impl TaskService {
     /// Resume consumes the same marker in either state without creating a new
     /// reviewer execution or accepting any unreviewed content.
     pub(crate) async fn retry_paused_integration(&self, task: &Task) -> Result<bool> {
+        super::execution::ensure_plan_publication_transition_authority(task, None)?;
         let Some(deferred) = crate::deferred_dispatch::paused_integration(task) else {
             return Ok(false);
         };
@@ -311,6 +352,7 @@ impl TaskService {
                     Some(crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     }),
                 )
                 .await
@@ -673,6 +715,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         if let Some(expected_version) = expected_version {
             if expected_version != task.version {
                 return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
@@ -777,6 +820,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -824,6 +868,7 @@ impl TaskService {
                 Some(crate::workflow::engine::WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;
@@ -847,6 +892,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, true)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -893,6 +939,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, true)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let now = now_rfc3339();
         let archived = TaskRepo::archive(
             &*self.db,

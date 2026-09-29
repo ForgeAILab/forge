@@ -54,6 +54,7 @@ async fn run() {
             .propose(
                 "cceb9983-0265-42c8-98d7-98e86097eb4f",
                 &scope,
+                "task-probe-session",
                 "task.propose",
                 arguments,
             )

@@ -233,6 +233,11 @@ pub struct BoardMoveRequest {
 pub struct WorkflowAuthority {
     pub project_version: i64,
     pub workflow_definition: String,
+    /// Clear stale review authority in the same transaction as this status
+    /// change. Plan publication uses this when a completed implementation
+    /// enters review; a separate pre-transition write would survive if the
+    /// project workflow changed before the status CAS.
+    pub clear_review_passed_at_on_commit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +503,10 @@ impl WorkflowEngine {
         rejection: bool,
         authority: Option<WorkflowAuthority>,
     ) -> crate::Result<TransitionResult> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)?;
         self.transition_inner(
             task_id.to_string(),
             target_state.to_string(),
@@ -538,6 +547,7 @@ impl WorkflowEngine {
             WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
             },
         )
         .await
@@ -1570,12 +1580,16 @@ impl WorkflowEngine {
                             return Err(db::DbError::VersionConflict.into());
                         }
                     }
+                    let clear_review_passed_at = authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
                     let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
                     )
                     .bind(&target_state)
                     .bind(&updated_at)
                     .bind(entry_barrier_json.as_deref())
+                    .bind(clear_review_passed_at)
                     .bind(&task_id)
                     .bind(version)
                     .execute(&mut *transaction)

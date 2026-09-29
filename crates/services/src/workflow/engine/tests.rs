@@ -396,6 +396,7 @@ async fn transition_rejects_stale_project_workflow_authority_without_mutation() 
             super::WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition.clone(),
+                clear_review_passed_at_on_commit: false,
             },
         )
         .await;
@@ -479,6 +480,7 @@ async fn retry_entry_barrier_rejects_stale_project_workflow_authority_without_mu
             super::WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition.clone(),
+                clear_review_passed_at_on_commit: false,
             },
         )
         .await;
@@ -531,6 +533,7 @@ async fn reset_to_initial_rejects_stale_project_workflow_authority_without_mutat
             super::WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition.clone(),
+                clear_review_passed_at_on_commit: false,
             },
         )
         .await;

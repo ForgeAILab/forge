@@ -129,6 +129,12 @@ pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionCon
     match std::fs::create_dir_all(&outbox) {
         Ok(()) => {
             command.env(executors::FORGE_OUTBOX_ENV, &outbox);
+            if executors::task_role_can_write_plan(executors::task_role(&ctx.agent_config)) {
+                command.env(
+                    executors::FORGE_PLAN_PATH_ENV,
+                    outbox.join(executors::OUTBOX_PLAN_FILE),
+                );
+            }
         }
         Err(error) => tracing::warn!(
             execution_id = %ctx.execution_id,
@@ -210,12 +216,14 @@ mod worktree_tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let worktree = temp.path().join("task-1").join("repo");
         std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let mut agent_config = serde_json::json!({});
+        executors::mark_task_role(&mut agent_config, "planner");
         let ctx = executors::ExecutionContext {
             task_id: "task-1".to_owned(),
             execution_id: "exec-1".to_owned(),
             worktree_path: worktree.to_string_lossy().into_owned(),
             description: String::new(),
-            agent_config: serde_json::json!({}),
+            agent_config,
             logs_path: String::new(),
             heartbeat_interval_seconds: 30,
             max_turns: None,
@@ -241,9 +249,43 @@ mod worktree_tests {
             .join(".forge-outbox")
             .join("exec-1");
         assert_eq!(env("FORGE_OUTBOX"), Some(outbox.clone().into_os_string()));
+        assert_eq!(
+            env("FORGE_PLAN_PATH"),
+            Some(outbox.join("plan.md").into_os_string())
+        );
         assert!(
             outbox.is_dir(),
             "the outbox exists before the harness starts"
+        );
+    }
+
+    #[test]
+    fn reviewer_children_do_not_receive_a_plan_write_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let worktree = temp.path().join("task-1").join("repo");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let mut agent_config = serde_json::json!({});
+        executors::mark_task_role(&mut agent_config, "reviewer");
+        let ctx = executors::ExecutionContext {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-review".to_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config,
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
+        let mut command = CommandBuilder::new("true").build();
+
+        run_in_task_worktree(&mut command, &ctx);
+
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(key, _)| key != OsStr::new(executors::FORGE_PLAN_PATH_ENV))
         );
     }
 }

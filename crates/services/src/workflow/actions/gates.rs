@@ -263,7 +263,7 @@ impl HookAction for RequirePlanChecklistComplete {
 
         HookResult::Failed {
             reason: format!(
-                "Plan checklist incomplete: {} unchecked item(s) remain in ../plan.md. Continue working on the unchecked items, then update completed items to `- [x]` before stopping.",
+                "Plan checklist incomplete: {} unchecked item(s) remain. Continue working on the unchecked items, then update completed items to `- [x]` using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness before stopping.",
                 summary.remaining
             ),
         }

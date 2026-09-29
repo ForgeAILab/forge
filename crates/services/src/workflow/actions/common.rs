@@ -120,6 +120,8 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
     if workflow.state_kind(&subtask.status) == Some(api_types::StateKind::Terminal) {
         return Ok(());
     }
+    crate::task_service::execution::ensure_plan_publication_transition_authority(&subtask, None)
+        .map_err(|error| error.to_string())?;
     let target_state = workflow
         .cancellation_state
         .as_deref()
@@ -132,6 +134,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         (Some(project_version), Some(workflow_definition)) => WorkflowAuthority {
             project_version,
             workflow_definition: workflow_definition.to_owned(),
+            clear_review_passed_at_on_commit: false,
         },
         _ => {
             let project = ProjectRepo::get_by_id(&*ctx.db, &subtask.project_id)
@@ -141,6 +144,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
             WorkflowAuthority {
                 project_version: project.version,
                 workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
             }
         }
     };

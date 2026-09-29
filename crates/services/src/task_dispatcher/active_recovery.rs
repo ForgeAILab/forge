@@ -57,10 +57,25 @@ impl TaskDispatcher {
 
         let tasks = self.list_tasks(&project.id, active_states).await?;
         let mut dispatched = 0;
-        for task in tasks {
+        for mut task in tasks {
             if self.is_stopped() {
                 break;
             }
+            task = match crate::task_service::execution::clear_stale_plan_publication_claim(
+                &self.db, &task,
+            )
+            .await
+            {
+                Ok(task) => task,
+                Err(ServiceError::Db(DbError::VersionConflict)) => {
+                    tracing::debug!(task_id = %task.id, "stale plan-publication cleanup lost version race");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, %error, "stale plan-publication cleanup failed");
+                    continue;
+                }
+            };
             let task_workflow = WorkflowEngine::resolve_workflow_for_task(
                 &task,
                 &project.workflow_definition,
@@ -143,6 +158,67 @@ impl TaskDispatcher {
                 }
                 continue;
             }
+
+            let Some(state) = task_workflow
+                .states
+                .iter()
+                .find(|state| state.name == task.status)
+            else {
+                continue;
+            };
+            let active_plan_claim =
+                crate::task_service::execution::active_plan_publication_claim_owner(&task)?;
+            if helpers::has_blocking_annotation(&task) && active_plan_claim.is_none() {
+                continue;
+            }
+            if let Some(role_name) = effective_role(state) {
+                let reconciliation_result = if role_name == crate::workflow::default_roles::REVIEWER
+                {
+                    self.reconcile_terminal_reviewer_execution(&task.id).await
+                } else {
+                    self.reconcile_terminal_role_execution(&task, role_name, project.version)
+                        .await
+                };
+                let reconciliation = match reconciliation_result {
+                    Ok(reconciliation) => reconciliation,
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(task_id = %task.id, "terminal reconciliation lost version race");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            target_role = role_name,
+                            %error,
+                            "terminal execution reconciliation failed"
+                        );
+                        continue;
+                    }
+                };
+                if reconciliation == ReviewerReconciliation::Reconciled {
+                    // Settle a lost terminal cascade before any dispatch-only
+                    // eligibility checks can hide it or launch a replacement.
+                    continue;
+                }
+                if role_name != crate::workflow::default_roles::REVIEWER
+                    && helpers::awaiting_human(&task)
+                {
+                    if helpers::awaiting_human_is_authoritative(&task, state, role_name)
+                        && crate::task_service::execution::planning_review_matches_current_state_entry(
+                            &self.db,
+                            &task,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
+                    task = crate::task_service::execution::clear_stale_planning_review_metadata(
+                        &self.db, &task,
+                    )
+                    .await?;
+                }
+            }
+
             let is_coordination_root =
                 crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
             let sequence_complete = is_coordination_root
@@ -233,6 +309,105 @@ impl TaskDispatcher {
         Ok(dispatched)
     }
 
+    /// Reconcile a completed non-reviewer before considering a fresh attempt.
+    /// This closes the crash window between terminal settlement and the
+    /// workflow cascade, including publication of a frozen plan candidate.
+    async fn reconcile_terminal_role_execution(
+        &self,
+        task: &Task,
+        role_name: &str,
+        project_version: i64,
+    ) -> Result<ReviewerReconciliation> {
+        let claimed_execution_id =
+            crate::task_service::execution::active_plan_publication_claim_owner(task)?;
+        let latest = if let Some(execution_id) = claimed_execution_id.as_deref() {
+            ExecutionRepo::get_by_id(&*self.db, execution_id)
+                .await?
+                .filter(|execution| execution.task_id == task.id)
+        } else {
+            let mut latest = None;
+            for role in helpers::execution_guard_roles(role_name) {
+                let page = ExecutionRepo::list_by_task_and_role(
+                    &*self.db,
+                    &task.id,
+                    role,
+                    PageRequest {
+                        cursor: None,
+                        limit: 1,
+                        include_total: false,
+                        sort_by: SortBy::CreatedAt,
+                        sort_order: SortOrder::Desc,
+                    },
+                )
+                .await?;
+                if let Some(candidate) = page.items.into_iter().next() {
+                    let replace = latest.as_ref().is_none_or(|current: &db::Execution| {
+                        (&candidate.created_at, &candidate.id) > (&current.created_at, &current.id)
+                    });
+                    if replace {
+                        latest = Some(candidate);
+                    }
+                }
+            }
+            latest
+        };
+        let Some(execution) = latest else {
+            return Ok(ReviewerReconciliation::None);
+        };
+        if execution.status != ExecutionStatus::Completed {
+            return Ok(ReviewerReconciliation::None);
+        }
+        if claimed_execution_id.is_none()
+            && helpers::execution_superseded_by_role_assignment(
+                &self.db, &task.id, role_name, &execution,
+            )
+            .await?
+        {
+            return Ok(ReviewerReconciliation::None);
+        }
+        if claimed_execution_id.is_none()
+            && !crate::task_service::execution::execution_belongs_to_current_state_entry(
+                &self.db, task, &execution,
+            )
+            .await?
+        {
+            return Ok(ReviewerReconciliation::None);
+        }
+        let superseded_project_authority =
+            crate::task_service::execution::execution_uses_brokered_plan(&execution)
+                && crate::task_service::execution::brokered_plan_dispatch_project_version(
+                    &execution,
+                ) != Some(project_version);
+        if claimed_execution_id.is_none()
+            && crate::task_service::execution::execution_completion_settled_for_current_state_entry(
+                &self.db, task, &execution,
+            )
+            .await?
+        {
+            // A same-state settlement is a durable replay receipt, but its
+            // outcome belongs to the Project revision that dispatched it. A
+            // later workflow edit must be able to launch a replacement under
+            // the new revision instead of reporting Reconciled forever.
+            return Ok(if superseded_project_authority {
+                ReviewerReconciliation::None
+            } else {
+                ReviewerReconciliation::Reconciled
+            });
+        }
+
+        self.task_service
+            .maybe_cascade_executor_completion(&execution.id)
+            .await?;
+        Ok(if superseded_project_authority {
+            // Cascade discarded any private candidate/claim. The immutable
+            // dispatch revision proves this execution cannot settle the
+            // current workflow, so continue to normal replacement dispatch.
+            ReviewerReconciliation::None
+        } else {
+            ReviewerReconciliation::Reconciled
+        })
+    }
+
     async fn recover_active_task(
         &self,
         project: &Project,
@@ -269,6 +444,17 @@ impl TaskDispatcher {
         let Some(role_name) = effective_role(state) else {
             return Ok(false);
         };
+        // The role already finished and the Task is waiting on a human
+        // decision (e.g. plan review); relaunching it would loop forever.
+        if role_name != crate::workflow::default_roles::REVIEWER
+            && helpers::awaiting_human_is_authoritative(task, state, role_name)
+            && crate::task_service::execution::planning_review_matches_current_state_entry(
+                &self.db, task,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
         if role_name == crate::workflow::default_roles::REVIEWER {
             self.task_service.ensure_task_reviewable(task).await?;
         } else {
@@ -286,7 +472,8 @@ impl TaskDispatcher {
         let reviewer_reconciliation = if role_name == crate::workflow::default_roles::REVIEWER {
             self.reconcile_terminal_reviewer_execution(&task.id).await?
         } else {
-            ReviewerReconciliation::None
+            self.reconcile_terminal_role_execution(task, role_name, project.version)
+                .await?
         };
         if reviewer_reconciliation == ReviewerReconciliation::Reconciled {
             // Reconciliation may change the Task version/state, install a

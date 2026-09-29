@@ -13,6 +13,29 @@ enum EmbeddedLeaseSignal {
     HardDeadline,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionOutboxDisposition {
+    /// This runner won terminal settlement and may persist the execution's
+    /// private output.
+    Ingest,
+    /// Another completion path already won. Keep its private output for that
+    /// winner's inline cascade or dispatcher recovery.
+    Preserve,
+    /// No successful completion owns the output, so it must not be ingested.
+    Discard,
+}
+
+fn execution_outbox_disposition(
+    status: &ExecutionStatus,
+    won_terminal_cas: bool,
+) -> ExecutionOutboxDisposition {
+    match (status, won_terminal_cas) {
+        (ExecutionStatus::Completed, true) => ExecutionOutboxDisposition::Ingest,
+        (ExecutionStatus::Completed, false) => ExecutionOutboxDisposition::Preserve,
+        _ => ExecutionOutboxDisposition::Discard,
+    }
+}
+
 /// Resolve an explicitly configured execution deadline. Missing and zero
 /// values mean "no hard deadline"; Forge does not impose an implicit runtime
 /// ceiling on a Task execution.
@@ -286,6 +309,27 @@ impl TaskService {
                         }
                     }
                 }
+
+                let plan_writing_role =
+                    executors::task_role_can_write_plan(Some(execution.role.as_str()));
+                if plan_writing_role {
+                    let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("task", execution.task_id.clone())
+                        })?;
+                    crate::plan_artifact::prepare_execution_plan_outbox(
+                        std::path::Path::new(&params.workspace_path),
+                        &execution.id,
+                        matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                        task.plan.as_deref(),
+                    )
+                    .map_err(|error| {
+                        ServiceError::invalid_operation(format!(
+                            "failed to prepare the remote execution plan outbox: {error}"
+                        ))
+                    })?;
+                }
             }
             provider.start(params).await
         }
@@ -294,6 +338,18 @@ impl TaskService {
         match result {
             Ok(result) => Ok(result),
             Err(error) => {
+                if let Some(workspace_id) = execution.workspace_id.as_deref() {
+                    if let Ok(Some(workspace)) =
+                        WorkspaceRepo::get_by_id(&*self.db, workspace_id).await
+                    {
+                        if let Some(outbox) = executors::execution_outbox_path(
+                            std::path::Path::new(&workspace.worktree_path),
+                            &execution.id,
+                        ) {
+                            let _ = std::fs::remove_dir_all(outbox);
+                        }
+                    }
+                }
                 let failure_message = error.to_string();
                 if let Err(mark_error) = self
                     .fail_execution_before_dispatch(&execution.id, failure_message)
@@ -555,6 +611,8 @@ impl TaskService {
             }
         };
 
+        let plan_writing_role = executors::task_role_can_write_plan(Some(execution.role.as_str()));
+
         // The scheduler owns the execution lease. Creation normally installs
         // the deterministic embedded owner atomically; older/ownerless rows
         // are claimed here immediately before launch. Every heartbeat,
@@ -622,6 +680,30 @@ impl TaskService {
             execution_before_launch.id.clone(),
             Arc::clone(&lease),
         );
+
+        // Create the agent-writable broker only after this runner owns the
+        // execution lease. Planners always start with a fresh candidate;
+        // coders receive a private copy of the canonical checklist when one
+        // exists.
+        if plan_writing_role {
+            if let Err(error) = crate::plan_artifact::prepare_execution_plan_outbox(
+                std::path::Path::new(&workspace.worktree_path),
+                &execution_id,
+                matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                task.plan.as_deref(),
+            ) {
+                if let Some(outbox) = executors::execution_outbox_path(
+                    std::path::Path::new(&workspace.worktree_path),
+                    &execution_id,
+                ) {
+                    let _ = std::fs::remove_dir_all(outbox);
+                }
+                let reason = format!("failed to prepare the execution plan outbox: {error}");
+                self.fail_execution_before_dispatch(&execution.id, reason.clone())
+                    .await?;
+                return Err(ServiceError::invalid_operation(reason));
+            }
+        }
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1070,6 +1152,17 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if current_execution.status != ExecutionStatus::Running {
+            // A completed row may be the winner of an earlier terminal CAS
+            // whose process died before its completion cascade consumed the
+            // outbox. Preserve that winner's exact plan/worklog/evidence for
+            // the dispatcher recovery pass. Failed and cancelled attempts
+            // have no publication authority and must leave no private output
+            // for a later cascade to ingest.
+            if execution_outbox_disposition(&current_execution.status, false)
+                == ExecutionOutboxDisposition::Discard
+            {
+                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+            }
             if current_execution.status == ExecutionStatus::Cancelled {
                 let late_reports = result.usage_reports.clone();
                 if !late_reports.is_empty() {
@@ -1162,46 +1255,6 @@ impl TaskService {
                 Some(db::ResumePolicy::Manual),
             ),
         };
-        // A CLI harness reports worklog and evidence through its outbox. Take
-        // it in before the execution settles so the next role — the reviewer,
-        // or the coder after a failed review — reads it with the Task.
-        if let (Some(embedded), Some(agent_id)) = (
-            self.credential_env.as_ref(),
-            current_execution.agent_id.as_deref(),
-        ) {
-            let report = embedded
-                .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
-                    task_id: &task.id,
-                    execution_id: &execution_id,
-                    agent_id,
-                    role: Some(current_execution.role.as_str()),
-                    worktree_path: &workspace.worktree_path,
-                })
-                .await;
-            if report.worklog_entries > 0 || report.evidence_items > 0 {
-                tracing::info!(
-                    %execution_id,
-                    worklog_entries = report.worklog_entries,
-                    evidence_items = report.evidence_items,
-                    "execution outbox ingested"
-                );
-            }
-            if !report.rejected.is_empty() {
-                tracing::warn!(
-                    %execution_id,
-                    rejected = ?report.rejected,
-                    "execution outbox entries were not ingested"
-                );
-            }
-        }
-        tracing::info!(
-            %execution_id,
-            task_id = %task.id,
-            status = %status,
-            logs_path = %logs_path,
-            "execution dispatch completed"
-        );
-
         let usage_settlements = super::ledger::build_task_usage_settlements(
             &self.db,
             &execution_id,
@@ -1287,6 +1340,15 @@ impl TaskService {
         let updated = match terminal {
             db::ExecutionTerminalOutcome::Committed { execution, .. } => execution,
             db::ExecutionTerminalOutcome::Concurrent { current } => {
+                if current.as_ref().is_none_or(|execution| {
+                    execution_outbox_disposition(&execution.status, false)
+                        == ExecutionOutboxDisposition::Discard
+                }) {
+                    discard_execution_outbox_and_plan_stage(
+                        &workspace.worktree_path,
+                        &execution_id,
+                    );
+                }
                 let current = current
                     .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
                 append_late_terminal_diagnostic(
@@ -1307,6 +1369,58 @@ impl TaskService {
                 return Ok(current);
             }
         };
+
+        match execution_outbox_disposition(&updated.status, true) {
+            ExecutionOutboxDisposition::Ingest => {
+                // Outbox files are untrusted execution output. Persist their
+                // worklog/evidence and freeze their plan only after this
+                // process wins the terminal owner/version CAS. A crash here
+                // is safe: the completed row and untouched outbox let
+                // dispatcher recovery run the same idempotent ingestion later.
+                if let (Some(embedded), Some(agent_id)) =
+                    (self.credential_env.as_ref(), updated.agent_id.as_deref())
+                {
+                    let report = embedded
+                        .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
+                            task_id: &task.id,
+                            execution_id: &execution_id,
+                            agent_id,
+                            role: Some(updated.role.as_str()),
+                            worktree_path: &workspace.worktree_path,
+                        })
+                        .await;
+                    if report.worklog_entries > 0 || report.evidence_items > 0 {
+                        tracing::info!(
+                            %execution_id,
+                            worklog_entries = report.worklog_entries,
+                            evidence_items = report.evidence_items,
+                            "execution outbox ingested after terminal CAS"
+                        );
+                    }
+                    if !report.rejected.is_empty() {
+                        tracing::warn!(
+                            %execution_id,
+                            rejected = ?report.rejected,
+                            "execution outbox entries were not ingested"
+                        );
+                    }
+                }
+            }
+            ExecutionOutboxDisposition::Discard => {
+                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+            }
+            ExecutionOutboxDisposition::Preserve => {
+                unreachable!("this runner won terminal settlement")
+            }
+        }
+
+        tracing::info!(
+            %execution_id,
+            task_id = %task.id,
+            status = %status,
+            logs_path = %logs_path,
+            "execution dispatch completed"
+        );
 
         super::publish_terminal_execution_event(self, &updated);
 
@@ -1329,32 +1443,25 @@ impl TaskService {
             let reviewer_outcome_pending = updated.role == crate::workflow::default_roles::REVIEWER
                 || updated.role == crate::workflow::default_roles::AUDITOR;
             if !reviewer_outcome_pending {
-                if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to clear execution retry metadata"
-                    );
-                }
-            }
-            if updated.role == crate::workflow::default_roles::PLANNER
-                && task.status == crate::workflow::default_states::PLANNING
-            {
-                if let Err(error) = super::set_planning_awaiting_review_metadata(
-                    &self.db,
-                    &task,
-                    Some(&updated.id),
-                    true,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %updated.id,
-                        %error,
-                        "failed to mark planning awaiting review"
-                    );
+                let project_version = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .map(|project| project.version);
+                if let Some(project_version) = project_version {
+                    if let Err(error) = super::clear_execution_retry_metadata_for_latest_execution(
+                        &self.db,
+                        &task,
+                        &updated,
+                        project_version,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            execution_id = %updated.id,
+                            %error,
+                            "failed to clear execution retry metadata"
+                        );
+                    }
                 }
             }
         } else if updated.status == ExecutionStatus::Failed && max_turns_exceeded {
@@ -1448,6 +1555,37 @@ impl TaskService {
 
         Ok(updated)
     }
+}
+
+pub(crate) fn discard_execution_plan_stage(worktree_path: &str, execution_id: &str) {
+    if let Err(error) = crate::plan_artifact::discard_staged_execution_plan(
+        std::path::Path::new(worktree_path),
+        execution_id,
+    ) {
+        tracing::warn!(
+            %execution_id,
+            %error,
+            "execution plan stage could not be discarded"
+        );
+    }
+}
+
+fn discard_execution_outbox_and_plan_stage(worktree_path: &str, execution_id: &str) {
+    if let Some(outbox) =
+        executors::execution_outbox_path(std::path::Path::new(worktree_path), execution_id)
+    {
+        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %execution_id,
+                    path = %outbox.display(),
+                    %error,
+                    "failed to remove outbox for a non-completed execution"
+                );
+            }
+        }
+    }
+    discard_execution_plan_stage(worktree_path, execution_id);
 }
 
 #[cfg(test)]
@@ -1723,6 +1861,62 @@ mod tests {
             None
         );
         assert_eq!(execution_deadline_seconds(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn only_the_terminal_cas_winner_may_ingest_a_completed_outbox() {
+        assert_eq!(
+            execution_outbox_disposition(&ExecutionStatus::Completed, true),
+            ExecutionOutboxDisposition::Ingest
+        );
+        assert_eq!(
+            execution_outbox_disposition(&ExecutionStatus::Completed, false),
+            ExecutionOutboxDisposition::Preserve
+        );
+        for status in [
+            ExecutionStatus::Running,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+        ] {
+            assert_eq!(
+                execution_outbox_disposition(&status, true),
+                ExecutionOutboxDisposition::Discard
+            );
+            assert_eq!(
+                execution_outbox_disposition(&status, false),
+                ExecutionOutboxDisposition::Discard
+            );
+        }
+    }
+
+    #[test]
+    fn non_completed_execution_discards_outbox_and_frozen_plan() {
+        let root = tempfile::tempdir().expect("temporary root creates");
+        let worktree = root.path().join("task").join("forge");
+        std::fs::create_dir_all(&worktree).expect("worktree creates");
+        let outbox = executors::prepare_execution_outbox(&worktree, "exec-1")
+            .expect("execution outbox creates");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_PLAN_FILE),
+            "- [ ] private plan\n",
+        )
+        .expect("plan candidate writes");
+        assert!(
+            crate::plan_artifact::stage_execution_outbox_plan(&outbox, &worktree, "exec-1")
+                .expect("plan candidate stages")
+        );
+        let stage = worktree
+            .parent()
+            .expect("Task root exists")
+            .join(".forge-plan-staging")
+            .join("exec-1.md");
+        assert!(outbox.exists());
+        assert!(stage.exists());
+
+        discard_execution_outbox_and_plan_stage(&worktree.to_string_lossy(), "exec-1");
+
+        assert!(!outbox.exists());
+        assert!(!stage.exists());
     }
 
     #[tokio::test]

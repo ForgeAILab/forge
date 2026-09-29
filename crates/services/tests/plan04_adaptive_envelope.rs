@@ -361,6 +361,7 @@ async fn adapter_propose(
         &fixture.provider,
         AGENT_ID,
         &fixture.scope,
+        "plan04-test-session",
         operation,
         json!({
             "payload": payload,

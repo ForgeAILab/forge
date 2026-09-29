@@ -622,6 +622,73 @@ fn planner_prompt_includes_parent_task_context() {
 }
 
 #[test]
+fn cli_plan_writers_use_the_brokered_plan_path() {
+    let mut planner = fake_context(default_roles::PLANNER);
+    planner.delivery = TaskDelivery::Outbox;
+    let planner_prompt = PlannerPromptBuilder.build(&planner);
+    assert!(planner_prompt.user.contains("$FORGE_PLAN_PATH"));
+    assert!(!planner_prompt.user.contains("`../plan.md`"));
+
+    let mut coder = fake_context(default_roles::CODER);
+    coder.delivery = TaskDelivery::Outbox;
+    let coder_prompt = resolve_prompt_builder(BUILDER_ID_CODER_IMPLEMENTATION_V2).build(&coder);
+    assert!(coder_prompt.system.contains("$FORGE_PLAN_PATH"));
+    assert!(coder_prompt.system.contains("Forge has copied"));
+
+    for builder_id in [
+        BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    ] {
+        let mut worker = fake_context(default_roles::WORKER);
+        worker.delivery = TaskDelivery::Outbox;
+        let worker_prompt = resolve_prompt_builder(builder_id).build(&worker);
+        assert!(
+            worker_prompt.system.contains("$FORGE_PLAN_PATH"),
+            "{builder_id} missing brokered plan path"
+        );
+        assert!(
+            worker_prompt.system.contains("entire checklist"),
+            "{builder_id} missing full-checklist contract"
+        );
+        assert!(
+            !worker_prompt.system.contains("typed `task.plan` operation"),
+            "{builder_id} names the unavailable native plan tool"
+        );
+    }
+}
+
+#[test]
+fn native_worker_plan_writers_use_the_typed_full_checklist_contract() {
+    for builder_id in [
+        BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    ] {
+        let worker_prompt =
+            resolve_prompt_builder(builder_id).build(&fake_context(default_roles::WORKER));
+        assert!(
+            worker_prompt.system.contains("typed `task.plan` operation"),
+            "{builder_id} missing native plan tool"
+        );
+        assert!(
+            worker_prompt
+                .system
+                .contains(r#"{"action":"write","content":"<full Markdown checklist>"}"#),
+            "{builder_id} missing write-full-checklist payload"
+        );
+        assert!(
+            worker_prompt.system.contains("entire checklist"),
+            "{builder_id} missing replacement semantics"
+        );
+        assert!(
+            !worker_prompt.system.contains("$FORGE_PLAN_PATH"),
+            "{builder_id} names the unavailable CLI plan path"
+        );
+    }
+}
+
+#[test]
 fn generic_prompt_dumps_core_context_for_unknown_role() {
     let mut ctx = fake_context("security_engineer");
     ctx.state_name = "security_review".to_string();

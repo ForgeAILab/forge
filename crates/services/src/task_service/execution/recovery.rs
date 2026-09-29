@@ -69,6 +69,7 @@ impl TaskService {
                 }));
             }
         }
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         if task.failed_json.is_some()
             && !matches!(
                 action,
@@ -825,6 +826,7 @@ impl TaskService {
         task: Task,
         context: Option<String>,
     ) -> Result<Task> {
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1442,6 +1444,7 @@ impl TaskService {
         reason: String,
         actor: &api_types::Actor,
     ) -> Result<Task> {
+        super::ensure_plan_publication_transition_authority(task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1477,6 +1480,7 @@ impl TaskService {
                     Some(crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     }),
                 )
                 .await?
@@ -2089,6 +2093,7 @@ impl TaskService {
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     },
                 )
                 .await?
@@ -2123,6 +2128,7 @@ impl TaskService {
         reason: Option<String>,
     ) -> Result<Task> {
         let reason = optional_recovery_reason(reason, "retry_hook");
+        super::ensure_plan_publication_transition_authority(&task, None)?;
         let cleared = self.clear_blocking_metadata(&task.id).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &cleared.project_id)
             .await?
@@ -2157,6 +2163,7 @@ impl TaskService {
                 Some(crate::workflow::engine::WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?
@@ -2445,6 +2452,7 @@ impl TaskService {
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
                     },
                 )
                 .await?
