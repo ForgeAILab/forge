@@ -5,9 +5,10 @@ use crate::{
             AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
             CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
             DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
-            PropagateDoneToSubtasks, RequireCleanWorktree, RequirePlanChecklistComplete,
-            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
-            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
+            PropagateDoneToSubtasks, RequireCleanWorktree, RequireConflictMarkersResolved,
+            RequirePlanChecklistComplete, RequireUpstreamRolesCompleted, RunBeforeWorkHooks,
+            RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
+            SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -33,6 +34,7 @@ pub fn is_known_action(name: &str) -> bool {
             | "check_retry_budget"
             | "require_clean_worktree"
             | "require_plan_checklist_complete"
+            | "require_conflict_markers_resolved"
             | "dependency_gate"
             | "dispatch_executor"
             | "dispatch_fix_agent"
@@ -73,6 +75,7 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "check_retry_budget" => Box::new(CheckRetryBudget),
         "require_clean_worktree" => Box::new(RequireCleanWorktree),
         "require_plan_checklist_complete" => Box::new(RequirePlanChecklistComplete),
+        "require_conflict_markers_resolved" => Box::new(RequireConflictMarkersResolved),
         "dependency_gate" => Box::new(DependencyGate),
         "dispatch_executor" => Box::new(DispatchExecutor),
         "dispatch_fix_agent" => Box::new(DispatchFixAgent),

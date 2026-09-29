@@ -8,10 +8,44 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Domain-event consumers (agent wake delivery, Agent Chat memory indexing,
+  attention projection) no longer wedge forever when rows in their
+  `domain_event` range were deleted (for example by the V146 progress-event
+  cleanup) while they were lagging. Ordering is now defined over existing
+  events (`MIN(sequence) > cursor`) instead of `cursor + 1`, so already-stuck
+  cursors advance across the gap on the next poll with no migration.
+  Completing an event while an earlier existing event is unprocessed is still
+  rejected.
+- A merge-fix repair that still commits Git conflict markers in a handed-off
+  file no longer goes to a full review (and no longer gets rebased over by the
+  next conflict round, which nested markers several layers deep). A new
+  `merge_failed` exit guard, `require_conflict_markers_resolved`, resumes the
+  worker with the affected file names and blocks the Task when the guard retry
+  budget is exhausted. Migration `V147` appends the guard to every stored
+  Project workflow's `merge_failed` state. Because the stored workflow is part
+  of a review's governing context, Tasks that passed review but had not merged
+  when this migration runs get one fresh review.
+- A managed Codex execution no longer fails with `Permission denied (os error
+  13)` on every retry after a project test leaves a read-only directory in the
+  Worker's TMPDIR (`.codex-managed-home/task-scratch`). Forge restores owner
+  write permission on that tree before resetting it.
+- A Task whose coder execution failed without the failure being recorded
+  (for example while the disk was full and SQLite writes failed) no longer
+  sits with no recovery action but `cancel`. The dispatcher's active-task
+  recovery now applies the normal executor-failure handling to it: a deferred
+  retry while budget remains, then an `executor_failed` block offering
+  `reexecute`, `reset_to_initial` and `cancel_task`.
+- Agent commits made at the end of merge-fix and review-fix runs are named
+  after the Task (`agent: <task title>`) instead of the role prompt's first
+  line (`agent: Forge role contract (authoritative):`).
 - Completing an approval-gated planning run no longer invalidates the Task
   version while removing Forge's private plan-cleanup marker. A human can now
   approve the plan using the version returned with the review-ready Task
   instead of intermittently receiving a version conflict.
+- Moving a Task into `todo` or `backlog` (transition or board move) now clears a
+  stale `dispatch_failed` error annotation, so tasks no longer show a red
+  dispatch error after the cause (e.g. a full disk) is fixed. A later
+  successful dispatch already cleared it. Work-failure annotations are kept.
 
 ## [0.13.9] - 2026-09-28
 

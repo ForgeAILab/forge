@@ -2033,9 +2033,13 @@ commits each text-content conflict step with its conflict markers, finishes the
 rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
 the affected paths. The worker reconciles those files by editing and committing them, and the
 result goes through fresh checks and review like any other repair. A handoff
-does not spend the merge-fix retry budget. Integration checks for remaining
-markers only in paths handed off in the current retry window and parks
-unresolved files for manual Task-worktree repair. Modify/delete and binary
+does not spend the merge-fix retry budget. A blocking `before_exit` guard on
+`merge_failed` (`require_conflict_markers_resolved`) refuses the move to
+`review` while the committed HEAD still adds marker lines in a handed-off path;
+the worker is resumed through the workflow guard-retry budget with the file
+names, and the Task blocks when that budget is spent. Integration repeats the
+check as the final safety net (only in paths handed off in the current retry
+window) and parks unresolved files for manual Task-worktree repair. Modify/delete and binary
 conflicts also require manual repair, as do more than five handoffs in one
 retry window and conflicts on coordination roots, whose aggregate branch stays
 on the manual path. There, the recovery action creates a

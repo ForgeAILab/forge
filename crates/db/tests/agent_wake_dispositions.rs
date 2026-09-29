@@ -979,3 +979,196 @@ async fn turn_admission_is_committed_with_wake_disposition() {
     .expect("turn event count");
     assert_eq!(event_count, 1);
 }
+
+async fn claim_all(db: &SqliteDb, consumer: &str, owner: &str) -> Vec<db::DomainEvent> {
+    DomainEventRepo::claim_event_batch(
+        db,
+        ClaimDomainEvents {
+            consumer_name: consumer.to_owned(),
+            lease_owner: owner.to_owned(),
+            now: "2026-08-21T00:00:00Z".to_owned(),
+            leased_until: "2026-08-21T00:01:00Z".to_owned(),
+            limit: 100,
+        },
+    )
+    .await
+    .expect("events claim")
+}
+
+fn plain_completion(consumer: &str, owner: &str, event: &db::DomainEvent) -> CompleteDomainEvent {
+    CompleteDomainEvent {
+        consumer_name: consumer.to_owned(),
+        lease_owner: owner.to_owned(),
+        event_sequence: event.sequence,
+        event_id: event.id.clone(),
+        dedupe_key: event.dedupe_key.clone().expect("dedupe key"),
+        completed_at: "2026-08-21T00:00:01Z".to_owned(),
+    }
+}
+
+async fn append_events(db: &SqliteDb, ids: &[&str]) -> Vec<db::DomainEvent> {
+    let mut events = Vec::new();
+    for id in ids {
+        events.push(
+            DomainEventRepo::append_event(db, source_event(id, "2026-08-21T00:00:00Z"))
+                .await
+                .expect("event appends"),
+        );
+    }
+    events
+}
+
+#[tokio::test]
+async fn domain_event_consumer_completes_across_pruned_gap() {
+    let db = database().await;
+    let events = append_events(&db, &["gap-a", "gap-b", "gap-c", "gap-d"]).await;
+    // Cursor lags right before the rows that get pruned.
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
+         VALUES ('gap-consumer', ?, 1, '2026-08-21T00:00:00Z')",
+    )
+    .bind(events[0].sequence - 1)
+    .execute(db.pool())
+    .await
+    .expect("cursor seeds");
+    sqlx::query("DELETE FROM domain_event WHERE id IN ('gap-a', 'gap-b', 'gap-c')")
+        .execute(db.pool())
+        .await
+        .expect("prune");
+
+    let claimed = claim_all(&db, "gap-consumer", "worker").await;
+    assert_eq!(claimed, vec![events[3].clone()]);
+    assert!(DomainEventRepo::complete_claimed_event(
+        &db,
+        plain_completion("gap-consumer", "worker", &events[3]),
+    )
+    .await
+    .expect("event after the gap completes"));
+    let cursor = DomainEventRepo::get_consumer_cursor(&db, "gap-consumer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, events[3].sequence);
+}
+
+#[tokio::test]
+async fn domain_event_catch_up_skips_pruned_gap_over_receipts() {
+    let db = database().await;
+    let events = append_events(&db, &["cu-a", "cu-b", "cu-c"]).await;
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
+         VALUES ('cu-consumer', ?, 1, '2026-08-21T00:00:00Z')",
+    )
+    .bind(events[0].sequence - 1)
+    .execute(db.pool())
+    .await
+    .expect("cursor seeds");
+    // Receipt exists for the first event but the cursor never checkpointed it.
+    sqlx::query(
+        "INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
+         VALUES ('cu-consumer', 'cu-a', 'wake-event-cu-a', '2026-08-21T00:00:00Z')",
+    )
+    .execute(db.pool())
+    .await
+    .expect("receipt seeds");
+    sqlx::query("DELETE FROM domain_event WHERE id = 'cu-b'")
+        .execute(db.pool())
+        .await
+        .expect("prune");
+    let claimed = claim_all(&db, "cu-consumer", "worker").await;
+    assert_eq!(claimed, vec![events[2].clone()]);
+    let cursor = DomainEventRepo::get_consumer_cursor(&db, "cu-consumer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, events[0].sequence);
+}
+
+#[tokio::test]
+async fn domain_event_completion_still_rejects_out_of_order_with_existing_earlier_event() {
+    let db = database().await;
+    let events = append_events(&db, &["ooo-a", "ooo-b", "ooo-c"]).await;
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
+         VALUES ('ooo-consumer', ?, 1, '2026-08-21T00:00:00Z')",
+    )
+    .bind(events[0].sequence - 1)
+    .execute(db.pool())
+    .await
+    .expect("cursor seeds");
+    // A gap before b must not license skipping the still-existing a.
+    sqlx::query("DELETE FROM domain_event WHERE id = 'ooo-b'")
+        .execute(db.pool())
+        .await
+        .expect("prune");
+    let claimed = claim_all(&db, "ooo-consumer", "worker").await;
+    assert_eq!(claimed.len(), 2);
+    let error = DomainEventRepo::complete_claimed_event(
+        &db,
+        plain_completion("ooo-consumer", "worker", &events[2]),
+    )
+    .await
+    .expect_err("later event must wait for the earlier existing one");
+    assert!(matches!(error, db::DbError::Check(_)), "{error:?}");
+    DomainEventRepo::complete_claimed_event(
+        &db,
+        plain_completion("ooo-consumer", "worker", &events[0]),
+    )
+    .await
+    .expect("head completes");
+    DomainEventRepo::complete_claimed_event(
+        &db,
+        plain_completion("ooo-consumer", "worker", &events[2]),
+    )
+    .await
+    .expect("tail completes across the gap");
+    let cursor = DomainEventRepo::get_consumer_cursor(&db, "ooo-consumer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, events[2].sequence);
+}
+
+#[tokio::test]
+async fn wake_completion_crosses_pruned_gap_but_rejects_existing_earlier_event() {
+    let db = database().await;
+    let events = append_events(&db, &["wk-a", "wk-b", "wk-c", "wk-d"]).await;
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = ? WHERE consumer_name = 'agent-wake-turns'")
+        .bind(events[0].sequence - 1)
+        .execute(db.pool())
+        .await
+        .expect("cursor rewinds");
+    sqlx::query("DELETE FROM domain_event WHERE id IN ('wk-b', 'wk-c')")
+        .execute(db.pool())
+        .await
+        .expect("prune");
+    let claimed = claim_all(&db, "agent-wake-turns", "wake-test").await;
+    assert_eq!(claimed.len(), 2);
+
+    let complete = |event: &db::DomainEvent| CompleteClaimedWake {
+        disposition: disposition(
+            event,
+            AgentWakeDispositionKind::DeterministicallySuppressed,
+            "gap_test",
+            "2026-08-21T00:00:01Z",
+        ),
+        completion: completion(event, "wake-test"),
+        admission: None,
+        expected_attention: None,
+    };
+    let error = AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[3]))
+        .await
+        .expect_err("tail must wait for the existing head");
+    assert!(matches!(error, db::DbError::Check(_)), "{error:?}");
+    AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[0]))
+        .await
+        .expect("head completes");
+    AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[3]))
+        .await
+        .expect("tail completes across the gap");
+    let cursor = DomainEventRepo::get_consumer_cursor(&db, "agent-wake-turns")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, events[3].sequence);
+}

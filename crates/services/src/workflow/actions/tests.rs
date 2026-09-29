@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
+use super::merge::RequireConflictMarkersResolved;
 use super::merge::{merge_failure_result, target_moved_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
@@ -2583,6 +2584,58 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
         .blocked_json
         .as_deref()
         .is_some_and(|value| value.contains("unresolved Git conflict markers")));
+}
+
+#[tokio::test]
+async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
+    let mut ctx = build_test_ctx(
+        "task-handoff-exit-guard",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let HookResult::Cascade { reason, .. } =
+        target_moved_result(&ctx, &task, "main advanced", "main").await
+    else {
+        panic!("conflict should hand off");
+    };
+    record_conflict_handoff(&ctx, reason, false).await;
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+    ctx.from_state = default_states::MERGE_FAILED.to_owned();
+    ctx.to_state = default_states::REVIEW.to_owned();
+    ctx.triggered_by = api_types::Actor::system(api_types::SystemComponent::Workflow);
+
+    // The Worker has not touched the marked files yet.
+    let HookResult::Failed { reason } = RequireConflictMarkersResolved.execute(&ctx).await else {
+        panic!("committed markers must keep the task out of review");
+    };
+    assert!(reason.contains("exports.py"), "{reason}");
+
+    // Other exits from merge_failed are not this guard's concern.
+    let mut other = ctx.clone();
+    other.to_state = default_states::IN_PROGRESS.to_owned();
+    assert!(matches!(
+        RequireConflictMarkersResolved.execute(&other).await,
+        HookResult::Skipped { .. }
+    ));
+
+    // A repair that is committed clears the guard.
+    std::fs::write(worktree_path.join("exports.py"), "resolved = True\n").expect("repair writes");
+    git::commit_all(&worktree_path, "resolve handoff")
+        .await
+        .expect("repair commits");
+    let result = RequireConflictMarkersResolved.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
 }
 
 #[tokio::test]

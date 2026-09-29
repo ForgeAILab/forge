@@ -16,7 +16,9 @@ pub use lifecycle::{
     AutoCascadeOnCompletion, CleanupWorkspaceNow, PublishTaskBlocked, RunBeforeWorkHooks,
     ScheduleWorkspaceCleanup,
 };
-pub use merge::{AutoCascadeOnMergeResult, CheckMergeFixBudget, RunMerge};
+pub use merge::{
+    AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
+};
 pub use review::{AutoCascadeOnReviewPass, AutoCascadeOnUnconfiguredReview, RunCiSteps};
 pub use subtasks::{
     CancelPendingSubtasks, PropagateDoneToSubtasks, SatisfyDependents, SubtaskSequenceComplete,

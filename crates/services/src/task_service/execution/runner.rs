@@ -444,6 +444,7 @@ impl TaskService {
         // after loading the immutable profile snapshot so every local CLI,
         // fallback candidate, and embedded runtime receives the same scope.
         executors::mark_task_role(&mut agent_config, &execution.role);
+        executors::mark_task_title(&mut agent_config, &task.title);
         // Provider-entry-backed harness agents get their API key injected into
         // the in-memory snapshot only; the stored snapshot never holds it.
         if let Some(credential_env) = self.credential_env.as_ref() {

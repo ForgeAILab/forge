@@ -4070,3 +4070,241 @@ fn a_running_execution_slot_is_not_a_deterministic_dispatch_refusal() {
         }
     ));
 }
+
+async fn seed_failed_coder_execution(
+    db: &db::SqliteDb,
+    task_id: &str,
+    project_id: &str,
+    agent_id: &str,
+) -> String {
+    let project_version = db::ProjectRepo::get_by_id(db, project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        db,
+        db::CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("io error: No space left on device".to_owned()),
+            executor_config_snapshot_json: Some(format!(
+                r#"{{"executor_type":"shell","config":{{}},"project_version":{project_version}}}"#
+            )),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("failed execution creates");
+    execution_id
+}
+
+async fn set_zero_execution_retry_budget(db: &db::SqliteDb, task: &Task) -> Task {
+    TaskRepo::update(
+        db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: Some(Some(r#"{"retry_budgets":{"execution":0}}"#.to_owned())),
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task retry budget updates")
+}
+
+async fn set_task_error_annotation(db: &db::SqliteDb, task: &Task, annotation: &str) {
+    TaskRepo::update_status(
+        db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: task.status.clone(),
+            assignee_id: None,
+            error_annotation: Some(Some(annotation.to_owned())),
+            blocked_json: None,
+            failed_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("annotation persists");
+}
+
+/// A run that died without its failure being recorded (full disk) leaves the
+/// Task in its working state with a failed newest execution and no blocker.
+/// The dispatcher must give it the normal executor-failure annotation so it
+/// offers recovery, keep the merge-conflict context's state, and not churn or
+/// relaunch on later ticks.
+#[tokio::test]
+async fn dispatcher_blocks_task_whose_failed_execution_was_never_recorded() {
+    for status in ["in_progress", "merge_failed"] {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let workspace_dir = TempDir::new().expect("workspace dir creates");
+        let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let mut task = seed_task(&db, &project_id, "lost failure", status, 0).await;
+        task = set_zero_execution_retry_budget(&db, &task).await;
+        assign_role(
+            &db,
+            &task.id,
+            crate::workflow::default_roles::CODER,
+            &agent_id,
+        )
+        .await;
+        if status == "merge_failed" {
+            set_task_error_annotation(
+                &db,
+                &task,
+                r#"{"type":"merge_conflict","blocking_reason":"merge_conflict","recovery_actions":[]}"#,
+            )
+            .await;
+            task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+        }
+        let execution_id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
+        let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+        dispatcher.check_once().await.expect("dispatcher runs");
+
+        let healed = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        let annotation: serde_json::Value =
+            serde_json::from_str(healed.error_annotation.as_deref().expect("annotated"))
+                .expect("annotation parses");
+        assert_eq!(annotation["type"], "executor_failed", "{status}");
+        assert_eq!(annotation["blocked_execution_id"], execution_id.as_str());
+        assert!(annotation["recovery_actions"]
+            .as_array()
+            .expect("recovery actions")
+            .iter()
+            .any(|action| action == "reexecute"));
+        assert!(healed.blocked_json.is_some());
+        assert_eq!(healed.status, status);
+        assert!(rx.try_recv().is_err(), "no replacement run is launched");
+
+        // Idempotent: a second tick changes nothing.
+        dispatcher.check_once().await.expect("dispatcher runs");
+        let again = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(again.version, healed.version, "{status}");
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+/// The reconciliation must not touch a Task that has a live execution
+/// launching or running after the failed one.
+#[tokio::test]
+async fn dispatcher_leaves_failed_execution_alone_while_a_newer_run_is_live() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "relaunched", "in_progress", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    seed_running_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await;
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(after.blocked_json.is_none());
+    assert!(after.error_annotation.is_none());
+}
+
+/// With execution retry budget left, the reconciliation takes the same
+/// deferred-retry path as the live failure handler (and only once).
+#[tokio::test]
+async fn dispatcher_schedules_retry_for_unrecorded_failure_once() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "lost failure", "in_progress", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let execution_id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+    let scheduled = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(deferred_dispatch::is_pending(
+        &scheduled,
+        chrono::Utc::now()
+    ));
+    assert!(scheduled
+        .metadata_json
+        .as_deref()
+        .expect("metadata")
+        .contains(&execution_id));
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+    let again = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(again.version, scheduled.version);
+    assert!(rx.try_recv().is_err());
+}

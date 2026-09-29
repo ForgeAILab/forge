@@ -209,7 +209,7 @@ impl TaskService {
         {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
-        if should_clear_transient_error_annotation(&task) {
+        if should_clear_transient_error_annotation(&task, &new_status) {
             match TaskRepo::update(
                 &*self.db,
                 UpdateTask {
@@ -1200,9 +1200,27 @@ pub(super) async fn clear_manual_review_awaiting_metadata(
         .map_err(Into::into)
 }
 
-pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {
+/// `requested_target` is the status the caller asked for, not necessarily
+/// `task.status`: a failed dispatch cascades the Task back to `todo` and
+/// records a fresh `dispatch_failed` annotation, which must survive the
+/// transition that triggered it.
+pub(super) fn should_clear_transient_error_annotation(task: &Task, requested_target: &str) -> bool {
     if task.status.as_str() == default_states::MERGE_FAILED {
         return false;
+    }
+    // `dispatch_failed` only describes a failed attempt to start work. Once
+    // the Task is deliberately placed in `todo`/`backlog` it is no longer
+    // attempting to start, so the annotation is stale (a disk-full incident
+    // left it on every backlog Task long after the disk was fixed). Real work
+    // failures (merge_conflict, executor_failed, review failures) are
+    // deliberately not covered here.
+    if matches!(
+        requested_target,
+        default_states::TODO | default_states::BACKLOG
+    ) && task.status.as_str() == requested_target
+        && crate::workflow::engine::is_dispatch_failed_annotation(task.error_annotation.as_deref())
+    {
+        return true;
     }
     // A blocked Task has not moved on, and its annotation is the only thing
     // carrying the blocking reason and the recovery actions a client can
@@ -1339,15 +1357,82 @@ mod tests {
 
         task.blocked_json = None;
         assert!(
-            should_clear_transient_error_annotation(&task),
+            should_clear_transient_error_annotation(&task, default_states::MERGING),
             "an unblocked Task moving on still drops a stale transient annotation"
         );
 
         task.blocked_json =
             Some(serde_json::json!({"kind": "merge_fix_budget_exhausted"}).to_string());
         assert!(
-            !should_clear_transient_error_annotation(&task),
+            !should_clear_transient_error_annotation(&task, default_states::MERGING),
             "a blocked Task must keep the annotation explaining the block"
         );
+    }
+
+    #[test]
+    fn dispatch_failed_annotation_cleared_only_when_parked_in_todo_or_backlog() {
+        let mut task = blocked_free_task(default_states::BACKLOG);
+        task.error_annotation = Some(serde_json::json!({"type": "dispatch_failed"}).to_string());
+
+        assert!(should_clear_transient_error_annotation(
+            &task,
+            default_states::BACKLOG
+        ));
+        task.status = default_states::TODO.into();
+        assert!(should_clear_transient_error_annotation(
+            &task,
+            default_states::TODO
+        ));
+        // A failed dispatch cascades back to todo with a fresh annotation
+        // while the caller asked for in_progress: it must be kept.
+        assert!(!should_clear_transient_error_annotation(
+            &task,
+            default_states::IN_PROGRESS
+        ));
+    }
+
+    #[test]
+    fn work_failure_annotations_survive_move_to_backlog() {
+        for kind in ["workspace_failed", "ci_failed", "review_blocked"] {
+            let mut task = blocked_free_task(default_states::BACKLOG);
+            task.error_annotation = Some(serde_json::json!({"type": kind}).to_string());
+            assert!(
+                !should_clear_transient_error_annotation(&task, default_states::BACKLOG),
+                "{kind} must not be cleared by a move to backlog"
+            );
+        }
+    }
+
+    fn blocked_free_task(status: &str) -> Task {
+        let now = db::now_rfc3339();
+        Task {
+            id: "task".into(),
+            project_id: "project".into(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "t".into(),
+            description: None,
+            task_type: "task".into(),
+            status: status.into(),
+            is_automation: false,
+            priority: 0,
+            board_position: 0.0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            entry_barrier_json: None,
+            review_passed_at: None,
+            archived_at: None,
+            deleted_at: None,
+            version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+        }
     }
 }

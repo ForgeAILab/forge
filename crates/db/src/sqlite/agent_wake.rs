@@ -540,7 +540,11 @@ async fn complete_event_in_tx(
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DbError::NotFound)?;
-    if input.event_sequence > cursor + 1 {
+    if input.event_sequence
+        > super::domain_event::next_existing_sequence(transaction, cursor)
+            .await?
+            .unwrap_or(i64::MAX)
+    {
         return Err(DbError::Check(
             "domain events must be checkpointed in sequence order".to_owned(),
         ));
@@ -586,7 +590,9 @@ async fn complete_event_in_tx(
         .map_err(map_wake_write_error)?;
     }
 
-    if input.event_sequence == cursor + 1 {
+    if Some(input.event_sequence)
+        == super::domain_event::next_existing_sequence(transaction, cursor).await?
+    {
         let updated = sqlx::query(
             "UPDATE event_consumer_cursor
              SET last_sequence = ?, version = version + 1, updated_at = ?

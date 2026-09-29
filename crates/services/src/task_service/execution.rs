@@ -23,7 +23,7 @@ const TERMINAL_EXECUTION_SETTLEMENT_KEY: &str = "terminal_execution_settlement";
 pub(crate) use runner::discard_execution_plan_stage;
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 
-pub(super) use cascade::should_block_task_for_failed_execution;
+pub(crate) use cascade::should_block_task_for_failed_execution;
 pub(crate) use cascade::{
     exact_review_for_execution, reviewer_execution_lacks_exact_review_binding,
     terminal_review_is_bound_to_execution,

@@ -2729,7 +2729,9 @@ fn render_workflow_guard_follow_up_prompt(
     attempt: u64,
     budget: u64,
 ) -> String {
-    let checklist_instruction = if guard == "planning_plan_ready" {
+    let checklist_instruction = if guard == "require_conflict_markers_resolved" {
+        "Fix the files named above: remove every conflict marker line and keep the correct merged code, verify nothing else in them is still conflicted, then commit the result. Forge re-checks the committed HEAD before the task can go to review."
+    } else if guard == "planning_plan_ready" {
         "Write a valid Markdown checklist using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness."
     } else {
         "Make sure you complete all tasks and fix what is needed for this guard. Update completed checklist items to `- [x]` using `task.plan` for a native session or `$FORGE_PLAN_PATH` for a CLI harness; you do not need to commit if all implementation work is already complete."

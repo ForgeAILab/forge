@@ -1,5 +1,21 @@
 use super::*;
 
+/// Smallest existing `domain_event.sequence` strictly greater than `cursor`.
+///
+/// Outbox sequences are AUTOINCREMENT but rows can be deleted (retention,
+/// migrations), so contiguity is defined over existing rows, never `cursor + 1`.
+pub(super) async fn next_existing_sequence(
+    transaction: &mut Transaction<'_, Sqlite>,
+    cursor: i64,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MIN(sequence) FROM domain_event WHERE sequence > ?",
+    )
+    .bind(cursor)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
 #[async_trait]
 impl DomainEventRepo for SqliteDb {
     async fn append_event(&self, input: CreateDomainEvent) -> Result<DomainEvent> {
@@ -165,15 +181,16 @@ impl DomainEventRepo for SqliteDb {
         .fetch_one(&mut *transaction)
         .await?;
         loop {
-            let Some((next_sequence, next_id)) = sqlx::query_as::<_, (i64, String)>(
-                "SELECT sequence, id FROM domain_event WHERE sequence = ?",
-            )
-            .bind(last_sequence + 1)
-            .fetch_optional(&mut *transaction)
-            .await?
+            let Some(next_sequence) =
+                next_existing_sequence(&mut transaction, last_sequence).await?
             else {
                 break;
             };
+            let next_id =
+                sqlx::query_scalar::<_, String>("SELECT id FROM domain_event WHERE sequence = ?")
+                    .bind(next_sequence)
+                    .fetch_one(&mut *transaction)
+                    .await?;
             let has_receipt = sqlx::query_scalar::<_, i64>(
                 "SELECT 1 FROM event_projection_receipt
                  WHERE consumer_name = ? AND event_id = ?",
@@ -266,7 +283,11 @@ impl DomainEventRepo for SqliteDb {
         .await?
         .ok_or(DbError::NotFound)?;
 
-        if input.event_sequence > cursor + 1 {
+        if input.event_sequence
+            > next_existing_sequence(&mut transaction, cursor)
+                .await?
+                .unwrap_or(i64::MAX)
+        {
             return Err(DbError::Check(
                 "domain events must be checkpointed in sequence order".to_owned(),
             ));
@@ -335,7 +356,7 @@ impl DomainEventRepo for SqliteDb {
         .rows_affected()
             == 1;
 
-        if input.event_sequence == cursor + 1 {
+        if Some(input.event_sequence) == next_existing_sequence(&mut transaction, cursor).await? {
             sqlx::query(
                 "UPDATE event_consumer_cursor
                  SET last_sequence = ?, version = version + 1, updated_at = ?

@@ -156,6 +156,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             Some(default_roles::CODER),
             CanonicalPhase::Review,
             StateHooks {
+                before_exit: vec![blocking_hook("require_conflict_markers_resolved")],
                 before_enter: vec![blocking_hook("run_before_work_hooks")],
                 on_enter: vec![hook("notify_role_holder"), hook("dispatch_role_agent")],
                 ..StateHooks::default()

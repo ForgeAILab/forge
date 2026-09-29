@@ -85,6 +85,43 @@ impl MergeService {
         }
     }
 
+    /// Handed-off conflict files whose current `HEAD` still adds Git conflict
+    /// markers relative to the target branch. Empty when the Task was never
+    /// handed a conflict, delivers through a pull request, or has no workspace.
+    /// Lets the workflow reject an unresolved repair before it is re-reviewed;
+    /// [`MergeService::merge`] repeats the same check as the final guard.
+    pub async fn unresolved_handoff_markers(&self, task_id: &str) -> Result<Vec<String>> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::NotFound {
+                entity: "task",
+                id: task_id.to_owned(),
+            })?;
+        let Some(execution) =
+            crate::task_service::latest_executor_execution_for_task(&self.db, &task).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
+        let Some(repo) = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
+        else {
+            return Ok(Vec::new());
+        };
+        if repo.work_mode == WorkMode::PullRequest {
+            return Ok(Vec::new());
+        }
+        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
+        unresolved_handed_off_markers(
+            &self.db,
+            task_id,
+            Path::new(&workspace.worktree_path),
+            &target_branch,
+        )
+        .await
+    }
+
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
         let _ = self.event_bus.receiver_count();
         let task_id = task_id.into();
@@ -133,18 +170,11 @@ impl MergeService {
                 files: git::status_porcelain(repo_path).await?,
             });
         }
-        let transitions = db::TransitionLogRepo::list_by_task(&*self.db, &task_id).await?;
-        let handed_off_paths = crate::workflow::handed_off_conflict_paths(&transitions);
-        if !handed_off_paths.is_empty() {
-            let marker_paths =
-                git::paths_adding_conflict_markers(worktree_path, &target_branch, "HEAD").await?;
-            let unresolved = marker_paths
-                .into_iter()
-                .filter(|path| handed_off_paths.contains(path))
-                .collect::<Vec<_>>();
-            if !unresolved.is_empty() {
-                return Ok(MergeOutcome::UnresolvedConflictMarkers { paths: unresolved });
-            }
+        let unresolved =
+            unresolved_handed_off_markers(&self.db, &task_id, worktree_path, &target_branch)
+                .await?;
+        if !unresolved.is_empty() {
+            return Ok(MergeOutcome::UnresolvedConflictMarkers { paths: unresolved });
         }
 
         let before_sha = git::get_current_sha(repo_path).await?;
@@ -387,6 +417,26 @@ impl MergeService {
     fn managed_repo_path(&self, repo_id: &str) -> PathBuf {
         self.workspace_root.join(".repos").join(repo_id)
     }
+}
+
+/// Handed-off conflict files where `HEAD` still adds conflict markers.
+async fn unresolved_handed_off_markers(
+    db: &SqliteDb,
+    task_id: &str,
+    worktree_path: &Path,
+    target_branch: &str,
+) -> Result<Vec<String>> {
+    let transitions = db::TransitionLogRepo::list_by_task(db, task_id).await?;
+    let handed_off_paths = crate::workflow::handed_off_conflict_paths(&transitions);
+    if handed_off_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marker_paths =
+        git::paths_adding_conflict_markers(worktree_path, target_branch, "HEAD").await?;
+    Ok(marker_paths
+        .into_iter()
+        .filter(|path| handed_off_paths.contains(path))
+        .collect())
 }
 
 /// Resolve the exact worktree pinned to the selected implementation attempt.
