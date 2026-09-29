@@ -193,7 +193,6 @@ impl Fixture {
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_executor: None,
             task_service,
             daemon_connections: None,
             workspace_exec_locks: None,

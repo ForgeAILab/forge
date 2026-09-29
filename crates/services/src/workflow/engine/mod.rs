@@ -10,7 +10,6 @@ use db::{
     TransitionLogRepo, UpdateTask,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent, TASK_MOVED_EVENT};
-use executors::TaskExecutor;
 use sqlx::{query, Row};
 use tracing::Instrument;
 use workspace::RepoCacheLockManager;
@@ -201,7 +200,9 @@ pub struct WorkflowEngine {
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    pub task_executor: Option<Arc<dyn TaskExecutor>>,
+    /// Single authority for execution dispatch dependencies. A separate
+    /// executor on the engine could let hook dispatch observe a stale or
+    /// differently configured service clone.
     pub task_service: crate::TaskService,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
@@ -664,7 +665,6 @@ impl WorkflowEngine {
             review_runner: self.review_runner.clone(),
             merge_service: self.merge_service.clone(),
             cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_executor: self.task_executor.clone(),
             task_service: self.task_service.clone(),
             daemon_connections: self.daemon_connections.clone(),
             workspace_exec_locks: self.workspace_exec_locks.clone(),
@@ -1241,7 +1241,6 @@ impl WorkflowEngine {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
                 task_service: self.task_service.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),
@@ -1274,7 +1273,6 @@ impl WorkflowEngine {
                 review_runner: self.review_runner.clone(),
                 merge_service: self.merge_service.clone(),
                 cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_executor: self.task_executor.clone(),
                 task_service: self.task_service.clone(),
                 daemon_connections: self.daemon_connections.clone(),
                 workspace_exec_locks: self.workspace_exec_locks.clone(),

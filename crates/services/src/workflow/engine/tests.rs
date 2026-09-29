@@ -226,7 +226,6 @@ fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
         review_runner: None,
         merge_service: None,
         cleanup_scheduler: None,
-        task_executor: None,
         task_service,
         daemon_connections: None,
         workspace_exec_locks: None,
@@ -1289,8 +1288,13 @@ async fn entry_barrier_stays_running_through_inline_role_dispatch() {
     .expect("entry-barrier assertion trigger creates");
 
     let mut eng = engine(Arc::clone(&db), event_bus);
-    eng.task_executor = Some(Arc::new(PendingExecutor));
-    eng.workspace_root = workspace_root.path().to_path_buf();
+    let workspace_root = workspace_root.path().to_path_buf();
+    eng.task_service = eng
+        .task_service
+        .clone()
+        .with_task_executor(Arc::new(PendingExecutor))
+        .with_workspace_root(workspace_root.clone());
+    eng.workspace_root = workspace_root;
     let result = eng
         .transition(
             task_id,
