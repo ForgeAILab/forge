@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-09-29
+
 ### Changed
 
 - A passed review's authority now carries across Forge's own mechanical
@@ -32,11 +34,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   but had not merged when it runs get one fresh review. The merge-fix prompt
   for a conflict handoff no longer says the repair "will receive a fresh
   review".
-
-## [0.13.10] - 2026-09-29
-
-### Changed
-
 - Upgrade the managed Codex CLI pin from `0.157.0` to `0.159.1`, whose
   upstream default model is GPT-6.1 Sol.
 - Upgrade the managed Claude Code CLI pin from `2.1.282` to `2.1.285`,
