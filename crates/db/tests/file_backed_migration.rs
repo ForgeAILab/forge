@@ -1,10 +1,10 @@
 use db::{
     create_sqlite_pool, run_migrations, run_migrations_from, AgentActionPolicyResult,
     AgentActionRepo, AgentActionStatus, AgentChatRepo, AgentCommitmentRepo, AgentCommitmentStatus,
-    AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentLcmRepo, AgentRepo, AgentSessionRepo,
-    AgentStatus, CreateAgent, CreateAgentAction, CreateAgentCommitment, CreateAgentInboxItem,
-    CreateAgentLcmTimeline, CreateAgentSession, CreateContextManifest, CreateContextManifestSource,
-    CreateDomainEvent, CreateForgeMemorySourceBinding, CreateTask, DomainEventRepo, MemoryItem,
+    AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentRepo, AgentSessionRepo, AgentStatus,
+    CreateAgent, CreateAgentAction, CreateAgentCommitment, CreateAgentInboxItem,
+    CreateAgentSession, CreateContextManifest, CreateContextManifestSource, CreateDomainEvent,
+    CreateForgeMemorySourceBinding, CreateTask, DomainEventRepo, MemoryItem,
     ScopedMemoryRepository, SqliteDb, TaskRepo, User, UserRepo,
 };
 use sqlx::Row;
@@ -1190,18 +1190,19 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
     )
     .await
     .expect("legacy session creates");
-    let timeline = AgentLcmRepo::create_or_get_lcm_timeline(
-        &db,
-        CreateAgentLcmTimeline {
-            id: "scope-rebuild-lcm".to_owned(),
-            identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            authorization_revision: "auth-legacy".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
+    // Seed through SQL: the repository writes columns this legacy schema
+    // predates.
+    sqlx::query(
+        "INSERT INTO agent_lcm_timeline (
+            id, identity_id, scope_type, scope_id, authorization_revision,
+            revision, created_at, updated_at
+         ) VALUES ('scope-rebuild-lcm', ?, 'account', ?, 'auth-legacy', 0, ?, ?)",
     )
+    .bind(&identity.id)
+    .bind(account_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
     .await
     .expect("legacy LCM timeline creates");
     let memory = MemoryItem {
@@ -1281,7 +1282,7 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
             scope_id: account_id.to_owned(),
             policy_revision: "legacy-policy".to_owned(),
             domain_revision: "legacy-domain".to_owned(),
-            lcm_binding_revision: Some(timeline.revision.to_string()),
+            lcm_binding_revision: Some("0".to_owned()),
             runtime_manifest_id: None,
             runtime_manifest_fingerprint: None,
             combined_fingerprint: "legacy-combined".to_owned(),

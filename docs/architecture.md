@@ -1529,9 +1529,20 @@ compaction while continuing to start without prior Task history or protected
 session reuse. SQLite implements the Agent
 Runtime LCM reader/writer contracts with host-minted view authority on every
 operation, immutable admitted entries, transactional DAG compare-and-swap,
-operation fingerprints, and restart recovery. Session rotation follows the
-same authorized timeline; histories from different canonical scopes cannot be
-opened or merged by possessing a timeline/node ID.
+operation fingerprints, and restart recovery. Histories from different
+canonical scopes cannot be opened or merged by possessing a timeline/node ID.
+
+A timeline records the runtime session that writes it. A restart suspends
+every native session, and the next turn opens a fresh runtime session (as does
+a session rotation) whose canonical history is rebuilt from the chat
+transcript. That history cannot continue another session's timeline: once the
+old timeline holds summary nodes the runtime cannot truncate the diverged
+tail, and every turn failed with "LCM source range overlaps an active node".
+So when a different runtime session binds a timeline that already has
+entries, the store retires it — the row keeps its entries and nodes, its
+`scope_id` gains a `#retired:<timeline id>` suffix, and `canonical_scope_id`
+keeps the original scope so Project deletion still removes it — and creates a
+fresh timeline for the new session.
 
 Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
 serialized canonical form, because the runtime's default sizer scans an

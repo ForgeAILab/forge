@@ -360,12 +360,18 @@ impl SqliteLcmStore {
     }
 
     /// Creates or retrieves the durable timeline for one canonical scope.
+    ///
+    /// With a `runtime_session`, a timeline written by a different runtime
+    /// session is retired and replaced: a fresh session rebuilds its canonical
+    /// history from the chat transcript and cannot continue another session's
+    /// summarized timeline.
     pub async fn open_for_binding(
         db: Arc<SqliteDb>,
         identity_id: &str,
         scope_type: &str,
         scope_id: &str,
         authorization_revision: &str,
+        runtime_session: Option<db::AgentLcmSessionClaim>,
         now: &str,
     ) -> Result<Self, AgentHostError> {
         let timeline = db
@@ -375,6 +381,7 @@ impl SqliteLcmStore {
                 scope_type: scope_type.to_owned(),
                 scope_id: scope_id.to_owned(),
                 authorization_revision: authorization_revision.to_owned(),
+                runtime_session,
                 created_at: now.to_owned(),
                 updated_at: now.to_owned(),
             })

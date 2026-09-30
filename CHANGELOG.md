@@ -30,6 +30,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   works) no longer offers recovery actions that would race the live run and
   fail with 409. They are disabled with the reason until the execution stops;
   Cancel Task and Open Side Session stay available.
+- An Agent Chat whose history had been compacted no longer breaks after a
+  server restart or session rotation. The fresh runtime session rebuilt its
+  history from the chat transcript but reused the old session's LCM
+  timeline, and once that timeline held summaries every turn failed with
+  "LCM source range overlaps an active node". A timeline now records its
+  runtime session; a different session retires it (rows kept, `scope_id`
+  suffixed `#retired:<id>`) and starts a fresh one. Migration V149 adds the
+  owner, retirement, and `canonical_scope_id` columns and backfills rows
+  already retired by hand.
 
 ## [0.13.10] - 2026-09-29
 

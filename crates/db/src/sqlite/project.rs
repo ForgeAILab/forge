@@ -740,42 +740,42 @@ impl ProjectRepo for SqliteDb {
             "DELETE FROM agent_lcm_node WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?
-                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                 WHERE (l.scope_type = 'project' AND l.canonical_scope_id = g.project_id)
                     OR (l.scope_type = 'task' AND EXISTS (
-                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                        SELECT 1 FROM task t WHERE t.id = l.canonical_scope_id
                           AND t.project_id = g.project_id))
                     OR (l.scope_type = 'agent_chat' AND EXISTS (
-                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.canonical_scope_id
                           AND c.project_id = g.project_id)))",
             "DELETE FROM agent_lcm_entry WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?
-                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                 WHERE (l.scope_type = 'project' AND l.canonical_scope_id = g.project_id)
                     OR (l.scope_type = 'task' AND EXISTS (
-                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                        SELECT 1 FROM task t WHERE t.id = l.canonical_scope_id
                           AND t.project_id = g.project_id))
                     OR (l.scope_type = 'agent_chat' AND EXISTS (
-                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.canonical_scope_id
                           AND c.project_id = g.project_id)))",
             "DELETE FROM agent_lcm_operation WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?
-                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                 WHERE (l.scope_type = 'project' AND l.canonical_scope_id = g.project_id)
                     OR (l.scope_type = 'task' AND EXISTS (
-                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                        SELECT 1 FROM task t WHERE t.id = l.canonical_scope_id
                           AND t.project_id = g.project_id))
                     OR (l.scope_type = 'agent_chat' AND EXISTS (
-                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.canonical_scope_id
                           AND c.project_id = g.project_id)))",
             "DELETE FROM agent_lcm_timeline WHERE id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?
-                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                 WHERE (l.scope_type = 'project' AND l.canonical_scope_id = g.project_id)
                     OR (l.scope_type = 'task' AND EXISTS (
-                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                        SELECT 1 FROM task t WHERE t.id = l.canonical_scope_id
                           AND t.project_id = g.project_id))
                     OR (l.scope_type = 'agent_chat' AND EXISTS (
-                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.canonical_scope_id
                           AND c.project_id = g.project_id)))",
             "DELETE FROM media_asset_tombstone WHERE asset_id IN
                  (SELECT id FROM media_asset WHERE project_id = ?)",

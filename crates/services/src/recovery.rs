@@ -102,8 +102,8 @@ impl CrashRecovery {
         // any 'starting'/'ready'/'running'/'degraded' native session left by
         // a previous process lies about liveness. Suspend them: the reuse
         // path (get_active_agent_session) then re-establishes a fresh session
-        // on next use, and conversation continuity is preserved because the
-        // LCM timeline is keyed by identity + scope, not the runtime id.
+        // on next use. That session rebuilds its history from the chat
+        // transcript and retires the old runtime's LCM timeline on first bind.
         let suspended_sessions =
             AgentSessionRepo::suspend_stale_native_sessions(&*self.db, &now_rfc3339()).await?;
         if suspended_sessions > 0 {

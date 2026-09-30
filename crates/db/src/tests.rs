@@ -10180,19 +10180,37 @@ async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
     )
     .await
     .expect("teardown identity");
-    for (timeline_id, scope_type, scope_id) in [
-        ("project-lcm", "project", project_id.as_str()),
-        ("chat-lcm", "agent_chat", project_chat_id.as_str()),
+    let retired_chat_scope_id = format!("{project_chat_id}#retired:chat-lcm-retired");
+    for (timeline_id, scope_type, scope_id, canonical_scope_id) in [
+        (
+            "project-lcm",
+            "project",
+            project_id.as_str(),
+            project_id.as_str(),
+        ),
+        (
+            "chat-lcm",
+            "agent_chat",
+            project_chat_id.as_str(),
+            project_chat_id.as_str(),
+        ),
+        (
+            "chat-lcm-retired",
+            "agent_chat",
+            retired_chat_scope_id.as_str(),
+            project_chat_id.as_str(),
+        ),
     ] {
         sqlx::query(
             "INSERT INTO agent_lcm_timeline
-             (id, identity_id, scope_type, scope_id, authorization_revision,
-              revision, created_at, updated_at)
-             VALUES (?, 'teardown-agent', ?, ?, 'auth-v1', 1, ?, ?)",
+             (id, identity_id, scope_type, scope_id, canonical_scope_id,
+              authorization_revision, revision, created_at, updated_at)
+             VALUES (?, 'teardown-agent', ?, ?, ?, 'auth-v1', 1, ?, ?)",
         )
         .bind(timeline_id)
         .bind(scope_type)
         .bind(scope_id)
+        .bind(canonical_scope_id)
         .bind(&now)
         .bind(&now)
         .execute(db.pool())
@@ -10379,18 +10397,21 @@ async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
             "agent_wake_disposition_current",
             "disposition_id = 'wake-disposition'",
         ),
-        ("agent_lcm_timeline", "id IN ('project-lcm', 'chat-lcm')"),
+        (
+            "agent_lcm_timeline",
+            "id IN ('project-lcm', 'chat-lcm', 'chat-lcm-retired')",
+        ),
         (
             "agent_lcm_entry",
-            "timeline_id IN ('project-lcm', 'chat-lcm')",
+            "timeline_id IN ('project-lcm', 'chat-lcm', 'chat-lcm-retired')",
         ),
         (
             "agent_lcm_node",
-            "timeline_id IN ('project-lcm', 'chat-lcm')",
+            "timeline_id IN ('project-lcm', 'chat-lcm', 'chat-lcm-retired')",
         ),
         (
             "agent_lcm_operation",
-            "timeline_id IN ('project-lcm', 'chat-lcm')",
+            "timeline_id IN ('project-lcm', 'chat-lcm', 'chat-lcm-retired')",
         ),
     ] {
         let sql = format!(
