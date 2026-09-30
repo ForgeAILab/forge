@@ -1034,7 +1034,8 @@ and readiness treats a receipt-backed `task_validation` result as release
 authority exactly as it treats a user attestation.
 
 Task sessions capture evidence with the typed `task.evidence` operation. A
-`capture` payload names a `kind`, a `caption`, and exactly one of `path` (a
+`capture` payload names a `kind` (`screenshot`, `walkthrough_video`, `log`,
+`report`, or `other`), a `caption`, and exactly one of `path` (a
 workspace-relative file the run produced) or `content` (verbatim captured
 output). Forge stores the bytes in the media store, derives the SHA-256
 checksum a milestone evidence attachment compares against, and returns the
@@ -1042,6 +1043,9 @@ checksum a milestone evidence attachment compares against, and returns the
 captures what that Task's own run did. Captured Task media is promoted to a
 project-scoped `media_asset`, so a single run's artifact can back every
 acceptance check it demonstrates.
+Agent capture accepts other non-empty kind strings as `other`, preserving the
+original kind as a `[kind]` caption prefix (and in the stored filename for
+native Task capture). Public evidence types retain the closed kind enum.
 
 Task sessions record progress with the typed `task.worklog` operation. An
 `append` payload carries a `kind` (`progress`, `decision`, `validation`, or
@@ -1084,8 +1088,13 @@ place it may write. The harness appends one JSON object per line to
 `worklog.jsonl` (`{"kind","summary"}`, as `task.worklog`) and `evidence.jsonl`
 (`{"kind","caption"}` plus exactly one of `path` or `content`, as
 `task.evidence`; `path` is worktree-relative or an absolute path inside the
-outbox). Before an implementation execution starts, Forge copies the canonical
-Task plan into its private plan path. `$FORGE_PLAN_PATH` is the supported
+outbox). Ingestion also accepts concatenated or pretty-printed JSON objects;
+genuinely malformed content is reported and parsing resumes at the next line.
+Unknown evidence kinds become `other` with the original kind prefixed to the
+stored caption. Replayed worklog and evidence receipts are successful without
+adding another comment or artifact, including concurrent ingestion. Before an
+implementation execution starts, Forge copies the canonical Task plan into its
+private plan path. `$FORGE_PLAN_PATH` is the supported
 plan-write contract for CLI agents. Managed Codex cannot write the surrounding
 Task directory; a CLI adapter without an OS sandbox may still have ambient
 filesystem ability to edit sibling files, so universal confinement is not
@@ -1134,7 +1143,9 @@ exactly one of `path` (a file under its Project workspace) or `content`
 result it backs; Forge stores the bytes as a Project `media_asset` and
 performs the same attach in one call. Readiness treats validation-sourced
 evidence with no Task provenance as fresh exactly while the cited validation
-result is current.
+result is current. Agent `capture` also normalizes unknown kinds to `other`
+and preserves the original kind in the attached caption; `attach` uses the
+closed evidence kind enum.
 
 ## Agent Chats
 
