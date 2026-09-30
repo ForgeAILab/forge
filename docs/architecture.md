@@ -2256,8 +2256,12 @@ capability without creating another reviewer execution.
    `B.after_enter` hooks. Gate states with `max_rejections` get
    `check_retry_budget` prepended unless already present.
 5. Backfill `transition_log.hook_results_json`.
-6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
-   transition with `triggered_by = "system"`; cascade depth is limited to 3.
+6. If an entry/exit hook returns `HookResult::Cascade`, recursively transition
+   with `triggered_by = "system"`. Non-terminal cascades stop at depth eight
+   and publish `transition.cascade_depth_exceeded`; terminal targets always
+   complete because terminal states are absorbing. Eight allows the normal
+   `review → merging → merge_failed → review → merging → done` review-authority
+   carry chain plus another target-moved rebase round.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
 barrier until those hooks and the target state's inline `on_enter` dispatch
@@ -2267,6 +2271,20 @@ latest worker thread) records its execution. Task responses derive
 `awaiting_human` from the same Task snapshot as the returned optimistic
 `version`; a running barrier therefore cannot expose a gate decision using a
 version that the barrier-clear write is about to invalidate.
+
+The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
+runs `run_merge` when its last entry is at least two minutes old, it has no
+blocking annotation or running entry barrier, and no execution, merge hook, or
+completion cascade is running for the Task. Human approval gates and published
+pull requests awaiting a human/provider merge remain parked.
+Recovery uses the same versioned, same-state engine entry path as paused
+integration retries, so entry hooks and their normal success/failure cascades
+run again; a version conflict skips the tick. The merge hook is tracked through
+its target-moved rebase handling, so a slow in-flight merge is never raced.
+Integration recognizes a candidate already ancestral to the target as successful
+before comparing its reviewed base with the target tip, retaining the normal
+review-authority and candidate checks. This completes a merge whose terminal
+cascade was interrupted even if sibling merges subsequently moved the target.
 
 Terminal execution settlement is serialized per Task. If two executions for
 the same Task finish while one completion is cascading the workflow, the later

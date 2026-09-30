@@ -26,6 +26,11 @@ impl HookAction for RunMerge {
                 reason: "merge service not configured".to_string(),
             };
         };
+        let Some(_merge_slot) = merge_service.claim_merge_hook(&ctx.task_id) else {
+            return HookResult::Skipped {
+                reason: "merge hook already running".to_string(),
+            };
+        };
         if workspace_id(ctx).await.is_none() {
             return HookResult::Skipped {
                 reason: "no worktree".to_string(),

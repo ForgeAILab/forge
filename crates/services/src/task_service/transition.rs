@@ -327,36 +327,13 @@ impl TaskService {
             .iter()
             .any(|hook| hook.action == "run_merge")
         {
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-            };
-            engine
-                .manual_override_transition_with_authority(
-                    &task.id,
-                    &task.status,
-                    task.version,
-                    &workflow,
-                    actor,
-                    "resuming integration after project pause",
-                    false,
-                    Some(crate::workflow::engine::WorkflowAuthority {
-                        project_version: project.version,
-                        workflow_definition: project.workflow_definition.clone(),
-                        clear_review_passed_at_on_commit: false,
-                    }),
-                )
-                .await
-                .map(|_| ())
+            self.retry_merge_state_entry(
+                task,
+                &project,
+                &workflow,
+                "resuming integration after project pause",
+            )
+            .await
         } else if let Some(target) = workflow.auto_transition_target(&task.status) {
             self.transition(
                 task.id.clone(),
@@ -406,6 +383,54 @@ impl TaskService {
         // retry is harmlessly idempotent.
         crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred).await?;
         Ok(true)
+    }
+
+    /// Re-enter an integration gate through the engine's ordinary entry hooks
+    /// and cascades. The same-state transition claims the observed Task version
+    /// before any merge side effect and records a fresh entry for the grace.
+    pub(crate) async fn retry_merge_state_entry(
+        &self,
+        task: &Task,
+        project: &db::Project,
+        workflow: &api_types::WorkflowDefinition,
+        reason: &str,
+    ) -> Result<()> {
+        let engine = WorkflowEngine {
+            db: Arc::clone(&self.db),
+            event_bus: Arc::clone(&self.event_bus),
+            review_runner: self.review_runner.clone(),
+            merge_service: self.merge_service.clone(),
+            cleanup_scheduler: self.cleanup_scheduler.clone(),
+            task_service: self.clone(),
+            daemon_connections: self.daemon_connections.clone(),
+            workspace_exec_locks: self.workspace_exec_locks.clone(),
+            terminal_activity: self.terminal_activity.clone(),
+            workspace_root: self.workspace_root.clone(),
+            repo_cache_locks: self.repo_cache_locks.clone(),
+        };
+        engine
+            .manual_override_transition_with_authority(
+                &task.id,
+                &task.status,
+                task.version,
+                workflow,
+                Actor::system(SystemComponent::TaskDispatcher),
+                reason,
+                false,
+                Some(WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) fn merge_hook_available(&self, task_id: &str) -> bool {
+        self.merge_service
+            .as_ref()
+            .is_some_and(|service| !service.merge_hook_running(task_id))
     }
 
     async fn retain_paused_integration_marker(&self, task_id: &str) -> Result<()> {

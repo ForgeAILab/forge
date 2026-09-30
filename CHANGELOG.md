@@ -28,6 +28,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Tasks no longer wedge in `merging` after review authority carries across a
+  target-moved rebase. Terminal workflow cascades always complete; the
+  non-terminal cascade limit is now eight to allow another mechanical refresh
+  round. The dispatcher also re-drives unblocked merge gates after two minutes
+  without a running execution or merge hook, using the normal versioned entry
+  path. A candidate already merged into the target completes idempotently,
+  including when sibling Tasks have advanced the target since it landed.
+
 - A resumed or follow-up execution whose session began before the upgrade to
   0.13.10 no longer wedges its Task. Its copied executor snapshot lacked
   `backend_kind`/`plan_delivery`, so Forge discarded the finished run's result

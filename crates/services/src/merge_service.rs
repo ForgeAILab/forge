@@ -7,8 +7,9 @@ use events::EventBus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tokio::process::Command;
 
@@ -17,6 +18,23 @@ pub struct MergeService {
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
     integration_locks: workspace::RepoCacheLockManager,
+    merge_hooks: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Tracks the entire merge hook, including target-moved rebase handling, so
+/// dispatcher recovery never races a hook that outlives its entry grace.
+pub(crate) struct MergeHookSlot {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    task_id: String,
+}
+
+impl Drop for MergeHookSlot {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .expect("merge hook set lock")
+            .remove(&self.task_id);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +115,26 @@ impl MergeService {
             event_bus,
             workspace_root,
             integration_locks: workspace::RepoCacheLockManager::new(),
+            merge_hooks: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub(crate) fn merge_hook_running(&self, task_id: &str) -> bool {
+        self.merge_hooks
+            .lock()
+            .expect("merge hook set lock")
+            .contains(task_id)
+    }
+
+    pub(crate) fn claim_merge_hook(&self, task_id: &str) -> Option<MergeHookSlot> {
+        self.merge_hooks
+            .lock()
+            .expect("merge hook set lock")
+            .insert(task_id.to_owned())
+            .then(|| MergeHookSlot {
+                in_flight: Arc::clone(&self.merge_hooks),
+                task_id: task_id.to_owned(),
+            })
     }
 
     /// Handed-off conflict files whose current `HEAD` still adds Git conflict
@@ -289,7 +326,7 @@ impl MergeService {
                 last_activity_at: None,
                 summary: None,
                 logs_path: None,
-                before_sha: Some(Some(worktree_sha)),
+                before_sha: Some(Some(worktree_sha.clone())),
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: None,
@@ -311,17 +348,27 @@ impl MergeService {
             .candidate
             .as_ref()
             .map(|candidate| candidate.commit_sha.clone());
+        let target_sha = ::review::contract::git_read(
+            repo_path,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{target_branch}"),
+            ],
+        )
+        .await
+        .map_err(ServiceError::invalid_operation)?;
+        let target_sha = target_sha.trim().to_owned();
+        // A merge can land before its terminal workflow cascade is persisted.
+        // Recognize that result before treating the now-newer target as another
+        // review refresh; this also handles siblings landing after this Task.
+        let already_merged = ::review::contract::git_read(
+            repo_path,
+            &["merge-base", "--is-ancestor", &worktree_sha, &target_sha],
+        )
+        .await
+        .is_ok();
         if let Some(candidate) = &review_guard.candidate {
-            let target_sha = ::review::contract::git_read(
-                repo_path,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/heads/{target_branch}"),
-                ],
-            )
-            .await
-            .map_err(ServiceError::invalid_operation)?;
             let current_sha = git::get_current_sha(worktree_path).await?;
             // Two different situations used to share one outcome. The Task
             // branch moving out from under its own review is a genuine
@@ -332,20 +379,25 @@ impl MergeService {
                     reason: "reviewed commit changed since review; fresh review required".into(),
                 });
             }
-            if candidate.base_sha != target_sha.trim() {
+            if !already_merged && candidate.base_sha != target_sha {
                 return Ok(MergeOutcome::TargetMoved {
                     reason: format!(
                         "{target_branch} advanced to {} since this Task was reviewed against {}",
-                        short_sha(target_sha.trim()),
+                        short_sha(&target_sha),
                         short_sha(&candidate.base_sha)
                     ),
                     target_branch: target_branch.clone(),
                 });
             }
         }
-        git::checkout_branch(repo_path, &target_branch).await?;
         let task_branch = workspace::task_branch_name(&task_id);
-        let merged = if let Some(sha) = reviewed_sha {
+        if !already_merged {
+            git::checkout_branch(repo_path, &target_branch).await?;
+        }
+        let merged = if already_merged {
+            review_guard.release().await?;
+            Ok(())
+        } else if let Some(sha) = reviewed_sha {
             // Integrate the immutable reviewed object. Fast-forward refuses to
             // synthesize an unreviewed merge tree if target ancestry changed.
             let result =
@@ -368,7 +420,11 @@ impl MergeService {
         };
         match merged {
             Ok(()) => {
-                let after_sha = git::get_current_sha(repo_path).await?;
+                let after_sha = if already_merged {
+                    target_sha
+                } else {
+                    git::get_current_sha(repo_path).await?
+                };
                 ExecutionRepo::update(
                     &*self.db,
                     db::UpdateExecution {
@@ -1095,7 +1151,7 @@ mod tests {
 
     #[tokio::test]
     async fn conformance_merge_refuses_changed_candidate_target_policy_and_legacy_pass() {
-        for changed in ["none", "candidate", "target", "policy", "legacy"] {
+        for changed in ["none", "candidate", "target", "policy", "legacy", "landed"] {
             let db = sqlite_db().await;
             let temp = TempDir::new().unwrap();
             let repo = setup_repo(&temp).await;
@@ -1179,6 +1235,11 @@ mod tests {
                     std::fs::write(repo.join("target.txt"), "new target\n").unwrap();
                     git::commit_all(&repo, "target moved").await.unwrap();
                 }
+                "landed" => {
+                    run_git(&repo, &["merge", "--ff-only", &accepted_sha]).await;
+                    std::fs::write(repo.join("sibling.txt"), "later merge\n").unwrap();
+                    git::commit_all(&repo, "sibling landed").await.unwrap();
+                }
                 "policy" => {
                     sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
                         .bind(r#"{"review":{"ci_steps":["false"]}}"#)
@@ -1204,6 +1265,10 @@ mod tests {
                 let outcome = service.merge(task_id).await.unwrap();
                 assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
                 assert_eq!(git::get_current_sha(&repo).await.unwrap(), accepted_sha);
+            } else if changed == "landed" {
+                let outcome = service.merge(task_id).await.unwrap();
+                assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
+                assert_eq!(git::get_current_sha(&repo).await.unwrap(), before);
             } else if changed == "target" {
                 let outcome = service.merge(task_id).await.unwrap();
                 // A moved integration target is contention, not a fault, and
