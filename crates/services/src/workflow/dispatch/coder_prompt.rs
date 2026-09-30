@@ -262,9 +262,7 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
     } else if let Some(reason) = conflict_handoff_reason(ctx) {
         user.push_str("Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nConflict:\n");
         user.push_str(&reason);
-        if ctx.task.review_passed_at.is_some() {
-            user.push_str("\n\nThe task previously passed review; the reconciled commit will receive a fresh review before Forge retries integration.");
-        }
+        user.push_str("\n\nForge will run the project's checks on the reconciled commit and integrate it, so keep your change limited to reconciling the files listed above, and run the relevant checks yourself before you commit.");
     } else {
         if ctx.task.review_passed_at.is_some() {
             user.push_str("The task previously passed review, but integration found a real merge conflict. That conflict requires manual workspace repair and a fresh review before Forge retries integration.\n\n");

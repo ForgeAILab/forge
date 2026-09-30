@@ -1876,6 +1876,11 @@ pub trait ReviewRepo: Send + Sync {
         expected_candidate_execution_id: &str,
         task_projection: Option<Option<String>>,
     ) -> Result<Review>;
+    /// Settle the Running Review of a mechanical integration step as Passed
+    /// under the previous review's authority, set `Task.review_passed_at`, and
+    /// record the carried candidate, all in one writer transaction bound to the
+    /// same Task/Project/workflow/candidate snapshot as any other settlement.
+    async fn settle_carried_review(&self, input: SettleCarriedReview) -> Result<Review>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Review>>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<Review>>;
     async fn list_latest_reviews_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Review>>;
@@ -3306,6 +3311,20 @@ pub struct CreateReview {
     pub started_at: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettleCarriedReview {
+    pub review_id: String,
+    pub expected_review_updated_at: String,
+    pub step_results_json: String,
+    pub candidate_execution_id: String,
+    pub expected_task_version: i64,
+    pub expected_task_status: String,
+    pub expected_project_version: i64,
+    pub expected_workflow_definition: String,
+    pub carry: crate::NewReviewAuthorityCarry,
+    pub occurred_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -685,7 +685,7 @@ pub async fn admit(
     Ok(contract)
 }
 
-async fn candidate_changed_paths(
+pub async fn candidate_changed_paths(
     path: &Path,
     base_sha: &str,
     commit_sha: &str,

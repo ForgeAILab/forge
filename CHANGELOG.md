@@ -6,6 +6,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Changed
+
+- A passed review's authority now carries across Forge's own mechanical
+  integration steps instead of forcing a full reviewer run each time a sibling
+  Task lands first. When a Task re-enters `review` only because Forge rebased
+  it cleanly onto a moved target (`[review-refresh] [target-moved-rebase]`), or
+  because its Worker reconciled a Forge-committed rebase conflict
+  (`[conflict-handoff]`), the new `carry_review_authority` `review` `on_enter`
+  hook (ahead of `dispatch_role_agent`) skips the reviewer and moves the Task
+  straight back to `merging` when all of these hold: the review immediately
+  before this entry passed and is still current (conformance passed, current
+  policy, governing-context digest and frozen assessment unchanged); the
+  project has `ci_steps` and every one passed for this entry; every path the
+  Task changes relative to the target is inside the approved contract's
+  `candidate_changed_paths`; the HEAD is a marker-free descendant of the
+  current target tip; and fewer than five integrations have already been
+  carried under that review. Anything else, and every other way of entering
+  `review`, dispatches the reviewer exactly as before. Each carry is recorded
+  in the new `review_authority_carry` table, and integration merges the
+  carried commit against the carried target tip rather than the commit and
+  base frozen in the contract. Migration `V148` adds the table and inserts the
+  hook into every stored Project workflow's `review` state; because the stored
+  workflow is part of a review's governing context, Tasks that passed review
+  but had not merged when it runs get one fresh review. The merge-fix prompt
+  for a conflict handoff no longer says the repair "will receive a fresh
+  review".
+
 ## [0.13.10] - 2026-09-29
 
 ### Changed

@@ -138,3 +138,100 @@ async fn lifecycle_database_fixture_covers_current_legacy_state_graph() {
         assert_eq!(actual, expected, "legacy transitions from {state} changed");
     }
 }
+
+/// V148 puts `carry_review_authority` at the front of every stored `review`
+/// `on_enter` list. Replaying its UPDATE over the checked-in strict workflow
+/// with the hook stripped must reproduce the current default exactly, and a
+/// second run must change nothing.
+#[tokio::test]
+async fn v148_inserts_the_carry_hook_before_reviewer_dispatch_idempotently() {
+    const V148: &str = include_str!("../../db/migrations/V148__review_authority_carry.sql");
+    let update_sql = &V148[V148
+        .find("UPDATE project")
+        .expect("V148 carries the workflow UPDATE")..];
+
+    let current: serde_json::Value =
+        serde_json::from_str(DEFAULT_WORKFLOW_FIXTURE).expect("fixture parses");
+    let mut legacy = current.clone();
+    let review_index = legacy["states"]
+        .as_array()
+        .expect("states array")
+        .iter()
+        .position(|state| state["name"] == "review")
+        .expect("review state");
+    let on_enter = legacy["states"][review_index]["hooks"]["on_enter"]
+        .as_array_mut()
+        .expect("review on_enter");
+    on_enter.retain(|hook| hook["action"] != "carry_review_authority");
+    assert_eq!(
+        on_enter.len(),
+        1,
+        "legacy review only dispatches the reviewer"
+    );
+    let actions = |value: &serde_json::Value| -> Vec<String> {
+        value["states"][review_index]["hooks"]["on_enter"]
+            .as_array()
+            .expect("on_enter")
+            .iter()
+            .map(|hook| hook["action"].as_str().expect("action").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        actions(&current),
+        ["carry_review_authority", "dispatch_role_agent"]
+    );
+
+    // A human-approval preset has no `on_enter` on review and is left alone.
+    let mut approval_only = legacy.clone();
+    approval_only["states"][review_index]["hooks"]
+        .as_object_mut()
+        .expect("hooks object")
+        .remove("on_enter");
+
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("sqlite pool creates");
+    run_migrations(&pool).await.expect("migrations run");
+    let now = db::now_rfc3339();
+    let mut ids = Vec::new();
+    for (name, workflow) in [("legacy", &legacy), ("approval", &approval_only)] {
+        let id = db::new_uuid_v4();
+        db::ProjectRepo::create(
+            &SqliteDb::new(pool.clone()),
+            db::CreateProject {
+                id: id.clone(),
+                name: name.to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: workflow.to_string(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        ids.push(id);
+    }
+    let read = |id: String| {
+        let pool = pool.clone();
+        async move {
+            let raw: String =
+                sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("workflow reads");
+            serde_json::from_str::<serde_json::Value>(&raw).expect("workflow parses")
+        }
+    };
+
+    for _ in 0..2 {
+        sqlx::raw_sql(update_sql)
+            .execute(&pool)
+            .await
+            .expect("V148 workflow update runs");
+        assert_eq!(read(ids[0].clone()).await, current);
+        assert_eq!(read(ids[1].clone()).await, approval_only);
+    }
+}

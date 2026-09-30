@@ -66,6 +66,21 @@ pub enum MergeOutcome {
     },
 }
 
+/// Git facts a review-authority carry needs about the Task's current HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewCarryFacts {
+    Ready {
+        /// Worktree HEAD, a descendant of `base_sha`.
+        commit_sha: String,
+        /// Tip of the integration target the HEAD is built on.
+        base_sha: String,
+        /// Every path HEAD changes relative to `base_sha`, sorted.
+        changed_paths: Vec<String>,
+    },
+    /// The candidate cannot be integrated without a fresh review.
+    Unavailable { reason: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -120,6 +135,87 @@ impl MergeService {
             &target_branch,
         )
         .await
+    }
+
+    /// Read-only Git facts for carrying a passed review across a mechanical
+    /// rebase or conflict repair. Anything that is not a clean, marker-free
+    /// descendant of the current target tip is `Unavailable`, so the caller
+    /// falls back to a full review.
+    pub async fn review_carry_facts(&self, task_id: &str) -> Result<ReviewCarryFacts> {
+        let unavailable = |reason: &str| ReviewCarryFacts::Unavailable {
+            reason: reason.to_owned(),
+        };
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::NotFound {
+                entity: "task",
+                id: task_id.to_owned(),
+            })?;
+        if task.parent_task_id.is_some() {
+            return Ok(unavailable("subtasks do not integrate"));
+        }
+        let Some(execution) =
+            crate::task_service::latest_executor_execution_for_task(&self.db, &task).await?
+        else {
+            return Ok(unavailable("no executor execution"));
+        };
+        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
+        let Some(repo) = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
+        else {
+            return Ok(unavailable("repository not found"));
+        };
+        if repo.work_mode == WorkMode::PullRequest {
+            return Ok(unavailable("pull request delivery is not carried"));
+        }
+        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
+        let worktree_path = Path::new(&workspace.worktree_path);
+        if !git::is_worktree_clean(worktree_path).await? {
+            return Ok(unavailable("worktree has uncommitted changes"));
+        }
+        let commit_sha = git::get_current_sha(worktree_path).await?;
+        let Ok(base_sha) = ::review::contract::git_read(
+            worktree_path,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{target_branch}"),
+            ],
+        )
+        .await
+        else {
+            return Ok(unavailable("integration target is unreadable"));
+        };
+        let base_sha = base_sha.trim().to_owned();
+        // The recorded base must be an ancestor of HEAD, or the later
+        // fast-forward would integrate something other than what was checked.
+        if ::review::contract::git_read(
+            worktree_path,
+            &["merge-base", "--is-ancestor", &base_sha, &commit_sha],
+        )
+        .await
+        .is_err()
+        {
+            return Ok(unavailable("the candidate is not based on the target tip"));
+        }
+        if !unresolved_handed_off_markers(&self.db, task_id, worktree_path, &target_branch)
+            .await?
+            .is_empty()
+        {
+            return Ok(unavailable("conflict markers remain in handed-off files"));
+        }
+        let Ok(changed_paths) =
+            ::review::contract::candidate_changed_paths(worktree_path, &base_sha, &commit_sha)
+                .await
+        else {
+            return Ok(unavailable("changed paths are unreadable"));
+        };
+        Ok(ReviewCarryFacts::Ready {
+            commit_sha,
+            base_sha,
+            changed_paths,
+        })
     }
 
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
@@ -209,11 +305,13 @@ impl MergeService {
             }
             Err(error) => return Err(error.into()),
         };
+        // The candidate is the reviewed commit and base, or the mechanically
+        // rebased/repaired successor a carry recorded under the same review.
         let reviewed_sha = review_guard
-            .contract
+            .candidate
             .as_ref()
-            .map(|contract| contract.commit_sha.clone());
-        if let Some(contract) = &review_guard.contract {
+            .map(|candidate| candidate.commit_sha.clone());
+        if let Some(candidate) = &review_guard.candidate {
             let target_sha = ::review::contract::git_read(
                 repo_path,
                 &[
@@ -229,17 +327,17 @@ impl MergeService {
             // branch moving out from under its own review is a genuine
             // problem; the integration target moving is ordinary contention
             // that the caller can resolve mechanically by rebasing.
-            if contract.commit_sha != current_sha {
+            if candidate.commit_sha != current_sha {
                 return Ok(MergeOutcome::ReviewRequired {
                     reason: "reviewed commit changed since review; fresh review required".into(),
                 });
             }
-            if contract.base_sha != target_sha.trim() {
+            if candidate.base_sha != target_sha.trim() {
                 return Ok(MergeOutcome::TargetMoved {
                     reason: format!(
                         "{target_branch} advanced to {} since this Task was reviewed against {}",
                         short_sha(target_sha.trim()),
-                        short_sha(&contract.base_sha)
+                        short_sha(&candidate.base_sha)
                     ),
                     target_branch: target_branch.clone(),
                 });
@@ -358,14 +456,14 @@ impl MergeService {
             }
             Err(error) => return Err(error.into()),
         };
-        let candidate = if let Some(contract) = &guard.contract {
+        let candidate = if let Some(candidate) = &guard.candidate {
             let head = git::get_current_sha(worktree_path).await?;
-            if head != contract.commit_sha {
+            if head != candidate.commit_sha {
                 return Ok(MergeOutcome::ReviewRequired {
                     reason: "PR candidate changed since review".into(),
                 });
             }
-            Some(contract.commit_sha.clone())
+            Some(candidate.commit_sha.clone())
         } else {
             None
         };

@@ -126,7 +126,7 @@ pub fn default_workflow() -> WorkflowDefinition {
                     blocking_hook("run_before_work_hooks"),
                     blocking_hook("run_ci_steps"),
                 ],
-                on_enter: vec![hook("dispatch_role_agent")],
+                on_enter: vec![hook("carry_review_authority"), hook("dispatch_role_agent")],
                 after_enter: vec![
                     hook("auto_cascade_on_review_pass"),
                     hook("auto_cascade_on_unconfigured_review"),

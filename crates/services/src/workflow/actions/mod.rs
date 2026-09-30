@@ -1,3 +1,4 @@
+pub(crate) mod carry;
 mod common;
 mod dispatch;
 mod gates;
@@ -6,6 +7,7 @@ mod merge;
 mod review;
 mod subtasks;
 
+pub use carry::CarryReviewAuthority;
 pub(crate) use common::review_ci_steps;
 pub use dispatch::{DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder};
 pub use gates::{

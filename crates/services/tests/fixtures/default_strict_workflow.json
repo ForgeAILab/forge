@@ -241,6 +241,12 @@
         ],
         "on_enter": [
           {
+            "action": "carry_review_authority",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
             "action": "dispatch_role_agent",
             "params": {},
             "applies_to": "all",

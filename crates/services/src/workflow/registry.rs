@@ -3,12 +3,12 @@ use crate::{
         actions::{
             AutoCascadeOnCompletion, AutoCascadeOnMergeResult, AutoCascadeOnReviewPass,
             AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
-            CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
-            DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
-            PropagateDoneToSubtasks, RequireCleanWorktree, RequireConflictMarkersResolved,
-            RequirePlanChecklistComplete, RequireUpstreamRolesCompleted, RunBeforeWorkHooks,
-            RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
-            SubtaskSequenceComplete,
+            CarryReviewAuthority, CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow,
+            DependencyGate, DispatchExecutor, DispatchFixAgent, DispatchRoleAgent,
+            NotifyRoleHolder, PropagateDoneToSubtasks, RequireCleanWorktree,
+            RequireConflictMarkersResolved, RequirePlanChecklistComplete,
+            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
+            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -24,6 +24,7 @@ pub fn is_known_action(name: &str) -> bool {
             | "cleanup_workspace_now"
             | "schedule_workspace_cleanup"
             | "dispatch_role_agent"
+            | "carry_review_authority"
             | "satisfy_dependents"
             | "auto_cascade_on_review_pass"
             | "auto_cascade_on_unconfigured_review"
@@ -65,6 +66,7 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "cleanup_workspace_now" => Box::new(CleanupWorkspaceNow),
         "schedule_workspace_cleanup" => Box::new(ScheduleWorkspaceCleanup),
         "dispatch_role_agent" => Box::new(DispatchRoleAgent),
+        "carry_review_authority" => Box::new(CarryReviewAuthority),
         "satisfy_dependents" => Box::new(SatisfyDependents),
         "auto_cascade_on_review_pass" => Box::new(AutoCascadeOnReviewPass),
         "auto_cascade_on_unconfigured_review" => Box::new(AutoCascadeOnUnconfiguredReview),
