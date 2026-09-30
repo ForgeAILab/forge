@@ -395,6 +395,7 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
                 | "target_repo_dirty"
                 | "executor_failed"
                 | "review_budget_exhausted"
+                | "review_needs_owner"
                 | "merge_fix_budget_exhausted"
                 | "merge_fix_ci_failed"
         )

@@ -1754,6 +1754,13 @@ pub trait ReviewRepo: Send + Sync {
         &self,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)>;
+    /// Transactional variant used to commit a linked follow-up Task together
+    /// with the manual pass. The caller owns commit and post-commit events.
+    async fn create_manual_pass_with_task_authority_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)>;
     /// Atomically reserve the next Review attempt with its Running execution
     /// and initial lease. The attempt number is allocated under the same
     /// writer transaction as both inserts, so a failed Review insert cannot
@@ -2147,6 +2154,24 @@ pub trait ProjectRepo: Send + Sync {
         repository_linked: bool,
         paused_at: &str,
         reason: &str,
+    ) -> Result<bool>;
+    /// Pause only an unchanged, unpaused Project. User and other system
+    /// pauses always win; a stale snapshot is a benign no-op.
+    async fn set_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool>;
+    /// Refresh the check detail only while the observed environment pause
+    /// remains current. Does not change the pause's original timestamp.
+    async fn update_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_paused_at: &str,
+        detail_json: &str,
     ) -> Result<bool>;
     /// Clear a dispatcher-owned Project pause only when the exact pause
     /// snapshot that the dispatcher observed is still current.  This is the

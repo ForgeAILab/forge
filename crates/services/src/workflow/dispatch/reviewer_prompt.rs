@@ -126,7 +126,7 @@ impl PromptBuilder for ReviewerPromptBuilder {
 
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. Decide whether the change works by exercising it: build it, run its tests, and drive the changed behavior programmatically or visually the way a user or caller would. Reading code tells you what to run and explains a failure you observed; it does not prove correctness on its own. If you fail the review, your feedback goes to the coder agent to fix in a follow-up attempt.\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
+                "You are the reviewer agent for this Forge workflow task. Decide whether the change works by exercising it: build it, run its tests, and drive the changed behavior programmatically or visually the way a user or caller would. Reading code tells you what to run and explains a failure you observed; it does not prove correctness on its own. Coder-fixable failures go to the coder; owner-only or repeated findings may park for the owner.\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
                 read_only_report_contract(ctx.delivery)
             ),
             user,

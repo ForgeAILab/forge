@@ -3967,6 +3967,8 @@ async fn seed_passed_carry_review(
         status: api_types::ConformanceStatus::Passed,
         contract: Some(contract),
         assessment: Some(api_types::ReviewAssessment {
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             result: api_types::ReviewResult::Pass,
             reason: "looks right".to_owned(),
             report: String::new(),

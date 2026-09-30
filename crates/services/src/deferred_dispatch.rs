@@ -335,10 +335,9 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
 
 /// The disposition still in force for this Task, if any.
 ///
-/// A recorded disposition means the dispatcher has stopped attempting this
-/// capability and will not reconsider until the Task changes or something
-/// wakes it — which is exactly the state a user needs to see, rather than the
-/// Task reading as ordinary queueing.
+/// Role dispositions wait for a Task change or explicit wake. The
+/// `project_capacity` capability instead explains temporary queueing and is
+/// rechecked each tick, since another Task can free a slot without a wake.
 pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
     dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
 }

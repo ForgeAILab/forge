@@ -431,7 +431,8 @@ impl TaskDispatcher {
         execution: &db::Execution,
         project_version: i64,
     ) -> Result<ReviewerReconciliation> {
-        if !crate::task_service::execution::should_block_task_for_failed_execution(execution)
+        if crate::project_environment::is_environment_pre_dispatch_failure(execution)
+            || !crate::task_service::execution::should_block_task_for_failed_execution(execution)
             || role_name == crate::workflow::default_roles::REVIEWER
             || helpers::has_blocking_annotation(task)
             || deferred_dispatch::is_pending(task, chrono::Utc::now())

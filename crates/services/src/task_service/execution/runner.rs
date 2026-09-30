@@ -575,9 +575,9 @@ impl TaskService {
         };
 
         // The workspace lock is held, so asset copies cannot race another
-        // execution in this worktree. A failed check parks the Task before
+        // execution in this worktree. A failed check pauses the Project before
         // any provider call.
-        if let Some(parked) = self
+        if let Some(failed) = self
             .prepare_execution_environment(
                 &task,
                 &execution_before_launch,
@@ -586,7 +586,7 @@ impl TaskService {
             )
             .await?
         {
-            return Ok(parked);
+            return Ok(failed);
         }
 
         // Freeze one pricing selection for every candidate before handing

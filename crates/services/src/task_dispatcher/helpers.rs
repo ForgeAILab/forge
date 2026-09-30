@@ -86,6 +86,7 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
             | "max_turns_exceeded"
             | "before_work_hook_failed"
             | "before_work_hook_timeout"
+            | "review_needs_owner"
             | crate::workflow::engine::DISPATCH_FAILED_ANNOTATION
     )
 }
@@ -262,6 +263,7 @@ fn review_ci_steps_finished(step_results_json: &str) -> bool {
 ///   the guard meant for failed/cancelled attempts.
 /// - `Failed`/`Cancelled` with `resume_policy: Some(ResumePolicy::Auto)` —
 ///   the executor already opted this attempt into automatic retry.
+/// - Environment pre-dispatch failures — the Project pause owns recovery.
 pub(super) async fn latest_stopped_execution_blocks_dispatch(
     db: &db::SqliteDb,
     task_id: &str,
@@ -311,6 +313,9 @@ async fn latest_execution_needs_explicit_decision(
     let Some(execution) = page.items.into_iter().next() else {
         return Ok(false);
     };
+    if crate::project_environment::is_environment_pre_dispatch_failure(&execution) {
+        return Ok(false);
+    }
     let terminal = matches!(
         execution.status,
         ExecutionStatus::Failed | ExecutionStatus::Cancelled

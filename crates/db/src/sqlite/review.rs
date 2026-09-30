@@ -596,9 +596,21 @@ impl ReviewRepo for SqliteDb {
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let result =
+            ReviewRepo::create_manual_pass_with_task_authority_in_tx(self, &mut transaction, input)
+                .await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
+
+    async fn create_manual_pass_with_task_authority_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)> {
         let source = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(&input.source_review_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .map(map_review)
             .transpose()?
@@ -619,7 +631,7 @@ impl ReviewRepo for SqliteDb {
              LIMIT 1",
         )
         .bind(&input.task_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if latest_review_id.as_deref() != Some(source.id.as_str()) {
             return Err(DbError::VersionConflict);
@@ -627,7 +639,7 @@ impl ReviewRepo for SqliteDb {
 
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
@@ -639,7 +651,7 @@ impl ReviewRepo for SqliteDb {
         }
         let project = sqlx::query("SELECT version, workflow_definition FROM project WHERE id = ?")
             .bind(&task.project_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?;
         let project_version: i64 = project.try_get("version")?;
@@ -649,12 +661,8 @@ impl ReviewRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        validate_review_candidate_in_tx(
-            &mut transaction,
-            &input.task_id,
-            &input.candidate_execution_id,
-        )
-        .await?;
+        validate_review_candidate_in_tx(transaction, &input.task_id, &input.candidate_execution_id)
+            .await?;
 
         let details: serde_json::Value =
             serde_json::from_str(&input.step_results_json).map_err(|error| {
@@ -663,7 +671,7 @@ impl ReviewRepo for SqliteDb {
                     reason: error.to_string(),
                 }
             })?;
-        validate_review_details(&mut transaction, &source, &ReviewStatus::Passed, &details).await?;
+        validate_review_details(transaction, &source, &ReviewStatus::Passed, &details).await?;
         let attempt_number = source.attempt_number + 1;
         sqlx::query(
             "INSERT INTO review (
@@ -680,7 +688,7 @@ impl ReviewRepo for SqliteDb {
         .bind(&input.occurred_at)
         .bind(&input.occurred_at)
         .bind(&input.occurred_at)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
 
         let task_update = sqlx::query(
@@ -693,7 +701,7 @@ impl ReviewRepo for SqliteDb {
         .bind(&input.task_id)
         .bind(input.expected_task_version)
         .bind(&input.expected_task_status)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if task_update.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -730,19 +738,18 @@ impl ReviewRepo for SqliteDb {
             .to_string(),
             created_at: input.occurred_at.clone(),
         };
-        DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        DomainEventRepo::append_event_in_tx(self, transaction, &event).await?;
 
         let review_row = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(&input.id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
         let review = map_review(review_row)?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
         let task = map_task(task_row)?;
-        transaction.commit().await?;
         Ok((review, task))
     }
 

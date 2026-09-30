@@ -196,6 +196,10 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::projects::pause_project),
         )
         .route(
+            "/api/v1/projects/{id}/environment/recheck",
+            post(routes::projects::recheck_project_environment),
+        )
+        .route(
             "/api/v1/projects/{id}/resume",
             post(routes::projects::resume_project),
         )

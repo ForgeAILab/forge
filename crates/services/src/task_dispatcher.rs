@@ -18,9 +18,11 @@ use tracing::Instrument;
 use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
 
 mod active_recovery;
+mod environment_pause_sync;
 mod helpers;
 mod initial_scheduling;
 mod repo_pause_sync;
+pub mod slots;
 mod workspace_blocking;
 
 pub struct TaskDispatcher {
@@ -110,6 +112,11 @@ impl TaskDispatcher {
             // shows up. Either direction leaves this scan's in-memory
             // `project` stale, so skip acting on it this tick either way.
             let pause_changed = self.sync_repository_pause(&project).await?;
+            let pause_changed = if pause_changed {
+                true
+            } else {
+                self.sync_environment_pause(&project).await?
+            };
             dispatched += self.reconcile_plan_publication_claims(&project).await?;
             if pause_changed {
                 continue;

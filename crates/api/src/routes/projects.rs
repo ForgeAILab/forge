@@ -126,7 +126,7 @@ async fn create_direct_project(
         },
     });
 
-    let mut response = project_response(project)?;
+    let mut response = project_response(&state.db, project).await?;
     response.execution_setup = Some(
         services::load_project_execution_setup(&state.db, &response.id)
             .await
@@ -185,12 +185,12 @@ pub async fn list_projects(
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
+    let mut items = Vec::with_capacity(page.items.len());
+    for project in page.items {
+        items.push(project_response(&state.db, project).await?);
+    }
     let response = PaginatedResponse {
-        items: page
-            .items
-            .into_iter()
-            .map(project_response)
-            .collect::<ApiResult<Vec<_>>>()?,
+        items,
         next_cursor,
         has_more,
         total_count,
@@ -204,7 +204,7 @@ pub async fn get_project(
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
     let project = require_project_visible(&state, &id, &user.user_id).await?;
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn list_project_hook_runs(
@@ -850,7 +850,7 @@ pub async fn pause_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_some() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     let paused_at = now_rfc3339();
@@ -866,7 +866,19 @@ pub async fn pause_project(
         context: EventContext::ProjectPaused { paused_at },
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
+}
+
+/// Run every Project environment check now, without filtering by Task role.
+pub async fn recheck_project_environment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::ProjectEnvironmentRecheckResponse>> {
+    let (checks, project) = state.task_service.recheck_project_environment(&id).await?;
+    Ok(Json(api_types::ProjectEnvironmentRecheckResponse {
+        checks,
+        project: project_response(&state.db, project).await?,
+    }))
 }
 
 pub async fn resume_project(
@@ -877,7 +889,7 @@ pub async fn resume_project(
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
     if project.paused_at.is_none() {
-        return Ok(Json(project_response(project)?));
+        return Ok(Json(project_response(&state.db, project).await?));
     }
 
     ProjectRepo::set_paused_at(&*state.db, &id, None).await?;
@@ -892,7 +904,7 @@ pub async fn resume_project(
         context: EventContext::ProjectResumed {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub async fn update_project(
@@ -949,7 +961,7 @@ pub async fn update_project(
         context: EventContext::ProjectUpdated {},
     });
 
-    Ok(Json(project_response(project)?))
+    Ok(Json(project_response(&state.db, project).await?))
 }
 
 pub(crate) async fn require_project_visible(

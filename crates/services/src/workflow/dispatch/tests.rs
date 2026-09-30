@@ -193,6 +193,9 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             // turns narrating instead of verifying.
             assert!(!prompt.system.contains(FAILURE_TAXONOMY_LINE));
             assert!(!prompt.system.contains("Before acting, restate objective"));
+            assert!(prompt
+                .system
+                .contains("owner-only or repeated findings may park for the owner"));
             continue;
         }
         assert!(

@@ -63,6 +63,62 @@ pub struct DiffEnvelope {
     pub data: DiffResponse,
 }
 
+/// Persisted detail for a Project paused by a pre-launch environment failure.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentPause {
+    pub checks: Vec<String>,
+    pub role: Option<String>,
+    pub output: String,
+    pub paused_at: String,
+    pub last_checked_at: String,
+    pub next_check_at: String,
+}
+
+/// The re-check endpoint takes no options: every configured check runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectEnvironmentRecheckRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentCheckResult {
+    pub name: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectEnvironmentRecheckResponse {
+    pub checks: Vec<ProjectEnvironmentCheckResult>,
+    pub project: ProjectResponse,
+}
+
+/// Project admission capacity, derived from the effective Task workflows.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectSlots {
+    /// Maximum active Tasks; 0 means unlimited.
+    pub limit: u32,
+    pub active: u32,
+    pub parked: u32,
+    pub queued: u32,
+}
+
+impl Default for ProjectSlots {
+    fn default() -> Self {
+        Self {
+            limit: crate::ProjectSettings::default().max_active_tasks,
+            active: 0,
+            parked: 0,
+            queued: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProjectResponse {
@@ -85,11 +141,14 @@ pub struct ProjectResponse {
     pub workflow_template_name: Option<String>,
     #[serde(default)]
     pub paused_at: Option<String>,
-    /// Only set alongside `paused_at` when the Task dispatcher paused this
-    /// Project automatically (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None`
-    /// for a user's own pause via `POST /projects/{id}/pause`.
+    /// Set alongside `paused_at` for a repository or environment auto-pause;
+    /// `None` for a user's own pause via `POST /projects/{id}/pause`.
     #[serde(default)]
     pub system_pause_reason: Option<String>,
+    #[serde(default)]
+    pub environment_pause: Option<ProjectEnvironmentPause>,
+    #[serde(default)]
+    pub slots: ProjectSlots,
     #[serde(default)]
     pub paused: bool,
     #[serde(default = "default_charter_status")]

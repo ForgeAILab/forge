@@ -93,6 +93,9 @@ pub type LifecycleHooks = std::collections::HashMap<LifecycleEvent, Vec<Lifecycl
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub struct ProjectSettings {
+    /// Maximum unparked Tasks in active/gate states; 0 disables the limit.
+    #[serde(default = "default_max_active_tasks")]
+    pub max_active_tasks: u32,
     #[serde(default)]
     pub retry_budgets: RetryBudgets,
     #[serde(default)]
@@ -105,6 +108,10 @@ pub struct ProjectSettings {
     pub environment: ProjectEnvironment,
 }
 
+fn default_max_active_tasks() -> u32 {
+    5
+}
+
 fn default_environment_check_timeout() -> u64 {
     120
 }
@@ -115,9 +122,9 @@ fn default_environment_check_timeout() -> u64 {
 /// Forge applies it immediately before an execution launches: `env` is set on
 /// the executor process (and on review steps and lifecycle hooks), `assets`
 /// are copied into the worktree, and the `checks` for the execution's role
-/// must pass or the Task is parked as `environment_not_ready` without
+/// must pass or the Project is paused as `environment_not_ready` without
 /// spending an agent run.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct ProjectEnvironment {
@@ -127,6 +134,24 @@ pub struct ProjectEnvironment {
     pub assets: Vec<EnvironmentAsset>,
     #[serde(default)]
     pub checks: Vec<EnvironmentCheck>,
+    /// Seconds between automatic re-checks while environment-paused (60–86400).
+    #[serde(default = "default_environment_recheck_interval")]
+    pub recheck_interval_seconds: u64,
+}
+
+fn default_environment_recheck_interval() -> u64 {
+    600
+}
+
+impl Default for ProjectEnvironment {
+    fn default() -> Self {
+        Self {
+            env: BTreeMap::new(),
+            assets: Vec::new(),
+            checks: Vec::new(),
+            recheck_interval_seconds: default_environment_recheck_interval(),
+        }
+    }
 }
 
 impl ProjectEnvironment {
@@ -187,6 +212,7 @@ pub struct LifecycleHookTestResponse {
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
+            max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
                 merge_fix: Some(default_merge_fix_retry_budget()),
@@ -718,6 +744,22 @@ mod tests {
         CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition,
         WorkflowTrigger, WorkflowTriggerDefinition,
     };
+
+    #[test]
+    fn project_settings_default_active_task_limit() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({
+            "default_review_config": {"ci_steps": []},
+            "environment": {"env": {"TOKEN": "value"}}
+        }))
+        .expect("stored settings without a limit deserialize");
+        assert_eq!(settings.max_active_tasks, 5);
+        assert_eq!(super::ProjectSettings::default().max_active_tasks, 5);
+
+        let unlimited: super::ProjectSettings =
+            serde_json::from_value(serde_json::json!({"max_active_tasks": 0}))
+                .expect("unlimited settings deserialize");
+        assert_eq!(unlimited.max_active_tasks, 0);
+    }
 
     fn state(name: &str, kind: StateKind) -> StateDefinition {
         StateDefinition {

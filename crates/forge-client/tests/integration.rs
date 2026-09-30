@@ -279,6 +279,8 @@ async fn create_project_route(
         workflow_template_name: None,
         paused_at: None,
         system_pause_reason: None,
+        environment_pause: None,
+        slots: api_types::ProjectSlots::default(),
         paused: request.paused.unwrap_or(false),
         project_hooks: vec![],
         charter_status: "legacy_unverified".to_owned(),

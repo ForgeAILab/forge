@@ -171,7 +171,8 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
     }
 }
 
-pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
+pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
+    let slots = services::task_dispatcher::slots::load_project_slots(db, &project).await?;
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")
@@ -183,6 +184,14 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
             project.id
         ))
     })?;
+    let environment_pause = project
+        .environment_pause_json
+        .as_deref()
+        .map(serde_json::from_str::<api_types::ProjectEnvironmentPause>)
+        .transpose()
+        .map_err(|error| {
+            ApiError::internal(format!("invalid persisted environment pause: {error}"))
+        })?;
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
@@ -196,6 +205,8 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
         system_pause_reason: project.system_pause_reason,
+        environment_pause,
+        slots,
         paused: project.paused_at.is_some(),
         charter_status: project.charter_status,
         charter_setup_required: project.charter_setup_required,

@@ -114,6 +114,7 @@ impl TaskDispatcher {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
+        let mut slots = super::slots::load_project_slots(&self.db, project).await?;
         let mut dispatched = 0;
         for task in tasks {
             if self.is_stopped() {
@@ -147,6 +148,9 @@ impl TaskDispatcher {
             if task_workflow.state_kind(&task.status) != Some(StateKind::Initial) {
                 continue;
             }
+            if helpers::has_blocking_annotation(&task) {
+                continue;
+            }
             // Creation gives a Task the Project's default assignees, so a Task
             // with no role assignment at all was proposed before those
             // defaults existed in Project settings (e.g. while the Project
@@ -176,9 +180,46 @@ impl TaskDispatcher {
                 // explicit `wake_task_dispatch` clears the disposition.
                 continue;
             }
+            let waiting_message = if slots.limit == 0 {
+                None
+            } else if slots.active >= slots.limit {
+                Some(format!(
+                    "project_at_capacity: waiting for a slot ({}/{} active)",
+                    slots.active, slots.limit
+                ))
+            } else if slots.parked >= 2 * slots.limit {
+                Some(format!(
+                    "project_waiting_on_owner: {} parked tasks waiting on the owner",
+                    slots.parked
+                ))
+            } else {
+                None
+            };
+            if let Some(message) = waiting_message {
+                // Capacity can change without changing this Task's version.
+                // Keep it outside the sticky role capability and re-check on
+                // every tick, writing only when the reason actually changes.
+                let identical = deferred_dispatch::current_dispatch_disposition(&task).is_some_and(
+                    |disposition| {
+                        disposition.capability == "project_capacity"
+                            && disposition.safe_message == message
+                    },
+                );
+                if !identical {
+                    deferred_dispatch::record_dispatch_disposition(
+                        &self.db,
+                        &task,
+                        "project_capacity",
+                        &message,
+                    )
+                    .await?;
+                }
+                continue;
+            }
             match self.dispatch_initial_task(&task, &target).await {
                 Ok(true) => {
                     deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    slots.active += 1;
                     dispatched += 1;
                 }
                 Ok(false) => {}
