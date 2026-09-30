@@ -70,25 +70,19 @@ pub async fn load_project_slots(db: &db::SqliteDb, project: &Project) -> Result<
             },
         )
         .await?;
-        let eligible: Vec<_> = page
-            .items
-            .iter()
-            .filter_map(|task| {
-                let workflow = WorkflowEngine::resolve_workflow_for_task(
-                    task,
-                    &project.workflow_definition,
-                    &actor,
-                );
-                match workflow.state_kind(&task.status) {
-                    Some(StateKind::Initial) => {
-                        slots.queued += 1;
-                        None
-                    }
-                    Some(StateKind::Active | StateKind::Gate) => Some(task),
-                    _ => None,
-                }
-            })
-            .collect();
+        let mut eligible = Vec::new();
+        for task in &page.items {
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                task,
+                &project.workflow_definition,
+                &actor,
+            );
+            match workflow.state_kind(&task.status) {
+                Some(StateKind::Initial) => slots.queued += 1,
+                Some(StateKind::Active | StateKind::Gate) => eligible.push(task),
+                _ => {}
+            }
+        }
         let review_task_ids: Vec<_> = eligible
             .iter()
             .filter(|task| !helpers::has_blocking_annotation(task))
