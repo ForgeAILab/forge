@@ -345,6 +345,27 @@ pub(super) fn stamp_executor_snapshot_authority(
         state_entry_token.map_or(Value::Null, |value| Value::String(value.to_owned())),
     );
     object.insert("project_version".to_owned(), Value::from(project_version));
+    // Resume and follow-up paths clone the parent execution's snapshot. A
+    // parent admitted before snapshots recorded the delivery contract would
+    // otherwise be classified as a CLI brokered plan (it has a daemon) while
+    // carrying no `plan_delivery`, so its terminal effects could never be
+    // matched to a Project revision and the Task would wedge. Every snapshot
+    // built today carries both fields; give cloned legacy snapshots the same.
+    if !object.contains_key("backend_kind") {
+        let backend_kind = if object
+            .get("resolved_daemon_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            "cli"
+        } else {
+            "native"
+        };
+        object.insert("backend_kind".to_owned(), Value::from(backend_kind));
+    }
+    object
+        .entry("plan_delivery".to_owned())
+        .or_insert_with(|| Value::from("execution_outbox"));
     serde_json::to_string(&snapshot).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
     })
@@ -837,6 +858,35 @@ mod tests {
         assert!(apply_route_outcome_to_snapshot(&legacy, &outcome)
             .expect("legacy path succeeds")
             .is_none());
+    }
+
+    #[test]
+    fn stamp_executor_snapshot_authority_upgrades_legacy_resumed_snapshot() {
+        // A resumed execution clones a parent snapshot written before
+        // `backend_kind`/`plan_delivery` existed.
+        let legacy = r#"{"executor_type":"codex","resolved_daemon_id":"daemon-1","dispatch_metadata":{"execution_policy":"resume_latest_target_role_thread"},"config":{}}"#;
+        let stamped =
+            stamp_executor_snapshot_authority(legacy, "merge_failed", Some("entry-1"), 22)
+                .expect("stamp succeeds");
+        let snapshot: Value = serde_json::from_str(&stamped).expect("valid json");
+
+        // The cascade treats a CLI snapshot as a brokered plan and reads its
+        // admitting Project revision only through `plan_delivery`.
+        assert!(snapshot_uses_cli_backend(&snapshot));
+        assert_eq!(snapshot["backend_kind"], "cli");
+        assert_eq!(snapshot["plan_delivery"], "execution_outbox");
+        assert_eq!(snapshot["project_version"], 22);
+    }
+
+    #[test]
+    fn stamp_executor_snapshot_authority_keeps_existing_delivery_fields() {
+        let current = r#"{"backend_kind":"native","plan_delivery":"execution_outbox","config":{}}"#;
+        let stamped =
+            stamp_executor_snapshot_authority(current, "in_progress", None, 3).expect("stamp");
+        let snapshot: Value = serde_json::from_str(&stamped).expect("valid json");
+        assert_eq!(snapshot["backend_kind"], "native");
+        assert_eq!(snapshot["plan_delivery"], "execution_outbox");
+        assert_eq!(snapshot["project_version"], 3);
     }
 
     #[test]

@@ -15,6 +15,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Release container builds reuse a GHCR BuildKit registry cache across tags,
   including intermediate Rust and frontend build layers.
 
+### Fixed
+
+- A resumed or follow-up execution whose session began before the upgrade to
+  0.13.10 no longer wedges its Task. Its copied executor snapshot lacked
+  `backend_kind`/`plan_delivery`, so Forge discarded the finished run's result
+  as coming from a superseded Project revision and the Task sat in
+  `merge_failed` or `in_progress` with nothing running. Forge now fills both
+  fields when it admits the execution.
+
 ## [0.13.10] - 2026-09-29
 
 ### Changed
