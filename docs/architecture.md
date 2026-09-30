@@ -2654,7 +2654,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
-- **review** — `ReviewRunner` prepares a detached clean checkout by running
+- **review** — `ReviewRunner` prepares the Task worktree by running
   `task.review_config.setup_steps`, then runs `ci_steps` as `bash -lc` commands.
   Task configuration overrides the Project's `default_review_config`; otherwise
   the Project defaults are inherited. A ready Project Agent can replace both
@@ -2826,8 +2826,13 @@ Task checkpoint persistence, so a retry cannot accumulate the previous full
 contract and report. Worker and planner Task continuity remains persistent,
 with deterministic structural compaction instead of an LCM timeline.
 
-Configured `setup_steps` run first in a detached clean checkout of the frozen
-candidate, followed by required checks, with bounded output and a per-command
+Configured `setup_steps` run first in the Task's own worktree, verified to sit
+at the frozen candidate commit with no tracked change, followed by required
+checks. Only tracked content is delivered, so the worktree's ignored dependency
+and build output is reused instead of a fresh clone repeating every install and
+cold build; after the checks the worktree is reset to the candidate commit and
+untracked, non-ignored output is removed so integration sees a clean tree. Each
+command runs with bounded output and a
 timeout (`check_timeout_seconds` in the review config, 1–14,400 seconds, default
 30 minutes; an unset value is not written into the frozen contract). A command
 that outruns the limit is Forge's own verification failing, not the reviewer:
@@ -2837,7 +2842,7 @@ to three attempts in all), and if they still time out the Task is parked with a
 failure is recorded separately and stops the checks. Forge records actual exit
 codes independently of model output and reruns required checks before accepting
 the assessment, even when the reviewer cited a frozen pre-review result. If
-setup or the checks modify tracked files (or move HEAD) in that clean checkout,
+setup or the checks modify tracked files (or move HEAD) at the candidate commit,
 the candidate does not reproduce from its own commit — a stale lockfile is the
 usual cause — so the review fails and the coder is told which files changed.
 Tracked changes in the reviewer's own worktree and stale Charter/Task/check

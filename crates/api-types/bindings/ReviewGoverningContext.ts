@@ -10,7 +10,7 @@ export type ReviewGoverningContext = { project_id: string, task_id: string, repo
  */
 requirements: Array<ReviewRequirement>, deferred_requirement_count: number, deferred_requirements_digest: string | null, 
 /**
- * Commands used to prepare the detached clean checkout before required
+ * Commands used to prepare the Task worktree before required
  * conformance checks execute.
  */
 setup_steps: Array<string>, required_checks: Array<ConformanceCheck>, 

@@ -10,8 +10,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Forge's clean-checkout re-run of a review's setup steps and checks now
-  allows 30 minutes per command instead of 120 seconds, configurable with the
+- Forge re-runs a review's setup steps and checks in the Task's own worktree
+  at the reviewed commit instead of a fresh clone in the temp directory, so
+  the worktree's `node_modules/` and `target/` are reused rather than
+  reinstalled and rebuilt from cold on every review. Afterwards the worktree
+  is reset to the reviewed commit and untracked, non-ignored output is
+  removed; a check that changes tracked files still fails the candidate.
+- That re-run now allows 30 minutes per command instead of 120 seconds, configurable with the
   new review config field `check_timeout_seconds` (1–14,400). A check that still
   outruns its limit no longer discards a finished review by dispatching a whole
   new reviewer: the timeout is not recorded as the verdict, the checks alone are

@@ -47,7 +47,7 @@ pub struct ReviewGoverningContext {
     pub deferred_requirement_count: usize,
     #[serde(default)]
     pub deferred_requirements_digest: Option<String>,
-    /// Commands used to prepare the detached clean checkout before required
+    /// Commands used to prepare the Task worktree before required
     /// conformance checks execute.
     #[serde(default)]
     pub setup_steps: Vec<String>,
