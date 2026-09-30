@@ -10,6 +10,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Forge's clean-checkout re-run of a review's setup steps and checks now
+  allows 30 minutes per command instead of 120 seconds, configurable with the
+  new review config field `check_timeout_seconds` (1–14,400). A check that still
+  outruns its limit no longer discards a finished review by dispatching a whole
+  new reviewer: the timeout is not recorded as the verdict, the checks alone are
+  re-run (up to three attempts), and then the Task is parked with
+  `review_blocked` for its owner. Previously a passing reviewer was thrown away
+  and re-dispatched every time a slow `cargo test` (for example one waiting on a
+  shared build lock) crossed 120 seconds.
 - A passed review's authority now carries across Forge's own mechanical
   integration steps instead of forcing a full reviewer run each time a sibling
   Task lands first. When a Task re-enters `review` only because Forge rebased

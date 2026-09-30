@@ -1861,21 +1861,66 @@ impl TaskService {
                 .await;
         }
         let user_approval_required = self.gate_requires_user_approval(&task).await?;
+        if review_blocked_by_execution(&task, &execution.id) {
+            // Duplicate delivery after the checks already timed out and parked
+            // the Task: the owner decides, so do not run them again.
+            return Ok(());
+        }
         let final_message = reviewer_final_message(execution).await?;
-        let conformance = match execution.workspace_id.as_deref() {
-            Some(id) => {
-                let workspace = WorkspaceRepo::get_by_id(&*self.db, id)
+        let workspace_path = match execution.workspace_id.as_deref() {
+            Some(id) => Some(
+                WorkspaceRepo::get_by_id(&*self.db, id)
                     .await?
-                    .ok_or_else(|| ServiceError::not_found("workspace", id.to_owned()))?;
-                ::review::contract::evaluate(
-                    &self.db,
-                    &execution.id,
-                    std::path::Path::new(&workspace.worktree_path),
-                    &final_message,
-                )
-                .await
+                    .ok_or_else(|| ServiceError::not_found("workspace", id.to_owned()))?
+                    .worktree_path,
+            ),
+            None => None,
+        };
+        let mut check_attempt = 1;
+        let conformance = loop {
+            let conformance = match workspace_path.as_deref() {
+                Some(path) => {
+                    ::review::contract::evaluate(
+                        &self.db,
+                        &execution.id,
+                        std::path::Path::new(path),
+                        &final_message,
+                    )
+                    .await
+                }
+                None => Err("review execution has no workspace evidence".to_owned()),
+            };
+            // A clean-checkout check that outran its limit is Forge's own
+            // verification failing, not the reviewer: re-run only the checks,
+            // and park the Task for its owner rather than discard the verdict
+            // by dispatching another reviewer.
+            let Some(reason) = conformance
+                .as_ref()
+                .ok()
+                .filter(|result| result.status == api_types::ConformanceStatus::Unverified)
+                .and_then(|result| result.reason.as_deref())
+                .filter(|reason| ::review::contract::is_check_timeout(reason))
+                .map(str::to_owned)
+            else {
+                break conformance;
+            };
+            if check_attempt >= REVIEW_CHECK_ATTEMPTS {
+                return self
+                    .block_task_for_review_environment(
+                        &task,
+                        execution,
+                        format!("{reason} ({check_attempt} attempts)"),
+                    )
+                    .await;
             }
-            None => Err("review execution has no workspace evidence".to_owned()),
+            tracing::warn!(
+                task_id = %task.id,
+                execution_id = %execution.id,
+                attempt = check_attempt,
+                %reason,
+                "review checks timed out; re-running the checks only"
+            );
+            check_attempt += 1;
         };
         let conformance = match conformance {
             Ok(result) if result.status != api_types::ConformanceStatus::Unverified => result,
@@ -2665,6 +2710,22 @@ impl TaskService {
             .and_then(|state| state.gate_config.as_ref())
             .is_some_and(|gate_config| gate_config.requires_user_approval()))
     }
+}
+
+/// How many times Forge runs a review's clean-checkout checks before a
+/// timeout parks the Task instead of retrying.
+const REVIEW_CHECK_ATTEMPTS: u32 = 3;
+
+/// Whether `task` is already parked by a review-environment block that this
+/// reviewer execution raised.
+fn review_blocked_by_execution(task: &Task, execution_id: &str) -> bool {
+    task.blocked_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .is_some_and(|blocked| {
+            blocked["kind"] == json!(api_types::FailureKind::ReviewBlocked)
+                && blocked["execution_id"].as_str() == Some(execution_id)
+        })
 }
 
 pub(crate) fn reviewer_execution_lacks_exact_review_binding(

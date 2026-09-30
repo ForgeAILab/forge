@@ -13,4 +13,9 @@ requirements: Array<ReviewRequirement>, deferred_requirement_count: number, defe
  * Commands used to prepare the detached clean checkout before required
  * conformance checks execute.
  */
-setup_steps: Array<string>, required_checks: Array<ConformanceCheck>, source_digest: string, };
+setup_steps: Array<string>, required_checks: Array<ConformanceCheck>, 
+/**
+ * Per-command limit for the setup steps and required checks. Absent
+ * (the default) keeps contracts frozen before the field existed equal.
+ */
+check_timeout_seconds?: number, source_digest: string, };

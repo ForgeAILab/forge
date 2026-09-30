@@ -3797,8 +3797,9 @@ failed automated result remains auditable. A `pass` is only as strong as the
 checks Forge ran, so configure `setup_steps` and `conformance_checks` for any
 Task whose acceptance depends on a build or test.
 
-An `unverified` result — no readable result block, or a review context or
-commit that changed under the reviewer — uses the bounded reviewer
+An `unverified` result other than a check timeout (described below) — no
+readable result block, or a review context or commit that changed under the
+reviewer — uses the bounded reviewer
 execution-retry path and eventually exposes a durable recovery blocker; it
 neither dispatches a coder nor grants acceptance. Embedded reviewers get up to
 two follow-up turns to supply a missing result block before that happens.
@@ -3833,7 +3834,10 @@ All other Project requirements stay deferred to milestone readiness.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. In the detached clean checkout, setup commands run first and each
-required check then runs independently. Read-only discovery/planning Tasks
+required check then runs independently. Each command is limited by the optional
+`check_timeout_seconds` (integer, 1–14,400; default 1,800). A timed-out check is
+not a verdict: Forge re-runs only the checks, up to three attempts, then parks
+the Task with `review_blocked` rather than dispatching another reviewer. Read-only discovery/planning Tasks
 suppress both lists. A Project Agent sets them through `project.review_config`;
 this keeps repository-specific preparation and check selection at Project scope.
 

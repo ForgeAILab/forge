@@ -434,6 +434,11 @@ pub struct ReviewConfig {
     pub ci_steps: Vec<String>,
     #[serde(default)]
     pub review_prompt: Option<String>,
+    /// Wall-clock limit, in seconds, for each setup step and check Forge
+    /// re-runs in its clean review checkout. Unset uses the 30-minute default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub check_timeout_seconds: Option<u32>,
 }
 
 #[cfg(test)]

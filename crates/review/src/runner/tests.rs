@@ -883,6 +883,55 @@ async fn clean_review_checkout_runs_setup_before_required_checks() {
 }
 
 #[tokio::test]
+async fn a_check_that_outruns_its_limit_is_not_recorded_as_the_verdict() {
+    let seed = seeded_review(vec!["sleep 5"]).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"review": {"ci_steps": ["sleep 5"], "check_timeout_seconds": 1}}).to_string())
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .expect("review timeout config updates");
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(PassingAuditor),
+    );
+
+    let error = runner
+        .run(req)
+        .await
+        .expect_err("timed-out check is not a verdict");
+
+    let ReviewError::Conformance {
+        execution_id,
+        reason,
+    } = error
+    else {
+        panic!("expected a conformance error, got {error:?}");
+    };
+    assert!(crate::contract::is_check_timeout(&reason), "{reason}");
+    assert!(reason.contains("`sleep 5` ran longer than 1s"), "{reason}");
+    // Unrecorded, so the checks alone can be run again for the same reviewer.
+    assert!(seed
+        .db
+        .review_conformance(&execution_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn setup_that_rewrites_a_tracked_file_fails_the_candidate() {
     let seed = seeded_review(vec!["true"]).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")

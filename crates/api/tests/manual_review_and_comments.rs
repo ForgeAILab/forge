@@ -51,6 +51,7 @@ fn review_config_serializes_without_auditor_agent_id() {
         setup_steps: vec!["cargo fetch".to_owned()],
         ci_steps: vec!["cargo test".to_owned()],
         review_prompt: Some("Check for correctness".to_owned()),
+        check_timeout_seconds: None,
     };
     let json_str = serde_json::to_string(&config).expect("serializes");
     let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parses");
@@ -77,6 +78,7 @@ fn review_config_serializes_without_auditor_agent_id() {
         setup_steps: vec![],
         ci_steps: vec![],
         review_prompt: None,
+        check_timeout_seconds: None,
     };
     let json_str = serde_json::to_string(&empty).expect("serializes");
     let deserialized: ReviewConfig = serde_json::from_str(&json_str).expect("deserializes");

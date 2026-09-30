@@ -2827,8 +2827,13 @@ contract and report. Worker and planner Task continuity remains persistent,
 with deterministic structural compaction instead of an LCM timeline.
 
 Configured `setup_steps` run first in a detached clean checkout of the frozen
-candidate, followed by required checks, with a 120-second timeout and bounded
-output per command. Setup prepares dependencies but never satisfies a requirement;
+candidate, followed by required checks, with bounded output and a per-command
+timeout (`check_timeout_seconds` in the review config, 1–14,400 seconds, default
+30 minutes; an unset value is not written into the frozen contract). A command
+that outruns the limit is Forge's own verification failing, not the reviewer:
+the result is not recorded, the reviewer completion re-runs only the checks (up
+to three attempts in all), and if they still time out the Task is parked with a
+`review_blocked` annotation instead of dispatching another reviewer. Setup prepares dependencies but never satisfies a requirement;
 failure is recorded separately and stops the checks. Forge records actual exit
 codes independently of model output and reruns required checks before accepting
 the assessment, even when the reviewer cited a frozen pre-review result. If

@@ -52,6 +52,11 @@ pub struct ReviewGoverningContext {
     #[serde(default)]
     pub setup_steps: Vec<String>,
     pub required_checks: Vec<ConformanceCheck>,
+    /// Per-command limit for the setup steps and required checks. Absent
+    /// (the default) keeps contracts frozen before the field existed equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub check_timeout_seconds: Option<u32>,
     pub source_digest: String,
 }
 

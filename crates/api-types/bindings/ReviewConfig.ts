@@ -13,4 +13,9 @@ requirement_ids: Array<string>, requirement_allocations: { [key in string]?: str
  * such as dependency installation. They do not themselves satisfy a
  * review requirement, but their result is retained with the review.
  */
-setup_steps: Array<string>, ci_steps: Array<string>, review_prompt: string | null, };
+setup_steps: Array<string>, ci_steps: Array<string>, review_prompt: string | null, 
+/**
+ * Wall-clock limit, in seconds, for each setup step and check Forge
+ * re-runs in its clean review checkout. Unset uses the 30-minute default.
+ */
+check_timeout_seconds?: number, };
