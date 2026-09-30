@@ -260,6 +260,8 @@ pub(super) async fn build_executor_config_snapshot(
     // Extract before normalization: the typed config round-trip drops
     // unknown fields, which would silently delete the chain.
     let fallbacks = extract_fallbacks(&mut base_config)?;
+    let agent_hard_deadline_seconds = extract_hard_deadline_seconds(&mut base_config)?;
+    let hard_deadline_seconds = hard_deadline_seconds.or(agent_hard_deadline_seconds);
     apply_agent_fields_to_config(agent, &mut base_config)?;
     let capabilities = parse_json_value("agent capabilities_json", &agent.capabilities_json)?;
     let kind = agent
@@ -345,6 +347,27 @@ pub(super) fn stamp_executor_snapshot_authority(
         state_entry_token.map_or(Value::Null, |value| Value::String(value.to_owned())),
     );
     object.insert("project_version".to_owned(), Value::from(project_version));
+    // Resume and follow-up paths clone the parent execution's snapshot. A
+    // parent admitted before snapshots recorded the delivery contract would
+    // otherwise be classified as a CLI brokered plan (it has a daemon) while
+    // carrying no `plan_delivery`, so its terminal effects could never be
+    // matched to a Project revision and the Task would wedge. Every snapshot
+    // built today carries both fields; give cloned legacy snapshots the same.
+    if !object.contains_key("backend_kind") {
+        let backend_kind = if object
+            .get("resolved_daemon_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            "cli"
+        } else {
+            "native"
+        };
+        object.insert("backend_kind".to_owned(), Value::from(backend_kind));
+    }
+    object
+        .entry("plan_delivery".to_owned())
+        .or_insert_with(|| Value::from("execution_outbox"));
     serde_json::to_string(&snapshot).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
     })
@@ -364,6 +387,31 @@ pub(super) fn snapshot_uses_cli_backend(snapshot: &Value) -> bool {
 }
 
 /// Remove and return the authored `fallbacks` entries from an agent config.
+/// The agent's default run time limit, `config_json.hard_deadline_seconds`.
+/// Missing or null means no limit. A claim or launch override replaces it.
+/// Extracted before normalization, which would drop the unknown key.
+pub(super) fn extract_hard_deadline_seconds(config: &mut Value) -> Result<Option<u32>> {
+    let Some(object) = config.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.remove(AGENT_HARD_DEADLINE_CONFIG_KEY) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|seconds| u32::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "agent config hard_deadline_seconds must be a positive whole number of \
+                     seconds, or omitted for no limit; got: {value}"
+                ))
+            }),
+    }
+}
+
+pub(crate) const AGENT_HARD_DEADLINE_CONFIG_KEY: &str = "hard_deadline_seconds";
+
 pub(super) fn extract_fallbacks(config: &mut Value) -> Result<Vec<Value>> {
     let Some(object) = config.as_object_mut() else {
         return Ok(Vec::new());
@@ -659,6 +707,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_hard_deadline_seconds_reads_positive_seconds_and_removes_key() {
+        let mut config = serde_json::json!({"profile": "acct-1", "hard_deadline_seconds": 5400});
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut config).expect("deadline extracts"),
+            Some(5400)
+        );
+        assert_eq!(config, serde_json::json!({"profile": "acct-1"}));
+
+        let mut unset = serde_json::json!({"hard_deadline_seconds": null});
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut unset).expect("null"),
+            None
+        );
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut serde_json::json!({})).expect("missing"),
+            None
+        );
+        for invalid in [
+            serde_json::json!({"hard_deadline_seconds": 0}),
+            serde_json::json!({"hard_deadline_seconds": -5}),
+            serde_json::json!({"hard_deadline_seconds": "3600"}),
+        ] {
+            let mut invalid = invalid;
+            assert!(extract_hard_deadline_seconds(&mut invalid).is_err());
+        }
+    }
+
+    #[test]
     fn extract_fallbacks_removes_key_and_returns_entries() {
         let mut config = serde_json::json!({
             "profile": "acct-1",
@@ -837,6 +913,35 @@ mod tests {
         assert!(apply_route_outcome_to_snapshot(&legacy, &outcome)
             .expect("legacy path succeeds")
             .is_none());
+    }
+
+    #[test]
+    fn stamp_executor_snapshot_authority_upgrades_legacy_resumed_snapshot() {
+        // A resumed execution clones a parent snapshot written before
+        // `backend_kind`/`plan_delivery` existed.
+        let legacy = r#"{"executor_type":"codex","resolved_daemon_id":"daemon-1","dispatch_metadata":{"execution_policy":"resume_latest_target_role_thread"},"config":{}}"#;
+        let stamped =
+            stamp_executor_snapshot_authority(legacy, "merge_failed", Some("entry-1"), 22)
+                .expect("stamp succeeds");
+        let snapshot: Value = serde_json::from_str(&stamped).expect("valid json");
+
+        // The cascade treats a CLI snapshot as a brokered plan and reads its
+        // admitting Project revision only through `plan_delivery`.
+        assert!(snapshot_uses_cli_backend(&snapshot));
+        assert_eq!(snapshot["backend_kind"], "cli");
+        assert_eq!(snapshot["plan_delivery"], "execution_outbox");
+        assert_eq!(snapshot["project_version"], 22);
+    }
+
+    #[test]
+    fn stamp_executor_snapshot_authority_keeps_existing_delivery_fields() {
+        let current = r#"{"backend_kind":"native","plan_delivery":"execution_outbox","config":{}}"#;
+        let stamped =
+            stamp_executor_snapshot_authority(current, "in_progress", None, 3).expect("stamp");
+        let snapshot: Value = serde_json::from_str(&stamped).expect("valid json");
+        assert_eq!(snapshot["backend_kind"], "native");
+        assert_eq!(snapshot["plan_delivery"], "execution_outbox");
+        assert_eq!(snapshot["project_version"], 3);
     }
 
     #[test]

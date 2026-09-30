@@ -428,6 +428,35 @@ pub fn derive_workflow_exception(
     )
 }
 
+/// A workflow exception can outlive the moment it was raised: after a
+/// `merge_failed` recovery hands the conflict to the coder, the annotation
+/// stays on the Task while that coder runs. Recovery would only race the live
+/// execution and return 409, so disable every action except cancelling the
+/// Task and opening a side session until the running execution stops.
+pub fn disable_recovery_while_running(
+    mut exception: WorkflowExceptionSummary,
+    running_execution: Option<&Execution>,
+) -> WorkflowExceptionSummary {
+    let Some(running) = running_execution else {
+        return exception;
+    };
+    for action in &mut exception.actions {
+        if action.enabled
+            && !matches!(
+                action.kind,
+                RecoveryAction::CancelTask | RecoveryAction::OpenInteractive
+            )
+        {
+            action.enabled = false;
+            action.disabled_reason = Some(format!(
+                "A {} execution is still running; wait for it to finish",
+                running.role
+            ));
+        }
+    }
+    exception
+}
+
 /// Derive exception actions with the live interactive execution selected
 /// independently from the newest execution row. The latter is still used for
 /// review/error evidence; the former controls whether opening another

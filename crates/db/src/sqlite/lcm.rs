@@ -18,32 +18,104 @@ impl AgentLcmRepo for SqliteDb {
         &self,
         input: CreateAgentLcmTimeline,
     ) -> Result<AgentLcmTimeline> {
-        sqlx::query(
-            "INSERT INTO agent_lcm_timeline (
-                id, identity_id, scope_type, scope_id, authorization_revision,
-                revision, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-             ON CONFLICT(identity_id, scope_type, scope_id) DO NOTHING",
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
+        let existing = sqlx::query(
+            "SELECT id, runtime_session_id, updated_at, authorization_revision,
+                    EXISTS(SELECT 1 FROM agent_lcm_entry e WHERE e.timeline_id = l.id)
+                        AS has_entries
+             FROM agent_lcm_timeline l
+             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
         )
-        .bind(&input.id)
         .bind(&input.identity_id)
         .bind(&input.scope_type)
         .bind(&input.scope_id)
-        .bind(&input.authorization_revision)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(self.pool())
+        .fetch_optional(&mut *transaction)
         .await?;
-
-        let timeline = self
-            .get_lcm_timeline_for_binding(&input.identity_id, &input.scope_type, &input.scope_id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if timeline.authorization_revision != input.authorization_revision {
-            return Err(DbError::Check(
-                "LCM binding already exists with a different authorization revision".to_owned(),
-            ));
+        let claim = input.runtime_session.as_ref();
+        let insert = match existing {
+            None => true,
+            Some(row) => {
+                let id: String = row.try_get("id")?;
+                let authorization_revision: String = row.try_get("authorization_revision")?;
+                if authorization_revision != input.authorization_revision {
+                    return Err(DbError::Check(
+                        "LCM binding already exists with a different authorization revision"
+                            .to_owned(),
+                    ));
+                }
+                match claim {
+                    None => false,
+                    Some(claim) => {
+                        let owner: Option<String> = row.try_get("runtime_session_id")?;
+                        let updated_at: String = row.try_get("updated_at")?;
+                        let has_entries: bool = row.try_get("has_entries")?;
+                        let written_by_other_session = match owner.as_deref() {
+                            Some(owner) => owner != claim.runtime_session_id,
+                            None => rfc3339_before(&updated_at, &claim.session_created_at),
+                        };
+                        if written_by_other_session && has_entries {
+                            // The new session's canonical history is rebuilt
+                            // from the chat transcript and cannot continue
+                            // this timeline. Keep it, but free the scope.
+                            sqlx::query(
+                                "UPDATE agent_lcm_timeline
+                                 SET scope_id = scope_id || '#retired:' || id,
+                                     retired_at = ?
+                                 WHERE id = ?",
+                            )
+                            .bind(&input.updated_at)
+                            .bind(&id)
+                            .execute(&mut *transaction)
+                            .await?;
+                            true
+                        } else {
+                            if owner.as_deref() != Some(claim.runtime_session_id.as_str()) {
+                                sqlx::query(
+                                    "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                                     WHERE id = ?",
+                                )
+                                .bind(&claim.runtime_session_id)
+                                .bind(&id)
+                                .execute(&mut *transaction)
+                                .await?;
+                            }
+                            false
+                        }
+                    }
+                }
+            }
+        };
+        if insert {
+            sqlx::query(
+                "INSERT INTO agent_lcm_timeline (
+                    id, identity_id, scope_type, scope_id, canonical_scope_id,
+                    runtime_session_id, authorization_revision, revision,
+                    created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            )
+            .bind(&input.id)
+            .bind(&input.identity_id)
+            .bind(&input.scope_type)
+            .bind(&input.scope_id)
+            .bind(&input.scope_id)
+            .bind(claim.map(|claim| claim.runtime_session_id.as_str()))
+            .bind(&input.authorization_revision)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
         }
+        let timeline = sqlx::query(
+            "SELECT * FROM agent_lcm_timeline
+             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
+        )
+        .bind(&input.identity_id)
+        .bind(&input.scope_type)
+        .bind(&input.scope_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map(map_timeline)??;
+        transaction.commit().await?;
         Ok(timeline)
     }
 
@@ -689,6 +761,16 @@ fn operation_result(
         already_committed,
         entries: operation.result_entries,
         node_id: operation.result_node_id,
+    }
+}
+
+fn rfc3339_before(left: &str, right: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(left),
+        chrono::DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left), Ok(right)) => left < right,
+        _ => false,
     }
 }
 

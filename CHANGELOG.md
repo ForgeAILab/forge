@@ -6,6 +6,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.11] - 2026-09-30
+
+### Added
+
+- Agent settings have a **Max run time (minutes)** field. When set, every
+  Task run of that agent stops at the limit; empty means no limit (the
+  default). It is stored as `config_json.hard_deadline_seconds`, and a
+  claim/launch `overrides.hard_deadline_seconds` still replaces it for one
+  run. Agent create/update rejects a value that is not a positive whole
+  number of seconds.
+
 ### Changed
 
 - Release tags no longer re-run the Rust and web test suites. The release
@@ -21,6 +32,37 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   cancelled, because a release needs a successful run on its exact commit.
 - Release container builds reuse a GHCR BuildKit registry cache across tags,
   including intermediate Rust and frontend build layers.
+
+### Fixed
+
+- Tasks no longer wedge in `merging` after review authority carries across a
+  target-moved rebase. Terminal workflow cascades always complete; the
+  non-terminal cascade limit is now eight to allow another mechanical refresh
+  round. The dispatcher also re-drives unblocked merge gates after two minutes
+  without a running execution or merge hook, using the normal versioned entry
+  path. A candidate already merged into the target completes idempotently,
+  including when sibling Tasks have advanced the target since it landed.
+
+- A resumed or follow-up execution whose session began before the upgrade to
+  0.13.10 no longer wedges its Task. Its copied executor snapshot lacked
+  `backend_kind`/`plan_delivery`, so Forge discarded the finished run's result
+  as coming from a superseded Project revision and the Task sat in
+  `merge_failed` or `in_progress` with nothing running. Forge now fills both
+  fields when it admits the execution.
+- A Task whose workflow exception is still showing while its coder or
+  reviewer runs (for example `merge_failed` while the conflict-fix coder
+  works) no longer offers recovery actions that would race the live run and
+  fail with 409. They are disabled with the reason until the execution stops;
+  Cancel Task and Open Side Session stay available.
+- An Agent Chat whose history had been compacted no longer breaks after a
+  server restart or session rotation. The fresh runtime session rebuilt its
+  history from the chat transcript but reused the old session's LCM
+  timeline, and once that timeline held summaries every turn failed with
+  "LCM source range overlaps an active node". A timeline now records its
+  runtime session; a different session retires it (rows kept, `scope_id`
+  suffixed `#retired:<id>`) and starts a fresh one. Migration V149 adds the
+  owner, retirement, and `canonical_scope_id` columns and backfills rows
+  already retired by hand.
 
 ## [0.13.10] - 2026-09-29
 

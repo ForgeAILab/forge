@@ -983,9 +983,12 @@ the configured checks. In human-required mode, either the user or the bound
 Project Agent may accept or reject. A Task may override the Project default. The
 execution record exposes owner health, lease expiry/hard deadline, heartbeat,
 and semantic progress separately. A quiet provider/tool call remains healthy
-while its owner lease is current. The hard deadline is `null` by default; set a
-positive `overrides.hard_deadline_seconds` when claiming, launching, or
-following up an execution only when that attempt needs a wall-clock bound.
+while its owner lease is current. The hard deadline is `null` by default. To
+bound every Task run of one agent, set **Max run time (minutes)** in the
+agent's settings (stored as `config_json.hard_deadline_seconds`); leave it
+empty for no limit. A positive `overrides.hard_deadline_seconds` when claiming,
+launching, or following up an execution replaces the agent's limit for that
+attempt. Reviewer runs are not bounded by this setting.
 
 Terminal execution events—including explicit stops and cancellations—remain
 per-attempt audit records and may resolve a semantic progress warning; they do

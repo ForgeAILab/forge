@@ -1444,6 +1444,259 @@ async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_gate() {
     );
 }
 
+struct MergeGateFixture {
+    db: Arc<db::SqliteDb>,
+    _repo_dir: TempDir,
+    _workspace_dir: TempDir,
+    task: Task,
+    merge_service: Arc<crate::merge_service::MergeService>,
+    dispatcher: TaskDispatcher,
+}
+
+async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let task = seed_task(&db, &project_id, "landed merge", "merging", 1).await;
+    let worktree_path = workspace_dir.path().join("worktree");
+    let branch = workspace::task_branch_name(&task.id);
+    git::create_worktree(repo_dir.path(), &branch, &worktree_path)
+        .await
+        .expect("task worktree creates");
+    std::fs::write(worktree_path.join("feature.txt"), "landed feature\n").unwrap();
+    run_git(&worktree_path, &["add", "-A"]);
+    run_git(&worktree_path, &["commit", "-m", "candidate"]);
+    run_git(repo_dir.path(), &["merge", "--ff-only", &branch]);
+    // The target has moved beyond the landed candidate, not merely to it.
+    std::fs::write(repo_dir.path().join("sibling.txt"), "sibling feature\n").unwrap();
+    run_git(repo_dir.path(), &["add", "-A"]);
+    run_git(repo_dir.path(), &["commit", "-m", "sibling landed"]);
+    let now = now_rfc3339();
+    let workspace = WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id,
+            worktree_path: worktree_path.to_string_lossy().into_owned(),
+            branch,
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("workspace creates");
+    let execution_id = seed_completed_coder_execution(&db, &task.id).await;
+    sqlx::query("UPDATE execution SET workspace_id = ? WHERE id = ?")
+        .bind(workspace.id)
+        .bind(execution_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    TransitionLogRepo::insert(
+        &*db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "merging".to_owned(),
+            trigger_name: Some("accept".to_owned()),
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            trigger_reason: "review passed".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: (chrono::Utc::now() - entered_ago).to_rfc3339(),
+        },
+    )
+    .await
+    .expect("merge entry records");
+    let event_bus = Arc::new(EventBus::new(32));
+    let merge_service = Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        workspace_dir.path().to_owned(),
+    ));
+    let task_service = Arc::new(
+        TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_merge_service(Arc::clone(&merge_service)),
+    );
+    let dispatcher = TaskDispatcher::new(Arc::clone(&db), event_bus, task_service);
+    MergeGateFixture {
+        db,
+        _repo_dir: repo_dir,
+        _workspace_dir: workspace_dir,
+        task,
+        merge_service,
+        dispatcher,
+    }
+}
+
+async fn assert_merge_gate_untouched(fixture: &MergeGateFixture) {
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "merging");
+    assert_eq!(current.version, fixture.task.version);
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_completes_already_merged_branch() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "done");
+    let logs = TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 3);
+    assert_eq!(logs[1].from_state, "merging");
+    assert_eq!(logs[1].to_state, "merging");
+    assert_eq!(logs[2].to_state, "done");
+    assert_eq!(logs[2].trigger_reason, "merge succeeded");
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_respects_entry_grace() {
+    let fixture = merge_gate_fixture(chrono::Duration::seconds(30)).await;
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_blocked_task() {
+    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    sqlx::query("UPDATE task SET error_annotation = ?, version = version + 1 WHERE id = ?")
+        .bind(r#"{"type":"manual_stop","message":"integration paused by user"}"#)
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_blocking_record() {
+    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    sqlx::query("UPDATE task SET blocked_json = ?, version = version + 1 WHERE id = ?")
+        .bind(r#"{"kind":"merge_conflict","reason":"manual repair required"}"#)
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_awaiting_pull_request() {
+    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    sqlx::query("UPDATE task SET metadata_json = ?, version = version + 1 WHERE id = ?")
+        .bind(r#"{"awaiting_human":true,"awaiting_human_reason":"pull_request_merge"}"#)
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_running_execution() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let agent_id = seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    seed_running_execution(&fixture.db, &fixture.task.id, &agent_id, "coder").await;
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_running_merge_hook() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let _slot = fixture
+        .merge_service
+        .claim_merge_hook(&fixture.task.id)
+        .unwrap();
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_skips_running_completion_cascade() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let _slot = fixture
+        .dispatcher
+        .task_service
+        .claim_completion_cascade(&fixture.task.id)
+        .unwrap();
+    assert_merge_gate_untouched(&fixture).await;
+}
+
+#[tokio::test]
+async fn dispatcher_merge_gate_reentry_rejects_stale_task_version() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let error = fixture
+        .dispatcher
+        .task_service
+        .retry_merge_state_entry(
+            &fixture.task,
+            &project,
+            &workflow,
+            "recover interrupted merge gate",
+        )
+        .await
+        .expect_err("stale recovery cannot run entry hooks");
+    assert!(matches!(
+        error,
+        crate::ServiceError::Db(db::DbError::VersionConflict)
+    ));
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "merging");
+    assert_eq!(current.version, fixture.task.version + 1);
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn dispatcher_does_not_relaunch_planner_awaiting_plan_review() {
     let db = Arc::new(sqlite_db().await);

@@ -555,7 +555,7 @@ impl SqliteProtectedRuntimeStore {
         scope_id: &str,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id, scope.scope_type, scope.scope_id
+            "SELECT session.identity_id, session.created_at, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
@@ -573,6 +573,9 @@ impl SqliteProtectedRuntimeStore {
         let identity_id: String = row
             .try_get("identity_id")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let session_created_at: String = row
+            .try_get("created_at")
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let stored_scope_type: String = row
             .try_get("scope_type")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
@@ -589,6 +592,10 @@ impl SqliteProtectedRuntimeStore {
             &stored_scope_type,
             &stored_scope_id,
             authorization_revision.as_str(),
+            Some(db::AgentLcmSessionClaim {
+                runtime_session_id: runtime_id.to_owned(),
+                session_created_at,
+            }),
             &db::now_rfc3339(),
         )
         .await

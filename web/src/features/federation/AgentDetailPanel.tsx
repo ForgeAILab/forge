@@ -27,7 +27,7 @@ import {
   useAgentProviderCapabilitiesQuery,
   useConnectEmbeddedProfileMutation,
 } from '@/features/federation/hooks'
-import type { FederatedAgent } from '@/features/federation/types'
+import type { FederatedAgent, JsonObject } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { CostSummaryView } from '@/components/analytics/CostSummary'
 import { StateBadge, StatusDot } from '@/features/federation/components'
@@ -396,6 +396,22 @@ export function AgentDetailPanel({
   )
 }
 
+const RUN_TIME_LIMIT_KEY = 'hard_deadline_seconds'
+
+/** Minutes shown for the agent's run time limit; empty means no limit. */
+function runTimeLimitMinutes(agent: FederatedAgent): string {
+  const seconds = agent.config_json?.[RUN_TIME_LIMIT_KEY]
+  return typeof seconds === 'number' && seconds > 0 ? String(Math.ceil(seconds / 60)) : ''
+}
+
+/** The agent config with its run time limit set, or removed for no limit. */
+function withRunTimeLimit(config: JsonObject, minutes: number | null): JsonObject {
+  const next: JsonObject = { ...(config ?? {}) }
+  if (minutes === null) delete next[RUN_TIME_LIMIT_KEY]
+  else next[RUN_TIME_LIMIT_KEY] = minutes * 60
+  return next
+}
+
 /**
  * The agent's settings, edited directly in the panel: fields show the current
  * values and a Save/Discard bar appears once something changes. Bindings
@@ -416,6 +432,7 @@ function AgentSettingsForm({
   const [name, setName] = useState(agent.name)
   const [description, setDescription] = useState(agent.description ?? '')
   const [maxConcurrentTasks, setMaxConcurrentTasks] = useState(String(agent.max_concurrent_tasks))
+  const [maxRunMinutes, setMaxRunMinutes] = useState(runTimeLimitMinutes(agent))
   const [entryId, setEntryId] = useState(agent.credential_handle_id ?? '')
   const [model, setModel] = useState(agent.model ?? '')
   const [reasoningEffort, setReasoningEffort] = useState(agent.reasoning_effort ?? '')
@@ -441,6 +458,7 @@ function AgentSettingsForm({
     setName(agent.name)
     setDescription(agent.description ?? '')
     setMaxConcurrentTasks(String(agent.max_concurrent_tasks))
+    setMaxRunMinutes(runTimeLimitMinutes(agent))
     setEntryId(agent.credential_handle_id ?? '')
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
@@ -458,7 +476,8 @@ function AgentSettingsForm({
   const identityDirty =
     name !== agent.name ||
     description !== (agent.description ?? '') ||
-    maxConcurrentTasks !== String(agent.max_concurrent_tasks)
+    maxConcurrentTasks !== String(agent.max_concurrent_tasks) ||
+    maxRunMinutes !== runTimeLimitMinutes(agent)
   const profileDirty =
     model !== (agent.model ?? '') ||
     systemPrompt !== (agent.prompt_template ?? '') ||
@@ -498,6 +517,20 @@ function AgentSettingsForm({
       setError('Max concurrent tasks must be a whole number greater than zero.')
       return
     }
+    const parsedMaxRunMinutes = maxRunMinutes.trim() ? Number(maxRunMinutes) : null
+    if (
+      parsedMaxRunMinutes !== null &&
+      (!Number.isSafeInteger(parsedMaxRunMinutes) || parsedMaxRunMinutes < 1)
+    ) {
+      setError('Max run time must be a whole number of minutes, or empty for no limit.')
+      return
+    }
+    // Only a changed limit writes config_json, so an unrelated save never
+    // rewrites the rest of the agent's config.
+    const configPatch =
+      maxRunMinutes !== runTimeLimitMinutes(agent)
+        ? { config_json: withRunTimeLimit(agent.config_json, parsedMaxRunMinutes) }
+        : {}
     setError(undefined)
     try {
       if (direct) {
@@ -515,6 +548,7 @@ function AgentSettingsForm({
               name: name.trim(),
               description: description.trim() ? description.trim() : null,
               max_concurrent_tasks: parsedMaxConcurrentTasks,
+              ...configPatch,
               version,
             },
           })
@@ -541,6 +575,7 @@ function AgentSettingsForm({
             name: name.trim(),
             description: description.trim() ? description.trim() : null,
             max_concurrent_tasks: parsedMaxConcurrentTasks,
+            ...configPatch,
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
             permission_policy: permissionPolicy,
@@ -629,6 +664,26 @@ function AgentSettingsForm({
               className="text-micro leading-4 text-muted-foreground"
             >
               Maximum task executions this agent may run at the same time.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="agent-settings-max-run-minutes">Max run time (minutes)</Label>
+            <Input
+              id="agent-settings-max-run-minutes"
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              value={maxRunMinutes}
+              onChange={(event) => setMaxRunMinutes(event.target.value)}
+              placeholder="No limit"
+              aria-describedby="agent-settings-max-run-minutes-help"
+            />
+            <p
+              id="agent-settings-max-run-minutes-help"
+              className="text-micro leading-4 text-muted-foreground"
+            >
+              Stops a task run that goes longer than this. Leave empty for no limit.
             </p>
           </div>
 

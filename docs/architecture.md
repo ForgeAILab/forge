@@ -757,8 +757,10 @@ turn a warning into owner death.
 
 `hard_deadline_at` is optional execution policy. By default it is `NULL`, so
 Forge imposes no wall-clock ceiling: the owner can keep the attempt live by
-renewing its short lease. A caller can opt one new execution into a limit with
-the positive `overrides.hard_deadline_seconds` value; Forge records the
+renewing its short lease. An agent's `config_json.hard_deadline_seconds`
+bounds each of its Task executions, and a caller can opt one new execution
+into a different limit with the positive `overrides.hard_deadline_seconds`
+value, which replaces the agent's; Forge records the
 resolved timestamp on that execution, and the first lease claim makes it
 immutable. Heartbeats are then clamped to the deadline and cannot extend it.
 Generic executor settings such as a shell command's `timeout_seconds` never
@@ -1529,9 +1531,20 @@ compaction while continuing to start without prior Task history or protected
 session reuse. SQLite implements the Agent
 Runtime LCM reader/writer contracts with host-minted view authority on every
 operation, immutable admitted entries, transactional DAG compare-and-swap,
-operation fingerprints, and restart recovery. Session rotation follows the
-same authorized timeline; histories from different canonical scopes cannot be
-opened or merged by possessing a timeline/node ID.
+operation fingerprints, and restart recovery. Histories from different
+canonical scopes cannot be opened or merged by possessing a timeline/node ID.
+
+A timeline records the runtime session that writes it. A restart suspends
+every native session, and the next turn opens a fresh runtime session (as does
+a session rotation) whose canonical history is rebuilt from the chat
+transcript. That history cannot continue another session's timeline: once the
+old timeline holds summary nodes the runtime cannot truncate the diverged
+tail, and every turn failed with "LCM source range overlaps an active node".
+So when a different runtime session binds a timeline that already has
+entries, the store retires it — the row keeps its entries and nodes, its
+`scope_id` gains a `#retired:<timeline id>` suffix, and `canonical_scope_id`
+keeps the original scope so Project deletion still removes it — and creates a
+fresh timeline for the new session.
 
 Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
 serialized canonical form, because the runtime's default sizer scans an
@@ -2243,8 +2256,12 @@ capability without creating another reviewer execution.
    `B.after_enter` hooks. Gate states with `max_rejections` get
    `check_retry_budget` prepended unless already present.
 5. Backfill `transition_log.hook_results_json`.
-6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
-   transition with `triggered_by = "system"`; cascade depth is limited to 3.
+6. If an entry/exit hook returns `HookResult::Cascade`, recursively transition
+   with `triggered_by = "system"`. Non-terminal cascades stop at depth eight
+   and publish `transition.cascade_depth_exceeded`; terminal targets always
+   complete because terminal states are absorbing. Eight allows the normal
+   `review → merging → merge_failed → review → merging → done` review-authority
+   carry chain plus another target-moved rebase round.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
 barrier until those hooks and the target state's inline `on_enter` dispatch
@@ -2254,6 +2271,20 @@ latest worker thread) records its execution. Task responses derive
 `awaiting_human` from the same Task snapshot as the returned optimistic
 `version`; a running barrier therefore cannot expose a gate decision using a
 version that the barrier-clear write is about to invalidate.
+
+The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
+runs `run_merge` when its last entry is at least two minutes old, it has no
+blocking annotation or running entry barrier, and no execution, merge hook, or
+completion cascade is running for the Task. Human approval gates and published
+pull requests awaiting a human/provider merge remain parked.
+Recovery uses the same versioned, same-state engine entry path as paused
+integration retries, so entry hooks and their normal success/failure cascades
+run again; a version conflict skips the tick. The merge hook is tracked through
+its target-moved rebase handling, so a slow in-flight merge is never raced.
+Integration recognizes a candidate already ancestral to the target as successful
+before comparing its reviewed base with the target tip, retaining the normal
+review-authority and candidate checks. This completes a merge whose terminal
+cascade was interrupted even if sibling merges subsequently moved the target.
 
 Terminal execution settlement is serialized per Task. If two executions for
 the same Task finish while one completion is cascading the workflow, the later

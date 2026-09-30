@@ -386,6 +386,144 @@ fn drain_events(rx: &mut broadcast::Receiver<ForgeEvent>) -> Vec<ForgeEvent> {
     events
 }
 
+fn cascade_chain_workflow(steps: usize) -> WorkflowDefinition {
+    let mut states = vec![with_trigger(
+        state("start", StateKind::Initial, None, StateHooks::default()),
+        WorkflowTrigger::Accept,
+        "step_0",
+    )];
+    for index in 0..steps {
+        let last = index + 1 == steps;
+        let mut step = with_trigger(
+            state(
+                &format!("step_{index}"),
+                StateKind::Active,
+                Some(default_roles::CODER),
+                StateHooks {
+                    on_enter: vec![hook(
+                        if last {
+                            "auto_cascade_on_completion"
+                        } else {
+                            "auto_cascade_on_unassigned_role"
+                        },
+                        FailurePolicy::Log,
+                    )],
+                    ..StateHooks::default()
+                },
+            ),
+            WorkflowTrigger::Accept,
+            &if last {
+                "done".to_owned()
+            } else {
+                format!("step_{}", index + 1)
+            },
+        );
+        step.gate_config = Some(GateConfig {
+            reject_target: None,
+            max_rejections: None,
+            approve_label: None,
+            reject_label: None,
+            requires_user_approval: Some(false),
+            optional_when_unassigned: Some(true),
+        });
+        states.push(step);
+    }
+    states.push(state(
+        "done",
+        StateKind::Terminal,
+        None,
+        StateHooks::default(),
+    ));
+    WorkflowDefinition {
+        roles: Vec::new(),
+        states,
+        configuration: Vec::new(),
+        cancellation_state: None,
+    }
+}
+
+#[tokio::test]
+async fn terminal_cascade_completes_at_depth_limit() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut events = event_bus.subscribe();
+    let task_id = "terminal-cascade-depth";
+    seed_project_repo_and_task(&db, task_id, "start").await;
+    // Entry into step_0 is depth 0; step_8 must still cascade into done.
+    // This also traverses the old depth-3 cutoff on the way there.
+    let workflow = cascade_chain_workflow(9);
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            task_id,
+            "step_0",
+            task.version,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start cascade chain",
+            false,
+        )
+        .await
+        .expect("terminal cascade completes");
+    assert_eq!(result.task.status, "done");
+    assert!(result.cascaded);
+    let transitions = TransitionLogRepo::list_by_task(&*db, task_id)
+        .await
+        .unwrap();
+    assert_eq!(transitions.len(), 10);
+    assert_eq!(transitions.last().unwrap().from_state, "step_8");
+    assert!(!drain_events(&mut events)
+        .iter()
+        .any(|event| { event.event_type == "transition.cascade_depth_exceeded" }));
+}
+
+#[tokio::test]
+async fn nonterminal_cascade_stops_at_depth_limit_and_publishes_event() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let mut events = event_bus.subscribe();
+    let task_id = "nonterminal-cascade-depth";
+    seed_project_repo_and_task(&db, task_id, "start").await;
+    let workflow = cascade_chain_workflow(10);
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            task_id,
+            "step_0",
+            task.version,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start cascade chain",
+            false,
+        )
+        .await
+        .expect("nonterminal cascade is bounded");
+    assert_eq!(result.task.status, "step_8");
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*db, task_id)
+            .await
+            .unwrap()
+            .len(),
+        9
+    );
+    let exceeded = drain_events(&mut events)
+        .into_iter()
+        .filter(|event| event.event_type == "transition.cascade_depth_exceeded")
+        .collect::<Vec<_>>();
+    assert_eq!(exceeded.len(), 1);
+    assert!(matches!(
+        &exceeded[0].context,
+        events::EventContext::TransitionCascadeDepthExceeded { state, depth: 8, .. }
+            if state == "step_8"
+    ));
+}
+
 #[tokio::test]
 async fn lifecycle_ordering() {
     let db = Arc::new(sqlite_db().await);

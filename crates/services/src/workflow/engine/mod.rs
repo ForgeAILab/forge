@@ -44,6 +44,11 @@ mod tests;
 /// is parked instead of rescheduled in a loop.
 pub(crate) const DISPATCH_FAILED_ANNOTATION: &str = "dispatch_failed";
 
+// review -> merging -> merge_failed -> review -> merging uses four cascades
+// when review authority carries after a target-moved rebase. Eight allows a
+// second such round plus its terminal completion, while bounding real loops.
+const MAX_CASCADE_DEPTH: u8 = 8;
+
 fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
     serde_json::json!({
         "type": DISPATCH_FAILED_ANNOTATION,
@@ -2365,7 +2370,9 @@ impl WorkflowEngine {
                     });
                 }
 
-                if depth >= 3 {
+                // Terminal states are absorbing: completing a cascade cannot
+                // loop, regardless of how many mechanical refreshes preceded it.
+                if depth >= MAX_CASCADE_DEPTH && !Self::is_terminal(workflow, &cascade_to) {
                     tracing::warn!(
                         task_id = %task.id,
                         state = %target_state,

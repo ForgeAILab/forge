@@ -7056,6 +7056,64 @@ async fn claim_task_records_execution_policy_overrides_in_snapshot() {
 }
 
 #[tokio::test]
+async fn claim_task_applies_agent_run_time_limit_unless_overridden() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(
+        &db,
+        "codex",
+        r#"{"model":"agent-model","hard_deadline_seconds":5400}"#,
+    )
+    .await;
+    let mut snapshots = Vec::new();
+    for overrides in [
+        None,
+        Some(ExecutionOverrides {
+            model_id: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            hard_deadline_seconds: Some(600),
+        }),
+    ] {
+        let task = service
+            .create_task(
+                project_id.clone(),
+                "Agent run time limit",
+                Some("unused".to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("task creates");
+        let claimed = service
+            .claim_task(task.id, Assignee::Agent(agent_id.clone()), overrides)
+            .await
+            .expect("task claims");
+        let execution = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        let snapshot: Value = serde_json::from_str(
+            execution
+                .executor_config_snapshot_json
+                .as_deref()
+                .expect("snapshot recorded"),
+        )
+        .expect("snapshot parses");
+        assert!(execution.hard_deadline_at.is_some());
+        assert!(snapshot["config"].get("hard_deadline_seconds").is_none());
+        snapshots.push(snapshot["hard_deadline_seconds"].clone());
+    }
+    assert_eq!(snapshots, vec![json!(5400), json!(600)]);
+}
+
+#[tokio::test]
 async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

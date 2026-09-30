@@ -19,9 +19,10 @@ use agent_runtime::{
     registry::{Fingerprint, RegistryRevision, TrustClass},
 };
 use db::{
-    AgentChatRepo, AgentContextScopeRepo, AgentRepo, AgentSessionRepo, AgentStatus, CreateAgent,
-    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CreateProject, CreateTask, ProjectRepo, RotateAgentSession, SqliteDb, TaskRepo, now_rfc3339,
+    AgentChatRepo, AgentContextScopeRepo, AgentLcmRepo, AgentRepo, AgentSessionRepo, AgentStatus,
+    CreateAgent, CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile,
+    CreateAgentSession, CreateProject, CreateTask, ProjectRepo, RotateAgentSession, SqliteDb,
+    TaskRepo, now_rfc3339,
 };
 use forge_agent_host::{
     AGENT_RUNTIME_REVISION, ContentGuardRevision, RuntimeContextManifestLink, Sensitivity,
@@ -72,6 +73,7 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
         "account",
         "account-1",
         "test-auth",
+        None,
         "2026-08-12T00:00:00Z",
     )
     .await
@@ -145,6 +147,7 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
         "account",
         "account-1",
         "test-auth",
+        None,
         "2026-08-12T00:00:00Z",
     )
     .await
@@ -215,6 +218,7 @@ async fn task_projection_preserves_tool_pairs_and_provenance() {
         "task",
         "task-1",
         "task-auth-1",
+        None,
         "2026-08-12T00:00:00Z",
     )
     .await
@@ -326,7 +330,7 @@ async fn task_projection_preserves_tool_pairs_and_provenance() {
 }
 
 #[tokio::test]
-async fn runtime_session_rotation_restart_preserves_scope_timeline_and_isolation() {
+async fn runtime_session_rotation_restart_isolates_scope_timelines() {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool");
@@ -560,18 +564,21 @@ async fn runtime_session_rotation_restart_preserves_scope_timeline_and_isolation
         .lcm_store_for_runtime_session("continuity-chat-runtime-2", "agent_chat", &chat_id)
         .await
         .expect("rotated Agent Chat runtime binding");
-    assert_eq!(chat_before.timeline_id(), chat_after.timeline_id());
+    // The rotated runtime rebuilds its history from the chat transcript, so
+    // it cannot continue the predecessor's timeline. That timeline is retired
+    // with its rows intact and the replacement starts a fresh one.
+    assert_ne!(chat_before.timeline_id(), chat_after.timeline_id());
     assert_eq!(
         chat_after
             .current_revision(&chat_after.view())
             .await
             .unwrap()
             .get(),
-        1
+        0
     );
     assert_eq!(
-        chat_after
-            .load_range(&chat_after.view(), LcmRange::single(LcmSequence::new(0)), 4)
+        chat_before
+            .load_range(&chat_view, LcmRange::single(LcmSequence::new(0)), 4)
             .await
             .unwrap(),
         vec![entry]
@@ -777,6 +784,7 @@ async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entr
         "account",
         "account-1",
         "test-auth",
+        None,
         "2026-08-12T00:00:00Z",
     )
     .await
@@ -864,4 +872,159 @@ async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entr
         store.truncate_from(&view, LcmSequence::new(0)).await,
         Err(agent_runtime::lcm::LcmError::RangeOverlap)
     ));
+}
+
+#[tokio::test]
+async fn replacement_runtime_session_retires_a_summarized_timeline() {
+    let pool = db::create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool");
+    db::run_migrations(&pool).await.expect("migrations");
+    let db = Arc::new(SqliteDb::new(pool));
+    AgentRepo::create(
+        &*db,
+        CreateAgent {
+            id: "replacement-agent".to_owned(),
+            name: "Replacement Agent".to_owned(),
+            description: None,
+            executor_type: "codex".to_owned(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "account".to_owned(),
+            created_at: "2026-08-12T00:00:00Z".to_owned(),
+            updated_at: "2026-08-12T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("identity");
+
+    let store = SqliteLcmStore::open_for_binding(
+        Arc::clone(&db),
+        "replacement-agent",
+        "account",
+        "account-1",
+        "test-auth",
+        Some(db::AgentLcmSessionClaim {
+            runtime_session_id: "runtime-a".to_owned(),
+            session_created_at: "2026-08-12T00:00:00Z".to_owned(),
+        }),
+        "2026-08-12T00:00:00Z",
+    )
+    .await
+    .expect("store");
+    let view = store.view();
+    let entry = LcmEntry::new(
+        LcmTimelineId::new(store.timeline_id()),
+        LcmEntryId::new("entry-0"),
+        LcmSequence::new(0),
+        Message::user("message 0"),
+        LcmSourceMetadata::new(LcmClassification::new(
+            agent_runtime::context::Sensitivity::Internal,
+            TrustClass::UserContent,
+        )),
+    );
+    store
+        .append(
+            &view,
+            LcmAppendRequest::new(LcmOperationId::new("append-0"), vec![entry.clone()]),
+        )
+        .await
+        .expect("append");
+    store
+        .commit_leaf(
+            &view,
+            LeafCommit {
+                expected_revision: store.current_revision(&view).await.expect("revision"),
+                operation_id: LcmOperationId::new("leaf-0"),
+                node_id: LcmNodeId::new("node-0"),
+                range: LcmRange::single(LcmSequence::new(0)),
+                entry_ids: vec![entry.id.clone()],
+                source_fingerprint: source_fingerprint_entries(std::slice::from_ref(&entry)),
+                summary: "covered".to_owned(),
+                token_count: 1,
+                source_token_count: 8,
+                policy_revision: RegistryRevision::new("policy-1"),
+                algorithm_revision: RegistryRevision::new("algorithm-1"),
+                sizer_revision: RegistryRevision::new("sizer-1"),
+                provenance: SummaryProvenance::Deterministic {
+                    revision: RegistryRevision::new("deterministic-1"),
+                },
+                classification: LcmClassification::new(
+                    agent_runtime::context::Sensitivity::Internal,
+                    TrustClass::UserContent,
+                ),
+                operation_fingerprint: None,
+            },
+        )
+        .await
+        .expect("leaf");
+    let original = store.timeline_id().to_owned();
+
+    let open = |runtime_session_id: &str, session_created_at: &str| {
+        SqliteLcmStore::open_for_binding(
+            Arc::clone(&db),
+            "replacement-agent",
+            "account",
+            "account-1",
+            "test-auth",
+            Some(db::AgentLcmSessionClaim {
+                runtime_session_id: runtime_session_id.to_owned(),
+                session_created_at: session_created_at.to_owned(),
+            }),
+            "2026-08-13T00:00:00Z",
+        )
+    };
+
+    // The owning session keeps its timeline across reopen.
+    let same = open("runtime-a", "2026-08-12T00:00:00Z")
+        .await
+        .expect("owner reopens");
+    assert_eq!(same.timeline_id(), original);
+
+    // A replacement session cannot continue a summarized timeline it did not
+    // write: it gets a fresh one, and the old one keeps its rows.
+    let replacement = open("runtime-b", "2026-08-13T00:00:00Z")
+        .await
+        .expect("replacement opens");
+    assert_ne!(replacement.timeline_id(), original);
+    assert_eq!(
+        replacement
+            .current_revision(&replacement.view())
+            .await
+            .expect("revision")
+            .get(),
+        0
+    );
+    let retired = AgentLcmRepo::get_lcm_timeline(&*db, &original)
+        .await
+        .expect("read retired")
+        .expect("retired timeline kept");
+    assert_eq!(retired.scope_id, format!("account-1#retired:{original}"));
+    assert_eq!(
+        AgentLcmRepo::list_lcm_entries(&*db, &original, 0, 0, 8)
+            .await
+            .expect("retired entries")
+            .len(),
+        1
+    );
+
+    // The replacement then owns the scope; reopening does not retire again.
+    let reopened = open("runtime-b", "2026-08-13T00:00:00Z")
+        .await
+        .expect("replacement reopens");
+    assert_eq!(reopened.timeline_id(), replacement.timeline_id());
 }

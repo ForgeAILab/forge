@@ -55,6 +55,7 @@ pub async fn register_agent(
         None
     };
 
+    validate_agent_config_json(request.config_json.as_ref())?;
     let agent = state
         .agent_service
         .register(
@@ -176,6 +177,25 @@ pub async fn list_agent_tasks(
     }))
 }
 
+/// Rejects an agent-level run time limit every claim would then refuse:
+/// `hard_deadline_seconds` is a positive whole number of seconds, or absent /
+/// null for no limit.
+fn validate_agent_config_json(config: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    let Some(value) = config.and_then(|config| config.get("hard_deadline_seconds")) else {
+        return Ok(());
+    };
+    if value.is_null()
+        || value
+            .as_u64()
+            .is_some_and(|seconds| seconds > 0 && u32::try_from(seconds).is_ok())
+    {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "config_json.hard_deadline_seconds must be a positive whole number of seconds, or omitted for no limit",
+    ))
+}
+
 pub async fn update_agent(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -186,6 +206,7 @@ pub async fn update_agent(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_manageable(&existing, &user, &id)?;
+    validate_agent_config_json(request.config_json.as_ref())?;
     if !user.is_admin
         && request
             .daemon_id

@@ -21,6 +21,7 @@ use services::{
     task_diagnostics::{
         compare_running_execution_authority, count_gate_rejections_since_boundary,
         derive_workflow_exception_with_running_interactive, derive_workflow_health,
+        disable_recovery_while_running,
     },
     task_service::action_resolver::{
         has_open_interactive_launch_authority, list_execution_action_authority,
@@ -482,6 +483,10 @@ async fn task_response_inner(
         .or(running_current_role_execution)
         .or(active_execution)
         .or_else(|| latest_execution.clone());
+    let running_role_execution = running_executions
+        .iter()
+        .filter(|execution| execution.role != "interactive")
+        .max_by(|left, right| compare_running_execution_authority(left, right));
     let workflow_exception = derive_workflow_exception_with_running_interactive(
         &task,
         workflow,
@@ -492,7 +497,8 @@ async fn task_response_inner(
         open_interactive_target,
         open_interactive_launch_authority,
         &remaining_retries,
-    );
+    )
+    .map(|exception| disable_recovery_while_running(exception, running_role_execution));
     let workflow_health = Some(derive_workflow_health(
         &task,
         workflow,

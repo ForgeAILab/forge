@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
+use api_types::{Actor, StateDefinition, StateKind, SystemComponent, WorkflowDefinition};
 use db::{
     AgentRepo, DbError, ExecutionRepo, ExecutionStatus, PageRequest, Project, ReviewRepo, SortBy,
-    SortOrder, Task, TaskRepo, TaskRoleAssignmentRepo,
+    SortOrder, Task, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo,
 };
 
 use crate::{
@@ -31,6 +31,8 @@ enum ReviewerReconciliation {
 }
 
 impl TaskDispatcher {
+    const MERGE_RECOVERY_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
     pub(super) async fn recover_active_tasks(
         &self,
         project: &Project,
@@ -166,6 +168,28 @@ impl TaskDispatcher {
             else {
                 continue;
             };
+            if state.kind == StateKind::Gate
+                && state
+                    .hooks
+                    .on_enter
+                    .iter()
+                    .any(|hook| hook.action == "run_merge")
+            {
+                match self
+                    .recover_merge_gate(project, &task_workflow, state, &task)
+                    .await
+                {
+                    Ok(true) => dispatched += 1,
+                    Ok(false) => {}
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(task_id = %task.id, "merge gate recovery lost version race");
+                    }
+                    Err(error) => {
+                        tracing::warn!(task_id = %task.id, %error, "merge gate recovery failed");
+                    }
+                }
+                continue;
+            }
             let active_plan_claim =
                 crate::task_service::execution::active_plan_publication_claim_owner(&task)?;
             if helpers::has_blocking_annotation(&task) && active_plan_claim.is_none() {
@@ -308,6 +332,55 @@ impl TaskDispatcher {
             }
         }
         Ok(dispatched)
+    }
+
+    async fn recover_merge_gate(
+        &self,
+        project: &Project,
+        workflow: &WorkflowDefinition,
+        state: &StateDefinition,
+        task: &Task,
+    ) -> Result<bool> {
+        if helpers::has_blocking_annotation(task)
+            || helpers::awaiting_human(task)
+            || task.entry_barrier_is_running()
+            || state
+                .gate_config
+                .as_ref()
+                .is_some_and(|config| config.requires_user_approval())
+            || !ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+                .await?
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        if !self.task_service.merge_hook_available(&task.id) {
+            return Ok(false);
+        }
+        let transitions = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let Some(entry) = transitions
+            .iter()
+            .rev()
+            .find(|entry| entry.to_state == task.status)
+        else {
+            return Ok(false);
+        };
+        let Ok(entered_at) = chrono::DateTime::parse_from_rfc3339(&entry.created_at) else {
+            return Ok(false);
+        };
+        if chrono::Utc::now().signed_duration_since(entered_at) < Self::MERGE_RECOVERY_GRACE {
+            return Ok(false);
+        }
+        // A reviewer completion owns this slot through the whole inline
+        // cascade, including time between the merge hook and its done hop.
+        let Some(_cascade_slot) = self.task_service.claim_completion_cascade(&task.id) else {
+            return Ok(false);
+        };
+        tracing::info!(task_id = %task.id, state = %task.status, "re-driving stale merge gate");
+        self.task_service
+            .retry_merge_state_entry(task, project, workflow, "recover interrupted merge gate")
+            .await?;
+        Ok(true)
     }
 
     /// Reconcile a completed non-reviewer before considering a fresh attempt.
