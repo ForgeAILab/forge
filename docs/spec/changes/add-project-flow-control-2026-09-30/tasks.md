@@ -35,5 +35,5 @@ completed_at:
 ## 4. Release
 - [x] 4.1 `docs/architecture.md` (dispatcher pause/admission, state machine notes), `docs/api.md`, `docs/cli.md`
 - [x] 4.2 CHANGELOG `Unreleased` → `### Breaking` (default limit 5; environment failures pause the Project)
-- [ ] 4.3 Relevant `happy_path` case(s) green
+- [x] 4.3 Relevant `happy_path` case(s) green
 - [ ] 4.4 Live check on NovelKit: pause on low disk, auto-resume, slot cap holds at 5, a NK-48-style review parks after one attempt

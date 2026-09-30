@@ -250,7 +250,7 @@ impl TaskDispatcher {
                 .await
             {
                 Ok(true) => {
-                    deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    self.clear_dispatch_disposition(&task).await?;
                     dispatched += 1;
                 }
                 Ok(false) => {}

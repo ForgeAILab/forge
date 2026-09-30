@@ -146,6 +146,15 @@ pub trait TaskRepo: Send + Sync {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task>;
+    /// Also report whether the mutations changed stored metadata, under the
+    /// same write lock. Conditional no-ops must not trigger refresh events.
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)>;
     /// Apply key-level metadata mutations under a Task version CAS and bump
     /// that version when anything changes. Use this for metadata that grants
     /// exclusive authority over a subsequent side effect: an already-started

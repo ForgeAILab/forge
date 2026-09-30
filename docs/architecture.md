@@ -2277,6 +2277,8 @@ Capacity waits record `project_capacity` dispatch dispositions with
 `project_at_capacity` or `project_waiting_on_owner`; `workflow_health` projects
 the current message and reason to cards and Task detail. Unlike sticky role
 refusals, these waits are reconsidered every tick as other Tasks free capacity.
+Recording a changed capacity disposition or clearing one publishes `task.updated`
+to refresh cards, Task detail, and Project slot usage; unchanged ticks emit nothing.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 

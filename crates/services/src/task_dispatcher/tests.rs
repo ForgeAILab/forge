@@ -4659,6 +4659,90 @@ async fn set_project_active_task_limit(db: &db::SqliteDb, project_id: &str, limi
 }
 
 #[tokio::test]
+async fn dispatcher_project_capacity_disposition_refreshes_only_on_change() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    seed_task(&db, &project_id, "admitted", "in_progress", 0).await;
+    let queued = seed_task(&db, &project_id, "queued", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    let project = set_project_active_task_limit(&db, &project_id, 1).await;
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    let mut events = dispatcher.event_bus.subscribe();
+
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    let recorded = events.try_recv().unwrap();
+    assert_eq!(recorded.event_type, "task.updated");
+    assert_eq!(recorded.entity_id, queued.id);
+    assert!(matches!(
+        recorded.context,
+        events::EventContext::TaskUpdated { project_id: id } if id == project_id
+    ));
+    assert!(
+        events.try_recv().is_err(),
+        "first record emits exactly once"
+    );
+    let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        deferred_dispatch::current_dispatch_disposition(&waiting)
+            .unwrap()
+            .capability,
+        "project_capacity"
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(events.try_recv().is_err(), "unchanged tick emits nothing");
+    assert!(rx.try_recv().is_err());
+
+    dispatcher
+        .clear_dispatch_disposition(&waiting)
+        .await
+        .unwrap();
+    let cleared = events.try_recv().unwrap();
+    assert_eq!(cleared.event_type, "task.updated");
+    assert_eq!(cleared.entity_id, queued.id);
+    assert!(matches!(
+        cleared.context,
+        events::EventContext::TaskUpdated { project_id: id } if id == project_id
+    ));
+    assert!(events.try_recv().is_err(), "clear emits exactly once");
+    let after_clear = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::dispatch_disposition(&after_clear).is_none());
+
+    // Even a stale clearer still carrying the marker must not emit again.
+    dispatcher
+        .clear_dispatch_disposition(&waiting)
+        .await
+        .unwrap();
+    dispatcher
+        .clear_dispatch_disposition(&after_clear)
+        .await
+        .unwrap();
+    assert!(events.try_recv().is_err(), "no-op clears emit nothing");
+}
+
+#[tokio::test]
 async fn dispatcher_full_project_rechecks_capacity_without_task_version_change() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().unwrap();

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
 use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
+use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
@@ -27,6 +28,26 @@ pub(super) struct InitialScheduleTarget {
 }
 
 impl TaskDispatcher {
+    fn publish_capacity_disposition_change(&self, task: &Task) {
+        self.event_bus.publish(ForgeEvent {
+            event_type: "task.updated".to_owned(),
+            entity_id: task.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskUpdated {
+                project_id: task.project_id.clone(),
+            },
+        });
+    }
+
+    pub(super) async fn clear_dispatch_disposition(&self, task: &Task) -> Result<()> {
+        let capacity_wait = deferred_dispatch::dispatch_disposition(task)
+            .is_some_and(|disposition| disposition.capability == "project_capacity");
+        if deferred_dispatch::clear_dispatch_disposition(&self.db, task).await? && capacity_wait {
+            self.publish_capacity_disposition_change(task);
+        }
+        Ok(())
+    }
+
     /// Attempt one coordination-root aggregate-review advance, quiescing on a
     /// deterministic refusal.
     ///
@@ -50,7 +71,7 @@ impl TaskDispatcher {
         }
         match self.task_service.advance_coordination_root(&task.id).await {
             Ok(()) => {
-                deferred_dispatch::clear_dispatch_disposition(&self.db, task).await?;
+                self.clear_dispatch_disposition(task).await?;
                 Ok(1)
             }
             Err(ServiceError::Db(DbError::VersionConflict)) => {
@@ -199,26 +220,21 @@ impl TaskDispatcher {
                 // Capacity can change without changing this Task's version.
                 // Keep it outside the sticky role capability and re-check on
                 // every tick, writing only when the reason actually changes.
-                let identical = deferred_dispatch::current_dispatch_disposition(&task).is_some_and(
-                    |disposition| {
-                        disposition.capability == "project_capacity"
-                            && disposition.safe_message == message
-                    },
-                );
-                if !identical {
-                    deferred_dispatch::record_dispatch_disposition(
-                        &self.db,
-                        &task,
-                        "project_capacity",
-                        &message,
-                    )
-                    .await?;
+                if deferred_dispatch::record_dispatch_disposition(
+                    &self.db,
+                    &task,
+                    "project_capacity",
+                    &message,
+                )
+                .await?
+                {
+                    self.publish_capacity_disposition_change(&task);
                 }
                 continue;
             }
             match self.dispatch_initial_task(&task, &target).await {
                 Ok(true) => {
-                    deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    self.clear_dispatch_disposition(&task).await?;
                     slots.active += 1;
                     dispatched += 1;
                 }
