@@ -655,6 +655,30 @@ describe('FederatedAgentsPage', () => {
     expect(connectProfile).not.toHaveBeenCalled()
   })
 
+  it('sets and clears an agent max run time through config_json', async () => {
+    updateAgent.mockResolvedValueOnce({ ...agent, version: 2 })
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+
+    const field = screen.getByLabelText('Max run time (minutes)') as HTMLInputElement
+    expect(field.value).toBe('')
+    fireEvent.change(field, { target: { value: '90' } })
+    fireEvent.click(screen.getByRole('button', { name: /save settings/i }))
+
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-1',
+        body: {
+          name: 'Forge Guide',
+          description: 'A bounded account assistant.',
+          max_concurrent_tasks: 1,
+          config_json: { hard_deadline_seconds: 5400 },
+          version: 1,
+        },
+      }),
+    )
+  })
+
   it('deletes an agent after confirmation and clears the detail selection', async () => {
     renderPage()
     fireEvent.click(screen.getByText('Forge Guide'))

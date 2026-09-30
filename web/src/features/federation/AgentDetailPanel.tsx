@@ -525,7 +525,12 @@ function AgentSettingsForm({
       setError('Max run time must be a whole number of minutes, or empty for no limit.')
       return
     }
-    const configJson = withRunTimeLimit(agent.config_json, parsedMaxRunMinutes)
+    // Only a changed limit writes config_json, so an unrelated save never
+    // rewrites the rest of the agent's config.
+    const configPatch =
+      maxRunMinutes !== runTimeLimitMinutes(agent)
+        ? { config_json: withRunTimeLimit(agent.config_json, parsedMaxRunMinutes) }
+        : {}
     setError(undefined)
     try {
       if (direct) {
@@ -543,7 +548,7 @@ function AgentSettingsForm({
               name: name.trim(),
               description: description.trim() ? description.trim() : null,
               max_concurrent_tasks: parsedMaxConcurrentTasks,
-              config_json: configJson,
+              ...configPatch,
               version,
             },
           })
@@ -570,7 +575,7 @@ function AgentSettingsForm({
             name: name.trim(),
             description: description.trim() ? description.trim() : null,
             max_concurrent_tasks: parsedMaxConcurrentTasks,
-            config_json: configJson,
+            ...configPatch,
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
             permission_policy: permissionPolicy,
