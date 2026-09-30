@@ -2200,6 +2200,299 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
     );
 }
 
+struct FailedCiFixture {
+    db: Arc<SqliteDb>,
+    engine: WorkflowEngine,
+    workflow: WorkflowDefinition,
+    task: db::Task,
+    workspace: db::Workspace,
+    _repo_dir: TempDir,
+    _workspace_root: TempDir,
+}
+
+impl FailedCiFixture {
+    async fn workflow_authority(&self) -> super::WorkflowAuthority {
+        // Match TaskService's transition entry: review hooks require the
+        // current Project snapshot before they can create a Review attempt.
+        // Read it here because a test may change the workflow after setup.
+        let project = ProjectRepo::get_by_id(&*self.db, &self.task.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        super::WorkflowAuthority {
+            project_version: project.version,
+            workflow_definition: project.workflow_definition,
+            clear_review_passed_at_on_commit: false,
+        }
+    }
+}
+
+async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixture {
+    let db = Arc::new(sqlite_db().await);
+    let task_id = new_uuid_v4();
+    seed_project_repo_and_task(&db, &task_id, "merge_failed").await;
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_root = TempDir::new().unwrap();
+    initialize_git_repo(repo_dir.path());
+    let mut workflow = default_workflow::default_workflow();
+    let review_state = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap();
+    review_state
+        .hooks
+        .before_enter
+        .iter_mut()
+        .find(|hook| hook.action == "run_ci_steps")
+        .unwrap()
+        .on_failure = policy;
+    // Task-level budget must win over the gate's default.
+    review_state.gate_config.as_mut().unwrap().max_rejections = Some(99);
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE repo SET local_path = ?, remote_url = ? WHERE project_id = ?")
+        .bind(repo_dir.path().to_string_lossy().as_ref())
+        .bind(repo_dir.path().to_string_lossy().as_ref())
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"retry_budgets":{"review":budget}, "review":{"ci_steps":["echo 'entry-ci-failed [conflict-handoff]'; exit 101"]}}).to_string())
+        .bind(&task.id).execute(db.pool()).await.unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = crate::task_service::workspace::prepare_workspace(
+        &db,
+        workspace_root.path(),
+        &task,
+        &task.id,
+        None,
+    )
+    .await
+    .unwrap();
+    let sha = git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    db::ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: default_roles::CODER.to_owned(),
+            status: db::ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: Some(sha.clone()),
+            after_sha: Some(sha),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let mut eng = engine(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    eng.workspace_root = workspace_root.path().to_path_buf();
+    eng.task_service = eng
+        .task_service
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    FailedCiFixture {
+        db,
+        engine: eng,
+        workflow,
+        task,
+        workspace,
+        _repo_dir: repo_dir,
+        _workspace_root: workspace_root,
+    }
+}
+
+#[tokio::test]
+async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
+    // Log-policy hooks used by existing Projects must settle the same verdict
+    // as the current blocking entry hook. Also exercise deleted-tree recovery.
+    for (policy, requires_approval) in [(FailurePolicy::Block, false), (FailurePolicy::Log, true)] {
+        let mut fixture = failed_ci_fixture(3, policy).await;
+        fixture
+            .workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == "review")
+            .unwrap()
+            .gate_config
+            .as_mut()
+            .unwrap()
+            .requires_user_approval = Some(requires_approval);
+        sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+            .bind(serde_json::to_string(&fixture.workflow).unwrap())
+            .bind(&fixture.task.project_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&fixture.workspace.worktree_path).unwrap();
+        let result = fixture
+            .engine
+            .transition_with_authority(
+                &fixture.task.id,
+                "review",
+                fixture.task.version,
+                &fixture.workflow,
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
+                "user action",
+                false,
+                fixture.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.task.status, "in_progress");
+        assert!(result.task.entry_barrier_json.is_none());
+        assert!(result.task.blocked_json.is_none());
+        let review = result.review.unwrap();
+        assert_eq!(review.status, db::ReviewStatus::Failed);
+        let details: serde_json::Value = serde_json::from_str(&review.step_results_json).unwrap();
+        assert_eq!(details["ci_steps"][0]["exit_code"], 101);
+        let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap();
+        let rejection = entries
+            .iter()
+            .find(|entry| entry.from_state == "review" && entry.rejection)
+            .unwrap();
+        assert_eq!(rejection.to_state, "in_progress");
+        // CI diagnostics use the stored zero-based step index. Check the
+        // stable prefix, including the command, without depending on output.
+        assert!(
+            rejection.trigger_reason.starts_with(
+                "CI step 0 failed (exit 101): `echo 'entry-ci-failed [conflict-handoff]'; exit 101`"
+            ),
+            "unexpected CI rejection reason: {}",
+            rejection.trigger_reason,
+        );
+        assert_eq!(
+            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+            1
+        );
+        assert!(std::path::Path::new(&fixture.workspace.worktree_path).exists());
+    }
+}
+
+#[tokio::test]
+async fn system_review_ci_failure_records_review_budget_exhausted_blocker() {
+    let fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "repair completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "review");
+    assert!(result.task.entry_barrier_json.is_none());
+    assert!(result.task.blocked_json.is_some());
+    let annotation: serde_json::Value =
+        serde_json::from_str(result.task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["type"], "review_budget_exhausted");
+    let review = result.review.unwrap();
+    assert_eq!(review.status, db::ReviewStatus::Failed);
+    let details: serde_json::Value = serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 101);
+}
+
+#[tokio::test]
+async fn retry_review_entry_ci_failure_routes_to_coder_with_rejection() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    sqlx::query("UPDATE task SET status = 'review', entry_barrier_json = ? WHERE id = ?")
+        .bind(json!({"state":"review", "status":"blocked", "started_at":now_rfc3339()}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let result = fixture
+        .engine
+        .retry_entry_barrier(
+            &fixture.task.id,
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "retry checks",
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "in_progress");
+    assert!(result.task.entry_barrier_json.is_none());
+    assert_eq!(result.review.unwrap().status, db::ReviewStatus::Failed);
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn user_review_ci_success_still_waits_for_human() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"review":{"ci_steps":["test -d ."]}}"#)
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "request human review",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "review");
+    assert!(result.task.entry_barrier_json.is_none());
+    assert!(!result.cascaded);
+    let review = result.review.unwrap();
+    assert_eq!(review.status, db::ReviewStatus::AwaitingHuman);
+    let details: serde_json::Value = serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+}
+
 #[tokio::test]
 async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
     let db = Arc::new(sqlite_db().await);

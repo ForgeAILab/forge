@@ -444,3 +444,112 @@ async fn is_awaiting_human_stays_false_while_review_entry_barrier_is_running() {
         "the gate becomes ready once the entry barrier has cleared"
     );
 }
+
+#[tokio::test]
+async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(32));
+    let workspace_root = TempDir::new().unwrap();
+    let runner = Arc::new(::review::ReviewRunner::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Arc::new(executors::AdapterRegistry::new()),
+    ));
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_review_runner(runner);
+    let (project_id, _, repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"review":{"ci_steps":["test -f candidate.txt && cat candidate.txt"]}}"#)
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
+        .await
+        .unwrap();
+    let worktree_path = std::path::Path::new(&workspace.worktree_path);
+    std::fs::write(
+        worktree_path.join("candidate.txt"),
+        "preserved candidate branch\n",
+    )
+    .unwrap();
+    run_git(worktree_path, &["add", "candidate.txt"]);
+    run_git(
+        worktree_path,
+        &["commit", "-m", "candidate branch evidence"],
+    );
+    let sha = git::get_current_sha(worktree_path).await.unwrap();
+    let now = now_rfc3339();
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: workspace.before_sha.clone(),
+            after_sha: Some(sha.clone()),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    // Reproduce the live layout: the Task directory/outbox remains but the
+    // linked checkout and Git's worktree registration have disappeared.
+    std::fs::create_dir_all(worktree_path.parent().unwrap().join(".forge-outbox")).unwrap();
+    std::fs::remove_dir_all(worktree_path).unwrap();
+    run_git(repo_dir.path(), &["worktree", "prune"]);
+    assert!(git::branch_exists(repo_dir.path(), &workspace.branch)
+        .await
+        .unwrap());
+
+    let (settled, review) = service
+        .rerun_review(Uuid::parse_str(&task.id).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(settled.status, "merging");
+    assert_eq!(review.status, ReviewStatus::Passed);
+    assert_eq!(review.execution_id, execution.id);
+    // CI-only reruns persist the step array directly; the workflow entry
+    // hook and auditor reviews use an object containing `ci_steps` instead.
+    let steps: Vec<Value> = serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0]["index"], 0);
+    assert_eq!(
+        steps[0]["command"],
+        "test -f candidate.txt && cat candidate.txt"
+    );
+    assert_eq!(steps[0]["exit_code"], 0);
+    assert!(steps[0]["output_tail"]
+        .as_str()
+        .unwrap()
+        .contains("preserved candidate branch"));
+    let recovered = WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, workspace.id);
+    assert_eq!(recovered.branch, workspace.branch);
+    assert_eq!(git::get_current_sha(worktree_path).await.unwrap(), sha);
+}

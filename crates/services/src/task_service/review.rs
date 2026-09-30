@@ -231,12 +231,17 @@ impl TaskService {
             return Ok(None);
         };
         let execution = self.latest_executor_execution(&task.id).await?;
-        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+        execution.workspace_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("executor execution missing workspace_id")
         })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let workspace = prepare_workspace(
+            &self.db,
+            &self.workspace_root,
+            task,
+            &task.id,
+            self.repo_cache_locks.clone(),
+        )
+        .await?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?

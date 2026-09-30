@@ -44,6 +44,11 @@ mod tests;
 /// is parked instead of rescheduled in a loop.
 pub(crate) const DISPATCH_FAILED_ANNOTATION: &str = "dispatch_failed";
 
+struct ReviewEntryFailure {
+    task: db::Task,
+    cascade: Option<(String, String)>,
+}
+
 // review -> merging -> merge_failed -> review -> merging uses four cascades
 // when review authority carries after a target-moved rebase. Eight allows a
 // second such round plus its terminal completion, while bounding real loops.
@@ -302,6 +307,50 @@ impl WorkflowEngine {
             )
             .await?),
         }
+    }
+
+    /// CI has already finalized the Review and invalidated acceptance. Settle
+    /// that verdict even when this hook uses Log rather than Block, and use
+    /// the same remediation budget as reviewer completion and explicit reruns.
+    async fn settle_failed_ci_entry(
+        &self,
+        task: &db::Task,
+        action: &str,
+        actor: &Actor,
+        entry_started_at: &str,
+        authority: Option<&WorkflowAuthority>,
+    ) -> crate::Result<Option<ReviewEntryFailure>> {
+        if action != "run_ci_steps" || actor.is_user() {
+            return Ok(None);
+        }
+        let Some(review) = latest_review(&self.db, &task.id).await? else {
+            return Ok(None);
+        };
+        if review.status != db::ReviewStatus::Failed {
+            return Ok(None);
+        }
+        // A configuration/runner failure before attempt creation must not
+        // route a failed Review left over from an earlier state entry.
+        if review.started_at.as_str() < entry_started_at {
+            return Ok(None);
+        }
+        let task = self
+            .set_entry_barrier_with_authority(
+                &task.id,
+                task.version,
+                None,
+                &now_rfc3339(),
+                authority,
+            )
+            .await?;
+        let (task, target, reason) = self
+            .task_service
+            .review_failure_target(&task, Some(&review.execution_id))
+            .await?;
+        Ok(Some(ReviewEntryFailure {
+            task,
+            cascade: target.map(|target| (target, reason)),
+        }))
     }
 
     #[tracing::instrument(
@@ -685,6 +734,7 @@ impl WorkflowEngine {
         };
 
         let mut cascade: Option<(String, String)> = None;
+        let mut ci_rejection_cascade = false;
         let mut blocked = false;
         for hook in &state.hooks.before_enter {
             if !hook_audience_matches(hook.applies_to, actor) {
@@ -723,6 +773,22 @@ impl WorkflowEngine {
             );
             match result {
                 HookResult::Failed { reason: error } => {
+                    if let Some(settled) = self
+                        .settle_failed_ci_entry(
+                            &task,
+                            &hook.action,
+                            actor,
+                            &retry_started_at,
+                            Some(&authority),
+                        )
+                        .await?
+                    {
+                        task = settled.task;
+                        cascade = settled.cascade.map(|(target, _)| (target, error.clone()));
+                        ci_rejection_cascade = cascade.is_some();
+                        blocked = cascade.is_none();
+                        break;
+                    }
                     if matches!(hook.on_failure, FailurePolicy::Block) {
                         let blocked_at = now_rfc3339();
                         let blocked_barrier = serde_json::json!({
@@ -855,7 +921,7 @@ impl WorkflowEngine {
                     workflow,
                     Actor::system(api_types::SystemComponent::Workflow),
                     cascade_reason,
-                    false,
+                    ci_rejection_cascade,
                     false,
                     None,
                     None,
@@ -1908,6 +1974,19 @@ impl WorkflowEngine {
                                 },
                             });
 
+                            if let Some(settled) = self
+                                .settle_failed_ci_entry(
+                                    &task, &hook.action, &actor, &entry_barrier_started_at, authority.as_ref(),
+                                )
+                                .await?
+                            {
+                                task = settled.task;
+                                cascade = settled.cascade.map(|(target, _)| (target, error.clone()));
+                                before_enter_rejection_cascade = cascade.is_some();
+                                skip_target_enter_hooks = true;
+                                break;
+                            }
+
                             if matches!(hook.on_failure, FailurePolicy::Block) {
                                 if target_state == crate::workflow::default_states::REVIEW {
                                     if let Some(reject_target) = to_state
@@ -2395,13 +2474,14 @@ impl WorkflowEngine {
                     task = TaskRepo::get_by_id(&*self.db, &task_id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-                    let cascade_rejection = to_state.kind == StateKind::Gate
-                        && !cascade_reason.starts_with("gate skipped:")
-                        && !cascade_reason
-                            .contains(crate::workflow::REVIEW_REFRESH_MARKER)
-                        && !cascade_reason
-                            .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
-                        && !Self::is_terminal(workflow, &cascade_to);
+                    let cascade_rejection = before_enter_rejection_cascade
+                        || (to_state.kind == StateKind::Gate
+                            && !cascade_reason.starts_with("gate skipped:")
+                            && !cascade_reason
+                                .contains(crate::workflow::REVIEW_REFRESH_MARKER)
+                            && !cascade_reason
+                                .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+                            && !Self::is_terminal(workflow, &cascade_to));
 
                     tracing::info!(
                         task_id = %task.id,

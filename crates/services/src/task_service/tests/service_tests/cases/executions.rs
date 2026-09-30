@@ -3375,6 +3375,59 @@ async fn timed_out_review_checks_rerun_alone_then_park_without_a_new_reviewer() 
 }
 
 #[tokio::test]
+async fn reviewer_conformance_recovers_deleted_worktree_before_checks() {
+    let (db, service, task, execution, repo_dir) = seed_admitted_review_with(
+        r#"{"retry_budgets":{"execution":3,"review":3},"review":{"ci_steps":["test -f README.md"]}}"#,
+    ).await;
+    let workspace_root = TempDir::new().unwrap();
+    let service = service.with_workspace_root(workspace_root.path().to_path_buf());
+    let workspace = WorkspaceRepo::get_by_id(&*db, execution.workspace_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let worktree = ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
+        .create_worktree_named(repo_dir.path().to_str().unwrap(), &task.id, "forge", "main")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace SET worktree_path = ?, branch = ? WHERE id = ?")
+        .bind(worktree.to_string_lossy().as_ref())
+        .bind(::workspace::task_branch_name(&task.id))
+        .bind(&workspace.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let sha = git::get_current_sha(&worktree).await.unwrap();
+    std::fs::remove_dir_all(&worktree).unwrap();
+    run_git(repo_dir.path(), &["worktree", "prune"]);
+
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"pass","reason":"acceptance satisfied"}"#,
+    )
+    .await;
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(review.status, ReviewStatus::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert_eq!(git::get_current_sha(&worktree).await.unwrap(), sha);
+    let recovered = WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, workspace.id);
+    assert_eq!(recovered.branch, ::workspace::task_branch_name(&task.id));
+}
+
+#[tokio::test]
 async fn a_reply_without_a_result_uses_bounded_reviewer_execution_retry() {
     let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
     // A reply with no result block is unusable: Forge cannot tell pass from

@@ -2272,6 +2272,28 @@ latest worker thread) records its execution. Task responses derive
 `version`; a running barrier therefore cannot expose a gate decision using a
 version that the barrier-clear write is about to invalidate.
 
+When `run_ci_steps` finalizes a failed Review during a non-user entry (including
+an entry-barrier retry), the engine clears the barrier and settles the verdict
+through `TaskService::review_failure_target` before any reviewer dispatch or
+review-authority carry. This also applies to older workflows whose CI hook uses
+log-only failure handling. The normal review budget applies: the remediation
+transition records a rejection; exhaustion records `review_budget_exhausted`
+instead of leaving an unannotated Review gate. A human approval requirement
+parks a passing review, but does not suppress automatic remediation of failed
+CI. User-entered reviews retain their existing entry-check and human-decision
+behavior.
+
+Active-task recovery also settles a reviewer state's latest Failed Review
+after two minutes from its failure write, when the verdict belongs to the
+current non-user state entry, the Task has no blocker or blocked entry barrier,
+is not awaiting a human, and has no running execution or completion cascade. It claims
+the Task version before using that same failure routing; stale snapshots lose
+the CAS, and a remediation transition or budget blocker makes repeat scans inert.
+An abandoned running entry barrier is cleared if its checks already produced
+that failed verdict; a newer entry retry remains fenced. Recovery rechecks the
+latest Review and running executions after claiming the Task snapshot.
+User routing overrides and historical verdicts from earlier entries are excluded.
+
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
 blocking annotation or running entry barrier, and no execution, merge hook, or
@@ -2780,6 +2802,15 @@ receive JSON as safely quoted `FORGE_GOVERNING_CONTEXT` and
 Review admission requires server access to the candidate git objects; an
 inaccessible remote worktree fails admission rather than receiving an unverifiable
 contract.
+
+Review reruns, the `run_ci_steps` entry hook, and reviewer-completion conformance
+checks call `task_service::workspace::prepare_workspace` before using the Task
+checkout. They share executor dispatch's repository-authority checks and
+missing/unusable worktree recovery. A stale Ready workspace row with a surviving
+Task branch is rebuilt in place with the same workspace identity; a missing
+branch retains the existing explicit reset-required failure rather than
+reviewing a new candidate silently. Subtasks continue to use the root-owned
+shared workspace.
 
 Before an agent review launches, Forge freezes an execution-specific contract
 with Task-scoped requirement IDs, checks, completed pre-review CI results,

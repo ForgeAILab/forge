@@ -3874,6 +3874,24 @@ When review configuration names an auditor, the Task's reviewer role
 assignment must already materialize that authority; configuration alone does
 not synthesize an Agent-backed reviewer during a rerun.
 
+Review reruns recover a deleted or unusable Task checkout from its existing
+branch before running checks. Review-entry CI and reviewer conformance checks
+use the same workspace preparation and recovery as executor dispatch; the Ready
+workspace row alone is not taken as proof that its directory still exists.
+
+A CI failure during a system/Agent entry into review, including completion of
+a merge-conflict repair, routes through the same failure outcome as a review
+rerun: the configured remediation target with a review-budget rejection, or
+the existing `review_budget_exhausted` blocker. The dispatcher recovers an
+unblocked latest failed Review belonging to the current non-user review entry
+after a two-minute grace, provided no execution or completion cascade is running,
+no blocked/newer entry barrier remains, and the Task is not awaiting a human.
+An abandoned running barrier whose checks already failed is cleared. User routing
+overrides keep their existing entry checks and human-review behavior; this automatic
+recovery does not reroute a user-entered review. Passing human-approval gates
+still wait for approval, while failed checks on a non-user entry return to
+remediation.
+
 `conformance_checks` is an array of `{id, command, requirement_ids}`. IDs must be
 unique, commands nonempty, and requirement IDs present in the resulting Task
 contract. Selecting a requirement from a check also brings it into that Task's
