@@ -260,6 +260,8 @@ pub(super) async fn build_executor_config_snapshot(
     // Extract before normalization: the typed config round-trip drops
     // unknown fields, which would silently delete the chain.
     let fallbacks = extract_fallbacks(&mut base_config)?;
+    let agent_hard_deadline_seconds = extract_hard_deadline_seconds(&mut base_config)?;
+    let hard_deadline_seconds = hard_deadline_seconds.or(agent_hard_deadline_seconds);
     apply_agent_fields_to_config(agent, &mut base_config)?;
     let capabilities = parse_json_value("agent capabilities_json", &agent.capabilities_json)?;
     let kind = agent
@@ -385,6 +387,31 @@ pub(super) fn snapshot_uses_cli_backend(snapshot: &Value) -> bool {
 }
 
 /// Remove and return the authored `fallbacks` entries from an agent config.
+/// The agent's default run time limit, `config_json.hard_deadline_seconds`.
+/// Missing or null means no limit. A claim or launch override replaces it.
+/// Extracted before normalization, which would drop the unknown key.
+pub(super) fn extract_hard_deadline_seconds(config: &mut Value) -> Result<Option<u32>> {
+    let Some(object) = config.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.remove(AGENT_HARD_DEADLINE_CONFIG_KEY) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|seconds| u32::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "agent config hard_deadline_seconds must be a positive whole number of \
+                     seconds, or omitted for no limit; got: {value}"
+                ))
+            }),
+    }
+}
+
+pub(crate) const AGENT_HARD_DEADLINE_CONFIG_KEY: &str = "hard_deadline_seconds";
+
 pub(super) fn extract_fallbacks(config: &mut Value) -> Result<Vec<Value>> {
     let Some(object) = config.as_object_mut() else {
         return Ok(Vec::new());
@@ -678,6 +705,34 @@ fn merge_override_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_hard_deadline_seconds_reads_positive_seconds_and_removes_key() {
+        let mut config = serde_json::json!({"profile": "acct-1", "hard_deadline_seconds": 5400});
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut config).expect("deadline extracts"),
+            Some(5400)
+        );
+        assert_eq!(config, serde_json::json!({"profile": "acct-1"}));
+
+        let mut unset = serde_json::json!({"hard_deadline_seconds": null});
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut unset).expect("null"),
+            None
+        );
+        assert_eq!(
+            extract_hard_deadline_seconds(&mut serde_json::json!({})).expect("missing"),
+            None
+        );
+        for invalid in [
+            serde_json::json!({"hard_deadline_seconds": 0}),
+            serde_json::json!({"hard_deadline_seconds": -5}),
+            serde_json::json!({"hard_deadline_seconds": "3600"}),
+        ] {
+            let mut invalid = invalid;
+            assert!(extract_hard_deadline_seconds(&mut invalid).is_err());
+        }
+    }
 
     #[test]
     fn extract_fallbacks_removes_key_and_returns_entries() {

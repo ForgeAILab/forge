@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [0.13.11] - 2026-09-30
 
+### Added
+
+- Agent settings have a **Max run time (minutes)** field. When set, every
+  Task run of that agent stops at the limit; empty means no limit (the
+  default). It is stored as `config_json.hard_deadline_seconds`, and a
+  claim/launch `overrides.hard_deadline_seconds` still replaces it for one
+  run. Agent create/update rejects a value that is not a positive whole
+  number of seconds.
+
 ### Changed
 
 - CI and release Rust verification share the existing dependency cache. Only

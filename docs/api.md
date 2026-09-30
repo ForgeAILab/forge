@@ -2331,7 +2331,11 @@ unconfigured tool-step and turn-time values are unlimited, and Agent Chat
 persists the complete successful Smith response instead of truncating it to a
 short preview. Explicit Task/workflow `max_turns` and the per-execution
 `hard_deadline_seconds` override remain available when a bounded run is
-actually wanted.
+actually wanted. An agent can also carry a default limit in
+`config_json.hard_deadline_seconds` (a positive whole number of seconds;
+omit or `null` for none). `POST /api/v1/agents` and `PATCH /api/v1/agents/{id}`
+reject any other value with `400`, and a per-execution override replaces the
+agent default.
 
 ## Task transitions
 

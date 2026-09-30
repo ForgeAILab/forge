@@ -757,8 +757,10 @@ turn a warning into owner death.
 
 `hard_deadline_at` is optional execution policy. By default it is `NULL`, so
 Forge imposes no wall-clock ceiling: the owner can keep the attempt live by
-renewing its short lease. A caller can opt one new execution into a limit with
-the positive `overrides.hard_deadline_seconds` value; Forge records the
+renewing its short lease. An agent's `config_json.hard_deadline_seconds`
+bounds each of its Task executions, and a caller can opt one new execution
+into a different limit with the positive `overrides.hard_deadline_seconds`
+value, which replaces the agent's; Forge records the
 resolved timestamp on that execution, and the first lease claim makes it
 immutable. Heartbeats are then clamped to the deadline and cannot extend it.
 Generic executor settings such as a shell command's `timeout_seconds` never
