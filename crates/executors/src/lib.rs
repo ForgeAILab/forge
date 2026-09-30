@@ -67,6 +67,29 @@ pub fn task_role(config: &serde_json::Value) -> Option<&str> {
         .filter(|role| !role.trim().is_empty())
 }
 
+const TASK_TITLE_CONFIG_KEY: &str = "_forge_task_title";
+
+/// Stamp the Task title onto an in-memory executor config so host-side
+/// finalization can name agent commits after the Task. Role prompts (merge
+/// fix, review fix) do not start with the title, so it cannot be recovered
+/// from the execution description.
+pub fn mark_task_title(config: &mut serde_json::Value, title: &str) {
+    if let Some(object) = config.as_object_mut() {
+        object.insert(
+            TASK_TITLE_CONFIG_KEY.to_owned(),
+            serde_json::Value::String(title.to_owned()),
+        );
+    }
+}
+
+/// Return the Task title carried by an in-memory config.
+pub fn task_title(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get(TASK_TITLE_CONFIG_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+}
+
 /// Mark an executor config so the runtime restores the worktree after execution.
 pub fn mark_worktree_read_only(config: &mut serde_json::Value) {
     if let Some(object) = config.as_object_mut() {

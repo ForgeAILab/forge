@@ -116,6 +116,42 @@ pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<St
     paths
 }
 
+/// Why the Task is entering `review`, when the reason is a purely mechanical
+/// integration step whose predecessor's review may still apply.
+///
+/// The transition log must end with `merging -> merge_failed` bridge followed
+/// directly by the current `merge_failed -> review` entry, so a failed check
+/// bounce, a user move, or any other intervening transition disqualifies the
+/// entry. Only Forge's own bridges qualify: a clean rebase carrying both the
+/// review-refresh and target-moved markers, or a conflict handoff.
+pub(crate) fn review_carry_entry_kind(
+    entries: &[db::TransitionLog],
+) -> Option<db::ReviewCarryKind> {
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    let [.., bridge, current] = entries else {
+        return None;
+    };
+    if current.from_state != default_states::MERGE_FAILED
+        || current.to_state != default_states::REVIEW
+        || current.rejection
+        || bridge.from_state != default_states::MERGING
+        || bridge.to_state != default_states::MERGE_FAILED
+        || bridge.triggered_by != workflow_actor
+    {
+        return None;
+    }
+    if bridge.trigger_reason.contains(CONFLICT_HANDOFF_MARKER) {
+        Some(db::ReviewCarryKind::ConflictRepair)
+    } else if bridge.trigger_reason.contains(REVIEW_REFRESH_MARKER)
+        && bridge.trigger_reason.contains(TARGET_MOVED_MARKER)
+        && current.trigger_reason.contains(REVIEW_REFRESH_MARKER)
+    {
+        Some(db::ReviewCarryKind::CleanRebase)
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn review_refresh_transition_pending(
     db: &db::SqliteDb,
     task_id: &str,

@@ -6,12 +6,98 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.13.10] - 2026-09-29
+
+### Changed
+
+- Forge re-runs a review's setup steps and checks in the Task's own worktree
+  at the reviewed commit instead of a fresh clone in the temp directory, so
+  the worktree's `node_modules/` and `target/` are reused rather than
+  reinstalled and rebuilt from cold on every review. Afterwards the worktree
+  is reset to the reviewed commit and untracked, non-ignored output is
+  removed; a check that changes tracked files still fails the candidate.
+- That re-run now allows 30 minutes per command instead of 120 seconds, configurable with the
+  new review config field `check_timeout_seconds` (1–14,400). A check that still
+  outruns its limit no longer discards a finished review by dispatching a whole
+  new reviewer: the timeout is not recorded as the verdict, the checks alone are
+  re-run (up to three attempts), and then the Task is parked with
+  `review_blocked` for its owner. Previously a passing reviewer was thrown away
+  and re-dispatched every time a slow `cargo test` (for example one waiting on a
+  shared build lock) crossed 120 seconds.
+- A passed review's authority now carries across Forge's own mechanical
+  integration steps instead of forcing a full reviewer run each time a sibling
+  Task lands first. When a Task re-enters `review` only because Forge rebased
+  it cleanly onto a moved target (`[review-refresh] [target-moved-rebase]`), or
+  because its Worker reconciled a Forge-committed rebase conflict
+  (`[conflict-handoff]`), the new `carry_review_authority` `review` `on_enter`
+  hook (ahead of `dispatch_role_agent`) skips the reviewer and moves the Task
+  straight back to `merging` when all of these hold: the review immediately
+  before this entry passed and is still current (conformance passed, current
+  policy, governing-context digest and frozen assessment unchanged); the
+  project has `ci_steps` and every one passed for this entry; every path the
+  Task changes relative to the target is inside the approved contract's
+  `candidate_changed_paths`; the HEAD is a marker-free descendant of the
+  current target tip; and fewer than five integrations have already been
+  carried under that review. Anything else, and every other way of entering
+  `review`, dispatches the reviewer exactly as before. Each carry is recorded
+  in the new `review_authority_carry` table, and integration merges the
+  carried commit against the carried target tip rather than the commit and
+  base frozen in the contract. Migration `V148` adds the table and inserts the
+  hook into every stored Project workflow's `review` state; because the stored
+  workflow is part of a review's governing context, Tasks that passed review
+  but had not merged when it runs get one fresh review. The merge-fix prompt
+  for a conflict handoff no longer says the repair "will receive a fresh
+  review".
+- Upgrade the managed Codex CLI pin from `0.157.0` to `0.159.1`, whose
+  upstream default model is GPT-6.1 Sol.
+- Upgrade the managed Claude Code CLI pin from `2.1.282` to `2.1.285`,
+  including its exact-package install-script allowance.
+
+### Added
+
+- Codex model discovery lists `gpt-6.1-sol` first with reasoning efforts
+  `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+
 ### Fixed
 
+- Domain-event consumers (agent wake delivery, Agent Chat memory indexing,
+  attention projection) no longer wedge forever when rows in their
+  `domain_event` range were deleted (for example by the V146 progress-event
+  cleanup) while they were lagging. Ordering is now defined over existing
+  events (`MIN(sequence) > cursor`) instead of `cursor + 1`, so already-stuck
+  cursors advance across the gap on the next poll with no migration.
+  Completing an event while an earlier existing event is unprocessed is still
+  rejected.
+- A merge-fix repair that still commits Git conflict markers in a handed-off
+  file no longer goes to a full review (and no longer gets rebased over by the
+  next conflict round, which nested markers several layers deep). A new
+  `merge_failed` exit guard, `require_conflict_markers_resolved`, resumes the
+  worker with the affected file names and blocks the Task when the guard retry
+  budget is exhausted. Migration `V147` appends the guard to every stored
+  Project workflow's `merge_failed` state. Because the stored workflow is part
+  of a review's governing context, Tasks that passed review but had not merged
+  when this migration runs get one fresh review.
+- A managed Codex execution no longer fails with `Permission denied (os error
+  13)` on every retry after a project test leaves a read-only directory in the
+  Worker's TMPDIR (`.codex-managed-home/task-scratch`). Forge restores owner
+  write permission on that tree before resetting it.
+- A Task whose coder execution failed without the failure being recorded
+  (for example while the disk was full and SQLite writes failed) no longer
+  sits with no recovery action but `cancel`. The dispatcher's active-task
+  recovery now applies the normal executor-failure handling to it: a deferred
+  retry while budget remains, then an `executor_failed` block offering
+  `reexecute`, `reset_to_initial` and `cancel_task`.
+- Agent commits made at the end of merge-fix and review-fix runs are named
+  after the Task (`agent: <task title>`) instead of the role prompt's first
+  line (`agent: Forge role contract (authoritative):`).
 - Completing an approval-gated planning run no longer invalidates the Task
   version while removing Forge's private plan-cleanup marker. A human can now
   approve the plan using the version returned with the review-ready Task
   instead of intermittently receiving a version conflict.
+- Moving a Task into `todo` or `backlog` (transition or board move) now clears a
+  stale `dispatch_failed` error annotation, so tasks no longer show a red
+  dispatch error after the cause (e.g. a full disk) is fixed. A later
+  successful dispatch already cleared it. Work-failure annotations are kept.
 
 ## [0.13.9] - 2026-09-28
 

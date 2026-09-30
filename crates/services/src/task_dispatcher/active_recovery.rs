@@ -355,6 +355,11 @@ impl TaskDispatcher {
         let Some(execution) = latest else {
             return Ok(ReviewerReconciliation::None);
         };
+        if execution.status == ExecutionStatus::Failed && claimed_execution_id.is_none() {
+            return self
+                .reconcile_failed_role_execution(task, role_name, &execution, project_version)
+                .await;
+        }
         if execution.status != ExecutionStatus::Completed {
             return Ok(ReviewerReconciliation::None);
         }
@@ -405,6 +410,73 @@ impl TaskDispatcher {
         } else {
             ReviewerReconciliation::Reconciled
         })
+    }
+
+    /// Heal a run that died without its failure reaching the Task (for
+    /// example the process or database hit a full disk between the execution
+    /// row turning `failed` and the executor-failure annotation). The Task is
+    /// still in its working state with no running execution and no blocker, so
+    /// it offers no recovery action and is never re-dispatched.
+    ///
+    /// Delegates to the same helper the live failure path uses, so the
+    /// annotation shape, retry budget and events are identical. Idempotent:
+    /// once the helper writes the blocker (`blocked_json`) the dispatcher's
+    /// blocking-annotation gate skips the Task, and a scheduled retry is
+    /// recorded via `last_execution_failure_execution_id` / a pending deferred
+    /// dispatch, both checked here.
+    async fn reconcile_failed_role_execution(
+        &self,
+        task: &Task,
+        role_name: &str,
+        execution: &db::Execution,
+        project_version: i64,
+    ) -> Result<ReviewerReconciliation> {
+        if !crate::task_service::execution::should_block_task_for_failed_execution(execution)
+            || role_name == crate::workflow::default_roles::REVIEWER
+            || helpers::has_blocking_annotation(task)
+            || deferred_dispatch::is_pending(task, chrono::Utc::now())
+            || crate::task_service::execution_dispatch_project_version(execution)
+                != Some(project_version)
+        {
+            return Ok(ReviewerReconciliation::None);
+        }
+        // The live path already handled this failure by scheduling a retry.
+        let retry_recorded = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .extra
+                    .get("last_execution_failure_execution_id")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+            })
+            .as_deref()
+            == Some(execution.id.as_str());
+        if retry_recorded {
+            return Ok(ReviewerReconciliation::None);
+        }
+        if helpers::has_running_execution_for_roles(
+            &self.db,
+            &task.id,
+            &helpers::execution_guard_roles(role_name),
+        )
+        .await?
+            || helpers::execution_superseded_by_role_assignment(
+                &self.db, &task.id, role_name, execution,
+            )
+            .await?
+            || !crate::task_service::execution::execution_belongs_to_current_state_entry(
+                &self.db, task, execution,
+            )
+            .await?
+        {
+            return Ok(ReviewerReconciliation::None);
+        }
+        // Version-CAS'd on the latest-execution authority inside the helper:
+        // a concurrently launched execution makes it a no-op.
+        self.task_service
+            .annotate_executor_failure_block(execution)
+            .await?;
+        Ok(ReviewerReconciliation::Reconciled)
     }
 
     async fn recover_active_task(

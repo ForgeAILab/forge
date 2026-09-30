@@ -883,6 +883,102 @@ async fn clean_review_checkout_runs_setup_before_required_checks() {
 }
 
 #[tokio::test]
+async fn a_check_that_outruns_its_limit_is_not_recorded_as_the_verdict() {
+    let seed = seeded_review(vec!["sleep 5"]).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"review": {"ci_steps": ["sleep 5"], "check_timeout_seconds": 1}}).to_string())
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .expect("review timeout config updates");
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(PassingAuditor),
+    );
+
+    let error = runner
+        .run(req)
+        .await
+        .expect_err("timed-out check is not a verdict");
+
+    let ReviewError::Conformance {
+        execution_id,
+        reason,
+    } = error
+    else {
+        panic!("expected a conformance error, got {error:?}");
+    };
+    assert!(crate::contract::is_check_timeout(&reason), "{reason}");
+    assert!(reason.contains("`sleep 5` ran longer than 1s"), "{reason}");
+    // Unrecorded, so the checks alone can be run again for the same reviewer.
+    assert!(seed
+        .db
+        .review_conformance(&execution_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn checks_reuse_the_worktree_caches_and_leave_it_at_the_reviewed_commit() {
+    let seed = seeded_review(vec!["test -f cache/warm", "touch stray.txt"]).await;
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join(".gitignore"), "cache/\n")
+        .await
+        .unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    // An ignored build cache the coder left behind, which a clean clone
+    // would not have: the check only passes if it runs in the worktree.
+    tokio::fs::create_dir(seed.workspace.path().join("cache"))
+        .await
+        .unwrap();
+    tokio::fs::write(seed.workspace.path().join("cache/warm"), "warm")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(PassingAuditor),
+    );
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        ReviewOutcome::Passed,
+        "{}",
+        review.step_results_json
+    );
+    assert!(seed.workspace.path().join("cache/warm").exists());
+    assert!(
+        !seed.workspace.path().join("stray.txt").exists(),
+        "untracked output of a check is removed so integration sees a clean tree"
+    );
+    assert!(git::is_worktree_clean(seed.workspace.path()).await.unwrap());
+}
+
+#[tokio::test]
 async fn setup_that_rewrites_a_tracked_file_fails_the_candidate() {
     let seed = seeded_review(vec!["true"]).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
@@ -934,6 +1030,13 @@ async fn setup_that_rewrites_a_tracked_file_fails_the_candidate() {
     assert!(
         reason.contains("modified tracked files: README.md"),
         "{reason}"
+    );
+    // The worktree goes back to the reviewed commit for the coder.
+    assert_eq!(
+        tokio::fs::read_to_string(seed.workspace.path().join("README.md"))
+            .await
+            .unwrap(),
+        "candidate\n"
     );
 }
 

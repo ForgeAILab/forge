@@ -1,3 +1,4 @@
+pub(crate) mod carry;
 mod common;
 mod dispatch;
 mod gates;
@@ -6,6 +7,7 @@ mod merge;
 mod review;
 mod subtasks;
 
+pub use carry::CarryReviewAuthority;
 pub(crate) use common::review_ci_steps;
 pub use dispatch::{DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder};
 pub use gates::{
@@ -16,7 +18,9 @@ pub use lifecycle::{
     AutoCascadeOnCompletion, CleanupWorkspaceNow, PublishTaskBlocked, RunBeforeWorkHooks,
     ScheduleWorkspaceCleanup,
 };
-pub use merge::{AutoCascadeOnMergeResult, CheckMergeFixBudget, RunMerge};
+pub use merge::{
+    AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
+};
 pub use review::{AutoCascadeOnReviewPass, AutoCascadeOnUnconfiguredReview, RunCiSteps};
 pub use subtasks::{
     CancelPendingSubtasks, PropagateDoneToSubtasks, SatisfyDependents, SubtaskSequenceComplete,

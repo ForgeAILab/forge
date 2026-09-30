@@ -13,12 +13,80 @@ pub trait ReviewConformanceRepo: Send + Sync {
     async fn review_contract(&self, execution_id: &str) -> Result<Option<ReviewContract>>;
     async fn record_review_conformance(&self, result: &ReviewConformance) -> Result<()>;
     async fn review_conformance(&self, execution_id: &str) -> Result<Option<ReviewConformance>>;
+    /// The still-valid passed review whose authority the Review row that was
+    /// just opened for `task_id` may carry forward. `DbError::Check` names why
+    /// it may not.
+    async fn review_carry_base(&self, task_id: &str) -> Result<ReviewCarryBase>;
+}
+
+/// Integration candidate carried under a passed review's authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewCarryKind {
+    CleanRebase,
+    ConflictRepair,
+}
+
+impl std::fmt::Display for ReviewCarryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CleanRebase => "clean_rebase",
+            Self::ConflictRepair => "conflict_repair",
+        })
+    }
+}
+
+impl std::str::FromStr for ReviewCarryKind {
+    type Err = DbError;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "clean_rebase" => Ok(Self::CleanRebase),
+            "conflict_repair" => Ok(Self::ConflictRepair),
+            other => Err(DbError::Check(format!(
+                "unknown review carry kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// A mechanical integration step recorded against a passed review's contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewReviewAuthorityCarry {
+    pub task_id: String,
+    pub contract_execution_id: String,
+    pub commit_sha: String,
+    pub base_sha: String,
+    pub kind: ReviewCarryKind,
+    pub changed_paths: Vec<String>,
+}
+
+/// The commit and target tip a merge must find, whether they come from the
+/// reviewed contract itself or from a later carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCandidate {
+    pub commit_sha: String,
+    pub base_sha: String,
+}
+
+/// What a carry may build on: the previous passed review's contract and
+/// details, and how many carries already ride on that contract.
+#[derive(Debug, Clone)]
+pub struct ReviewCarryBase {
+    /// The Running Review row opened for the current entry.
+    pub review_id: String,
+    pub contract: ReviewContract,
+    /// The previous passed Review's details (`conformance`, `auditor`, ...).
+    pub prior_details: Value,
+    pub carries_since_review: i64,
 }
 
 /// Holds the authority write lock only across the local, bounded integration step.
 /// No provider or test command may run while this guard is held.
 pub struct ReviewIntegrationGuard {
     pub contract: Option<ReviewContract>,
+    /// The commit and target tip integration must match. Equal to the
+    /// contract's own `commit_sha`/`base_sha` unless a carry recorded against
+    /// this contract superseded them.
+    pub candidate: Option<ReviewCandidate>,
     transaction: sqlx::Transaction<'static, sqlx::Sqlite>,
 }
 impl ReviewIntegrationGuard {
@@ -265,6 +333,61 @@ pub(crate) async fn verify_review_source(
     Ok(())
 }
 
+/// Every check that makes a passed review still current authority for its
+/// Task, shared by integration and by authority carry: the Review recorded a
+/// passed conformance under the current policy, the governing context still
+/// hashes to the contract's digest, and the frozen assessment matches.
+async fn verified_passed_contract(
+    conn: &mut SqliteConnection,
+    task_id: &str,
+    raw: Option<&str>,
+) -> Result<ReviewContract> {
+    let details: Value = serde_json::from_str(raw.unwrap_or("{}")).map_err(json_error)?;
+    let result: ReviewConformance = serde_json::from_value(details.get("conformance").cloned().unwrap_or_else(|| json!({"status":"not_assessed","contract":null,"assessment":null,"checks":[],"reason":null}))).map_err(json_error)?;
+    if result.status != api_types::ConformanceStatus::Passed {
+        return Err(DbError::Check(
+            "fresh conformance review required before integration".into(),
+        ));
+    }
+    let contract = result
+        .contract
+        .ok_or_else(|| DbError::Check("review acceptance has no contract".into()))?;
+    if contract.policy != api_types::REVIEW_CONFORMANCE_POLICY {
+        return Err(DbError::Check(
+            "review acceptance uses an obsolete policy; fresh review required".into(),
+        ));
+    }
+    let contract_source = review_source_in_tx(conn, task_id, Some(&contract.execution_id)).await?;
+    if contract.context.task_id != task_id
+        || api_types::canonical_digest(&contract_source).map_err(json_error)?
+            != contract.context.source_digest
+    {
+        return Err(DbError::Check(
+            "review acceptance is stale; fresh review required".into(),
+        ));
+    }
+    let persisted: Option<String> = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id = ?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let persisted: ReviewConformance = serde_json::from_str(
+        persisted
+            .as_deref()
+            .ok_or_else(|| DbError::Check("review acceptance has no immutable evidence".into()))?,
+    )
+    .map_err(json_error)?;
+    if persisted.status != api_types::ConformanceStatus::Passed
+        || persisted.contract.as_ref() != Some(&contract)
+    {
+        return Err(DbError::Check(
+            "review acceptance does not match immutable evidence".into(),
+        ));
+    }
+    Ok(contract)
+}
+
 #[async_trait]
 impl ReviewConformanceRepo for SqliteDb {
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard> {
@@ -308,56 +431,38 @@ impl ReviewConformanceRepo for SqliteDb {
             }
             let raw: Option<String> = sqlx::query_scalar("SELECT CASE WHEN status = 'passed' THEN step_results_json ELSE '{}' END FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1")
                 .bind(task_id).fetch_optional(&mut *tx).await?;
-            let details: Value =
-                serde_json::from_str(raw.as_deref().unwrap_or("{}")).map_err(json_error)?;
-            let result: ReviewConformance = serde_json::from_value(details.get("conformance").cloned().unwrap_or_else(|| json!({"status":"not_assessed","contract":null,"assessment":null,"checks":[],"reason":null}))).map_err(json_error)?;
-            if result.status != api_types::ConformanceStatus::Passed {
-                return Err(DbError::Check(
-                    "fresh conformance review required before integration".into(),
-                ));
-            }
-            let contract = result
-                .contract
-                .ok_or_else(|| DbError::Check("review acceptance has no contract".into()))?;
-            if contract.policy != api_types::REVIEW_CONFORMANCE_POLICY {
-                return Err(DbError::Check(
-                    "review acceptance uses an obsolete policy; fresh review required".into(),
-                ));
-            }
-            let contract_source =
-                review_source_in_tx(&mut tx, task_id, Some(&contract.execution_id)).await?;
-            if contract.context.task_id != task_id
-                || api_types::canonical_digest(&contract_source).map_err(json_error)?
-                    != contract.context.source_digest
-            {
-                return Err(DbError::Check(
-                    "review acceptance is stale; fresh review required".into(),
-                ));
-            }
-            let persisted: Option<String> = sqlx::query_scalar(
-                "SELECT conformance_json FROM execution_review_assessment WHERE execution_id = ?",
-            )
-            .bind(&contract.execution_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let persisted: ReviewConformance =
-                serde_json::from_str(persisted.as_deref().ok_or_else(|| {
-                    DbError::Check("review acceptance has no immutable evidence".into())
-                })?)
-                .map_err(json_error)?;
-            if persisted.status != api_types::ConformanceStatus::Passed
-                || persisted.contract.as_ref() != Some(&contract)
-            {
-                return Err(DbError::Check(
-                    "review acceptance does not match immutable evidence".into(),
-                ));
-            }
+            let contract = verified_passed_contract(&mut tx, task_id, raw.as_deref()).await?;
             Some(contract)
         } else {
             None
         };
+        let candidate = match &contract {
+            Some(contract) => {
+                let carried = sqlx::query(
+                    "SELECT commit_sha, base_sha FROM review_authority_carry
+                     WHERE task_id = ? AND contract_execution_id = ?
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                )
+                .bind(task_id)
+                .bind(&contract.execution_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                Some(match carried {
+                    Some(row) => ReviewCandidate {
+                        commit_sha: row.try_get("commit_sha")?,
+                        base_sha: row.try_get("base_sha")?,
+                    },
+                    None => ReviewCandidate {
+                        commit_sha: contract.commit_sha.clone(),
+                        base_sha: contract.base_sha.clone(),
+                    },
+                })
+            }
+            None => None,
+        };
         Ok(ReviewIntegrationGuard {
             contract,
+            candidate,
             transaction: tx,
         })
     }
@@ -469,5 +574,53 @@ impl ReviewConformanceRepo for SqliteDb {
         value
             .map(|s| serde_json::from_str(&s).map_err(json_error))
             .transpose()
+    }
+
+    async fn review_carry_base(&self, task_id: &str) -> Result<ReviewCarryBase> {
+        let mut tx = self.pool().begin().await?;
+        let rows = sqlx::query(
+            "SELECT id, status, step_results_json FROM review WHERE task_id = ?
+             ORDER BY attempt_number DESC, created_at DESC, id DESC LIMIT 2",
+        )
+        .bind(task_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let [current, previous] = rows.as_slice() else {
+            return Err(DbError::Check(
+                "no previous review whose authority could be carried".into(),
+            ));
+        };
+        if current.try_get::<String, _>("status")? != "running" {
+            return Err(DbError::Check(
+                "the current review attempt is not open for a carry".into(),
+            ));
+        }
+        // Only the review immediately before this entry counts. A Failed or
+        // cancelled attempt in between means something other than the
+        // mechanical step happened since the reviewer last looked.
+        if previous.try_get::<String, _>("status")? != "passed" {
+            return Err(DbError::Check(
+                "the previous review attempt did not pass".into(),
+            ));
+        }
+        let raw: String = previous.try_get("step_results_json")?;
+        let contract = verified_passed_contract(&mut tx, task_id, Some(&raw)).await?;
+        let prior_details: Value = serde_json::from_str(&raw).map_err(json_error)?;
+        let carries_since_review: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM review_authority_carry
+             WHERE task_id = ? AND contract_execution_id = ?",
+        )
+        .bind(task_id)
+        .bind(&contract.execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let review_id: String = current.try_get("id")?;
+        tx.commit().await?;
+        Ok(ReviewCarryBase {
+            review_id,
+            contract,
+            prior_details,
+            carries_since_review,
+        })
     }
 }

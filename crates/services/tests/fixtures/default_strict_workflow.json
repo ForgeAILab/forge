@@ -241,6 +241,12 @@
         ],
         "on_enter": [
           {
+            "action": "carry_review_authority",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "log"
+          },
+          {
             "action": "dispatch_role_agent",
             "params": {},
             "applies_to": "all",
@@ -373,7 +379,14 @@
       "display_name": "Merge Failed",
       "role": "coder",
       "hooks": {
-        "before_exit": [],
+        "before_exit": [
+          {
+            "action": "require_conflict_markers_resolved",
+            "params": {},
+            "applies_to": "all",
+            "on_failure": "block"
+          }
+        ],
         "on_exit": [],
         "before_enter": [
           {

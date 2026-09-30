@@ -9,8 +9,13 @@ export type ReviewConfig = { conformance_checks: Array<ConformanceCheck>,
  */
 requirement_ids: Array<string>, requirement_allocations: { [key in string]?: string }, 
 /**
- * Commands that prepare a clean review checkout before `ci_steps` run,
+ * Commands that prepare the Task worktree before `ci_steps` run,
  * such as dependency installation. They do not themselves satisfy a
  * review requirement, but their result is retained with the review.
  */
-setup_steps: Array<string>, ci_steps: Array<string>, review_prompt: string | null, };
+setup_steps: Array<string>, ci_steps: Array<string>, review_prompt: string | null, 
+/**
+ * Wall-clock limit, in seconds, for each setup step and check Forge
+ * re-runs in the Task worktree. Unset uses the 30-minute default.
+ */
+check_timeout_seconds?: number, };

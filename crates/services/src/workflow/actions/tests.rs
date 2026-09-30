@@ -6,9 +6,10 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask,
     CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo,
-    ExecutionStatus, PageRequest, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject,
-    UpdateTaskStatus, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
+    ExecutionStatus, PageRequest, ProjectRepo, RepoRepo, ReviewConformanceRepo, ReviewRepo,
+    ReviewStatus, SortBy, SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateDaemonReport, UpdateProject, UpdateTaskStatus, UpsertDaemon, WorkspaceRepo,
+    WorkspaceStatus,
 };
 use events::{EventBus, EventContext};
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
@@ -17,6 +18,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
+use super::merge::RequireConflictMarkersResolved;
 use super::merge::{merge_failure_result, target_moved_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
@@ -2586,6 +2588,58 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
 }
 
 #[tokio::test]
+async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
+    let mut ctx = build_test_ctx(
+        "task-handoff-exit-guard",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let HookResult::Cascade { reason, .. } =
+        target_moved_result(&ctx, &task, "main advanced", "main").await
+    else {
+        panic!("conflict should hand off");
+    };
+    record_conflict_handoff(&ctx, reason, false).await;
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&ctx.db),
+        Arc::clone(&ctx.event_bus),
+        dir.path().to_path_buf(),
+    )));
+    ctx.from_state = default_states::MERGE_FAILED.to_owned();
+    ctx.to_state = default_states::REVIEW.to_owned();
+    ctx.triggered_by = api_types::Actor::system(api_types::SystemComponent::Workflow);
+
+    // The Worker has not touched the marked files yet.
+    let HookResult::Failed { reason } = RequireConflictMarkersResolved.execute(&ctx).await else {
+        panic!("committed markers must keep the task out of review");
+    };
+    assert!(reason.contains("exports.py"), "{reason}");
+
+    // Other exits from merge_failed are not this guard's concern.
+    let mut other = ctx.clone();
+    other.to_state = default_states::IN_PROGRESS.to_owned();
+    assert!(matches!(
+        RequireConflictMarkersResolved.execute(&other).await,
+        HookResult::Skipped { .. }
+    ));
+
+    // A repair that is committed clears the guard.
+    std::fs::write(worktree_path.join("exports.py"), "resolved = True\n").expect("repair writes");
+    git::commit_all(&worktree_path, "resolve handoff")
+        .await
+        .expect("repair commits");
+    let result = RequireConflictMarkersResolved.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+}
+
+#[tokio::test]
 async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     let mut ctx = build_test_ctx(
         "task-handoff-resolved",
@@ -3683,4 +3737,747 @@ async fn read_only_task_without_reviewer_ignores_implementation_checks_and_casca
         }
         other => panic!("expected cascade to merging, got {other:?}"),
     }
+}
+
+// --- Review authority carry across mechanical rebases and conflict repairs ---
+
+const CARRY_REFRESH_REASON: &str =
+    "[review-refresh] mechanical merge contention resolved; fresh review required";
+
+struct CarryScenario {
+    worktree: PathBuf,
+    repo_path: PathBuf,
+    workspace_id: String,
+    executor_execution_id: String,
+    commit_sha: String,
+    changed_paths: Vec<String>,
+}
+
+/// A Task branch reviewed and approved against `main`, after which a sibling
+/// lands on `main`. With `conflict` the sibling edits the same line of
+/// `shared.txt` the Task edited; without it the sibling touches another file.
+async fn build_carry_scenario(
+    task_id: &str,
+    agent_id: &str,
+    conflict: bool,
+) -> (DispatchHarness, CarryScenario) {
+    let harness = build_role_dispatch_harness(
+        task_id,
+        default_states::MERGING,
+        default_states::MERGING,
+        default_roles::REVIEWER,
+        agent_id,
+        1,
+    )
+    .await;
+    let ctx = &harness.ctx;
+    let repo_path = harness._repo_dir.path().to_path_buf();
+    std::fs::write(repo_path.join("shared.txt"), "core = 1\n").expect("shared writes");
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-m", "shared"]);
+
+    let branch = ::workspace::task_branch_name(task_id);
+    let worktree = harness._workspace_root.path().join("worktree");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            worktree.to_str().expect("worktree path is UTF-8"),
+            "main",
+        ],
+    );
+    run_git(&worktree, &["config", "user.email", "test@forge.dev"]);
+    run_git(&worktree, &["config", "user.name", "Forge Test"]);
+    std::fs::write(worktree.join("shared.txt"), "core = 1\napi = 1\n").expect("task edit writes");
+    std::fs::write(worktree.join("feature.txt"), "feature\n").expect("feature writes");
+    run_git(&worktree, &["add", "-A"]);
+    run_git(&worktree, &["commit", "-m", "add api"]);
+    let commit_sha = run_git(&worktree, &["rev-parse", "HEAD"]);
+    let base_sha = run_git(&repo_path, &["rev-parse", "main"]);
+
+    if conflict {
+        std::fs::write(repo_path.join("shared.txt"), "core = 1\ncli = 1\n")
+            .expect("sibling edit writes");
+    } else {
+        std::fs::write(repo_path.join("other.txt"), "other\n").expect("sibling file writes");
+    }
+    run_git(&repo_path, &["add", "-A"]);
+    run_git(&repo_path, &["commit", "-m", "sibling lands"]);
+
+    let repo_id = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .primary_repo_id
+        .expect("primary repo exists");
+    let now = now_rfc3339();
+    let workspace_id = new_uuid_v4();
+    WorkspaceRepo::create(
+        &*ctx.db,
+        CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task_id.to_owned(),
+            repo_id,
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            branch,
+            status: WorkspaceStatus::Ready,
+            before_sha: Some(base_sha.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace creates");
+    let executor_execution_id = new_uuid_v4();
+    create_carry_execution(
+        ctx,
+        &executor_execution_id,
+        "executor",
+        &workspace_id,
+        false,
+    )
+    .await;
+
+    let scenario = CarryScenario {
+        worktree,
+        repo_path,
+        workspace_id,
+        executor_execution_id,
+        commit_sha,
+        changed_paths: vec!["feature.txt".to_owned(), "shared.txt".to_owned()],
+    };
+    let mut harness = harness;
+    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+        Arc::clone(&harness.ctx.db),
+        Arc::clone(&harness.ctx.event_bus),
+        harness._workspace_root.path().to_path_buf(),
+    )));
+    seed_passed_carry_review(
+        &harness.ctx,
+        &scenario,
+        &scenario.commit_sha,
+        &base_sha,
+        &scenario.changed_paths,
+        1,
+    )
+    .await;
+    (harness, scenario)
+}
+
+async fn create_carry_execution(
+    ctx: &HookContext,
+    id: &str,
+    role: &str,
+    workspace_id: &str,
+    running: bool,
+) {
+    let now = now_rfc3339();
+    // A running execution must belong to the agent holding the role.
+    let agent_id: Option<String> = if running {
+        sqlx::query_scalar(
+            "SELECT assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&ctx.task_id)
+        .bind(role)
+        .fetch_optional(ctx.db.pool())
+        .await
+        .expect("role assignment loads")
+        .flatten()
+    } else {
+        None
+    };
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: id.to_owned(),
+            task_id: ctx.task_id.clone(),
+            agent_id,
+            role: role.to_owned(),
+            status: if running {
+                ExecutionStatus::Running
+            } else {
+                ExecutionStatus::Completed
+            },
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("execution creates");
+}
+
+/// Freeze a review contract and a passed assessment for `commit_sha`/`base_sha`
+/// and record the passed Review row that carries them, exactly as a reviewer
+/// run that passed would leave them. Returns the contract's execution id.
+async fn seed_passed_carry_review(
+    ctx: &HookContext,
+    scenario: &CarryScenario,
+    commit_sha: &str,
+    base_sha: &str,
+    changed_paths: &[String],
+    attempt_number: i64,
+) -> String {
+    let reviewer_execution_id = new_uuid_v4();
+    create_carry_execution(
+        ctx,
+        &reviewer_execution_id,
+        "reviewer",
+        &scenario.workspace_id,
+        true,
+    )
+    .await;
+    let context =
+        ::review::contract::load_context(&ctx.db, &ctx.task_id, Some(&reviewer_execution_id))
+            .await
+            .expect("governing context loads");
+    let mut contract = api_types::ReviewContract {
+        execution_id: reviewer_execution_id.clone(),
+        policy: api_types::REVIEW_CONFORMANCE_POLICY.to_owned(),
+        commit_sha: commit_sha.to_owned(),
+        base_sha: base_sha.to_owned(),
+        candidate_changed_paths: changed_paths.to_vec(),
+        context,
+        check_results: Vec::new(),
+        digest: String::new(),
+    };
+    contract.digest = api_types::canonical_digest(&contract).expect("contract digests");
+    ctx.db
+        .create_review_contract(&contract)
+        .await
+        .expect("contract freezes");
+    let conformance = api_types::ReviewConformance {
+        status: api_types::ConformanceStatus::Passed,
+        contract: Some(contract),
+        assessment: Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Pass,
+            reason: "looks right".to_owned(),
+            report: String::new(),
+        }),
+        checks: Vec::new(),
+        reason: None,
+    };
+    ctx.db
+        .record_review_conformance(&conformance)
+        .await
+        .expect("assessment freezes");
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+        .bind(&reviewer_execution_id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("reviewer execution completes");
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            execution_id: scenario.executor_execution_id.clone(),
+            attempt_number,
+            status: ReviewStatus::Passed,
+            step_results_json: json!({
+                "ci_steps": [],
+                "conformance": conformance,
+                "auditor": { "verdict": "pass", "reason": "looks right" },
+            })
+            .to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("passed review records");
+    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, Some(now.clone()), &now)
+        .await
+        .expect("review_passed_at seeds");
+    reviewer_execution_id
+}
+
+async fn record_transition_entry(
+    ctx: &HookContext,
+    from: &str,
+    to: &str,
+    actor: api_types::Actor,
+    reason: &str,
+) {
+    db::TransitionLogRepo::insert(
+        &*ctx.db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: ctx.task_id.clone(),
+            from_state: from.to_owned(),
+            to_state: to.to_owned(),
+            trigger_name: None,
+            triggered_by: actor.display(),
+            trigger_reason: reason.to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("transition records");
+}
+
+/// Log the bridge Forge wrote when it sent the Task to `merge_failed`, then the
+/// move back into `review`, and put `ctx` where the review entry hooks run.
+async fn enter_review_after_bridge(
+    ctx: &mut HookContext,
+    bridge_reason: &str,
+    entry_actor: api_types::Actor,
+    entry_reason: &str,
+    ci_steps: serde_json::Value,
+) {
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow);
+    record_transition_entry(
+        ctx,
+        default_states::MERGING,
+        default_states::MERGE_FAILED,
+        workflow_actor,
+        bridge_reason,
+    )
+    .await;
+    record_transition_entry(
+        ctx,
+        default_states::MERGE_FAILED,
+        default_states::REVIEW,
+        entry_actor.clone(),
+        entry_reason,
+    )
+    .await;
+    ctx.from_state = default_states::MERGE_FAILED.to_owned();
+    ctx.to_state = default_states::REVIEW.to_owned();
+    ctx.triggered_by = entry_actor;
+    ctx.state_config = json!({ "ci_steps": ci_steps });
+    ctx.gate_config = ctx
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == default_states::REVIEW)
+        .and_then(|state| state.gate_config.clone());
+    enter_target_state(ctx).await;
+    refresh_project_authority(ctx).await;
+}
+
+async fn carry_rows(ctx: &HookContext) -> Vec<(String, String, String, String)> {
+    sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT contract_execution_id, commit_sha, base_sha, kind
+         FROM review_authority_carry WHERE task_id = ? ORDER BY created_at, rowid",
+    )
+    .bind(&ctx.task_id)
+    .fetch_all(ctx.db.pool())
+    .await
+    .expect("carry rows load")
+}
+
+async fn reviewer_execution_count(ctx: &HookContext) -> i64 {
+    ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
+        .await
+        .expect("reviewer execution count loads")
+}
+
+async fn merge_again_from_review(ctx: &mut HookContext) -> HookResult {
+    ctx.from_state = default_states::REVIEW.to_owned();
+    ctx.to_state = default_states::MERGING.to_owned();
+    enter_target_state(ctx).await;
+    refresh_project_authority(ctx).await;
+    RunMerge.execute(ctx).await
+}
+
+#[tokio::test]
+async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
+    let (harness, scenario) =
+        build_carry_scenario("task-carry-clean", "agent-carry-clean", false).await;
+    let mut ctx = harness.ctx.clone();
+    let reviewers_before = reviewer_execution_count(&ctx).await;
+
+    let HookResult::Cascade { to, reason } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    assert_eq!(to, default_states::MERGE_FAILED);
+    assert!(
+        reason.contains(crate::workflow::TARGET_MOVED_MARKER),
+        "{reason}"
+    );
+    let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(rebased_head, scenario.commit_sha, "the branch was rebased");
+
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+        CARRY_REFRESH_REASON,
+        json!(["test -d ."]),
+    )
+    .await;
+    let ci = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci, HookResult::Ok), "{ci:?}");
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    let HookResult::Cascade { to, reason } = carried else {
+        panic!("a clean rebase with passing checks carries the review, got {carried:?}");
+    };
+    assert_eq!(to, default_states::MERGING);
+    assert!(reason.contains("[review-carry]"), "{reason}");
+
+    assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before);
+    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 2);
+    assert!(reviews
+        .iter()
+        .all(|review| review.status == ReviewStatus::Passed));
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(task.review_passed_at.is_some());
+    let rows = carry_rows(&ctx).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, rebased_head);
+    assert_eq!(
+        rows[0].2,
+        run_git(&scenario.repo_path, &["rev-parse", "main"])
+    );
+    assert_eq!(rows[0].3, "clean_rebase");
+
+    let merged = merge_again_from_review(&mut ctx).await;
+    assert!(
+        matches!(&merged, HookResult::Cascade { to, .. } if to == default_states::DONE),
+        "{merged:?}"
+    );
+    assert_eq!(
+        run_git(&scenario.repo_path, &["rev-parse", "main"]),
+        rebased_head
+    );
+}
+
+#[tokio::test]
+async fn conflict_repair_by_the_worker_carries_review_authority() {
+    let (harness, scenario) =
+        build_carry_scenario("task-carry-conflict", "agent-carry-conflict", true).await;
+    let mut ctx = harness.ctx.clone();
+    let reviewers_before = reviewer_execution_count(&ctx).await;
+
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the conflicting sibling should hand the conflict back");
+    };
+    assert!(
+        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        "{reason}"
+    );
+    // The Worker reconciles only the handed-off file and commits.
+    std::fs::write(
+        scenario.worktree.join("shared.txt"),
+        "core = 1\ncli = 1\napi = 1\n",
+    )
+    .expect("Worker resolves both sides");
+    run_git(&scenario.worktree, &["add", "-A"]);
+    run_git(&scenario.worktree, &["commit", "-m", "resolve handoff"]);
+    let repaired_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
+
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Test),
+        "worker completed the merge repair",
+        json!(["test -d ."]),
+    )
+    .await;
+    let ci = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci, HookResult::Ok), "{ci:?}");
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    assert!(
+        matches!(&carried, HookResult::Cascade { to, .. } if to == default_states::MERGING),
+        "{carried:?}"
+    );
+    assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before);
+    let rows = carry_rows(&ctx).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, repaired_head);
+    assert_eq!(rows[0].3, "conflict_repair");
+
+    let merged = merge_again_from_review(&mut ctx).await;
+    assert!(
+        matches!(&merged, HookResult::Cascade { to, .. } if to == default_states::DONE),
+        "{merged:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scenario.repo_path.join("shared.txt")).expect("shared reads"),
+        "core = 1\ncli = 1\napi = 1\n"
+    );
+}
+
+#[tokio::test]
+async fn repair_touching_a_new_path_gets_a_full_review() {
+    let (mut harness, scenario) =
+        build_carry_scenario("task-carry-scope", "agent-carry-scope", true).await;
+    let mut ctx = harness.ctx.clone();
+    let reviewers_before = reviewer_execution_count(&ctx).await;
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the conflicting sibling should hand the conflict back");
+    };
+    std::fs::write(
+        scenario.worktree.join("shared.txt"),
+        "core = 1\ncli = 1\napi = 1\n",
+    )
+    .expect("Worker resolves both sides");
+    std::fs::write(scenario.worktree.join("extra.txt"), "not reviewed\n")
+        .expect("Worker adds a file");
+    run_git(&scenario.worktree, &["add", "-A"]);
+    run_git(&scenario.worktree, &["commit", "-m", "resolve and extend"]);
+
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Test),
+        "worker completed the merge repair",
+        json!(["test -d ."]),
+    )
+    .await;
+    let ci = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci, HookResult::Ok), "{ci:?}");
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    let HookResult::Skipped { reason } = carried else {
+        panic!("a path outside the reviewed change set must not carry, got {carried:?}");
+    };
+    assert!(reason.contains("extra.txt"), "{reason}");
+    assert!(carry_rows(&ctx).await.is_empty());
+
+    // The ordinary reviewer dispatch follows.
+    let dispatched = DispatchRoleAgent.execute(&ctx).await;
+    assert!(matches!(dispatched, HookResult::Ok), "{dispatched:?}");
+    tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("reviewer executor spawned in time")
+        .expect("reviewer execution context received");
+    assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before + 1);
+}
+
+#[tokio::test]
+async fn no_configured_checks_means_a_full_review() {
+    let (harness, _scenario) =
+        build_carry_scenario("task-carry-no-ci", "agent-carry-no-ci", false).await;
+    let mut ctx = harness.ctx.clone();
+    let reviewers_before = reviewer_execution_count(&ctx).await;
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+        CARRY_REFRESH_REASON,
+        json!([]),
+    )
+    .await;
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    let HookResult::Skipped { reason } = carried else {
+        panic!("nothing verified the rebased tree, got {carried:?}");
+    };
+    assert!(reason.contains("no ci_steps"), "{reason}");
+    assert!(carry_rows(&ctx).await.is_empty());
+    assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before);
+}
+
+#[tokio::test]
+async fn changed_governing_context_means_a_full_review() {
+    let (harness, _scenario) =
+        build_carry_scenario("task-carry-context", "agent-carry-context", false).await;
+    let mut ctx = harness.ctx.clone();
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    sqlx::query("UPDATE task SET description = 'a different acceptance scope' WHERE id = ?")
+        .bind(&ctx.task_id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("task scope changes");
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+        CARRY_REFRESH_REASON,
+        json!(["test -d ."]),
+    )
+    .await;
+    let ci = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci, HookResult::Ok), "{ci:?}");
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    let HookResult::Skipped { reason } = carried else {
+        panic!("changed Task scope must not ride an old approval, got {carried:?}");
+    };
+    assert!(reason.contains("stale"), "{reason}");
+    assert!(carry_rows(&ctx).await.is_empty());
+}
+
+#[tokio::test]
+async fn other_review_entries_never_carry() {
+    let (harness, _scenario) =
+        build_carry_scenario("task-carry-entry", "agent-carry-entry", false).await;
+    let mut ctx = harness.ctx.clone();
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    // A user moving the Task is never mechanical.
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::user(api_types::UserActionSource::Api),
+        CARRY_REFRESH_REASON,
+        json!(["test -d ."]),
+    )
+    .await;
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    assert!(matches!(carried, HookResult::Skipped { .. }), "{carried:?}");
+
+    // Neither is an entry whose bridge was not a Forge rebase/handoff.
+    let entries = db::TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("entries load");
+    assert_eq!(
+        crate::workflow::review_carry_entry_kind(&entries[..entries.len() - 1]),
+        None,
+        "a bridge alone is not an entry into review"
+    );
+}
+
+#[tokio::test]
+async fn carry_for_an_old_review_is_ignored_after_a_newer_real_review() {
+    let (harness, scenario) =
+        build_carry_scenario("task-carry-superseded", "agent-carry-superseded", false).await;
+    let mut ctx = harness.ctx.clone();
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+        CARRY_REFRESH_REASON,
+        json!(["test -d ."]),
+    )
+    .await;
+    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+    assert!(matches!(
+        super::CarryReviewAuthority.execute(&ctx).await,
+        HookResult::Cascade { .. }
+    ));
+
+    let guard = ctx
+        .db
+        .lock_review_integration(&ctx.task_id)
+        .await
+        .expect("carried review authorises integration");
+    let candidate = guard.candidate.clone().expect("a reviewed candidate");
+    guard.release().await.expect("guard releases");
+    assert_eq!(candidate.commit_sha, rebased_head);
+
+    // A newer real review of a later commit supersedes the carry.
+    std::fs::write(scenario.worktree.join("feature.txt"), "feature v2\n").expect("edit writes");
+    run_git(&scenario.worktree, &["add", "-A"]);
+    run_git(&scenario.worktree, &["commit", "-m", "second pass"]);
+    let later_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
+    let base = run_git(&scenario.repo_path, &["rev-parse", "main"]);
+    let mut carried_scenario = CarryScenario {
+        worktree: scenario.worktree.clone(),
+        repo_path: scenario.repo_path.clone(),
+        workspace_id: scenario.workspace_id.clone(),
+        executor_execution_id: scenario.executor_execution_id.clone(),
+        commit_sha: later_head.clone(),
+        changed_paths: scenario.changed_paths.clone(),
+    };
+    carried_scenario.changed_paths.sort();
+    seed_passed_carry_review(
+        &ctx,
+        &carried_scenario,
+        &later_head,
+        &base,
+        &carried_scenario.changed_paths,
+        3,
+    )
+    .await;
+
+    let guard = ctx
+        .db
+        .lock_review_integration(&ctx.task_id)
+        .await
+        .expect("the newer review authorises integration");
+    let candidate = guard.candidate.clone().expect("a reviewed candidate");
+    guard.release().await.expect("guard releases");
+    assert_eq!(candidate.commit_sha, later_head);
+    assert_eq!(candidate.base_sha, base);
+    assert_eq!(carry_rows(&ctx).await.len(), 1, "history stays intact");
+}
+
+#[tokio::test]
+async fn carries_are_bounded_per_review() {
+    let (harness, scenario) =
+        build_carry_scenario("task-carry-bound", "agent-carry-bound", false).await;
+    let mut ctx = harness.ctx.clone();
+    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+        panic!("the moved target should bounce the merge through a rebase");
+    };
+    let contract_execution_id: String =
+        sqlx::query_scalar("SELECT execution_id FROM execution_review_contract WHERE task_id = ?")
+            .bind(&ctx.task_id)
+            .fetch_one(ctx.db.pool())
+            .await
+            .expect("contract execution loads");
+    for _ in 0..super::carry::MAX_REVIEW_CARRIES {
+        sqlx::query(
+            "INSERT INTO review_authority_carry
+                (id, task_id, contract_execution_id, commit_sha, base_sha, kind,
+                 changed_paths_json, created_at)
+             VALUES (?, ?, ?, ?, ?, 'clean_rebase', '[]', ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&ctx.task_id)
+        .bind(&contract_execution_id)
+        .bind(&scenario.commit_sha)
+        .bind(&scenario.commit_sha)
+        .bind(now_rfc3339())
+        .execute(ctx.db.pool())
+        .await
+        .expect("carry row seeds");
+    }
+    enter_review_after_bridge(
+        &mut ctx,
+        &reason,
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+        CARRY_REFRESH_REASON,
+        json!(["test -d ."]),
+    )
+    .await;
+    assert!(matches!(RunCiSteps.execute(&ctx).await, HookResult::Ok));
+
+    let carried = super::CarryReviewAuthority.execute(&ctx).await;
+    let HookResult::Skipped { reason } = carried else {
+        panic!("the carry bound must force a real review, got {carried:?}");
+    };
+    assert!(reason.contains("already carried"), "{reason}");
 }

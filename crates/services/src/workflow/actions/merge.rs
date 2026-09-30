@@ -835,3 +835,44 @@ impl HookAction for AutoCascadeOnMergeResult {
         HookResult::Ok
     }
 }
+
+/// Blocking `merge_failed` exit guard: a conflict-handoff repair must not
+/// reach a full review while its handed-off files still add Git conflict
+/// markers. Failing here routes through the workflow guard-retry machinery,
+/// which resumes the Worker with these file names and blocks the Task once the
+/// execution retry budget is spent. The merge-time check stays the final
+/// safety net.
+pub struct RequireConflictMarkersResolved;
+
+#[async_trait]
+impl HookAction for RequireConflictMarkersResolved {
+    async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if ctx.to_state != default_states::REVIEW {
+            return HookResult::Skipped {
+                reason: "only the repair-to-review exit is checked".to_string(),
+            };
+        }
+        if ctx.triggered_by.is_user() {
+            return HookResult::Skipped {
+                reason: "user-managed transition bypasses the conflict marker guard".to_string(),
+            };
+        }
+        let Some(merge_service) = ctx.merge_service.as_ref() else {
+            return HookResult::Skipped {
+                reason: "merge service unavailable".to_string(),
+            };
+        };
+        match merge_service.unresolved_handoff_markers(&ctx.task_id).await {
+            Ok(paths) if paths.is_empty() => HookResult::Ok,
+            Ok(paths) => HookResult::Failed {
+                reason: format!(
+                    "Unresolved Git conflict markers (`<<<<<<<`, `|||||||`, `>>>>>>>`) remain in committed file(s): {}. Open each file, reconcile both sides into the final code, delete every marker line (including nested or duplicated marker blocks from earlier conflict rounds), and commit the result.",
+                    paths.join(", ")
+                ),
+            },
+            Err(error) => HookResult::Failed {
+                reason: format!("conflict marker check failed: {error}"),
+            },
+        }
+    }
+}

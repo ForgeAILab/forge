@@ -3146,13 +3146,31 @@ async fn unbound_legacy_reviewer_cannot_settle_a_newer_review() {
 /// A Task in review with a running reviewer execution whose contract is
 /// admitted, ready for the reviewer's final reply.
 async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execution, TempDir) {
+    seed_admitted_review_with(r#"{"retry_budgets":{"execution":3,"review":3}}"#).await
+}
+
+async fn seed_admitted_review_with(
+    task_state_config: &str,
+) -> (Arc<SqliteDb>, TaskService, Task, db::Execution, TempDir) {
+    // `run_ci_steps` records each configured step before the contract admits.
+    let pre_review_ci_steps: Vec<Value> = serde_json::from_str::<Value>(task_state_config)
+        .expect("task state config parses")
+        .pointer("/review/ci_steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, command)| {
+            json!({"index": index, "command": command, "exit_code": 0, "stderr_tail": ""})
+        })
+        .collect();
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
-        .bind(r#"{"retry_budgets":{"execution":3,"review":3}}"#)
+        .bind(task_state_config)
         .bind(r#"{"execution_retry_count":0}"#)
         .bind(&task.id)
         .execute(db.pool())
@@ -3244,7 +3262,7 @@ async fn seed_admitted_review() -> (Arc<SqliteDb>, TaskService, Task, db::Execut
             execution_id: candidate.id,
             attempt_number: 1,
             status: ReviewStatus::Running,
-            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            step_results_json: json!({ "ci_steps": pre_review_ci_steps }).to_string(),
             started_at: now.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -3287,6 +3305,73 @@ async fn complete_review_with(
         .maybe_cascade_executor_completion(&execution.id)
         .await
         .expect("completed review cascades");
+}
+
+#[tokio::test]
+async fn timed_out_review_checks_rerun_alone_then_park_without_a_new_reviewer() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review_with(
+        r#"{"retry_budgets":{"execution":3,"review":3},"review":{"ci_steps":["sleep 3"],"check_timeout_seconds":1}}"#,
+    )
+    .await;
+    // Live case (NK-28): the reviewer passed, but Forge's own clean-checkout
+    // `cargo test` outran the limit while a sibling held the build lock, and
+    // every timeout dispatched a whole new reviewer.
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        "All criteria met.\n\n{\"result\": \"pass\", \"reason\": \"criteria met\"}",
+    )
+    .await;
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, crate::workflow::default_states::REVIEW);
+    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        current
+            .error_annotation
+            .as_deref()
+            .expect("the Task is parked for its owner"),
+    )
+    .expect("annotation parses");
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::ReviewBlocked
+    );
+    let message = annotation.message.unwrap_or_default();
+    assert!(
+        message.contains("`sleep 3` ran longer than 1s"),
+        "{message}"
+    );
+    assert!(message.contains("3 attempts"), "{message}");
+
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert!(
+        !review.step_results_json.contains("execution_retry"),
+        "no replacement reviewer is scheduled: {}",
+        review.step_results_json
+    );
+    assert!(
+        db::ReviewConformanceRepo::review_conformance(&*db, &execution.id)
+            .await
+            .expect("conformance loads")
+            .is_none()
+    );
+
+    // Duplicate terminal delivery is inert: the checks do not run again.
+    let started = std::time::Instant::now();
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .expect("duplicate delivery is inert");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
 #[tokio::test]

@@ -47,11 +47,16 @@ pub struct ReviewGoverningContext {
     pub deferred_requirement_count: usize,
     #[serde(default)]
     pub deferred_requirements_digest: Option<String>,
-    /// Commands used to prepare the detached clean checkout before required
+    /// Commands used to prepare the Task worktree before required
     /// conformance checks execute.
     #[serde(default)]
     pub setup_steps: Vec<String>,
     pub required_checks: Vec<ConformanceCheck>,
+    /// Per-command limit for the setup steps and required checks. Absent
+    /// (the default) keeps contracts frozen before the field existed equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub check_timeout_seconds: Option<u32>,
     pub source_digest: String,
 }
 

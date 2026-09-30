@@ -2032,10 +2032,16 @@ hits a plain merge conflict, which Forge then rebases the same way unless the
 commits each text-content conflict step with its conflict markers, finishes the
 rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
 the affected paths. The worker reconciles those files by editing and committing them, and the
-result goes through fresh checks and review like any other repair. A handoff
-does not spend the merge-fix retry budget. Integration checks for remaining
-markers only in paths handed off in the current retry window and parks
-unresolved files for manual Task-worktree repair. Modify/delete and binary
+result goes through fresh checks; it keeps the previous approval when the review
+authority carry described under review conformance applies, and otherwise gets
+a fresh review. A handoff
+does not spend the merge-fix retry budget. A blocking `before_exit` guard on
+`merge_failed` (`require_conflict_markers_resolved`) refuses the move to
+`review` while the committed HEAD still adds marker lines in a handed-off path;
+the worker is resumed through the workflow guard-retry budget with the file
+names, and the Task blocks when that budget is spent. Integration repeats the
+check as the final safety net (only in paths handed off in the current retry
+window) and parks unresolved files for manual Task-worktree repair. Modify/delete and binary
 conflicts also require manual repair, as do more than five handoffs in one
 retry window and conflicts on coordination roots, whose aggregate branch stays
 on the manual path. There, the recovery action creates a
@@ -2648,7 +2654,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
-- **review** — `ReviewRunner` prepares a detached clean checkout by running
+- **review** — `ReviewRunner` prepares the Task worktree by running
   `task.review_config.setup_steps`, then runs `ci_steps` as `bash -lc` commands.
   Task configuration overrides the Project's `default_review_config`; otherwise
   the Project defaults are inherited. A ready Project Agent can replace both
@@ -2820,13 +2826,23 @@ Task checkpoint persistence, so a retry cannot accumulate the previous full
 contract and report. Worker and planner Task continuity remains persistent,
 with deterministic structural compaction instead of an LCM timeline.
 
-Configured `setup_steps` run first in a detached clean checkout of the frozen
-candidate, followed by required checks, with a 120-second timeout and bounded
-output per command. Setup prepares dependencies but never satisfies a requirement;
+Configured `setup_steps` run first in the Task's own worktree, verified to sit
+at the frozen candidate commit with no tracked change, followed by required
+checks. Only tracked content is delivered, so the worktree's ignored dependency
+and build output is reused instead of a fresh clone repeating every install and
+cold build; after the checks the worktree is reset to the candidate commit and
+untracked, non-ignored output is removed so integration sees a clean tree. Each
+command runs with bounded output and a
+timeout (`check_timeout_seconds` in the review config, 1–14,400 seconds, default
+30 minutes; an unset value is not written into the frozen contract). A command
+that outruns the limit is Forge's own verification failing, not the reviewer:
+the result is not recorded, the reviewer completion re-runs only the checks (up
+to three attempts in all), and if they still time out the Task is parked with a
+`review_blocked` annotation instead of dispatching another reviewer. Setup prepares dependencies but never satisfies a requirement;
 failure is recorded separately and stops the checks. Forge records actual exit
 codes independently of model output and reruns required checks before accepting
 the assessment, even when the reviewer cited a frozen pre-review result. If
-setup or the checks modify tracked files (or move HEAD) in that clean checkout,
+setup or the checks modify tracked files (or move HEAD) at the candidate commit,
 the candidate does not reproduce from its own commit — a stale lockfile is the
 usual cause — so the review fails and the coder is told which files changed.
 Tracked changes in the reviewer's own worktree and stale Charter/Task/check
@@ -2847,11 +2863,53 @@ compares source and target commits, fast-forwards only the immutable reviewed
 object, and checks the resulting head. Stale review authority and a clean target
 rebase enter a marked review-refresh route; they do not consume merge-fix budget
 or dispatch a coder. Actual conflicts enter bounded merge repair. Changed content
-must receive a new semantic review, regardless of `review_passed_at`. PR
-publication pushes the immutable reviewed object and
+must receive a new semantic review, regardless of `review_passed_at`, except for
+the mechanical carry below. PR publication pushes the immutable reviewed object and
 rechecks authority; the external provider's final merge remains a human/provider
 operation. Explicit human and no-agent-review workflows remain separate and
 cannot manufacture an automated Charter assessment.
+
+**Review authority carry.** A Task that loses merge races on shared hub files
+would otherwise pay a full reviewer run per lost race. The `review` state's
+`on_enter` hook `carry_review_authority` (ahead of `dispatch_role_agent`) keeps
+the previous approval when the Task re-enters `review` only because (a) Forge
+rebased it cleanly onto a moved target (the transition log ends with the
+`[review-refresh] [target-moved-rebase]` bridge followed directly by the move
+into `review`), or (b) its Worker completed the repair of a Forge-committed
+rebase conflict (the bridge carries `[conflict-handoff]`). Every condition must
+hold, and failing any one is a `Skipped` hook, so the reviewer is dispatched as
+usual:
+
+- the transition was not user-triggered, the review gate does not require user
+  approval, the Task is not a coordination root or read-only, and the log
+  matches exactly one bridge then the entry (a check-failure bounce, a user move
+  or any other intervening transition disqualifies it);
+- `ci_steps` are configured and this entry's blocking `run_ci_steps` recorded
+  every one with exit code 0 (with no checks, nothing verified the new tree);
+- the Review attempt immediately before this entry passed and is still current
+  authority under the same checks integration makes: passed conformance, current
+  policy, an unchanged governing-context digest (Charter, Task scope, workflow,
+  reviewer assignment) and a matching frozen assessment;
+- every path `HEAD` changes relative to the target tip is in the approved
+  contract's `candidate_changed_paths`, `HEAD` descends from the current target
+  tip, the worktree is clean and no handed-off file adds conflict markers;
+- fewer than five carries already exist for that contract.
+
+On success one writer transaction settles the Review attempt that
+`run_ci_steps` opened as `passed` (its details keep the previous `conformance`
+and `auditor` verbatim and this entry's `ci_steps`; the attempt is not a new
+verdict), sets `review_passed_at`, and inserts a `review_authority_carry` row
+naming the contract execution, the rebased or repaired `commit_sha`, the target
+tip as `base_sha`, the kind (`clean_rebase` or `conflict_repair`) and the changed
+paths. The hook then posts a system comment and cascades to `merging`; the
+engine stops running `on_enter` hooks after a cascade, so no reviewer is
+dispatched. `lock_review_integration` keeps every existing check and exposes the
+effective candidate: the newest carry row whose `contract_execution_id` is the
+current passed contract's, else the contract's own `commit_sha`/`base_sha`.
+Integration and PR publication compare `HEAD` and the target tip with that
+candidate, so a newer real review (a different contract execution) supersedes
+all earlier carries automatically. A stored workflow change (such as migration
+`V148`) alters the governing context and therefore also forces one fresh review.
 
 The manual review-rerun endpoint consumes the same result categories as automatic
 review completion. Passed reruns cascade into merging, failed reruns use the

@@ -88,7 +88,9 @@ pub(crate) async fn commit_execution_changes_with_policy(
     {
         return Ok(None);
     }
-    let subject = build_commit_subject(Some(&ctx.description), &ctx.task_id);
+    let subject_source =
+        executors::task_title(&ctx.agent_config).unwrap_or(ctx.description.as_str());
+    let subject = build_commit_subject(Some(subject_source), &ctx.task_id);
     commit_worktree_changes(Path::new(&ctx.worktree_path), &subject).await
 }
 
@@ -277,6 +279,36 @@ mod tests {
 
         assert_ne!(sha, before);
         assert_eq!(log_subject, "agent: Implement the thing");
+    }
+
+    #[tokio::test]
+    async fn role_prompt_commits_are_named_after_the_task_title() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        init_repo(tempdir.path()).await;
+        fs::write(tempdir.path().join("resolved.rs"), "fn resolved() {}\n").expect("file writes");
+        let mut agent_config = serde_json::json!({});
+        executors::mark_task_title(&mut agent_config, "NK-20 Context Resolver");
+        let ctx = executors::ExecutionContext {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            worktree_path: tempdir.path().to_string_lossy().into_owned(),
+            // A merge-fix prompt carries no `Task:` line to recover a title from.
+            description: "Forge role contract (authoritative):\nReconcile the conflicts."
+                .to_owned(),
+            agent_config,
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
+
+        commit_execution_changes(&ctx)
+            .await
+            .expect("commit succeeds")
+            .expect("dirty worktree creates commit");
+        let log_subject = git_output(tempdir.path(), &["log", "-1", "--pretty=%s"]).await;
+
+        assert_eq!(log_subject, "agent: NK-20 Context Resolver");
     }
 
     #[tokio::test]

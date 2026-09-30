@@ -417,6 +417,14 @@ fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
             prompt.user
         );
         assert!(!prompt.user.contains("Forge commits your changes"));
+        // The repair is integrated by Forge after its own checks; the prompt
+        // does not promise (or mention) a review.
+        assert!(prompt.user.contains("Forge will run the project's checks"));
+        assert!(
+            !prompt.user.contains("review"),
+            "{builder_id}: {}",
+            prompt.user
+        );
         assert!(
             !prompt
                 .user

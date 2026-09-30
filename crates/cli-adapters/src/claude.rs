@@ -18,7 +18,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.282";
+const DEFAULT_CLAUDE_VERSION: &str = "2.1.285";
 // Router v3 replaced the `ccr code <claude args>` pass-through with
 // `ccr <profile> [-- <agent args>]`; adopting it needs an invocation rework,
 // so stay on the 2.x line until then.
@@ -1234,8 +1234,8 @@ mod tests {
             args,
             vec![
                 "-y",
-                "--allow-scripts=@anthropic-ai/claude-code@2.1.282",
-                "@anthropic-ai/claude-code@2.1.282",
+                "--allow-scripts=@anthropic-ai/claude-code@2.1.285",
+                "@anthropic-ai/claude-code@2.1.285",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",

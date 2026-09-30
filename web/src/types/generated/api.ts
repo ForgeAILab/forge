@@ -210,6 +210,7 @@ export interface ReviewConfig {
   setup_steps?: string[]
   ci_steps: string[]
   review_prompt?: string | null
+  check_timeout_seconds?: number
 }
 
 export interface DefaultRoleAssignment {

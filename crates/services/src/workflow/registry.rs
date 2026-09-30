@@ -3,9 +3,10 @@ use crate::{
         actions::{
             AutoCascadeOnCompletion, AutoCascadeOnMergeResult, AutoCascadeOnReviewPass,
             AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
-            CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
-            DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
-            PropagateDoneToSubtasks, RequireCleanWorktree, RequirePlanChecklistComplete,
+            CarryReviewAuthority, CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow,
+            DependencyGate, DispatchExecutor, DispatchFixAgent, DispatchRoleAgent,
+            NotifyRoleHolder, PropagateDoneToSubtasks, RequireCleanWorktree,
+            RequireConflictMarkersResolved, RequirePlanChecklistComplete,
             RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
             SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
         },
@@ -23,6 +24,7 @@ pub fn is_known_action(name: &str) -> bool {
             | "cleanup_workspace_now"
             | "schedule_workspace_cleanup"
             | "dispatch_role_agent"
+            | "carry_review_authority"
             | "satisfy_dependents"
             | "auto_cascade_on_review_pass"
             | "auto_cascade_on_unconfigured_review"
@@ -33,6 +35,7 @@ pub fn is_known_action(name: &str) -> bool {
             | "check_retry_budget"
             | "require_clean_worktree"
             | "require_plan_checklist_complete"
+            | "require_conflict_markers_resolved"
             | "dependency_gate"
             | "dispatch_executor"
             | "dispatch_fix_agent"
@@ -63,6 +66,7 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "cleanup_workspace_now" => Box::new(CleanupWorkspaceNow),
         "schedule_workspace_cleanup" => Box::new(ScheduleWorkspaceCleanup),
         "dispatch_role_agent" => Box::new(DispatchRoleAgent),
+        "carry_review_authority" => Box::new(CarryReviewAuthority),
         "satisfy_dependents" => Box::new(SatisfyDependents),
         "auto_cascade_on_review_pass" => Box::new(AutoCascadeOnReviewPass),
         "auto_cascade_on_unconfigured_review" => Box::new(AutoCascadeOnUnconfiguredReview),
@@ -73,6 +77,7 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "check_retry_budget" => Box::new(CheckRetryBudget),
         "require_clean_worktree" => Box::new(RequireCleanWorktree),
         "require_plan_checklist_complete" => Box::new(RequirePlanChecklistComplete),
+        "require_conflict_markers_resolved" => Box::new(RequireConflictMarkersResolved),
         "dependency_gate" => Box::new(DependencyGate),
         "dispatch_executor" => Box::new(DispatchExecutor),
         "dispatch_fix_agent" => Box::new(DispatchFixAgent),

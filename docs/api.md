@@ -2021,8 +2021,8 @@ ten-minute review at a time:
   configuration, not a secret store. Use the executor's credential provider
   for tokens and passwords.
 - `assets` copy a host file or directory (absolute `source`) to a
-  worktree-relative `target` immediately before each local execution, and into
-  the clean checkout that runs review checks. A target that already exists is
+  worktree-relative `target` immediately before each local execution and before
+  Forge re-runs the review checks in the Task worktree. A target that already exists is
   never overwritten, so tracked content and earlier copies are left alone.
   Copies are staged and renamed atomically; symbolic links, overlapping
   targets, and sources inside (or containing) the worktree are refused.
@@ -2045,7 +2045,7 @@ general settings authority through the typed native `project.review_config`
 operation. Its only action is `set_ci_steps`; the payload requires the Project
 version from `project.current_state` and a `ci_steps` array of at most 16 unique,
 single-line commands (2,048 characters each). An optional `setup_steps` array
-uses the same bounds and prepares the detached clean checkout before checks run;
+uses the same bounds and prepares the Task worktree before checks run;
 omission preserves the existing list and `[]` clears it. The command replaces
 only those two lists, preserving the reviewer prompt, requirement policy,
 conformance checks, retry budgets, and all unrelated settings. The Project
@@ -2299,8 +2299,12 @@ Task scope server-side, requires the normal assignment and Workspace lease,
 keeps Main/Project Agent Chats filesystem-denied, and reserves user-only
 approval, waiver, and release operations for the user.
 
-Codex currently advertises GPT-6 Astra, Sol, and Luna, GPT-5.6 Sol, Terra,
-and Luna, and GPT-5.5. Claude Code advertises Claude Fable 5.1, Opus 5.5,
+Codex currently advertises GPT-6.1 Sol (`gpt-6.1-sol`) first, followed by
+GPT-6 Astra, Sol, and Luna, GPT-5.6 Sol, Terra, and Luna, and GPT-5.5.
+GPT-6.1 Sol advertises `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`
+reasoning efforts. The managed Codex CLI version is `0.159.1`, exposed as
+`cli_specific.codex_version`.
+Claude Code advertises Claude Fable 5.1, Opus 5.5,
 Fable 5, Opus 5, Sonnet 5, and Haiku 4.5. The web client uses the per-model map so, for example, Codex
 `ultra` is not offered for Luna and reasoning controls are not offered for
 Claude Haiku 4.5. Clients may still submit a custom model id because providers
@@ -3793,8 +3797,9 @@ failed automated result remains auditable. A `pass` is only as strong as the
 checks Forge ran, so configure `setup_steps` and `conformance_checks` for any
 Task whose acceptance depends on a build or test.
 
-An `unverified` result — no readable result block, or a review context or
-commit that changed under the reviewer — uses the bounded reviewer
+An `unverified` result other than a check timeout (described below) — no
+readable result block, or a review context or commit that changed under the
+reviewer — uses the bounded reviewer
 execution-retry path and eventually exposes a durable recovery blocker; it
 neither dispatches a coder nor grants acceptance. Embedded reviewers get up to
 two follow-up turns to supply a missing result block before that happens.
@@ -3828,8 +3833,13 @@ from `scope.explicit_non_goals` and `success.non_claims` are added automatically
 All other Project requirements stay deferred to milestone readiness.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
-override them. In the detached clean checkout, setup commands run first and each
-required check then runs independently. Read-only discovery/planning Tasks
+override them. Forge re-runs them in the Task's worktree at the reviewed commit
+(reusing its ignored dependency and build output), setup commands first and each
+required check then independently; afterwards the worktree is reset to that
+commit and untracked, non-ignored output is removed. Each command is limited by the optional
+`check_timeout_seconds` (integer, 1–14,400; default 1,800). A timed-out check is
+not a verdict: Forge re-runs only the checks, up to three attempts, then parks
+the Task with `review_blocked` rather than dispatching another reviewer. Read-only discovery/planning Tasks
 suppress both lists. A Project Agent sets them through `project.review_config`;
 this keeps repository-specific preparation and check selection at Project scope.
 

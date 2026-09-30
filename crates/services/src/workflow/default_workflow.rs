@@ -126,7 +126,7 @@ pub fn default_workflow() -> WorkflowDefinition {
                     blocking_hook("run_before_work_hooks"),
                     blocking_hook("run_ci_steps"),
                 ],
-                on_enter: vec![hook("dispatch_role_agent")],
+                on_enter: vec![hook("carry_review_authority"), hook("dispatch_role_agent")],
                 after_enter: vec![
                     hook("auto_cascade_on_review_pass"),
                     hook("auto_cascade_on_unconfigured_review"),
@@ -156,6 +156,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             Some(default_roles::CODER),
             CanonicalPhase::Review,
             StateHooks {
+                before_exit: vec![blocking_hook("require_conflict_markers_resolved")],
                 before_enter: vec![blocking_hook("run_before_work_hooks")],
                 on_enter: vec![hook("notify_role_holder"), hook("dispatch_role_agent")],
                 ..StateHooks::default()

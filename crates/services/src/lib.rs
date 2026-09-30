@@ -211,7 +211,7 @@ pub use memory_source::{
     ForgeMemoryQuery, ForgeMemoryRecord, ForgeMemorySearch, ForgeMemorySource,
     MemorySourceBindingInput,
 };
-pub use merge_service::{MergeOutcome, MergeService};
+pub use merge_service::{MergeOutcome, MergeService, ReviewCarryFacts};
 pub use milestone_orchestration::{
     evaluate_readiness, milestone_identity, principals_equal, recompute_readiness_digest,
     release_identity, release_snapshot_digest, validate_definition_transition,

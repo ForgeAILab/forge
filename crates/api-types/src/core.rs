@@ -425,7 +425,7 @@ pub struct ReviewConfig {
     pub requirement_ids: Vec<String>,
     #[serde(default)]
     pub requirement_allocations: std::collections::BTreeMap<String, String>,
-    /// Commands that prepare a clean review checkout before `ci_steps` run,
+    /// Commands that prepare the Task worktree before `ci_steps` run,
     /// such as dependency installation. They do not themselves satisfy a
     /// review requirement, but their result is retained with the review.
     #[serde(default)]
@@ -434,6 +434,11 @@ pub struct ReviewConfig {
     pub ci_steps: Vec<String>,
     #[serde(default)]
     pub review_prompt: Option<String>,
+    /// Wall-clock limit, in seconds, for each setup step and check Forge
+    /// re-runs in the Task worktree. Unset uses the 30-minute default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub check_timeout_seconds: Option<u32>,
 }
 
 #[cfg(test)]

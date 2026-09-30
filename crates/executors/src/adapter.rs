@@ -826,6 +826,9 @@ fn apply_runtime_scope(source: &serde_json::Value, target: &mut serde_json::Valu
     if let Some(role) = crate::task_role(source) {
         crate::mark_task_role(target, role);
     }
+    if let Some(title) = crate::task_title(source) {
+        crate::mark_task_title(target, title);
+    }
     crate::environment::mark_task_environment(
         target,
         &crate::environment::task_environment(source),
@@ -1110,6 +1113,7 @@ mod tests {
             }
         });
         crate::mark_task_role(&mut snapshot, "worker");
+        crate::mark_task_title(&mut snapshot, "NK-20 Context Resolver");
         crate::mark_worktree_read_only(&mut snapshot);
         let env = std::collections::BTreeMap::from([("GODOT_BIN".to_owned(), "/opt/g".to_owned())]);
         crate::environment::mark_task_environment(&mut snapshot, &env);
@@ -1119,6 +1123,10 @@ mod tests {
         apply_runtime_scope(&snapshot, &mut candidate);
 
         assert_eq!(crate::task_role(&candidate), Some("worker"));
+        assert_eq!(
+            crate::task_title(&candidate),
+            Some("NK-20 Context Resolver")
+        );
         assert!(crate::is_worktree_read_only(&candidate));
         assert_eq!(crate::environment::task_environment(&candidate), env);
         assert_eq!(

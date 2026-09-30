@@ -1,6 +1,6 @@
 use super::*;
 use crate::new_uuid_v4;
-use crate::repository::CreateManualReviewPass;
+use crate::repository::{CreateManualReviewPass, SettleCarriedReview};
 
 struct TaskAuthorityUpdate {
     expected_version: i64,
@@ -288,6 +288,7 @@ async fn update_status_with_review_authority_inner(
     expected_review_updated_at: &str,
     expected_candidate_execution_id: Option<&str>,
     task_projection: Option<Option<String>>,
+    carry: Option<&crate::NewReviewAuthorityCarry>,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
@@ -406,6 +407,30 @@ async fn update_status_with_review_authority_inner(
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+    }
+
+    if let Some(carry) = carry {
+        // Same writer transaction as the settlement: a carried Review without
+        // its candidate record (or the reverse) can never be observed.
+        sqlx::query(
+            "INSERT INTO review_authority_carry
+                (id, task_id, contract_execution_id, commit_sha, base_sha, kind,
+                 changed_paths_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&carry.task_id)
+        .bind(&carry.contract_execution_id)
+        .bind(&carry.commit_sha)
+        .bind(&carry.base_sha)
+        .bind(carry.kind.to_string())
+        .bind(
+            serde_json::to_string(&carry.changed_paths)
+                .map_err(|error| DbError::Check(error.to_string()))?,
+        )
+        .bind(updated_at)
+        .execute(&mut *transaction)
+        .await?;
     }
 
     let event = CreateDomainEvent {
@@ -1002,6 +1027,7 @@ impl ReviewRepo for SqliteDb {
             expected_review_updated_at,
             expected_candidate_execution_id,
             None,
+            None,
         )
         .await?;
         Ok(review)
@@ -1038,6 +1064,29 @@ impl ReviewRepo for SqliteDb {
             expected_review_updated_at,
             Some(expected_candidate_execution_id),
             task_projection,
+            None,
+        )
+        .await?;
+        Ok(review)
+    }
+
+    async fn settle_carried_review(&self, input: SettleCarriedReview) -> Result<Review> {
+        let (review, _) = update_status_with_review_authority_inner(
+            self,
+            &input.review_id,
+            ReviewStatus::Passed,
+            input.step_results_json,
+            Some(input.occurred_at.clone()),
+            &input.occurred_at,
+            input.expected_task_version,
+            &input.expected_task_status,
+            Some(input.expected_project_version),
+            Some(&input.expected_workflow_definition),
+            ReviewStatus::Running,
+            &input.expected_review_updated_at,
+            Some(&input.candidate_execution_id),
+            Some(Some(input.occurred_at.clone())),
+            Some(&input.carry),
         )
         .await?;
         Ok(review)

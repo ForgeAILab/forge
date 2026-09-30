@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.157.0";
+const DEFAULT_CODEX_VERSION: &str = "0.159.1";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
 const MANAGED_CONFIG: &str = "suppress_unstable_features_warning = true\n";
@@ -35,6 +35,7 @@ const MANAGED_RULES_FILE: &str = "forge-task-boundary.rules";
 const MANAGED_RULES: &str = include_str!("../tests/fixtures/forge-task-boundary.rules");
 
 const CODEX_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -51,7 +52,9 @@ pub const CODEX_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh",
 #[must_use]
 pub fn codex_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     match model {
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => CODEX_REASONING_EFFORTS,
+        "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => {
+            CODEX_REASONING_EFFORTS
+        }
         "gpt-6-luna" | "gpt-reserve" | "gpt-5.6-luna" | "codex-auto-review" => {
             &["low", "medium", "high", "xhigh", "max"]
         }
@@ -1429,12 +1432,43 @@ fn prepare_managed_codex_home(
 fn reset_managed_runtime_path(path: &Path) -> Result<(), ExecutorError> {
     match path.symlink_metadata() {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            // `task-scratch` is the Worker's TMPDIR, so it holds whatever the
+            // project's tests leave behind — including directories a test
+            // made read-only and never restored. Removing an entry needs
+            // write permission on its parent, so `remove_dir_all` failed with
+            // EACCES on every later execution of the Task.
+            #[cfg(unix)]
+            make_directories_owner_writable(path).map_err(ExecutorError::Io)?;
             std::fs::remove_dir_all(path).map_err(ExecutorError::Io)
         }
         Ok(_) => std::fs::remove_file(path).map_err(ExecutorError::Io),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ExecutorError::Io(error)),
     }
+}
+
+/// Grant the owner `rwx` on every real directory under `root` so its entries
+/// can be listed and unlinked. Symlinks are never followed, so nothing outside
+/// `root` is touched.
+#[cfg(unix)]
+fn make_directories_owner_writable(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let mode = dir.symlink_metadata()?.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode | 0o700))?;
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_managed_config(managed_home: &Path) -> Result<(), ExecutorError> {
@@ -1565,7 +1599,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-y", "@openai/codex@0.157.0", "app-server", "--verbose"]
+            vec!["-y", "@openai/codex@0.159.1", "app-server", "--verbose"]
         );
     }
 
@@ -1579,6 +1613,7 @@ mod tests {
         assert_eq!(
             discovered.models,
             vec![
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-6-sol",
                 "gpt-6-luna",
@@ -1589,6 +1624,11 @@ mod tests {
                 "gpt-5.5",
                 "codex-auto-review",
             ]
+        );
+        assert_eq!(discovered.cli_specific["codex_version"], "0.159.1");
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-6.1-sol"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
         );
         assert_eq!(
             discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-sol"],
@@ -1623,7 +1663,7 @@ mod tests {
     #[test]
     fn thread_start_params_maps_policy() {
         let config = CodexConfig {
-            model: Some("gpt-5-codex".to_owned()),
+            model: Some("gpt-6.1-sol".to_owned()),
             permission_policy: Some(PermissionPolicy::Plan),
             model_reasoning_effort: Some("high".to_owned()),
             ..CodexConfig::default()
@@ -1632,7 +1672,7 @@ mod tests {
         let params =
             CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], &[]);
 
-        assert_eq!(params.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(params.model.as_deref(), Some("gpt-6.1-sol"));
         assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
         assert!(matches!(
             params.approval_policy,
@@ -1845,6 +1885,36 @@ mod tests {
             &tempdir.path().join("sibling-cache"),
             &worktree,
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_codex_home_resets_scratch_left_read_only_by_a_test() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let ambient = dir.path().join("ambient");
+        let managed = dir.path().join("logs/task/.codex-managed-home");
+        fs::create_dir_all(&ambient).expect("ambient home creates");
+        prepare_managed_codex_home(&managed, &ambient).expect("first execution prepares");
+
+        // A project test migrated a fixture it had made read-only and never
+        // restored the mode, so its tempdir could not clean up after itself.
+        let legacy = managed.join("task-scratch/.tmpXYZ/legacy.novelkit");
+        fs::create_dir_all(legacy.join("chapters")).expect("fixture tree creates");
+        fs::write(legacy.join("project.json"), "{}").expect("fixture file writes");
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o555))
+            .expect("fixture made read-only");
+
+        prepare_managed_codex_home(&managed, &ambient).expect("second execution prepares");
+
+        let scratch = managed.join("task-scratch");
+        assert!(scratch.is_dir());
+        assert_eq!(
+            fs::read_dir(&scratch).expect("scratch lists").count(),
+            0,
+            "the next execution starts from an empty scratch directory"
+        );
     }
 
     #[test]
