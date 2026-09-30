@@ -2299,8 +2299,12 @@ Task scope server-side, requires the normal assignment and Workspace lease,
 keeps Main/Project Agent Chats filesystem-denied, and reserves user-only
 approval, waiver, and release operations for the user.
 
-Codex currently advertises GPT-6 Astra, Sol, and Luna, GPT-5.6 Sol, Terra,
-and Luna, and GPT-5.5. Claude Code advertises Claude Fable 5.1, Opus 5.5,
+Codex currently advertises GPT-6.1 Sol (`gpt-6.1-sol`) first, followed by
+GPT-6 Astra, Sol, and Luna, GPT-5.6 Sol, Terra, and Luna, and GPT-5.5.
+GPT-6.1 Sol advertises `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`
+reasoning efforts. The managed Codex CLI version is `0.159.1`, exposed as
+`cli_specific.codex_version`.
+Claude Code advertises Claude Fable 5.1, Opus 5.5,
 Fable 5, Opus 5, Sonnet 5, and Haiku 4.5. The web client uses the per-model map so, for example, Codex
 `ultra` is not offered for Luna and reasoning controls are not offered for
 Claude Haiku 4.5. Clients may still submit a custom model id because providers

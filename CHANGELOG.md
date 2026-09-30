@@ -8,6 +8,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [0.13.10] - 2026-09-29
 
+### Changed
+
+- Upgrade the managed Codex CLI pin from `0.157.0` to `0.159.1`, whose
+  upstream default model is GPT-6.1 Sol.
+- Upgrade the managed Claude Code CLI pin from `2.1.282` to `2.1.285`,
+  including its exact-package install-script allowance.
+
+### Added
+
+- Codex model discovery lists `gpt-6.1-sol` first with reasoning efforts
+  `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+
 ### Fixed
 
 - Domain-event consumers (agent wake delivery, Agent Chat memory indexing,

@@ -26,7 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CODEX_VERSION: &str = "0.157.0";
+const DEFAULT_CODEX_VERSION: &str = "0.159.1";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
 const MANAGED_CONFIG: &str = "suppress_unstable_features_warning = true\n";
@@ -35,6 +35,7 @@ const MANAGED_RULES_FILE: &str = "forge-task-boundary.rules";
 const MANAGED_RULES: &str = include_str!("../tests/fixtures/forge-task-boundary.rules");
 
 const CODEX_MODELS: &[&str] = &[
+    "gpt-6.1-sol",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -51,7 +52,9 @@ pub const CODEX_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh",
 #[must_use]
 pub fn codex_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     match model {
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => CODEX_REASONING_EFFORTS,
+        "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-5.6-sol" | "gpt-5.6-terra" => {
+            CODEX_REASONING_EFFORTS
+        }
         "gpt-6-luna" | "gpt-reserve" | "gpt-5.6-luna" | "codex-auto-review" => {
             &["low", "medium", "high", "xhigh", "max"]
         }
@@ -1596,7 +1599,7 @@ mod tests {
             .collect();
         assert_eq!(
             args,
-            vec!["-y", "@openai/codex@0.157.0", "app-server", "--verbose"]
+            vec!["-y", "@openai/codex@0.159.1", "app-server", "--verbose"]
         );
     }
 
@@ -1610,6 +1613,7 @@ mod tests {
         assert_eq!(
             discovered.models,
             vec![
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-6-sol",
                 "gpt-6-luna",
@@ -1620,6 +1624,11 @@ mod tests {
                 "gpt-5.5",
                 "codex-auto-review",
             ]
+        );
+        assert_eq!(discovered.cli_specific["codex_version"], "0.159.1");
+        assert_eq!(
+            discovered.cli_specific["model_reasoning_efforts"]["gpt-6.1-sol"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
         );
         assert_eq!(
             discovered.cli_specific["model_reasoning_efforts"]["gpt-5.6-sol"],
@@ -1654,7 +1663,7 @@ mod tests {
     #[test]
     fn thread_start_params_maps_policy() {
         let config = CodexConfig {
-            model: Some("gpt-5-codex".to_owned()),
+            model: Some("gpt-6.1-sol".to_owned()),
             permission_policy: Some(PermissionPolicy::Plan),
             model_reasoning_effort: Some("high".to_owned()),
             ..CodexConfig::default()
@@ -1663,7 +1672,7 @@ mod tests {
         let params =
             CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], &[]);
 
-        assert_eq!(params.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(params.model.as_deref(), Some("gpt-6.1-sol"));
         assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
         assert!(matches!(
             params.approval_policy,

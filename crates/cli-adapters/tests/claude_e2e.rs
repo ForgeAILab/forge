@@ -57,8 +57,8 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
     if !npx_package_available_offline([
         "--offline",
         "-y",
-        "--allow-scripts=@anthropic-ai/claude-code@2.1.282",
-        "@anthropic-ai/claude-code@2.1.282",
+        "--allow-scripts=@anthropic-ai/claude-code@2.1.285",
+        "@anthropic-ai/claude-code@2.1.285",
         "--version",
     ]) {
         println!(
