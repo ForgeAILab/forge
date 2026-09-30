@@ -1175,3 +1175,66 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
         "expected invalid_operation, got {error:?}"
     );
 }
+
+#[tokio::test]
+async fn test_recovery_actions_disabled_while_role_execution_runs() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
+    let reviewer = seed_execution(
+        &db,
+        &task.id,
+        None,
+        crate::workflow::default_roles::REVIEWER,
+        ExecutionStatus::Completed,
+        Some("review-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let review = seed_failed_review(&db, &task.id, &reviewer.id, 1, json!({})).await;
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &[],
+        Some(&review),
+        Some(&reviewer),
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+    assert!(exception.actions.iter().any(|action| action.enabled
+        && action.kind != api_types::RecoveryAction::CancelTask
+        && action.kind != api_types::RecoveryAction::OpenInteractive));
+
+    let coder = seed_execution(
+        &db,
+        &task.id,
+        None,
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Running,
+        Some("coder-session"),
+        "2026-05-02T11:00:00Z",
+    )
+    .await;
+    let gated =
+        crate::task_diagnostics::disable_recovery_while_running(exception.clone(), Some(&coder));
+    for (action, before) in gated.actions.iter().zip(&exception.actions) {
+        if matches!(
+            action.kind,
+            api_types::RecoveryAction::CancelTask | api_types::RecoveryAction::OpenInteractive
+        ) || !before.enabled
+        {
+            assert_eq!(action, before);
+        } else {
+            assert!(!action.enabled, "{:?} stays enabled", action.kind);
+            assert_eq!(
+                action.disabled_reason.as_deref(),
+                Some("A coder execution is still running; wait for it to finish")
+            );
+        }
+    }
+
+    let untouched =
+        crate::task_diagnostics::disable_recovery_while_running(exception.clone(), None);
+    assert_eq!(untouched.actions, exception.actions);
+}

@@ -25,6 +25,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   as coming from a superseded Project revision and the Task sat in
   `merge_failed` or `in_progress` with nothing running. Forge now fills both
   fields when it admits the execution.
+- A Task whose workflow exception is still showing while its coder or
+  reviewer runs (for example `merge_failed` while the conflict-fix coder
+  works) no longer offers recovery actions that would race the live run and
+  fail with 409. They are disabled with the reason until the execution stops;
+  Cancel Task and Open Side Session stay available.
 
 ## [0.13.10] - 2026-09-29
 
