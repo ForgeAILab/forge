@@ -8,10 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- CI and release Rust verification share the existing dependency cache. Only
-  default-branch CI runs save it, including failed runs, reducing duplicate
-  branch and tag caches. Newer CI runs cancel superseded runs for the same
-  event and ref.
+- Release tags no longer re-run the Rust and web test suites. The release
+  workflow's `verify-ci` gate waits for CI on the tagged commit on `main` and
+  fails the release unless it passed, so a tag can be pushed right after
+  merging. The GHCR image now builds alongside the native archives instead of
+  after them. A patch release's own runtime drops from about 2h10m to roughly
+  20 minutes after `main` CI is green.
+- CI runs on pull requests and on pushes to `main` only; branch pushes no
+  longer run the full suite a second time next to their PR run. Only
+  default-branch runs save the Rust dependency cache, including failed runs.
+  Newer pull-request runs cancel superseded ones; `main` runs are never
+  cancelled, because a release needs a successful run on its exact commit.
 - Release container builds reuse a GHCR BuildKit registry cache across tags,
   including intermediate Rust and frontend build layers.
 

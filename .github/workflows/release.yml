@@ -78,31 +78,80 @@ jobs:
               raise SystemExit(f"CHANGELOG.md has no release section for {version}")
           PY
 
-  verify-rust:
-    name: Verify Rust
+  # The tag does not re-run the test suites. This gate requires the CI workflow
+  # (Rust, security audit, web, npm) to have passed on this exact commit on the
+  # default branch, waiting for it when the tag is pushed right after a merge.
+  verify-ci:
+    name: Verify CI passed on the tagged commit
     runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      actions: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Wait for default-branch CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          runs="repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=$DEFAULT_BRANCH&per_page=1"
+          missing_polls=0
+          while true; do
+            if ! run=$(gh api "$runs" --jq '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "-") \(.html_url)"'); then
+              echo "::warning::Could not read CI runs; retrying."
+              sleep 60
+              continue
+            fi
+            if [[ -z "$run" ]]; then
+              # A run can take a moment to appear after the merge push.
+              missing_polls=$((missing_polls + 1))
+              if ((missing_polls > 10)); then
+                echo "::error::No CI run on $DEFAULT_BRANCH for $SHA. Tag a commit that was pushed to $DEFAULT_BRANCH."
+                exit 1
+              fi
+            else
+              read -r status conclusion url <<<"$run"
+              if [[ "$status" == completed ]]; then
+                if [[ "$conclusion" == success ]]; then
+                  echo "CI passed on $SHA: $url"
+                  exit 0
+                fi
+                echo "::error::CI on $SHA finished with '$conclusion': $url"
+                exit 1
+              fi
+              echo "CI on $SHA is $status: $url"
+            fi
+            sleep 60
+          done
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+  # Superseded by verify-ci; the same suite already ran on this commit.
+  # verify-rust:
+  #   name: Verify Rust
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v7
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust
-          # Restore the CI cache; tag-scoped copies cannot seed later releases.
-          save-if: false
+  #     - name: Install Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         components: clippy, rustfmt
 
-      - name: Run Rust CI
-        run: ./scripts/ci-rust.sh
+  #     - name: Cache Rust dependencies
+  #       uses: Swatinem/rust-cache@v2
+  #       with:
+  #         shared-key: rust
+  #         # Restore the CI cache; tag-scoped copies cannot seed later releases.
+  #         save-if: false
 
-      - name: Test performance collector
-        if: ${{ !cancelled() }}
-        run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+  #     - name: Run Rust CI
+  #       run: ./scripts/ci-rust.sh
+
+  #     - name: Test performance collector
+  #       if: ${{ !cancelled() }}
+  #       run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
 
   verify-audit:
     name: Verify security audit
@@ -121,7 +170,7 @@ jobs:
         run: cargo audit
 
   verify-web:
-    name: Verify and build web
+    name: Build web
     runs-on: ubuntu-latest
     container: mcr.microsoft.com/playwright:v1.59.1-noble
     defaults:
@@ -149,24 +198,25 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint
-        run: pnpm lint
-
-      - name: Typecheck
-        if: ${{ !cancelled() }}
-        run: pnpm typecheck
-
-      - name: Unit tests
-        if: ${{ !cancelled() }}
-        run: pnpm test
+      # Lint, types, unit tests and the Playwright smoke run in CI; verify-ci
+      # requires them to have passed on this commit.
+      # - name: Lint
+      #   run: pnpm lint
+      #
+      # - name: Typecheck
+      #   if: ${{ !cancelled() }}
+      #   run: pnpm typecheck
+      #
+      # - name: Unit tests
+      #   if: ${{ !cancelled() }}
+      #   run: pnpm test
 
       - name: Build
-        if: ${{ !cancelled() }}
         run: pnpm build
 
-      - name: Playwright smoke
-        if: ${{ !cancelled() }}
-        run: pnpm run e2e
+      # - name: Playwright smoke
+      #   if: ${{ !cancelled() }}
+      #   run: pnpm run e2e
 
       - name: Upload verified web assets
         uses: actions/upload-artifact@v7
@@ -199,7 +249,7 @@ jobs:
     name: Build ${{ matrix.target }}
     needs:
       - verify-version
-      - verify-rust
+      - verify-ci
       - verify-audit
       - verify-web
       - verify-npm
@@ -297,9 +347,15 @@ jobs:
           path: ${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
 
+  # The image builds from the Dockerfile rather than the native archives, so it
+  # runs alongside the platform builds instead of after them.
   container:
     name: Publish GHCR image
-    needs: build
+    needs:
+      - verify-version
+      - verify-ci
+      - verify-audit
+      - verify-npm
     runs-on: ubuntu-latest
     permissions:
       contents: read
