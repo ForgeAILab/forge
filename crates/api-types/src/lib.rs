@@ -101,6 +101,7 @@ fn export_typescript() {
     ReviewGoverningContext::export().expect("export ReviewGoverningContext");
     ReviewContract::export().expect("export ReviewContract");
     ReviewResult::export().expect("export ReviewResult");
+    FixableBy::export().expect("export FixableBy");
     ReviewAssessment::export().expect("export ReviewAssessment");
     ConformanceStatus::export().expect("export ConformanceStatus");
     ConformanceCheckResult::export().expect("export ConformanceCheckResult");

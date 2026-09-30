@@ -15,6 +15,52 @@ function createMocks() {
 }
 
 describe('routeSsePayload', () => {
+  it.each(['task.status_changed', 'task.blocked', 'task.recovered'])(
+    'refreshes slot usage for %s in the affected project',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.project('proj-2'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'task-1',
+          project_id: 'proj-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.project('proj-2'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
+  it.each(['task.awaiting_human', 'review.passed'])(
+    'refreshes slot summaries when %s omits the project id',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.projectPages(20), {})
+      client.setQueryData(qk.repos('proj-1'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'review-1',
+          task_id: 'task-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.projectPages(20))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.repos('proj-1'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
   it('does not invalidate broad queries for execution.log', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(

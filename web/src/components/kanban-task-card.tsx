@@ -5,6 +5,7 @@ import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { AgentAssigneeDropdown } from '@/components/task-controls'
 import { Avatar } from '@/components/ui/avatar'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
+import { TaskCapacityNotice } from '@/components/task-capacity-notice'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -17,6 +18,7 @@ import type { Agent, Task } from '@/types/generated'
 export type TaskCardMenuRenderer = (task: Task) => ReactNode
 
 function formatBlockingReason(value: string) {
+  if (value === 'review_needs_owner') return 'Needs owner'
   const withSpaces = value.replace(/_/g, ' ')
   return withSpaces.charAt(0).toUpperCase() + withSpaces.slice(1)
 }
@@ -170,6 +172,7 @@ export function KanbanTaskCard({
                   <span className="italic">Unassigned</span>
                 )}
               </div>
+              <TaskCapacityNotice task={task} />
             </div>
             <div
               className="pointer-events-auto flex shrink-0 items-center gap-0.5"

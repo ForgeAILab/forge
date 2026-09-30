@@ -1,6 +1,8 @@
 import { SettingsSection } from '@/components/settings/SettingsSection'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { ENVIRONMENT_EXAMPLE, parseEnvironmentText } from './environment-utils'
 
@@ -9,6 +11,10 @@ interface EnvironmentTabProps {
   canSave: boolean
   isSaving: boolean
   environmentText: string
+  recheckMinutes: string
+  recheckIntervalError: string | null
+  saveError: string | null
+  onRecheckMinutesChange: (value: string) => void
   onEnvironmentTextChange: (text: string) => void
   onSave: () => void
 }
@@ -19,6 +25,10 @@ export function EnvironmentTab({
   canSave,
   isSaving,
   environmentText,
+  recheckMinutes,
+  recheckIntervalError,
+  saveError,
+  onRecheckMinutesChange,
   onEnvironmentTextChange,
   onSave,
 }: EnvironmentTabProps) {
@@ -64,8 +74,60 @@ export function EnvironmentTab({
           </div>
         )}
       </SettingsSection>
+      <SettingsSection
+        title="Environment re-check interval"
+        description="Automatically retry failing checks while the project is environment-paused."
+      >
+        {projectIsLoading ? (
+          <Skeleton className="h-10 w-full" />
+        ) : (
+          <div className="space-y-2">
+            <Label htmlFor="project-environment-recheck-minutes">
+              Environment re-check interval (minutes)
+            </Label>
+            <Input
+              id="project-environment-recheck-minutes"
+              type="number"
+              min={1}
+              max={1440}
+              step="any"
+              value={recheckMinutes}
+              onChange={(event) => onRecheckMinutesChange(event.target.value)}
+              aria-invalid={Boolean(recheckIntervalError)}
+              aria-describedby={
+                recheckIntervalError
+                  ? 'project-environment-recheck-help project-environment-recheck-error'
+                  : 'project-environment-recheck-help'
+              }
+            />
+            <p id="project-environment-recheck-help" className="text-xs text-muted-foreground">
+              Forge re-runs failing environment checks at this interval and resumes the project
+              automatically when they pass. Default: 10 minutes.
+            </p>
+            {recheckIntervalError ? (
+              <p
+                id="project-environment-recheck-error"
+                role="alert"
+                className="text-xs text-destructive"
+              >
+                {recheckIntervalError}
+              </p>
+            ) : null}
+          </div>
+        )}
+      </SettingsSection>
+      {saveError ? (
+        <p role="alert" className="mt-2 text-xs text-destructive">
+          {saveError}
+        </p>
+      ) : null}
       <div className="flex justify-end pt-4">
-        <Button disabled={!canSave || isSaving || Boolean(validationError)} onClick={onSave}>
+        <Button
+          disabled={
+            !canSave || isSaving || Boolean(validationError) || Boolean(recheckIntervalError)
+          }
+          onClick={onSave}
+        >
           {isSaving ? 'Saving…' : 'Save environment'}
         </Button>
       </div>

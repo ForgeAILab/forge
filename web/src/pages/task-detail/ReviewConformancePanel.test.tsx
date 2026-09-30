@@ -146,6 +146,8 @@ describe('ReviewConformancePanel', () => {
         },
       },
       assessment: {
+        fixable_by: 'coder',
+        repeat: false,
         result: 'pass',
         reason: 'The CLI and library compile',
         report: 'The crate is implemented in `src/lib.rs:1-3`.',

@@ -6,6 +6,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Projects now default to `settings.max_active_tasks = 5`, including existing
+  Projects. Planning, implementation, review, merging, and conflict repair
+  hold slots unless parked; new admission also stops at twice the limit parked.
+  Set the limit to `0` for unlimited admission. Recovery of admitted Tasks is
+  still allowed over the limit.
+- Failing Project environment checks now pause the Project instead of parking
+  individual Tasks with `environment_not_ready`. Migration V149 clears legacy
+  Task environment blocks; Tasks keep their workflow states and re-dispatch
+  after the Project resumes.
+
+### Added
+
+- Persisted Project environment pause detail, automatic re-check and resume,
+  `POST /api/v1/projects/{id}/environment/recheck`, and
+  `forge-ctl project env-recheck`. Project cards/list and headers show the
+  failing checks, output tail, next check time, and Check now. Settings expose
+  the active task limit and environment re-check interval (default 600 seconds).
+- Project `slots` usage and visible Task capacity queue reasons, including the
+  parked-owner guard.
+- Reviewer result fields `fixable_by` and `repeat`, owner parks with
+  `review_needs_owner` without coder dispatch or review retry budget spent,
+  and `defer_to_follow_up` recovery with a required reason. Deferring atomically
+  creates a linked backlog Task and records a manual review pass for the original.
+
 ### Changed
 
 - CI and release Rust verification share the existing dependency cache. Only

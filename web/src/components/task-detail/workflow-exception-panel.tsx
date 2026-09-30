@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { CaretDown } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import {
   Dialog,
   DialogContent,
@@ -28,6 +29,7 @@ import type {
   WorkflowExceptionAction,
   WorkflowExceptionSummary,
 } from '@/types/generated'
+import type { ReviewAssessment } from '@/types/generated/bindings/ReviewAssessment'
 
 const EXCEPTION_RETRY_FAMILY: RecoveryAction[] = [
   'resume_process',
@@ -118,6 +120,7 @@ function FailingStepDetails({
 
 export function WorkflowExceptionPanel({
   task,
+  assessment,
   actions,
   recoverPending,
   terminal,
@@ -127,6 +130,7 @@ export function WorkflowExceptionPanel({
   onCancelTask,
 }: {
   task: Task
+  assessment?: ReviewAssessment | null
   actions: WorkflowExceptionAction[]
   recoverPending: boolean
   terminal: boolean
@@ -144,6 +148,29 @@ export function WorkflowExceptionPanel({
 
   const failure = isFailureTone(exception)
   const title = workflowLabelFromKind(exception.type)
+  const needsOwner = exception.type === 'review_needs_owner'
+  const ownerBadge = !needsOwner
+    ? null
+    : exception.message.startsWith('fixable by owner: ')
+      ? 'fixable by owner'
+      : exception.message.startsWith('repeated finding: ')
+        ? 'repeated finding'
+        : assessment?.fixable_by === 'owner'
+          ? 'fixable by owner'
+          : assessment?.repeat
+            ? 'repeated finding'
+            : null
+  const ownerLabels: Partial<Record<RecoveryAction, string>> = {
+    reexecute: 'Retry with guidance',
+    mark_reviewed: 'Mark reviewed',
+    defer_to_follow_up: 'Defer to follow-up',
+    open_interactive: 'Open interactive',
+  }
+  const panelActions = actions.map((action) => ({
+    ...action,
+    label: needsOwner ? (ownerLabels[action.kind] ?? action.label) : action.label,
+    requires_reason: action.requires_reason || action.kind === 'defer_to_follow_up',
+  }))
   const step = exception.failing_step
   const details = [
     exception.state ? `state ${exception.state}` : null,
@@ -152,7 +179,7 @@ export function WorkflowExceptionPanel({
     exception.target_role ? `target role ${exception.target_role}` : null,
   ].filter(Boolean)
 
-  const retryActions = actions.filter((a) => EXCEPTION_RETRY_FAMILY.includes(a.kind))
+  const retryActions = panelActions.filter((a) => EXCEPTION_RETRY_FAMILY.includes(a.kind))
   const primaryRetry =
     EXCEPTION_RETRY_PRIMARY_ORDER.map((k) =>
       retryActions.find((a) => a.kind === k && a.enabled),
@@ -163,10 +190,10 @@ export function WorkflowExceptionPanel({
     retryActions[0] ??
     null
   const secondaryRetries = retryActions.filter((a) => a !== primaryRetry)
-  const openInteractive = actions.find((a) => a.kind === 'open_interactive') ?? null
+  const openInteractive = panelActions.find((a) => a.kind === 'open_interactive') ?? null
   // cancel_task gets the dedicated destructive button below; keep it out of
   // the generic action row so the panel never shows two cancel buttons.
-  const standaloneActions = actions.filter(
+  const standaloneActions = panelActions.filter(
     (a) =>
       !EXCEPTION_RETRY_FAMILY.includes(a.kind) &&
       a.kind !== 'open_interactive' &&
@@ -220,6 +247,9 @@ export function WorkflowExceptionPanel({
         <div className="space-y-1">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-semibold">{title}</p>
+            {ownerBadge ? (
+              <Badge className="border-warning/30 bg-warning/10">{ownerBadge}</Badge>
+            ) : null}
             <div className="flex flex-wrap gap-2 text-xs">
               {exception.review_id ? (
                 <Link
@@ -373,11 +403,18 @@ export function WorkflowExceptionPanel({
                 This records a new, auditable manual pass. The failed review remains in history.
               </p>
             ) : null}
+            {confirmingAction?.kind === 'defer_to_follow_up' ? (
+              <p className="rounded-md border border-warning/30 bg-warning/10 p-3 text-sm">
+                This creates a linked backlog task for the finding and records a manual pass so this
+                task can proceed to merge.
+              </p>
+            ) : null}
             {confirmingAction?.requires_reason ? (
               <div className="space-y-2">
                 <Label htmlFor="workflow-recovery-reason">Reason</Label>
                 <Input
                   id="workflow-recovery-reason"
+                  required
                   value={reasonDraft}
                   onChange={(event) => setReasonDraft(event.target.value)}
                   placeholder="Why is this recovery action needed?"
