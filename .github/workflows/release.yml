@@ -92,6 +92,10 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust
+          # Restore the CI cache; tag-scoped copies cannot seed later releases.
+          save-if: false
 
       - name: Run Rust CI
         run: ./scripts/ci-rust.sh
@@ -326,6 +330,12 @@ jobs:
           # `latest` is added automatically for stable semver tags only —
           # pre-releases like v0.1.1-rc.1 correctly skip it.
 
+      - name: Set container cache reference
+        shell: bash
+        run: |
+          cache_image_name=$(printf '%s' "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          echo "CONTAINER_CACHE=${REGISTRY}/${cache_image_name}:buildcache" >> "$GITHUB_ENV"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
@@ -333,6 +343,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Registry caches persist across release tags without using Actions quota.
+          cache-from: type=registry,ref=${{ env.CONTAINER_CACHE }}
+          cache-to: type=registry,ref=${{ env.CONTAINER_CACHE }},mode=max,ignore-error=true
           provenance: true
           sbom: true
 

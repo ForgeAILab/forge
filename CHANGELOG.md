@@ -6,6 +6,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Changed
+
+- CI and release Rust verification share the existing dependency cache. Only
+  default-branch CI runs save it, including failed runs, reducing duplicate
+  branch and tag caches. Newer CI runs cancel superseded runs for the same
+  event and ref.
+- Release container builds reuse a GHCR BuildKit registry cache across tags,
+  including intermediate Rust and frontend build layers.
+
 ## [0.13.10] - 2026-09-29
 
 ### Changed

@@ -24,6 +24,7 @@ Use this checklist for public beta releases.
 - [ ] Merge the reviewed release PR and confirm the full CI, security, and code-scanning checks pass on the exact release commit before tagging.
 - [ ] Tag the release with `vX.Y.Z`.
 - [ ] Confirm `.github/workflows/release.yml` passes its independent version, Rust, web/browser, security-audit, npm-package, and platform-build gates before any publication job starts.
+- [ ] Check the Rust verification cache hit and container registry cache import/export in the release logs; see [CI cache behavior](ci.md). A first container cache import or native build for a new tag may be cold.
 - [ ] Wait for the release workflow to publish native archives, `SHA256SUMS`, the GHCR image, npm bootstrapper, and Homebrew update request.
 - [ ] Download one archive, verify its checksum and the presence of `forge`, `forge-ctl`, `forge-solo`, and `web/dist/index.html`, install it, and smoke-test `forge --help` plus browser navigation outside the repo checkout using an isolated data directory.
 - [ ] Confirm the published Docker image contains `/usr/local/share/forge/web/dist/index.html`.

@@ -45,6 +45,11 @@ pnpm exec playwright install --with-deps chromium
 pnpm run e2e
 ```
 
+## Continuous Integration
+
+See [GitHub Actions builds and caches](docs/ci.md) for CI and release cache
+behavior, cache scope limitations, and commands to investigate slow runs.
+
 ## Code Standards
 
 - **No unsafe code** — `#![forbid(unsafe_code)]` is enforced workspace-wide
