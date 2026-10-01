@@ -1507,6 +1507,25 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
+Protected session/checkpoint payloads use a versioned zstd envelope inside
+authenticated encryption; earlier encrypted JSON rows remain readable and are
+converted on their next state change. Snapshot digests use domain-separated
+HMAC-SHA256 with the protected store key and exclude the save timestamp, so
+unchanged saves do no encryption or database write. Checkpoints
+are idempotent by session, turn, revision, and operation fingerprint, and retain
+the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
+also serves as the session snapshot (NULL standalone snapshot columns reference
+it); only independent canonical state changes need a separate snapshot. Writes
+use the protected row's revision CAS. A competing snapshot save supersedes the
+losing save; a checkpoint save reloads and retries once if it can still advance
+the winning turn. Newer turns/revisions, conflicting fingerprints, and any
+remaining CAS conflict supersede the losing save. The store handles these races
+for every runtime caller without failing the turn. Snapshot/checkpoint LCM policy markers are tracked
+separately so a standalone save cannot relabel an older checkpoint. A checkpoint
+decode failure returns an error naming the runtime session; it cannot safely
+fall back to fresh state because that would discard provider/tool recovery
+barriers.
+
 Forge does not configure Agent Runtime's tool-step or turn-time limits; their
 defaults are `None`. Task workflow `max_turns` is also optional and has no
 default. CLI Task execution, including Smith, receives no max-turn value unless
@@ -1878,6 +1897,17 @@ validation/review state, stalls, health, budget thresholds, and overdue
 commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
+
+Attention consumer health buffers successful progress, flushing at an event
+boundary after five seconds or 100 processed events, and immediately on errors.
+Batch release flushes remaining progress and clears any published processing
+lease. New batch owners and lease renewals are buffered; empty polls write health
+at most once every five seconds. Buffered deltas and the latest successful
+sequence/time are preserved when flushing; a published lease expiry remains visible
+during processing. Each event's authoritative cursor and receipt still commit
+individually. Health counters are diagnostic: a crash may lose up to 99 buffered
+increments, without losing event delivery. The stale threshold remains 90
+seconds since the last successfully processed event.
 
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,

@@ -20,8 +20,9 @@ use db::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::{Result, ServiceError};
 
@@ -30,6 +31,8 @@ const CONSUMER_LEASE_SECONDS: i64 = 30;
 const CONSUMER_STALE_SECONDS: i64 = 90;
 const MAX_ATTENTION_SUMMARY_LEN: usize = 160;
 const PROJECTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const HEALTH_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const HEALTH_WRITE_EVENTS: i64 = 100;
 /// Terminal execution truth is committed before Task recovery disposition.
 /// Give that short saga time to settle before treating a still-manual,
 /// undisposed terminal attempt as an actionable orphan.
@@ -161,6 +164,15 @@ enum WakeDecisionEvent {
 pub struct AttentionService {
     db: Arc<SqliteDb>,
     event_bus: Option<Arc<events::EventBus>>,
+    health_writes: Arc<Mutex<ConsumerHealthWrites>>,
+}
+
+#[derive(Default)]
+struct ConsumerHealthWrites {
+    pending: Option<UpsertAttentionConsumerHealth>,
+    last_written: Option<Instant>,
+    lease_owner: Option<String>,
+    lease_until: Option<String>,
 }
 
 impl AttentionService {
@@ -168,6 +180,7 @@ impl AttentionService {
         Self {
             db,
             event_bus: None,
+            health_writes: Arc::new(Mutex::new(ConsumerHealthWrites::default())),
         }
     }
 
@@ -241,36 +254,69 @@ impl AttentionService {
     /// Every event is checkpointed only after its projection has committed, so
     /// a crash leaves the event eligible for an idempotent replay.
     pub async fn project_once(&self, limit: i64) -> Result<AttentionProjectionRun> {
+        let result = self.project_batch(limit).await;
+        if let Err(error) = &result {
+            let writes = self.health_writes.lock().await;
+            let input = UpsertAttentionConsumerHealth {
+                consumer_name: CONSUMER_NAME.to_owned(),
+                last_sequence: 0,
+                last_started_at: None,
+                last_success_at: None,
+                last_error_at: Some(now_rfc3339()),
+                last_error_code: Some(error_code(error).to_owned()),
+                last_error_message: Some(bounded_error_message(error)),
+                lease_owner: writes.pending.as_ref().map_or_else(
+                    || writes.lease_owner.clone(),
+                    |pending| pending.lease_owner.clone(),
+                ),
+                lease_until: writes.pending.as_ref().map_or_else(
+                    || writes.lease_until.clone(),
+                    |pending| pending.lease_until.clone(),
+                ),
+                processed_events_delta: 0,
+                updated_at: now_rfc3339(),
+            };
+            drop(writes);
+            // Preserve the projection error if the database also rejects its health write.
+            let _ = self.record_health(input).await;
+        }
+        result
+    }
+
+    async fn project_batch(&self, limit: i64) -> Result<AttentionProjectionRun> {
         let owner = new_uuid_v4();
         let started_at = now_rfc3339();
         let leased_until = (Utc::now() + Duration::seconds(CONSUMER_LEASE_SECONDS)).to_rfc3339();
-        self.record_health(UpsertAttentionConsumerHealth {
-            consumer_name: CONSUMER_NAME.to_owned(),
-            last_sequence: 0,
-            last_started_at: Some(started_at.clone()),
-            last_success_at: None,
-            last_error_at: None,
-            last_error_code: None,
-            last_error_message: None,
-            lease_owner: Some(owner.clone()),
-            lease_until: Some(leased_until.clone()),
-            processed_events_delta: 0,
-            updated_at: started_at.clone(),
-        })
-        .await?;
-
         let events = DomainEventRepo::claim_event_batch(
             &*self.db,
             ClaimDomainEvents {
                 consumer_name: CONSUMER_NAME.to_owned(),
                 lease_owner: owner.clone(),
                 now: started_at.clone(),
-                leased_until,
+                leased_until: leased_until.clone(),
                 limit: limit.clamp(1, 100),
             },
         )
         .await?;
         let claimed_events = events.len();
+        // Empty polls have no reportable processing lease. Their final health
+        // update is just an interval-limited heartbeat.
+        if claimed_events > 0 {
+            self.record_health(UpsertAttentionConsumerHealth {
+                consumer_name: CONSUMER_NAME.to_owned(),
+                last_sequence: 0,
+                last_started_at: Some(started_at.clone()),
+                last_success_at: None,
+                last_error_at: None,
+                last_error_code: None,
+                last_error_message: None,
+                lease_owner: Some(owner.clone()),
+                lease_until: Some(leased_until.clone()),
+                processed_events_delta: 0,
+                updated_at: started_at.clone(),
+            })
+            .await?;
+        }
         let mut processed_events = 0;
         let mut last_sequence = self
             .consumer_cursor()
@@ -306,23 +352,6 @@ impl AttentionService {
                 // event (complete it without projection) and keep going;
                 // transient errors still abort the poll and retry.
                 if !matches!(&error, ServiceError::Db(db::DbError::Check(_))) {
-                    let error_code = error_code(&error);
-                    let error_message = bounded_error_message(&error);
-                    let _ = self
-                        .record_health(UpsertAttentionConsumerHealth {
-                            consumer_name: CONSUMER_NAME.to_owned(),
-                            last_sequence,
-                            last_started_at: None,
-                            last_success_at: None,
-                            last_error_at: Some(now_rfc3339()),
-                            last_error_code: Some(error_code.to_owned()),
-                            last_error_message: Some(error_message),
-                            lease_owner: Some(owner.clone()),
-                            lease_until: None,
-                            processed_events_delta: 0,
-                            updated_at: now_rfc3339(),
-                        })
-                        .await;
                     return Err(error);
                 }
                 tracing::error!(
@@ -359,7 +388,7 @@ impl AttentionService {
                 last_error_code: None,
                 last_error_message: None,
                 lease_owner: Some(owner.clone()),
-                lease_until: None,
+                lease_until: Some(leased_until.clone()),
                 processed_events_delta: 1,
                 updated_at: completed_at,
             })
@@ -2483,8 +2512,41 @@ impl AttentionService {
         Ok(eligible)
     }
 
-    async fn record_health(&self, input: UpsertAttentionConsumerHealth) -> Result<()> {
-        AttentionRepo::upsert_attention_consumer_health(&*self.db, input).await?;
+    async fn record_health(&self, mut input: UpsertAttentionConsumerHealth) -> Result<()> {
+        let mut writes = self.health_writes.lock().await;
+        if let Some(pending) = &writes.pending {
+            input.processed_events_delta += pending.processed_events_delta;
+            input.last_sequence = input.last_sequence.max(pending.last_sequence);
+            input.last_started_at = input
+                .last_started_at
+                .or_else(|| pending.last_started_at.clone());
+            input.last_success_at = input
+                .last_success_at
+                .or_else(|| pending.last_success_at.clone());
+        }
+        let due = writes
+            .last_written
+            .is_none_or(|last| last.elapsed() >= HEALTH_WRITE_INTERVAL)
+            || input.processed_events_delta >= HEALTH_WRITE_EVENTS
+            || input.last_error_at.is_some()
+            // A batch's new owner/expiry is diagnostic, not a health change
+            // that merits another write. Release does flush real progress or
+            // clear a lease that was published by an interval/count flush.
+            || (input.lease_owner.is_none()
+                && (input.processed_events_delta > 0 || writes.lease_owner.is_some()));
+        writes.pending = Some(input);
+        if due {
+            let input = writes
+                .pending
+                .as_ref()
+                .expect("health update is pending")
+                .clone();
+            AttentionRepo::upsert_attention_consumer_health(&*self.db, input.clone()).await?;
+            writes.pending = None;
+            writes.last_written = Some(Instant::now());
+            writes.lease_owner = input.lease_owner;
+            writes.lease_until = input.lease_until;
+        }
         Ok(())
     }
 
@@ -3710,6 +3772,154 @@ fn bounded_error_message(error: &ServiceError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn health_service() -> AttentionService {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        AttentionService::new(Arc::new(SqliteDb::new(pool)))
+    }
+
+    fn health_update(sequence: i64, delta: i64) -> UpsertAttentionConsumerHealth {
+        UpsertAttentionConsumerHealth {
+            consumer_name: CONSUMER_NAME.to_owned(),
+            last_sequence: sequence,
+            last_started_at: None,
+            last_success_at: (delta > 0).then(now_rfc3339),
+            last_error_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            lease_owner: Some("health-owner".to_owned()),
+            lease_until: Some("2026-09-30T12:00:30Z".to_owned()),
+            processed_events_delta: delta,
+            updated_at: now_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_health_throttles_progress_and_flushes_after_100_events() {
+        let service = health_service().await;
+        service.record_health(health_update(0, 0)).await.unwrap();
+        for sequence in 1..100 {
+            service
+                .record_health(health_update(sequence, 1))
+                .await
+                .unwrap();
+        }
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 1);
+        assert_eq!(health.processed_events, 0);
+        service.record_health(health_update(100, 1)).await.unwrap();
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 2);
+        assert_eq!(health.processed_events, 100);
+        assert_eq!(health.last_sequence, 100);
+        assert!(health.last_success_at.is_some());
+        assert_eq!(health.lease_until.as_deref(), Some("2026-09-30T12:00:30Z"));
+    }
+
+    #[tokio::test]
+    async fn consumer_health_flushes_after_five_seconds() {
+        let service = health_service().await;
+        service.record_health(health_update(0, 0)).await.unwrap();
+        service.record_health(health_update(1, 1)).await.unwrap();
+        service.health_writes.lock().await.last_written =
+            Some(Instant::now() - HEALTH_WRITE_INTERVAL);
+        service.record_health(health_update(2, 1)).await.unwrap();
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 2);
+        assert_eq!(health.processed_events, 2);
+        assert_eq!(health.last_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn consumer_health_flushes_errors_and_release_without_losing_progress() {
+        let service = health_service().await;
+        service.record_health(health_update(0, 0)).await.unwrap();
+        service.record_health(health_update(1, 1)).await.unwrap();
+        let mut error = health_update(1, 0);
+        error.last_error_at = Some(now_rfc3339());
+        error.last_error_code = Some("database".to_owned());
+        error.last_error_message = Some("projection failed".to_owned());
+        service.record_health(error).await.unwrap();
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 2);
+        assert_eq!(health.processed_events, 1);
+        assert_eq!(health.last_error_code.as_deref(), Some("database"));
+        assert!(health.last_success_at.is_some());
+        service.record_health(health_update(2, 1)).await.unwrap();
+        let mut renew = health_update(2, 0);
+        renew.lease_until = Some("2026-09-30T12:01:00Z".to_owned());
+        service.record_health(renew.clone()).await.unwrap();
+        let mut release = renew;
+        release.lease_owner = None;
+        release.lease_until = None;
+        service.record_health(release).await.unwrap();
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 3);
+        assert_eq!(health.processed_events, 2);
+        assert_eq!(health.last_sequence, 2);
+        assert!(health.last_error_code.is_none());
+        assert!(health.lease_owner.is_none());
+        assert!(health.lease_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn consumer_health_throttles_batch_lease_churn_and_idle_polls() {
+        let service = health_service().await;
+        service.project_once(100).await.unwrap();
+        for _ in 0..10 {
+            service.project_once(100).await.unwrap();
+        }
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 1);
+        assert!(health.lease_owner.is_none());
+        assert!(health.last_started_at.is_none());
+        assert!(health.last_success_at.is_none());
+
+        for sequence in 1..10 {
+            let mut acquisition = health_update(sequence, 0);
+            acquisition.lease_owner = Some(format!("batch-{sequence}"));
+            acquisition.lease_until = Some(format!("2026-09-30T12:00:{sequence:02}Z"));
+            service.record_health(acquisition).await.unwrap();
+            let mut release = health_update(sequence, 0);
+            release.lease_owner = None;
+            release.lease_until = None;
+            service.record_health(release).await.unwrap();
+        }
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 1);
+        service.health_writes.lock().await.last_written =
+            Some(Instant::now() - HEALTH_WRITE_INTERVAL);
+        service.project_once(100).await.unwrap();
+        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.version, 2);
+        assert_eq!(health.processed_events, 0);
+        assert!(health.lease_owner.is_none());
+    }
 
     fn event(event_type: &str, payload_json: &str) -> DomainEvent {
         DomainEvent {
