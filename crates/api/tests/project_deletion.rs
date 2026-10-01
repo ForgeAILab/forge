@@ -5,8 +5,8 @@ use axum::http::{Method, StatusCode};
 use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateRepo,
     CreateReview, CreateTask, CreateWorkspace, CreateWorkspaceLease, ExecutionRepo,
-    ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRepo, WorkMode,
-    WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRepo, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use serde_json::{json, Value};
 
@@ -88,7 +88,6 @@ async fn project_delete_removes_all_managed_workspaces_but_preserves_linked_repo
                 name: name.to_owned(),
                 remote_url: Some(path.to_string_lossy().into_owned()),
                 local_path: Some(path.to_string_lossy().into_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -249,7 +248,6 @@ async fn project_delete_preserves_a_repository_path_reused_by_another_project() 
                 name: name.to_owned(),
                 remote_url: Some(shared_path.to_string_lossy().into_owned()),
                 local_path: Some(shared_path.to_string_lossy().into_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -461,7 +459,6 @@ async fn project_delete_reports_active_lease_without_running_execution_and_force
             name: "active-lease-repository".to_owned(),
             remote_url: Some("file:///tmp/active-lease-repository".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -721,7 +718,6 @@ async fn project_delete_collects_workspace_paths_at_the_final_db_boundary() {
             name: "late-repository".to_owned(),
             remote_url: Some(repository_path.to_string_lossy().into_owned()),
             local_path: Some(repository_path.to_string_lossy().into_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

@@ -92,24 +92,6 @@ impl HookAction for RunMerge {
                     reason: "merge succeeded".to_string(),
                 }
             }
-            Ok(MergeOutcome::PullRequest {
-                pr_url,
-                branch,
-                target_branch,
-            }) => {
-                let location = pr_url.unwrap_or_else(|| "provider URL pending".to_string());
-                if let Err(error) = create_system_comment(
-                    ctx,
-                    format!("Pull request published from {branch} to {target_branch}: {location}"),
-                )
-                .await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-                HookResult::Ok
-            }
             Ok(MergeOutcome::TargetMoved {
                 reason,
                 target_branch,

@@ -95,7 +95,6 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     CancelProductGenesisRequest::export().expect("export CancelProductGenesisRequest");
     ApplyProductGenesisGuidedSetupRequest::export()
         .expect("export ApplyProductGenesisGuidedSetupRequest");
-    WorkMode::export().expect("export WorkMode");
     CreateRepoRequest::export().expect("export CreateRepoRequest");
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");
     RepoResponse::export().expect("export RepoResponse");

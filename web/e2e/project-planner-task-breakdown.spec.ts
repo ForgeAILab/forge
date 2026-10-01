@@ -26,7 +26,6 @@ type RepoResponse = {
   name: string
   local_path: string | null
   remote_url: string
-  work_mode: 'direct_merge' | 'pull_request'
 }
 
 type AgentResponse = {
@@ -476,7 +475,6 @@ test.describe('planner-approved Vite React task flow (integration)', () => {
         name: `vite-react-planner-app-${runId}`,
         remote_url: fixturePath,
         local_path: fixturePath,
-        work_mode: 'direct_merge',
         default_branch: 'main',
       })
 

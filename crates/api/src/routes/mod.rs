@@ -230,18 +230,8 @@ pub fn repo_response(repo: Repo) -> RepoResponse {
         local_path: repo.local_path,
         remote_url: repo.remote_url,
         default_branch: repo.default_branch,
-        work_mode: repo_work_mode_response(repo.work_mode),
-        pr_provider: None,
-        pr_provider_status: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
-    }
-}
-
-fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
-    match work_mode {
-        db::WorkMode::DirectMerge => api_types::WorkMode::DirectMerge,
-        db::WorkMode::PullRequest => api_types::WorkMode::PullRequest,
     }
 }
 

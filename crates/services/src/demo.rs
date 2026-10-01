@@ -174,7 +174,6 @@ async fn find_or_create_demo_repo(db: &SqliteDb, project_id: &str, now: &str) ->
             name: "demo-repo".to_owned(),
             remote_url: Some("https://example.com/demo.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),

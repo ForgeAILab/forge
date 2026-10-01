@@ -13,7 +13,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     Router,
 };
-use db::{PrProviderConfigRepo, ProjectRepo};
+use db::ProjectRepo;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -292,8 +292,8 @@ async fn update_repo_clears_local_path_for_remote_clone_mode() {
 }
 
 #[tokio::test]
-async fn create_pull_request_repo_persists_provider_config() {
-    let (app, db) = test_app_with_db().await;
+async fn create_repo_rejects_removed_pull_request_work_mode() {
+    let app = test_app().await;
     let project: ProjectResponse = json_request(
         &app,
         Method::POST,
@@ -303,7 +303,7 @@ async fn create_pull_request_repo_persists_provider_config() {
     )
     .await;
 
-    let repo: RepoResponse = json_request(
+    let error: Value = json_request(
         &app,
         Method::POST,
         &format!("/api/v1/projects/{}/repos", project.id),
@@ -312,28 +312,14 @@ async fn create_pull_request_repo_persists_provider_config() {
             "remote_url": "https://gitlab.example.com/acme/pr-repo.git",
             "default_branch": "main",
             "work_mode": "pull_request",
-            "pr_provider": "gitlab",
-            "pr_provider_config": {
-                "base_url": "https://gitlab.example.com",
-                "polling_interval_seconds": 42,
-                "token": "test-token"
-            }
         }),
-        StatusCode::OK,
+        StatusCode::BAD_REQUEST,
     )
     .await;
-
-    let config = PrProviderConfigRepo::get_by_repo_id(&*db, &repo.id)
-        .await
-        .expect("load provider config")
-        .expect("provider config exists");
-    assert_eq!(config.provider_type, "gitlab");
-    assert_eq!(
-        config.base_url.as_deref(),
-        Some("https://gitlab.example.com")
-    );
-    assert_eq!(config.polling_interval_seconds, 42);
-    assert_eq!(config.token_secret_ref.as_deref(), Some("test-token"));
+    assert_eq!(error["code"], "validation_error");
+    assert!(error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("work_mode")));
 }
 
 #[tokio::test]

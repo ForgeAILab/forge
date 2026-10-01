@@ -101,6 +101,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `409 board_snapshot_changed`. A page and its decorations are now read in one
   database snapshot, so there is nothing to retry. Board moves and subtask
   reorders still return 409 on a stale `board_revision`.
+- The pull-request work mode is removed; every repository is merged directly.
+  PR mode never completed a merge: the Task stayed in `merging` and nothing
+  reconciled the pull request.
+  - Repo create and update reject `work_mode`, `pr_provider` and
+    `pr_provider_config` with `400 validation_error`, including `null` and
+    `direct_merge`. Upgrade `forge-ctl` together with the server.
+  - Repo responses and the execution-setup repo object no longer carry
+    `work_mode`, `pr_provider` or `pr_provider_status`, and `forge-ctl repo`
+    no longer prints the work mode.
+  - Removed: failure kind `pr_closed_without_merge`, placement filter
+    `work_mode_unsupported`, error codes `pr_provider_missing`,
+    `pr_provider_token_missing` and `pr_sync_failure`.
+  - A Task that was waiting in `merging` for a pull request stays parked and
+    is not merged automatically. Choose **Retry Merge** to merge it directly,
+    or cancel it.
+  - The upgrade clears stored pull-request provider tokens. The stored work
+    mode of existing repositories is kept unchanged because it is part of
+    release and evidence digests.
 
 ### Changed
 
@@ -211,6 +229,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `409 WORKSPACE_RESET_REQUIRED` when the branch is gone; it used to fail with
   a not-found error. Reassigning a subtask leaves the shared root worktree
   unchanged.
+- A malformed repo create or update body returns `400` with the standard
+  error envelope instead of `422`.
 
 ### Added
 

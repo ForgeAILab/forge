@@ -393,8 +393,6 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::MissingPrimaryRepo { .. }
         | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
-        | ServiceError::PrProviderMissing { .. }
-        | ServiceError::PrProviderTokenMissing { .. }
         | ServiceError::ParentWorkspaceRequired { .. }
         | ServiceError::TerminalDisabled
         | ServiceError::TerminalWorkspaceNotReady => (
@@ -434,8 +432,7 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::DaemonTimeout { .. }
         | ServiceError::TerminalDaemonUnavailable { .. }
         | ServiceError::TerminalActiveExecution { .. }
-        | ServiceError::ExecutionAlreadyRunning { .. }
-        | ServiceError::PrSyncFailure { .. } => (
+        | ServiceError::ExecutionAlreadyRunning { .. } => (
             OutcomeCode::TransientFailure,
             "the command could not complete right now; retry later",
             Some(RetryInstruction::new(RetryAction::RefreshAndRetry, true)),
@@ -519,10 +516,6 @@ fn setup_requirement_for(error: &ServiceError) -> SetupRequirement {
         ServiceError::MissingPrimaryRepo { .. } => SetupRequirement::new("primary_repository"),
         ServiceError::PrimaryRepoNotFound { .. } => SetupRequirement::new("repository_link"),
         ServiceError::RepoMismatch { .. } => SetupRequirement::new("repository_link"),
-        ServiceError::PrProviderMissing { .. } => SetupRequirement::new("pull_request_provider"),
-        ServiceError::PrProviderTokenMissing { .. } => {
-            SetupRequirement::new("pull_request_provider_token")
-        }
         ServiceError::ParentWorkspaceRequired { .. } => SetupRequirement::new("parent_workspace"),
         ServiceError::TerminalDisabled => SetupRequirement::new("terminal_enabled"),
         ServiceError::TerminalWorkspaceNotReady => SetupRequirement::new("terminal_workspace"),

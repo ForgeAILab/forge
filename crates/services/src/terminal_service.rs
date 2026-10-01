@@ -1609,7 +1609,7 @@ mod tests {
     use db::{
         create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
         CreateTask, CreateWorkspace, ProjectRepo, RepoRepo, TaskRepo, TerminalSessionRepo,
-        UpdateTerminalSessionStatus, UserRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+        UpdateTerminalSessionStatus, UserRepo, WorkspaceRepo, WorkspaceStatus,
     };
     use tempfile::TempDir;
 
@@ -1719,7 +1719,6 @@ mod tests {
                 name: "repo".to_owned(),
                 remote_url: Some("file:///tmp/repo".to_owned()),
                 local_path: None,
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

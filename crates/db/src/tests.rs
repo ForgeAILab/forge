@@ -21,8 +21,7 @@ use crate::{
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
     TransitionLogRepo, UpdateAgent, UpdateExecution, UpdateProject,
     UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill, UpdateTask, UpdateTaskStatus,
-    UpdateTerminalSessionStatus, UpsertDaemon, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    UpdateTerminalSessionStatus, UpsertDaemon, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
@@ -753,7 +752,6 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -3336,7 +3334,6 @@ async fn sqlite_repo_create_round_trips_local_path() {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -3345,7 +3342,6 @@ async fn sqlite_repo_create_round_trips_local_path() {
     .await
     .expect("local repo creates");
 
-    assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, Some("/tmp/forge-test-repo".to_owned()));
     assert_eq!(
         repo.remote_url.as_deref(),
@@ -3384,7 +3380,6 @@ async fn sqlite_repo_create_round_trips_remote_url() {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -3393,7 +3388,6 @@ async fn sqlite_repo_create_round_trips_remote_url() {
     .await
     .expect("remote repo creates");
 
-    assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, None);
     assert_eq!(
         repo.remote_url.as_deref(),
@@ -3429,7 +3423,7 @@ async fn sqlite_repo_create_accepts_missing_remote_url() {
         .bind("forge")
         .bind(None::<String>)
         .bind(None::<String>)
-        .bind(WorkMode::DirectMerge.to_string())
+        .bind("direct_merge")
         .bind("main")
         .bind(&now)
         .bind(&now)
@@ -3467,14 +3461,12 @@ async fn sqlite_repo_create_normalizes_blank_remote_url() {
                 name: "Local Repo".to_owned(),
                 remote_url: remote_url.map(str::to_owned),
                 local_path: Some("/tmp/local-repo".to_owned()),
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
             let repo = if primary {
-                RepoRepo::create_primary_for_project(&db, input, None, project.version, now.clone())
-                    .await
+                RepoRepo::create_primary_for_project(&db, input, project.version, now.clone()).await
             } else {
                 RepoRepo::create(&db, input).await
             }
@@ -3516,7 +3508,6 @@ async fn sqlite_repo_update_and_read_normalize_blank_remote_url() {
                 name: None,
                 local_path: None,
                 remote_url: input,
-                work_mode: None,
                 default_branch: None,
                 updated_at: now_rfc3339(),
             },
@@ -8003,7 +7994,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             name: None,
             local_path: None,
             remote_url: None,
-            work_mode: None,
             default_branch: Some("trunk".to_owned()),
             updated_at: now.clone(),
         },

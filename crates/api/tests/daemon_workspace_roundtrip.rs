@@ -14,7 +14,7 @@ use db::{
     ExecutionStatus, PlacementOwnerKind, PlacementSelectedBy, PlacementState, ProjectRepo,
     RepoLocationKind, RepoLocationOwnerKind, RepoLocationRepo, RepoLocationStatus, RepoRepo,
     ReviewRepo, ReviewStatus, RuntimeRepo, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateWorkspacePlacement, WorkMode, WorkspacePlacementRepo, WorkspaceRepo, WorkspaceStatus,
+    UpdateWorkspacePlacement, WorkspacePlacementRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_client::{
     daemon_persistence::{JournalEntry, JournalOperation},
@@ -279,7 +279,6 @@ impl Fixture {
                 name: "repo".into(),
                 remote_url: Some("https://example.test/owner-only.git".into()),
                 local_path: None,
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".into(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

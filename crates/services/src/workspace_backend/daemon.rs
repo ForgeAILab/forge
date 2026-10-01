@@ -496,14 +496,9 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             .acquire(&placement.repo_location_id)
             .await;
         let workspace = self.workspace(placement).await?;
-        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+        RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("repo", &workspace.repo_id))?;
-        if repo.work_mode != db::WorkMode::DirectMerge {
-            return Err(
-                ServiceError::invalid_operation("daemon workspaces require direct merge").into(),
-            );
-        }
         let task = TaskRepo::get_by_id(&*self.db, &placement.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", &placement.task_id))?;

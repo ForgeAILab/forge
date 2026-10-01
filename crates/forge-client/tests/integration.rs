@@ -14,7 +14,7 @@ use api_types::{
     CostKind, CostSummary, CreateAgentRequest, CreateProjectRequest, CreateRepoRequest,
     CreateTaskRequest, DaemonResponse, ExecutionEvidenceSummary, PaginatedResponse,
     ProjectResponse, RepoResponse, TaskExecutionObservability, TaskResponse, TaskType,
-    TokenCounters, UsageAggregate, UsageCostCoverage, WorkMode,
+    TokenCounters, UsageAggregate, UsageCostCoverage,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -345,9 +345,6 @@ async fn create_repo_route(
         local_path: request.local_path,
         remote_url: request.remote_url,
         default_branch: request.default_branch.unwrap_or_else(|| "main".to_owned()),
-        work_mode: request.work_mode.unwrap_or(WorkMode::DirectMerge),
-        pr_provider: request.pr_provider,
-        pr_provider_status: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -502,9 +499,6 @@ async fn create_repo(client: &ForgeClient, project_id: &str, local_path: &str) -
                 local_path: Some(local_path.to_owned()),
                 name: Some("forge".to_owned()),
                 default_branch: None,
-                work_mode: None,
-                pr_provider: None,
-                pr_provider_config: None,
             },
         )
         .await

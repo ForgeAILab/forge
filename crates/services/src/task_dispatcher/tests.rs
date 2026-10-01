@@ -115,7 +115,6 @@ async fn seed_project_repo(db: &db::SqliteDb, repo_path: &Path) -> (String, Stri
             name: "forge".to_owned(),
             remote_url: Some(repo_path.to_string_lossy().into_owned()),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now.clone(),
             updated_at: now,
@@ -766,7 +765,6 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
             name: "forge".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -900,7 +898,6 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
             name: "manual-pause-repo".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -975,7 +972,6 @@ async fn stale_repository_resume_cannot_clear_a_later_manual_pause() {
             name: "stale-resume-repo".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -1066,7 +1062,6 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
             name: "unborn".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -1156,7 +1151,6 @@ async fn stale_repository_pause_cannot_pause_after_repository_attachment() {
             name: "stale-pause-repo".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
@@ -2291,6 +2285,70 @@ async fn dispatcher_merge_gate_completes_already_merged_branch() {
 }
 
 #[tokio::test]
+async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    run_git(fixture._repo_dir.path(), &["reset", "--hard", "HEAD~2"]);
+    let candidate_sha = run_git(
+        fixture._workspace_dir.path().join("worktree").as_path(),
+        &["rev-parse", "HEAD"],
+    );
+    assert_ne!(
+        run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]),
+        candidate_sha
+    );
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "awaiting_human": true,
+                "awaiting_human_reason": "pull_request_merge",
+                "awaiting_human_marker_id": "legacy-pr-marker",
+            })
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+    let parked = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.status, "merging");
+    assert_eq!(
+        fixture
+            .dispatcher
+            .task_service
+            .available_recovery_actions(&parked.id)
+            .await
+            .unwrap(),
+        vec![api_types::RecoveryAction::RetryHook]
+    );
+
+    let merged = fixture
+        .dispatcher
+        .task_service
+        .recover_task(
+            &parked.id,
+            api_types::RecoveryAction::RetryHook,
+            Some("operator approved direct merge".to_owned()),
+            None,
+        )
+        .await
+        .expect("human merge retry integrates the reviewed candidate");
+    assert_eq!(merged.status, "done");
+    assert_eq!(
+        run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]),
+        candidate_sha
+    );
+    let metadata = db::TaskMetadata::parse(merged.metadata_json.as_deref()).unwrap();
+    assert!(metadata.extra.get("awaiting_human").is_none());
+    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+    assert!(metadata.extra.get("awaiting_human_marker_id").is_none());
+}
+
+#[tokio::test]
 async fn dispatcher_merge_gate_respects_entry_grace() {
     let fixture = merge_gate_fixture(chrono::Duration::seconds(30)).await;
     assert_merge_gate_untouched(&fixture).await;
@@ -2317,22 +2375,6 @@ async fn dispatcher_merge_gate_skips_blocking_record() {
     let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
     sqlx::query("UPDATE task SET blocked_json = ?, version = version + 1 WHERE id = ?")
         .bind(r#"{"kind":"merge_conflict","reason":"manual repair required"}"#)
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_awaiting_pull_request() {
-    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    sqlx::query("UPDATE task SET metadata_json = ?, version = version + 1 WHERE id = ?")
-        .bind(r#"{"awaiting_human":true,"awaiting_human_reason":"pull_request_merge"}"#)
         .bind(&fixture.task.id)
         .execute(fixture.db.pool())
         .await

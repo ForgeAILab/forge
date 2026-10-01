@@ -406,13 +406,10 @@ impl From<ServiceError> for McpToolError {
             }
             ServiceError::MissingPrimaryRepo { .. }
             | ServiceError::PrimaryRepoNotFound { .. }
-            | ServiceError::RepoMismatch { .. }
-            | ServiceError::PrProviderMissing { .. }
-            | ServiceError::PrProviderTokenMissing { .. } => {
+            | ServiceError::RepoMismatch { .. } => {
                 Self::new(-32029, "required repository setup is missing")
                     .with_data(json!({ "code": "setup_required" }))
             }
-            ServiceError::PrSyncFailure { .. } => Self::new(-32603, "PR sync failed"),
             ServiceError::NestedSubtaskUnsupported => {
                 Self::new(-32602, "nested subtasks are unsupported").with_data(json!({
                     "code": "NESTED_SUBTASK_UNSUPPORTED"

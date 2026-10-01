@@ -948,7 +948,6 @@ async function createTestProject(
     name: `recovery-repo-${runId}`,
     remote_url: fixturePath,
     local_path: fixturePath,
-    work_mode: 'direct_merge',
     default_branch: 'main',
   })
   return { projectId: project.id }
@@ -1070,7 +1069,6 @@ test.describe('workflow exception recovery (integration)', () => {
         name: `recovery-full-${runId}`,
         remote_url: fixturePath,
         local_path: fixturePath,
-        work_mode: 'direct_merge',
         default_branch: 'main',
       })
 

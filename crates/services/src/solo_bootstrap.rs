@@ -22,7 +22,7 @@ use db::{
     AgentStatus, CreateAgent, CreateProject, CreateProjectMember, CreateRepo, Page, PageRequest,
     Project, ProjectAdmissionReceiptRepo, ProjectAgentBinding, ProjectAgentBindingRepo,
     ProjectMember, ProjectMemberRepo, ProjectRepo, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
-    SystemSettingRepo, UpdateProject, UpdateRepo, User, UserRepo, WorkMode,
+    SystemSettingRepo, UpdateProject, UpdateRepo, User, UserRepo,
 };
 use executors::ExecutorKind;
 use serde::{Deserialize, Serialize};
@@ -1382,7 +1382,6 @@ impl SoloBootstrapService {
                     // moves and avoids a fabricated network origin.
                     remote_url: Some(request.canonical_repository.clone()),
                     local_path: Some(request.source_path().to_owned()),
-                    work_mode: WorkMode::DirectMerge,
                     default_branch: request.default_branch.clone(),
                     created_at: now.clone(),
                     updated_at: now,
@@ -1440,7 +1439,6 @@ impl SoloBootstrapService {
                 name: None,
                 local_path: Some(Some(request.source_path().to_owned())),
                 remote_url: None,
-                work_mode: None,
                 default_branch: None,
                 updated_at: db::now_rfc3339(),
             },
@@ -2236,7 +2234,6 @@ fn status_next_step(status: &EffectiveStatus) -> &'static str {
 fn is_same_repo_identity(repo: &Repo, request: &SoloBootstrapRequest) -> bool {
     repo.remote_url.as_deref() == Some(request.canonical_repository.as_str())
         && repo.default_branch == request.default_branch
-        && repo.work_mode == WorkMode::DirectMerge
 }
 
 fn is_same_source_path(repo: &Repo, request: &SoloBootstrapRequest) -> bool {

@@ -59,9 +59,6 @@ impl RepoArgs {
                     local_path: local_path.clone(),
                     name: Some(name.clone()),
                     default_branch: default_branch.clone(),
-                    work_mode: None,
-                    pr_provider: None,
-                    pr_provider_config: None,
                 };
                 let repo: RepoResponse = client
                     .post(&format!("/api/v1/projects/{project_id}/repos"), &request)

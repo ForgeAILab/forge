@@ -12,7 +12,7 @@ use db::{
     ClaimExecutionLease, CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask,
     CreateWorkspace, CreateWorkspaceLease, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, ProjectRepo, RepoRepo, SqliteDb,
-    TaskRepo, TerminalizeExecution, UpdateProject, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    TaskRepo, TerminalizeExecution, UpdateProject, WorkspaceLeaseRepo, WorkspaceRepo,
     WorkspaceStatus,
 };
 
@@ -74,7 +74,6 @@ async fn fixture() -> ExecutionFixture {
             name: "execution-liveness".to_owned(),
             remote_url: Some("https://example.invalid/execution-liveness.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

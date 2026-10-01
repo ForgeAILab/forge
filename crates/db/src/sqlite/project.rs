@@ -793,6 +793,10 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM pr_metadata WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_provider_config WHERE repo_id IN
+                 (SELECT id FROM repo WHERE project_id = ?)",
             "DELETE FROM agent_lcm_node WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?

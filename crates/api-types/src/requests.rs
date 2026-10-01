@@ -8,7 +8,7 @@ use crate::{
 };
 use crate::{
     InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
-    TaskType, WorkMode,
+    TaskType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,18 +184,17 @@ pub struct TestLifecycleHookRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct CreateRepoRequest {
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
     pub name: Option<String>,
     pub default_branch: Option<String>,
-    pub work_mode: Option<WorkMode>,
-    pub pr_provider: Option<String>,
-    pub pr_provider_config: Option<PrProviderConfigRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdateRepoRequest {
     #[ts(optional = nullable)]
@@ -214,8 +213,6 @@ pub struct UpdateRepoRequest {
     pub local_path: Option<Option<String>>,
     #[ts(optional = nullable)]
     pub default_branch: Option<String>,
-    #[ts(optional = nullable)]
-    pub work_mode: Option<WorkMode>,
 }
 
 fn deserialize_optional_update_field<'de, D, T>(
@@ -241,12 +238,4 @@ where
     parse_project_hooks_json(&json)
         .map(Some)
         .map_err(serde::de::Error::custom)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct PrProviderConfigRequest {
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: Option<i64>,
-    pub token: Option<String>,
 }

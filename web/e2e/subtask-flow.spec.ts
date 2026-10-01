@@ -25,7 +25,6 @@ type RepoResponse = {
   name: string
   local_path: string | null
   remote_url: string
-  work_mode: 'direct_merge' | 'pull_request'
 }
 
 type AgentResponse = {
@@ -354,7 +353,6 @@ test.describe('subtask flow (integration)', () => {
           name: `subtask-app-${runId}`,
           remote_url: fixturePath,
           local_path: fixturePath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         },
       )

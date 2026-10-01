@@ -812,7 +812,7 @@ async fn local_git(path: &Path, args: &[&str]) -> std::result::Result<String, St
 mod tests {
     use db::{
         CreateProject, CreateRepo, CreateRuntime, DaemonStatus, ProjectRepo, RuntimeStatus,
-        UpsertDaemon, WorkMode,
+        UpsertDaemon,
     };
 
     use super::*;
@@ -827,7 +827,6 @@ mod tests {
             name: "repo".to_owned(),
             remote_url: Some("https://example.test/repo.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
@@ -1241,7 +1240,6 @@ mod tests {
                 name: repo.name,
                 remote_url: repo.remote_url,
                 local_path: None,
-                work_mode: repo.work_mode,
                 default_branch: repo.default_branch,
                 created_at: now.clone(),
                 updated_at: now.clone(),

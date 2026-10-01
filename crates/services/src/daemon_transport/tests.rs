@@ -6,7 +6,7 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, ClaimExecutionLease, CreateAgent,
     CreateExecution, CreateProject, CreateRepo, CreateTask, DaemonRepo, DaemonStatus,
     ExecutionLeaseMutation, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
-    UpsertDaemon, WorkMode,
+    UpsertDaemon,
 };
 use events::EventBus;
 use serde::Deserialize;
@@ -229,7 +229,6 @@ async fn seed_running_execution(
             name: "repo".to_owned(),
             remote_url: Some("file:///tmp/repo".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

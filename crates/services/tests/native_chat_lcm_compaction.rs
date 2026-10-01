@@ -20,7 +20,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentContextScopeRepo, AgentRepo,
     AgentSessionRepo, AgentStatus, CreateAgentContextScope, CreateAgentIdentity,
     CreateAgentProfile, CreateAgentSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
-    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType, Message,
@@ -872,7 +872,6 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
             name: "repository".to_owned(),
             remote_url: Some("https://example.invalid/repository.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

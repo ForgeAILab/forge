@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 use crate::{
     project_hooks::ProjectHookRule, AuthorType, ProjectExecutionSetupResponse, ReviewConfig,
-    ReviewStatus, TaskResponse, WorkMode, WorkflowDefinition,
+    ReviewStatus, TaskResponse, WorkflowDefinition,
 };
 
 fn default_json_object() -> Value {
@@ -221,29 +221,8 @@ pub struct RepoResponse {
     pub local_path: Option<String>,
     pub remote_url: Option<String>,
     pub default_branch: String,
-    pub work_mode: WorkMode,
-    pub pr_provider: Option<String>,
-    pub pr_provider_status: Option<PrProviderStatus>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct PrProviderStatus {
-    pub provider_type: String,
-    pub has_token: bool,
-    pub polling_interval_seconds: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct PrSummary {
-    pub pr_url: Option<String>,
-    pub pr_state: String,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub merge_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

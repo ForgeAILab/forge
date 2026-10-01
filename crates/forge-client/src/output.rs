@@ -106,15 +106,12 @@ pub fn print_table_repos(items: &[RepoResponse]) {
 }
 
 fn repo_source(value: &RepoResponse) -> String {
-    format!(
-        "[{}] {}",
-        serialized_label(&value.work_mode),
-        value
-            .remote_url
-            .as_deref()
-            .or(value.local_path.as_deref())
-            .unwrap_or("—")
-    )
+    value
+        .remote_url
+        .as_deref()
+        .or(value.local_path.as_deref())
+        .unwrap_or("—")
+        .to_owned()
 }
 
 pub fn print_table_repo_locations(items: &[RepoLocationResponse]) {

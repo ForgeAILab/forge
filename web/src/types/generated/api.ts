@@ -93,7 +93,6 @@ export type RecoveryAction =
 export type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'
 export type ReviewStatus = 'running' | 'awaiting_human' | 'passed' | 'failed' | 'cancelled'
 export type DaemonStatus = 'online' | 'offline'
-export type WorkMode = 'direct_merge' | 'pull_request'
 export type TerminalSessionStatus =
   | 'starting'
   | 'running'
@@ -187,7 +186,6 @@ export type FailureKind =
   | 'merge_fix_budget_exhausted'
   | 'workflow_guard_rejected'
   | 'internal_command_failed'
-  | 'pr_closed_without_merge'
   | 'executor_failed'
   | 'workspace_failed'
   | 'workspace_reset_required'
@@ -394,12 +392,6 @@ export interface WorkflowExceptionSummary {
   failing_step: FailingStepSummary | null
   related_evidence: RelatedEvidence[]
   actions: WorkflowExceptionAction[]
-}
-
-export interface PrProviderStatus {
-  provider_type: string
-  has_token: boolean
-  polling_interval_seconds: number
 }
 
 export interface TaskExecutionObservability {
@@ -841,9 +833,6 @@ export interface Repo {
   local_path: string | null
   remote_url: string | null
   default_branch: string
-  work_mode: WorkMode
-  pr_provider?: string | null
-  pr_provider_status?: PrProviderStatus | null
   created_at: string
   updated_at: string
 }
@@ -1145,13 +1134,6 @@ export interface CreateRepoRequest {
   local_path?: string | null
   name?: string | null
   default_branch?: string | null
-  work_mode?: WorkMode
-  pr_provider?: string | null
-  pr_provider_config?: {
-    base_url?: string | null
-    polling_interval_seconds?: number | null
-    token?: string | null
-  } | null
 }
 
 export interface UpdateRepoRequest {
@@ -1159,13 +1141,6 @@ export interface UpdateRepoRequest {
   local_path?: string | null
   remote_url?: string | null
   default_branch?: string | null
-  work_mode?: WorkMode
-  pr_provider?: string | null
-  pr_provider_config?: {
-    base_url?: string | null
-    polling_interval_seconds?: number | null
-    token?: string | null
-  } | null
 }
 
 export interface CreateAgentRequest {

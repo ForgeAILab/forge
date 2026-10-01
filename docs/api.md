@@ -2028,6 +2028,12 @@ retrospective mutation tool in this change.
 
 ## Repository locations
 
+A Repo is always integrated by direct merge. `POST /api/v1/projects/{id}/repos`
+accepts `remote_url`, `local_path`, `name`, and `default_branch`; the PATCH route
+accepts the corresponding mutable fields. The removed `work_mode`,
+`pr_provider`, and `pr_provider_config` fields are rejected with HTTP 400
+`validation_error` rather than ignored.
+
 A repository location records a physical checkout separately from its Repo.
 Every location route requires a Project `owner`/`admin` membership or a server
 administrator. A daemon and its runtime must be visible to the caller, and
@@ -2435,7 +2441,7 @@ rows only; inherited defaults are never copied into that array or into storage.
 `repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
 and generated clients omit it. For work that has already run, repository
 identity is read from the execution's Workspace or Workspace lease; review,
-pull-request, evidence, and release records retain that attempt-pinned
+evidence, and release records retain that attempt-pinned
 provenance even if the Project later selects another primary Repo.
 
 Task role rows, not Project defaults, authorize Task execution. `PUT
@@ -3789,8 +3795,8 @@ Workspace admission errors use HTTP `409`. `placement_unavailable` includes
 candidate names its repository location, owner, daemon/runtime and `filter_codes`.
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
-`agent_capacity`, `daemon_capacity`, `work_mode_unsupported`,
-`native_backend_unsupported`, `run_purpose_denied`, and `not_visible`.
+`agent_capacity`, `daemon_capacity`, `native_backend_unsupported`,
+`run_purpose_denied`, and `not_visible`.
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.

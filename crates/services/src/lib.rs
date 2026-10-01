@@ -53,7 +53,6 @@ pub mod operator_status_emitter;
 pub mod orchestration_authorization;
 pub mod placement;
 pub mod plan_artifact;
-pub mod pr_service;
 pub mod pricing;
 pub mod pricing_auto;
 pub mod pricing_db;
@@ -444,15 +443,6 @@ pub enum ServiceError {
 
     #[error("repo does not match primary repo for project {project_id}")]
     RepoMismatch { project_id: String },
-
-    #[error("PR provider missing for repo {repo_id}")]
-    PrProviderMissing { repo_id: String },
-
-    #[error("PR provider token missing for repo {repo_id}")]
-    PrProviderTokenMissing { repo_id: String },
-
-    #[error("PR sync failure for task {task_id}: {details}")]
-    PrSyncFailure { task_id: String, details: String },
 
     #[error("agent {agent_id} is paused and cannot accept new work")]
     AgentPaused { agent_id: String },

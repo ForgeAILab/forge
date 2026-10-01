@@ -349,20 +349,6 @@ impl From<ServiceError> for ApiError {
                 "repo_mismatch",
                 format!("repo does not match primary repo for project {project_id}"),
             ),
-            ServiceError::PrProviderMissing { repo_id } => Self::conflict_with_code(
-                "pr_provider_missing",
-                format!("PR provider missing for repo {repo_id}"),
-            ),
-            ServiceError::PrProviderTokenMissing { repo_id } => Self::conflict_with_code(
-                "pr_provider_token_missing",
-                format!("PR provider token missing for repo {repo_id}"),
-            ),
-            ServiceError::PrSyncFailure { task_id, details } => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "pr_sync_failure",
-                message: format!("PR sync failure for task {task_id}: {details}"),
-                details: Some(json!({ "task_id": task_id, "details": details })),
-            },
             ServiceError::AgentPaused { agent_id } => Self::conflict_with_code(
                 "agent_paused",
                 format!("agent {agent_id} is paused and cannot accept new work"),

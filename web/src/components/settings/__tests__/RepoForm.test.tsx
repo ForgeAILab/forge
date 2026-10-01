@@ -12,11 +12,6 @@ const localRepoForm: RepoFormState = {
   local_path: '/work/forge',
   remote_url: 'https://github.com/acme/forge.git',
   default_branch: 'main',
-  work_mode: 'direct_merge',
-  pr_provider: 'github',
-  pr_base_url: '',
-  pr_token: '',
-  pr_polling_interval_seconds: '60',
 }
 
 const daemons: Daemon[] = [
@@ -96,9 +91,6 @@ describe('RepoForm', () => {
       local_path: localRepoForm.local_path,
       remote_url: null,
       default_branch: 'main',
-      work_mode: 'direct_merge',
-      pr_provider: null,
-      pr_provider_status: null,
       created_at: '2026-09-30T00:00:00Z',
       updated_at: '2026-09-30T00:00:00Z',
     }
