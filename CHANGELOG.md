@@ -49,6 +49,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - The server holds `runtime.lock` in the data directory while it runs. A
   second Forge server, or a database conversion, on the same data directory
   now refuses to start.
+- Agent Chat keeps its system prompt identical from turn to turn, so provider
+  prompt caching can reuse it. For Project, Main and Product Genesis chats the
+  system prompt now holds only the operating skill, the server's rules and the
+  agent's Profile (in full, as quoted text). Task counts, versions, milestones,
+  open decisions and the permission ceiling arrive in a server-created state
+  card at the end of the turn's input. Content digests, the event watermark
+  and context-manifest references are no longer shown to the agent; they are
+  still recorded in each turn's context manifest, and the agent reads current
+  state through its tools.
 
 ### Added
 
@@ -68,6 +77,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - A Main Agent turn admitted under the second baseline revision is no longer
   treated as a discovery turn after an upgrade.
+- A Project Agent chat turn admitted before an upgrade no longer fails when
+  the upgrade moves the Project Agent to a newer operating-skill revision. The
+  turn runs with the revision it was admitted under, and its context manifest
+  records that revision.
 
 ## [0.13.12] - 2026-10-01
 
