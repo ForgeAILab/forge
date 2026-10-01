@@ -3895,7 +3895,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         .await
         .expect("repository task loads")
         .expect("repository task exists");
-    let repository_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let repository_result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &db,
         &repository_task.id,
         repository_task.version,
@@ -3904,6 +3904,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         &now,
         None,
+        Vec::new(),
         Vec::new(),
     )
     .await;
@@ -3932,7 +3933,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         .await
         .expect("interactive task loads")
         .expect("interactive task exists");
-    let interactive_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let interactive_result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &db,
         &interactive_task.id,
         interactive_task.version,
@@ -3941,6 +3942,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         &now,
         None,
+        Vec::new(),
         Vec::new(),
     )
     .await;
@@ -3951,6 +3953,138 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
             execution_id,
         }) if scope == "interactive" && execution_id == interactive_execution_id
     ));
+}
+
+#[tokio::test]
+async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admission() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Queued recovery", None).await;
+    let task_id = seed_task(&db, &project_id, None, "in_progress".to_owned(), "Recover").await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let task = TaskRepo::update(
+        &db,
+        UpdateTask {
+            id: task_id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::json!({
+                    "type": "recovery_required", "blocking_reason": "crash_recovery",
+                    "recovery_actions": ["reexecute"],
+                })
+                .to_string(),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("interruption persists");
+    let mutations = vec![
+        crate::TaskMetadataMutation::Set {
+            key: "queued_recovery".to_owned(),
+            value: serde_json::json!({ "action": "reexecute" }),
+        },
+        crate::TaskMetadataMutation::Set {
+            key: "deferred_dispatch".to_owned(),
+            value: serde_json::json!({ "target_state": "in_progress" }),
+        },
+        crate::TaskMetadataMutation::Set {
+            key: "unrelated".to_owned(),
+            value: serde_json::json!("preserved"),
+        },
+    ];
+    let queued = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        &db,
+        &task_id,
+        task.version,
+        None,
+        None,
+        None,
+        &now_rfc3339(),
+        None,
+        Vec::new(),
+        mutations,
+    )
+    .await
+    .expect("clear and queue commit together");
+    assert_eq!(queued.version, task.version + 1);
+    assert!(queued.error_annotation.is_none());
+    let metadata: serde_json::Value =
+        serde_json::from_str(queued.metadata_json.as_deref().expect("queue metadata"))
+            .expect("metadata parses");
+    assert!(metadata.get("queued_recovery").is_some());
+    assert!(metadata.get("deferred_dispatch").is_some());
+    let stale = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        &db,
+        &task_id,
+        task.version,
+        task.error_annotation,
+        None,
+        None,
+        &now_rfc3339(),
+        None,
+        Vec::new(),
+        vec![crate::TaskMetadataMutation::Remove {
+            key: "queued_recovery".to_owned(),
+        }],
+    )
+    .await;
+    assert!(matches!(stale, Err(DbError::VersionConflict)));
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("execution admits and consumes queue");
+    let admitted = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata: serde_json::Value = serde_json::from_str(
+        admitted
+            .metadata_json
+            .as_deref()
+            .expect("remaining metadata"),
+    )
+    .expect("metadata parses");
+    assert!(metadata.get("queued_recovery").is_none());
+    assert!(metadata.get("deferred_dispatch").is_none());
+    assert_eq!(metadata["unrelated"], "preserved");
 }
 
 #[tokio::test]

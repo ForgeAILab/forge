@@ -958,6 +958,20 @@ impl SqliteDb {
         .execute(&mut **transaction)
         .await?;
 
+        if input.status == ExecutionStatus::Running {
+            // Consume accepted recovery intent with admission, so a crash
+            // after INSERT cannot replay it into a second execution.
+            sqlx::query(
+                "UPDATE task
+                 SET metadata_json = NULLIF(json_remove(metadata_json, '$.queued_recovery', '$.deferred_dispatch'), '{}')
+                 WHERE id = ? AND json_valid(metadata_json)
+                   AND json_type(metadata_json, '$.queued_recovery') IS NOT NULL",
+            )
+            .bind(&input.task_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut **transaction)

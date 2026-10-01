@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::{Result, ServiceError};
 
 const METADATA_KEY: &str = "deferred_dispatch";
+pub(crate) const QUEUED_RECOVERY_KEY: &str = "queued_recovery";
 const PAUSED_INTEGRATION_METADATA_KEY: &str = "paused_integration";
 // Ordinary metadata mutations intentionally do not advance Task.version.
 // Project-level dispatch wakes do advance it for affected rows, forming a
@@ -20,6 +21,20 @@ pub(crate) struct DeferredDispatch {
     pub not_before: String,
     pub reason: String,
     pub target_state: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct QueuedRecovery {
+    pub id: String,
+    pub request: api_types::RecoverTaskRequest,
+    pub target_state: String,
+    pub error_annotation: Option<String>,
+    pub blocked_json: Option<String>,
+}
+
+pub(crate) fn queued_recovery(task: &Task) -> Option<QueuedRecovery> {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
+    serde_json::from_value(metadata.extra.get(QUEUED_RECOVERY_KEY)?.clone()).ok()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

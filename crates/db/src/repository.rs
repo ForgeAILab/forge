@@ -86,13 +86,13 @@ pub trait TaskRepo: Send + Sync {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
     ) -> Result<Task>;
-    /// Restore interruption metadata only when no newer running execution for
-    /// the same Task (in any workspace) or the same workspace (including a
+    /// Update interruption and dispatch metadata only when no newer running
+    /// execution for the same Task (in any workspace) or the same workspace (including a
     /// shared-root sibling Task) is present. Recovery failure paths use this
     /// boundary so they cannot resurrect a manual-stop annotation over a live
     /// cross-role replacement admitted after the clear.
     #[allow(clippy::too_many_arguments)]
-    async fn restore_recovery_metadata_if_no_running_execution(
+    async fn update_recovery_metadata_if_no_running_execution(
         &self,
         id: &str,
         expected_version: i64,
@@ -102,6 +102,7 @@ pub trait TaskRepo: Send + Sync {
         updated_at: &str,
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
+        metadata_mutations: Vec<TaskMetadataMutation>,
     ) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;

@@ -1,4 +1,5 @@
 use super::*;
+use db::TaskMetadataMutation;
 
 impl TaskService {
     pub async fn available_recovery_actions(
@@ -69,6 +70,26 @@ impl TaskService {
                 }));
             }
         }
+        let request = api_types::RecoverTaskRequest {
+            action,
+            reason: reason.clone(),
+            context: context.clone(),
+        };
+        match Box::pin(self.apply_recovery_action(task.clone(), action, reason, context)).await {
+            Err(ServiceError::Db(db::DbError::AgentAtCapacity)) => {
+                self.queue_recovery_for_capacity(&task, request).await
+            }
+            result => result,
+        }
+    }
+
+    async fn apply_recovery_action(
+        &self,
+        task: Task,
+        action: api_types::RecoveryAction,
+        reason: Option<String>,
+        context: Option<String>,
+    ) -> Result<Task> {
         super::ensure_plan_publication_transition_authority(&task, None)?;
         if task.failed_json.is_some()
             && !matches!(
@@ -174,6 +195,266 @@ impl TaskService {
             | api_types::RecoveryAction::UpdateWorkspaceAndRetryHook
             | api_types::RecoveryAction::SkipHookOnce => unreachable!(),
         }
+    }
+
+    async fn queue_recovery_for_capacity(
+        &self,
+        original: &Task,
+        request: api_types::RecoverTaskRequest,
+    ) -> Result<Task> {
+        let task = TaskRepo::get_by_id(&*self.db, &original.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", original.id.clone()))?;
+        // Launch failure may have restored the interruption at a new version.
+        // Never clear a different interruption installed by a concurrent writer.
+        if task.error_annotation != original.error_annotation
+            || task.blocked_json != original.blocked_json
+            || task.failed_json != original.failed_json
+        {
+            return Err(db::DbError::VersionConflict.into());
+        }
+        let queued = crate::deferred_dispatch::QueuedRecovery {
+            id: new_uuid_v4(),
+            request,
+            target_state: task.status.clone(),
+            error_annotation: task.error_annotation.clone(),
+            blocked_json: task.blocked_json.clone(),
+        };
+        let now = now_rfc3339();
+        let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            None,
+            None,
+            task.failed_json.clone(),
+            &now,
+            None,
+            Vec::new(),
+            vec![
+                TaskMetadataMutation::Set {
+                    key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                    value: serde_json::to_value(&queued)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                },
+                TaskMetadataMutation::Set {
+                    key: "deferred_dispatch".to_owned(),
+                    value: json!({
+                        "not_before": now,
+                        "reason": "recovery queued: agent at capacity",
+                        "target_state": task.status,
+                    }),
+                },
+            ],
+        )
+        .await?;
+        self.publish(ForgeEvent {
+            event_type: "task.recovery_action".to_owned(),
+            entity_id: updated.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskRecovered {
+                project_id: updated.project_id.clone(),
+                reason: queued.request.reason.unwrap_or_else(|| {
+                    format!("{} queued: agent at capacity", queued.request.action)
+                }),
+            },
+        });
+        Ok(updated)
+    }
+
+    async fn queued_recovery_agent(
+        &self,
+        task: &Task,
+        request: &api_types::RecoverTaskRequest,
+    ) -> Result<String> {
+        let annotation = self.recovery_annotation(task).ok();
+        let agent_id = if request.action == api_types::RecoveryAction::OpenInteractive {
+            match self
+                .interactive_follow_up_execution(task, annotation.as_ref())
+                .await?
+                .and_then(|execution| execution.agent_id)
+            {
+                Some(agent_id) => agent_id,
+                None => {
+                    self.interactive_launch_agent(task, annotation.as_ref())
+                        .await?
+                }
+            }
+        } else {
+            let execution = match annotation
+                .as_ref()
+                .and_then(|annotation| annotation.blocked_execution_id.as_deref())
+            {
+                Some(id) => ExecutionRepo::get_by_id(&*self.db, id).await?,
+                None => None,
+            };
+            if request.action == api_types::RecoveryAction::ResumeSession {
+                execution.and_then(|execution| execution.agent_id)
+            } else {
+                let role = match execution.as_ref() {
+                    Some(execution) => Some(execution.role.clone()),
+                    None => self.current_effective_role_name(task).await?,
+                };
+                let assignment_role = match role.as_deref() {
+                    Some("executor") => Some(crate::workflow::default_roles::CODER),
+                    Some("interactive" | "auditor") | None => None,
+                    Some(role) => Some(role),
+                };
+                let assigned = match assignment_role {
+                    Some(role) => {
+                        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+                            .await?
+                            .and_then(|assignment| assignment.assignee_id)
+                    }
+                    None => None,
+                };
+                assigned.or_else(|| execution.and_then(|execution| execution.agent_id))
+            }
+            .ok_or_else(|| ServiceError::invalid_operation("queued recovery requires an agent"))?
+        };
+        Ok(agent_id)
+    }
+
+    pub(crate) async fn dispatch_queued_recovery(&self, task: &Task) -> Result<bool> {
+        let Some(queued) = crate::deferred_dispatch::queued_recovery(task) else {
+            return Ok(false);
+        };
+        let deferred = crate::deferred_dispatch::pending_until(task);
+        let interruption_matches = (task.error_annotation.is_none() && task.blocked_json.is_none())
+            || (task.error_annotation == queued.error_annotation
+                && task.blocked_json == queued.blocked_json);
+        if queued.target_state != task.status
+            || !interruption_matches
+            || task.failed_json.is_some()
+            || task.archived_at.is_some()
+        {
+            let mut mutations = vec![TaskMetadataMutation::RemoveIf {
+                key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                expected: serde_json::to_value(&queued)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            }];
+            if let Some(deferred) = deferred {
+                mutations.push(TaskMetadataMutation::RemoveIf {
+                    key: "deferred_dispatch".to_owned(),
+                    expected: serde_json::to_value(deferred)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                });
+            }
+            TaskRepo::mutate_metadata_and_bump_version(
+                &*self.db,
+                &task.id,
+                task.version,
+                mutations,
+                &now_rfc3339(),
+            )
+            .await?;
+            return Ok(false);
+        }
+        if crate::deferred_dispatch::is_pending(task, chrono::Utc::now()) {
+            return Ok(false);
+        }
+        let mut recovery_task = task.clone();
+        recovery_task.error_annotation = queued.error_annotation.clone();
+        recovery_task.blocked_json = queued.blocked_json.clone();
+        let agent_id = self
+            .queued_recovery_agent(&recovery_task, &queued.request)
+            .await?;
+        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id))?;
+        if !matches!(
+            crate::agent_service::compute_effective_status(&self.db, &agent).await?,
+            crate::agent_service::EffectiveStatus::Active
+                | crate::agent_service::EffectiveStatus::Busy
+        ) || !crate::agent_capacity::has_running_execution_capacity(&self.db, &agent).await?
+        {
+            return Ok(false);
+        }
+        // Keep the marker through replay. Its short deferral and version CAS
+        // fence concurrent scans; a crash before admission remains retryable.
+        let claim = json!({
+            "not_before": (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
+            "reason": deferred.map(|deferred| deferred.reason)
+                .unwrap_or_else(|| "recovery queued: agent at capacity".to_owned()),
+            "target_state": queued.target_state,
+        });
+        let claimed = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            queued.error_annotation.clone(),
+            queued.blocked_json.clone(),
+            None,
+            &now_rfc3339(),
+            None,
+            Vec::new(),
+            vec![TaskMetadataMutation::Set {
+                key: "deferred_dispatch".to_owned(),
+                value: claim.clone(),
+            }],
+        )
+        .await?;
+        let result = Box::pin(self.recover_task_at_version(
+            &claimed.id,
+            queued.request.action,
+            queued.request.reason.clone(),
+            queued.request.context.clone(),
+            claimed.version,
+        ))
+        .await;
+        let current = TaskRepo::get_by_id(&*self.db, &claimed.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", claimed.id.clone()))?;
+        match crate::deferred_dispatch::queued_recovery(&current) {
+            None => return result.map(|_| true),
+            Some(current) if current.id != queued.id => {
+                // A capacity race installed a new queue intent, or another writer
+                // superseded this one. Never clear that newer dispatch authority.
+                return result.map(|_| false);
+            }
+            Some(_) => {}
+        }
+        let mutations = vec![
+            TaskMetadataMutation::RemoveIf {
+                key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                expected: serde_json::to_value(&queued)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            },
+            TaskMetadataMutation::RemoveIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: claim,
+            },
+        ];
+        if result.is_err()
+            && current.status == claimed.status
+            && current.error_annotation.is_none()
+            && current.blocked_json.is_none()
+            && current.failed_json.is_none()
+        {
+            TaskRepo::update_recovery_metadata_if_no_running_execution(
+                &*self.db,
+                &current.id,
+                current.version,
+                queued.error_annotation,
+                queued.blocked_json,
+                None,
+                &now_rfc3339(),
+                None,
+                Vec::new(),
+                mutations,
+            )
+            .await?;
+        } else {
+            TaskRepo::mutate_metadata(
+                &*self.db,
+                &current.id,
+                Some(current.version),
+                mutations,
+                &now_rfc3339(),
+            )
+            .await?;
+        }
+        result.map(|_| true)
     }
 
     fn parse_blocking_annotation(&self, task: &Task) -> Option<api_types::TaskBlockingAnnotation> {
@@ -373,7 +654,7 @@ impl TaskService {
         // replacement execution was admitted in the clear-to-launch gap. The
         // DB boundary checks both facts under one write transaction; in
         // particular, an execution insert does not bump Task.version.
-        let result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+        let result = TaskRepo::update_recovery_metadata_if_no_running_execution(
             &*self.db,
             &cleared_task.id,
             cleared_task.version,
@@ -383,6 +664,7 @@ impl TaskService {
             &now_rfc3339(),
             workspace_id,
             overlapping_execution_roles(execution_role),
+            Vec::new(),
         )
         .await;
         if let Err(error) = result {

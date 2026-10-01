@@ -2479,6 +2479,15 @@ snapshot and its agent still owns the exact Task role.
 
 ### Crash recovery
 
+Explicit Task recovery whose only refusal is Agent capacity is accepted into
+the durable dispatch queue. Clearing its interruption and recording its action,
+reason, and context share a Task-version CAS and a no-running-execution check.
+The dispatcher retries that intent before ordinary scheduling once capacity
+is available, revalidating the current workflow and execution admission. The
+Running execution INSERT consumes the queued intent in the same transaction,
+so restart cannot replay an already admitted recovery. While queued, the Task
+reports `Retry Queued` through the existing deferred-dispatch health projection.
+
 `CrashRecovery` runs at server and Solo startup and deterministically reconciles
 ownerless or expired running executions left by an earlier process. Migration
 `V089` does not invent ownership for pre-existing rows: a running row without
