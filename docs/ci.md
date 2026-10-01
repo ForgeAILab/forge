@@ -12,6 +12,13 @@ invocation, local and CI, so test threads have the same stack as the server's
 runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
 test binary on Linux, and the tests after it never run.
 
+`scripts/ci-rust.sh` builds with `CARGO_PROFILE_DEV_DEBUG=line-tables-only`
+(and the same for the test profile). The workspace links more than 150
+integration-test binaries; with full debug info they fill the hosted runner's
+disk and the linker fails with `ld terminated with signal 7 [Bus error]`.
+Panics and backtraces still show file and line. Local builds are unaffected;
+export the same two variables to shrink a local `target/` directory.
+
 `.cargo/config.toml` also sets `FORGE_TEST_FORBID_DEFAULT_DATA_DIR=1` for local
 and CI Cargo invocations. The default data-directory resolver panics when this
 variable is set and the current executable's parent directory is `deps`, so
