@@ -170,7 +170,12 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
-    let state = AppState::new(db, Arc::new(events::EventBus::new(32)), true);
+    let state = AppState::with_adapter_registry(
+        db,
+        Arc::new(events::EventBus::new(32)),
+        true,
+        Arc::new(cli_adapters::test_support::test_registry()),
+    );
     let web_dist_dir = std::env::temp_dir().join(format!("forge-task-diff-web-{}", new_uuid_v4()));
     std::fs::create_dir_all(&web_dist_dir).expect("web dir creates");
     std::fs::write(

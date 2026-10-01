@@ -1534,7 +1534,8 @@ mod tests {
         request["operation_id"] = json!("operation");
         request["expected"] = json!({"kind":"base_sha", "sha":"candidate"});
         request["operation"] = json!({"kind":"review_checkout", "commit_sha":"candidate",
-            "environment":{"env":{}, "assets":[], "checks":[]}, "prepare":true});
+            "environment":{"env":{}, "assets":[], "checks":[],
+                "recheck_interval_seconds":600}, "prepare":true});
         assert_round_trip::<WorkspaceOwnerOperationParams>(request);
         let mut request = workspace;
         request["operation"] = json!("reconcile");

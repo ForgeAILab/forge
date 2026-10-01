@@ -184,7 +184,19 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
-        self.cleanup_terminal_task(&workspace.task_id).await
+        let result = self.cleanup_task(&workspace.task_id, false).await;
+        if let Err(cleanup_error) = &result {
+            if let Err(error) = self
+                .record_cleanup_failure(&workspace.task_id, cleanup_error)
+                .await
+            {
+                tracing::warn!(task_id = %workspace.task_id, %error, %cleanup_error, "failed to back off immediate Task cleanup");
+            }
+            if matches!(cleanup_error, ServiceError::DaemonUnavailable { .. }) {
+                return Ok(());
+            }
+        }
+        result
     }
 
     pub(crate) async fn cleanup_terminal_task(&self, task_id: &str) -> Result<()> {
@@ -518,6 +530,7 @@ impl WorkspaceCleanupScheduler {
             if present {
                 self.cleanup_workspace(workspace).await
             } else {
+                Self::acknowledge_cleanup_receipts(&resolved).await?;
                 Ok(())
             }
         } else {

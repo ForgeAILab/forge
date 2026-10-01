@@ -2419,6 +2419,9 @@ stable `line` or `line:column` strings for ingestion receipts. Terminal and clea
 results replay after reconnect until `journal.ack { entry_id }`. The server must
 persist a result before acknowledging it. The daemon then deletes the receipt; repeated acks are
 idempotent. Unacknowledged results survive a crash between completion and ack.
+For a successful write-capable execution, the daemon records the worktree's
+actual Git HEAD when the selected adapter does not return one, so reconnect
+reconciliation retains commit evidence for Shell and other minimal adapters.
 The journal caps receipts at 1,024 and all persisted journal files (including the
 workspace registry) at 32 MiB, with 16 MiB per receipt. Usage is indexed once and
 updated on writes. Mutation deduplication opens only its operation receipt with
@@ -2593,7 +2596,8 @@ existing timeout, so concurrent disconnect or reconciliation does not discard
 the cleanup request. A retry of an already cleaned daemon workspace also drains
 retained journal acknowledgements. With a persisted `cleaning` intent, an owner's
 `invalid_input: unknown workspace_handle` response means cleanup already finished;
-other unknown-handle responses remain errors.
+other unknown-handle responses remain errors. Cleanup acknowledgements report
+`removed: false` when the exact embedded worktree was already absent.
 
 Remote output, reasoning, and tool notifications update semantic progress
 when accepted, but a quiet remote execution remains healthy while its lease is
@@ -3785,6 +3789,9 @@ the candidate does not reproduce from its own commit — a stale lockfile is the
 usual cause — so the review fails and the coder is told which files changed.
 Tracked changes in the reviewer's own worktree and stale Charter/Task/check
 inputs make conformance unverified while retaining the parsed review.
+An owner-transport or placement-infrastructure failure leaves the assessment
+unrecorded, so reconnect recovery can evaluate it again against the same frozen
+contract instead of freezing an environmental failure as review authority.
 Natural-language Charter text never becomes an executable command;
 product-specific deterministic checks must be configured explicitly.
 
