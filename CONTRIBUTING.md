@@ -50,6 +50,18 @@ pnpm run e2e
 See [GitHub Actions builds and caches](docs/ci.md) for CI and release cache
 behavior, cache scope limitations, and commands to investigate slow runs.
 
+### TypeScript bindings
+
+After changing Rust API types in `crates/api-types`, run `make types` from the
+repository root and commit the generated files in the same change. This runs
+only ts-rs's `export_bindings_*` tests. The shared `.cargo/config.toml` directs
+exports to `web/src/types/generated/bindings/` from any crate directory or
+worktree location; there is no separate Rust-side copy to synchronize.
+
+Do not edit or format these bindings by hand. ESLint and Prettier exclude them.
+The Rust CI job regenerates them and fails on changed or untracked output with
+a reminder to run `make types`.
+
 ## Code Standards
 
 - **No unsafe code** — `#![forbid(unsafe_code)]` is enforced workspace-wide

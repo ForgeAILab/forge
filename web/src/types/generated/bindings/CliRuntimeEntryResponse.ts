@@ -5,11 +5,11 @@ import type { ProviderEntryAgentRef } from "./ProviderEntryAgentRef";
  * A CLI-managed runtime discovered on a connected daemon. Forge reads only
  * availability signals; it never imports the CLI's credential files.
  */
-export type CliRuntimeEntryResponse = { kind: string, daemon_id: string, daemon_hostname: string | null, daemon_status: string, availability: string,
+export type CliRuntimeEntryResponse = { kind: string, daemon_id: string, daemon_hostname: string | null, daemon_status: string, availability: string, 
 /**
  * Reversible account policy for this exact daemon/runtime source.
  */
-enabled: boolean,
+enabled: boolean, 
 /**
  * Zero means no policy row exists yet; the first availability update
  * creates version one.

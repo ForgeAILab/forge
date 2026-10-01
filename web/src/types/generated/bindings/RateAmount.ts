@@ -3,11 +3,11 @@
 /**
  * A USD rate per one million tokens.
  */
-export type RateAmount = {
+export type RateAmount = { 
 /**
  * Always `USD` in this API revision.
  */
-currency: "USD",
+currency: "USD", 
 /**
  * Canonical non-negative decimal text; never an exponent.
  */

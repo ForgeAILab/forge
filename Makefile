@@ -1,4 +1,4 @@
-.PHONY: dev dev-demo dev-no-daemon frontend test build install-local install-ctl ci ci-rust ci-web clean-test
+.PHONY: dev dev-demo dev-no-daemon frontend types test build install-local install-ctl ci ci-rust ci-web clean-test
 
 # Start the server using ./test as the data directory (safe for manual/agent testing)
 dev:
@@ -15,6 +15,10 @@ dev-no-daemon:
 # Vite dev server (proxies /api to the Forge backend bind)
 frontend:
 	cd web && pnpm run dev
+
+# Regenerate the web client's TypeScript bindings from api-types
+types:
+	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_bindings
 
 # Run all Rust tests
 test:
