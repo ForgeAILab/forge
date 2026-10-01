@@ -35,6 +35,7 @@ tokio = { version = "1", features = ["sync", "rt", "time", "process", "net", "io
 tokio-util = "0.7"
 tracing = "0.1"
 url = "2"
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }

@@ -263,7 +263,7 @@ fn conversation_budget_tokens(
         .max(LCM_MIN_CONVERSATION_BUDGET_TOKENS)
 }
 
-/// Forge's pressure policy, adjusted on three axes the stock defaults get
+/// Forge's pressure policy, adjusted on four axes the stock defaults get
 /// wrong for real chats:
 ///
 /// - `leaf_target_tokens` must exceed one full canonical turn. Leaf planning
@@ -293,10 +293,15 @@ fn conversation_budget_tokens(
 ///   while pressure still reads Soft — and Soft never compacts, because the
 ///   host does not drive the idle admission phase. Hard at 85% trips
 ///   before the estimator error can eat the whole margin.
-fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::LcmPressurePolicy {
+/// - `retain_recent_entries`: the runtime protects the active turn itself;
+///   retaining completed entries can exclude a short, oversized prior turn.
+fn forge_lcm_pressure_policy(max_output_tokens: u32) -> agent_runtime::lcm::LcmPressurePolicy {
     agent_runtime::lcm::LcmPressurePolicy {
-        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-3"),
-        leaf_target_tokens: u64::from(request.provider.max_output_tokens).saturating_add(4096),
+        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-4"),
+        leaf_target_tokens: u64::from(max_output_tokens).saturating_add(4096),
+        // The runtime already protects the active user turn. Retaining four
+        // more entries can make a short, oversized completed turn ineligible.
+        retain_recent_entries: 0,
         max_rounds: 16,
         soft_threshold_percent: 70,
         hard_threshold_percent: 85,
@@ -523,7 +528,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
                 LcmCoordinatorPolicy {
                     input_budget_tokens: conversation_budget_tokens(&request, &composition),
-                    pressure: forge_lcm_pressure_policy(&request),
+                    pressure: forge_lcm_pressure_policy(request.provider.max_output_tokens),
                     // The stock sizer cannot see a tool call's arguments or a
                     // tool result's body, so a tool-exchange timeline read
                     // Soft — which never compacts — right up to the planner's
@@ -1089,6 +1094,130 @@ impl agent_runtime::core::workspace::Workspace for TaskWorkspace {
         std::fs::canonicalize(&candidate)
             .map(|canonical| canonical.as_path() == root.as_path() || canonical.starts_with(root))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod lcm_policy_tests {
+    use super::*;
+    use agent_runtime::{
+        core::{
+            content::{ContentPart, Message},
+            event::TurnFinish,
+            ids::TurnId,
+            prelude::Timestamp,
+        },
+        harness::{TurnCommitHook, TurnCommitView},
+        lcm::LcmReader,
+    };
+
+    async fn admission(
+        history: Vec<Message>,
+        retain_recent_entries: usize,
+    ) -> (Option<RuntimeError>, Vec<agent_runtime::lcm::LcmNode>) {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO agent_identity (id, name, created_at, updated_at) VALUES ('pressure-agent', 'Pressure agent', ?, ?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let store = crate::SqliteLcmStore::open_for_binding(
+            db,
+            "pressure-agent",
+            "account",
+            "pressure-account",
+            "pressure-auth",
+            None,
+            &now,
+        )
+        .await
+        .unwrap();
+        let session = SessionId::new("pressure-session");
+        let binding = store.runtime_binding(session.clone()).unwrap();
+        let store = Arc::new(store);
+        let mut pressure = forge_lcm_pressure_policy(4096);
+        pressure.retain_recent_entries = retain_recent_entries;
+        let coordinator = LcmCoordinator::new(
+            store.clone(),
+            Arc::new(DeterministicLcmSummaryModel::default()),
+            Arc::new(StaticLcmTimelineResolver::new(binding)),
+            LcmCoordinatorPolicy {
+                input_budget_tokens: 4096,
+                pressure,
+                sizer: Arc::new(ForgeLcmSizer::new()),
+                ..LcmCoordinatorPolicy::default()
+            },
+        )
+        .unwrap();
+        let mut view = TurnCommitView {
+            session,
+            turn: TurnId::new("pressure-turn"),
+            finish: TurnFinish::Completed,
+            provider_error_kind: None,
+            visible_output: false,
+            history: Arc::from(history),
+            state: None,
+            usage: Arc::from([]),
+            started_at: Timestamp::ZERO,
+            committed_at: Timestamp::ZERO,
+        };
+        for _ in 0..40 {
+            let outcome = coordinator.before_provider(&view).await.unwrap();
+            view.state = outcome.patch.state.map(|state| state.into_state());
+            if !outcome.retry_admission {
+                return (
+                    outcome.block,
+                    store.active_nodes(&store.view()).await.unwrap(),
+                );
+            }
+        }
+        panic!("LCM admission did not terminate within its bounded rounds");
+    }
+
+    #[tokio::test]
+    async fn lcm_policy_compacts_oversized_completed_turn_inside_recent_tail() {
+        let history = vec![
+            Message::user("summarize this"),
+            Message::assistant(vec![ContentPart::text(
+                "delivered project context ".repeat(2000),
+            )]),
+            Message::user("continue"),
+        ];
+        // Four retained entries exclude even this entire completed turn.
+        let (blocked, nodes) = admission(history.clone(), 4).await;
+        assert!(blocked.is_some());
+        assert!(nodes.is_empty());
+        let (blocked, nodes) = admission(
+            history,
+            forge_lcm_pressure_policy(4096).retain_recent_entries,
+        )
+        .await;
+        assert!(blocked.is_none(), "{blocked:?}");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].range.start.get(), 0);
+        assert_eq!(nodes[0].range.end.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn lcm_policy_active_turn_overflow_remains_a_runtime_limit() {
+        let history = vec![
+            Message::user("summarize this"),
+            Message::assistant(vec![ContentPart::text(
+                "active tool-loop context ".repeat(2000),
+            )]),
+        ];
+        let (blocked, nodes) = admission(
+            history,
+            forge_lcm_pressure_policy(4096).retain_recent_entries,
+        )
+        .await;
+        assert!(
+            blocked
+                .unwrap()
+                .to_string()
+                .contains("LCM context cannot fit after bounded hard compaction")
+        );
+        assert!(nodes.is_empty());
     }
 }
 

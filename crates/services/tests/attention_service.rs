@@ -1230,6 +1230,46 @@ async fn recovered_task_suppresses_a_stale_interruption_wake_before_budget() {
 }
 
 #[tokio::test]
+async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
+    let db = database().await;
+    for sequence in 0..100 {
+        DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "test.health_progress".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: format!("health-task-{sequence}"),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "account".to_owned(),
+                scope_id: "health-account".to_owned(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(new_uuid_v4()),
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let service = AttentionService::new(Arc::clone(&db));
+    let run = service.project_once(100).await.unwrap();
+    assert_eq!(run.processed_events, 100);
+    let health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.processed_events, 100);
+    assert_eq!(health.last_sequence, run.last_sequence);
+    assert_eq!(health.version, 3); // lease acquisition, 100-event flush, lease release
+    assert!(health.lease_owner.is_none());
+    assert!(health.lease_until.is_none());
+}
+
+#[tokio::test]
 async fn projection_worker_drains_events_reports_health_and_stops() {
     let db = database().await;
     let project_id = new_uuid_v4();

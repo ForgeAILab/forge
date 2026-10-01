@@ -773,6 +773,13 @@ Entries carry actor, canonical scope, operation, input digest, policy result,
 status, correlation id, optional committed outcome, and occurrence time. The
 projection never returns an action payload body.
 
+The `consumer_health` projection flushes successful progress at an event boundary
+after five seconds or 100 events, with immediate writes on errors and consumer lease
+changes. Batch release flushes the remaining progress. Its processed-event
+counter is diagnostic and can lose up to 99 buffered increments on a crash;
+durable delivery cursors and receipts remain authoritative. `stale` continues
+to mean more than 90 seconds since the last successfully processed event.
+
 Without `project_id`, authorized account/Main activity and all visible Project
 activity are included. Account/Main Chat entries are visible only to the
 account owner; Project and Project Chat/task entries require Project access.
