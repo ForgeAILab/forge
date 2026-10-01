@@ -12,6 +12,19 @@ invocation, local and CI, so test threads have the same stack as the server's
 runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
 test binary on Linux, and the tests after it never run.
 
+`.cargo/config.toml` also sets `FORGE_TEST_FORBID_DEFAULT_DATA_DIR=1` for local
+and CI Cargo invocations. The default data-directory resolver panics when this
+variable is set and the current executable's parent directory is `deps`, so
+unit and integration tests (including dependency crates) cannot fall back to
+the developer's real `~/.forge`. Test harnesses must own a `tempfile::TempDir`
+or use their existing temporary workspace and inject it with
+`ForgeConfig::with_data_dir`, `ForgeRuntimeBuilder::from_config`, an explicit
+config file/`ConfigOverrides::data_dir`, or `FORGE_DATA_DIR`; media, Project Agent
+workspaces, workflows and logs must stay within temporary roots. The API
+convenience constructors retain their temporary data root across state clones.
+The executable check leaves `cargo run` and `make dev` unchanged, and explicitly
+configured data roots bypass the tripwire.
+
 The [release workflow](../.github/workflows/release.yml) does not re-run the
 Rust or web test suites. Its `verify-ci` gate looks up the CI run for the
 tagged commit on `main` and waits for it to finish, so a tag can be pushed

@@ -553,16 +553,14 @@ fn default_forge_home() -> PathBuf {
     if let Some(path) = std::env::var_os("FORGE_DATA_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
-    if let Some(home) = home_dir() {
-        return home.join(".forge");
+    let data_dir = config::default_data_dir();
+    // Keep the client's USERPROFILE fallback when HOME is absent.
+    if std::env::var_os("HOME").is_none() {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(home).join(data_dir);
+        }
     }
-    PathBuf::from(".forge")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    data_dir
 }
 
 fn read_credentials(path: &Path) -> Result<Option<DaemonCredentials>> {

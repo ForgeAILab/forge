@@ -493,12 +493,6 @@ async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
 async fn agent_chat_turn_logs_serve_the_turns_durable_activity() {
     let workspace = common::TestDir::new("agent-chat-turn-logs");
     let harness = common::test_app(workspace.path(), "agent-chat-turn-logs").await;
-    // The harness has no `--data-dir`; keep this test's logs inside its own
-    // workspace instead of the default `~/.forge`.
-    harness
-        .state
-        .agent_chat_turn_logs
-        .set_root(workspace.path().join("agent-chat-logs"));
     let token = common::test_jwt();
 
     let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(

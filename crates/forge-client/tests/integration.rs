@@ -226,7 +226,7 @@ impl TestServer {
         });
 
         Some(Self {
-            client: ForgeClient::new(localhost_url(addr)),
+            client: ForgeClient::new_without_credentials(localhost_url(addr)),
             handle,
             _repo_dir: repo_dir,
         })

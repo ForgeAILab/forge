@@ -139,6 +139,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `validation_error` with the reason, and a failure to load
   `project.current_state` returns `internal_failure`; both used to be reported
   as `policy_denied`.
+- Running the test suites no longer writes media, project directories or
+  workflow files into the developer's real `~/.forge`, and the `forge-ctl`
+  integration tests no longer read the stored login. Test harnesses use
+  temporary data directories, and a test that resolves the default data
+  directory now panics with instructions (see `docs/ci.md`).
 
 ## [0.13.12] - 2026-10-01
 

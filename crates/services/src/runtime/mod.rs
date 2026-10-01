@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use config::{default_config_path, ForgeConfig};
+use config::ForgeConfig;
 use db::SqliteDb;
 use events::EventBus;
 use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
@@ -376,30 +376,30 @@ pub struct ForgeRuntimeBuilder {
 impl ForgeRuntimeBuilder {
     #[must_use]
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self::from_config(db, event_bus, ForgeConfig::default())
+    }
+
+    /// Start a builder with the caller's fully resolved configuration, without
+    /// first constructing a configuration rooted in the user's data directory.
+    #[must_use]
+    pub fn from_config(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, config: ForgeConfig) -> Self {
+        let config_path = config.forge.data_dir.join("forge.yaml");
         Self {
             db,
             event_bus,
             adapter_registry: Arc::new(AdapterRegistry::new()),
-            config: ForgeConfig::default(),
+            config,
             workspace_root: None,
             workflows_dir: None,
             jwt_secret: b"test-jwt-secret-for-development".to_vec(),
             bcrypt_cost: 4,
             shutdown_signal: ShutdownSignal::new(),
-            config_path: default_config_path(),
+            config_path,
             start_notification_service: false,
             merge_service: None,
             cleanup_scheduler: None,
             review_runner: None,
         }
-    }
-
-    /// Start a builder with the caller's fully resolved configuration. This
-    /// is the usual entry point for a local mode that has already applied
-    /// CLI/environment/config-file precedence.
-    #[must_use]
-    pub fn from_config(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, config: ForgeConfig) -> Self {
-        Self::new(db, event_bus).with_config(config)
     }
 
     #[must_use]
@@ -1066,24 +1066,29 @@ mod tests {
     use db::{create_sqlite_pool, run_migrations};
     use std::sync::Arc;
 
-    async fn runtime() -> Arc<ForgeRuntime> {
+    async fn runtime() -> (tempfile::TempDir, Arc<ForgeRuntime>) {
         runtime_with_notification(false).await
     }
 
-    async fn runtime_with_notification(start_notification_service: bool) -> Arc<ForgeRuntime> {
+    async fn runtime_with_notification(
+        start_notification_service: bool,
+    ) -> (tempfile::TempDir, Arc<ForgeRuntime>) {
         let pool = create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
-        let builder = ForgeRuntimeBuilder::new(Arc::clone(&db), Arc::new(EventBus::new(64)))
-            .with_workspace_root(std::env::temp_dir().join("forge-runtime-test-workspaces"));
+        let data_dir = tempfile::tempdir().expect("runtime test data directory");
+        let mut config = ForgeConfig::with_data_dir(data_dir.path().to_path_buf());
+        config.workspace.root = data_dir.path().join("workspaces");
+        let builder =
+            ForgeRuntimeBuilder::from_config(Arc::clone(&db), Arc::new(EventBus::new(64)), config);
         let builder = if start_notification_service {
             builder.start_notification_service()
         } else {
             builder
         };
-        Arc::new(builder.build())
+        (data_dir, Arc::new(builder.build()))
     }
 
     #[test]
@@ -1099,7 +1104,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_monitoring_excludes_a_disabled_worker_with_or_without_a_cursor() {
-        let runtime = runtime().await;
+        let (_data_dir, runtime) = runtime().await;
         let service = &runtime.operator_status_service;
         assert!(service
             .compute_status()
@@ -1133,7 +1138,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_start_is_idempotent_and_shutdown_is_bounded() {
-        let runtime_graph = runtime().await;
+        let (_data_dir, runtime_graph) = runtime().await;
         let mut supervisor =
             RuntimeSupervisor::new(Arc::clone(&runtime_graph), RuntimeAssemblyMode::Solo);
         assert!(!supervisor.started());
@@ -1161,7 +1166,7 @@ mod tests {
             .event_consumers
             .is_empty());
 
-        let second_runtime = runtime().await;
+        let (_second_data_dir, second_runtime) = runtime().await;
         let mut rejected = RuntimeSupervisor::new(second_runtime, RuntimeAssemblyMode::Solo);
         rejected.request_shutdown();
         assert!(rejected.start().await.is_err());
@@ -1169,7 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn compatibility_notification_worker_transfers_to_supervisor() {
-        let runtime = runtime_with_notification(true).await;
+        let (_data_dir, runtime) = runtime_with_notification(true).await;
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");

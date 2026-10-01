@@ -38,9 +38,7 @@ impl OperatorStatusService {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
             expected_event_consumers: RwLock::new(Vec::new()),
-            consumer_stall_seconds: config::ForgeConfig::default()
-                .server
-                .event_consumer_stall_seconds,
+            consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
         }
     }
 
