@@ -2330,7 +2330,13 @@ impl WorkflowEngine {
 
             if to_state.kind == StateKind::Terminal {
                 if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
-                    if let Err(error) = scheduler.cleanup_terminal_task(&task.id).await {
+                    let delay = match workflow.cleanup_policy_for(&target_state) {
+                        Some(api_types::CleanupPolicy::Delayed { seconds }) => {
+                            std::time::Duration::from_secs(seconds)
+                        }
+                        _ => std::time::Duration::ZERO,
+                    };
+                    if let Err(error) = scheduler.schedule_terminal_task(&task.id, delay).await {
                         tracing::warn!(task_id = %task.id, %error, "terminal Task cleanup deferred");
                     }
                 }

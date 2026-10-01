@@ -137,7 +137,48 @@ impl WorkspaceCleanupScheduler {
     pub(crate) async fn cleanup_terminal_task(&self, task_id: &str) -> Result<()> {
         // Filesystem deletion can outlive a cancelled future. Keep the lifecycle
         // lock until removal finishes so reopening cannot race a timed-out job.
-        self.cleanup_task(task_id, true).await
+        let result = self.cleanup_task(task_id, true).await;
+        if result.is_err() {
+            if let Err(error) = self.schedule_terminal_task(task_id, TICK_INTERVAL).await {
+                tracing::warn!(%task_id, %error, "failed to back off Task cleanup");
+            }
+        }
+        result
+    }
+
+    pub(crate) async fn schedule_terminal_task(
+        &self,
+        task_id: &str,
+        delay: Duration,
+    ) -> Result<()> {
+        let cleanup_after = chrono::Utc::now()
+            + chrono::Duration::from_std(delay).map_err(|error| {
+                ServiceError::invalid_operation(format!("invalid cleanup delay: {error}"))
+            })?;
+        // Do not decode the workspace here: a malformed row must still get a
+        // retry deadline when cleanup fails before loading it.
+        sqlx::query(
+            "UPDATE workspace SET cleanup_after = ?, updated_at = ?
+             WHERE task_id = ? AND status != 'cleaned'",
+        )
+        .bind(cleanup_after.to_rfc3339())
+        .bind(now_rfc3339())
+        .bind(task_id)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_cleanup_after(&self, task_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE workspace SET cleanup_after = NULL, updated_at = ?
+             WHERE task_id = ? AND cleanup_after IS NOT NULL",
+        )
+        .bind(now_rfc3339())
+        .bind(task_id)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn reset_workspace_now(&self, workspace_id: String) -> Result<()> {
@@ -219,12 +260,9 @@ impl WorkspaceCleanupScheduler {
         .await?;
         for repo_id in &repo_ids {
             cursor.repo_id = repo_id.clone();
-            let repo = RepoRepo::get_by_id(&*self.db, repo_id).await?;
-            let source = repo
-                .as_ref()
-                .and_then(|repo| self.repo_source(repo))
-                .or_else(|| self.cached_repo_source(repo_id));
-            if let Some(source) = source {
+            // Broad pruning is safe only in Forge-owned repository caches.
+            // User local_path repositories are cleaned by exact worktree path.
+            if let Some(source) = self.cached_repo_source(repo_id) {
                 let locks = self.repo_cache_locks()?;
                 match timeout(SWEEP_BUDGET, async {
                     let _guard = locks.acquire(&source.to_string_lossy()).await;
@@ -297,14 +335,14 @@ impl WorkspaceCleanupScheduler {
 
     async fn cleanup_task(&self, task_id: &str, terminal_only: bool) -> Result<()> {
         let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
-            return Ok(());
+            return self.clear_cleanup_after(task_id).await;
         };
         let _guard = self.lock_task(&task).await;
         let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
-            return Ok(());
+            return self.clear_cleanup_after(task_id).await;
         };
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
-            return Ok(());
+            return self.clear_cleanup_after(task_id).await;
         };
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
@@ -314,11 +352,47 @@ impl WorkspaceCleanupScheduler {
         if terminal_only
             && workflow.state_kind(&task.status) != Some(api_types::StateKind::Terminal)
         {
-            return Ok(());
+            return self.clear_cleanup_after(task_id).await;
         }
         let workspace = WorkspaceRepo::get_by_task_id(&*self.db, task_id).await?;
         if terminal_only {
+            let now = chrono::Utc::now();
+            // The sweep also sees Tasks with no workspace/deadline, such as
+            // terminal subtasks and historical managed homes. Preserve their
+            // grace period using the terminal Task's timestamp.
+            let grace_until = match workflow.cleanup_policy_for(&task.status) {
+                Some(api_types::CleanupPolicy::Delayed { seconds }) => {
+                    let updated_at = chrono::DateTime::parse_from_rfc3339(&task.updated_at)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    Some(
+                        updated_at
+                            + chrono::Duration::from_std(Duration::from_secs(seconds)).map_err(
+                                |error| ServiceError::invalid_operation(error.to_string()),
+                            )?,
+                    )
+                }
+                _ => None,
+            };
+            if let Some(grace_until) = grace_until.filter(|deadline| *deadline > now) {
+                if let Some(workspace) = workspace.as_ref() {
+                    WorkspaceRepo::set_cleanup_after(
+                        &*self.db,
+                        &workspace.id,
+                        Some(grace_until.to_rfc3339()),
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
             if let Some(workspace) = workspace.as_ref() {
+                if let Some(deadline) = workspace.cleanup_after.as_deref() {
+                    let deadline = chrono::DateTime::parse_from_rfc3339(deadline)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    if deadline > now {
+                        return Ok(());
+                    }
+                }
                 if workspace.status != WorkspaceStatus::Cleaned {
                     self.schedule(&workspace.id, TICK_INTERVAL).await?;
                 }
@@ -762,8 +836,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_transitions_release_worktree_and_codex_home_without_cleanup_hooks() {
-        for terminal in ["done", "cancelled"] {
+    async fn terminal_transitions_schedule_cleanup_and_preserve_cancelled_grace() {
+        for (terminal, with_hooks) in [
+            ("done", false),
+            ("done", true),
+            ("cancelled", false),
+            ("cancelled", true),
+        ] {
             let db = sqlite_db().await;
             let bus = Arc::new(EventBus::new(16));
             let temp = TempDir::new().expect("temp dir creates");
@@ -772,8 +851,10 @@ mod tests {
             let task = fixture_task(&db, &workspace_id).await;
             let task = set_fixture_status(&db, &task, "todo").await;
             let mut workflow = crate::workflow::default_workflow::default_workflow();
-            for state in &mut workflow.states {
-                state.hooks = api_types::StateHooks::default();
+            if !with_hooks {
+                for state in &mut workflow.states {
+                    state.hooks = api_types::StateHooks::default();
+                }
             }
             let project = ProjectRepo::get_by_id(&*db, &task.project_id)
                 .await
@@ -795,7 +876,7 @@ mod tests {
                 temp.path().to_path_buf(),
             ));
             let service = crate::TaskService::new(Arc::clone(&db), bus)
-                .with_cleanup_scheduler(scheduler)
+                .with_cleanup_scheduler(Arc::clone(&scheduler))
                 .with_workspace_root(temp.path().to_path_buf());
             let updated = service
                 .transition(
@@ -806,13 +887,56 @@ mod tests {
                 .await
                 .expect("terminal transition succeeds");
             assert_eq!(updated.task.status, terminal);
-            assert!(!worktree_path.exists());
-            assert_retained_logs(temp.path(), &task);
+            assert!(
+                worktree_path.exists(),
+                "deletion must run outside the transition"
+            );
+            assert!(logs_dir(temp.path(), &task)
+                .join(".codex-managed-home")
+                .exists());
             let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
                 .await
                 .expect("workspace loads")
                 .expect("workspace exists");
-            assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+            assert_eq!(workspace.status, WorkspaceStatus::Ready);
+            let deadline = chrono::DateTime::parse_from_rfc3339(
+                workspace
+                    .cleanup_after
+                    .as_deref()
+                    .expect("cleanup schedules"),
+            )
+            .unwrap();
+            if terminal == "cancelled" {
+                assert!(deadline > chrono::Utc::now() + chrono::Duration::hours(23));
+                scheduler.tick().await.expect("tick respects grace");
+                scheduler.sweep().await.expect("sweep respects grace");
+                assert!(worktree_path.exists());
+                assert!(logs_dir(temp.path(), &task)
+                    .join(".codex-managed-home")
+                    .exists());
+                // Advance the persisted terminal timestamp and deadline past grace.
+                sqlx::query("UPDATE task SET updated_at = ?, version = version + 1 WHERE id = ?")
+                    .bind((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339())
+                    .bind(&task.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                scheduler
+                    .schedule(&workspace_id, Duration::ZERO)
+                    .await
+                    .unwrap();
+            }
+            scheduler.tick().await.expect("worker cleans due workspace");
+            assert!(!worktree_path.exists());
+            assert_retained_logs(temp.path(), &task);
+            assert_eq!(
+                WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                WorkspaceStatus::Cleaned
+            );
             let source = temp.path().join(".repos").join(&workspace.repo_id);
             assert!(git::branch_exists(&source, &workspace.branch)
                 .await
@@ -849,15 +973,317 @@ mod tests {
             assert!(logs_dir(temp.path(), &task)
                 .join(".codex-managed-home")
                 .exists());
-            assert_eq!(
-                WorkspaceRepo::get_by_id(&*db, &workspace_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status,
-                WorkspaceStatus::Ready
-            );
+            let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(workspace.status, WorkspaceStatus::Ready);
+            assert!(workspace.cleanup_after.is_none());
         }
+    }
+
+    struct FailingTerminalCleanup;
+
+    #[async_trait]
+    impl WorkspaceCleanupObserver for FailingTerminalCleanup {
+        async fn cleanup_workspace_terminals(&self, _workspace_id: &str) -> Result<()> {
+            Err(ServiceError::invalid_operation("cleanup observer failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_emit_transition_effect_failed() {
+        let db = sqlite_db().await;
+        let bus = Arc::new(EventBus::new(256));
+        let mut events = bus.subscribe();
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        let scheduler = Arc::new(WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            temp.path().to_path_buf(),
+        ));
+        scheduler.set_terminal_cleanup_handler(Arc::new(FailingTerminalCleanup));
+        let service = crate::TaskService::new(Arc::clone(&db), bus)
+            .with_cleanup_scheduler(Arc::clone(&scheduler))
+            .with_workspace_root(temp.path().to_path_buf());
+
+        // Cleanup holds this same lock during physical deletion. The transition
+        // must finish without waiting for the worker to acquire it.
+        let guard = scheduler.lock_task(&task).await;
+        let outcome = timeout(
+            Duration::from_secs(5),
+            service.transition(task.id.clone(), "done".to_owned(), (task.version, None)),
+        )
+        .await
+        .expect("transition does not wait for cleanup")
+        .expect("transition succeeds");
+        drop(guard);
+        assert_eq!(outcome.task.status, "done");
+        assert!(worktree_path.exists());
+        assert!(logs_dir(temp.path(), &task)
+            .join(".codex-managed-home")
+            .exists());
+        scheduler
+            .tick()
+            .await
+            .expect("worker isolates cleanup failure");
+        assert!(worktree_path.exists());
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(workspace.cleanup_after.as_deref().unwrap())
+                .unwrap()
+                > chrono::Utc::now()
+        );
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.event_type, "transition.effect_failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_clears_ineligible_batch_and_reaches_later_terminal_task() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let repo_id = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .repo_id;
+        let mut stale_ids = Vec::new();
+        for index in 0..SWEEP_LIMIT {
+            let stale_task = seed_log_only_task(
+                &db,
+                temp.path(),
+                &task,
+                new_uuid_v4(),
+                None,
+                if index < 2 { "done" } else { "review" },
+            )
+            .await;
+            let id = new_uuid_v4();
+            WorkspaceRepo::create(
+                &*db,
+                CreateWorkspace {
+                    id: id.clone(),
+                    task_id: stale_task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: temp
+                        .path()
+                        .join(&stale_task.id)
+                        .join("repo")
+                        .to_string_lossy()
+                        .into_owned(),
+                    branch: workspace::task_branch_name(&stale_task.id),
+                    status: WorkspaceStatus::Ready,
+                    before_sha: None,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            WorkspaceRepo::set_cleanup_after(
+                &*db,
+                &id,
+                Some((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()),
+                &now_rfc3339(),
+            )
+            .await
+            .unwrap();
+            if index < 2 {
+                // Reproduce historical dangling references without changing
+                // the schema's normal foreign-key guarantees.
+                let mut connection = db.pool().acquire().await.unwrap();
+                sqlx::query("PRAGMA foreign_keys = OFF")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                if index == 0 {
+                    sqlx::query(
+                        "UPDATE task SET project_id = ?, version = version + 1 WHERE id = ?",
+                    )
+                    .bind(new_uuid_v4())
+                    .bind(&stale_task.id)
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                } else {
+                    sqlx::query("UPDATE workspace SET task_id = ? WHERE id = ?")
+                        .bind(new_uuid_v4())
+                        .bind(&id)
+                        .execute(&mut *connection)
+                        .await
+                        .unwrap();
+                }
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
+            stale_ids.push(id);
+        }
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler
+            .schedule(&workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
+        scheduler.tick().await.unwrap();
+        assert!(
+            worktree_path.exists(),
+            "first batch contains only ineligible rows"
+        );
+        for id in stale_ids {
+            let workspace = WorkspaceRepo::get_by_id(&*db, &id).await.unwrap().unwrap();
+            assert_eq!(workspace.status, WorkspaceStatus::Ready);
+            assert!(workspace.cleanup_after.is_none());
+        }
+        scheduler.tick().await.unwrap();
+        assert!(
+            !worktree_path.exists(),
+            "ineligible rows must not starve later cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_backs_off_errors_before_workspace_is_loaded() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler
+            .schedule(&workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace SET status = 'invalid' WHERE id = ?")
+            .bind(&workspace_id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+        scheduler.tick().await.unwrap();
+        let deadline =
+            sqlx::query_scalar::<_, String>("SELECT cleanup_after FROM workspace WHERE id = ?")
+                .bind(&workspace_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&deadline).unwrap() > chrono::Utc::now());
+        assert!(worktree_path.exists());
+        sqlx::query("UPDATE workspace SET status = 'ready' WHERE id = ?")
+            .bind(&workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        scheduler.tick().await.unwrap();
+        assert!(worktree_path.exists(), "failed row respects retry backoff");
+        scheduler
+            .schedule(&workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
+        scheduler.tick().await.unwrap();
+        assert!(!worktree_path.exists());
+    }
+
+    #[tokio::test]
+    async fn sweep_preserves_cancelled_managed_home_without_workspace_until_grace_expires() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let root = fixture_task(&db, &workspace_id).await;
+        let task =
+            seed_log_only_task(&db, temp.path(), &root, new_uuid_v4(), None, "cancelled").await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler.sweep().await.unwrap();
+        assert!(logs_dir(temp.path(), &task)
+            .join(".codex-managed-home")
+            .exists());
+        sqlx::query("UPDATE task SET updated_at = ?, version = version + 1 WHERE id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339())
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        scheduler.sweep().await.unwrap();
+        assert_retained_logs(temp.path(), &task);
+    }
+
+    #[tokio::test]
+    async fn sweep_never_prunes_user_owned_local_repository() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        set_fixture_status(&db, &task, "review").await;
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_repo = temp.path().join("user-repo");
+        std::fs::create_dir_all(&user_repo).unwrap();
+        git::init(&user_repo).await.unwrap();
+        git::commit_all(&user_repo, "initial commit").await.unwrap();
+        let user_worktree = temp.path().join("user-worktree");
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&user_worktree)
+            .arg("HEAD")
+            .current_dir(&user_repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::remove_dir_all(&user_worktree).unwrap();
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+            .bind(user_repo.to_string_lossy().as_ref())
+            .bind(&workspace.repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler.sweep().await.unwrap();
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&user_repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains(user_worktree.to_str().unwrap()));
     }
 
     #[tokio::test]
@@ -932,6 +1358,10 @@ mod tests {
             .execute(db.pool())
             .await
             .expect("execution settles");
+        scheduler
+            .schedule(&workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
         scheduler.sweep().await.expect("backfill retries");
         assert!(!worktree_path.exists());
         assert_retained_logs(temp.path(), &task);
@@ -1028,7 +1458,7 @@ mod tests {
             temp.path().to_path_buf(),
         );
         scheduler
-            .cleanup_now(workspace_id)
+            .cleanup_now(workspace_id.clone())
             .await
             .expect("cleanup defers");
         scheduler.sweep().await.expect("sweep defers");
@@ -1039,6 +1469,10 @@ mod tests {
         db::WorkspaceLeaseRepo::revoke(&*db, &lease.id, lease.version, &now_rfc3339())
             .await
             .expect("lease revokes");
+        scheduler
+            .schedule(&workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
         scheduler.sweep().await.expect("cleanup retries");
         assert!(!worktree_path.exists());
         assert_retained_logs(temp.path(), &task);
@@ -1128,7 +1562,7 @@ mod tests {
                     &root,
                     format!("{}-backfill-{index:03}", root.id),
                     None,
-                    "cancelled",
+                    "done",
                 )
                 .await,
             );
@@ -1218,7 +1652,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(workspace.status, WorkspaceStatus::Ready);
-        assert!(workspace.cleanup_after.is_some());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(workspace.cleanup_after.as_deref().unwrap())
+                .unwrap()
+                > chrono::Utc::now()
+        );
     }
 
     #[tokio::test]

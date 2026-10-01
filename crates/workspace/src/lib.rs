@@ -396,8 +396,8 @@ impl WorkspaceManager {
             }
             .into());
         }
-        if registered && fs::try_exists(worktree_path).await? {
-            let output = git_command()
+        if registered {
+            let mut output = git_command()
                 .args(["worktree", "remove", "--force"])
                 .arg(worktree_path)
                 .current_dir(repo_path)
@@ -412,13 +412,37 @@ impl WorkspaceManager {
                 }
                 .into());
             }
+            if !output.status.success() {
+                // An old cleaner may have left only build/outbox files. Remove
+                // those leftovers, then unregister this exact missing path.
+                match fs::remove_dir_all(worktree_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                output = git_command()
+                    .args(["worktree", "remove", "--force"])
+                    .arg(worktree_path)
+                    .current_dir(repo_path)
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    return Err(git::GitError::CommandFailed {
+                        command: "git worktree remove --force".to_owned(),
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    }
+                    .into());
+                }
+            }
         }
         match fs::remove_dir_all(task_root).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        Self::prune_worktrees(repo_path).await
+        Ok(())
     }
 
     pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
@@ -633,5 +657,46 @@ mod tests {
             .cleanup_worktree("task-1", &repo_path, &worktree_path)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_user_worktree_registrations() {
+        for missing in [false, true] {
+            let (_repo_dir, repo_path) = setup_repo().await;
+            let workspace_dir = TempDir::new().unwrap();
+            let manager = WorkspaceManager::new(workspace_dir.path().join("forge"));
+            let worktree_path = manager
+                .create_worktree(repo_path.to_str().unwrap(), "task-1", "HEAD")
+                .await
+                .unwrap();
+            let user_worktree = workspace_dir.path().join("user-worktree");
+            let output = git_command()
+                .args(["worktree", "add", "--detach"])
+                .arg(&user_worktree)
+                .arg("HEAD")
+                .current_dir(&repo_path)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            fs::remove_dir_all(&user_worktree).await.unwrap();
+            if missing {
+                fs::remove_dir_all(&worktree_path).await.unwrap();
+            }
+            manager
+                .cleanup_worktree("task-1", &repo_path, &worktree_path)
+                .await
+                .unwrap();
+            let output = git_command()
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo_path)
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            let registrations = String::from_utf8_lossy(&output.stdout);
+            assert!(registrations.contains(user_worktree.to_str().unwrap()));
+            assert!(!registrations.contains(worktree_path.to_str().unwrap()));
+        }
     }
 }

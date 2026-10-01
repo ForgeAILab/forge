@@ -2106,15 +2106,22 @@ review before retrying integration. A failed or
 blocked child stops the sequence at that child so the Project Agent can inspect
 evidence, reassign it, or otherwise coordinate recovery.
 
-Forge owns Task workspace cleanup. Entering a terminal workflow state (`done`
-or `cancelled` in the built-in workflows) removes the Task's worktree through
-`git worktree remove --force`, removes its build output, and prunes missing Git
-worktree registrations. Task branches and execution logs are retained; only
+Forge owns Task workspace cleanup. Entering a terminal workflow state schedules
+cleanup without waiting for filesystem deletion. The deadline worker removes
+the Task's exact worktree through `git worktree remove --force` and removes its
+build output. Built-in `done` Tasks are eligible promptly; `cancelled` Tasks
+retain their worktrees and managed homes for 24 hours to preserve uncommitted
+work. Broad Git worktree pruning runs only in Forge-owned `.repos/` caches;
+user-owned repositories retain all unrelated worktree registrations.
+Task branches and execution logs are retained; only
 `.codex-managed-home` (including task scratch) is removed from the Task's logs
 directory. Cleanup is deferred while any execution or WorkspaceLease is active.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs; failed
-workspace cleanup is also retried by the deadline worker.
+workspace cleanup is also retried with backoff by the deadline worker. The sweep
+honors cleanup deadlines and grace periods, and ineligible scheduled rows have
+their deadlines cleared so they cannot starve later cleanup. Cleanup failures
+are logged by the worker and never reported as transition effect failures.
 
 Operators must not delete worktrees based on execution status. A completed or
 failed execution can belong to a Task still in `review` or `merge_failed`, whose

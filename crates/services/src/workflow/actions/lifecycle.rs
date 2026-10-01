@@ -272,7 +272,7 @@ impl HookAction for CleanupWorkspaceNow {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
         let current_task = match task(ctx).await {
             Ok(task) => task,
-            Err(reason) => return HookResult::Failed { reason },
+            Err(reason) => return HookResult::Skipped { reason },
         };
         if current_task.parent_task_id.is_some() {
             return HookResult::Skipped {
@@ -290,8 +290,12 @@ impl HookAction for CleanupWorkspaceNow {
                 reason: "nothing to clean up".to_string(),
             };
         };
-        if let Err(error) = cleanup_scheduler.cleanup_now(workspace_id).await {
-            return HookResult::Failed {
+        if let Err(error) = cleanup_scheduler
+            .schedule(workspace_id, Duration::ZERO)
+            .await
+        {
+            tracing::warn!(task_id = %ctx.task_id, %error, "workspace cleanup scheduling failed");
+            return HookResult::Skipped {
                 reason: error.to_string(),
             };
         };
@@ -315,7 +319,7 @@ impl HookAction for ScheduleWorkspaceCleanup {
 
         let current_task = match task(ctx).await {
             Ok(task) => task,
-            Err(reason) => return HookResult::Failed { reason },
+            Err(reason) => return HookResult::Skipped { reason },
         };
         if current_task.parent_task_id.is_some() {
             return HookResult::Skipped {
@@ -337,13 +341,14 @@ impl HookAction for ScheduleWorkspaceCleanup {
         let delay = ctx
             .workflow
             .cleanup_policy_for(&ctx.to_state)
-            .and_then(|policy| match policy {
-                api_types::CleanupPolicy::Immediate => None,
-                api_types::CleanupPolicy::Delayed { seconds } => Some(Duration::from_secs(seconds)),
+            .map(|policy| match policy {
+                api_types::CleanupPolicy::Immediate => Duration::ZERO,
+                api_types::CleanupPolicy::Delayed { seconds } => Duration::from_secs(seconds),
             })
-            .unwrap_or(Duration::ZERO);
+            .unwrap_or(Duration::from_secs(86_400));
         if let Err(error) = cleanup_scheduler.schedule(&workspace_id, delay).await {
-            return HookResult::Failed {
+            tracing::warn!(task_id = %ctx.task_id, %error, "workspace cleanup scheduling failed");
+            return HookResult::Skipped {
                 reason: error.to_string(),
             };
         };
