@@ -20,7 +20,7 @@ workspace = { path = "../workspace" }
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-bcrypt = "0.17"
+bcrypt = "0.19"
 config = { path = "../config" }
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
