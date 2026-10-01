@@ -20,8 +20,6 @@ function task(id: string, status: string, position: number, version = 1): TaskLi
     priority: 0,
     board_position: position,
     role_assignments: [],
-    effective_coder: null,
-    effective_coder_source: null,
     remaining_retries: {},
     version,
     created_at: `2026-07-22T00:00:0${position}Z`,

@@ -81,6 +81,8 @@ describe('Project capacity waits on task surfaces', () => {
         task={{
           ...queuedTask(),
           execution_observability: undefined,
+          effective_coder: null,
+          effective_coder_source: null,
           status: 'review',
           failed: {
             kind: 'review_needs_owner',
@@ -119,7 +121,12 @@ describe('Project capacity waits on task surfaces', () => {
   it('shows the same capacity reason in the Task detail header', () => {
     render(
       <TaskDetailHeader
-        task={{ ...queuedTask(), execution_observability: undefined }}
+        task={{
+          ...queuedTask(),
+          execution_observability: undefined,
+          effective_coder: null,
+          effective_coder_source: null,
+        }}
         editingTitle={false}
         titleDraft="NK-50"
         updatePending={false}
