@@ -161,6 +161,25 @@ PY"# }
         latest_subject.contains("hi") || latest_subject.contains(&task_id),
         "latest git subject references the task change: {latest_subject}"
     );
+    let workspace = db::WorkspaceRepo::get_by_task_id(&*harness.state.db, &task_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    assert_eq!(workspace.status, db::WorkspaceStatus::Ready);
+    assert!(workspace.cleanup_after.is_some(), "cleanup is scheduled");
+    assert!(worktree_path.exists(), "transition does not delete inline");
+
+    let (cleanup_shutdown, cleanup_shutdown_rx) = tokio::sync::watch::channel(false);
+    let cleanup_worker = Arc::clone(&harness.state.cleanup_scheduler).spawn(cleanup_shutdown_rx);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while workspaces_root.path().join(&task_id).exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cleanup worker removes the workspace");
+    cleanup_shutdown.send(true).expect("cleanup worker stops");
+    cleanup_worker.await.expect("cleanup worker joins");
     assert!(
         !workspaces_root.path().join(&task_id).exists(),
         "workspace task directory is cleaned"

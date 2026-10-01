@@ -551,6 +551,9 @@ impl TaskService {
     }
 
     pub fn with_repo_cache_locks(mut self, locks: Arc<RepoCacheLockManager>) -> Self {
+        if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+            scheduler.set_repo_cache_locks(Arc::clone(&locks));
+        }
         self.repo_cache_locks = Some(locks);
         self
     }
@@ -559,6 +562,9 @@ impl TaskService {
         mut self,
         cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
     ) -> Self {
+        if let Some(locks) = self.repo_cache_locks.as_ref() {
+            cleanup_scheduler.set_repo_cache_locks(Arc::clone(locks));
+        }
         self.cleanup_scheduler = Some(cleanup_scheduler);
         self
     }
@@ -999,6 +1005,14 @@ impl TaskService {
         workspace_id: Option<&str>,
     ) {
         let mut removed_workspace = false;
+        let workspace = if let Some(workspace_id) = workspace_id {
+            WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         if let Some(workspace_id) = workspace_id {
             // Delete only our workspace row and only while no execution has
             // acquired it. This protects a concurrent launch which reused
@@ -1030,7 +1044,31 @@ impl TaskService {
             manager = manager.with_repo_cache_locks(locks);
         }
         if removed_workspace {
-            if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+            let Some(workspace) = workspace else {
+                return;
+            };
+            let source = match RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await {
+                Ok(Some(repo)) => {
+                    match project_agent_workspace::resolve_repo_source(&repo, &self.workspace_root)
+                        .await
+                    {
+                        Ok(source) => source,
+                        Err(error) => {
+                            tracing::warn!(task_id, %error, "failed to resolve rejected execution workspace repository");
+                            return;
+                        }
+                    }
+                }
+                _ => return,
+            };
+            if let Err(cleanup_error) = manager
+                .cleanup_worktree(
+                    task_id,
+                    std::path::Path::new(&source),
+                    std::path::Path::new(&workspace.worktree_path),
+                )
+                .await
+            {
                 tracing::warn!(
                     task_id,
                     %cleanup_error,

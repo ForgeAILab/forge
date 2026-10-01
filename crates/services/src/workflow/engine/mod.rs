@@ -1576,6 +1576,17 @@ impl WorkflowEngine {
                     })
                     .to_string()
                 });
+            let cleanup_guard = if from_state.kind == StateKind::Terminal
+                && to_state.kind != StateKind::Terminal
+            {
+                if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+                    Some(scheduler.lock_task(&task).await)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let reopens_visible_work = from_state.kind == StateKind::Terminal
                 && to_state.kind != StateKind::Terminal
                 && !task.is_automation;
@@ -1748,6 +1759,7 @@ impl WorkflowEngine {
                     };
                     (task, transition_log, None)
                 };
+            drop(cleanup_guard);
 
             // The authoritative event was committed with the task mutation.
             // Fetching by the transition-log/event id also makes replayed board
@@ -2391,6 +2403,20 @@ impl WorkflowEngine {
                             break;
                         }
                         HookResult::Ok | HookResult::Skipped { .. } => {}
+                    }
+                }
+            }
+
+            if to_state.kind == StateKind::Terminal {
+                if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+                    let delay = match workflow.cleanup_policy_for(&target_state) {
+                        Some(api_types::CleanupPolicy::Delayed { seconds }) => {
+                            std::time::Duration::from_secs(seconds)
+                        }
+                        _ => std::time::Duration::ZERO,
+                    };
+                    if let Err(error) = scheduler.schedule_terminal_task(&task.id, delay).await {
+                        tracing::warn!(task_id = %task.id, %error, "terminal Task cleanup deferred");
                     }
                 }
             }

@@ -968,7 +968,7 @@ impl TaskService {
             if let (Some(cleanup_scheduler), Some(workspace_id)) =
                 (self.cleanup_scheduler.as_ref(), workspace_id)
             {
-                cleanup_scheduler.cleanup_now(workspace_id).await?;
+                cleanup_scheduler.reset_workspace_now(workspace_id).await?;
                 return Ok((true, false));
             }
             return Ok((false, false));
