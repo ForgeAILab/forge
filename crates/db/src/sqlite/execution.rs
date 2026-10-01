@@ -28,6 +28,21 @@ impl ExecutionRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let execution = self
+            .create_with_lease_and_admission_in_tx(&mut transaction, input, lease, admission)
+            .await?;
+        transaction.commit().await?;
+        Ok(execution)
+    }
+
+    async fn create_with_lease_and_admission_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<Execution> {
         let invalid_deadline = lease
             .hard_deadline_at
             .as_deref()
@@ -43,13 +58,12 @@ impl ExecutionRepo for SqliteDb {
                     .to_owned(),
             ));
         }
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        Self::create_execution_in_tx(&mut transaction, &input, admission.as_ref()).await?;
+        Self::create_execution_in_tx(transaction, &input, admission.as_ref()).await?;
         // Reviewer/auditor executions are durably owned by the exact Review
         // attempt selected by the admission snapshot. Keep this binding in
         // the same writer transaction as the execution row and lease
         // reservation.
-        SqliteDb::bind_role_execution_to_review_in_tx(&mut transaction, &input, admission.as_ref())
+        SqliteDb::bind_role_execution_to_review_in_tx(transaction, &input, admission.as_ref())
             .await?;
         let result = sqlx::query(
             "UPDATE execution
@@ -70,15 +84,14 @@ impl ExecutionRepo for SqliteDb {
         .bind(&lease.now)
         .bind(&lease.now)
         .bind(&lease.execution_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
-        let execution = execution_in_tx(&mut transaction, &input.id)
+        let execution = execution_in_tx(transaction, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
-        transaction.commit().await?;
         Ok(execution)
     }
 

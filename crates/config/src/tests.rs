@@ -653,6 +653,7 @@ fn clear_forge_env() {
         "FORGE_DATA_DIR",
         "FORGE_WORKSPACE_ROOT",
         "FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS",
+        "FORGE_MAX_DISCONNECT_SECONDS",
         "FORGE_AGENT_MAX_CONCURRENT_TASKS",
         "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
@@ -664,6 +665,44 @@ fn clear_forge_env() {
     ] {
         env::remove_var(key);
     }
+}
+
+#[test]
+fn max_disconnect_defaults_and_obeys_file_env_override_precedence() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("forge.yaml");
+    assert_eq!(
+        ForgeConfig::default().workspace.max_disconnect_seconds,
+        24 * 60 * 60
+    );
+    fs::write(&path, "workspace:\n  max_disconnect_seconds: 600\n").expect("config writes");
+    let loaded = ForgeConfig::load(Some(&path), ConfigOverrides::default()).expect("file loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 600);
+    env::set_var("FORGE_MAX_DISCONNECT_SECONDS", "900");
+    let loaded = ForgeConfig::load(Some(&path), ConfigOverrides::default()).expect("env loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 900);
+    let loaded = ForgeConfig::load(
+        Some(&path),
+        ConfigOverrides {
+            workspace_max_disconnect_seconds: Some(1200),
+            ..Default::default()
+        },
+    )
+    .expect("override loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 1200);
+    clear_forge_env();
+}
+
+#[test]
+fn max_disconnect_rejects_zero() {
+    let mut config = ForgeConfig::default();
+    config.workspace.max_disconnect_seconds = 0;
+    assert!(
+        matches!(config.validate(), Err(ConfigError::InvalidConfig { message })
+        if message.contains("max_disconnect_seconds"))
+    );
 }
 
 #[test]

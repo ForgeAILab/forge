@@ -268,11 +268,14 @@ async fn run_daemon_loop(
         config.initial_credentials.token.clone(),
     );
     let active_executions = config.active_executions.clone();
+    let run_policy =
+        crate::daemon_config::DaemonConfig::load(config.credentials_path)?.run_policy();
     let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
         active_executions.clone(),
+        run_policy,
     ));
     loop {
         tokio::select! {

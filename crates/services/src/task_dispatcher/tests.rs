@@ -153,12 +153,11 @@ async fn seed_agent(
     agent_status: AgentStatus,
 ) -> String {
     let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
-    DaemonRepo::upsert_by_machine_id(
+    let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -173,7 +172,8 @@ async fn seed_agent(
         },
     )
     .await
-    .expect("daemon creates");
+    .expect("daemon creates")
+    .id;
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
@@ -2811,11 +2811,20 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
             .expect("queued recovery dispatches")
             .expect("execution context arrives");
         assert_eq!(ctx.task_id, task.id);
-        assert!(ctx.description.contains("keep this recovery guidance"));
+        // Shell input stays the Task's command; recovery prose is retained
+        // on the admitted execution prompt rather than executed as a script.
+        assert!(ctx
+            .description
+            .ends_with(task.description.as_deref().unwrap_or(&task.title)));
         let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
             .await
             .expect("execution loads")
             .expect("execution exists");
+        assert!(execution
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("keep this recovery guidance"));
         if action == api_types::RecoveryAction::ResumeSession {
             assert_eq!(
                 execution.agent_session_id.as_deref(),
@@ -3102,11 +3111,20 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .await
             .unwrap()
             .unwrap();
-        assert!(ctx.description.contains("resume guidance"));
+        // Shell input stays the Task's command; recovery prose is retained
+        // on the admitted execution prompt rather than executed as a script.
+        assert!(ctx
+            .description
+            .ends_with(task.description.as_deref().unwrap_or(&task.title)));
         let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
             .await
             .unwrap()
             .unwrap();
+        assert!(execution
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("resume guidance"));
         if previous_session == Some(true) {
             assert_eq!(
                 execution.parent_execution_id,
@@ -5434,4 +5452,52 @@ async fn dispatcher_schedules_retry_for_unrecorded_failure_once() {
         .expect("task exists");
     assert_eq!(again.version, scheduled.version);
     assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn disconnected_owner_is_skipped_before_dispatch_and_never_falls_back() {
+    let db = Arc::new(sqlite_db().await);
+    let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    let bus = Arc::new(events::EventBus::new(16));
+    let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
+    let dispatcher = TaskDispatcher::new(db.clone(), bus, service);
+    assert!(dispatcher
+        .list_tasks(&task.project_id, vec![task.status.clone()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!dispatcher
+        .dispatch_initial_task(
+            &task,
+            &super::initial_scheduling::InitialScheduleTarget {
+                transition_to: "in_progress".to_owned(),
+                role: "coder".to_owned(),
+                agent_id: execution.agent_id.clone().unwrap(),
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        db::WorkspacePlacementRepo::get_for_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        placement.id
+    );
+    assert_eq!(
+        ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
 }

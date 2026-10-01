@@ -295,13 +295,12 @@ async fn seed_agent(db: &SqliteDb, agent_id: &str) {
 
 async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks: i64) {
     let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
 
-    DaemonRepo::upsert_by_machine_id(
+    let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -316,7 +315,8 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
         },
     )
     .await
-    .expect("daemon creates");
+    .expect("daemon creates")
+    .id;
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
@@ -469,6 +469,7 @@ async fn build_role_dispatch_harness(
             project_id,
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
+            workspace_backend_router: task_service.workspace_backend_router(),
             db,
             event_bus,
             gate_config,
@@ -530,6 +531,7 @@ async fn build_no_repo_dispatch_harness(
             project_id,
             from_state: default_states::TODO.to_owned(),
             to_state: default_states::IN_PROGRESS.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,
@@ -635,6 +637,7 @@ async fn build_test_ctx(
         project_id,
         from_state: from_state.to_owned(),
         to_state: to_state.to_owned(),
+        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
         db,
         event_bus,
         gate_config,
@@ -2569,7 +2572,7 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2666,7 +2669,7 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     .expect("Worker resolves both sides");
     run_git(&worktree_path, &["add", "-A"]);
     run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -3038,6 +3041,7 @@ async fn build_reviewer_dispatch_harness(
             project_id,
             from_state: default_states::IN_PROGRESS.to_owned(),
             to_state: default_states::REVIEW.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,

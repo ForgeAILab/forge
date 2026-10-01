@@ -82,6 +82,45 @@ impl DaemonExecutionEventHandler for ConflictHandler {
     }
 }
 
+#[derive(Default)]
+struct JournalReadinessHandler {
+    ready: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl DaemonExecutionEventHandler for JournalReadinessHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            DaemonTerminalDisposition::Acknowledge
+        } else {
+            DaemonTerminalDisposition::Pending
+        })
+    }
+}
+
 fn make_registry() -> Arc<DaemonConnectionRegistry> {
     let event_bus = Arc::new(EventBus::new(16));
     let handler = Arc::new(NoopHandler) as Arc<dyn DaemonExecutionEventHandler>;
@@ -396,6 +435,42 @@ async fn pre_handshake_dispatch_is_rejected_without_sending_a_request() {
 }
 
 #[tokio::test]
+async fn revision_two_terminal_success_uses_revision_two_ack_wire_format() {
+    let registry =
+        DaemonConnectionRegistry::new(Arc::new(EventBus::new(16)), Arc::new(NoopHandler));
+    let (connection, mut outbound) = DaemonConnection::new("daemon-revision-two".into());
+    let connection_id = connection.id();
+    registry.register("daemon-revision-two".into(), connection);
+    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision": 2, "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack"]}),
+    });
+    assert!(registry
+        .get("daemon-revision-two")
+        .unwrap()
+        .protocol_compatible());
+    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_EXECUTION_TERMINAL.into(),
+        params: json!({"terminal_report_id":"report-two", "execution_id":"execution-two", "exit_code":0, "signal":null, "error":null, "ts":now_rfc3339(), "usage_reports":[]}),
+    });
+    let ack = tokio::time::timeout(Duration::from_secs(2), outbound.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let api_types::DaemonFrame::Request { id, method, params } = ack else {
+        panic!("expected ack request");
+    };
+    assert_eq!(method, "execution.terminal.ack");
+    assert_eq!(
+        params,
+        json!({"terminal_report_id":"report-two", "execution_id":"execution-two"})
+    );
+    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Response {
+        id, result: json!({"terminal_report_id":"report-two", "execution_id":"execution-two", "acknowledged":true}),
+    });
+}
+
+#[tokio::test]
 async fn terminal_success_sends_ack_and_conflict_does_not() {
     let event_bus = Arc::new(EventBus::new(16));
     let handler = Arc::new(NoopHandler) as Arc<dyn DaemonExecutionEventHandler>;
@@ -427,16 +502,15 @@ async fn terminal_success_sends_ack_and_conflict_does_not() {
     let api_types::DaemonFrame::Request { id, method, params } = ack else {
         panic!("expected terminal acknowledgement request");
     };
-    assert_eq!(method, api_types::METHOD_EXECUTION_TERMINAL_ACK);
-    assert_eq!(params["terminal_report_id"], "terminal-report-1");
+    assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+    assert_eq!(params["entry_id"], "terminal-report-1");
     registry.dispatch_incoming_for_connection(
         "daemon-terminal-ack",
         connection_id,
         api_types::DaemonFrame::Response {
             id,
             result: json!({
-                "terminal_report_id": "terminal-report-1",
-                "execution_id": "execution-1",
+                "entry_id": "terminal-report-1",
                 "acknowledged": true
             }),
         },
@@ -817,4 +891,132 @@ async fn execution_terminal_from_non_owner_daemon_is_rejected() {
         .expect("execution loads")
         .expect("execution exists");
     assert_eq!(unchanged.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
+async fn connection_snapshot_retains_handshake_facts_only_for_current_incarnation() {
+    let registry = make_registry();
+    let (connection, _outbound) = DaemonConnection::new("snapshot-owner".to_owned());
+    let first_id = connection.id();
+    registry.register("snapshot-owner".to_owned(), connection.clone());
+    let handshake = json!({"protocol_revision": 3,
+        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+        "executor_capabilities": {"codex": {"resume": true, "usage": true}},
+        "workspace_run_policy": {"allowed_purposes": ["ci_step", "hook"]}});
+    registry.dispatch_incoming_for_connection(
+        "snapshot-owner",
+        first_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: handshake.clone(),
+        },
+    );
+    let snapshots = registry.connection_snapshots();
+    let facts = &snapshots["snapshot-owner"];
+    assert_eq!(facts.connection_id, first_id);
+    assert!(!facts.workspace_incapable);
+    assert!(facts.handshake.executor_capabilities["codex"].resume);
+    assert_eq!(
+        facts.handshake.workspace_run_policy.allowed_purposes,
+        vec![
+            api_types::WorkspaceRunPurpose::CiStep,
+            api_types::WorkspaceRunPurpose::Hook
+        ]
+    );
+    let (replacement, _replacement_outbound) = DaemonConnection::new("snapshot-owner".to_owned());
+    registry.register("snapshot-owner".to_owned(), replacement);
+    assert!(registry.connection_snapshots().is_empty());
+    assert!(connection.snapshot().is_none());
+    assert!(!registry.dispatch_incoming_for_connection(
+        "snapshot-owner",
+        first_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: handshake,
+        }
+    ));
+    assert!(registry.connection_snapshots().is_empty());
+}
+
+#[tokio::test]
+async fn connection_snapshot_revision_two_stays_connected_but_is_workspace_incapable() {
+    let registry = make_registry();
+    let (connection, _outbound) = DaemonConnection::new("old-owner".to_owned());
+    let id = connection.id();
+    registry.register("old-owner".to_owned(), connection);
+    registry.dispatch_incoming_for_connection("old-owner", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+        params: json!({"protocol_revision": 2, "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack", "workspace.v1"]}),
+    });
+    assert!(registry.is_connected("old-owner"));
+    let snapshots = registry.connection_snapshots();
+    let facts = &snapshots["old-owner"];
+    assert_eq!(facts.handshake.protocol_revision, 2);
+    assert!(facts.workspace_incapable);
+    assert!(facts.handshake.executor_capabilities.is_empty());
+    assert!(facts
+        .handshake
+        .workspace_run_policy
+        .allowed_purposes
+        .is_empty());
+}
+
+#[tokio::test]
+async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
+    let handler = Arc::new(JournalReadinessHandler::default());
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        handler.clone(),
+    ));
+    let (connection, mut outbound) = DaemonConnection::new("journal-owner".to_owned());
+    let connection_id = connection.id();
+    registry.register("journal-owner".to_owned(), connection);
+    accept_protocol_handshake(&registry, "journal-owner", connection_id);
+    let notification: api_types::ExecutionTerminalNotification = serde_json::from_value(json!({
+        "terminal_report_id": "report-journal", "execution_id": "execution-journal", "exit_code": 0,
+        "ts": now_rfc3339(), "status": "completed", "usage_reports": [],
+    }))
+    .unwrap();
+    super::lock(&registry.inner.journal_terminals).insert(
+        (
+            "journal-owner".to_owned(),
+            connection_id,
+            notification.execution_id.clone(),
+        ),
+        notification,
+    );
+    let execution_ids = vec!["execution-journal".to_owned()];
+    assert!(!registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    assert!(outbound.try_recv().is_err());
+    handler
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    let responder = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, params } =
+                outbound.recv().await.unwrap()
+            else {
+                panic!("journal ack");
+            };
+            assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+            assert_eq!(params["entry_id"], "report-journal");
+            registry.dispatch_incoming_for_connection(
+                "journal-owner",
+                connection_id,
+                api_types::DaemonFrame::Response {
+                    id,
+                    result: json!({"entry_id": "report-journal", "acknowledged": true}),
+                },
+            );
+        })
+    };
+    assert!(registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    responder.await.unwrap();
 }

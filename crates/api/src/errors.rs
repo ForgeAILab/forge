@@ -225,6 +225,23 @@ impl IntoResponse for ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::PlacementUnavailable(error) => Self::conflict_with_code_and_details(
+                "placement_unavailable",
+                error.to_string(),
+                json!({
+                    "task_id": error.task_id,
+                    "repo_id": error.repo_id,
+                    "rejected_candidates": error.rejected_candidates,
+                }),
+            ),
+            ServiceError::PrepareFailed {
+                placement_id,
+                message,
+            } => Self::conflict_with_code_and_details(
+                "prepare_failed",
+                message,
+                json!({ "placement_id": placement_id, "failure_cause": "prepare_failed" }),
+            ),
             ServiceError::DependencyGate => Self {
                 status: StatusCode::CONFLICT,
                 code: "dependency_gate",
@@ -593,5 +610,49 @@ impl From<serde_json::Error> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn placement_unavailable_preserves_candidate_rejections_in_409() {
+        let error = ApiError::from(ServiceError::PlacementUnavailable(
+            services::placement::PlacementUnavailable {
+                task_id: "task".to_owned(),
+                repo_id: "repo".to_owned(),
+                rejected_candidates: vec![services::placement::CandidateRejection {
+                    repo_location_id: "location".to_owned(),
+                    owner_kind: "daemon".to_owned(),
+                    daemon_id: Some("daemon".to_owned()),
+                    runtime_id: Some("runtime".to_owned()),
+                    filter_codes: vec![
+                        services::placement::PlacementFilterCode::ExecutorUnavailable,
+                    ],
+                }],
+            },
+        ));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "placement_unavailable");
+        let details = error.details.unwrap();
+        assert_eq!(details["task_id"], "task");
+        assert_eq!(details["rejected_candidates"][0]["daemon_id"], "daemon");
+        assert_eq!(
+            details["rejected_candidates"][0]["filter_codes"][0],
+            "executor_unavailable"
+        );
+    }
+
+    #[test]
+    fn prepare_failed_exposes_placement_failure_cause() {
+        let error = ApiError::from(ServiceError::PrepareFailed {
+            placement_id: "placement".to_owned(),
+            message: "owner refused preparation".to_owned(),
+        });
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "prepare_failed");
+        assert_eq!(error.details.unwrap()["failure_cause"], "prepare_failed");
     }
 }

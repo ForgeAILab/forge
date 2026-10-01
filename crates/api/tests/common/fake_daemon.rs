@@ -6,7 +6,7 @@ use api::{serve_with_listener, AppState};
 use api_types::{
     DaemonFrame, DaemonHandshakeNotification, DaemonRegisterResponse, DaemonResponse,
     ExecutionLogNotification, ExecutionStartResult, ExecutionTerminalNotification, FsEntry,
-    FsListResult, TerminalClientFrame, TerminalServerFrame, DAEMON_CAPABILITY_TERMINAL_ACK,
+    FsListResult, TerminalClientFrame, TerminalServerFrame, DAEMON_CAPABILITY_JOURNAL_ACK,
     DAEMON_CAPABILITY_USAGE_REPORTS, DAEMON_PROTOCOL_REVISION, METHOD_DAEMON_HANDSHAKE,
     METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
 };
@@ -181,8 +181,17 @@ fn daemon_handshake() -> DaemonHandshakeNotification {
         protocol_revision: DAEMON_PROTOCOL_REVISION,
         capabilities: vec![
             DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
-            DAEMON_CAPABILITY_TERMINAL_ACK.to_owned(),
+            DAEMON_CAPABILITY_JOURNAL_ACK.to_owned(),
         ],
+        executor_capabilities: std::collections::BTreeMap::from([(
+            "shell".to_owned(),
+            api_types::ExecutorAdapterCapabilityFacts {
+                cancel_ack: true,
+                terminal_observed: true,
+                ..Default::default()
+            },
+        )]),
+        workspace_run_policy: Default::default(),
     }
 }
 
@@ -209,25 +218,30 @@ pub async fn next_daemon_request(
     socket: &mut ClientSocket,
     expected_method: &str,
 ) -> (String, Value) {
-    loop {
-        let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
-            .await
-            .expect("daemon request arrives")
-            .expect("daemon websocket remains open")
-            .expect("daemon request is valid");
-        let WsMessage::Text(text) = message else {
-            continue;
-        };
-        let frame: DaemonFrame = serde_json::from_str(text.as_ref()).expect("daemon frame parses");
-        match frame {
-            DaemonFrame::Request { id, method, params } => {
-                assert_eq!(method, expected_method);
-                return (id, params);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .expect("daemon websocket remains open")
+                .expect("daemon request is valid");
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: DaemonFrame =
+                serde_json::from_str(text.as_ref()).expect("daemon frame parses");
+            match frame {
+                DaemonFrame::Request { id, method, params } => {
+                    assert_eq!(method, expected_method);
+                    return (id, params);
+                }
+                DaemonFrame::Heartbeat { .. } => {}
+                other => panic!("expected daemon request frame, got {other:?}"),
             }
-            DaemonFrame::Heartbeat { .. } => {}
-            other => panic!("expected daemon request frame, got {other:?}"),
         }
-    }
+    })
+    .await
+    .expect("daemon request arrives")
 }
 
 pub async fn send_daemon_response<T: Serialize>(socket: &mut ClientSocket, id: String, result: T) {
@@ -437,6 +451,7 @@ pub async fn send_execution_terminal_completed(
             summary: summary.map(str::to_owned),
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -466,6 +481,7 @@ pub async fn send_execution_terminal_failed(
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -614,6 +630,137 @@ pub struct StartableExecutionFixture {
     pub execution: Execution,
 }
 
+async fn seed_shared_mount_placement(
+    state: &AppState,
+    workspace: &db::Workspace,
+    path: &std::path::Path,
+    daemon_id: &str,
+    agent_id: &str,
+) -> db::WorkspacePlacement {
+    let now = db::now_rfc3339();
+    let root = state.cleanup_scheduler.workspace_root().to_path_buf();
+    super::setup_git_repo(path.parent().expect("fixture worktree has a parent"));
+    super::run_git(path, &["checkout", "-b", &workspace.branch]);
+    let runtime = db::RuntimeRepo::upsert_by_daemon_kind(
+        &*state.db,
+        db::CreateRuntime {
+            id: db::new_uuid_v4(),
+            daemon_id: daemon_id.to_owned(),
+            kind: "local".to_owned(),
+            workspace_root: root.to_string_lossy().into_owned(),
+            status: db::RuntimeStatus::Ready,
+            labels_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("shared-mount runtime reports");
+
+    // Verify over an in-process command link so callers retain their original
+    // fake socket/channel for execution and terminal assertions. The real
+    // verifier still writes a probe and the real daemon reads it back.
+    let registry =
+        Arc::new(services::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let (connection, mut requests) =
+        services::daemon_transport::DaemonConnection::new(daemon_id.to_owned());
+    registry.register(daemon_id.to_owned(), connection);
+    registry.dispatch_incoming(
+        daemon_id,
+        DaemonFrame::Notification {
+            method: METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: serde_json::to_value(daemon_handshake()).unwrap(),
+        },
+    );
+    let journal_root = TestDir::new("forge-api-shared-mount-journal");
+    let journal = Arc::new(forge_client::daemon_persistence::DaemonJournal::new(
+        journal_root.path(),
+    ));
+    journal
+        .initialize()
+        .expect("verification journal initializes");
+    let owner = forge_client::daemon_workspace::DaemonWorkspaceBackend::new(
+        root.clone(),
+        daemon_id.to_owned(),
+        Default::default(),
+        journal,
+    )
+    .expect("shared-mount verifier starts");
+    let replies = Arc::clone(&registry);
+    let owner_id = daemon_id.to_owned();
+    let responder = tokio::spawn(async move {
+        let _journal_root = journal_root;
+        let DaemonFrame::Request { id, method, params } =
+            requests.recv().await.expect("verification request arrives")
+        else {
+            panic!("expected repository verification request");
+        };
+        let response = match owner.handle(&method, params, Vec::new).await {
+            Ok(result) => DaemonFrame::Response { id, result },
+            Err(error) => DaemonFrame::Error {
+                id: Some(id),
+                error,
+            },
+        };
+        replies.dispatch_incoming(&owner_id, response);
+    });
+    let locations = services::repo_location::RepoLocationService::new(
+        Arc::clone(&state.db),
+        Arc::new(services::repo_location::RemoteDaemonLocationVerifier::new(
+            registry, root,
+        )),
+    );
+    let location = locations
+        .register(
+            &workspace.repo_id,
+            api_types::CreateRepoLocationRequest {
+                owner_kind: api_types::RepoLocationOwnerKind::Server,
+                daemon_id: Some(daemon_id.to_owned()),
+                runtime_id: Some(runtime.id),
+                path: path.to_string_lossy().into_owned(),
+                kind: api_types::RepoLocationKind::SharedMount,
+                is_default: Some(true),
+            },
+            FAKE_DAEMON_USER_ID,
+            true,
+        )
+        .await
+        .expect("shared mount registers and verifies");
+    responder.await.expect("shared-mount verifier joins");
+    assert_eq!(
+        location.status,
+        db::RepoLocationStatus::Ready,
+        "{:?}",
+        location.last_error
+    );
+    db::WorkspacePlacementRepo::create(
+        &*state.db,
+        db::CreateWorkspacePlacement {
+            id: db::new_uuid_v4(),
+            workspace_id: workspace.id.clone(),
+            task_id: workspace.task_id.clone(),
+            agent_id: Some(agent_id.to_owned()),
+            owner_kind: db::PlacementOwnerKind::Server,
+            daemon_id: None,
+            runtime_id: None,
+            repo_location_id: location.id,
+            execution_daemon_id: Some(daemon_id.to_owned()),
+            workspace_handle: Some(path.to_string_lossy().into_owned()),
+            generation: 1,
+            state: db::PlacementState::Ready,
+            selected_by: db::PlacementSelectedBy::Pin,
+            selection_reason: json!({"rule": "agent_pin", "rejected_candidates": []}).to_string(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("server placement binds the verified provider")
+}
+
 pub async fn seed_startable_execution_for_daemon(
     state: &AppState,
     daemon_id: &str,
@@ -629,7 +776,8 @@ pub async fn seed_startable_execution_for_daemon(
         .cleanup_scheduler
         .workspace_root()
         .join("execution-start")
-        .join(&task_id);
+        .join(&task_id)
+        .join("repo");
     std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
 
     // A startable remote execution needs the same daemon onboarding fact as
@@ -767,7 +915,7 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("coder role assignment creates");
-    WorkspaceRepo::create(
+    let workspace = WorkspaceRepo::create(
         &*state.db,
         CreateWorkspace {
             id: workspace_id.clone(),
@@ -790,6 +938,8 @@ pub async fn seed_startable_execution_for_daemon(
         .rev()
         .find(|entry| entry.to_state == task.status)
         .map(|entry| entry.id);
+    let placement =
+        seed_shared_mount_placement(state, &workspace, &workspace_path, daemon_id, &agent_id).await;
     let execution = ExecutionRepo::create(
         &*state.db,
         CreateExecution {
@@ -818,6 +968,7 @@ pub async fn seed_startable_execution_for_daemon(
                     "task_state": task.status,
                     "state_entry_token": state_entry_token,
                     "project_version": project.version,
+                    "placement_id": placement.id,
                 })
                 .to_string(),
             ),
@@ -996,7 +1147,7 @@ pub async fn seed_terminal_task_for_daemon(
             task_id: task_id.clone(),
             role_name: services::workflow::default_roles::CODER.to_owned(),
             assignee_type: Some(AssigneeKind::Agent),
-            assignee_id: Some(agent_id),
+            assignee_id: Some(agent_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -1011,7 +1162,7 @@ pub async fn seed_terminal_task_for_daemon(
         .join(&task_id)
         .join("repo");
     std::fs::create_dir_all(&worktree_path).expect("worktree path exists");
-    WorkspaceRepo::create(
+    let workspace = WorkspaceRepo::create(
         &*state.db,
         CreateWorkspace {
             id: workspace_id,
@@ -1027,6 +1178,7 @@ pub async fn seed_terminal_task_for_daemon(
     )
     .await
     .expect("workspace creates");
+    seed_shared_mount_placement(state, &workspace, &worktree_path, daemon_id, &agent_id).await;
 
     TerminalTaskFixture {
         task_id,

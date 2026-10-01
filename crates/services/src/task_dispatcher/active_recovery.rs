@@ -7,7 +7,7 @@ use db::{
 };
 
 use crate::{
-    agent_capacity::has_running_execution_capacity,
+    agent_capacity::has_execution_capacity,
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
     workflow::{
@@ -39,6 +39,8 @@ impl TaskDispatcher {
         project: &Project,
         workflow: &WorkflowDefinition,
     ) -> Result<u64> {
+        crate::placement::admission::sweep_expired_reservations(&self.db, &db::now_rfc3339())
+            .await?;
         let mut active_states: Vec<String> = workflow
             .states
             .iter()
@@ -801,6 +803,27 @@ impl TaskDispatcher {
             return Ok(false);
         }
 
+        let workspace = db::WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await?;
+        if let Some(workspace) = workspace.as_ref() {
+            if db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &workspace.id)
+                .await?
+                .is_some_and(|placement| {
+                    matches!(
+                        placement.state,
+                        db::PlacementState::Disconnected
+                            | db::PlacementState::Cleaning
+                            | db::PlacementState::Reserved
+                            | db::PlacementState::Preparing
+                    )
+                })
+            {
+                return Ok(false);
+            }
+        }
         let state_config =
             helpers::merged_state_config(state, project, task.task_state_config.as_deref());
         if task.entry_barrier_json.is_some() {
@@ -826,7 +849,13 @@ impl TaskDispatcher {
             | EffectiveStatus::Deactivated => return Ok(false),
             EffectiveStatus::Active | EffectiveStatus::Busy => {}
         }
-        if !has_running_execution_capacity(&self.db, &agent).await? {
+        if !has_execution_capacity(
+            &self.db,
+            &agent,
+            workspace.as_ref().map(|workspace| workspace.id.as_str()),
+        )
+        .await?
+        {
             return Ok(false);
         }
         if deferred_dispatch::pending_until(task).is_some() {

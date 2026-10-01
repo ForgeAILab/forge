@@ -666,7 +666,7 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
-                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                    if crate::placement::is_capacity_refusal(&error) {
                         return self
                             .queue_resume_for_capacity(
                                 &current,
@@ -711,7 +711,7 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
-                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                    if crate::placement::is_capacity_refusal(&error) {
                         let role = if execution.role == "executor" {
                             crate::workflow::default_roles::CODER
                         } else {
@@ -766,7 +766,7 @@ impl TaskService {
             Err(error) => {
                 self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), role)
                     .await;
-                if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                if crate::placement::is_capacity_refusal(&error) {
                     return self
                         .queue_resume_for_capacity(&current, Some(&agent_id), context)
                         .await;

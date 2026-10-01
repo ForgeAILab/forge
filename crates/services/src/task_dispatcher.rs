@@ -124,11 +124,13 @@ impl TaskDispatcher {
             // interrupted Task — one whose execution a restart stopped with
             // an automatic resume — was even considered, so it waited behind
             // the whole ready queue while holding its worktree.
-            dispatched += self.recover_active_tasks(&project, &workflow).await?;
+            // Admission retains large reserve/prepare futures. Keep each
+            // phase off the scan's inline future, including concurrent scans.
+            dispatched += Box::pin(self.recover_active_tasks(&project, &workflow)).await?;
             if self.is_stopped() {
                 break;
             }
-            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
+            dispatched += Box::pin(self.dispatch_initial_tasks(&project, &workflow)).await?;
         }
 
         tracing::info!(
@@ -323,7 +325,19 @@ impl TaskDispatcher {
                 },
             )
             .await?;
-            items.extend(page.items);
+            for task in page.items {
+                let placement =
+                    db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?;
+                if placement.is_some_and(|placement| {
+                    matches!(
+                        placement.state,
+                        db::PlacementState::Disconnected | db::PlacementState::Cleaning
+                    )
+                }) {
+                    continue;
+                }
+                items.push(task);
+            }
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;

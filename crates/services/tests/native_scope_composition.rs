@@ -195,7 +195,7 @@ async fn fixture(with_task_service: bool) -> Fixture {
 
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
     if with_task_service {
-        provider.set_task_service(Arc::new(TaskService::new(
+        provider.set_task_service(Arc::new(TaskService::new_for_test(
             Arc::clone(&db),
             Arc::new(EventBus::new(32)),
         )));
@@ -1610,20 +1610,21 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     )
     .await
     .expect("other Project");
-    let other_task = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)))
-        .create_task(
-            other_project_id,
-            "Other Project Task",
-            None,
-            None,
-            None,
-            Some("planning_task".to_owned()),
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("other Project Task");
+    let other_task =
+        TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)))
+            .create_task(
+                other_project_id,
+                "Other Project Task",
+                None,
+                None,
+                None,
+                Some("planning_task".to_owned()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("other Project Task");
     let cross_project = invoke_tool(
         &project,
         "forge_scope_propose",

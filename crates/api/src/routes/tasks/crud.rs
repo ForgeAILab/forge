@@ -37,7 +37,9 @@ pub async fn create_task(
             request.governance,
         )
         .await?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn list_tasks(
@@ -266,7 +268,13 @@ pub async fn get_task(
         .await?
         .ok_or_else(|| ApiError::not_found("task", id))?;
     let awaiting_human = state.task_service.is_task_awaiting_human(&task).await?;
-    let response = task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
+    let response = task_response_with_awaiting_human(
+        &state.db,
+        &state.workspace_backend_router,
+        task,
+        awaiting_human,
+    )
+    .await?;
     Ok(Json(response))
 }
 
@@ -276,7 +284,9 @@ pub async fn update_task(
     Json(request): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
     let task = state.task_service.update_task(id, request).await?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn delete_task(
@@ -300,7 +310,9 @@ pub async fn reorder_subtasks(
     let task = TaskRepo::get_by_id(&*state.db, &task_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", task_id.clone()))?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn move_task(
@@ -320,7 +332,7 @@ pub async fn move_task(
             other => ApiError::from(other),
         })?;
     Ok(Json(MoveTaskResponse {
-        task: task_response(&state.db, result.task).await?,
+        task: task_response(&state.db, &state.workspace_backend_router, result.task).await?,
         board_revision: result.board_revision,
         operation_id,
     }))
@@ -331,7 +343,9 @@ pub async fn archive_task(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
     let task = state.task_service.archive_task(id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn advance_task(
@@ -339,7 +353,9 @@ pub async fn advance_task(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
     let task = state.task_service.advance_to_next_state(id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn recover_task(
@@ -358,7 +374,9 @@ pub async fn recover_task(
             }
             _ => ApiError::from(error),
         })?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }
 
 pub async fn duplicate_task(
@@ -366,5 +384,7 @@ pub async fn duplicate_task(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
     let task = state.task_service.duplicate_task(&id).await?;
-    Ok(Json(task_response(&state.db, task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, task).await?,
+    ))
 }

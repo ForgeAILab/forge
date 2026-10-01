@@ -408,6 +408,16 @@ impl EmbeddedAgentService {
         self.tool_provider.ingest_execution_outbox(input).await
     }
 
+    pub async fn ingest_execution_outbox_entries(
+        &self,
+        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> crate::native_tools::ExecutionOutboxReport {
+        self.tool_provider
+            .ingest_execution_outbox_entries(input, entries)
+            .await
+    }
+
     /// Attach the media storage root so a Task session can capture the
     /// artifacts its run produced as authoritative evidence.
     pub fn set_media_root(&self, media_root: std::path::PathBuf) {

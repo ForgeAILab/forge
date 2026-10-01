@@ -299,6 +299,7 @@ function taskDefaults() {
     review_passed_at: null,
     archived_at: null,
     workspace: null,
+    placement: null,
     plan_progress: null,
     plan_artifact: null,
     execution_actions: [],

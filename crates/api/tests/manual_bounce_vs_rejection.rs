@@ -19,7 +19,7 @@ use services::{
 async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::clone(&event_bus));
     let api_state = AppState::new(Arc::clone(&db), Arc::clone(&event_bus), false);
 
     let manual_task_id = seed_project_repo_and_task(&db, default_states::IN_PROGRESS).await;

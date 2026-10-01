@@ -606,6 +606,7 @@ fn task_response(
         review_passed_at: None,
         archived_at: None,
         workspace: None,
+        placement: None,
         plan_progress: None,
         plan_artifact: None,
         external_issue_number: None,

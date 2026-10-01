@@ -12,20 +12,52 @@ use tracing::{info, warn};
 use crate::{
     lifecycle::{LifecycleHookContext, LifecycleHookRunner, PluginRegistry},
     workflow::engine::WorkflowEngine,
+    workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
 };
 
 #[derive(Clone)]
 pub struct LifecycleEventEmitter {
     db: Arc<db::SqliteDb>,
     plugin_registry: Arc<PluginRegistry>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
 impl LifecycleEventEmitter {
-    pub fn new(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+    pub fn new_with_router(
+        db: Arc<db::SqliteDb>,
+        plugin_registry: Arc<PluginRegistry>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         Self {
             db,
             plugin_registry,
+            workspace_backend_router,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+        Self::new_for_test(db, plugin_registry)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+        let workspace_backend_router =
+            crate::lifecycle::context::embedded_workspace_router_for_test(
+                Arc::clone(&db),
+                crate::task_service::workspace::default_workspace_root(),
+                None,
+            );
+        Self {
+            db,
+            plugin_registry,
+            workspace_backend_router,
+        }
+    }
+
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self
     }
 
     /// Run the emitter until the event bus closes.
@@ -262,23 +294,52 @@ impl LifecycleEventEmitter {
                 .await
                 .unwrap_or_else(|| task.status.clone()),
         };
-        let workspace = if before_execution {
-            None
-        } else {
-            self.resolve_workspace(&task, execution.as_ref()).await
+        let workspace = self.resolve_workspace(&task, execution.as_ref()).await;
+        let resolved = match workspace.as_ref() {
+            Some(workspace) => Some(
+                crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+                    &self.workspace_backend_router,
+                    &self.db,
+                    workspace,
+                    &crate::task_service::workspace::default_workspace_root(),
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+            ),
+            None => None,
         };
-        let worktree_path = workspace
-            .as_ref()
-            .filter(|workspace| Path::new(&workspace.worktree_path).exists())
-            .map(|workspace| workspace.worktree_path.clone());
-        let repo_path = self
-            .resolve_repo_path(
-                &project,
-                execution.as_ref(),
-                workspace.as_ref(),
-                worktree_path.as_deref(),
-            )
-            .await;
+        // Before preparation, server hooks retain their primary-checkout
+        // context. An existing daemon placement remains the routing authority.
+        let resolved = resolved.filter(|workspace| {
+            !before_execution || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
+        });
+        let (repo_path, worktree_path) = match resolved.as_ref() {
+            Some(resolved) => {
+                let (repo_path, handle) =
+                    crate::lifecycle::context::workspace_context_paths(&self.db, resolved)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let exists = workspace_exists(resolved).await?;
+                if !exists && resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+                    return Err(format!(
+                        "workspace {} does not exist on its owner",
+                        resolved.placement.workspace_id
+                    ));
+                }
+                let repo_path = if exists {
+                    repo_path
+                } else {
+                    self.resolve_repo_path(&project, execution.as_ref(), workspace.as_ref(), None)
+                        .await
+                };
+                (repo_path, exists.then_some(handle))
+            }
+            None => (
+                self.resolve_repo_path(&project, execution.as_ref(), None, None)
+                    .await,
+                None,
+            ),
+        };
         let log_dir = resolve_log_dir(execution.as_ref(), resolved_execution_id.as_deref());
 
         let ctx = LifecycleHookContext {
@@ -297,7 +358,20 @@ impl LifecycleEventEmitter {
             log_dir,
         };
 
-        LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await;
+        match resolved.as_ref().filter(|_| ctx.worktree_path.is_some()) {
+            Some(resolved) => {
+                LifecycleHookRunner::run_workspace_hooks(
+                    ctx,
+                    &hooks,
+                    Arc::clone(&self.plugin_registry),
+                    resolved,
+                )
+                .await
+            }
+            None => {
+                LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await
+            }
+        }
         Ok(())
     }
 
@@ -355,9 +429,12 @@ impl LifecycleEventEmitter {
                 .ok()?;
         }
 
-        WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
-            .await
-            .ok()?
+        WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await
+        .ok()?
     }
 
     async fn resolve_repo_path(
@@ -387,6 +464,23 @@ impl LifecycleEventEmitter {
             None => worktree_path.unwrap_or_default().to_owned(),
         }
     }
+}
+
+async fn workspace_exists(workspace: &ResolvedWorkspace) -> Result<bool, String> {
+    if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
+        // Lifecycle hooks previously accepted any existing directory, even
+        // while its Git metadata was being repaired.
+        return workspace
+            .embedded_path()
+            .map(|path| path.exists())
+            .map_err(|error| error.to_string());
+    }
+    workspace
+        .backend
+        .describe(&workspace.placement)
+        .await
+        .map(|state| state.exists)
+        .map_err(|error| error.to_string())
 }
 
 async fn wait_for_shutdown(mut shutdown: Option<watch::Receiver<bool>>) {

@@ -81,6 +81,7 @@ function task(
       },
     ],
     remaining_retries: {},
+    placement: null,
     version: 1,
     created_at: '',
     updated_at: '',

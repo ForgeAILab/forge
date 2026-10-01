@@ -5,7 +5,7 @@ use db::ReviewStatus;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
-    agent_capacity::has_running_execution_capacity,
+    agent_capacity::has_execution_capacity,
     workflow::{
         dispatch::{
             build_effective_prompt, dispatch_intent_from_workflow_dispatch,
@@ -305,7 +305,7 @@ impl HookAction for DispatchRoleAgent {
                         reason: "agent paused".to_string(),
                     };
                 }
-                match has_running_execution_capacity(&ctx.db, &agent).await {
+                match has_execution_capacity(&ctx.db, &agent, ctx.workspace_id.as_deref()).await {
                     Ok(true) => {}
                     Ok(false) => {
                         return HookResult::Skipped {
@@ -426,6 +426,8 @@ impl HookAction for DispatchRoleAgent {
 
                 let service = ctx.task_service.clone();
 
+                let service = service
+                    .with_workspace_backend_router(Arc::clone(&ctx.workspace_backend_router));
                 let dispatch_result = match reviewer_admission {
                     Some(admission) => {
                         service

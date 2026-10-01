@@ -352,9 +352,38 @@ async fn handle_daemon_text_frame(
         }
     }
 
-    state
-        .daemon_connections
-        .dispatch_incoming_for_connection(daemon_id, connection_id, frame)
+    let is_handshake = matches!(
+        &frame,
+        DaemonFrame::Notification { method, .. } if method == api_types::METHOD_DAEMON_HANDSHAKE
+    );
+    let accepted =
+        state
+            .daemon_connections
+            .dispatch_incoming_for_connection(daemon_id, connection_id, frame);
+    if accepted
+        && is_handshake
+        && state
+            .daemon_connections
+            .get(daemon_id)
+            .is_some_and(|connection| {
+                connection.id() == connection_id
+                    && !connection.is_stale()
+                    && connection.protocol_compatible()
+            })
+    {
+        let repo_location_service = std::sync::Arc::clone(&state.repo_location_service);
+        let daemon_id = daemon_id.to_owned();
+        // Verification responses are received by this socket reader.
+        tokio::spawn(async move {
+            if let Err(error) = repo_location_service
+                .retry_verification_on_reconnect(&daemon_id)
+                .await
+            {
+                tracing::warn!(%daemon_id, %error, "failed to retry repository location verification");
+            }
+        });
+    }
+    accepted
 }
 
 async fn send_invalid_frame(

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -9,15 +9,14 @@ use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::Result;
 use api_types::{
     DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalAckParams,
-    ExecutionTerminalAckResult, ExecutionTerminalNotification, FsBranchesParams, FsListParams,
-    RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt, RemoteUsageReport,
-    UsageTelemetryState, DAEMON_CAPABILITY_TERMINAL_ACK, DAEMON_CAPABILITY_USAGE_REPORTS,
-    DAEMON_PROTOCOL_REVISION, INVALID_FRAME, METHOD_DAEMON_HANDSHAKE, METHOD_EXECUTION_CANCEL,
-    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL,
-    METHOD_EXECUTION_TERMINAL_ACK, METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT,
-    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE,
-    TERMINAL_REPORT_CONFLICT, UNSUPPORTED_METHOD,
+    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
+    FsListParams, JournalAckParams, JournalAckResult, RemoteExecutionFailureClass,
+    RemoteResolvedCandidate, RemoteRouteAttempt, RemoteUsageReport, UsageTelemetryState,
+    DAEMON_CAPABILITY_JOURNAL_ACK, DAEMON_CAPABILITY_USAGE_REPORTS, DAEMON_PROTOCOL_REVISION,
+    INVALID_FRAME, METHOD_DAEMON_HANDSHAKE, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
+    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
+    METHOD_JOURNAL_ACK, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
+    METHOD_TERMINAL_TERMINATE, TERMINAL_REPORT_CONFLICT, UNSUPPORTED_METHOD,
 };
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
@@ -30,12 +29,11 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     daemon_fs,
     daemon_link::{run_dispatch_loop, run_with_reconnect, DaemonClient},
+    daemon_outbox,
+    daemon_workspace::DaemonWorkspaceBackend,
 };
 
-pub use crate::daemon_persistence::{
-    DaemonTerminalStore, MAX_TERMINAL_REPORTS, MAX_TERMINAL_REPORT_BYTES, MAX_TERMINAL_REPORT_SIZE,
-    TERMINAL_REPORT_DIRECTORY,
-};
+pub use crate::daemon_persistence::{DaemonJournal, JournalEntry, MAX_TERMINAL_REPORT_SIZE};
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
 const EXECUTION_ERROR: &str = "execution_error";
@@ -66,6 +64,19 @@ impl Default for ActiveExecutionTracker {
 }
 
 impl ActiveExecutionTracker {
+    pub fn running_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .inner
+            .lock()
+            .expect("active execution tracker lock")
+            .active
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn with_finished_linger(finished_linger: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(TrackerInner::default())),
@@ -126,24 +137,94 @@ impl Drop for ActiveExecutionGuard {
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
+#[derive(Clone)]
+struct RuntimeOutbound(Arc<Mutex<mpsc::UnboundedSender<DaemonFrame>>>);
+
+impl RuntimeOutbound {
+    fn send(
+        &self,
+        frame: DaemonFrame,
+    ) -> std::result::Result<(), mpsc::error::SendError<DaemonFrame>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).send(frame)
+    }
+}
+
+fn adapter_capability_facts(
+    registry: &executors::AdapterRegistry,
+) -> BTreeMap<String, api_types::ExecutorAdapterCapabilityFacts> {
+    use executors::{AvailabilityStatus, ExecutorKind};
+
+    let mut facts = BTreeMap::new();
+    for kind in registry.kinds() {
+        let Some(adapter) = registry.get(&kind) else {
+            continue;
+        };
+        if matches!(
+            adapter.check_availability().status,
+            AvailabilityStatus::NotFound
+        ) {
+            continue;
+        }
+        // Facts describe the installed adapter path we actually use. No
+        // capability is inferred for an absent or unknown executor.
+        facts.insert(
+            kind.to_string(),
+            api_types::ExecutorAdapterCapabilityFacts {
+                structured_events: matches!(
+                    kind,
+                    ExecutorKind::Codex
+                        | ExecutorKind::ClaudeCode
+                        | ExecutorKind::Cursor
+                        | ExecutorKind::Opencode
+                        | ExecutorKind::Gemini
+                        | ExecutorKind::Smith
+                ),
+                usage: matches!(
+                    kind,
+                    ExecutorKind::Codex | ExecutorKind::ClaudeCode | ExecutorKind::Smith
+                ),
+                resume: matches!(
+                    kind,
+                    ExecutorKind::Codex
+                        | ExecutorKind::ClaudeCode
+                        | ExecutorKind::Cursor
+                        | ExecutorKind::Opencode
+                        | ExecutorKind::Gemini
+                        | ExecutorKind::Smith
+                ),
+                cancel_ack: true,
+                terminal_observed: true,
+            },
+        );
+    }
+    facts
+}
+
 pub async fn run_command_stream(
     client: Arc<DaemonClient>,
     workspace_root: PathBuf,
     shutdown: watch::Receiver<bool>,
     active_executions: ActiveExecutionTracker,
+    run_policy: api_types::WorkspaceRunPolicy,
 ) -> Result<()> {
-    let workspace_root = Arc::new(workspace_root);
+    let (initial_tx, _initial_rx) = mpsc::unbounded_channel();
+    let daemon_id = client
+        .daemon_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("daemon credentials are missing"))?;
+    let runtime = DaemonRuntime::new_owned(
+        initial_tx,
+        workspace_root,
+        active_executions,
+        daemon_id,
+        run_policy,
+    )?;
     run_with_reconnect(client, move |stream| {
-        let workspace_root = Arc::clone(&workspace_root);
+        let runtime = Arc::clone(&runtime);
         let shutdown = shutdown.clone();
-        let active_executions = active_executions.clone();
         async move {
             let (responses_tx, responses_rx) = mpsc::unbounded_channel();
-            let runtime = DaemonRuntime::new_with_tracker(
-                responses_tx.clone(),
-                workspace_root.as_ref().clone(),
-                active_executions,
-            );
+            runtime.attach(responses_tx.clone());
             let handler = {
                 let runtime = Arc::clone(&runtime);
                 move |frame| {
@@ -159,10 +240,13 @@ pub async fn run_command_stream(
 
 pub struct DaemonRuntime {
     workspace_root: PathBuf,
-    outbound: mpsc::UnboundedSender<DaemonFrame>,
+    outbound: RuntimeOutbound,
     executor: Arc<FallbackExecutor>,
     active_executions: ActiveExecutionTracker,
-    terminal_store: Arc<DaemonTerminalStore>,
+    journal: Arc<DaemonJournal>,
+    workspace: Option<DaemonWorkspaceBackend>,
+    registry: Arc<executors::AdapterRegistry>,
+    run_policy: api_types::WorkspaceRunPolicy,
 }
 
 impl DaemonRuntime {
@@ -175,18 +259,73 @@ impl DaemonRuntime {
         workspace_root: PathBuf,
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
+        Self::build(
+            outbound,
+            workspace_root,
+            active_executions,
+            None,
+            crate::daemon_config::DaemonConfig::default().run_policy(),
+        )
+        .expect("initialize daemon journal")
+    }
+
+    pub fn new_owned(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        active_executions: ActiveExecutionTracker,
+        daemon_id: String,
+        run_policy: api_types::WorkspaceRunPolicy,
+    ) -> Result<Arc<Self>> {
+        Self::build(
+            outbound,
+            workspace_root,
+            active_executions,
+            Some(daemon_id),
+            run_policy,
+        )
+    }
+
+    fn build(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        active_executions: ActiveExecutionTracker,
+        daemon_id: Option<String>,
+        run_policy: api_types::WorkspaceRunPolicy,
+    ) -> Result<Arc<Self>> {
         let registry = Arc::new(cli_adapters::default_registry());
-        let terminal_store = Arc::new(DaemonTerminalStore::new(&workspace_root));
+        let journal = Arc::new(DaemonJournal::new(&workspace_root));
+        journal.initialize()?;
+        let workspace = daemon_id
+            .map(|id| {
+                DaemonWorkspaceBackend::new(
+                    workspace_root.clone(),
+                    id,
+                    run_policy.clone(),
+                    Arc::clone(&journal),
+                )
+            })
+            .transpose()?;
         let runtime = Arc::new(Self {
             workspace_root,
-            outbound,
-            executor: Arc::new(FallbackExecutor::new(registry)),
+            outbound: RuntimeOutbound(Arc::new(Mutex::new(outbound))),
+            executor: Arc::new(FallbackExecutor::new(Arc::clone(&registry))),
             active_executions,
-            terminal_store,
+            journal,
+            workspace,
+            registry,
+            run_policy,
         });
         runtime.announce_protocol();
-        runtime.replay_pending_terminals();
-        runtime
+        runtime.replay_pending_journal();
+        Ok(runtime)
+    }
+
+    /// Keep the executor, handle registry and write locks alive across sockets.
+    /// In-flight completions send through the current socket, or remain retained.
+    pub fn attach(&self, outbound: mpsc::UnboundedSender<DaemonFrame>) {
+        *self.outbound.0.lock().unwrap_or_else(|p| p.into_inner()) = outbound;
+        self.announce_protocol();
+        self.replay_pending_journal();
     }
 
     pub fn active_execution_ids(&self) -> Vec<String> {
@@ -197,33 +336,38 @@ impl DaemonRuntime {
     /// stream reconnects. Keeping this accessor public gives the daemon host a
     /// narrow inspection point for diagnostics without exposing raw payload
     /// files or credentials.
-    pub fn terminal_store(&self) -> &DaemonTerminalStore {
-        &self.terminal_store
+    pub fn journal(&self) -> &DaemonJournal {
+        &self.journal
     }
 
     fn announce_protocol(&self) {
+        let mut capabilities = vec![
+            DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
+            DAEMON_CAPABILITY_JOURNAL_ACK.to_owned(),
+        ];
+        if self.workspace.is_some() {
+            capabilities.push(api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned());
+        }
         let handshake = api_types::DaemonHandshakeNotification {
             protocol_revision: DAEMON_PROTOCOL_REVISION,
-            capabilities: vec![
-                DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
-                DAEMON_CAPABILITY_TERMINAL_ACK.to_owned(),
-            ],
+            capabilities,
+            executor_capabilities: adapter_capability_facts(&self.registry),
+            workspace_run_policy: self.run_policy.clone(),
         };
         emit_notification(&self.outbound, METHOD_DAEMON_HANDSHAKE, handshake);
     }
 
-    fn replay_pending_terminals(&self) {
-        match self.terminal_store.pending() {
-            Ok(notifications) => {
-                for notification in notifications {
-                    emit_notification(&self.outbound, METHOD_EXECUTION_TERMINAL, notification);
+    fn replay_pending_journal(&self) {
+        match self.journal.pending() {
+            Ok(entries) => {
+                for entry in entries {
+                    if let Some((method, params)) = entry.replay_notification() {
+                        emit_notification(&self.outbound, method, params);
+                    }
                 }
             }
             Err(error) => {
-                // A malformed or unreadable durable record must not be
-                // silently deleted. Keep the daemon connected for ordinary
-                // work, but surface the replay failure for operator recovery.
-                tracing::error!(%error, "failed to replay retained daemon terminal reports");
+                tracing::error!(%error, "failed to replay retained daemon journal entries")
             }
         }
     }
@@ -279,18 +423,42 @@ impl DaemonRuntime {
                 },
                 Err(frame) => frame,
             },
-            METHOD_EXECUTION_TERMINAL_ACK => {
-                match decode_params::<ExecutionTerminalAckParams>(&id, params) {
-                    Ok(params) => match self.acknowledge_terminal(params).await {
-                        Ok(result) => response_frame(id, result),
-                        Err(error) => DaemonFrame::Error {
-                            id: Some(id),
-                            error,
-                        },
+            METHOD_JOURNAL_ACK => match decode_params::<JournalAckParams>(&id, params) {
+                Ok(params) => match self.acknowledge_journal(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
                     },
-                    Err(frame) => frame,
-                }
-            }
+                },
+                Err(frame) => frame,
+            },
+            method if DaemonWorkspaceBackend::supports(method) => match &self.workspace {
+                Some(workspace) => match workspace
+                    .handle(method, params, || self.active_executions.running_ids())
+                    .await
+                {
+                    Ok(result) => {
+                        if method == api_types::METHOD_WORKSPACE_DESCRIBE {
+                            self.replay_pending_journal();
+                        }
+                        if method == api_types::METHOD_WORKSPACE_CLEANUP {
+                            emit_notification(&self.outbound, method, result.clone());
+                        }
+                        response_frame(id, result)
+                    }
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
+                    },
+                },
+                None => error_frame(
+                    Some(id),
+                    UNSUPPORTED_METHOD,
+                    "workspace ownership is not configured for this runtime",
+                    None,
+                ),
+            },
             METHOD_TERMINAL_START
             | METHOD_TERMINAL_INPUT
             | METHOD_TERMINAL_RESIZE
@@ -312,6 +480,12 @@ impl DaemonRuntime {
             Path::new(params.workspace_path.trim()),
             &self.workspace_root,
         )?;
+        let active_guard = self.active_executions.track(params.execution_id.clone());
+        if let Some(workspace) = &self.workspace {
+            workspace
+                .register_execution(&params.execution_id, &worktree_path)
+                .await?;
+        }
         let logs_path = local_execution_log_path(&self.workspace_root, &params.execution_id);
         let description = prompt_description(&params.prompt);
         let ctx = ExecutionContext {
@@ -329,10 +503,9 @@ impl DaemonRuntime {
         let execution_id = params.execution_id.clone();
         let executor = Arc::clone(&self.executor);
         let outbound = self.outbound.clone();
-        let active_executions = self.active_executions.clone();
-        let terminal_store = Arc::clone(&self.terminal_store);
+        let journal = Arc::clone(&self.journal);
         tokio::spawn(async move {
-            run_execution_task(executor, outbound, ctx, active_executions, terminal_store).await;
+            run_execution_task(executor, outbound, ctx, active_guard, journal).await;
         });
 
         Ok(ExecutionStartResult {
@@ -355,11 +528,11 @@ impl DaemonRuntime {
         })
     }
 
-    pub async fn acknowledge_terminal(
+    pub async fn acknowledge_journal(
         &self,
-        params: ExecutionTerminalAckParams,
-    ) -> CommandResult<ExecutionTerminalAckResult> {
-        self.terminal_store.acknowledge(&params).map_err(|error| {
+        params: JournalAckParams,
+    ) -> CommandResult<JournalAckResult> {
+        self.journal.acknowledge(&params).map_err(|error| {
             let message = error.to_string();
             let code = if message.contains(TERMINAL_REPORT_CONFLICT) {
                 TERMINAL_REPORT_CONFLICT
@@ -377,12 +550,11 @@ impl DaemonRuntime {
 
 async fn run_execution_task(
     executor: Arc<FallbackExecutor>,
-    outbound: mpsc::UnboundedSender<DaemonFrame>,
+    outbound: RuntimeOutbound,
     mut ctx: ExecutionContext,
-    active_executions: ActiveExecutionTracker,
-    terminal_store: Arc<DaemonTerminalStore>,
+    _active_guard: ActiveExecutionGuard,
+    journal: Arc<DaemonJournal>,
 ) {
-    let _active_guard = active_executions.track(ctx.execution_id.clone());
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
     ctx.log_sender = Some(log_tx);
     let log_outbound = outbound.clone();
@@ -398,6 +570,13 @@ async fn run_execution_task(
     );
 
     let execution_id = ctx.execution_id.clone();
+    let worktree_path = PathBuf::from(&ctx.worktree_path);
+    let workspace_root = journal
+        .directory()
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let mut outbox_entries = Vec::new();
     let read_only_path = executors::is_worktree_read_only(&ctx.agent_config)
         .then(|| PathBuf::from(&ctx.worktree_path));
     let read_only_head = match read_only_path.as_deref() {
@@ -411,6 +590,9 @@ async fn run_execution_task(
     let result = match read_only_head {
         Ok(read_only_head) => {
             let execution_result = executor.execute(ctx).await;
+            if let Some(root) = &workspace_root {
+                outbox_entries = daemon_outbox::harvest(&worktree_path, &execution_id, root);
+            }
             let restore_result = match (read_only_path.as_deref(), read_only_head.as_deref()) {
                 (Some(path), Some(head)) => {
                     git::restore_worktree(path, head).await.map_err(|error| {
@@ -446,7 +628,7 @@ async fn run_execution_task(
         let _ = log_forwarder.await;
     }
 
-    let notification = match result {
+    let mut notification = match result {
         Ok(result) => terminal_notification_from_result(execution_id, result),
         Err(error) => ExecutionTerminalNotification {
             terminal_report_id: terminal_report_id_for_execution(&execution_id),
@@ -460,13 +642,16 @@ async fn run_execution_task(
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
             route_attempts: None,
         },
     };
-    match terminal_store.retain(&notification) {
+    notification.outbox_entries = outbox_entries;
+    daemon_outbox::fit_report(&mut notification);
+    match journal.retain(&notification) {
         Ok(()) => emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification),
         Err(error) => tracing::error!(
             %error,
@@ -502,6 +687,7 @@ fn terminal_notification_from_result(
             .into_iter()
             .map(remote_usage_report_from_executor)
             .collect(),
+        outbox_entries: Vec::new(),
         failure_class: result.failure_class.map(|class| match class {
             ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
             ExecutionFailureClass::ExecutorUnavailable => {
@@ -580,7 +766,7 @@ fn daemon_system_log(execution_id: &str, line: &str) -> LogEntry {
     }
 }
 
-fn emit_execution_log(outbound: &mpsc::UnboundedSender<DaemonFrame>, entry: LogEntry) {
+fn emit_execution_log(outbound: &RuntimeOutbound, entry: LogEntry) {
     let line = entry
         .payload
         .get("line")
@@ -611,11 +797,7 @@ fn emit_execution_log(outbound: &mpsc::UnboundedSender<DaemonFrame>, entry: LogE
     emit_notification(outbound, METHOD_EXECUTION_LOG, notification);
 }
 
-fn emit_notification<T: Serialize>(
-    outbound: &mpsc::UnboundedSender<DaemonFrame>,
-    method: &str,
-    notification: T,
-) {
+fn emit_notification<T: Serialize>(outbound: &RuntimeOutbound, method: &str, notification: T) {
     match serde_json::to_value(notification) {
         Ok(params) => {
             let _ = outbound.send(DaemonFrame::Notification {
@@ -793,6 +975,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbox_entries_are_present_in_replayed_terminal_report() {
+        use api_types::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("primary");
+        fs::create_dir(&repo).unwrap();
+        git::init(&repo).await.unwrap();
+        fs::write(repo.join("README.md"), "base").unwrap();
+        let sha = git::commit_all(&repo, "base").await.unwrap();
+        let policy = crate::daemon_config::DaemonConfig::default().run_policy();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new_owned(
+            tx,
+            dir.path().to_owned(),
+            ActiveExecutionTracker::default(),
+            "daemon-1".into(),
+            policy.clone(),
+        )
+        .unwrap();
+        let DaemonFrame::Notification { method, params } = rx.recv().await.unwrap() else {
+            panic!("expected handshake");
+        };
+        assert_eq!(method, METHOD_DAEMON_HANDSHAKE);
+        let handshake: DaemonHandshakeNotification = serde_json::from_value(params).unwrap();
+        assert!(handshake
+            .capabilities
+            .contains(&DAEMON_CAPABILITY_WORKSPACE.to_owned()));
+        assert_eq!(handshake.workspace_run_policy, policy);
+        assert!(handshake.executor_capabilities["shell"].terminal_observed);
+        assert!(!handshake.executor_capabilities["shell"].resume);
+        let mut workspace_path = None;
+        let mut workspace_handle = None;
+        for (method, params) in [
+            (
+                METHOD_REPO_LOCATION_VERIFY,
+                serde_json::json!({"repo_location_id":"location-1", "daemon_id":"daemon-1", "runtime_id":"runtime-1", "path":repo, "kind":"primary_checkout", "default_branch":"main", "remote_url":null, "expected_version":0}),
+            ),
+            (
+                METHOD_WORKSPACE_PREPARE,
+                serde_json::json!({"daemon_id":"daemon-1", "runtime_id":"runtime-1", "placement_id":"placement-1", "operation_id":"prepare-1", "generation":1, "expected":{"kind":"base_sha", "sha":sha}, "repo_location_id":"location-1", "workspace_id":"workspace-1", "task_id":"task-1", "base_ref":"main", "branch":"task/outbox"}),
+            ),
+        ] {
+            let response = runtime
+                .handle_request(DaemonFrame::Request {
+                    id: method.into(),
+                    method: method.into(),
+                    params,
+                })
+                .await;
+            match response {
+                DaemonFrame::Response { result, .. } => {
+                    if let Some(path) = result.get("workspace_path").and_then(Value::as_str) {
+                        workspace_path = Some(path.to_owned());
+                    }
+                    if let Some(handle) = result.get("workspace_handle").and_then(Value::as_str) {
+                        workspace_handle = Some(handle.to_owned());
+                    }
+                }
+                other => panic!("workspace request failed: {other:?}"),
+            }
+        }
+        runtime.start(ExecutionStartParams {
+            task_id: "task-1".into(), execution_id: "exec-outbox".into(), workspace_path: workspace_path.unwrap(),
+            executor_type: "shell".into(), executor_config: serde_json::json!({"executor_type":"shell", "config":{}}),
+            prompt: serde_json::json!({"description": r#"mkdir -p ../.forge-outbox/exec-outbox; printf '%s\n' '{"kind":"progress","summary":"remote progress"}' > ../.forge-outbox/exec-outbox/worklog.jsonl; printf '%s\n' '{"kind":"report","caption":"remote evidence","content":"captured remotely"}' > ../.forge-outbox/exec-outbox/evidence.jsonl"#}),
+            max_turns: None,
+        }).await.unwrap();
+        let report = next_terminal_notification(&mut rx, "exec-outbox").await;
+        assert_eq!(report.outbox_entries.len(), 2);
+        assert!(
+            matches!(&report.outbox_entries[0], ExecutionOutboxEntry::Worklog { summary, .. } if summary == "remote progress")
+        );
+        drop(runtime);
+        let (tx, mut replay_rx) = mpsc::unbounded_channel();
+        let restarted = DaemonRuntime::new_owned(
+            tx,
+            dir.path().to_owned(),
+            ActiveExecutionTracker::default(),
+            "daemon-1".into(),
+            policy,
+        )
+        .unwrap();
+        let replayed = next_terminal_notification(&mut replay_rx, "exec-outbox").await;
+        assert_eq!(replayed, report);
+        let describe = restarted.handle_request(DaemonFrame::Request {
+            id: "describe-replay".to_owned(), method: METHOD_WORKSPACE_DESCRIBE.to_owned(),
+            params: serde_json::json!({"daemon_id": "daemon-1", "runtime_id": "runtime-1", "placement_id": "placement-1",
+                "workspace_handle": workspace_handle.unwrap(), "generation": 1}),
+        }).await;
+        let DaemonFrame::Response { result, .. } = describe else {
+            panic!("describe response");
+        };
+        let described: WorkspaceDescribeResult = serde_json::from_value(result).unwrap();
+        assert!(described.active_execution_ids.is_empty());
+        assert_eq!(described.journaled_execution_ids, ["exec-outbox"]);
+        assert_eq!(
+            next_terminal_notification(&mut replay_rx, "exec-outbox").await,
+            report
+        );
+        restarted
+            .acknowledge_journal(JournalAckParams {
+                entry_id: replayed.terminal_report_id,
+            })
+            .await
+            .unwrap();
+        assert!(!restarted
+            .journal()
+            .pending()
+            .unwrap()
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Terminal { .. })));
+    }
+
+    #[tokio::test]
     async fn terminal_report_is_retained_until_acknowledged() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -816,18 +1112,18 @@ mod tests {
             .expect("execution starts");
 
         let notification = next_terminal_notification(&mut rx, &execution_id).await;
+        let retained = runtime.journal().pending().expect("pending reports");
         assert_eq!(
-            runtime.terminal_store().pending().expect("pending reports"),
-            vec![notification.clone()]
+            retained[0].replay_notification().unwrap().1,
+            serde_json::to_value(&notification).unwrap()
         );
 
         let response = runtime
             .handle_request(DaemonFrame::Request {
                 id: "terminal-ack-1".to_owned(),
-                method: METHOD_EXECUTION_TERMINAL_ACK.to_owned(),
-                params: serde_json::to_value(ExecutionTerminalAckParams {
-                    terminal_report_id: notification.terminal_report_id.clone(),
-                    execution_id: notification.execution_id.clone(),
+                method: METHOD_JOURNAL_ACK.to_owned(),
+                params: serde_json::to_value(JournalAckParams {
+                    entry_id: notification.terminal_report_id.clone(),
                 })
                 .expect("ack params serialize"),
             })
@@ -835,11 +1131,10 @@ mod tests {
         let DaemonFrame::Response { result, .. } = response else {
             panic!("expected ack response");
         };
-        let result: ExecutionTerminalAckResult =
-            serde_json::from_value(result).expect("ack result parses");
+        let result: JournalAckResult = serde_json::from_value(result).expect("ack result parses");
         assert!(result.acknowledged);
         assert!(runtime
-            .terminal_store()
+            .journal()
             .pending()
             .expect("empty reports")
             .is_empty());

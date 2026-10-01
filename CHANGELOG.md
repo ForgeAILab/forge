@@ -6,7 +6,62 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Unpinned CLI Agents now run on the owner selected by their persisted workspace
+  placement. Claim returns structured `placement_unavailable` rejection reasons
+  when no compatible owner exists, instead of silently using embedded execution.
+  Daemon-owned workspaces require direct-merge repositories and CLI Agents for
+  every assigned worktree role. See [workspace placement](docs/architecture.md#workspace-placement).
+- Daemon protocol revision 3 adds `workspace.v1` for daemon-owned workspaces.
+  Revision 2 daemons remain connected for server-owned execution and filesystem
+  browsing, but report `workspace_incapable` and cannot own workspaces.
+  `journal.ack { entry_id }` replaces `execution.terminal.ack` for revision 3
+  daemons; revision 2 connections retain their existing acknowledgement shape.
+- Executor snapshots replace `resolved_daemon_id` with `placement_id`. Task and
+  Workspace responses gain a `placement` object identifying the owner and state.
+- Agents pinned to remote daemons need a verified `shared_mount` repository
+  location to execute in server-owned workspaces. Matching absolute paths alone
+  no longer qualify; the server's embedded daemon remains an in-process provider.
+- Claim now reserves capacity and prepares the workspace before creating the
+  Task claim, Running Execution, or lease. Failed preparation creates no
+  Execution and consumes no Task retry budget. Agent and daemon capacity counts
+  include `reserved`/`preparing` placements; daemon counts include unpinned
+  executions routed there through placement.
+- Daemons read local `daemon.yaml` policy (`workspace.run.allow`, default
+  `[ci_step]`); hooks and environment setup require opt-in. The terminal store
+  moves automatically into `<workspace-root>/.forge/journal/` on startup,
+  preserving pending reports. See [daemon configuration and migration](docs/getting-started.md#daemon-run-policy).
+
+### Added
+
+- Daemon-owned placements freeze running leases while their owner is offline.
+  `workspace.max_disconnect_seconds` (`FORGE_MAX_DISCONNECT_SECONDS`, default
+  86400) bounds that wait; expiry records `owner_disconnected_timeout` without
+  consuming the Task retry budget.
+
 ### Fixed
+
+- Managed Codex no longer fails to start when a package cache directory (for
+  example a relocated `~/.npm`) is a symlink; writable roots are resolved
+  before they are passed to the Codex sandbox.
+- Shell Agents re-dispatched by the workflow (re-execute, rework after review)
+  now run the Task's command again instead of executing the LLM role prompt as
+  a shell script.
+- Workspace reconciliation that is waiting on an operator `reset_to_initial`
+  no longer logs a warning every recovery tick.
+- Remote workspace executions now suspend on heartbeat-lease expiry before
+  socket-disconnect detection, preserving work committed during a daemon freeze.
+  Reconnect accepts the journaled terminal result once without requiring a reset;
+  embedded execution keeps its existing lease-expiry behavior.
+- Daemon workspace reads allow sibling plan and outbox artifacts within the
+  handle's workspace directory while rejecting escapes and journal access.
+  Missing plans preserve the server placement's no-plan review-gate behavior.
+- Repository location verification accepts equivalent local-path/file URL and
+  SSH/HTTP remotes on both server and daemon owners.
+- Execution start and cancel now follow the persisted workspace placement.
+  Unpinned CLI Agents dispatch to their selected owner, matching the execution
+  ledger.
 
 - Failed CI checks on non-user review entry now return the Task to its
   configured remediation state through the normal review retry budget, or

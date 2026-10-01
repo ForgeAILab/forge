@@ -736,20 +736,29 @@ impl CoordinationToolProvider {
         // the stored artifact ambiguous about what was actually observed.
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
-                let root = self.task_workspace_root(&task_id).await?;
+                let workspace = self.task_workspace(&task_id).await?;
+                let root = workspace
+                    .embedded_path()
+                    .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
                 let resolved = resolve_workspace_artifact(&root, path)?;
-                let bytes = read_bounded_regular_file(
-                    &resolved,
-                    &root,
-                    MAX_CAPTURED_EVIDENCE_BYTES as u64,
-                    false,
-                )
-                .map_err(|error| {
-                    AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
-                })?
-                .ok_or_else(|| {
-                    AgentHostError::Runtime("captured artifact does not exist".to_owned())
-                })?;
+                let relative = resolved
+                    .strip_prefix(root.canonicalize().map_err(|error| {
+                        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+                    })?)
+                    .map_err(|error| AgentHostError::Authority(error.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = workspace
+                    .backend
+                    .read(
+                        &workspace.placement,
+                        &relative,
+                        MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                    })?;
                 let name = resolved
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -1143,8 +1152,14 @@ impl CoordinationToolProvider {
         {
             let result = match entry {
                 Ok(entry) => {
-                    self.ingest_outbox_evidence(input, &author_name, &outbox, &position, &entry)
-                        .await
+                    self.ingest_local_outbox_evidence(
+                        input,
+                        &author_name,
+                        &outbox,
+                        &position,
+                        &entry,
+                    )
+                    .await
                 }
                 Err(reason) => Err(reason),
             };
@@ -1221,7 +1236,7 @@ impl CoordinationToolProvider {
             .await
     }
 
-    async fn ingest_outbox_evidence(
+    async fn ingest_local_outbox_evidence(
         &self,
         input: &ExecutionOutboxInput<'_>,
         author_name: &str,
@@ -1306,6 +1321,210 @@ impl CoordinationToolProvider {
         .await
     }
 
+    /// Apply owner-harvested entries without opening any owner-local paths.
+    pub async fn ingest_execution_outbox_entries(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> ExecutionOutboxReport {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxWorklogKind};
+        let mut report = ExecutionOutboxReport::default();
+        let author_name = input.role.unwrap_or("agent");
+        let mut worklog_count = 0;
+        let mut evidence_count = 0;
+        let mut evidence_bytes = 0_u64;
+        for entry in entries {
+            let (file, line_no, result) = match entry {
+                ExecutionOutboxEntry::Worklog {
+                    position,
+                    kind,
+                    summary,
+                } => {
+                    worklog_count += 1;
+                    let kind = match kind {
+                        ExecutionOutboxWorklogKind::Progress => "progress",
+                        ExecutionOutboxWorklogKind::Decision => "decision",
+                        ExecutionOutboxWorklogKind::Validation => "validation",
+                        ExecutionOutboxWorklogKind::Blocker => "blocker",
+                    };
+                    let result = if worklog_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND
+                    {
+                        Err("execution outbox has too many worklog entries".to_owned())
+                    } else if position.is_empty() {
+                        Err("line number must be positive".to_owned())
+                    } else if summary.trim().is_empty() {
+                        Err("summary is required".to_owned())
+                    } else if summary.trim().chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
+                        Err(format!("summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"))
+                    } else {
+                        self.append_outbox_worklog(
+                            input,
+                            author_name,
+                            kind,
+                            summary.trim(),
+                            format!("outbox:{}:worklog:{position}", input.execution_id),
+                        )
+                        .await
+                    };
+                    if result.is_ok() {
+                        report.worklog_entries += 1;
+                    }
+                    (executors::OUTBOX_WORKLOG_FILE, position, result)
+                }
+                ExecutionOutboxEntry::Evidence {
+                    position,
+                    kind,
+                    caption,
+                    path,
+                    content,
+                    artifact,
+                } => {
+                    evidence_count += 1;
+                    let size = artifact
+                        .as_ref()
+                        .map(|artifact| artifact.bytes.len())
+                        .or_else(|| content.as_ref().map(String::len))
+                        .unwrap_or(0) as u64;
+                    evidence_bytes = evidence_bytes.saturating_add(size);
+                    let result =
+                        if evidence_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND {
+                            Err("execution outbox has too many evidence entries".to_owned())
+                        } else if evidence_bytes > api_types::MAX_EXECUTION_OUTBOX_EVIDENCE_BYTES {
+                            Err("execution outbox evidence exceeds size budget".to_owned())
+                        } else {
+                            self.ingest_outbox_evidence(
+                                input,
+                                author_name,
+                                ExecutionOutboxEntry::Evidence {
+                                    position: position.clone(),
+                                    kind,
+                                    caption,
+                                    path,
+                                    content,
+                                    artifact,
+                                },
+                            )
+                            .await
+                        };
+                    if result.is_ok() {
+                        report.evidence_items += 1;
+                    }
+                    (executors::OUTBOX_EVIDENCE_FILE, position, result)
+                }
+            };
+            if let Err(reason) = result {
+                report.rejected.push(format!("{file}:{line_no}: {reason}"));
+            }
+        }
+        report
+    }
+
+    async fn ingest_outbox_evidence(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        author_name: &str,
+        entry: api_types::ExecutionOutboxEntry,
+    ) -> Result<(), String> {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxEvidenceKind};
+        let ExecutionOutboxEntry::Evidence {
+            position: line_no,
+            kind,
+            caption,
+            path,
+            content,
+            artifact,
+        } = entry
+        else {
+            return Err("expected an evidence entry".to_owned());
+        };
+        let kind = match kind {
+            ExecutionOutboxEvidenceKind::Screenshot => "screenshot",
+            ExecutionOutboxEvidenceKind::WalkthroughVideo => "walkthrough_video",
+            ExecutionOutboxEvidenceKind::Log => "log",
+            ExecutionOutboxEvidenceKind::Report => "report",
+            ExecutionOutboxEvidenceKind::Other => "other",
+        };
+        if line_no.is_empty() {
+            return Err("line number must be positive".to_owned());
+        }
+        let caption = caption.trim();
+        if caption.is_empty() {
+            return Err("caption describing the artifact is required".to_owned());
+        }
+        let path = path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content = content.as_deref().filter(|value| !value.trim().is_empty());
+        let (bytes, filename, content_type) = match (path, content, artifact) {
+            (Some(_), None, Some(artifact)) => {
+                if artifact.filename.is_empty()
+                    || artifact.filename.contains('/')
+                    || artifact.filename.contains('\\')
+                {
+                    return Err("captured artifact filename is invalid".to_owned());
+                }
+                (artifact.bytes, artifact.filename, artifact.content_type)
+            }
+            (None, Some(content), None) => (
+                content.as_bytes().to_vec(),
+                format!("{kind}.txt"),
+                "text/plain".to_owned(),
+            ),
+            (Some(_), Some(_), _) => {
+                return Err("supply either path or content, not both".to_owned())
+            }
+            (Some(_), None, None) => {
+                return Err("owner did not supply captured artifact bytes".to_owned())
+            }
+            _ => {
+                return Err(
+                    "evidence requires either a path with captured bytes or inline content"
+                        .to_owned(),
+                )
+            }
+        };
+        if bytes.is_empty() {
+            return Err("captured artifact is empty".to_owned());
+        }
+        if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(format!(
+                "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
+            ));
+        }
+        let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
+        let already_ingested = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task_comment WHERE task_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(input.task_id)
+        .bind(&idempotency_key)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+        if already_ingested {
+            return Ok(());
+        }
+        self.store_task_evidence_with_id(
+            input.agent_id,
+            input.task_id,
+            &filename,
+            content_type,
+            &bytes,
+            outbox_evidence_media_id(input.execution_id, &line_no),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        self.append_outbox_worklog(
+            input,
+            author_name,
+            "validation",
+            &format!("Captured {kind} evidence `{filename}`: {caption}"),
+            idempotency_key,
+        )
+        .await
+    }
+
     async fn outbox_worklog_receipt_exists(
         &self,
         task_id: &str,
@@ -1368,23 +1587,29 @@ impl CoordinationToolProvider {
         }
     }
 
-    async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT worktree_path FROM workspace
-             WHERE task_id = ? AND status != 'cleaned'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(task_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        path.filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
+    async fn task_workspace(
+        &self,
+        task_id: &str,
+    ) -> Result<crate::workspace_backend::ResolvedWorkspace, AgentHostError> {
+        let workspace = db::WorkspaceRepo::get_by_task_id(&*self.db, task_id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+            .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
             .ok_or_else(|| {
                 AgentHostError::Runtime(
                     "this Task has no active workspace to capture an artifact from".to_owned(),
                 )
-            })
+            })?;
+        let router = self
+            .task_service_handle()
+            .map(|service| service.workspace_backend_router())
+            .ok_or_else(|| {
+                AgentHostError::Runtime("workspace router is not configured".to_owned())
+            })?;
+        router
+            .resolve(&self.db, &workspace)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))
     }
 
     /// The Project Agent's own verification workspace root (`forge/` plus the
@@ -4951,6 +5176,86 @@ pub struct ExecutionOutboxReport {
     pub(crate) plan_rejected: bool,
 }
 
+const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
+
+/// A worklog entry is a summary the next role reads, not a transcript.
+const MAX_WORKLOG_SUMMARY_CHARS: usize = 4_000;
+
+/// Inline only what an Agent can read and act on; anything larger is named
+/// rather than pasted into a turn.
+const MAX_INLINE_ARTIFACT_BYTES: i64 = 256 * 1024;
+const MAX_INLINE_ARTIFACT_CHARS: usize = 8_000;
+
+/// Resolve a caller-supplied artifact path inside the Task workspace.
+/// Traversal, absolute paths, and symlinked escapes are all rejected: the
+/// capture surface must never read a file the Task session could not read.
+fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, AgentHostError> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return Err(AgentHostError::Authority(
+            "captured artifact path must be workspace-relative".to_owned(),
+        ));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(AgentHostError::Authority(
+            "captured artifact path escapes the Task workspace".to_owned(),
+        ));
+    }
+    let joined = root.join(candidate);
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| {
+        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+    })?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(AgentHostError::Authority(
+            "Task workspace must be a real directory".to_owned(),
+        ));
+    }
+    let leaf_metadata = fs::symlink_metadata(&joined).map_err(|error| {
+        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
+    })?;
+    if !leaf_metadata.file_type().is_file() {
+        return Err(AgentHostError::Authority(
+            "captured artifact must be a regular file, not a symlink".to_owned(),
+        ));
+    }
+    let canonical_root = root.canonicalize().map_err(|error| {
+        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+    })?;
+    let canonical = joined.canonicalize().map_err(|error| {
+        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(AgentHostError::Authority(
+            "captured artifact path escapes the Task workspace".to_owned(),
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(AgentHostError::Runtime(
+            "captured artifact is not a file".to_owned(),
+        ));
+    }
+    Ok(joined)
+}
+
+/// Build the on-disk destination for a storage key without letting the key
+/// itself walk out of the media root.
+fn safe_media_destination(root: &Path, storage_key: &str) -> Result<PathBuf, AgentHostError> {
+    let candidate = Path::new(storage_key);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(AgentHostError::Authority(
+            "media storage key is invalid".to_owned(),
+        ));
+    }
+    Ok(root.join(candidate))
+}
+
 /// At most this many bytes of one outbox file are read.
 const MAX_OUTBOX_FILE_BYTES: u64 = 1024 * 1024;
 /// At most this many entries of one outbox file are ingested.
@@ -5161,86 +5466,6 @@ fn same_open_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.file_type() == right.file_type()
         && left.len() == right.len()
         && left.modified().ok() == right.modified().ok()
-}
-
-const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
-
-/// A worklog entry is a summary the next role reads, not a transcript.
-const MAX_WORKLOG_SUMMARY_CHARS: usize = 4_000;
-
-/// Inline only what an Agent can read and act on; anything larger is named
-/// rather than pasted into a turn.
-const MAX_INLINE_ARTIFACT_BYTES: i64 = 256 * 1024;
-const MAX_INLINE_ARTIFACT_CHARS: usize = 8_000;
-
-/// Resolve a caller-supplied artifact path inside the Task workspace.
-/// Traversal, absolute paths, and symlinked escapes are all rejected: the
-/// capture surface must never read a file the Task session could not read.
-fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, AgentHostError> {
-    let candidate = Path::new(relative);
-    if candidate.is_absolute() {
-        return Err(AgentHostError::Authority(
-            "captured artifact path must be workspace-relative".to_owned(),
-        ));
-    }
-    if candidate
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(AgentHostError::Authority(
-            "captured artifact path escapes the Task workspace".to_owned(),
-        ));
-    }
-    let joined = root.join(candidate);
-    let root_metadata = fs::symlink_metadata(root).map_err(|error| {
-        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
-    })?;
-    if !root_metadata.file_type().is_dir() {
-        return Err(AgentHostError::Authority(
-            "Task workspace must be a real directory".to_owned(),
-        ));
-    }
-    let leaf_metadata = fs::symlink_metadata(&joined).map_err(|error| {
-        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
-    })?;
-    if !leaf_metadata.file_type().is_file() {
-        return Err(AgentHostError::Authority(
-            "captured artifact must be a regular file, not a symlink".to_owned(),
-        ));
-    }
-    let canonical_root = root.canonicalize().map_err(|error| {
-        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
-    })?;
-    let canonical = joined.canonicalize().map_err(|error| {
-        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
-    })?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(AgentHostError::Authority(
-            "captured artifact path escapes the Task workspace".to_owned(),
-        ));
-    }
-    if !canonical.is_file() {
-        return Err(AgentHostError::Runtime(
-            "captured artifact is not a file".to_owned(),
-        ));
-    }
-    Ok(joined)
-}
-
-/// Build the on-disk destination for a storage key without letting the key
-/// itself walk out of the media root.
-fn safe_media_destination(root: &Path, storage_key: &str) -> Result<PathBuf, AgentHostError> {
-    let candidate = Path::new(storage_key);
-    if candidate.is_absolute()
-        || candidate
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(AgentHostError::Authority(
-            "media storage key is invalid".to_owned(),
-        ));
-    }
-    Ok(root.join(candidate))
 }
 
 fn content_type_for(filename: &str, kind: &str) -> String {
@@ -5969,10 +6194,10 @@ mod tests {
         let (first, replay) = tokio::join!(
             fixture
                 .provider
-                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+                .ingest_local_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
             fixture
                 .provider
-                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+                .ingest_local_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
         );
         first.expect("first evidence capture succeeds");
         replay.expect("concurrent evidence replay succeeds");

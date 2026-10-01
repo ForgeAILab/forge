@@ -16,6 +16,15 @@ use super::common::{
     update_review_status_with_authority_checks, workspace_id,
 };
 
+pub(super) async fn resolve_workspace(
+    ctx: &HookContext,
+    workspace: &db::Workspace,
+) -> crate::workspace_backend::Result<crate::workspace_backend::ResolvedWorkspace> {
+    ctx.workspace_backend_router
+        .resolve(&ctx.db, workspace)
+        .await
+}
+
 pub struct RunCiSteps;
 
 #[async_trait]
@@ -68,6 +77,7 @@ impl HookAction for RunCiSteps {
             &task,
             &task.id,
             ctx.repo_cache_locks.clone(),
+            &ctx.workspace_backend_router,
         )
         .await
         {
@@ -108,10 +118,16 @@ impl HookAction for RunCiSteps {
                 return HookResult::Failed { reason };
             }
         };
+        let resolved = match resolve_workspace(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let reason = error.to_string();
+                cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                return HookResult::Failed { reason };
+            }
+        };
         let (ci_results, failed_step_index) =
-            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps, &environment.env)
-                .await
-            {
+            match run_ci_steps_in_worktree(&resolved, &ci_steps, &environment.env).await {
                 Ok(result) => result,
                 Err(reason) => {
                     cancel_review_after_authority_loss(ctx, &review, &reason).await;

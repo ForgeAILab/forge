@@ -5,7 +5,7 @@ use api_types::{
     ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
     ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
     TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
-    UsageAggregate, WorkspaceResponse,
+    UsageAggregate, WorkspacePlacementResponse, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
-    plan_artifact::{read_plan_for_workspace, PlanArtifactError},
+    plan_artifact::{read_plan_with_router, PlanArtifactError},
     task_diagnostics::{
         compare_running_execution_authority, count_gate_rejections_since_boundary,
         derive_workflow_exception_with_running_interactive, derive_workflow_health,
@@ -69,6 +69,7 @@ pub mod projects;
 pub mod provider_authorizations;
 pub mod providers;
 pub mod reconciliations;
+pub mod repo_locations;
 pub mod repos;
 pub mod reviews;
 pub mod scoped_memory;
@@ -233,19 +234,25 @@ fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
     }
 }
 
-pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    Ok(task_response_and_workflow(db, task).await?.0)
+pub async fn task_response(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    task: Task,
+) -> ApiResult<TaskResponse> {
+    Ok(task_response_and_workflow(db, router, task).await?.0)
 }
 
 pub async fn task_response_and_workflow(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
 ) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
-    task_response_and_workflow_with_awaiting_human(db, task, false).await
+    task_response_and_workflow_with_awaiting_human(db, router, task, false).await
 }
 
 pub async fn task_response_and_workflow_with_awaiting_human(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
@@ -253,6 +260,7 @@ pub async fn task_response_and_workflow_with_awaiting_human(
     let workflow = task_workflow_for_response(db, &task).await?;
     let response = task_response_inner(
         db,
+        router,
         task,
         true,
         awaiting_human,
@@ -264,11 +272,16 @@ pub async fn task_response_and_workflow_with_awaiting_human(
     Ok((response, workflow))
 }
 
-pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
+pub async fn task_response_light(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    task: Task,
+) -> ApiResult<TaskResponse> {
     let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
     let workflow = task_workflow_for_response(db, &task).await?;
     task_response_inner(
         db,
+        router,
         task,
         false,
         false,
@@ -281,11 +294,12 @@ pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<Tas
 
 pub async fn task_response_with_awaiting_human(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<TaskResponse> {
     Ok(
-        task_response_and_workflow_with_awaiting_human(db, task, awaiting_human)
+        task_response_and_workflow_with_awaiting_human(db, router, task, awaiting_human)
             .await?
             .0,
     )
@@ -315,8 +329,10 @@ async fn latest_diagnostic_rows(
     Ok((reviews.pop(), executions.pop()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_response_inner(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     include_actions: bool,
     awaiting_human: bool,
@@ -344,16 +360,21 @@ async fn task_response_inner(
     } else {
         Vec::new()
     };
-    let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
+    let workspace_model =
+        WorkspaceRepo::get_by_task_id(db, task.parent_task_id.as_deref().unwrap_or(&task.id))
+            .await?;
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
-            Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
+            Some(workspace) => plan_artifact_response(db, router, &workspace.id).await?,
             None => (None, None),
         }
     } else {
         (None, None)
     };
-    let workspace = workspace_model.map(workspace_response);
+    let workspace = match workspace_model {
+        Some(workspace) => Some(workspace_response(db, router, workspace).await?),
+        None => None,
+    };
     let current_role = workflow
         .states
         .iter()
@@ -427,6 +448,9 @@ async fn task_response_inner(
         task_state_config: task.task_state_config.map(parse_json_value),
         review_passed_at: task.review_passed_at,
         archived_at: task.archived_at,
+        placement: workspace
+            .as_ref()
+            .map(|workspace| workspace.placement.clone()),
         workspace,
         plan_progress,
         plan_artifact,
@@ -970,19 +994,69 @@ pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
     }
 }
 
-pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
-    WorkspaceResponse {
+pub async fn workspace_response(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    workspace: Workspace,
+) -> ApiResult<WorkspaceResponse> {
+    let placement = match db::WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await?
+    {
+        Some(placement) => placement,
+        None => {
+            router
+                .resolve(db, &workspace)
+                .await
+                .map_err(services::ServiceError::from)?
+                .placement
+        }
+    };
+    let worktree_path = if placement.owner_kind == db::PlacementOwnerKind::Server {
+        placement.workspace_handle.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let placement = workspace_placement_response(placement)?;
+    Ok(WorkspaceResponse {
         id: workspace.id,
         task_id: workspace.task_id,
         repo_id: workspace.repo_id,
-        worktree_path: workspace.worktree_path,
+        worktree_path,
+        placement,
         branch: workspace.branch,
         status: workspace.status.to_string(),
         before_sha: workspace.before_sha,
         error: workspace.error,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
-    }
+    })
+}
+
+pub fn workspace_placement_response(
+    placement: db::WorkspacePlacement,
+) -> ApiResult<WorkspacePlacementResponse> {
+    Ok(WorkspacePlacementResponse {
+        id: placement.id,
+        workspace_id: placement.workspace_id,
+        task_id: placement.task_id,
+        agent_id: placement.agent_id,
+        owner_kind: placement.owner_kind.to_string(),
+        daemon_id: placement.daemon_id,
+        runtime_id: placement.runtime_id,
+        repo_location_id: placement.repo_location_id,
+        execution_daemon_id: placement.execution_daemon_id,
+        workspace_handle: placement.workspace_handle,
+        generation: placement.generation,
+        state: placement.state.to_string(),
+        selected_by: placement.selected_by.to_string(),
+        selection_reason: serde_json::from_str(&placement.selection_reason)
+            .map_err(|_| ApiError::internal("invalid workspace placement selection reason"))?,
+        reserved_until: placement.reserved_until,
+        disconnected_at: placement.disconnected_at,
+        failure_cause: placement.failure_cause.map(|cause| cause.to_string()),
+        version: placement.version,
+        created_at: placement.created_at,
+        updated_at: placement.updated_at,
+    })
 }
 
 pub fn execution_response(execution: Execution) -> ExecutionResponse {
@@ -1200,12 +1274,14 @@ fn execution_status_code(value: &db::ExecutionStatus) -> &'static str {
 
 pub async fn execution_response_with_plan(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
     let workspace_id = execution.workspace_id.clone();
     let mut response = execution_response_with_usage(db, execution).await?;
     if let Some(workspace_id) = workspace_id {
-        let (plan_progress, plan_artifact) = plan_artifact_response(db, &workspace_id).await?;
+        let (plan_progress, plan_artifact) =
+            plan_artifact_response(db, router, &workspace_id).await?;
         response.plan_progress = plan_progress;
         response.plan_artifact = plan_artifact;
     }
@@ -1229,12 +1305,13 @@ pub async fn execution_response_with_usage(
 
 async fn plan_artifact_response(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     workspace_id: &str,
 ) -> ApiResult<(
     Option<api_types::PlanProgressSummary>,
     Option<api_types::PlanArtifactDetail>,
 )> {
-    match read_plan_for_workspace(db, workspace_id).await {
+    match read_plan_with_router(db, router, workspace_id).await {
         Ok(Some((progress, artifact))) => Ok((Some(progress), Some(artifact))),
         Ok(None) | Err(PlanArtifactError::WorkspaceNotFound { .. }) => Ok((None, None)),
         Err(PlanArtifactError::DbError(error)) => Err(ApiError::from(error)),

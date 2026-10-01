@@ -108,15 +108,11 @@ impl TaskService {
         }
         self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
+        let workspace_admission = self
+            .reserve_claim_workspace(&task, Some(&agent), role)
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         let executor_config_snapshot_json = with_dispatch_metadata(
             build_executor_config_snapshot(&self.db, &task, &agent, None).await?,
             dispatch_metadata,
@@ -149,8 +145,9 @@ impl TaskService {
         let execution = self
             .create_running_execution_with_admission(
                 create_input,
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -243,15 +240,15 @@ impl TaskService {
             project.version,
         )
         .await?;
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
+        let workspace_admission = self
+            .reserve_claim_workspace(
                 &task,
-                &task_id,
-                self.repo_cache_locks.clone(),
+                Some(&agent),
+                crate::workflow::default_roles::INTERACTIVE,
             )
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         self.run_blocking_before_work_preflight(&task, &project, &workspace, Some(&agent_id), None)
             .await?;
         let executor_config_snapshot_json =
@@ -283,8 +280,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -517,15 +515,11 @@ impl TaskService {
         } else {
             parent_execution_id.clone()
         };
-        let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
+        let workspace_admission = self
+            .reserve_claim_workspace(&task, Some(&agent), &follow_up_role)
             .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = workspace_admission.workspace.clone();
         let mut executor_config_snapshot_json =
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
         if let (Some(snapshot_json), Some(parent_snapshot_json)) = (
@@ -572,8 +566,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await?;
 
@@ -800,30 +795,29 @@ impl TaskService {
                 return Err(error);
             }
         };
-        let (workspace, workspace_created_by_attempt) =
-            match super::super::workspace::prepare_workspace_owned(
-                &self.db,
-                &self.workspace_root,
-                &task,
-                &task.id,
-                self.repo_cache_locks.clone(),
-            )
-            .await
-            {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    if let Some(original) = original_recovery_task.as_ref() {
-                        self.restore_recovery_metadata_after_failed_resume(
-                            &task,
-                            original,
-                            None,
-                            &parent_execution.role,
-                        )
-                        .await;
-                    }
-                    return Err(error);
+        let workspace_admission = match async {
+            let admission = self
+                .reserve_claim_workspace(&task, Some(&agent), &parent_execution.role)
+                .await?;
+            self.prepare_claim_workspace(admission).await
+        }
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
                 }
-            };
+                return Err(error);
+            }
+        };
+        let workspace = workspace_admission.workspace.clone();
         let executor_config_snapshot_json =
             match build_executor_config_snapshot(&self.db, &task, &agent, None).await {
                 Ok(snapshot) => snapshot,
@@ -946,8 +940,9 @@ impl TaskService {
                     created_at: now.clone(),
                     updated_at: now,
                 },
-                workspace_created_by_attempt,
+                false,
                 Some(admission),
+                Some(&workspace_admission),
             )
             .await
         {

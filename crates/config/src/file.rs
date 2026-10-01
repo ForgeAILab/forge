@@ -64,6 +64,7 @@ pub(crate) struct FileServerConfig {
 pub(crate) struct FileWorkspaceConfig {
     pub root: Option<String>,
     pub cleanup_delay_seconds: Option<u64>,
+    pub max_disconnect_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

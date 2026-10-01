@@ -4,7 +4,10 @@ mod common;
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use api_types::{AgentResponse, TaskResponse, METHOD_EXECUTION_START};
+use api_types::{
+    AgentResponse, DaemonFrame, RepoLocationResponse, TaskResponse, METHOD_EXECUTION_START,
+    METHOD_REPO_LOCATION_VERIFY,
+};
 use axum::http::{Method, StatusCode};
 use db::{ExecutionRepo, ExecutionStatus as DbExecutionStatus, StopReason, TaskRepo};
 use futures_util::SinkExt;
@@ -99,18 +102,17 @@ struct RemoteRoundtripFixture {
     agent_id: String,
     reviewer_id: String,
     _repo_dir: TestDir,
-    _workspaces_root: TestDir,
 }
 
 async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
     let repo_dir = TestDir::new(&format!("{prefix}-repo"));
     let repo_path = setup_git_repo(repo_dir.path());
-    let workspaces_root = TestDir::new(&format!("{prefix}-workspaces"));
-    let harness = test_app(workspaces_root.path(), prefix).await;
+    let workspaces_root = repo_dir.path().join("workspaces");
+    let harness = test_app(&workspaces_root, prefix).await;
 
     let registration = register_daemon(&harness.app, &format!("{prefix}-machine"), prefix).await;
     let server = TestServer::start(Arc::clone(&harness.state)).await;
-    let daemon_socket = connect_daemon(
+    let mut daemon_socket = connect_daemon(
         &server,
         &registration.daemon_id,
         Some(&registration.registration_token),
@@ -122,13 +124,68 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
         &harness.app,
         &registration.daemon_id,
         &registration.registration_token,
-        workspaces_root.path(),
+        repo_dir.path(),
         prefix,
     )
     .await;
 
     let (project_id, repo_id) =
         create_project_and_repo(&harness.app, &format!("{prefix} Project"), &repo_path).await;
+
+    let runtime_id = db::RuntimeRepo::get_by_daemon_id(&*harness.state.db, &registration.daemon_id)
+        .await
+        .expect("runtime loads")
+        .expect("runtime exists")
+        .id;
+    let app = harness.app.clone();
+    let locations_path = format!("/api/v1/repos/{repo_id}/locations");
+    let location_request = json!({
+        "owner_kind": "server",
+        "daemon_id": registration.daemon_id,
+        "runtime_id": runtime_id,
+        "path": repo_path,
+        "kind": "shared_mount",
+    });
+    let registering = tokio::spawn(async move {
+        json_request_with_bearer::<RepoLocationResponse>(
+            &app,
+            Method::POST,
+            &locations_path,
+            &admin_jwt(),
+            location_request,
+            StatusCode::OK,
+        )
+        .await
+    });
+    let (id, params) = next_daemon_request(&mut daemon_socket, METHOD_REPO_LOCATION_VERIFY).await;
+    // Use the real verifier so the fake execution transport proves it can
+    // read the server's probe within its advertised root.
+    let (outbound, _unused) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+        outbound,
+        repo_dir.path().to_path_buf(),
+        Default::default(),
+        registration.daemon_id.clone(),
+        Default::default(),
+    )
+    .expect("shared-mount verifier starts");
+    let response = runtime
+        .handle_request(DaemonFrame::Request {
+            id,
+            method: METHOD_REPO_LOCATION_VERIFY.to_owned(),
+            params,
+        })
+        .await;
+    daemon_socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&response).unwrap().into(),
+        ))
+        .await
+        .expect("shared-mount verification response sends");
+    let location = registering
+        .await
+        .expect("shared-mount registration completes");
+    assert_eq!(location.status, api_types::RepoLocationStatus::Ready);
 
     let agent: AgentResponse = json_request_with_bearer(
         &harness.app,
@@ -187,7 +244,6 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
         agent_id: agent.id,
         reviewer_id: reviewer.id,
         _repo_dir: repo_dir,
-        _workspaces_root: workspaces_root,
     }
 }
 
@@ -593,6 +649,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
             retry_at: Some(retry_at),
             resolved_candidate: None,

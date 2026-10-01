@@ -2,13 +2,14 @@
 use api_types::*;
 use db::{Execution, ExecutionRepo, Review, ReviewConformanceRepo, ReviewRepo, SqliteDb};
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path, time::Duration};
-use tokio::process::Command;
+use std::collections::BTreeSet;
+
+use crate::{CommandLimits, ReviewWorkspace};
 
 const MAX_CONTEXT_BYTES: usize = 96 * 1024;
 const MAX_PREPARED_PROMPT_BYTES: usize = 192 * 1024;
 const MAX_REPORT_BYTES: usize = 128 * 1024;
-const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_CANDIDATE_PATH_BYTES: usize = 64 * 1024;
 const CHARTER_REQUIREMENT_ROOTS: [(&str, bool); 11] = [
     ("/identity/one_line_vision", false),
@@ -454,14 +455,11 @@ pub fn governing_prompt(context: &ReviewGoverningContext) -> String {
 /// Put `worktree` back at `commit` after the checks: reset tracked files and
 /// HEAD, and remove untracked files that are not ignored, which integration
 /// would otherwise refuse as a dirty worktree. Ignored caches are kept.
-async fn restore_reviewed_tree(worktree: &Path, commit: &str) -> Result<(), String> {
-    git_read(worktree, &["reset", "--hard", "--quiet", commit])
-        .await
-        .map_err(|error| format!("review worktree could not be reset to {commit}: {error}"))?;
-    git_read(worktree, &["clean", "-fdq"])
-        .await
-        .map_err(|error| format!("review worktree could not be cleaned: {error}"))?;
-    Ok(())
+async fn restore_reviewed_tree(
+    worktree: &(impl ReviewWorkspace + ?Sized),
+    commit: &str,
+) -> Result<(), String> {
+    worktree.restore(commit).await
 }
 
 const COMMAND_TIMED_OUT: &str = "review command timed out";
@@ -481,59 +479,30 @@ pub fn is_check_timeout(reason: &str) -> bool {
     reason.starts_with(CHECK_TIMEOUT_PREFIX)
 }
 
-async fn check_output(
-    command: &mut Command,
+async fn check_workspace_output(
+    workspace: &(impl ReviewWorkspace + ?Sized),
     label: &str,
+    environment: &std::collections::BTreeMap<String, String>,
     seconds: u32,
-) -> Result<std::process::Output, String> {
-    bounded_output(command, u64::from(seconds), MAX_EVIDENCE_BYTES)
+) -> Result<crate::CommandOutput, String> {
+    workspace
+        .run(
+            label,
+            environment,
+            Some(CommandLimits {
+                timeout_secs: u64::from(seconds),
+                max_output_bytes: MAX_EVIDENCE_BYTES,
+            }),
+        )
         .await
         .map_err(|error| {
-            if error == COMMAND_TIMED_OUT {
+            let reason = error.to_string();
+            if reason.contains(COMMAND_TIMED_OUT) {
                 format!("{CHECK_TIMEOUT_PREFIX}: `{label}` ran longer than {seconds}s")
             } else {
-                error
+                reason
             }
         })
-}
-
-async fn bounded_output(
-    command: &mut Command,
-    seconds: u64,
-    limit: usize,
-) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let stdout = child.stdout.take().ok_or("missing stdout pipe")?;
-    let stderr = child.stderr.take().ok_or("missing stderr pipe")?;
-    let read = |pipe: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
-        let mut bytes = Vec::new();
-        pipe.take((limit + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > limit {
-            return Err("review command output exceeds size budget".to_owned());
-        }
-        Ok(bytes)
-    };
-    tokio::time::timeout(Duration::from_secs(seconds), async {
-        let (stdout, stderr) = tokio::try_join!(read(Box::pin(stdout)), read(Box::pin(stderr)))?;
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        })
-    })
-    .await
-    .map_err(|_| COMMAND_TIMED_OUT.to_owned())?
 }
 
 fn output_tail(text: &str) -> String {
@@ -546,43 +515,25 @@ fn output_tail(text: &str) -> String {
         .collect()
 }
 
-pub async fn git_read(path: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    let output = bounded_output(&mut command, 30, MAX_EVIDENCE_BYTES).await?;
-    if !output.status.success() {
-        return Err(format!(
-            "git evidence unavailable: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+pub async fn git_read(
+    workspace: &(impl ReviewWorkspace + ?Sized),
+    args: &[&str],
+) -> Result<String, String> {
+    workspace
+        .git_read(args, false)
+        .await?
+        .ok_or_else(|| "git evidence unavailable".to_owned())
 }
 
 /// Like `git_read`, but a nonzero exit (no common ancestor, unknown ref, ...)
 /// resolves to `Ok(None)` instead of an error. Mirrors
 /// `crates/services/src/diff.rs::try_run_git` so callers can attempt a
 /// `merge-base` lookup and fall back cleanly when it does not apply.
-async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    let output = bounded_output(&mut command, 30, MAX_EVIDENCE_BYTES).await?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    String::from_utf8(output.stdout)
-        .map(Some)
-        .map_err(|e| e.to_string())
+async fn try_git_read(
+    workspace: &(impl ReviewWorkspace + ?Sized),
+    args: &[&str],
+) -> Result<Option<String>, String> {
+    workspace.git_read(args, true).await
 }
 
 /// Resolve the review base commit: the point the reviewed branch actually
@@ -601,7 +552,10 @@ async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, Stri
 ///    the fix report for what that would take.)
 /// 3. The previous behavior: the named branch's current tip, or `HEAD` when
 ///    no branch is known.
-async fn review_base(path: &Path, context: &ReviewGoverningContext) -> Result<String, String> {
+async fn review_base(
+    path: &(impl ReviewWorkspace + ?Sized),
+    context: &ReviewGoverningContext,
+) -> Result<String, String> {
     let config: Value = context.task_scope["merge_config"]
         .as_str()
         .map(serde_json::from_str)
@@ -634,7 +588,7 @@ pub async fn admit(
     db: &SqliteDb,
     execution_id: &str,
     task_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
 ) -> Result<ReviewContract, String> {
     let context = load_context(db, task_id, Some(execution_id)).await?;
     let check_results = completed_ci_check_results(db, task_id, execution_id, &context).await?;
@@ -677,7 +631,7 @@ pub async fn admit(
 }
 
 pub async fn candidate_changed_paths(
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     base_sha: &str,
     commit_sha: &str,
 ) -> Result<Vec<String>, String> {
@@ -900,10 +854,10 @@ pub async fn prepare_prompt(
     db: &SqliteDb,
     execution_id: &str,
     task_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     reviewer: bool,
     shell: bool,
-    mut prompt: String,
+    prompt: String,
 ) -> Result<String, String> {
     let (context, contract) = if reviewer {
         let contract = admit(db, execution_id, task_id, path).await?;
@@ -911,31 +865,45 @@ pub async fn prepare_prompt(
     } else {
         (load_context(db, task_id, Some(execution_id)).await?, None)
     };
+    let mut prompt = assemble_prepared_prompt(&context, contract.as_ref(), shell, prompt)?;
+    if !shell {
+        if let Some(contract) = contract.as_ref() {
+            let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
+            prompt.push_str(
+                &reviewer_context_prompt(db, task_id, execution_id, path, contract, budget).await,
+            );
+        }
+    }
+    Ok(prompt)
+}
+
+pub fn assemble_prepared_prompt(
+    context: &ReviewGoverningContext,
+    contract: Option<&ReviewContract>,
+    shell: bool,
+    mut prompt: String,
+) -> Result<String, String> {
     if shell {
         // Shell descriptions are executable programs. Supply structured context
         // as data without appending natural language to the user's command.
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
         let mut prelude = format!(
             "export FORGE_GOVERNING_CONTEXT={}\n",
-            quote(&serde_json::to_string(&context).map_err(|e| e.to_string())?)
+            quote(&serde_json::to_string(context).map_err(|e| e.to_string())?)
         );
         if let Some(contract) = contract {
             prelude.push_str(&format!(
                 "export FORGE_REVIEW_CONTRACT={}\n",
-                quote(&serde_json::to_string(&contract).map_err(|e| e.to_string())?)
+                quote(&serde_json::to_string(contract).map_err(|e| e.to_string())?)
             ));
         }
         prelude.push_str(&prompt);
         return Ok(prelude);
     }
     if let Some(contract) = contract {
-        prompt.push_str(&contract_prompt(&contract));
-        let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
-        prompt.push_str(
-            &reviewer_context_prompt(db, task_id, execution_id, path, &contract, budget).await,
-        );
+        prompt.push_str(&contract_prompt(contract));
     } else {
-        prompt.push_str(&governing_prompt(&context));
+        prompt.push_str(&governing_prompt(context));
     }
     if prompt.len() > MAX_PREPARED_PROMPT_BYTES {
         return Err(format!(
@@ -961,7 +929,7 @@ async fn reviewer_context_prompt(
     db: &SqliteDb,
     task_id: &str,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
 ) -> String {
@@ -995,7 +963,11 @@ async fn reviewer_context_prompt(
 }
 
 /// `git diff --stat` plus the full diff when it fits in `limit` bytes.
-async fn diff_section(path: &Path, range: &str, limit: usize) -> Option<String> {
+async fn diff_section(
+    path: &(impl ReviewWorkspace + ?Sized),
+    range: &str,
+    limit: usize,
+) -> Option<String> {
     let stat = try_git_read(path, &["diff", "--stat=120", range, "--"])
         .await
         .ok()
@@ -1026,7 +998,7 @@ async fn prior_review_section(
     db: &SqliteDb,
     task_id: &str,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
 ) -> Option<String> {
@@ -1189,7 +1161,7 @@ fn report_without_block(message: &str, (open, close): (usize, usize)) -> String 
 pub async fn evaluate(
     db: &SqliteDb,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     message: &str,
 ) -> Result<ReviewConformance, String> {
     let contract = db
@@ -1273,7 +1245,7 @@ async fn verify_contract_context(db: &SqliteDb, contract: &ReviewContract) -> Re
 
 async fn evaluate_inner(
     db: &SqliteDb,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     message: &str,
     contract: &ReviewContract,
     result: &mut ReviewConformance,
@@ -1303,7 +1275,7 @@ async fn evaluate_inner(
         !contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty();
     let environment = project_environment(db, &contract.context.task_id).await?;
     if runs_checks {
-        executors::environment::materialize_assets(checkout, &environment.assets).await?;
+        checkout.materialize_assets(&environment).await?;
     }
     let timeout = contract
         .context
@@ -1311,20 +1283,11 @@ async fn evaluate_inner(
         .unwrap_or(DEFAULT_CHECK_TIMEOUT_SECONDS);
     let mut setup_failed = false;
     for (index, setup) in contract.context.setup_steps.iter().enumerate() {
-        let mut command = Command::new("bash");
-        command
-            .args(["-lc", setup])
-            .envs(&environment.env)
-            .current_dir(checkout)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .kill_on_drop(true);
-        let output = check_output(&mut command, setup, timeout).await?;
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let output = check_workspace_output(checkout, setup, &environment.env, timeout).await?;
+        let mut text = output.stdout;
+        text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
-        let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = output.exit_code.unwrap_or(-1);
         result.checks.push(ConformanceCheckResult {
             check_id: format!("setup:{index}"),
             command: setup.clone(),
@@ -1342,23 +1305,15 @@ async fn evaluate_inner(
         .iter()
         .take_while(|_| !setup_failed)
     {
-        let mut command = Command::new("bash");
-        command
-            .args(["-lc", &check.command])
-            .envs(&environment.env)
-            .current_dir(checkout)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .kill_on_drop(true);
-        let output = check_output(&mut command, &check.command, timeout).await?;
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let output =
+            check_workspace_output(checkout, &check.command, &environment.env, timeout).await?;
+        let mut text = output.stdout;
+        text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         result.checks.push(ConformanceCheckResult {
             check_id: check.id.clone(),
             command: check.command.clone(),
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: output.exit_code.unwrap_or(-1),
             output: output_tail(&text),
         });
     }

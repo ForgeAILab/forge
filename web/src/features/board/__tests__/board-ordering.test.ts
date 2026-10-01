@@ -21,6 +21,7 @@ function task(id: string, status: string, position: number, version = 1): TaskLi
     board_position: position,
     role_assignments: [],
     remaining_retries: {},
+    placement: null,
     version,
     created_at: `2026-07-22T00:00:0${position}Z`,
     updated_at: '2026-07-22T00:00:00Z',

@@ -301,7 +301,7 @@ async fn fixture() -> Fixture {
     .await;
     seed_milestone(&db).await;
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
-    provider.set_task_service(Arc::new(TaskService::new(
+    provider.set_task_service(Arc::new(TaskService::new_for_test(
         Arc::clone(&db),
         Arc::new(EventBus::new(32)),
     )));

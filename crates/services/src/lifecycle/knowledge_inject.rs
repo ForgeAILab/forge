@@ -76,6 +76,114 @@ impl LifecyclePlugin for KnowledgeInjectPlugin {
 
         Ok(PluginResult::Success)
     }
+
+    async fn execute_in_workspace(
+        &self,
+        ctx: &LifecycleHookContext,
+        workspace: &crate::workspace_backend::ResolvedWorkspace,
+    ) -> Result<PluginResult, PluginError> {
+        if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let mut ctx = ctx.clone();
+            ctx.worktree_path = Some(
+                workspace
+                    .embedded_path()
+                    .map_err(|error| PluginError {
+                        message: error.to_string(),
+                    })?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            return self.execute(&ctx).await;
+        }
+        let mut files = workspace
+            .read_files("docs/knowledge", 1024, 1024 * 1024)
+            .await
+            .map_err(|error| PluginError {
+                message: error.to_string(),
+            })?;
+        let repository = !files
+            .iter()
+            .any(|file| file.path == "docs/knowledge/KNOWLEDGE.md");
+        if repository {
+            files = workspace
+                .read_repository_files("docs/knowledge", 1024, 1024 * 1024)
+                .await
+                .map_err(|error| PluginError {
+                    message: error.to_string(),
+                })?;
+        }
+        if !files
+            .iter()
+            .any(|file| file.path == "docs/knowledge/KNOWLEDGE.md")
+        {
+            return Ok(PluginResult::Skipped {
+                reason: "no_knowledge_base".into(),
+            });
+        }
+        let keywords = tokenize(&ctx.task_title);
+        let mut entries = Vec::new();
+        for file in files {
+            let path = Path::new(&file.path);
+            if path.file_name().and_then(|name| name.to_str()) == Some("KNOWLEDGE.md")
+                || path.extension().and_then(|extension| extension.to_str()) != Some("md")
+            {
+                continue;
+            }
+            let text = String::from_utf8(file.bytes).map_err(|error| PluginError {
+                message: error.to_string(),
+            })?;
+            let parsed = parse_knowledge(&text);
+            let title = parsed.title.unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Untitled")
+                    .to_owned()
+            });
+            let searchable = format!(
+                "{} {} {} {}",
+                title,
+                parsed.category.as_deref().unwrap_or_default(),
+                parsed.tags.join(" "),
+                parsed.body
+            );
+            let score = keywords.intersection(&tokenize(&searchable)).count();
+            if score > 0 {
+                entries.push(KnowledgeEntry {
+                    title,
+                    tags: parsed.tags,
+                    category: parsed.category,
+                    body: parsed.body,
+                    relative_path: file.path,
+                    score,
+                });
+            }
+        }
+        entries.sort_by(|left, right| {
+            right
+                .score
+                .cmp(&left.score)
+                .then_with(|| left.title.cmp(&right.title))
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        entries.truncate(MAX_ENTRIES);
+        let content = truncate_chars(
+            &format_knowledge_context(&ctx.task_title, &entries),
+            MAX_CONTEXT_CHARS,
+        );
+        let files = vec![api_types::WorkspaceFileContent {
+            path: ".forge/knowledge-context.md".into(),
+            bytes: content.into_bytes(),
+        }];
+        let result = if repository {
+            workspace.write_repository_knowledge(files).await
+        } else {
+            workspace.write_knowledge(files, false, None).await
+        };
+        result.map_err(|error| PluginError {
+            message: error.to_string(),
+        })?;
+        Ok(PluginResult::Success)
+    }
 }
 
 async fn find_base_path(ctx: &LifecycleHookContext) -> Result<Option<PathBuf>, PluginError> {

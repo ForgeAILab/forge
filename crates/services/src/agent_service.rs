@@ -1,4 +1,4 @@
-use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
+use crate::{agent_capacity::has_execution_capacity, Result, ServiceError, TaskService};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
     AgentStatus, CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, PageRequest,
@@ -75,7 +75,7 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
             Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
             _ => return Ok(EffectiveStatus::ConnectionUnavailable),
         }
-        if !has_running_execution_capacity(db, agent).await? {
+        if !has_execution_capacity(db, agent, None).await? {
             return Ok(EffectiveStatus::Busy);
         }
         return Ok(EffectiveStatus::Active);
@@ -111,7 +111,7 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         }
     }
 
-    if !has_running_execution_capacity(db, agent).await? {
+    if !has_execution_capacity(db, agent, None).await? {
         return Ok(EffectiveStatus::Busy);
     }
 
@@ -480,7 +480,7 @@ impl AgentService {
 
         let mut available = Vec::new();
         for agent in page.items {
-            if has_running_execution_capacity(&self.db, &agent).await? {
+            if has_execution_capacity(&self.db, &agent, None).await? {
                 available.push(agent);
             }
         }
@@ -492,11 +492,8 @@ impl AgentService {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
-        let task_service = TaskService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let role_events = task_service
-            .on_agent_deleted_in_tx(&mut transaction, &agent_id)
-            .await?;
+        let role_events = TaskService::on_agent_deleted_in_tx(&mut transaction, &agent_id).await?;
         let now = now_rfc3339();
         let result = sqlx::query(
             "UPDATE agent_identity
@@ -513,7 +510,7 @@ impl AgentService {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;
-        task_service.publish_role_sweep_events(role_events);
+        TaskService::publish_role_sweep_events(&self.event_bus, role_events);
         self.publish(ForgeEvent {
             event_type: "agent.archived".to_owned(),
             entity_id: agent_id,

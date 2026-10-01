@@ -46,6 +46,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cli-adapters = { path = "../cli-adapters" }
 db = { path = "../db" }
 events = { path = "../events" }
+forge-client = { path = "../forge-client" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-tungstenite = "0.28"

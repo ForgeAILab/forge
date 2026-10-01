@@ -167,7 +167,7 @@ pub async fn list_agent_tasks(
     let has_more = page.next_cursor.is_some();
     let mut items = Vec::with_capacity(page.items.len());
     for task in page.items {
-        items.push(task_response_light(&state.db, task).await?);
+        items.push(task_response_light(&state.db, &state.workspace_backend_router, task).await?);
     }
     Ok(Json(PaginatedResponse {
         items,

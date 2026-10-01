@@ -115,6 +115,7 @@ mod project_provisioning;
 mod project_review_config;
 mod provider_authorization;
 mod repo;
+mod repo_location;
 mod review;
 mod runtime;
 mod shared_media;
@@ -131,6 +132,7 @@ mod user_auth;
 mod workflow;
 mod workspace;
 mod workspace_lease;
+mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
@@ -1415,17 +1417,43 @@ impl SqliteDb {
                 return Err(DbError::VersionConflict);
             }
         }
-        let running_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
+        let occupied_slots = sqlx::query_scalar::<_, i64>(
+            "SELECT
+                (SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running') +
+                (SELECT COUNT(*) FROM workspace_placement p
+                 WHERE p.agent_id = ? AND p.state IN ('reserved', 'preparing')
+                   AND NOT EXISTS (SELECT 1 FROM execution e
+                                   WHERE e.workspace_id = p.workspace_id AND e.status = 'running'))",
         )
+        .bind(agent_id)
         .bind(agent_id)
         .fetch_one(&mut **transaction)
         .await?;
-        if running_count >= actual_max {
+        if occupied_slots >= actual_max {
             return Err(DbError::AgentAtCapacity);
         }
 
-        let daemon_id: Option<String> = agent_row.try_get("daemon_id")?;
+        let daemon_id = match input.workspace_id.as_deref() {
+            Some(workspace_id) => sqlx::query_scalar::<_, Option<String>>(
+                "SELECT COALESCE(execution_daemon_id, daemon_id)
+                 FROM workspace_placement WHERE workspace_id = ?",
+            )
+            .bind(workspace_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .flatten(),
+            None => input
+                .executor_config_snapshot_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("daemon_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or(agent_row.try_get::<Option<String>, _>("daemon_id")?),
+        };
         let Some(daemon_id) = daemon_id else {
             return Ok(());
         };
@@ -1441,13 +1469,23 @@ impl SqliteDb {
             return Ok(());
         };
         let daemon_execution_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM execution
-             JOIN agent_current AS running_agent
-               ON running_agent.id = execution.agent_id
-             WHERE running_agent.daemon_id = ?
-               AND execution.status = 'running'",
+            "SELECT
+                (SELECT COUNT(*) FROM execution e
+                 LEFT JOIN workspace_placement p ON p.workspace_id = e.workspace_id
+                 LEFT JOIN agent_current a ON a.id = e.agent_id
+                 WHERE e.status = 'running' AND
+                   CASE WHEN e.workspace_id IS NOT NULL
+                     THEN COALESCE(p.execution_daemon_id, p.daemon_id)
+                     ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
+                         THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
+                   END = ?) +
+                (SELECT COUNT(*) FROM workspace_placement p
+                 WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = ?
+                   AND p.state IN ('reserved', 'preparing')
+                   AND NOT EXISTS (SELECT 1 FROM execution e
+                       WHERE e.workspace_id = p.workspace_id AND e.status = 'running'))",
         )
+        .bind(&daemon_id)
         .bind(&daemon_id)
         .fetch_one(&mut **transaction)
         .await?;

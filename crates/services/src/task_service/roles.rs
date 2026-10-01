@@ -7,16 +7,13 @@ impl TaskService {
     pub async fn on_agent_deleted(&self, agent_id: &str) -> Result<()> {
         validate_required("agent_id", agent_id)?;
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let events = self
-            .on_agent_deleted_in_tx(&mut transaction, agent_id)
-            .await?;
+        let events = Self::on_agent_deleted_in_tx(&mut transaction, agent_id).await?;
         transaction.commit().await?;
-        self.publish_role_sweep_events(events);
+        Self::publish_role_sweep_events(&self.event_bus, events);
         Ok(())
     }
 
     pub(crate) async fn on_agent_deleted_in_tx(
-        &self,
         transaction: &mut Transaction<'_, Sqlite>,
         agent_id: &str,
     ) -> Result<Vec<RoleSweepEvent>> {
@@ -101,15 +98,23 @@ impl TaskService {
         Ok(events)
     }
 
-    pub(crate) fn publish_role_sweep_events(&self, events: Vec<RoleSweepEvent>) {
+    pub(crate) fn publish_role_sweep_events(event_bus: &EventBus, events: Vec<RoleSweepEvent>) {
         for event in events {
-            self.publish_role_reassigned(
-                &event.task_id,
-                &event.role_name,
-                Some(&event.previous_assignment),
-                Some(&event.new_assignment),
-                RoleReassignmentEventFlags::default(),
-            );
+            event_bus.publish(ForgeEvent {
+                event_type: "task.role_reassigned".to_owned(),
+                entity_id: event.task_id.clone(),
+                timestamp: event_timestamp(),
+                context: EventContext::TaskRoleReassigned {
+                    task_id: event.task_id,
+                    role_name: event.role_name,
+                    previous_assignment: Some(snapshot(&event.previous_assignment)),
+                    new_assignment: Some(snapshot(&event.new_assignment)),
+                    triggered_cancellation: false,
+                    reset_workspace: false,
+                    reset_worktree: false,
+                    transitioned_to_todo: false,
+                },
+            });
         }
     }
 
@@ -1021,6 +1026,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         }
     }
 

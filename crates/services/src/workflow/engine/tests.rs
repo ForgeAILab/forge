@@ -221,6 +221,7 @@ impl TaskExecutor for PendingExecutor {
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
     let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     WorkflowEngine {
+        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
         db,
         event_bus,
         review_runner: None,
@@ -2279,12 +2280,19 @@ async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixtur
         &task,
         &task.id,
         None,
+        &crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            workspace_root.path().to_path_buf(),
+            None,
+        ),
     )
     .await
     .unwrap();
-    let sha = git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
-        .await
-        .unwrap();
+    let sha = git::get_current_sha(std::path::Path::new(
+        &workspace.embedded_worktree_path_for_backend(),
+    ))
+    .await
+    .unwrap();
     let now = now_rfc3339();
     db::ExecutionRepo::create(
         &*db,
@@ -2353,7 +2361,7 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             .execute(fixture.db.pool())
             .await
             .unwrap();
-        std::fs::remove_dir_all(&fixture.workspace.worktree_path).unwrap();
+        std::fs::remove_dir_all(fixture.workspace.embedded_worktree_path_for_backend()).unwrap();
         let result = fixture
             .engine
             .transition_with_authority(
@@ -2396,7 +2404,9 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
             1
         );
-        assert!(std::path::Path::new(&fixture.workspace.worktree_path).exists());
+        assert!(
+            std::path::Path::new(&fixture.workspace.embedded_worktree_path_for_backend()).exists()
+        );
     }
 }
 
