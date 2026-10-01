@@ -633,6 +633,14 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
             .get_mut("harness.lcm")
             .expect("the checkpoint carries LCM component state")
             .revision = superseded;
+        // The store treats a save with the same turn, revision and fingerprint
+        // as a replay and keeps what it has (the runtime's idempotency
+        // contract). Forget the stored revision so this rewrite, which stands
+        // in for another binary's write, replaces the checkpoint.
+        sqlx::query("UPDATE protected_agent_session_state SET checkpoint_revision = NULL")
+            .execute(fixture.db.pool())
+            .await
+            .expect("stored checkpoint revision clears");
         CheckpointStore::save(&*store, &checkpoint)
             .await
             .expect("checkpoint saves");
@@ -654,13 +662,17 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
     );
 
     // A policy change leaves exactly this behind: state from the old policy,
-    // beside the old policy's marker.
+    // beside the old policy's marker. The snapshot and the checkpoint each
+    // carry their own marker, and the old binary wrote both.
     stamp_superseded_state().await;
-    sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision = ?")
-        .bind("forge-lcm-policy-superseded")
-        .execute(fixture.db.pool())
-        .await
-        .expect("marker updates");
+    sqlx::query(
+        "UPDATE protected_agent_session_state
+         SET lcm_policy_revision = ?1, checkpoint_lcm_policy_revision = ?1",
+    )
+    .bind("forge-lcm-policy-superseded")
+    .execute(fixture.db.pool())
+    .await
+    .expect("marker updates");
 
     let output = backend
         .run_turn(

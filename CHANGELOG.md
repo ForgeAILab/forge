@@ -63,12 +63,92 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Unpinned CLI Agents dispatch to their selected owner, matching the execution
   ledger.
 
+## [0.13.12] - 2026-10-01
+
+### Breaking
+
+- A repository's remote URL can now be empty. `RepoResponse.remote_url` may be
+  `null`, `CreateRepoRequest.remote_url` is optional, and `PATCH` with
+  `remote_url: null` clears the remote (it was ignored before).
+  `forge-ctl repo list` shows the local path, or `—`, for a repository with no
+  remote.
+- `GET /projects/{id}/tasks` and `forge-ctl task list --output json` return
+  compact items. They no longer include the description, task state config,
+  workspace, plan, execution actions, evidence, blocker, or usage
+  observability. Read those from the Task detail.
+
+### Changed
+
+- Provider unavailability now counts against a Task's execution retry budget.
+  Before, it never did.
+- Migrations after V149 are named by their UTC creation time
+  (`VYYYYMMDDHHMM__name.sql`), so branches written in parallel cannot pick the
+  same version.
+- TypeScript bindings are generated into `web/src/types/generated/bindings`
+  only. `make types` regenerates them, and CI fails when the committed files
+  drift from the Rust types. `.cargo/config.toml` is now tracked; keep a local
+  agent-runtime `[patch]` override in `~/.cargo/config.toml` or a parent
+  directory's `.cargo/config.toml`.
+
+### Fixed
+
+- The server no longer skips a migration without an error. It refuses to
+  start when two migrations share a version, or when the database already
+  applied a different migration under a version this build uses. Before, the
+  second migration was treated as applied and its schema never existed. A
+  host that ran a hand-deployed build may be refused on upgrade: compare
+  `SELECT version, name FROM _migration` with `crates/db/migrations/`, apply
+  the release's migration by hand if its schema is missing, and set that
+  row's `name` to the release's file name.
+- Editing a Project setting no longer makes every approved Task in the Project
+  need a fresh review. An approval now depends only on what governs the
+  review: the Charter revision, the Task's scope and requirements, linked
+  document revisions, the review configuration, and the names of Project
+  environment variables. Approvals made before this release are still checked
+  the old way, so upgrading re-reviews nothing.
+- Milestone readiness no longer fails for local-only repositories that have no
+  remote URL. `forge-ctl repo create --kind local` used to save an empty
+  remote, readiness then rejected every Task in the Project as having
+  incomplete repository context, and the Project Agent used up its wake budget
+  retrying. A migration converts existing blank remotes to `null` and keeps
+  every repository and its references. An affected Project may rebuild its
+  Project Agent checkout once; notes are kept.
+- Polling a Project's task list no longer pins the CPU. The list is built from
+  a few batched queries per page, where it used to run Git, agent-health and
+  usage checks for every open Task. Request logs now include the client's
+  socket address and a bounded `X-Forwarded-For` value, logged for diagnosis
+  only.
+- When a provider's usage or rate limit is hit (Codex, Claude Code, Gemini, or
+  HTTP 429), the agent's fallback chain moves to the next executor. Before,
+  the Task failed. With no fallback, Forge retries at the provider's reset
+  time, at most six hours away, or after a cooldown. The Task shows
+  "Retry Scheduled" with the reason and is blocked only when its execution
+  retries run out.
+- Recovering a Task whose agent or daemon is at capacity no longer fails with
+  `409 agent_at_capacity`. The request returns 200 with the Task marked
+  "Retry Queued", and Forge runs the recovery when a slot frees up, keeping
+  its reason, guidance and session. If the queued recovery can no longer run,
+  the Task shows as blocked again with the reason.
+- Long agent sessions no longer rewrite tens of megabytes of encrypted session
+  state on every step. Saves that change nothing are skipped, saved state is
+  compressed, and the snapshot is no longer stored twice next to its recovery
+  checkpoint. Sessions saved by earlier versions still load. Attention health
+  is written in batches, not once per event.
+- Forge now removes the worktree and managed Codex home of done and cancelled
+  Tasks, through Git, and keeps the branch and logs. It never touches a Task
+  that is still active or has a running execution or lease, and it never
+  prunes a user's own repository. Cleanup runs in the background, so a
+  transition never waits on it. Cancelled Tasks keep their worktree for 24
+  hours.
+- Agent outbox entries are no longer dropped silently. Pretty-printed or
+  concatenated JSON in a `.jsonl` outbox file is accepted, a replayed worklog
+  or evidence entry counts as already ingested, and an unknown evidence kind
+  is stored as `other` with the agent's label.
 - Failed CI checks on non-user review entry now return the Task to its
   configured remediation state through the normal review retry budget, or
   record `review_budget_exhausted`. The dispatcher also recovers unblocked
   failed reviews after two minutes, without rerouting user-entered reviews,
   human decisions, or running work.
-
 - Review reruns, review-entry CI, and reviewer conformance checks now recover
   deleted Task worktrees from the existing branch through the same workspace
   preparation path used by executor dispatch.

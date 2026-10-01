@@ -675,8 +675,9 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
     .await;
     assert_eq!(failed.status, DbExecutionStatus::Failed);
 
-    // Transient unavailability: deferred dispatch scheduled, no retry budget
-    // consumed, task not blocked.
+    // Provider unavailability: a deferred dispatch is scheduled and the task
+    // is not blocked. The attempt spends one execution retry, so a provider
+    // that never comes back cannot retry forever.
     let mut deferred_seen = false;
     for _ in 0..200 {
         let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
@@ -689,9 +690,9 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             .and_then(|raw| serde_json::from_str(raw).ok())
             .unwrap_or_else(|| json!({}));
         if metadata.get("deferred_dispatch").is_some() {
-            assert!(
-                metadata.get("execution_retry_count").is_none(),
-                "executor unavailability must not consume the retry budget; metadata: {metadata}"
+            assert_eq!(
+                metadata["execution_retry_count"], 1,
+                "executor unavailability spends exactly one execution retry; metadata: {metadata}"
             );
             assert!(
                 task.blocked_json.is_none(),
