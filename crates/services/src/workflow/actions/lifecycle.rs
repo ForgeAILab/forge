@@ -72,7 +72,23 @@ impl HookAction for RunBeforeWorkHooks {
         };
         let workspace = match workspace_id(ctx).await {
             Some(workspace_id) => match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-                Ok(Some(workspace)) => workspace,
+                Ok(Some(workspace)) => match crate::task_service::workspace::ensure_valid(
+                    &ctx.db,
+                    &ctx.workspace_root,
+                    &task,
+                    workspace,
+                    ctx.repo_cache_locks.clone(),
+                    &ctx.workspace_backend_router,
+                )
+                .await
+                {
+                    Ok(workspace) => workspace,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                },
                 Ok(None) => {
                     return HookResult::Failed {
                         reason: format!("workspace not found: {workspace_id}"),

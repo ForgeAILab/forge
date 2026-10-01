@@ -1166,6 +1166,104 @@ pub(crate) async fn prepare_workspace(
     )
 }
 
+/// Return the persisted workspace only after its recorded owner can use it.
+///
+/// Server-owned workspaces are checked as real Git worktrees and recovered
+/// from their surviving Task branch when their directory or Git metadata is
+/// missing. Daemon-owned placements retain the existing describe/prepare
+/// behavior; Forge never interprets their opaque handle as a local path.
+pub(crate) async fn ensure_valid(
+    db: &SqliteDb,
+    workspace_root: &Path,
+    task: &Task,
+    workspace: Workspace,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+) -> Result<Workspace> {
+    if let Some(placement) = WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await? {
+        if placement.owner_kind == PlacementOwnerKind::Daemon {
+            match placement.state {
+                PlacementState::Ready => {}
+                PlacementState::Disconnected => {
+                    return Err(ServiceError::DaemonUnavailable {
+                        daemon_id: placement.daemon_id.unwrap_or_default(),
+                    })
+                }
+                _ => {
+                    return Err(ServiceError::WorkspaceResetRequired {
+                        task_id: task.id.clone(),
+                        reason: format!("workspace placement is {}", placement.state),
+                    })
+                }
+            }
+            let resolved = router.resolve(db, &workspace).await?;
+            let needs_recreation = match resolved.backend.describe(&resolved.placement).await {
+                Ok(state) => !state.exists,
+                Err(error) => return Err(error.into()),
+            };
+            if needs_recreation {
+                if sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')")
+                    .bind(&workspace.id).fetch_one(db.pool()).await? {
+                    return Err(ServiceError::conflict("workspace still has a running execution"));
+                }
+                let recovered = resolved
+                    .backend
+                    .prepare(
+                        &resolved.placement,
+                        &crate::workspace_backend::PrepareSpec {
+                            base_ref: workspace.before_sha.clone().ok_or_else(|| {
+                                ServiceError::WorkspaceResetRequired {
+                                    task_id: workspace.task_id.clone(),
+                                    reason: "workspace has no recorded recovery base".to_owned(),
+                                }
+                            })?,
+                        },
+                    )
+                    .await?;
+                let mut update = crate::placement::admission::placement_update(&resolved.placement);
+                update.workspace_handle = Some(Some(recovered.handle));
+                WorkspacePlacementRepo::update(db, update).await?;
+            }
+            return clear_workspace_cleanup_after(db, workspace).await;
+        }
+    }
+
+    if workspace.status != WorkspaceStatus::Ready {
+        return Err(ServiceError::invalid_operation(format!(
+            "workspace for task {} is not ready",
+            workspace.task_id
+        )));
+    }
+    let repo = RepoRepo::get_by_id(db, &workspace.repo_id)
+        .await?
+        .filter(|repo| repo.project_id == task.project_id)
+        .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+    let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
+    let worktree_path = resolved.embedded_path()?;
+    match worktree_readiness(&worktree_path).await {
+        WorktreeReadiness::Ready => clear_workspace_cleanup_after(db, workspace).await,
+        WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
+            let delete_missing_workspace = workspace.task_id == task.id;
+            let owner_task_id = workspace.task_id.clone();
+            clear_workspace_cleanup_after(
+                db,
+                recover_missing_worktree(
+                    db,
+                    workspace_root,
+                    &repo,
+                    &owner_task_id,
+                    workspace,
+                    repo_cache_locks,
+                    delete_missing_workspace,
+                    router,
+                )
+                .await?,
+            )
+            .await
+        }
+    }
+}
+
 fn worktree_describe_needs_recreation(
     error: &crate::workspace_backend::WorkspaceBackendError,
 ) -> bool {
@@ -1199,51 +1297,18 @@ pub(crate) async fn prepare_workspace_owned(
                     owner_task_id,
                 )
                 .await?;
-                match placement.state {
-                    PlacementState::Ready => {}
-                    PlacementState::Disconnected => {
-                        return Err(ServiceError::DaemonUnavailable {
-                            daemon_id: placement.daemon_id.unwrap_or_default(),
-                        })
-                    }
-                    _ => {
-                        return Err(ServiceError::WorkspaceResetRequired {
-                            task_id: task.id.clone(),
-                            reason: format!("workspace placement is {}", placement.state),
-                        })
-                    }
-                }
-                let resolved = router.resolve(db, &workspace).await?;
-                let needs_recreation = match resolved.backend.describe(&resolved.placement).await {
-                    Ok(state) => !state.exists,
-                    Err(error) => return Err(error.into()),
-                };
-                if needs_recreation {
-                    if sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')")
-                        .bind(&workspace.id).fetch_one(db.pool()).await? {
-                        return Err(ServiceError::conflict("workspace still has a running execution"));
-                    }
-                    let recovered = resolved
-                        .backend
-                        .prepare(
-                            &resolved.placement,
-                            &crate::workspace_backend::PrepareSpec {
-                                base_ref: workspace.before_sha.clone().ok_or_else(|| {
-                                    ServiceError::WorkspaceResetRequired {
-                                        task_id: owner_task_id.to_owned(),
-                                        reason: "workspace has no recorded recovery base"
-                                            .to_owned(),
-                                    }
-                                })?,
-                            },
-                        )
-                        .await?;
-                    let mut update =
-                        crate::placement::admission::placement_update(&resolved.placement);
-                    update.workspace_handle = Some(Some(recovered.handle));
-                    WorkspacePlacementRepo::update(db, update).await?;
-                }
-                return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
+                return Ok((
+                    ensure_valid(
+                        db,
+                        workspace_root,
+                        task,
+                        workspace,
+                        repo_cache_locks,
+                        router,
+                    )
+                    .await?,
+                    false,
+                ));
             }
         }
     }
@@ -1273,41 +1338,18 @@ pub(crate) async fn prepare_workspace_owned(
         ensure_workspace_repository_current(db, task, &workspace, &authority.repo, parent_task_id)
             .await?;
         if workspace.status == WorkspaceStatus::Ready {
-            let resolved =
-                resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
-            let worktree_path = resolved.embedded_path()?;
-            match worktree_readiness(&worktree_path, workspace.before_sha.as_deref()).await {
-                WorktreeReadiness::Ready => {
-                    info!(
-                        task_id = task_id,
-                        parent_task_id,
-                        workspace_id = %workspace.id,
-                        worktree_path = %worktree_path.display(),
-                        "reusing parent workspace"
-                    );
-                    return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
-                }
-                WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-                    return Ok((
-                        clear_workspace_cleanup_after(
-                            db,
-                            recover_missing_worktree(
-                                db,
-                                workspace_root,
-                                &authority.repo,
-                                parent_task_id,
-                                workspace,
-                                repo_cache_locks,
-                                false,
-                                router,
-                            )
-                            .await?,
-                        )
-                        .await?,
-                        false,
-                    ));
-                }
-            }
+            return Ok((
+                ensure_valid(
+                    db,
+                    workspace_root,
+                    task,
+                    workspace,
+                    repo_cache_locks,
+                    router,
+                )
+                .await?,
+                false,
+            ));
         }
         return Err(ServiceError::parent_workspace_required(parent_task_id));
     }
@@ -1363,40 +1405,18 @@ pub(crate) async fn prepare_workspace_owned(
             ));
         }
         if workspace.status == WorkspaceStatus::Ready {
-            let resolved =
-                resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
-            let worktree_path = resolved.embedded_path()?;
-            match worktree_readiness(&worktree_path, workspace.before_sha.as_deref()).await {
-                WorktreeReadiness::Ready => {
-                    info!(
-                        task_id = task_id,
-                        workspace_id = %workspace.id,
-                        worktree_path = %worktree_path.display(),
-                        "reusing existing workspace"
-                    );
-                    return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
-                }
-                WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-                    return Ok((
-                        clear_workspace_cleanup_after(
-                            db,
-                            recover_missing_worktree(
-                                db,
-                                workspace_root,
-                                &authority.repo,
-                                task_id,
-                                workspace,
-                                repo_cache_locks,
-                                true,
-                                router,
-                            )
-                            .await?,
-                        )
-                        .await?,
-                        false,
-                    ));
-                }
-            }
+            return Ok((
+                ensure_valid(
+                    db,
+                    workspace_root,
+                    task,
+                    workspace,
+                    repo_cache_locks,
+                    router,
+                )
+                .await?,
+                false,
+            ));
         }
         return Err(ServiceError::invalid_operation(format!(
             "workspace for task {task_id} is not ready"
@@ -1452,7 +1472,7 @@ async fn recover_missing_worktree(
 ) -> Result<Workspace> {
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let existing_path = resolved.embedded_path()?;
-    let readiness = worktree_readiness(&existing_path, workspace.before_sha.as_deref()).await;
+    let readiness = worktree_readiness(&existing_path).await;
     warn!(
         task_id = task_id,
         workspace_id = %workspace.id,
@@ -1552,22 +1572,12 @@ enum WorktreeReadiness {
     Invalid,
 }
 
-async fn worktree_readiness(
-    worktree_path: &Path,
-    recorded_head: Option<&str>,
-) -> WorktreeReadiness {
+async fn worktree_readiness(worktree_path: &Path) -> WorktreeReadiness {
     if !worktree_path.exists() {
         return WorktreeReadiness::Missing;
     }
     if !worktree_path.join(".git").exists() {
-        // A recorded Git HEAD proves this was a real worktree: missing
-        // metadata is damage, even though the directory itself still exists.
-        // Lightweight rows without Git evidence retain their existing behavior.
-        return if recorded_head.is_some() {
-            WorktreeReadiness::Invalid
-        } else {
-            WorktreeReadiness::Ready
-        };
+        return WorktreeReadiness::Invalid;
     }
     match git::get_current_sha(worktree_path).await {
         Ok(_) => WorktreeReadiness::Ready,
@@ -2437,6 +2447,31 @@ mod tests {
         .expect("task creates")
     }
 
+    fn init_test_checkout(path: &std::path::Path, branch: &str) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("git command runs");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-b", branch]);
+        run(&["config", "user.email", "test@forge.dev"]);
+        run(&["config", "user.name", "Forge Test"]);
+        std::fs::write(path.join("README.md"), "# Test\n").expect("write README");
+        run(&["add", "-A"]);
+        run(&["commit", "-m", "initial"]);
+    }
+
     async fn seed_workspace(
         db: &SqliteDb,
         task: &Task,
@@ -2445,6 +2480,8 @@ mod tests {
     ) -> Workspace {
         let worktree_path = worktree_dir.join(&task.id);
         std::fs::create_dir_all(&worktree_path).expect("worktree dir creates");
+        let branch = ::workspace::task_branch_name(&task.id);
+        init_test_checkout(&worktree_path, &branch);
         let now = now_rfc3339();
         let repo_id = ProjectRepo::get_by_id(db, &task.project_id)
             .await
@@ -2465,7 +2502,7 @@ mod tests {
                 task_id: task.id.clone(),
                 repo_id,
                 worktree_path: worktree_path.to_string_lossy().into_owned(),
-                branch: ::workspace::task_branch_name(&task.id),
+                branch,
                 status,
                 before_sha: None,
                 created_at: now.clone(),
@@ -3812,47 +3849,7 @@ mod tests {
         db: &SqliteDb,
         repo_path: &std::path::Path,
     ) -> (String, String) {
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@forge.dev"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("git config email");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Forge Test"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("git config name");
-        std::fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(repo_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .expect("git commit");
+        init_test_checkout(repo_path, "main");
 
         let now = now_rfc3339();
         let project_id = new_uuid_v4();
@@ -3937,6 +3934,32 @@ mod tests {
         assert_eq!(recovered.id, fresh.id);
         assert_eq!(recovered.branch, branch);
         assert!(std::path::Path::new(recovered.embedded_worktree_path_for_backend()).exists());
+    }
+
+    #[tokio::test]
+    async fn directory_without_git_metadata_is_recreated() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+
+        let fresh = prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        let worktree_path = std::path::PathBuf::from(fresh.embedded_worktree_path_for_backend());
+        std::fs::remove_file(worktree_path.join(".git")).expect("worktree metadata removes");
+        assert!(worktree_path.exists());
+        assert!(!worktree_path.join(".git").exists());
+
+        let recovered =
+            prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+                .await
+                .expect("workspace with missing Git metadata recovers");
+
+        assert_eq!(recovered.id, fresh.id);
+        assert!(worktree_path.join(".git").exists());
+        assert!(git::get_current_sha(&worktree_path).await.is_ok());
     }
 
     #[tokio::test]

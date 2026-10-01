@@ -1022,6 +1022,28 @@ impl TaskService {
                 WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?
             }
             .ok_or_else(|| ServiceError::not_found("workspace", task.id.clone()))?;
+            let resolved = self.resolve_task_workspace(&workspace).await?;
+            if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+                let workspace = super::workspace::ensure_valid(
+                    &self.db,
+                    &self.workspace_root,
+                    task,
+                    workspace,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                )
+                .await?;
+                let worktree_path = self
+                    .resolve_task_workspace(&workspace)
+                    .await?
+                    .embedded_path()?;
+                let head = git::get_current_sha(&worktree_path).await?;
+                git::restore_worktree(&worktree_path, &head).await?;
+                return Ok((false, true));
+            }
+
+            // Daemon-owned reassignment keeps its existing behavior. Repair
+            // and owner-local reset are deliberately outside this change.
             let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;

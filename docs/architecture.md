@@ -2276,12 +2276,15 @@ Agent fails admission. Reclaim describes the existing ready workspace. If its
 directory was deleted, claim, resume, recovery launch, and review-CI preparation
 recreate the worktree from its surviving Task branch through the recorded owner;
 daemon owners receive a fenced `workspace.prepare` request with the recorded base
-SHA. Embedded owners also repair damaged Git metadata. A damaged worktree on a
-daemon owner requires a reset; other describe failures remain transient errors
-and do not trigger preparation. Missing branches or
-incompatible history require an explicit workspace reset. A child preserves its
-root's shared workspace row when its branch is missing. Merge, target-moved
-rebase, and other gate reads retain their existing reset/readiness behavior.
+SHA. Server-owned Task launch and delivery paths use the same validity accessor
+before Git I/O, including review entry and reviewer evaluation, merge and
+review-carry reads, target-moved rebase, and reset-to-initial. An existing
+directory is valid only when its `.git` metadata resolves; a missing directory
+or damaged metadata is repaired or recreated from the surviving Task branch.
+Missing branches or incompatible history return the typed reset-required error,
+and a child preserves its root's shared workspace row when that branch is
+missing. A damaged worktree on a daemon owner still requires a reset; daemon
+describe failures remain transient errors and do not trigger metadata repair.
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
 Cleanup moves through `cleaning` to `cleaned`; failures use `failed`.

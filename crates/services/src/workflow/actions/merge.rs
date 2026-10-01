@@ -462,6 +462,23 @@ pub(super) async fn target_moved_result(
             };
         }
     };
+    let workspace = match crate::task_service::workspace::ensure_valid(
+        &ctx.db,
+        &ctx.workspace_root,
+        task,
+        workspace,
+        ctx.repo_cache_locks.clone(),
+        &ctx.workspace_backend_router,
+    )
+    .await
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return HookResult::Failed {
+                reason: error.to_string(),
+            };
+        }
+    };
     let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
         &ctx.workspace_backend_router,
         &ctx.db,
