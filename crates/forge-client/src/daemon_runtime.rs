@@ -610,7 +610,14 @@ async fn run_execution_task(
     };
     let result = match read_only_head {
         Ok(read_only_head) => {
-            let execution_result = executor.execute(ctx).await;
+            let mut execution_result = executor.execute(ctx).await;
+            if read_only_head.is_none() {
+                if let Ok(result) = &mut execution_result {
+                    if result.status == ExecutionOutcome::Completed && result.after_sha.is_none() {
+                        result.after_sha = git::get_current_sha(&worktree_path).await.ok();
+                    }
+                }
+            }
             if let Some(root) = &workspace_root {
                 outbox_entries = daemon_outbox::harvest(&worktree_path, &execution_id, root);
             }
@@ -1088,6 +1095,41 @@ mod tests {
             fs::read_to_string(dir.path().join("marker.txt")).expect("marker exists"),
             "ok"
         );
+    }
+
+    #[tokio::test]
+    async fn shell_execution_reports_committed_head_when_adapter_omits_it() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        git::init(dir.path()).await.expect("repository initializes");
+        fs::write(dir.path().join("base.txt"), "base\n").expect("base file writes");
+        let base_sha = git::commit_all(dir.path(), "base")
+            .await
+            .expect("base commit creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
+
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: "exec-shell-commit".to_owned(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "shell".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {}
+                }),
+                prompt: serde_json::json!({
+                    "description": "printf 'candidate\\n' > candidate.txt; git add candidate.txt; git commit -m candidate"
+                }),
+                max_turns: None,
+            })
+            .await
+            .expect("execution starts");
+
+        let notification = next_terminal_notification(&mut rx, "exec-shell-commit").await;
+        let after_sha = notification.after_sha.expect("committed HEAD is reported");
+        assert_ne!(after_sha, base_sha);
+        assert_eq!(after_sha, git::get_current_sha(dir.path()).await.unwrap());
     }
 
     #[tokio::test]

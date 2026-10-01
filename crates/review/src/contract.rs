@@ -1204,6 +1204,9 @@ pub async fn evaluate(
     };
     let validation = evaluate_inner(db, path, message, &contract, &mut result).await;
     if let Err(reason) = validation {
+        if let Some(error) = path.infrastructure_error(&reason) {
+            return Err(error.to_string());
+        }
         // A check that outran its limit says nothing about the candidate or
         // the reviewer's verdict (a build lock held by a sibling Task is the
         // usual cause). Leave it unrecorded so the checks alone can run again.

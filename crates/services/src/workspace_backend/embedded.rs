@@ -555,12 +555,13 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
             .acquire(&source.to_string_lossy())
             .await;
         let path = self.path(placement, &workspace);
+        let existed = tokio::fs::try_exists(&path).await?;
         match self
             .manager
             .cleanup_worktree(&workspace.task_id, &source, path)
             .await
         {
-            Ok(()) => Ok(CleanupAck { removed: true }),
+            Ok(()) => Ok(CleanupAck { removed: existed }),
             Err(WorkspaceError::NotFound) => Ok(CleanupAck { removed: false }),
             Err(error) => Err(error.into()),
         }

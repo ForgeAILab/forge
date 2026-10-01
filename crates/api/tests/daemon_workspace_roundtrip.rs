@@ -17,7 +17,7 @@ use db::{
     UpdateWorkspacePlacement, WorkspacePlacementRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_client::{
-    daemon_persistence::{JournalEntry, JournalOperation},
+    daemon_persistence::{JournalEntry, JournalOperation, MAX_CI_LOG_BYTES},
     daemon_runtime::{ActiveExecutionTracker, DaemonRuntime},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -674,6 +674,20 @@ impl Fixture {
         );
     }
 
+    async fn wait_until_journal_empty(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.runtime.journal().pending().unwrap().is_empty() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "owner journal acknowledgement arrives"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn assert_server_cannot_resolve_workspace(&self) {
         assert!(!self.inaccessible_server_path.exists());
         assert!(self.resolved.embedded_path().is_err());
@@ -1205,7 +1219,7 @@ async fn remote_review_uses_owner_evidence_checkouts_and_unbounded_ci_output() {
         "head -c 1100000 /dev/zero | tr '\\000' x; printf '%s' \"$FORGE_TEST_SECRET\"; printf 'stderr' >&2", &env, None)
         .await.expect("CI collects the full stream");
     assert_eq!(output.exit_code, Some(0));
-    assert!(output.stdout.len() >= 1_100_000);
+    assert_eq!(output.stdout.len(), MAX_CI_LOG_BYTES);
     assert!(!output.stdout.contains("secret-value"));
     assert_eq!(output.stderr, "stderr");
     let run = fixture
@@ -1339,7 +1353,7 @@ async fn remote_review_uses_owner_evidence_checkouts_and_unbounded_ci_output() {
         assert_eq!(output.stdout_tail, "owner");
     }
     fixture.assert_server_cannot_resolve_workspace();
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
 }
 
 #[tokio::test]
@@ -1400,7 +1414,7 @@ async fn remote_merge_binds_approved_evidence_and_replays_durable_success() {
             .len(),
         1
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     fixture.assert_server_cannot_resolve_workspace();
 }
 
@@ -1519,7 +1533,7 @@ async fn remote_merge_without_a_reviewer_preserves_merge_commit_and_conflict_evi
         fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["conflict_paths"],
         json!(["feature.txt"])
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     fixture.assert_server_cannot_resolve_workspace();
 }
 
@@ -1599,7 +1613,7 @@ async fn remote_knowledge_plugins_read_and_write_through_the_owner() {
             .trim(),
         ""
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     fixture.assert_server_cannot_resolve_workspace();
 }
 
@@ -1650,7 +1664,7 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
         fixture.receipt(METHOD_WORKSPACE_CLEANUP).await["owner_result"]["cleaned"],
         true
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     fixture.assert_server_cannot_resolve_workspace();
 }
 
@@ -1711,7 +1725,7 @@ async fn remote_cleanup_retry_acknowledges_after_the_cleaned_state_commits() {
         .cleanup_now(&placement.workspace_id)
         .await
         .unwrap();
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     assert_eq!(
         fixture
             .link
@@ -1756,7 +1770,7 @@ async fn remote_interrupted_run_is_settled_and_error_acknowledged_without_rerun(
     let receipt = fixture.receipt(METHOD_WORKSPACE_RUN).await;
     assert_eq!(receipt["metadata"]["status"], "error");
     assert_eq!(receipt["owner_result"]["error"]["code"], DAEMON_UNAVAILABLE);
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     assert_eq!(fixture.run("test ! -e never-run").await.exit_code, 0);
     let requests = fixture
         .link
@@ -1814,7 +1828,7 @@ async fn remote_run_policy_error_is_durably_recorded_and_acknowledged() {
             .len(),
         1
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
 }
 
 #[tokio::test]
@@ -1906,7 +1920,7 @@ async fn remote_interrupted_merge_recovers_only_the_exact_candidate() {
         fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["diffstat"]["files_changed"],
         1
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     assert_eq!(
         fixture
             .link
@@ -1976,7 +1990,7 @@ async fn remote_lost_run_result_reconciles_from_the_real_daemon_journal() {
         fixture.receipt(METHOD_WORKSPACE_RUN).await["owner_result"]["stdout"],
         "retained"
     );
-    assert!(fixture.runtime.journal().pending().unwrap().is_empty());
+    fixture.wait_until_journal_empty().await;
     assert_eq!(fixture.run("cat run-count").await.stdout_tail, "once");
     fixture.assert_server_cannot_resolve_workspace();
 }

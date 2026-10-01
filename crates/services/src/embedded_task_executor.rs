@@ -385,12 +385,14 @@ impl EmbeddedTaskExecutor {
         let execution = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", ctx.execution_id.clone()))?;
-        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("embedded execution missing workspace_id")
-        })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?,
+            None => WorkspaceRepo::get_by_task_id(&*self.db, &ctx.task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", ctx.task_id.clone()))?,
+        };
         let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
             &self.workspace_backend_router,
             &self.db,
