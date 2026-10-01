@@ -43,9 +43,7 @@ impl OperatorStatusService {
         Self {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
-            consumer_stall_seconds: config::ForgeConfig::default()
-                .server
-                .event_consumer_stall_seconds,
+            consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
             daemon_connections: None,
             workspace_backend_router,
@@ -63,9 +61,7 @@ impl OperatorStatusService {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
-            consumer_stall_seconds: config::ForgeConfig::default()
-                .server
-                .event_consumer_stall_seconds,
+            consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
             daemon_connections: None,
         }

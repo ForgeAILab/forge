@@ -227,6 +227,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   disconnected is applied once after the daemon reconnects, without a reset.
 - Workspace reconciliation that is waiting on an operator `reset_to_initial`
   no longer logs a warning every recovery tick.
+- Running the test suites no longer writes media, project directories or
+  workflow files into the developer's real `~/.forge`, and the `forge-ctl`
+  integration tests no longer read the stored login. Test harnesses use
+  temporary data directories, and a test that resolves the default data
+  directory now panics with instructions (see `docs/ci.md`).
 
 ### Known issues
 

@@ -729,8 +729,7 @@ async fn test_app(
         Arc::clone(&adapter_registry),
     ));
 
-    let mut config = config::ForgeConfig::default();
-    config.forge.data_dir = data_dir.to_path_buf();
+    let mut config = config::ForgeConfig::with_data_dir(data_dir.to_path_buf());
     config.workspace.root = workspace_root.to_path_buf();
     config.server.media_upload_limit_bytes = media_upload_limit_bytes;
 

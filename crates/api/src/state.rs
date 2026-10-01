@@ -77,6 +77,8 @@ pub struct AppState {
     /// Keeps compatibility notification startup abortable when no runtime
     /// supervisor is present (for example in API-only test harnesses).
     _notification_worker: Arc<services::RuntimeTaskHandle>,
+    /// Owns the isolated data root used by the convenience/test constructors.
+    _test_data_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl AppState {
@@ -153,10 +155,11 @@ impl AppState {
         bcrypt_cost: u32,
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
-        let effective_config = effective_config_for_workspace(workspace_root);
-        let runtime = services::ForgeRuntimeBuilder::new(db, event_bus)
+        let data_dir = Arc::new(tempfile::tempdir().expect("test data directory creates"));
+        let mut effective_config = ForgeConfig::with_data_dir(data_dir.path().to_path_buf());
+        effective_config.workspace.root = workspace_root;
+        let runtime = services::ForgeRuntimeBuilder::from_config(db, event_bus, effective_config)
             .with_adapter_registry(adapter_registry)
-            .with_config(effective_config)
             .with_cleanup_scheduler(cleanup_scheduler)
             .with_merge_service(merge_service)
             .with_review_runner(review_runner)
@@ -166,7 +169,9 @@ impl AppState {
             .with_bcrypt_cost(bcrypt_cost)
             .start_notification_service()
             .build();
-        Self::from_runtime(runtime, mcp_enabled)
+        let mut state = Self::from_runtime(runtime, mcp_enabled);
+        state._test_data_dir = Some(data_dir);
+        state
     }
 
     /// Construct API state from the transport-neutral component graph.
@@ -228,6 +233,7 @@ impl AppState {
             config_path: Arc::clone(&runtime.config_path),
             effective_config: Arc::clone(&runtime.effective_config),
             _notification_worker: runtime.notification_worker_handle(),
+            _test_data_dir: None,
         }
     }
 
@@ -241,10 +247,6 @@ impl AppState {
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service
             .set_command_policy(&config.commands);
-        // The constructor only had `ForgeConfig::default()`, so every data-dir
-        // path resolved against `~/.forge` rather than the server's actual
-        // `--data-dir`. Re-point them here, where the real configuration first
-        // becomes available.
         self.embedded_agent_service
             .set_media_root(config.forge.data_dir.join("media"));
         self.embedded_agent_service.set_workspace_root(
@@ -325,10 +327,4 @@ pub fn test_bcrypt_cost() -> u32 {
 /// turn's durable activity log.
 fn agent_chat_turn_log_root(config: &ForgeConfig) -> PathBuf {
     config.forge.data_dir.join("agent-chat-logs")
-}
-
-fn effective_config_for_workspace(workspace_root: PathBuf) -> ForgeConfig {
-    let mut config = ForgeConfig::default();
-    config.workspace.root = workspace_root;
-    config
 }

@@ -114,6 +114,20 @@ async fn test_app(
     workspace_root: &std::path::Path,
     config_path: std::path::PathBuf,
 ) -> axum::Router {
+    let mut config: serde_yaml::Value = if config_path.exists() {
+        serde_yaml::from_str(&std::fs::read_to_string(&config_path).expect("config reads"))
+            .expect("config parses")
+    } else {
+        serde_yaml::from_str("{}").expect("empty config parses")
+    };
+    config["forge"]["data_dir"] =
+        serde_yaml::Value::String(workspace_root.join("data").to_string_lossy().into_owned());
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("config serializes"),
+    )
+    .expect("isolated config writes");
+
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");

@@ -366,10 +366,16 @@ impl ForgeConfig {
 
 impl Default for ForgeConfig {
     fn default() -> Self {
+        Self::with_data_dir(default_data_dir())
+    }
+}
+
+impl ForgeConfig {
+    /// Construct defaults with an explicit data root, without resolving the user's directory.
+    #[must_use]
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            forge: ForgePaths {
-                data_dir: default_data_dir(),
-            },
+            forge: ForgePaths { data_dir },
             server: ServerConfig {
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
@@ -578,5 +584,5 @@ fn parse_trusted_origin(value: &str) -> Option<String> {
 }
 
 fn default_event_consumer_stall_seconds() -> u32 {
-    300
+    crate::DEFAULT_EVENT_CONSUMER_STALL_SECONDS
 }

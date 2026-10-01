@@ -13,7 +13,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use config::{ForgeConfig, TerminalConfig};
+use config::TerminalConfig;
 use db::{new_uuid_v4, now_rfc3339};
 use events::EventBus;
 use serde_json::{json, Value};
@@ -71,7 +71,7 @@ async fn setup(terminal: TerminalConfig) -> Harness {
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
     );
-    let mut config = ForgeConfig::default();
+    let mut config = (*state.effective_config).clone();
     config.workspace.root = workspace_root.path().to_path_buf();
     config.terminal = terminal;
     state = state.with_effective_config(config);
