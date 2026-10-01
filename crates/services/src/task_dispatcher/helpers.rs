@@ -1,7 +1,7 @@
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
     ExecutionRepo, ExecutionStatus, PageRequest, ResumePolicy, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder, TaskRoleAssignmentRepo,
+    SortOrder, TaskRepo,
 };
 use serde_json::Value;
 
@@ -48,6 +48,8 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. } => true,
+        ServiceError::DaemonUpgradeRequired { .. } => true,
+        ServiceError::PlacementUnavailable(error) => error.needs_daemon_upgrade(),
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
         // A slot held by a concurrently running execution frees itself the
         // moment that execution terminalises, and nothing about that clears a
@@ -89,6 +91,10 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     let Some(kind) = annotation.get("type").and_then(Value::as_str) else {
         return false;
     };
+    is_blocking_annotation_type(kind)
+}
+
+pub(crate) fn is_blocking_annotation_type(kind: &str) -> bool {
     BLOCKING_ANNOTATION_KINDS.contains(&kind)
 }
 
@@ -143,8 +149,7 @@ pub(super) async fn execution_superseded_by_role_assignment(
     canonical_role: &str,
     execution: &db::Execution,
 ) -> Result<bool> {
-    let assignment =
-        TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, canonical_role).await?;
+    let assignment = effective_assignment(db, task_id, canonical_role).await?;
     Ok(assignment.is_some_and(|assignment| {
         let Ok(assignment_updated_at) =
             chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
@@ -340,7 +345,7 @@ async fn latest_execution_needs_explicit_decision(
     // scoped to this exact Task/role, so it can authorize one fresh dispatcher
     // attempt without weakening the default no-auto-retry rule for failures or
     // manual stops. A newly stopped attempt will again be newer and block.
-    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, role_name).await?;
+    let assignment = effective_assignment(db, task_id, role_name).await?;
     let assignment_is_newer = assignment.is_some_and(|assignment| {
         let Ok(assignment_updated_at) =
             chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
@@ -433,4 +438,19 @@ fn merge_project_review_config(merged: &mut Value, project: &db::Project) {
             *merged = Value::Object(review_config.clone());
         }
     }
+}
+
+async fn effective_assignment(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role: &str,
+) -> Result<Option<db::TaskRoleAssignment>> {
+    let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+        return Ok(None);
+    };
+    Ok(
+        crate::task_hierarchy::effective_role_assignment(db, &task, role)
+            .await?
+            .map(|resolved| resolved.assignment),
+    )
 }

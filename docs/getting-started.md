@@ -338,7 +338,8 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 ```
 
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
-`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_MAX_DISCONNECT_SECONDS`,
+`FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
 `FORGE_EVENT_CONSUMER_STALL_SECONDS`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
@@ -389,6 +390,15 @@ journal/WAL. Data is preserved. Conversion failure reports an error; restart
 Forge only after the command exits. Already-incremental databases are left in
 that mode without another full rebuild. Existing databases are never fully
 vacuumed automatically.
+
+`workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
+placement, or a server-owned workspace executed on a remote daemon, waits for
+that daemon to reconnect. Both freeze heartbeat leases to prevent a second
+execution from writing to a live worktree on a shared mount. The same bound
+covers a Task queued on an offline owner before its first placement exists.
+It defaults to `86400` (24 hours) and must be positive. `FORGE_MAX_DISCONNECT_SECONDS` overrides the file value.
+After the bound elapses, the placement and running execution fail with
+`owner_disconnected_timeout`; execution hard deadlines still apply during the wait.
 
 ### Commands an Agent may run in its workspace
 
@@ -1228,11 +1238,128 @@ local CLI availability and keeps the command stream open. `daemon link` and
 `daemon start` create the configured workspace root if it does not already
 exist, so filesystem browsing can open the launch directory immediately.
 
-Execution dispatch expects the server-created task worktree to exist at the same
-absolute path on the daemon host. For containers, mount the server workspace
-root into the container at that same path. A daemon on an unrelated filesystem
-can still serve filesystem browsing under its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+### Register a machine-local repository
+
+A linked daemon can own the whole Task workspace lifecycle on its machine:
+preparation, CLI execution, review checks, direct merge, and cleanup. The server
+does not need access to that machine's checkout or worktree paths.
+
+1. Link or start the daemon with `--workspace-root` containing both the checkout
+   you want to register and its generated workspaces. For example, use
+   `/Volumes/Data/codes` for a checkout at `/Volumes/Data/codes/app`; the default
+   `$HOME/.forge/workspaces` root would not contain that checkout.
+2. Register that checkout as a `daemon`-owned `primary_checkout` location for
+   the Project's repository, supplying the linked daemon ID, runtime ID, and
+   machine-local path. Use the [repository location commands](cli.md#repository-locations)
+   to add, inspect, verify, and optionally make it the default location.
+3. Check that the location is `ready`. The daemon verifies that the path is
+   within its root, is a Git worktree, resolves the repository's default branch,
+   and has a matching remote when present. `unverified`, `unavailable`, and
+   `invalid` locations cannot receive work; inspect the last error and retry
+   verification after fixing the checkout or reconnecting the daemon.
+4. Use a direct-merge repository and CLI Agents for every assigned worktree role
+   (coder, reviewer, planner). Install, authenticate, and enable their executors
+   on that daemon, and allow the configured run purposes below. Daemon-owned
+   pull-request delivery and native Agents are outside this slice.
+
+Claim reserves capacity, prepares the workspace on its owner, then creates the
+Task claim, Running Execution, and lease. Preparation failure creates no
+Execution and spends no retry budget. An unpinned CLI Agent runs on the owner
+selected from eligible locations; a daemon pin restricts that selection. If no
+owner qualifies, claim returns `placement_unavailable` with rejection reasons.
+Task and Workspace responses expose `placement` so you can inspect the owner
+and state. Once prepared, retries and subtasks sharing that workspace stay on
+the same owner.
+
+If the daemon disconnects, the placement becomes `disconnected` and work waits.
+Running leases are frozen until reconciliation or `max_disconnect` (default
+24 hours), while hard deadlines still apply. Reconnect reconciles active and
+journaled executions before dispatch resumes. You can wait, retry on that owner,
+or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
+[the placement and failure model](architecture.md#workspace-placement).
+
+For containers sharing server workspaces, register a server-owned `shared_mount`
+location instead. Forge verifies a server-written probe through the daemon at
+the same path before using it as an execution provider. Matching absolute paths
+alone are insufficient. Daemon ownership requires revision 3 with `workspace.v1`.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+
+### Daemon run policy
+
+The daemon reads `daemon.yaml` beside its credentials file when it starts
+(`~/.forge/daemon.yaml` by default; with `--credentials`, use that file's
+directory). This is local configuration; requests cannot override the effective
+policy loaded at startup. `workspace.run.allow` defaults to `[ci_step]`. To opt into Project hooks and
+environment setup too, save:
+
+```yaml
+workspace:
+  run:
+    allow: [ci_step, hook, environment_setup]
+```
+
+Keep only the purposes you want to permit; `allow: []` disables all three.
+Restart the daemon after editing the file. It advertises the effective policy,
+and claim rejects a daemon with `run_purpose_denied` if the Task's review, hooks,
+or environment needs a disallowed purpose. A refused command returns
+`purpose_denied` and is never retried.
+
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
+### Daemon journal migration
+
+Revision 3 keeps terminal reports, their bounded worklog/evidence outbox entries,
+workspace operation results, and cleanup acknowledgements in one journal at
+`<workspace-root>/.forge/journal/`. On first startup after upgrading, the daemon
+automatically converts reports from
+`<workspace-root>/.forge-daemon/terminal-reports/`. Each old report is removed
+only after its journal entry is durably saved; interrupted conversion resumes
+on the next start. Unknown files in the old directory are left intact.
+
+Restart with the same workspace root to migrate its pending reports. No manual
+copy is needed. Unacknowledged terminal and cleanup results replay after
+reconnect until `journal.ack`. After the server durably stores the result, ack
+removes the receipt and releases its space. The whole journal (including its
+registry) is capped at 32 MiB and 1,024 receipts. CI output is capped at 1 MiB per
+stream with a marker before the retained tail; execution time may remain
+unbounded. Unbounded CI retains its exit verdict even when logs are shortened or
+omitted. Completion metadata has reserved headroom in the shared budget. Cleanup
+prunes workspace handles and their execution IDs when its receipt is acknowledged;
+reset and release keep retired review handles fenced until acknowledgement too.
+Requests store environment
+variable names and a digest of the redacted request. Output and errors are
+redacted without changing identities or exit codes. Corrupt or non-regular entries
+are quarantined as `corrupt-<original name>` when possible and logged. A failed
+quarantine is logged and skipped so other entries still replay. Command-stream
+initialization failure stops the process promptly.
 
 ## Where to next
 

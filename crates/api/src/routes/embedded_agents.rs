@@ -318,10 +318,11 @@ async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_typ
         AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let running_execution_count =
         AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
-    let effective_status = compute_effective_status(&state.db, &agent)
-        .await?
-        .as_str()
-        .to_owned();
+    let effective_status =
+        compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
+            .await?
+            .as_str()
+            .to_owned();
     Ok(agent_response(
         agent,
         Some(active_assigned_task_count),

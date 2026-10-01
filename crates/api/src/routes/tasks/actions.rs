@@ -274,5 +274,7 @@ async fn execute(
         .task_service
         .perform_task_action(id, action, request.reason, request.version)
         .await?;
-    Ok(Json(task_response(&state.db, result.task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, result.task).await?,
+    ))
 }

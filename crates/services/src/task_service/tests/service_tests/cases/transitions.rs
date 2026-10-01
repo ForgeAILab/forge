@@ -299,7 +299,14 @@ async fn transition_to_review_runs_configured_review_runner() {
             .await
             .expect("workspace loads")
             .expect("workspace exists");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("temp worktree creates");
+    std::fs::create_dir_all(
+        service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("temp worktree creates");
     // Review reviews a finished attempt: the claimed execution is the
     // candidate, and it has to be terminal before the Task can enter review.
     sqlx::query("UPDATE execution SET status = 'completed', stopped_at = ? WHERE id = ?")
@@ -470,10 +477,19 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
         .await
         .unwrap()
         .unwrap();
-    let workspace = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
-        .await
-        .unwrap();
-    let worktree_path = std::path::Path::new(&workspace.worktree_path);
+    let workspace = prepare_workspace(
+        &db,
+        workspace_root.path(),
+        &task,
+        &task.id,
+        None,
+        &service.workspace_backend_router(),
+    )
+    .await
+    .unwrap();
+    let worktree_path_buf =
+        std::path::PathBuf::from(workspace.embedded_worktree_path_for_backend());
+    let worktree_path = worktree_path_buf.as_path();
     std::fs::write(
         worktree_path.join("candidate.txt"),
         "preserved candidate branch\n",

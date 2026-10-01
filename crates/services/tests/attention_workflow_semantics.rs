@@ -186,10 +186,12 @@ impl Fixture {
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, &actor);
         let event_bus = Arc::new(events::EventBus::new(16));
-        let task_service = services::TaskService::new(Arc::clone(&self.db), Arc::clone(&event_bus));
+        let task_service =
+            services::TaskService::new_for_test(Arc::clone(&self.db), Arc::clone(&event_bus));
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus,
+            workspace_backend_router: task_service.workspace_backend_router(),
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,

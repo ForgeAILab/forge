@@ -178,7 +178,8 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         return Ok(());
     };
     crate::plan_artifact::discard_staged_execution_plan(
-        std::path::Path::new(&workspace.worktree_path),
+        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(db, &workspace)
+            .await?,
         execution_id,
     )
     .map_err(|error| {
@@ -187,7 +188,8 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         ))
     })?;
     if let Some(outbox) = executors::execution_outbox_path(
-        std::path::Path::new(&workspace.worktree_path),
+        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(db, &workspace)
+            .await?,
         execution_id,
     ) {
         match std::fs::remove_dir_all(&outbox) {
@@ -765,13 +767,23 @@ impl TaskService {
         ) else {
             return Ok(crate::native_tools::ExecutionOutboxReport::default());
         };
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        // Daemon-owned outboxes are carried in the retained terminal report;
+        // their handles do not name files on the Forge host.
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            return Ok(crate::native_tools::ExecutionOutboxReport::default());
+        }
+        let path = resolved.embedded_path()?;
         let report = embedded
             .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
                 task_id: &task.id,
                 execution_id: &execution.id,
                 agent_id,
                 role: Some(execution.role.as_str()),
-                worktree_path: &workspace.worktree_path,
+                worktree_path: &path.to_string_lossy(),
             })
             .await;
         if report.worklog_entries > 0 || report.evidence_items > 0 {

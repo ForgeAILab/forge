@@ -472,7 +472,7 @@ async fn cleanup_project_owned_paths(
         // reservation.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM task WHERE id = ? LIMIT 1",
+            Some("SELECT 1 FROM task WHERE id = ? LIMIT 1"),
             task_id,
             &workspace_root,
             &workspace_root.join(task_id),
@@ -508,7 +508,7 @@ async fn cleanup_project_owned_paths(
         // wins.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1",
+            None,
             path,
             &workspace_root,
             FsPath::new(path),
@@ -545,7 +545,7 @@ async fn cleanup_project_owned_paths(
             // and quarantine rename are serialized under BEGIN IMMEDIATE.
             match remove_confined_direct_child_if_unowned(
                 state,
-                "SELECT 1 FROM repo WHERE local_path = ? LIMIT 1",
+                Some("SELECT 1 FROM repo WHERE local_path = ? LIMIT 1"),
                 local_path,
                 &managed_root,
                 FsPath::new(local_path),
@@ -584,7 +584,7 @@ async fn cleanup_project_owned_paths(
         // ownership check and quarantine rename share the DB write lock.
         match remove_confined_direct_child_if_unowned(
             state,
-            "SELECT 1 FROM repo WHERE id = ? LIMIT 1",
+            Some("SELECT 1 FROM repo WHERE id = ? LIMIT 1"),
             &repository.id,
             &cache_root,
             &cache_root.join(&repository.id),
@@ -619,7 +619,7 @@ async fn cleanup_project_owned_paths(
     // the check and quarantine rename share the DB write lock.
     match remove_confined_direct_child_if_unowned(
         state,
-        "SELECT 1 FROM project WHERE id = ? LIMIT 1",
+        Some("SELECT 1 FROM project WHERE id = ? LIMIT 1"),
         project_id,
         &project_root,
         &project_root.join(project_id),
@@ -656,7 +656,7 @@ async fn cleanup_project_owned_paths(
 /// deleting another owner's path.
 async fn remove_confined_direct_child_if_unowned(
     state: &AppState,
-    ownership_query: &str,
+    ownership_query: Option<&str>,
     ownership_value: &str,
     root: &std::path::Path,
     candidate: &std::path::Path,
@@ -665,12 +665,23 @@ async fn remove_confined_direct_child_if_unowned(
     let mut transaction = db::begin_immediate(state.db.pool())
         .await
         .map_err(|error| ApiError::internal(format!("lock Project cleanup ownership: {error}")))?;
-    let live = sqlx::query_scalar::<_, i64>(ownership_query)
-        .bind(ownership_value)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?
-        .is_some();
+    let live = match ownership_query {
+        Some(query) => sqlx::query_scalar::<_, i64>(query)
+            .bind(ownership_value)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map(|row| row.is_some())
+            .map_err(db::DbError::from),
+        None => {
+            db::WorkspaceRepo::embedded_path_is_owned_in_tx(
+                &*state.db,
+                &mut transaction,
+                ownership_value,
+            )
+            .await
+        }
+    }
+    .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?;
     if live {
         transaction.commit().await.map_err(|error| {
             ApiError::internal(format!("release Project cleanup lock: {error}"))

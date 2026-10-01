@@ -9,19 +9,38 @@ impl ForgeConfig {
         config_path: Option<&Path>,
         overrides: ConfigOverrides,
     ) -> Result<Self, ConfigError> {
-        let mut config = Self::default();
         let path = config_path.map_or_else(default_config_path, Path::to_path_buf);
 
-        if path.exists() {
+        let file_config = if path.exists() {
             let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
                 path: path.clone(),
                 source,
             })?;
-            let file_config =
-                serde_yaml::from_str::<FileConfig>(&text).map_err(|source| ConfigError::Parse {
+            Some(serde_yaml::from_str::<FileConfig>(&text).map_err(|source| {
+                ConfigError::Parse {
                     path: path.clone(),
                     source,
-                })?;
+                }
+            })?)
+        } else {
+            None
+        };
+        let data_dir = overrides
+            .data_dir
+            .clone()
+            .or_else(|| env_value("FORGE_DATA_DIR").map(|value| expand_path(&value)))
+            .or_else(|| {
+                file_config
+                    .as_ref()?
+                    .forge
+                    .as_ref()?
+                    .data_dir
+                    .as_deref()
+                    .map(expand_path)
+            })
+            .unwrap_or_else(crate::default_data_dir);
+        let mut config = Self::with_data_dir(data_dir);
+        if let Some(file_config) = file_config {
             config.apply_file(file_config);
         }
 
@@ -71,6 +90,9 @@ impl ForgeConfig {
             }
             if let Some(cleanup_delay_seconds) = workspace.cleanup_delay_seconds {
                 self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+            }
+            if let Some(max_disconnect_seconds) = workspace.max_disconnect_seconds {
+                self.workspace.max_disconnect_seconds = max_disconnect_seconds;
             }
         }
 
@@ -210,6 +232,10 @@ impl ForgeConfig {
             self.workspace.cleanup_delay_seconds =
                 parse_env_u64("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", &value)?;
         }
+        if let Some(value) = env_value("FORGE_MAX_DISCONNECT_SECONDS") {
+            self.workspace.max_disconnect_seconds =
+                parse_env_u64("FORGE_MAX_DISCONNECT_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =
                 parse_env_u32("FORGE_AGENT_MAX_CONCURRENT_TASKS", &value)?;
@@ -266,6 +292,9 @@ impl ForgeConfig {
         }
         if let Some(cleanup_delay_seconds) = overrides.workspace_cleanup_delay_seconds {
             self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+        }
+        if let Some(max_disconnect_seconds) = overrides.workspace_max_disconnect_seconds {
+            self.workspace.max_disconnect_seconds = max_disconnect_seconds;
         }
         if let Some(max_concurrent_tasks) = overrides.agent_max_concurrent_tasks {
             self.agent.max_concurrent_tasks = max_concurrent_tasks;

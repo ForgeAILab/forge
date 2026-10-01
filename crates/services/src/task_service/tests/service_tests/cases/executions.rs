@@ -5,12 +5,455 @@ use db::{PageRequest, SortBy, SortOrder};
 use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
+async fn claim_uses_injected_cli_availability() {
+    use cli_adapters::test_support::TestAdapter;
+    use executors::{AdapterRegistry, AvailabilityStatus};
+
+    let db = Arc::new(sqlite_db().await);
+    let workspace_root = TempDir::new().unwrap();
+    let mut service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, "todo".into()).await;
+
+    for status in [AvailabilityStatus::NotFound, AvailabilityStatus::Installed] {
+        let mut registry = AdapterRegistry::new();
+        registry.register(Box::new(TestAdapter::new(ExecutorKind::Codex, status)));
+        service = service.with_placement_adapter_registry(Arc::new(registry));
+        let error = service
+            .claim_task(&task.id, Assignee::Agent(agent_id.clone()), None)
+            .await
+            .expect_err("unavailable fixture adapter must refuse claim");
+        let ServiceError::PlacementUnavailable(refusal) = error else {
+            panic!("unexpected refusal: {error:?}");
+        };
+        assert!(refusal.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .filter_codes
+                .contains(&crate::placement::PlacementFilterCode::ExecutorUnavailable)
+        }));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_placement")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "refused claim cannot reserve placement");
+    }
+
+    service = service
+        .with_placement_adapter_registry(Arc::new(cli_adapters::test_support::test_registry()));
+    let claimed = service
+        .claim_task(&task.id, Assignee::Agent(agent_id.clone()), None)
+        .await
+        .expect("available fixture adapter admits claim");
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_id.as_str())
+    );
+    assert_eq!(claimed.execution.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
+async fn project_pause_precedes_placement_on_every_execution_launch_path() {
+    let db = Arc::new(sqlite_db().await);
+    let workspace_root = TempDir::new().unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        // Any placement attempt would fail availability even on a signed-in host.
+        .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new()));
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let claimable = seed_task_with_status(&db, &project_id, "todo".into()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".into()).await;
+    seed_role_assignment(&db, &task.id, "coder", Some(&agent_id)).await;
+    let parent = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        "coder",
+        ExecutionStatus::Completed,
+        Some("fixture-session"),
+        &now_rfc3339(),
+    )
+    .await;
+    sqlx::query("UPDATE project SET paused_at = ?, system_pause_reason = 'environment_not_ready' WHERE id = ?")
+        .bind(now_rfc3339()).bind(&project_id).execute(db.pool()).await.unwrap();
+
+    let mut errors = vec![service
+        .claim_task(&claimable.id, Assignee::Agent(agent_id.clone()), None)
+        .await
+        .expect_err("paused Project refuses launch")];
+    errors.push(
+        service
+            .launch_execution(&task.id, &agent_id, None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .dispatch_initial_role_execution(&task.id, &agent_id, "coder", "Continue".into())
+            .await
+            .expect_err("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .re_execute_execution(&parent.id)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .follow_up_execution(&parent.id, "Continue".into(), None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .follow_up_interactive_execution(&parent.id, "Continue".into(), None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .resume_task_execution(
+                &task,
+                &crate::workflow::default_workflow::default_workflow(),
+                None,
+                task.version,
+            )
+            .await
+            .expect_err("paused Project refuses launch"),
+    );
+    for error in errors {
+        assert!(
+            matches!(error, ServiceError::ProjectPaused { project_id: id } if id == project_id)
+        );
+    }
+    for table in [
+        "workspace",
+        "workspace_placement",
+        "workspace_lease",
+        "review",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "paused launch cannot mutate {table}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "paused launch cannot create an execution");
+    for original in [claimable, task] {
+        let current = TaskRepo::get_by_id(&*db, &original.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, original.version);
+        assert_eq!(current.status, original.status);
+        assert_eq!(current.metadata_json, original.metadata_json);
+        assert_eq!(current.error_annotation, original.error_annotation);
+    }
+}
+
+#[tokio::test]
+async fn unpinned_cli_execution_routes_start_and_cancel_to_ledger_daemon() {
+    use crate::daemon_transport::{DaemonConnection, DaemonConnectionRegistry};
+    use db::{PricingSubjectRepo, UserRepo};
+
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let connections = Arc::new(DaemonConnectionRegistry::without_handlers());
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_daemon_connections(Arc::clone(&connections));
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id =
+        seed_agent_with_executor_type(&db, "codex", r#"{"model":"routing-test-model"}"#).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    let daemon_id = agent.daemon_id.clone().expect("fixture daemon is pinned");
+    let mut agent_update = db::UpdateAgent {
+        id: agent_id.clone(),
+        expected_version: agent.version,
+        name: None,
+        description: None,
+        model: Some(Some("routing-test-model".to_owned())),
+        reasoning_effort: None,
+        permission_policy: None,
+        prompt_template: None,
+        capabilities_json: None,
+        config_json: None,
+        daemon_id: Some(None),
+        max_concurrent_tasks: None,
+        heartbeat_interval_seconds: None,
+        max_missed_heartbeats: None,
+        status: None,
+        last_heartbeat_at: None,
+        is_default: None,
+        paused: None,
+        updated_at: now_rfc3339(),
+    };
+    let agent = AgentRepo::update(&*db, agent_update.clone())
+        .await
+        .expect("agent is unpinned");
+    assert!(agent.daemon_id.is_none());
+
+    let now = now_rfc3339();
+    let runtime = db::RuntimeRepo::create(
+        &*db,
+        db::CreateRuntime {
+            id: new_uuid_v4(),
+            daemon_id: daemon_id.clone(),
+            kind: "local".to_owned(),
+            workspace_root: repo_dir
+                .path()
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            status: db::RuntimeStatus::Ready,
+            labels_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("shared runtime creates");
+    // Seed the verified shared mount whose execution provider admission
+    // must record for this unpinned Agent.
+    db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Server,
+            daemon_id: Some(daemon_id.clone()),
+            runtime_id: Some(runtime.id),
+            path: repo_dir.path().to_string_lossy().into_owned(),
+            kind: db::RepoLocationKind::SharedMount,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("ready shared mount creates");
+    let (connection, mut outbound) = DaemonConnection::new(daemon_id.clone());
+    let connection_id = connection.id();
+    connections.register(daemon_id.clone(), connection);
+    assert!(connections.dispatch_incoming_for_connection(
+        &daemon_id,
+        connection_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: json!({
+                "protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+                "capabilities": api_types::DAEMON_REQUIRED_CAPABILITIES,
+                "executor_capabilities": {
+                    "codex": {
+                        "structured_events": true,
+                        "usage": true,
+                        "resume": true,
+                        "cancel_ack": true,
+                        "terminal_observed": true,
+                    },
+                },
+            }),
+        },
+    ));
+    let task = service
+        .create_task(
+            project_id.clone(),
+            "Route the resolved daemon",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id, Assignee::Agent(agent_id.clone()), None)
+        .await
+        .expect("unpinned CLI agent claims");
+    let snapshot: Value = serde_json::from_str(
+        claimed
+            .execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("snapshot exists"),
+    )
+    .expect("snapshot parses");
+    let placement = db::WorkspacePlacementRepo::get_by_workspace_id(
+        &*db,
+        claimed
+            .execution
+            .workspace_id
+            .as_deref()
+            .expect("execution workspace"),
+    )
+    .await
+    .expect("placement loads")
+    .expect("workspace is placed");
+    assert_eq!(placement.owner_kind, db::PlacementOwnerKind::Server);
+    assert_eq!(
+        placement.execution_daemon_id.as_deref(),
+        Some(daemon_id.as_str())
+    );
+    assert_eq!(
+        snapshot["placement_id"].as_str(),
+        Some(placement.id.as_str())
+    );
+    assert!(snapshot.get("resolved_daemon_id").is_none());
+
+    // Give admission an account and a fixed rate so the ledger retains the
+    // exact CLI runtime subject without depending on a pricing catalog.
+    let now = now_rfc3339();
+    let owner_id = new_uuid_v4();
+    UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: owner_id.clone(),
+            email: "daemon-routing@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("ledger owner creates");
+    let project = db::ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let updated = sqlx::query(
+        "UPDATE project SET owner_id = ?, version = version + 1 WHERE id = ? AND version = ?",
+    )
+    .bind(&owner_id)
+    .bind(&project_id)
+    .bind(project.version)
+    .execute(db.pool())
+    .await
+    .expect("project owner sets");
+    assert_eq!(updated.rows_affected(), 1);
+    PricingSubjectRepo::upsert_pricing_adjustment(
+        &*db,
+        db::UpsertPricingAdjustment {
+            owner_user_id: owner_id,
+            scope: db::PricingAdjustmentScope::Agent(agent_id.clone()),
+            mode: db::PricingAdjustmentMode::Fixed,
+            discount_bps: None,
+            fixed_rates: db::RateBuckets::new(Some(1_000_000), Some(2_000_000), None, None),
+            catalog_provider_id: None,
+            catalog_model_id: None,
+            expected_version: 0,
+            now,
+        },
+    )
+    .await
+    .expect("fixed pricing adjustment creates");
+
+    let respond = async {
+        for method in [
+            api_types::METHOD_EXECUTION_START,
+            api_types::METHOD_EXECUTION_CANCEL,
+        ] {
+            let frame = outbound.recv().await.expect("daemon receives command");
+            let api_types::DaemonFrame::Request {
+                id,
+                method: actual_method,
+                params,
+            } = frame
+            else {
+                panic!("expected daemon request");
+            };
+            assert_eq!(actual_method, method);
+            assert_eq!(params["execution_id"], claimed.execution.id);
+            let result = if method == api_types::METHOD_EXECUTION_START {
+                json!({ "execution_id": claimed.execution.id, "accepted": true })
+            } else {
+                json!({ "execution_id": claimed.execution.id, "cancelled": true })
+            };
+            assert!(connections.dispatch_incoming_for_connection(
+                &daemon_id,
+                connection_id,
+                api_types::DaemonFrame::Response { id, result },
+            ));
+        }
+    };
+    let dispatch = async {
+        let result = service
+            .start_execution(claimed.execution.id.clone())
+            .await
+            .expect("start dispatches remotely");
+        assert!(result.accepted);
+        let execution = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(
+            execution.lease_owner,
+            Some(crate::daemon_transport::execution_lease_owner(
+                &daemon_id,
+                connection_id,
+            )),
+        );
+        let ledger_daemon: String = sqlx::query_scalar(
+            "SELECT s.daemon_id FROM pricing_selection p
+             JOIN pricing_subject s ON s.id = p.subject_id
+             WHERE p.execution_id = ? AND s.subject_kind = 'cli_runtime'",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("ledger records the CLI runtime");
+        assert_eq!(ledger_daemon, daemon_id);
+        let agent = AgentRepo::get_by_id(&*db, &agent_id)
+            .await
+            .expect("running agent loads")
+            .expect("agent exists");
+        agent_update.expected_version = agent.version;
+        agent_update.daemon_id = Some(Some("different-daemon".to_owned()));
+        AgentRepo::update(&*db, agent_update)
+            .await
+            .expect("agent pin changes after dispatch");
+        service
+            .cancel_execution_with_provider(&execution, "routing regression")
+            .await
+            .expect("cancel dispatches to the same daemon");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(dispatch, respond);
+    })
+    .await
+    .expect("remote start and cancel complete");
+}
+
+#[tokio::test]
 async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    // This case drives the real adapter registry, so the agent has to be the
+    // This case executes through the adapter registry, so the agent has to be the
     // shell harness: it runs the Task's own command and logs its output.
     // Any other harness shells out to a CLI that is not on the host.
     let agent_id = seed_agent(&db).await;
@@ -64,9 +507,16 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
             .await
             .expect("workspace loads")
             .expect("workspace exists");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("workspace dir creates");
+    std::fs::create_dir_all(
+        service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("workspace dir creates");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(claimed.execution.id, &executor)
@@ -131,7 +581,14 @@ async fn claim_shell_task_with_environment(
             .await
             .expect("workspace loads")
             .expect("workspace exists");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("workspace dir creates");
+    std::fs::create_dir_all(
+        service
+            .workspace_backend_router()
+            .embedded_path(db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("workspace dir creates");
     (task, claimed.execution, workspace)
 }
 
@@ -156,7 +613,7 @@ async fn run_execution_applies_the_project_environment() {
     )
     .await;
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(execution.id, &executor)
@@ -164,9 +621,15 @@ async fn run_execution_applies_the_project_environment() {
         .expect("execution runs");
 
     assert_eq!(execution.status, ExecutionStatus::Completed);
-    assert!(std::path::Path::new(&workspace.worktree_path)
-        .join("vendor/fountain.png")
-        .exists());
+    assert!(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    )
+    .join("vendor/fountain.png")
+    .exists());
     let logs = executors::LogReader::read(
         std::path::Path::new(&execution.logs_path.expect("logs path recorded")),
         0,
@@ -207,7 +670,7 @@ async fn a_failed_environment_check_pauses_the_project_without_blocking_the_task
         .expect("task loads before dispatch")
         .expect("task exists before dispatch");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(execution.id, &executor)
@@ -217,9 +680,15 @@ async fn a_failed_environment_check_pauses_the_project_without_blocking_the_task
     assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(execution.resume_policy, Some(db::ResumePolicy::Auto));
     assert!(
-        !std::path::Path::new(&workspace.worktree_path)
-            .join("agent-ran")
-            .exists(),
+        !std::path::Path::new(
+            &service
+                .workspace_backend_router()
+                .embedded_path(&db, &workspace)
+                .await
+                .expect("workspace path resolves")
+        )
+        .join("agent-ran")
+        .exists(),
         "no agent run is spent on a known-broken environment"
     );
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -447,7 +916,12 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
     .await
     .expect("workspace loads")
     .expect("workspace exists");
-    let worktree = std::path::Path::new(&workspace.worktree_path);
+    let workspace_path = service
+        .workspace_backend_router()
+        .embedded_path(&db, &workspace)
+        .await
+        .expect("workspace path resolves");
+    let worktree = workspace_path.as_path();
     let marker = repo_dir.path().join("fsmonitor-ran");
     let monitor = worktree.join("fsmonitor.sh");
     std::fs::write(
@@ -942,14 +1416,24 @@ async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_dif
     .to_string();
     assert_eq!(updated.status, ExecutionStatus::Failed);
     assert_eq!(updated.error.as_deref(), Some(expected_error.as_str()));
-    assert!(std::path::Path::new(&workspace.worktree_path)
-        .join("uncommitted.txt")
-        .exists());
-    assert!(
-        !git::is_worktree_clean(std::path::Path::new(&workspace.worktree_path))
+    assert!(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
             .await
-            .expect("worktree cleanliness reads")
-    );
+            .expect("workspace path resolves")
+    )
+    .join("uncommitted.txt")
+    .exists());
+    assert!(!git::is_worktree_clean(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    ))
+    .await
+    .expect("worktree cleanliness reads"));
 
     let comments = db::TaskCommentRepo::list_comments(
         &*db,
@@ -2087,7 +2571,14 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
             .expect("workspace loads")
             .expect("workspace exists");
     let marker = std::fs::read_to_string(
-        std::path::Path::new(&workspace.worktree_path).join("required-hook.out"),
+        std::path::Path::new(
+            &service
+                .workspace_backend_router()
+                .embedded_path(&db, &workspace)
+                .await
+                .expect("workspace path resolves"),
+        )
+        .join("required-hook.out"),
     )
     .expect("required hook marker exists");
     assert_eq!(marker, "required-ok");
@@ -2340,7 +2831,14 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
             .expect("workspace loads")
             .expect("workspace exists");
     let marker = std::fs::read_to_string(
-        std::path::Path::new(&workspace.worktree_path).join("retry-hook.out"),
+        std::path::Path::new(
+            &service
+                .workspace_backend_router()
+                .embedded_path(&db, &workspace)
+                .await
+                .expect("workspace path resolves"),
+        )
+        .join("retry-hook.out"),
     )
     .expect("retry hook marker exists");
     assert_eq!(marker, "retry-ok");
@@ -2525,9 +3023,15 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .await
         .expect("workspace loads")
         .expect("workspace exists");
-    assert!(!std::path::Path::new(&workspace.worktree_path)
-        .join("hook-marker.txt")
-        .exists());
+    assert!(!std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    )
+    .join("hook-marker.txt")
+    .exists());
 
     std::fs::write(repo_dir.path().join("hook-marker.txt"), "updated\n").expect("marker writes");
     run_git(repo_dir.path(), &["add", "-A"]);
@@ -2546,9 +3050,15 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
     assert_eq!(recovered.status, "in_progress");
     assert_eq!(recovered.entry_barrier_json, None);
     assert_eq!(recovered.error_annotation, None);
-    assert!(std::path::Path::new(&workspace.worktree_path)
-        .join("hook-marker.txt")
-        .exists());
+    assert!(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    )
+    .join("hook-marker.txt")
+    .exists());
 }
 
 #[tokio::test]
@@ -3500,6 +4010,144 @@ async fn seed_admitted_review_with(
         .await
         .expect("review contract admits");
     (db, service, task, execution, repo_dir)
+}
+
+#[tokio::test]
+async fn daemon_placement_reviewer_completion_evaluates_through_owner() {
+    use crate::workspace_backend::DaemonWorkspaceBackend;
+    let (db, service, task, execution, repo_dir) = seed_admitted_review().await;
+    let (_, owner, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    let workspace_id = execution.workspace_id.as_deref().unwrap();
+    let repo_id: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id = ?")
+        .bind(workspace_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let location = db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Daemon,
+            daemon_id: owner.daemon_id.clone(),
+            runtime_id: owner.runtime_id.clone(),
+            path: "/owner-only/repo".into(),
+            kind: db::RepoLocationKind::PrimaryCheckout,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::WorkspacePlacementRepo::create(
+        &*db,
+        db::CreateWorkspacePlacement {
+            id: new_uuid_v4(),
+            workspace_id: workspace_id.into(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            owner_kind: db::PlacementOwnerKind::Daemon,
+            daemon_id: owner.daemon_id.clone(),
+            runtime_id: owner.runtime_id,
+            repo_location_id: location.id,
+            execution_daemon_id: owner.daemon_id.clone(),
+            workspace_handle: Some("opaque-review-owner".into()),
+            generation: 1,
+            state: db::PlacementState::Ready,
+            selected_by: db::PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".into(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let daemon_id = owner.daemon_id.unwrap();
+    let (connection_id, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    let sha = git::get_current_sha(repo_dir.path()).await.unwrap();
+    let evidence_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder = {
+        let registry = registry.clone();
+        let evidence_reads = evidence_reads.clone();
+        tokio::spawn(async move {
+            while let Some(api_types::DaemonFrame::Request { id, method, params }) =
+                outbound.recv().await
+            {
+                assert_eq!(params["workspace_handle"], "opaque-review-owner");
+                let result = match method.as_str() {
+                    api_types::METHOD_WORKSPACE_DESCRIBE => {
+                        json!({"workspace_handle": "opaque-review-owner", "generation": 1,
+                        "exists": true, "head_sha": sha, "dirty": false, "branch": "review-candidate", "locked": false,
+                        "active_execution_ids": [], "journaled_execution_ids": []})
+                    }
+                    api_types::METHOD_WORKSPACE_READ => {
+                        evidence_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        match params["query"]["kind"].as_str().unwrap() {
+                            "head" | "resolve_ref" | "merge_base" => {
+                                json!({"kind": "git", "output": format!("{sha}\n")})
+                            }
+                            "tracked_changes" | "candidate_paths" => {
+                                json!({"kind": "git", "output": ""})
+                            }
+                            query => panic!("unexpected conformance query: {query}"),
+                        }
+                    }
+                    method => panic!("unexpected reviewer owner operation: {method}"),
+                };
+                registry.dispatch_incoming_for_connection(
+                    &daemon_id,
+                    connection_id,
+                    api_types::DaemonFrame::Response { id, result },
+                );
+            }
+        })
+    };
+    let router = (*service.workspace_backend_router())
+        .clone()
+        .with_daemon(Arc::new(DaemonWorkspaceBackend::new(db.clone(), registry)));
+    let service = service.with_workspace_backend_router(Arc::new(router));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        complete_review_with(
+            &db,
+            &service,
+            &execution,
+            r#"{"result":"pass","reason":"acceptance satisfied"}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    responder.abort();
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(review.status, ReviewStatus::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert!(evidence_reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "merging"
+    );
 }
 
 /// Complete the reviewer execution with `reply` and run the review cascade.
@@ -6249,7 +6897,7 @@ async fn interactive_execution_completion_does_not_trigger_review_cascade() {
         .await
         .expect("launch succeeds");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(launched.execution.id.clone(), &executor)

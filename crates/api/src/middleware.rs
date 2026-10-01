@@ -276,7 +276,6 @@ mod request_address_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
-    use tracing::instrument::WithSubscriber;
 
     struct CapturedSpan {
         name: &'static str,
@@ -363,27 +362,38 @@ mod request_address_tests {
         assert_eq!(request_address_fields(&request), (None, None));
     }
 
-    #[tokio::test]
-    async fn request_address_fields_are_logged_on_one_span() {
-        let web_dist = crate::temp_web_dist();
-        let app = crate::build_router(crate::test_state().await, &web_dist);
+    #[test]
+    fn request_address_fields_are_logged_on_one_span() {
         let capture = SpanCapture::default();
-        let mut request = Request::builder()
-            .uri("/api/v1/auth/me")
-            .header("x-forwarded-for", "198.51.100.8")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        request.extensions_mut().insert(ConnectInfo(
-            "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
-        ));
+        // Keep two dispatchers alive so tracing registers callsites against its
+        // subscriber registry. Its sole-dispatcher fast path uses the current
+        // thread's subscriber, which may be absent in another parallel test.
+        let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        // Cover router construction as well as every poll of the request. A
+        // current-thread runtime keeps the scoped subscriber on this thread.
+        tracing::dispatcher::with_default(&dispatch, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let web_dist = crate::temp_web_dist();
+                    let app = crate::build_router(crate::test_state().await, &web_dist);
+                    let mut request = Request::builder()
+                        .uri("/api/v1/auth/me")
+                        .header("x-forwarded-for", "198.51.100.8")
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                    request.extensions_mut().insert(ConnectInfo(
+                        "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),
+                    ));
 
-        let response = app
-            .oneshot(request)
-            .with_subscriber(capture.clone())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
-        std::fs::remove_dir_all(web_dist).unwrap();
+                    let response = app.oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+                    std::fs::remove_dir_all(web_dist).unwrap();
+                });
+        });
 
         let spans = capture.0.lock().unwrap();
         assert!(spans.iter().any(|span| span.name == "http.request"));

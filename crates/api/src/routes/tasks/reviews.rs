@@ -18,7 +18,7 @@ pub async fn trigger_review(
         .map_err(|error| ApiError::bad_request(format!("invalid task id: {error}")))?;
     let (task, review) = state.task_service.rerun_review(task_id).await?;
     Ok(Json(TransitionTaskResponse {
-        task: task_response(&state.db, task).await?,
+        task: task_response(&state.db, &state.workspace_backend_router, task).await?,
         review: Some(review_response_server_checked(review)?),
     }))
 }
@@ -45,7 +45,7 @@ pub async fn approve_review(
         .await
         .map_err(map_manual_review_error)?;
     Ok(Json(ReviewDecisionResponse {
-        task: task_response(&state.db, task).await?,
+        task: task_response(&state.db, &state.workspace_backend_router, task).await?,
         review: review_response_server_checked(review)?,
     }))
 }
@@ -61,7 +61,7 @@ pub async fn reject_review(
         .await
         .map_err(map_manual_review_error)?;
     Ok(Json(ReviewDecisionResponse {
-        task: task_response(&state.db, task).await?,
+        task: task_response(&state.db, &state.workspace_backend_router, task).await?,
         review: review_response_server_checked(review)?,
     }))
 }

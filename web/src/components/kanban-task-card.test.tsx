@@ -81,6 +81,7 @@ describe('Project capacity waits on task surfaces', () => {
         task={{
           ...queuedTask(),
           execution_observability: undefined,
+          placement: null,
           effective_coder: null,
           effective_coder_source: null,
           status: 'review',
@@ -124,6 +125,7 @@ describe('Project capacity waits on task surfaces', () => {
         task={{
           ...queuedTask(),
           execution_observability: undefined,
+          placement: null,
           effective_coder: null,
           effective_coder_source: null,
         }}

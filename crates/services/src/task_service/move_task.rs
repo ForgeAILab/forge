@@ -179,6 +179,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let engine_result = engine
             .move_task_with_authority(

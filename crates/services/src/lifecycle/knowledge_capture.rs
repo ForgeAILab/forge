@@ -138,6 +138,95 @@ impl LifecyclePlugin for KnowledgeCapturePlugin {
 
         Ok(PluginResult::Success)
     }
+
+    async fn execute_in_workspace(
+        &self,
+        ctx: &LifecycleHookContext,
+        workspace: &crate::workspace_backend::ResolvedWorkspace,
+    ) -> Result<PluginResult, PluginError> {
+        if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let mut ctx = ctx.clone();
+            ctx.worktree_path = Some(
+                workspace
+                    .embedded_path()
+                    .map_err(|error| PluginError {
+                        message: error.to_string(),
+                    })?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            return self.execute(&ctx).await;
+        }
+        let Some(log_dir) = ctx.log_dir.as_ref().filter(|directory| directory.exists()) else {
+            return Ok(PluginResult::Skipped {
+                reason: "no_log_dir".into(),
+            });
+        };
+        let snippets = extract_from_logs(log_dir).await;
+        if snippets.is_empty() {
+            return Ok(PluginResult::Skipped {
+                reason: "no_knowledge_found".into(),
+            });
+        }
+        let existing = workspace
+            .read_files("docs/knowledge", 1024, 1024 * 1024)
+            .await
+            .map_err(|error| PluginError {
+                message: error.to_string(),
+            })?;
+        let index = existing
+            .iter()
+            .find(|file| file.path == "docs/knowledge/KNOWLEDGE.md")
+            .map(|file| String::from_utf8_lossy(&file.bytes).into_owned())
+            .unwrap_or_else(|| "# Knowledge Base\n".into());
+        let now = Utc::now().to_rfc3339();
+        let mut files = Vec::new();
+        let mut written = Vec::new();
+        for snippet in snippets.iter().take(MAX_ENTRIES_PER_TASK) {
+            let filename = format!("{}.md", to_kebab_case(&snippet.title));
+            let path = format!("docs/knowledge/{}/{filename}", snippet.category);
+            if existing.iter().any(|file| file.path == path) {
+                continue;
+            }
+            let content = format!("---\ntitle: \"{}\"\ncategory: {}\ntags:\n{}\ncreated_by: knowledge-capture\ntask_id: \"{}\"\ncreated_at: \"{}\"\nupdated_at: \"{}\"\n---\n\n{}\n", snippet.title, snippet.category,
+                snippet.tags.iter().map(|tag| format!("  - {tag}")).collect::<Vec<_>>().join("\n"), ctx.task_id, now, now, snippet.body);
+            files.push(api_types::WorkspaceFileContent {
+                path,
+                bytes: content.into_bytes(),
+            });
+            written.push(IndexEntry {
+                title: snippet.title.clone(),
+                category: snippet.category.clone(),
+                filename,
+                tags: snippet.tags.clone(),
+            });
+        }
+        if written.is_empty() {
+            return Ok(PluginResult::Skipped {
+                reason: "all_duplicates".into(),
+            });
+        }
+        workspace
+            .write_knowledge(files, true, None)
+            .await
+            .map_err(|error| PluginError {
+                message: error.to_string(),
+            })?;
+        workspace
+            .write_knowledge(
+                vec![api_types::WorkspaceFileContent {
+                    path: "docs/knowledge/KNOWLEDGE.md".into(),
+                    bytes: updated_index(&index, &written).into_bytes(),
+                }],
+                false,
+                Some(ctx.task_id.clone()),
+            )
+            .await
+            .map_err(|error| PluginError {
+                message: error.to_string(),
+            })?;
+        Ok(PluginResult::Success)
+    }
 }
 
 struct Snippet {
@@ -384,7 +473,19 @@ async fn ensure_knowledge_dir(dir: &Path) -> Result<(), PluginError> {
 async fn update_index(knowledge_dir: &Path, entries: &[IndexEntry]) -> Result<(), PluginError> {
     let index_path = knowledge_dir.join("KNOWLEDGE.md");
     let existing = fs::read_to_string(&index_path).await.unwrap_or_default();
-    let mut content = existing.clone();
+    let content = updated_index(&existing, entries);
+    if content != existing {
+        fs::write(&index_path, &content)
+            .await
+            .map_err(|e| PluginError {
+                message: format!("update KNOWLEDGE.md: {e}"),
+            })?;
+    }
+    Ok(())
+}
+
+fn updated_index(existing: &str, entries: &[IndexEntry]) -> String {
+    let mut content = existing.to_owned();
 
     for entry in entries {
         let link = format!(
@@ -408,17 +509,10 @@ async fn update_index(knowledge_dir: &Path, entries: &[IndexEntry]) -> Result<()
         content.insert_str(insert_pos, &format!("{link}\n"));
     }
 
-    if content != existing {
-        fs::write(&index_path, &content)
-            .await
-            .map_err(|e| PluginError {
-                message: format!("update KNOWLEDGE.md: {e}"),
-            })?;
-    }
-    Ok(())
+    content
 }
 
-async fn git_commit(base: &Path, task_id: &str) -> Result<(), String> {
+pub(crate) async fn git_commit(base: &Path, task_id: &str) -> Result<(), String> {
     let add = Command::new("git")
         .args(["add", "docs/knowledge/"])
         .current_dir(base)

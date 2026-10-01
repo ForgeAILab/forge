@@ -47,6 +47,7 @@ pub struct AppState {
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
     pub daemon_service: Arc<DaemonService>,
+    pub repo_location_service: Arc<services::repo_location::RepoLocationService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     pub workflow_template_service:
         Arc<services::workflow::template_service::WorkflowTemplateService>,
@@ -64,6 +65,7 @@ pub struct AppState {
     pub task_dispatcher: Option<Arc<services::TaskDispatcher>>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
+    pub workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     pub event_bus: Arc<EventBus>,
     pub shutdown_signal: ShutdownSignal,
     pub auth_service: Arc<AuthService>,
@@ -75,6 +77,8 @@ pub struct AppState {
     /// Keeps compatibility notification startup abortable when no runtime
     /// supervisor is present (for example in API-only test harnesses).
     _notification_worker: Arc<services::RuntimeTaskHandle>,
+    /// Owns the isolated data root used by the convenience/test constructors.
+    _test_data_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl AppState {
@@ -106,7 +110,7 @@ impl AppState {
     ) -> Self {
         let workspace_root = default_workspace_root();
         let workflows_dir = test_workflows_dir();
-        let merge_service = Arc::new(MergeService::new(
+        let merge_service = Arc::new(MergeService::new_for_test(
             Arc::clone(&db),
             Arc::clone(&event_bus),
             workspace_root.clone(),
@@ -151,10 +155,11 @@ impl AppState {
         bcrypt_cost: u32,
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
-        let effective_config = effective_config_for_workspace(workspace_root);
-        let runtime = services::ForgeRuntimeBuilder::new(db, event_bus)
+        let data_dir = Arc::new(tempfile::tempdir().expect("test data directory creates"));
+        let mut effective_config = ForgeConfig::with_data_dir(data_dir.path().to_path_buf());
+        effective_config.workspace.root = workspace_root;
+        let runtime = services::ForgeRuntimeBuilder::from_config(db, event_bus, effective_config)
             .with_adapter_registry(adapter_registry)
-            .with_config(effective_config)
             .with_cleanup_scheduler(cleanup_scheduler)
             .with_merge_service(merge_service)
             .with_review_runner(review_runner)
@@ -164,7 +169,9 @@ impl AppState {
             .with_bcrypt_cost(bcrypt_cost)
             .start_notification_service()
             .build();
-        Self::from_runtime(runtime, mcp_enabled)
+        let mut state = Self::from_runtime(runtime, mcp_enabled);
+        state._test_data_dir = Some(data_dir);
+        state
     }
 
     /// Construct API state from the transport-neutral component graph.
@@ -182,6 +189,7 @@ impl AppState {
             models_dev_client: Arc::clone(&runtime.models_dev_client),
             agent_usage_cache: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
+            workspace_backend_router: Arc::clone(&runtime.workspace_backend_router),
             agent_service: Arc::clone(&runtime.agent_service),
             embedded_agent_service: Arc::clone(&runtime.embedded_agent_service),
             agent_chat_service: Arc::clone(&runtime.agent_chat_service),
@@ -193,6 +201,13 @@ impl AppState {
             agent_inbox_service: Arc::clone(&runtime.agent_inbox_service),
             agent_action_service: Arc::clone(&runtime.agent_action_service),
             daemon_service: Arc::clone(&runtime.daemon_service),
+            repo_location_service: Arc::new(services::repo_location::RepoLocationService::new(
+                Arc::clone(&runtime.db),
+                Arc::new(services::repo_location::RemoteDaemonLocationVerifier::new(
+                    Arc::clone(&runtime.daemon_connections),
+                    runtime.cleanup_scheduler.workspace_root().to_path_buf(),
+                )),
+            )),
             daemon_connections: Arc::clone(&runtime.daemon_connections),
             workflow_template_service: Arc::clone(&runtime.workflow_template_service),
             memory_service: Arc::clone(&runtime.memory_service),
@@ -218,6 +233,7 @@ impl AppState {
             config_path: Arc::clone(&runtime.config_path),
             effective_config: Arc::clone(&runtime.effective_config),
             _notification_worker: runtime.notification_worker_handle(),
+            _test_data_dir: None,
         }
     }
 
@@ -231,10 +247,6 @@ impl AppState {
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service
             .set_command_policy(&config.commands);
-        // The constructor only had `ForgeConfig::default()`, so every data-dir
-        // path resolved against `~/.forge` rather than the server's actual
-        // `--data-dir`. Re-point them here, where the real configuration first
-        // becomes available.
         self.embedded_agent_service
             .set_media_root(config.forge.data_dir.join("media"));
         self.embedded_agent_service.set_workspace_root(
@@ -259,6 +271,7 @@ impl AppState {
             config.terminal.clone(),
             self.cleanup_scheduler.workspace_root().to_path_buf(),
             terminal_activity,
+            Arc::clone(&self.workspace_backend_router),
         ));
         let terminal_cleanup_handler: Arc<
             dyn services::workspace_cleanup::WorkspaceCleanupObserver,
@@ -314,10 +327,4 @@ pub fn test_bcrypt_cost() -> u32 {
 /// turn's durable activity log.
 fn agent_chat_turn_log_root(config: &ForgeConfig) -> PathBuf {
     config.forge.data_dir.join("agent-chat-logs")
-}
-
-fn effective_config_for_workspace(workspace_root: PathBuf) -> ForgeConfig {
-    let mut config = ForgeConfig::default();
-    config.workspace.root = workspace_root;
-    config
 }

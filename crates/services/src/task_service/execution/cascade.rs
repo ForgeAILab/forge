@@ -72,6 +72,40 @@ impl TaskService {
         }
     }
 
+    /// A sweep must never wait behind another Task cascade while holding an owner permit.
+    pub(crate) async fn try_cascade_executor_completion(&self, execution_id: &str) -> Result<bool> {
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(true);
+        };
+        let Some(slot) = self.claim_completion_cascade(&execution.task_id) else {
+            return Ok(false);
+        };
+        let service = self.clone();
+        let execution_id = execution_id.to_owned();
+        tokio::spawn(async move {
+            let result = service.cascade_executor_completion(&execution_id).await;
+            drop(slot);
+            if let Err(error) = result {
+                tracing::warn!(%execution_id, %error, "detached completion cascade remains pending");
+                return;
+            }
+            if let Some(registry) = &service.daemon_connections {
+                if let Ok(Some(placement)) =
+                    db::WorkspacePlacementRepo::get_for_task(&*service.db, &execution.task_id).await
+                {
+                    if let Some(daemon_id) =
+                        crate::recovery::placement_execution_daemon_id(&placement)
+                    {
+                        if let Err(error) = registry.retry_retained_terminals(daemon_id).await {
+                            tracing::warn!(%daemon_id, %error, "cascade acknowledgement remains pending");
+                        }
+                    }
+                }
+            }
+        });
+        Ok(true)
+    }
+
     pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
         self.completion_cascades
             .lock()
@@ -358,7 +392,11 @@ impl TaskService {
             let workspace = brokered_workspace
                 .as_ref()
                 .expect("brokered workspace checked before plan publication");
-            let worktree = std::path::Path::new(&workspace.worktree_path);
+            let worktree =
+                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                    &self.db, workspace,
+                )
+                .await?;
             match crate::plan_artifact::publish_staged_execution_plan(worktree, &execution.id) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -659,7 +697,10 @@ impl TaskService {
             return Ok(());
         };
         crate::plan_artifact::discard_staged_execution_plan(
-            std::path::Path::new(&workspace.worktree_path),
+            &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                &self.db, &workspace,
+            )
+            .await?,
             &execution.id,
         )
         .map_err(|error| {
@@ -668,7 +709,10 @@ impl TaskService {
             ))
         })?;
         if let Some(outbox) = executors::execution_outbox_path(
-            std::path::Path::new(&workspace.worktree_path),
+            &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                &self.db, &workspace,
+            )
+            .await?,
             &execution.id,
         ) {
             match std::fs::remove_dir_all(&outbox) {
@@ -731,7 +775,7 @@ impl TaskService {
         };
         if let Some(workspace) = workspace.as_ref() {
             crate::plan_artifact::restore_plan_before_abandon(
-                std::path::Path::new(&workspace.worktree_path),
+                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(&self.db, workspace).await?,
                 execution_id,
             )
             .map_err(|_| {
@@ -789,7 +833,10 @@ impl TaskService {
         };
         if let Some(workspace) = workspace {
             crate::plan_artifact::restore_plan_before_abandon(
-                std::path::Path::new(&workspace.worktree_path),
+                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                    &self.db, &workspace,
+                )
+                .await?,
                 &execution.id,
             )
             .map_err(|error| {
@@ -1891,28 +1938,29 @@ impl TaskService {
             return Ok(());
         }
         let final_message = reviewer_final_message(execution).await?;
-        let workspace_path = match execution.workspace_id.as_deref() {
-            Some(_) => Some(
-                prepare_workspace(
+        let workspace_io = match execution.workspace_id.as_deref() {
+            Some(_) => {
+                let workspace = prepare_workspace(
                     &self.db,
                     &self.workspace_root,
                     &task,
                     &task.id,
                     self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
                 )
-                .await?
-                .worktree_path,
-            ),
+                .await?;
+                Some(self.review_workspace_io(&workspace).await?)
+            }
             None => None,
         };
         let mut check_attempt = 1;
         let conformance = loop {
-            let conformance = match workspace_path.as_deref() {
+            let conformance = match workspace_io.as_ref() {
                 Some(path) => {
                     ::review::contract::evaluate(
                         &self.db,
                         &execution.id,
-                        std::path::Path::new(path),
+                        path.as_ref(),
                         &final_message,
                     )
                     .await

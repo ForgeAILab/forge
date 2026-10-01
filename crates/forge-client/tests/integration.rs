@@ -226,7 +226,7 @@ impl TestServer {
         });
 
         Some(Self {
-            client: ForgeClient::new(localhost_url(addr)),
+            client: ForgeClient::new_without_credentials(localhost_url(addr)),
             handle,
             _repo_dir: repo_dir,
         })
@@ -610,6 +610,7 @@ fn task_response(
         review_passed_at: None,
         archived_at: None,
         workspace: None,
+        placement: None,
         plan_progress: None,
         plan_artifact: None,
         external_issue_number: None,

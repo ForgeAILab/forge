@@ -51,11 +51,39 @@ pub struct AgentAvailabilityResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct WorkspacePlacementResponse {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: String,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: String,
+    pub selected_by: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub selection_reason: Value,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct WorkspaceResponse {
     pub id: String,
     pub task_id: String,
     pub repo_id: String,
+    /// A host path for server placements; empty for daemon placements.
     pub worktree_path: String,
+    pub placement: WorkspacePlacementResponse,
     pub branch: String,
     pub status: String,
     pub before_sha: Option<String>,

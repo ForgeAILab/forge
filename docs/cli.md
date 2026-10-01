@@ -189,7 +189,7 @@ idempotency key.
 | `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects, re-check environment checks |
 | `analytics` | Inspect account-wide usage, cost coverage, and pricing provenance |
-| `repo`    | Add / list repos under a project |
+| `repo`    | Add / list repos and manage their machine-local locations |
 | `memory`  | Search and retrieve project-scoped memory |
 | `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
@@ -270,6 +270,53 @@ JSON output returns `{checks, project}`. All checks passing resumes an
 environment-paused Project. User and repository pauses are left in place.
 Scheduled re-checks use `settings.environment.recheck_interval_seconds`
 (default 600 seconds); this command does not wait for the next scheduled check.
+A daemon-owned environment pause re-checks through the recorded owner. If its
+`environment_setup` run policy refuses a check, the pause explains the refusal
+and disables scheduled re-checks. Enable that purpose on the owner and invoke
+this command to check again.
+
+### Repository locations
+
+Use `repo location` to manage physical checkouts of a Repo. Every command
+requires `--repo-id` and Project owner/admin access (or a server administrator).
+Registration verifies the location and prints its persisted status and error.
+
+```bash
+forge-ctl repo location list --repo-id <REPO_ID> --include-total
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner server --path /srv/checkouts/app --default
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner daemon --daemon-id <DAEMON_ID> --runtime-id <RUNTIME_ID> \
+  --path /Volumes/Data/codes/app --kind primary_checkout
+forge-ctl repo location verify --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location set-default --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location remove --repo-id <REPO_ID> <LOCATION_ID>
+```
+
+`add` defaults to `--owner server` and `--kind primary_checkout`. Other kinds
+are `managed_clone` and `shared_mount`; a shared mount uses `--owner server`
+with both daemon/runtime IDs. Daemon/runtime IDs must be visible and belong
+together. Configure the daemon's `--workspace-root` to include the checkout
+path supplied to `add`; a daemon path must lie within that runtime's advertised
+root, and the server never opens it. Verification uses `repo_location.verify`
+over the daemon command stream; an offline daemon reports `unavailable` with
+`daemon_unavailable`. Shared mounts also require the daemon to read back a
+server-written probe under the server's worktree root at the same path.
+Verification is retried after an accepted daemon handshake, including for
+previously ready locations. A root escape reports `invalid` with
+`outside_workspace_root`.
+
+Table output includes full location, daemon, and runtime IDs, the path, kind,
+default flag, status, version, and last error. Use `--output json` for the full
+response and verification timestamps. `list` accepts `--limit`, `--cursor`,
+and `--include-total`; pass the returned next cursor unchanged. A successful
+request can return an `invalid` or `unavailable` location: inspect its status
+to determine whether verification succeeded.
+
+Pass the current version shown by `list` to `verify` and `set-default`.
+A stale version returns 409. Setting a new default clears the old default
+atomically, which also changes that old location's version. `remove` returns
+409 naming the Task while any non-cleaned placement still uses the location.
 
 ### Usage and cost analytics
 
@@ -314,6 +361,15 @@ registration/report that does not keep the command stream open.
 The configured workspace root is created automatically before the daemon
 registers or reports.
 
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
 After a daemon has been linked once, use `forge-ctl daemon start` to run it
 again from the saved daemon credentials without registering or claiming it
 again:
@@ -331,11 +387,38 @@ stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
 connected. When the Forge server starts, external daemons are considered
 offline until their command stream reconnects.
 
-Execution dispatch requires the task worktree path created by the server to
-exist at the same absolute path on the daemon host. Use a local daemon or mount
-the server workspace root into the daemon host/container at the same path. A
-daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+Repository locations identify a checkout on the server or a particular daemon
+runtime. Register daemon checkouts through `repo location add` and verify them
+before placement. A daemon may execute a server-owned workspace only through
+a verified `shared_mount` location; matching absolute paths alone are
+insufficient. Daemon-owned placement requires a direct-merge repository and
+CLI Agents for every role that touches its worktree.
+
+The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
+(default: `[ci_step]`). Hook and environment setup purposes require local opt-in.
+This dispatch policy has the trust limits described above.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
 
 ### Installing MCP client config
 

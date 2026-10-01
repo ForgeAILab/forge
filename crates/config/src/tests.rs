@@ -6,7 +6,6 @@ use crate::{
 };
 use std::{
     env, fs,
-    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 use tempfile::tempdir;
@@ -21,11 +20,9 @@ fn defaults_are_usable_without_a_config_file() {
     let _guard = env_lock().lock().expect("env lock poisoned");
     clear_forge_env();
 
-    let missing_path = tempdir()
-        .expect("tempdir")
-        .path()
-        .join("missing-forge.yaml");
-    let config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+    let dir = tempdir().expect("tempdir");
+    let missing_path = dir.path().join("missing-forge.yaml");
+    let config = ForgeConfig::load(Some(&missing_path), test_overrides(dir.path()))
         .expect("default config loads");
 
     assert_eq!(config.server.bind, DEFAULT_SERVER_BIND);
@@ -34,8 +31,8 @@ fn defaults_are_usable_without_a_config_file() {
         config.server.media_upload_limit_bytes,
         DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
     );
-    assert_eq!(config.forge.data_dir, default_data_dir());
-    assert_eq!(config.db_path(), default_data_dir().join("forge.db"));
+    assert_eq!(config.forge.data_dir, dir.path());
+    assert_eq!(config.db_path(), dir.path().join("forge.db"));
     assert_eq!(config.workspace.root, default_workspace_root());
     assert_eq!(
         config.workspace.cleanup_delay_seconds,
@@ -75,7 +72,7 @@ terminal:
     .expect("write config");
 
     let config =
-        ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).expect("config loads");
+        ForgeConfig::load(Some(&config_path), test_overrides(dir.path())).expect("config loads");
 
     assert!(config.terminal.enabled);
     assert_eq!(config.terminal.max_sessions_per_task, 3);
@@ -176,7 +173,7 @@ public_search:
     .expect("write config");
     env::set_var("FORGE_PUBLIC_SEARCH_TIMEOUT_MS", "3000");
 
-    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+    let config = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
         .expect("search config loads");
     assert_eq!(
         config.public_search.endpoint.as_deref(),
@@ -203,7 +200,7 @@ terminal:
     )
     .expect("write config");
 
-    let error = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+    let error = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
         .expect_err("invalid config rejects on load");
 
     assert!(matches!(
@@ -242,7 +239,7 @@ providers:
     )
     .expect("write config");
 
-    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+    let config = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
         .expect("provider config loads");
 
     assert_eq!(config.providers.entries.len(), 2);
@@ -299,7 +296,7 @@ fn provider_declarations_reject_invalid_kinds_and_credential_shapes() {
         let dir = tempdir().expect("tempdir");
         let config_path = dir.path().join("forge.yaml");
         fs::write(&config_path, body).expect("write config");
-        let error = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        let error = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
             .expect_err("invalid provider declaration rejects on load");
         assert!(
             matches!(
@@ -335,14 +332,22 @@ agent:
   max_missed_heartbeats: 4
 project:
   default_priority: normal
-"#,
+"#
+        .replace(
+            "/file/data",
+            &dir.path().join("file-data").to_string_lossy(),
+        )
+        .replace(
+            "/file/worktrees",
+            &dir.path().join("file-worktrees").to_string_lossy(),
+        ),
     )
     .expect("write config");
 
     env::set_var("FORGE_SERVER_BIND", "127.0.0.1:9100");
     env::set_var("FORGE_PUBLIC_BASE_URL", "https://env.example.com/app");
-    env::set_var("FORGE_DATA_DIR", "/env/data");
-    env::set_var("FORGE_WORKSPACE_ROOT", "/env/worktrees");
+    env::set_var("FORGE_DATA_DIR", dir.path().join("env-data"));
+    env::set_var("FORGE_WORKSPACE_ROOT", dir.path().join("env-worktrees"));
     env::set_var("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", "20");
     env::set_var("FORGE_AGENT_MAX_CONCURRENT_TASKS", "3");
     env::set_var("FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS", "25");
@@ -354,8 +359,8 @@ project:
             server_bind: Some("127.0.0.1:9200".to_owned()),
             server_public_base_url: Some("https://cli.example.com/app".to_owned()),
             mcp_enabled: None,
-            data_dir: Some(PathBuf::from("/cli/data")),
-            workspace_root: Some(PathBuf::from("/cli/worktrees")),
+            data_dir: Some(dir.path().join("cli-data")),
+            workspace_root: Some(dir.path().join("cli-worktrees")),
             workspace_cleanup_delay_seconds: Some(30),
             agent_max_concurrent_tasks: Some(4),
             agent_heartbeat_interval_seconds: Some(35),
@@ -370,9 +375,9 @@ project:
         config.server.public_base_url.as_deref(),
         Some("https://cli.example.com/app")
     );
-    assert_eq!(config.forge.data_dir, PathBuf::from("/cli/data"));
-    assert_eq!(config.db_path(), PathBuf::from("/cli/data/forge.db"));
-    assert_eq!(config.workspace.root, PathBuf::from("/cli/worktrees"));
+    assert_eq!(config.forge.data_dir, dir.path().join("cli-data"));
+    assert_eq!(config.db_path(), dir.path().join("cli-data/forge.db"));
+    assert_eq!(config.workspace.root, dir.path().join("cli-worktrees"));
     assert_eq!(config.workspace.cleanup_delay_seconds, 30);
     assert_eq!(config.agent.max_concurrent_tasks, 4);
     assert_eq!(config.agent.heartbeat_interval_seconds, 35);
@@ -387,7 +392,8 @@ project:
 
 #[test]
 fn trusted_origin_uses_bind_when_public_base_url_is_absent() {
-    let mut config = ForgeConfig::default();
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.bind = "127.0.0.1:8080".to_owned();
     config.server.public_base_url = None;
 
@@ -396,7 +402,8 @@ fn trusted_origin_uses_bind_when_public_base_url_is_absent() {
 
 #[test]
 fn trusted_origin_strips_public_base_url_path() {
-    let mut config = ForgeConfig::default();
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.bind = "127.0.0.1:8080".to_owned();
     config.server.public_base_url = Some("https://forge.example.com/something".to_owned());
 
@@ -405,7 +412,8 @@ fn trusted_origin_strips_public_base_url_path() {
 
 #[test]
 fn mcp_resource_url_appends_mcp_to_trusted_origin() {
-    let mut config = ForgeConfig::default();
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.public_base_url = Some("https://forge.example.com/something".to_owned());
 
     assert_eq!(config.mcp_resource_url(), "https://forge.example.com/mcp");
@@ -416,11 +424,9 @@ fn mcp_enabled_defaults_to_true_and_can_be_overridden() {
     let _guard = env_lock().lock().expect("env lock poisoned");
     clear_forge_env();
 
-    let missing_path = tempdir()
-        .expect("tempdir")
-        .path()
-        .join("missing-forge.yaml");
-    let default_config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+    let dir = tempdir().expect("tempdir");
+    let missing_path = dir.path().join("missing-forge.yaml");
+    let default_config = ForgeConfig::load(Some(&missing_path), test_overrides(dir.path()))
         .expect("default config loads");
     assert!(default_config.server.mcp_enabled);
 
@@ -428,7 +434,7 @@ fn mcp_enabled_defaults_to_true_and_can_be_overridden() {
         Some(&missing_path),
         ConfigOverrides {
             mcp_enabled: Some(false),
-            ..Default::default()
+            ..test_overrides(dir.path())
         },
     )
     .expect("config loads with override");
@@ -451,23 +457,31 @@ server:
   public_base_url: https://file.example.com/app
 workspace:
   root: /file/worktrees
-"#,
+"#
+        .replace(
+            "/file/data",
+            &dir.path().join("file-data").to_string_lossy(),
+        )
+        .replace(
+            "/file/worktrees",
+            &dir.path().join("file-worktrees").to_string_lossy(),
+        ),
     )
     .expect("write config");
 
-    env::set_var("FORGE_DATA_DIR", "/env/data");
+    env::set_var("FORGE_DATA_DIR", dir.path().join("env-data"));
     env::set_var("FORGE_PUBLIC_BASE_URL", "https://env.example.com/app");
-    env::set_var("FORGE_WORKSPACE_ROOT", "/env/worktrees");
+    env::set_var("FORGE_WORKSPACE_ROOT", dir.path().join("env-worktrees"));
 
     let config =
         ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).expect("config loads");
 
-    assert_eq!(config.forge.data_dir, PathBuf::from("/env/data"));
+    assert_eq!(config.forge.data_dir, dir.path().join("env-data"));
     assert_eq!(
         config.server.public_base_url.as_deref(),
         Some("https://env.example.com/app")
     );
-    assert_eq!(config.workspace.root, PathBuf::from("/env/worktrees"));
+    assert_eq!(config.workspace.root, dir.path().join("env-worktrees"));
 
     clear_forge_env();
 }
@@ -489,7 +503,15 @@ server:
   public_base_url: https://file.example.com/app
 workspace:
   root: /file/worktrees
-"#,
+"#
+        .replace(
+            "/file/data",
+            &dir.path().join("file-data").to_string_lossy(),
+        )
+        .replace(
+            "/file/worktrees",
+            &dir.path().join("file-worktrees").to_string_lossy(),
+        ),
     )
     .expect("write config");
 
@@ -501,9 +523,9 @@ workspace:
         config.server.public_base_url.as_deref(),
         Some("https://file.example.com/app")
     );
-    assert_eq!(config.forge.data_dir, PathBuf::from("/file/data"));
-    assert_eq!(config.db_path(), PathBuf::from("/file/data/forge.db"));
-    assert_eq!(config.workspace.root, PathBuf::from("/file/worktrees"));
+    assert_eq!(config.forge.data_dir, dir.path().join("file-data"));
+    assert_eq!(config.db_path(), dir.path().join("file-data/forge.db"));
+    assert_eq!(config.workspace.root, dir.path().join("file-worktrees"));
 }
 
 #[test]
@@ -548,8 +570,7 @@ fn resolve_jwt_secret_uses_config_value_when_set() {
     clear_forge_env();
 
     let dir = tempdir().expect("tempdir");
-    let mut config = ForgeConfig::default();
-    config.forge.data_dir = dir.path().to_path_buf();
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.jwt_secret = Some("configured-secret-value".to_owned());
 
     let secret = config.resolve_jwt_secret().expect("secret resolves");
@@ -563,8 +584,7 @@ fn resolve_jwt_secret_reads_persisted_file_when_config_is_unset() {
     clear_forge_env();
 
     let dir = tempdir().expect("tempdir");
-    let mut config = ForgeConfig::default();
-    config.forge.data_dir = dir.path().to_path_buf();
+    let config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     let secret_path = config.jwt_secret_path();
     let persisted = vec![7_u8; 32];
     fs::write(&secret_path, &persisted).expect("write secret file");
@@ -579,8 +599,7 @@ fn resolve_jwt_secret_generates_persists_and_reuses_secret_file() {
     clear_forge_env();
 
     let dir = tempdir().expect("tempdir");
-    let mut config = ForgeConfig::default();
-    config.forge.data_dir = dir.path().to_path_buf();
+    let config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     let secret_path = config.jwt_secret_path();
     assert!(!secret_path.exists());
 
@@ -602,8 +621,7 @@ fn resolve_jwt_secret_persists_file_with_restricted_permissions() {
     clear_forge_env();
 
     let dir = tempdir().expect("tempdir");
-    let mut config = ForgeConfig::default();
-    config.forge.data_dir = dir.path().to_path_buf();
+    let config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
 
     config.resolve_jwt_secret().expect("secret resolves");
 
@@ -616,7 +634,8 @@ fn resolve_jwt_secret_persists_file_with_restricted_permissions() {
 
 #[test]
 fn trusted_web_origins_include_the_serving_origin_with_both_loopback_spellings() {
-    let mut config = ForgeConfig::default();
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.bind = "127.0.0.1:8080".to_owned();
 
     let origins = config.trusted_web_origins();
@@ -628,7 +647,8 @@ fn trusted_web_origins_include_the_serving_origin_with_both_loopback_spellings()
 
 #[test]
 fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
-    let mut config = ForgeConfig::default();
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
     config.server.public_base_url = Some("https://forge.example.com/app".to_owned());
     config.server.cors_origins = vec!["https://ui.example.com".to_owned()];
 
@@ -654,6 +674,7 @@ fn clear_forge_env() {
         "FORGE_DATA_DIR",
         "FORGE_WORKSPACE_ROOT",
         "FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS",
+        "FORGE_MAX_DISCONNECT_SECONDS",
         "FORGE_AGENT_MAX_CONCURRENT_TASKS",
         "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
@@ -668,13 +689,54 @@ fn clear_forge_env() {
 }
 
 #[test]
+fn max_disconnect_defaults_and_obeys_file_env_override_precedence() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("forge.yaml");
+    assert_eq!(
+        ForgeConfig::with_data_dir(dir.path().to_path_buf())
+            .workspace
+            .max_disconnect_seconds,
+        24 * 60 * 60
+    );
+    fs::write(&path, "workspace:\n  max_disconnect_seconds: 600\n").expect("config writes");
+    let loaded = ForgeConfig::load(Some(&path), test_overrides(dir.path())).expect("file loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 600);
+    env::set_var("FORGE_MAX_DISCONNECT_SECONDS", "900");
+    let loaded = ForgeConfig::load(Some(&path), test_overrides(dir.path())).expect("env loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 900);
+    let loaded = ForgeConfig::load(
+        Some(&path),
+        ConfigOverrides {
+            workspace_max_disconnect_seconds: Some(1200),
+            ..test_overrides(dir.path())
+        },
+    )
+    .expect("override loads");
+    assert_eq!(loaded.workspace.max_disconnect_seconds, 1200);
+    clear_forge_env();
+}
+
+#[test]
+fn max_disconnect_rejects_zero() {
+    let dir = tempdir().expect("test data directory");
+    let mut config = ForgeConfig::with_data_dir(dir.path().to_path_buf());
+    config.workspace.max_disconnect_seconds = 0;
+    assert!(
+        matches!(config.validate(), Err(ConfigError::InvalidConfig { message })
+        if message.contains("max_disconnect_seconds"))
+    );
+}
+
+#[test]
 fn scaffold_command_defaults_then_file_then_env() {
     let _guard = env_lock().lock().expect("env lock poisoned");
     clear_forge_env();
 
     let dir = tempdir().expect("tempdir");
     let missing_path = dir.path().join("missing-forge.yaml");
-    let config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+    let config = ForgeConfig::load(Some(&missing_path), test_overrides(dir.path()))
         .expect("default config loads");
     assert_eq!(config.scaffold.command, crate::DEFAULT_SCAFFOLD_COMMAND);
 
@@ -684,7 +746,7 @@ fn scaffold_command_defaults_then_file_then_env() {
         "scaffold:\n  command: bun /opt/spark/packages/create-spark/src/cli.ts\n",
     )
     .expect("write config");
-    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+    let config = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
         .expect("file config loads");
     assert_eq!(
         config.scaffold.command,
@@ -692,7 +754,7 @@ fn scaffold_command_defaults_then_file_then_env() {
     );
 
     env::set_var("FORGE_SCAFFOLD_COMMAND", "/usr/local/bin/create-spark-fake");
-    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+    let config = ForgeConfig::load(Some(&config_path), test_overrides(dir.path()))
         .expect("env config loads");
     assert_eq!(config.scaffold.command, "/usr/local/bin/create-spark-fake");
 
@@ -705,19 +767,19 @@ fn consumer_stall_setting_follows_config_precedence_and_validates() {
     clear_forge_env();
     let dir = tempdir().unwrap();
     let path = dir.path().join("forge.yaml");
-    let defaults = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    let defaults = ForgeConfig::load(Some(&path), test_overrides(dir.path())).unwrap();
     assert_eq!(defaults.server.event_consumer_stall_seconds, 300);
     fs::write(&path, "server:\n  event_consumer_stall_seconds: 600\n").unwrap();
-    let file = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    let file = ForgeConfig::load(Some(&path), test_overrides(dir.path())).unwrap();
     assert_eq!(file.server.event_consumer_stall_seconds, 600);
     env::set_var("FORGE_EVENT_CONSUMER_STALL_SECONDS", "60");
-    let env_config = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    let env_config = ForgeConfig::load(Some(&path), test_overrides(dir.path())).unwrap();
     assert_eq!(env_config.server.event_consumer_stall_seconds, 60);
     let cli = ForgeConfig::load(
         Some(&path),
         ConfigOverrides {
             event_consumer_stall_seconds: Some(120),
-            ..Default::default()
+            ..test_overrides(dir.path())
         },
     )
     .unwrap();
@@ -727,8 +789,25 @@ fn consumer_stall_setting_follows_config_precedence_and_validates() {
         Some(&path),
         ConfigOverrides {
             event_consumer_stall_seconds: Some(0),
-            ..Default::default()
+            ..test_overrides(dir.path())
         }
     )
     .is_err());
+}
+
+fn test_overrides(data_dir: &std::path::Path) -> ConfigOverrides {
+    ConfigOverrides {
+        data_dir: Some(data_dir.to_path_buf()),
+        ..Default::default()
+    }
+}
+
+#[test]
+#[should_panic(expected = "a test tried to use the real Forge data directory")]
+fn default_data_dir_tripwire_panics_in_test_binary() {
+    assert_eq!(
+        env::var("FORGE_TEST_FORBID_DEFAULT_DATA_DIR").as_deref(),
+        Ok("1")
+    );
+    let _ = default_data_dir();
 }

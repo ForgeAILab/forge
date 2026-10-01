@@ -345,6 +345,22 @@ impl From<ServiceError> for McpToolError {
         let protected_cause = error.to_string();
         let mapped = match error {
             ServiceError::TurnFailure { error, .. } => return Self::from(*error),
+
+            ServiceError::PlacementUnavailable(error) => {
+                Self::new(-32029, if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE } else { "workspace placement unavailable" }).with_data(json!({
+                    "code": if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
+                    "task_id": error.task_id,
+                    "repo_id": error.repo_id,
+                    "rejected_candidates": error.rejected_candidates,
+                }))
+            }
+            ServiceError::PrepareFailed { placement_id, .. } => {
+                Self::new(-32029, "workspace preparation failed").with_data(json!({
+                    "code": "prepare_failed",
+                    "placement_id": placement_id,
+                    "failure_cause": "prepare_failed",
+                }))
+            }
             ServiceError::ExecutionSetupRequired {
                 message,
                 requirements,
@@ -482,6 +498,10 @@ impl From<ServiceError> for McpToolError {
                     "code": TERMINAL_INVALID_INPUT
                 }))
             }
+            ServiceError::DaemonNotReady { daemon_id } => Self::new(-32029, "daemon command handshake is not ready")
+                .with_data(json!({"code":"daemon_not_ready", "daemon_id":daemon_id})),
+            ServiceError::DaemonUpgradeRequired { daemon_id } => Self::new(-32029, api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE)
+                .with_data(json!({"code":api_types::DAEMON_UPGRADE_REQUIRED, "daemon_id":daemon_id, "needs_human":true})),
             ServiceError::DaemonUnavailable { daemon_id } => {
                 Self::new(-32029, format!("daemon {daemon_id} unavailable"))
                     .with_data(json!({"code": "daemon_unavailable", "daemon_id": daemon_id}))
@@ -536,6 +556,10 @@ impl From<DbError> for McpToolError {
         let protected_cause = error.to_string();
         let mapped = match error {
             DbError::NotFound => Self::new(-32004, "not found"),
+            DbError::TurnNotRetryable => Self::new(-32009, "Agent Chat turn is not retryable")
+                .with_data(json!({"code":"turn_not_retryable"})),
+            DbError::ChatTurnLive => Self::new(-32009, "another Agent Chat turn is live")
+                .with_data(json!({"code":"another_turn_live"})),
             DbError::VersionConflict => Self::new(-32009, "version conflict"),
             DbError::TaskVersionConflict {
                 expected: _,
@@ -581,5 +605,33 @@ impl From<DbError> for McpToolError {
             "MCP database failure mapped to a safe tool outcome"
         );
         mapped
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn chat_retry_and_daemon_target_errors_keep_specific_codes() {
+        for (error, code) in [
+            (DbError::TurnNotRetryable, "turn_not_retryable"),
+            (DbError::ChatTurnLive, "another_turn_live"),
+        ] {
+            let mapped = McpToolError::from(error);
+            assert_eq!(mapped.code, -32009);
+            assert_eq!(mapped.details.data.unwrap()["code"], code);
+        }
+        let mapped = McpToolError::from(ServiceError::TurnFailure {
+            failure: api_types::TurnFailure::Unclassified,
+            error: Box::new(ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            }),
+        });
+        assert_eq!(mapped.code, -32029);
+        assert_eq!(
+            mapped.details.data.unwrap()["code"],
+            api_types::DAEMON_UPGRADE_REQUIRED
+        );
     }
 }

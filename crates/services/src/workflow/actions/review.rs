@@ -16,6 +16,15 @@ use super::common::{
     update_review_status_with_authority_checks, workspace_id,
 };
 
+pub(super) async fn resolve_workspace(
+    ctx: &HookContext,
+    workspace: &db::Workspace,
+) -> crate::workspace_backend::Result<crate::workspace_backend::ResolvedWorkspace> {
+    ctx.workspace_backend_router
+        .resolve(&ctx.db, workspace)
+        .await
+}
+
 pub struct RunCiSteps;
 
 #[async_trait]
@@ -39,6 +48,14 @@ impl HookAction for RunCiSteps {
             Err(reason) => return HookResult::Failed { reason },
         };
         if ci_steps.is_empty() {
+            if let Err(error) =
+                crate::placement::admission::resolve_review_ci_attention(&ctx.db, &ctx.task_id)
+                    .await
+            {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
             return HookResult::Skipped {
                 reason: "no ci steps".to_string(),
             };
@@ -68,28 +85,27 @@ impl HookAction for RunCiSteps {
             &task,
             &task.id,
             ctx.repo_cache_locks.clone(),
+            &ctx.workspace_backend_router,
         )
         .await
         {
             Ok(workspace) => workspace,
             Err(error) => {
+                let reset = matches!(error, crate::ServiceError::WorkspaceResetRequired { .. });
+                let retry = matches!(
+                    error,
+                    crate::ServiceError::DaemonUnavailable { .. }
+                        | crate::ServiceError::DaemonTimeout { .. }
+                );
+                if reset || retry {
+                    return interrupt_ci(ctx, &task, &error.to_string(), retry, reset).await;
+                }
                 return HookResult::Failed {
                     reason: error.to_string(),
                 };
             }
         };
 
-        let review = match create_review_attempt_with_authority(
-            ctx,
-            &execution_id,
-            task.version,
-            &execution_id,
-        )
-        .await
-        {
-            Ok(review) => review,
-            Err(reason) => return HookResult::Failed { reason },
-        };
         let had_review_passed = task.review_passed_at.is_some();
         let reviewer_assignment =
             match get_role_assignment(ctx, crate::workflow::default_roles::REVIEWER).await {
@@ -104,20 +120,70 @@ impl HookAction for RunCiSteps {
         {
             Ok(environment) => environment,
             Err(reason) => {
-                cancel_review_after_authority_loss(ctx, &review, &reason).await;
                 return HookResult::Failed { reason };
             }
         };
-        let (ci_results, failed_step_index) =
-            match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps, &environment.env)
-                .await
-            {
-                Ok(result) => result,
-                Err(reason) => {
+        let resolved = match resolve_workspace(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let reason = error.to_string();
+                return HookResult::Failed { reason };
+            }
+        };
+        let review = match create_review_attempt_with_authority(
+            ctx,
+            &execution_id,
+            task.version,
+            &execution_id,
+        )
+        .await
+        {
+            Ok(review) => review,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        let (ci_results, failed_step_index) = match run_ci_steps_in_worktree(
+            &resolved,
+            &ci_steps,
+            &environment.env,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(failure) => {
+                let retry = matches!(
+                    &failure.error,
+                    crate::workspace_backend::WorkspaceBackendError::OwnerUnreachable { .. }
+                        | crate::workspace_backend::WorkspaceBackendError::RpcTimeoutBeforeStart { .. }
+                );
+                let reason = failure.error.to_string();
+                if retry && failure.completed_steps == 0 {
+                    // No command ran; this is not a Review attempt.
+                    if let Err(error) =
+                        sqlx::query("DELETE FROM review WHERE id = ? AND status = 'running'")
+                            .bind(&review.id)
+                            .execute(ctx.db.pool())
+                            .await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                } else {
                     cancel_review_after_authority_loss(ctx, &review, &reason).await;
-                    return HookResult::Failed { reason };
                 }
+                if retry || resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+                    return interrupt_ci(ctx, &task, &reason, retry, false).await;
+                }
+                return HookResult::Failed { reason };
+            }
+        };
+        if let Err(error) =
+            crate::placement::admission::resolve_review_ci_attention(&ctx.db, &ctx.task_id).await
+        {
+            return HookResult::Failed {
+                reason: error.to_string(),
             };
+        }
         let mut review_details = json!({ "ci_steps": ci_results });
         let now = now_rfc3339();
 
@@ -568,6 +634,29 @@ fn ci_failure_summary(ci_results: &Value, failed_step_index: usize) -> String {
         summary.push_str(&detail);
     }
     summary
+}
+
+async fn interrupt_ci(
+    ctx: &HookContext,
+    task: &db::Task,
+    reason: &str,
+    retry: bool,
+    reset: bool,
+) -> HookResult {
+    if !ctx.triggered_by.is_user() {
+        if let Err(error) = ctx
+            .task_service
+            .annotate_review_ci_interruption(task, ctx, reason, retry, reset)
+            .await
+        {
+            return HookResult::Failed {
+                reason: error.to_string(),
+            };
+        }
+    }
+    HookResult::Failed {
+        reason: reason.to_owned(),
+    }
 }
 
 #[cfg(test)]

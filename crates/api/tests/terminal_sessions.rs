@@ -13,7 +13,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use config::{ForgeConfig, TerminalConfig};
+use config::TerminalConfig;
 use db::{new_uuid_v4, now_rfc3339};
 use events::EventBus;
 use serde_json::{json, Value};
@@ -42,8 +42,8 @@ async fn setup(terminal: TerminalConfig) -> Harness {
 
     let workspace_root = common::TestDir::new("forge-terminal-workspaces");
     let event_bus = Arc::new(EventBus::new(256));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
-    let merge_service = Arc::new(services::MergeService::new(
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.path().to_path_buf(),
@@ -71,7 +71,7 @@ async fn setup(terminal: TerminalConfig) -> Harness {
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
     );
-    let mut config = ForgeConfig::default();
+    let mut config = (*state.effective_config).clone();
     config.workspace.root = workspace_root.path().to_path_buf();
     config.terminal = terminal;
     state = state.with_effective_config(config);

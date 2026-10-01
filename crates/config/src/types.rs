@@ -2,8 +2,8 @@ use crate::{
     default_data_dir, default_workspace_root, error::ConfigError,
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND,
+    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -129,6 +129,8 @@ pub struct ServerConfig {
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub cleanup_delay_seconds: u64,
+    #[serde(default = "default_max_disconnect_seconds")]
+    pub max_disconnect_seconds: u64,
 }
 
 /// Repository scaffolding run by Genesis provisioning when the approved
@@ -243,6 +245,7 @@ pub struct ConfigOverrides {
     pub data_dir: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub workspace_cleanup_delay_seconds: Option<u64>,
+    pub workspace_max_disconnect_seconds: Option<u64>,
     pub agent_max_concurrent_tasks: Option<u32>,
     pub agent_heartbeat_interval_seconds: Option<u64>,
     pub agent_max_missed_heartbeats: Option<u32>,
@@ -345,6 +348,11 @@ impl ForgeConfig {
                 message: "server.event_consumer_stall_seconds must be positive".to_owned(),
             });
         }
+        if self.workspace.max_disconnect_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.max_disconnect_seconds must be positive".to_owned(),
+            });
+        }
         self.terminal.validate()?;
         self.public_search.validate()?;
         self.providers.validate()
@@ -358,10 +366,16 @@ impl ForgeConfig {
 
 impl Default for ForgeConfig {
     fn default() -> Self {
+        Self::with_data_dir(default_data_dir())
+    }
+}
+
+impl ForgeConfig {
+    /// Construct defaults with an explicit data root, without resolving the user's directory.
+    #[must_use]
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            forge: ForgePaths {
-                data_dir: default_data_dir(),
-            },
+            forge: ForgePaths { data_dir },
             server: ServerConfig {
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
@@ -375,6 +389,7 @@ impl Default for ForgeConfig {
             workspace: WorkspaceConfig {
                 root: default_workspace_root(),
                 cleanup_delay_seconds: DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+                max_disconnect_seconds: DEFAULT_MAX_DISCONNECT_SECONDS,
             },
             agent: AgentDefaults {
                 max_concurrent_tasks: DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
@@ -558,6 +573,10 @@ fn default_media_upload_limit_bytes() -> u64 {
     DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
 }
 
+fn default_max_disconnect_seconds() -> u64 {
+    DEFAULT_MAX_DISCONNECT_SECONDS
+}
+
 fn parse_trusted_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     let origin = url.origin();
@@ -565,5 +584,5 @@ fn parse_trusted_origin(value: &str) -> Option<String> {
 }
 
 fn default_event_consumer_stall_seconds() -> u32 {
-    300
+    crate::DEFAULT_EVENT_CONSUMER_STALL_SECONDS
 }

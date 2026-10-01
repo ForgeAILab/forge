@@ -54,12 +54,12 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     .await
     .expect("seed test user");
 
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -226,7 +226,7 @@ pub async fn configure_execution_test_setup(
         .expect("test worker lookup")
         .expect("test worker exists");
     assert_eq!(
-        services::agent_service::compute_effective_status(db, &worker)
+        services::agent_service::compute_effective_status(db, &worker, None)
             .await
             .expect("test worker effective status"),
         services::agent_service::EffectiveStatus::Active,
@@ -238,7 +238,7 @@ pub async fn configure_execution_test_setup(
             .expect("test reviewer lookup")
             .expect("test reviewer exists");
         assert_eq!(
-            services::agent_service::compute_effective_status(db, &reviewer)
+            services::agent_service::compute_effective_status(db, &reviewer, None)
                 .await
                 .expect("test reviewer effective status"),
             services::agent_service::EffectiveStatus::Active,

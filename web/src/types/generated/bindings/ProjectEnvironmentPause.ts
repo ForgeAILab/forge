@@ -3,4 +3,4 @@
 /**
  * Persisted detail for a Project paused by a pre-launch environment failure.
  */
-export type ProjectEnvironmentPause = { checks: Array<string>, role: string | null, output: string, paused_at: string, last_checked_at: string, next_check_at: string, };
+export type ProjectEnvironmentPause = { workspace_id: string | null, checks: Array<string>, role: string | null, output: string, paused_at: string, last_checked_at: string, next_check_at: string, };

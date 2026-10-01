@@ -268,14 +268,21 @@ async fn run_daemon_loop(
         config.initial_credentials.token.clone(),
     );
     let active_executions = config.active_executions.clone();
-    let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+    let run_policy =
+        crate::daemon_config::DaemonConfig::load(config.credentials_path)?.run_policy();
+    let mut connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
         active_executions.clone(),
+        run_policy,
     ));
     loop {
         tokio::select! {
+            result = &mut connect_handle => {
+                result.context("daemon command stream task failed")??;
+                return Err(anyhow!("daemon command stream stopped unexpectedly"));
+            }
             result = tokio::signal::ctrl_c() => {
                 result.context("listen for Ctrl-C")?;
                 let _ = shutdown_tx.send(true);
@@ -553,16 +560,14 @@ fn default_forge_home() -> PathBuf {
     if let Some(path) = std::env::var_os("FORGE_DATA_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
-    if let Some(home) = home_dir() {
-        return home.join(".forge");
+    let data_dir = config::default_data_dir();
+    // Keep the client's USERPROFILE fallback when HOME is absent.
+    if std::env::var_os("HOME").is_none() {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(home).join(data_dir);
+        }
     }
-    PathBuf::from(".forge")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    data_dir
 }
 
 fn read_credentials(path: &Path) -> Result<Option<DaemonCredentials>> {

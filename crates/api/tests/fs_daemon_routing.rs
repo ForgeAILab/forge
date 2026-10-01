@@ -688,6 +688,7 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -768,6 +769,7 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -787,6 +789,70 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
         updated.error.as_deref(),
         Some("remote process failed; exit code 1")
     );
+}
+
+#[tokio::test]
+async fn task_terminal_shared_mount_routes_over_in_process_daemon_link() {
+    let base_state = test_state().await;
+    let mut config = (*base_state.effective_config).clone();
+    config.terminal.enabled = true;
+    let state = Arc::new((*base_state).clone().with_effective_config(config));
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "terminal-shared-mount", "fs_daemon_routing").await;
+    let (connection, mut outbound) =
+        services::daemon_transport::DaemonConnection::new(registration.daemon_id.clone());
+    state
+        .daemon_connections
+        .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
+    let fixture = seed_terminal_task_for_daemon(&state, &registration.daemon_id).await;
+    let create_app = app.clone();
+    let uri = format!("/api/v1/tasks/{}/terminals", fixture.task_id);
+    let creator = tokio::spawn(async move {
+        json_request_with_bearer::<CreateTerminalSessionResponse>(
+            &create_app,
+            Method::POST,
+            &uri,
+            &test_jwt(),
+            json!({"rows": 31, "cols": 101}),
+            StatusCode::CREATED,
+        )
+        .await
+    });
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), outbound.recv())
+        .await
+        .expect("terminal start reaches the placement provider")
+        .expect("daemon command link stays open");
+    let DaemonFrame::Request { id, method, params } = request else {
+        panic!("expected terminal start request");
+    };
+    assert_eq!(method, METHOD_TERMINAL_START);
+    let params: TerminalStartParams = serde_json::from_value(params).unwrap();
+    assert_eq!(params.workspace_path, fixture.workspace_path);
+    state.daemon_connections.dispatch_incoming(
+        &registration.daemon_id,
+        DaemonFrame::Response {
+            id,
+            result: serde_json::to_value(TerminalStartResult {
+                session_id: params.session_id,
+                pid: Some(4242),
+                started_at: db::now_rfc3339(),
+            })
+            .unwrap(),
+        },
+    );
+    let created = tokio::time::timeout(std::time::Duration::from_secs(2), creator)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        created.session.daemon_id.as_deref(),
+        Some(registration.daemon_id.as_str())
+    );
+    assert!(matches!(
+        created.session.status,
+        ApiTerminalSessionStatus::Running
+    ));
 }
 
 #[tokio::test]

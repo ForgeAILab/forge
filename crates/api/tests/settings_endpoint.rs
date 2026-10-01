@@ -114,15 +114,29 @@ async fn test_app(
     workspace_root: &std::path::Path,
     config_path: std::path::PathBuf,
 ) -> axum::Router {
+    let mut config: serde_yaml::Value = if config_path.exists() {
+        serde_yaml::from_str(&std::fs::read_to_string(&config_path).expect("config reads"))
+            .expect("config parses")
+    } else {
+        serde_yaml::from_str("{}").expect("empty config parses")
+    };
+    config["forge"]["data_dir"] =
+        serde_yaml::Value::String(workspace_root.join("data").to_string_lossy().into_owned());
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("config serializes"),
+    )
+    .expect("isolated config writes");
+
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     let event_bus = Arc::new(events::EventBus::new(16));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
