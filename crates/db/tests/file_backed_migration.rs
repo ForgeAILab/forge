@@ -98,7 +98,28 @@ async fn file_backed_migrations_apply_cleanly() {
     let _ = std::fs::remove_file(&db_path);
     let url = format!("sqlite://{}", db_path.display());
     let pool = create_sqlite_pool(&url).await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
+    // Test builds copy a migrated snapshot into a fresh database, so replay
+    // the bundled directory explicitly: this is the one place every migration
+    // body runs against a real file with a multi-connection WAL pool.
+    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("migrations");
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("history loads");
+    let bundled = fs::read_dir(&migrations)
+        .expect("migration directory reads")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
+        })
+        .count() as i64;
+    assert_eq!(applied, bundled);
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
 }
 
 #[tokio::test]

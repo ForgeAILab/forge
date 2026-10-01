@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+db = { path = "../db", features = ["test-template"] }
 tempfile = "3"
 
 [lints]

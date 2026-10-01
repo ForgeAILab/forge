@@ -31,7 +31,7 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 
 [dev-dependencies]
 api = { path = "../api" }
-db = { path = "../db" }
+db = { path = "../db", features = ["test-template"] }
 events = { path = "../events" }
 axum = "0.8"
 tempfile = "3"
