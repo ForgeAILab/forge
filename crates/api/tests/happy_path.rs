@@ -181,7 +181,7 @@ PY"# }
     assert_eq!(ci_steps.as_array().expect("step results array").len(), 1);
     assert_eq!(ci_steps[0]["exit_code"], 0);
 
-    let listed_tasks: PaginatedResponse<TaskResponse> = empty_request(
+    let listed_tasks: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &harness.app,
         Method::GET,
         &format!("/api/v1/projects/{project_id}/tasks"),

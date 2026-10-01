@@ -1,7 +1,8 @@
+import type { TaskListItem as Task } from '@/types/generated'
 import type {
   StateKind,
-  Task,
   TaskBlockingAnnotation,
+  TaskExecutionObservability,
   TaskResponse,
   TaskType,
   WorkflowDefinition,
@@ -41,7 +42,11 @@ export function groupByColumns(tasks: Task[], cols: BoardColumn[]): Record<strin
   return result
 }
 
-export function taskHasError(task: Task): boolean {
+type TaskAnnotationSummary = Pick<TaskResponse, 'blocked' | 'failed' | 'error_annotation'> & {
+  execution_observability?: Pick<TaskExecutionObservability, 'latest_execution_id'>
+}
+
+export function taskHasError(task: TaskAnnotationSummary): boolean {
   if (task.blocked || task.failed) return true
   if (!task.error_annotation) return false
   return !isStaleBlockingAnnotation(task)
@@ -68,12 +73,12 @@ export function getTaskWorkflowWarning(
   }
 }
 
-export function isTaskBlocked(task: TaskResponse): boolean {
+export function isTaskBlocked(task: TaskAnnotationSummary): boolean {
   if (task.blocked) return true
   return Boolean(getBlockingAnnotation(task))
 }
 
-function rawBlockingAnnotation(task: TaskResponse): TaskBlockingAnnotation | null {
+function rawBlockingAnnotation(task: TaskAnnotationSummary): TaskBlockingAnnotation | null {
   if (
     !task.error_annotation ||
     typeof task.error_annotation !== 'object' ||
@@ -85,19 +90,19 @@ function rawBlockingAnnotation(task: TaskResponse): TaskBlockingAnnotation | nul
   return task.error_annotation as TaskBlockingAnnotation
 }
 
-export function isStaleBlockingAnnotation(task: TaskResponse): boolean {
+export function isStaleBlockingAnnotation(task: TaskAnnotationSummary): boolean {
   const annotation = rawBlockingAnnotation(task)
   if (!annotation?.blocked_execution_id) return false
   const latestExecutionId = task.execution_observability?.latest_execution_id
   return Boolean(latestExecutionId && latestExecutionId !== annotation.blocked_execution_id)
 }
 
-export function getStaleBlockingAnnotation(task: TaskResponse): TaskBlockingAnnotation | null {
+export function getStaleBlockingAnnotation(task: TaskAnnotationSummary): TaskBlockingAnnotation | null {
   const annotation = rawBlockingAnnotation(task)
   return annotation && isStaleBlockingAnnotation(task) ? annotation : null
 }
 
-export function getBlockingAnnotation(task: TaskResponse): TaskBlockingAnnotation | null {
+export function getBlockingAnnotation(task: TaskAnnotationSummary): TaskBlockingAnnotation | null {
   const annotation = rawBlockingAnnotation(task)
   return annotation && !isStaleBlockingAnnotation(task) ? annotation : null
 }

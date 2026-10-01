@@ -1244,6 +1244,13 @@ pub trait RuntimeRepo: Send + Sync {
     async fn list(&self, query: RuntimeListQuery) -> Result<Page<Runtime>>;
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskExecutionProjectionQuery {
+    pub task_id: String,
+    pub current_role: Option<String>,
+    pub blocked_execution_id: Option<String>,
+}
+
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
@@ -1274,6 +1281,11 @@ pub trait ExecutionRepo: Send + Sync {
     /// concurrent insert cannot shift an older running row to another page.
     async fn list_running_by_task(&self, task_id: &str) -> Result<Vec<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;
+    /// Latest history, running occupancy, and bounded action authority for a page.
+    async fn list_task_projection_executions(
+        &self,
+        tasks: &[TaskExecutionProjectionQuery],
+    ) -> Result<Vec<Execution>>;
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -2344,6 +2356,8 @@ pub trait ExternalLinkRepo: Send + Sync {
     async fn get_by_global_id(&self, global_id: &str) -> Result<Option<TaskExternalLink>>;
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<TaskExternalLink>>;
     async fn list_by_task_id(&self, task_id: &str) -> Result<Vec<TaskExternalLink>>;
+    async fn list_latest_links_for_tasks(&self, task_ids: &[&str])
+        -> Result<Vec<TaskExternalLink>>;
     async fn list_by_integration(&self, integration_id: &str) -> Result<Vec<TaskExternalLink>>;
     async fn delete_link(&self, id: &str) -> Result<()>;
 }
@@ -3401,6 +3415,7 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
         &self,
         task_id: &str,
     ) -> std::result::Result<Vec<TaskRoleAssignment>, crate::DbError>;
+    async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TaskRoleAssignment>>;
     async fn remove(
         &self,
         task_id: &str,
@@ -3448,6 +3463,7 @@ pub trait TransitionLogRepo: Send + Sync {
         &self,
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, crate::DbError>;
+    async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>>;
     async fn count_gate_rejections(
         &self,
         task_id: &str,

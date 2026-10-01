@@ -1621,6 +1621,11 @@ eligible responses are Brotli/gzip compressed; HTML navigation responses remain
 uncached so deployments pick up the current asset graph. The production client
 keeps route screens and editor-backed dialogs behind dynamic import boundaries.
 
+HTTP request and response logs carry `client_addr` from the peer socket via
+Axum `ConnectInfo<SocketAddr>`. When supplied, `X-Forwarded-For` is recorded
+separately as `forwarded_for`; it is untrusted diagnostic metadata and does not
+change authentication or the peer address.
+
 ### Durable events and the in-process event bus
 
 Agent-critical mutations commit a monotonic `domain_event` row in the same

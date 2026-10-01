@@ -83,7 +83,7 @@ async fn forge_mvp_rest_api_flow() {
     assert_eq!(created_task.version, 4);
     let task_id = created_task.id;
 
-    let tasks: PaginatedResponse<TaskResponse> = empty_request(
+    let tasks: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &app,
         Method::GET,
         &format!("/api/v1/projects/{project_id}/tasks"),
@@ -128,7 +128,7 @@ async fn forge_mvp_rest_api_flow() {
         raw_empty_request(&app, Method::DELETE, &format!("/api/v1/tasks/{task_id}")).await;
     assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
 
-    let tasks_after_delete: PaginatedResponse<TaskResponse> = empty_request(
+    let tasks_after_delete: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &app,
         Method::GET,
         &format!("/api/v1/projects/{project_id}/tasks"),
@@ -645,7 +645,7 @@ async fn scoped_mcp_endpoint_creates_task_without_project_id_argument() {
     assert_eq!(task["title"], title);
     assert_eq!(task["description"], "created by scoped MCP endpoint e2e");
 
-    let tasks: PaginatedResponse<TaskResponse> = empty_request(
+    let tasks: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &app,
         Method::GET,
         &format!("/api/v1/projects/{project_id}/tasks"),

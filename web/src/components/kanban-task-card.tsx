@@ -12,7 +12,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
 import { getBlockingAnnotation, getStateColors, taskHasError } from '@/lib/workflow-utils'
-import type { Agent, Task } from '@/types/generated'
+import type { Agent } from '@/types/generated'
+import type { TaskListItem as Task } from '@/types/generated'
 
 export type TaskCardMenuRenderer = (task: Task) => ReactNode
 

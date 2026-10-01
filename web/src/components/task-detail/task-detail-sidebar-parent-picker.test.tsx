@@ -1,10 +1,11 @@
 import { createElement, type PropsWithChildren } from 'react'
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { filterParentTaskCandidates, useParentTaskCandidatesQuery } from './task-detail-sidebar'
 import { useAuthStore } from '@/stores/auth'
-import type { Task } from '@/types/generated'
+import type { TaskListItem, TasksResponse } from '@/types/generated'
+import { taskListItem } from '@/test-utils/task-list-item'
 
 describe('parent task candidate pagination', () => {
   afterEach(() => {
@@ -19,10 +20,16 @@ describe('parent task candidate pagination', () => {
     const fetchMock = vi.spyOn(window, 'fetch').mockImplementation(async (input) => {
       const url = new URL(input instanceof URL ? input.href : String(input))
       const cursor = url.searchParams.get('cursor')
-      const body =
+      const body: TasksResponse =
         cursor === 'cursor-2'
-          ? { items: [], next_cursor: null, has_more: false, total_count: null }
-          : { items: [], next_cursor: 'cursor-2', has_more: true, total_count: null }
+          ? { items: [], next_cursor: null, has_more: false, total_count: null, board_revision: 1 }
+          : {
+              items: [taskListItem({ title: 'Release notes' })],
+              next_cursor: 'cursor-2',
+              has_more: true,
+              total_count: null,
+              board_revision: 1,
+            }
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'content-type': 'application/json' },
@@ -42,6 +49,9 @@ describe('parent task candidate pagination', () => {
     )
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(result.current.data?.pages[0].items).toHaveLength(1))
+    expectTypeOf(result.current.data!.pages[0].items).toEqualTypeOf<TaskListItem[]>()
+    expect(result.current.data!.pages[0].items[0]).not.toHaveProperty('description')
     const firstPageUrl = new URL(String(fetchMock.mock.calls[0][0]))
     expect(firstPageUrl.pathname).toBe('/api/v1/projects/project-1/tasks')
     expect(firstPageUrl.searchParams.get('q')).toBe('release notes')
@@ -61,15 +71,15 @@ describe('parent task candidate pagination', () => {
 
   it('keeps server matches whose description, rather than title, matched the search', () => {
     const candidates = [
-      {
+      taskListItem({
         id: 'description-match',
         title: 'Prepare launch',
-        description: 'Release notes',
-        parent_task_id: null,
-      },
-      { id: 'child', title: 'Release notes child', parent_task_id: 'parent' },
-      { id: 'current', title: 'Release notes task', parent_task_id: null },
-    ] as Task[]
+      }),
+      taskListItem({ id: 'child', title: 'Release notes child', parent_task_id: 'parent' }),
+      taskListItem({ id: 'current', title: 'Release notes task' }),
+    ]
+
+    expectTypeOf(filterParentTaskCandidates(candidates, 'current')).toEqualTypeOf<TaskListItem[]>()
 
     expect(filterParentTaskCandidates(candidates, 'current').map((task) => task.id)).toEqual([
       'description-match',

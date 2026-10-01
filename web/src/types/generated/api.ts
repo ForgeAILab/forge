@@ -616,6 +616,39 @@ export interface Task {
   updated_at: string
 }
 
+// --- Project task list item (matches api_types::TaskListItemResponse) ---
+
+export interface TaskListItem {
+  id: string
+  project_id: string
+  parent_task_id: string | null
+  assignee_type: string | null
+  assignee_id: string | null
+  title: string
+  task_type: TaskType
+  status: TaskStatus
+  canonical_phase: CanonicalPhase
+  awaiting_human: boolean
+  priority: number
+  board_position: number
+  subtask_order: number | null
+  role_assignments: TaskRoleAssignmentResponse[]
+  remaining_retries: Record<string, number>
+  error_annotation: TaskAnnotation | null
+  blocked: InterruptionMetadata | null
+  failed: InterruptionMetadata | null
+  workflow_health: WorkflowHealthSummary | null
+  workflow_exception: WorkflowExceptionSummary | null
+  review_passed_at: string | null
+  archived_at: string | null
+  external_issue_number: number | null
+  external_issue_url: string | null
+  execution_observability: { latest_execution_id: string | null }
+  version: number
+  created_at: string
+  updated_at: string
+}
+
 export type TaskResponse = Task
 
 // --- Execution (matches api_types::ExecutionResponse) ---
@@ -1352,7 +1385,7 @@ export interface ReorderSubtasksRequest {
 export type ExecutionsResponse = PaginatedResponse<ExecutionSummary>
 export type AgentsResponse = PaginatedResponse<Agent>
 export type ProjectsResponse = PaginatedResponse<Project>
-export type TasksResponse = PaginatedResponse<Task> & { board_revision: number }
+export type TasksResponse = PaginatedResponse<TaskListItem> & { board_revision: number }
 
 // --- Events (matches events::ForgeEvent/EventContext) ---
 

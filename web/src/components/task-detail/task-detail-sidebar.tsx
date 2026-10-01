@@ -40,8 +40,9 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type {
   Agent,
   Execution,
-  PaginatedResponse,
   Task,
+  TaskListItem,
+  TasksResponse,
   TaskRoleAssignmentResponse,
   WorkflowDefinition,
 } from '@/types/generated'
@@ -558,7 +559,7 @@ export function useParentTaskCandidatesQuery(projectId: string, search: string, 
   return useInfiniteQuery({
     queryKey: [...qk.projectTasks(projectId), 'parent-picker', search, PARENT_TASK_PAGE_SIZE],
     queryFn: ({ signal, pageParam }) =>
-      apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
+      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
         search: {
           q: search || undefined,
           cursor: pageParam,
@@ -574,7 +575,7 @@ export function useParentTaskCandidatesQuery(projectId: string, search: string, 
   })
 }
 
-export function filterParentTaskCandidates(candidates: Task[], taskId: string): Task[] {
+export function filterParentTaskCandidates(candidates: TaskListItem[], taskId: string): TaskListItem[] {
   return candidates.filter(
     (candidate) => candidate.parent_task_id == null && candidate.id !== taskId,
   )

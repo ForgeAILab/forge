@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import type { MoveTaskResponse, Task } from '@/types/generated'
+import type { MoveTaskResponse, TaskListItem } from '@/types/generated'
+import { taskListItem } from '@/test-utils/task-list-item'
+import { emptyUsage } from '@/test-utils/usage'
 import { boardReducer, createBoardState } from '../board-reducer'
 import type { BoardSnapshot } from '../board-ordering'
 
-function task(id: string, position: number, version = 1): Task {
-  return {
+function task(id: string, position: number, version = 1): TaskListItem {
+  return taskListItem({
     id,
     project_id: 'project',
     title: id,
@@ -17,7 +19,7 @@ function task(id: string, position: number, version = 1): Task {
     version,
     created_at: '2026-07-22T00:00:00Z',
     updated_at: '2026-07-22T00:00:00Z',
-  }
+  })
 }
 
 function snapshot(revision: number, tasks = [task('a', 1), task('b', 2)]): BoardSnapshot {
@@ -70,7 +72,16 @@ describe('board reducer', () => {
     })
     state = boardReducer(state, { type: 'commit_started', snapshot: snapshot(41) })
     const response: MoveTaskResponse = {
-      task: task('b', 0, 2),
+      task: {
+        ...task('b', 0, 2),
+        execution_observability: {
+          counts: emptyUsage.counts,
+          tokens: emptyUsage.tokens,
+          cost: emptyUsage.cost,
+          total_runtime_seconds: 0,
+          latest_execution_id: 'execution-b',
+        },
+      },
       board_revision: 42,
       operation_id: 'gesture',
     }
@@ -79,5 +90,8 @@ describe('board reducer', () => {
     expect(state.phase).toBe('reconciling')
     expect(state.rendered.tasks.filter((item) => item.id === 'b')).toHaveLength(1)
     expect(state.rendered.tasks[0].id).toBe('b')
+    expect(state.rendered.tasks[0].execution_observability).toEqual({
+      latest_execution_id: 'execution-b',
+    })
   })
 })
