@@ -8,8 +8,23 @@ use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{SqliteDb, WorkspaceRepo};
 
 pub const DEFAULT_PLAN_ARTIFACT_PATH: &str = executors::OUTBOX_PLAN_FILE;
-pub const PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = "Write the implementation plan with `task.plan` (`write`) as a Markdown checklist. Forge publishes that execution-scoped candidate as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation.";
-pub const OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = "Write an implementation plan as a Markdown checklist to the file named by `$FORGE_PLAN_PATH`. Forge publishes that file as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation.";
+// Both delivery channels render the same planning doctrine.
+macro_rules! plan_instruction {
+    ($delivery:literal) => {
+        concat!(
+            $delivery,
+            " Forge publishes that execution-scoped candidate as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation. ",
+            "Name the Task's owned repository-relative paths and keep planned changes inside them. Report a required out-of-scope edit instead of widening the plan silently."
+        )
+    };
+}
+
+pub const PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = plan_instruction!(
+    "Write the implementation plan with `task.plan` (`write`) as a Markdown checklist."
+);
+pub const OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = plan_instruction!(
+    "Write an implementation plan as a Markdown checklist to the file named by `$FORGE_PLAN_PATH`."
+);
 
 pub(crate) const MAX_PLAN_ARTIFACT_SIZE_BYTES: u64 = 1_048_576;
 const PLAN_STAGE_DIR: &str = ".forge-plan-staging";

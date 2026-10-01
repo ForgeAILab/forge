@@ -59,6 +59,116 @@ struct BaselineFixture {
 }
 
 #[tokio::test]
+async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions() {
+    use db::AgentChatTurnJobRepo;
+    use services::AgentChatTurnRunner;
+    use std::sync::Arc;
+
+    let workspace = common::TestDir::new("merge-friendly-doctrine-upgrade");
+    let harness = common::test_app(workspace.path(), "merge-friendly-doctrine-upgrade").await;
+    // Model the pre-upgrade current pointers. Historical bodies remain seeded
+    // by the same immutable migrations as on an upgraded user database.
+    for (key, revision) in [
+        (
+            "forge.main.project-discovery/v2",
+            "forge.main.project-discovery/v2@5",
+        ),
+        (
+            "forge.project.orchestration/v1",
+            "forge.project.orchestration/v1@16",
+        ),
+    ] {
+        sqlx::query("UPDATE operating_skill SET current_revision_id = ? WHERE skill_key = ?")
+            .bind(revision)
+            .bind(key)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+    }
+    let genesis =
+        create_genesis_project(&harness.app, &common::test_jwt(), "doctrine-upgrade").await;
+    let main_jobs =
+        AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*harness.state.db, &genesis.main_chat_id)
+            .await
+            .unwrap();
+    let project_jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(
+        &*harness.state.db,
+        &genesis.project_chat_id,
+    )
+    .await
+    .unwrap();
+    let main_job = main_jobs
+        .iter()
+        .find(|job| {
+            job.operating_skill_revision_id.as_deref() == Some("forge.main.project-discovery/v2@5")
+        })
+        .expect("old Genesis admission");
+    let project_job = project_jobs
+        .iter()
+        .find(|job| {
+            job.operating_skill_revision_id.as_deref() == Some("forge.project.orchestration/v1@16")
+        })
+        .expect("old handoff admission");
+    let session_before: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+
+    // The fixture already seeds successor rows. Replay the actual migration
+    // with only those duplicate inserts ignored, exercising its activation
+    // and binding update against admissions made under the old pointers.
+    let migration = include_str!("../../db/migrations/V202610010500__merge_friendly_doctrine.sql")
+        .replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&migration)
+        .execute(harness.state.db.pool())
+        .await
+        .expect("doctrine upgrade");
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@17");
+    let session_after: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(session_before, session_after);
+
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    for job in [main_job, project_job] {
+        let persisted = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &job.id)
+            .await
+            .unwrap()
+            .expect("frozen admission retained");
+        assert_eq!(&persisted, job);
+        runner
+            .validate_admission_authority(&persisted)
+            .await
+            .expect("old revision resolves through the real worker after upgrade");
+    }
+}
+
+#[tokio::test]
 async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     let workspace = common::TestDir::new("v076-genesis-handoff-adoption");
     let harness = common::test_app(workspace.path(), "v076-genesis-handoff-adoption").await;

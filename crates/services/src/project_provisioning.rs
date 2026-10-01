@@ -1851,7 +1851,7 @@ async fn write_scaffold_exports(
     Ok(())
 }
 
-const FORGE_AGENTS_SECTION: &str = "## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n";
+const FORGE_AGENTS_SECTION: &str = "## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n\nKeep features in small modules with clear ownership and thin, mechanical composition; avoid shared registries, route tables, export lists, feature enums, and giant libraries that every feature must edit. Stay inside the Task's owned repository-relative paths and put new code in a new feature file instead of growing a shared one. Report a required out-of-scope edit before widening the Task.\n";
 
 async fn find_or_register_repository(
     db: &Arc<SqliteDb>,

@@ -1030,6 +1030,17 @@ fn tools_list_returns_descriptors() {
             .expect("create task description")
             .contains("shared-workspace subtask relationship"));
 
+        for phrase in [
+            "owned repository-relative paths",
+            "parallel Task files disjoint",
+            "depends_on_ids to order shared-file edits",
+        ] {
+            assert!(create_task["description"]
+                .as_str()
+                .unwrap()
+                .contains(phrase));
+        }
+
         let create_subtasks = tools
             .iter()
             .find(|tool| tool["name"] == "forge_create_sub_tasks")

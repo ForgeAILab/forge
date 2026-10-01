@@ -4,7 +4,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
     json!([
         tool_descriptor(
             "forge_create_task",
-            "Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency.",
+            "Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency. Name owned repository-relative paths in the description; keep parallel Task files disjoint and use depends_on_ids to order shared-file edits.",
             json!({
                 "project_id": { "type": "string" },
                 "title": { "type": "string" },
