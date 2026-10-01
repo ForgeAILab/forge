@@ -964,7 +964,8 @@ impl TaskService {
         admission.placement =
             WorkspacePlacementRepo::update_in_tx(&*self.db, &mut transaction, update).await?;
         sqlx::query("UPDATE workspace SET status = 'ready', branch = ?, before_sha = COALESCE(before_sha, ?),
-                worktree_path = ?, error = NULL, cleanup_after = NULL, updated_at = ? WHERE id = ?")
+                worktree_path = ?, error = NULL, cleanup_after = NULL, cleanup_attempts = 0,
+                last_cleanup_error = NULL, updated_at = ? WHERE id = ?")
             .bind(prepared.branch).bind(prepared.base_sha)
             .bind(if admission.placement.owner_kind == PlacementOwnerKind::Server { prepared.handle } else { String::new() })
             .bind(now).bind(&admission.workspace.id).execute(&mut *transaction).await?;
@@ -2141,7 +2142,8 @@ pub(super) async fn reset_daemon_workspace(
     update.disconnected_at = Some(None);
     update.failure_cause = Some(None);
     db::WorkspacePlacementRepo::update_in_tx(db, &mut transaction, update).await?;
-    sqlx::query("UPDATE workspace SET status = 'ready', before_sha = ?, branch = ?, cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE workspace SET status = 'ready', before_sha = ?, branch = ?, cleanup_after = NULL,
+            cleanup_attempts = 0, last_cleanup_error = NULL, error = NULL, updated_at = ? WHERE id = ?")
         .bind(prepared.base_sha).bind(prepared.branch).bind(now_rfc3339()).bind(&workspace.id)
         .execute(&mut *transaction).await?;
     crate::placement::admission::resolve_workspace_attention_in_tx(
@@ -4217,7 +4219,18 @@ mod tests {
             .reserve_claim_workspace(&task, Some(&agent), "coder")
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE workspace
+             SET cleanup_attempts = 3, last_cleanup_error = 'prior cleanup failure'
+             WHERE id = ?",
+        )
+        .bind(&admission.workspace.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        assert_eq!(prepared.workspace.cleanup_attempts, 0);
+        assert!(prepared.workspace.last_cleanup_error.is_none());
         // Ready reclaims don't rerun history validation or clone/worktree creation.
         sqlx::query("UPDATE workspace SET before_sha = 'obsolete-base-object' WHERE id = ?")
             .bind(&prepared.workspace.id)

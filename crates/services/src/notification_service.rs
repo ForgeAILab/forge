@@ -5,7 +5,7 @@ use db::{
     SqliteDb, TaskRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 pub struct NotificationService {
     db: Arc<SqliteDb>,
@@ -19,32 +19,43 @@ impl NotificationService {
 
     pub fn start_with_shutdown(
         self: Arc<Self>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            if *shutdown.borrow_and_update() {
-                return;
-            }
+        let receiver = self.event_bus.subscribe();
+        tokio::spawn(self.run(receiver, shutdown))
+    }
 
-            let mut rx = self.event_bus.subscribe();
-            loop {
-                tokio::select! {
-                    event = rx.recv() => {
-                        let Ok(event) = event else {
-                            break;
-                        };
-                        if let Err(error) = self.handle_event(event).await {
-                            tracing::warn!(%error, "notification service failed to handle event");
+    async fn run(
+        self: Arc<Self>,
+        mut receiver: broadcast::Receiver<ForgeEvent>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                result = receiver.recv() => {
+                    let event = match result {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped_events = skipped, "notification service event receiver lagged");
+                            continue;
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+                    if let Err(error) = self.handle_event(event).await {
+                        tracing::warn!(%error, "notification service failed to handle event");
                     }
-                    result = shutdown.changed() => {
-                        if result.is_err() || *shutdown.borrow() {
-                            break;
-                        }
+                }
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
             }
-        })
+        }
     }
 
     pub async fn create_project_hook_notification(
@@ -271,4 +282,81 @@ fn extract_review_failure_reason(step_results_json: &str) -> Option<String> {
         .and_then(|auditor| auditor.get("reason"))
         .and_then(|reason| reason.as_str())
         .map(|reason| reason.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use db::{create_sqlite_pool, run_migrations, CreateProject, ProjectRepo};
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn worker_robustness_notification_receiver_continues_after_lag() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let event_bus = Arc::new(EventBus::new(1));
+        let service = Arc::new(NotificationService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        ));
+        let project = ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: new_uuid_v4(),
+                name: "Notifications".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let receiver = event_bus.subscribe();
+        for entity_id in ["first", "second"] {
+            event_bus.publish(ForgeEvent {
+                event_type: "test.event".to_owned(),
+                entity_id: entity_id.to_owned(),
+                timestamp: event_timestamp(),
+                context: EventContext::Empty {},
+            });
+        }
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(Arc::clone(&service).run(receiver, shutdown_rx));
+
+        event_bus.publish(ForgeEvent {
+            event_type: "project.autonomy_stalled".to_owned(),
+            entity_id: project.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::ProjectAutonomyStalled {
+                project_id: project.id.clone(),
+                open_incidents: 1,
+                reason: "needs attention".to_owned(),
+            },
+        });
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM notification
+                     WHERE project_id = ? AND event_type = 'project.autonomy_stalled'",
+                )
+                .bind(&project.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                if count == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-lag event is delivered");
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
 }

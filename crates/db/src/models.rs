@@ -1084,6 +1084,8 @@ pub struct Workspace {
     pub status: WorkspaceStatus,
     pub before_sha: Option<String>,
     pub cleanup_after: Option<String>,
+    pub cleanup_attempts: i64,
+    pub last_cleanup_error: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,

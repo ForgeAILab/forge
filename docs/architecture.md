@@ -118,6 +118,16 @@ MCP endpoint, OAuth callback listener, remote-daemon connection lifecycle,
 external sync, and task-terminal transport. Solo therefore opens no TCP
 listener and does not silently start a hidden `forge` server.
 
+The heartbeat monitor isolates recoverable pass failures within a tick while
+preserving two safety dependencies: Agent timeout runs only after owner
+suspension succeeds, and WorkspaceLease expiry runs only after lease renewal
+succeeds. Placement suspension, progress warning, execution expiry,
+reservation, and placement maintenance remain independent. Notification and
+Project-hook broadcast consumers treat receiver lag as a warned delivery gap
+and continue receiving subsequent events; they exit only when their bus closes
+or runtime shutdown is requested. Durable replay remains the responsibility of
+the durable-event consumers rather than these broadcast loops.
+
 Codex Agent Chat uses app-server stdio dynamic-tool callbacks to invoke the
 same `ScopeToolComposition` and shared `CoordinationToolProvider` as native
 turns. The host resolves the persisted CLI session, verifies the admitted
@@ -2804,11 +2814,17 @@ Task branches and execution logs are retained; only
 `.codex-managed-home` (including task scratch) is removed from the Task's logs
 directory. Cleanup is deferred while any execution or WorkspaceLease is active.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
-including missing worktrees and managed homes left by older installs; failed
-workspace cleanup is also retried with backoff by the deadline worker. The sweep
-honors cleanup deadlines and grace periods, and ineligible scheduled rows have
-their deadlines cleared so they cannot starve later cleanup. Cleanup failures
-are logged by the worker and never reported as transition effect failures.
+including missing worktrees and managed homes left by older installs. The
+deadline worker snapshots a bounded set of due rows before processing them, so
+rescheduling one failed cleanup does not remove later due rows from that tick.
+Ordinary failures persist an attempt count and bounded error tail, then retry
+with exponential backoff from one minute up to one hour. An unreachable daemon
+owner keeps the fixed one-minute retry without increasing the failure count.
+The sweep honors cleanup deadlines and grace periods, and ineligible scheduled
+rows have their deadlines and retry state cleared so they cannot starve later
+cleanup. Successful cleanup and workspace reuse also clear retry state. Cleanup
+failures are logged by the worker and never reported as transition effect
+failures.
 
 Operators must not delete worktrees based on execution status. A completed or
 failed execution can belong to a Task still in `review` or `merge_failed`, whose

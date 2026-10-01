@@ -265,6 +265,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   integration tests no longer read the stored login. Test harnesses use
   temporary data directories, and a test that resolves the default data
   directory now panics with instructions (see `docs/ci.md`).
+- A failing heartbeat recovery pass no longer stops the passes after it in the
+  same tick. Two orderings are kept: Agent timeouts are not evaluated in a
+  tick where owner suspension failed, and workspace leases are not expired in
+  a tick where their renewal failed.
+- A workspace whose cleanup keeps failing is retried with exponential
+  back-off (one minute, doubling, capped at one hour) and its last error is
+  recorded, instead of being retried every minute. An unreachable daemon
+  owner keeps the fixed one-minute retry.
+- The notification and Project-hook services keep delivering after they fall
+  behind on the event bus; they used to stop until the server restarted.
 
 ### Known issues
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use db::SqliteDb;
 use events::{EventBus, EventContext, ForgeEvent};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::{NotificationService, Result, TaskService};
@@ -55,51 +55,62 @@ impl ProjectHookService {
     }
 
     fn start_inner(self: Arc<Self>, shutdown: Option<watch::Receiver<bool>>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
-                return;
-            }
+        let receiver = self.event_bus.subscribe();
+        tokio::spawn(self.run(receiver, shutdown))
+    }
 
-            let mut receiver = self.event_bus.subscribe();
-            let shutdown = wait_for_shutdown(shutdown);
-            tokio::pin!(shutdown);
-            let mut evaluations = JoinSet::new();
+    async fn run(
+        self: Arc<Self>,
+        mut receiver: broadcast::Receiver<ForgeEvent>,
+        shutdown: Option<watch::Receiver<bool>>,
+    ) {
+        if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
+            return;
+        }
 
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown => break,
-                    Some(result) = evaluations.join_next(), if !evaluations.is_empty() => {
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "project hook evaluation task failed");
-                        }
+        let shutdown = wait_for_shutdown(shutdown);
+        tokio::pin!(shutdown);
+        let mut evaluations = JoinSet::new();
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => break,
+                Some(result) = evaluations.join_next(), if !evaluations.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "project hook evaluation task failed");
                     }
-                    result = receiver.recv() => {
-                        let Ok(event) = result else {
-                            break;
-                        };
-                        let Some((project_id, cause)) = evaluation_cause_from_event(&event) else {
+                }
+                result = receiver.recv() => {
+                    let event = match result {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped_events = skipped, "project hook event receiver lagged");
                             continue;
-                        };
-                        let service = Arc::clone(&self);
-                        evaluations.spawn(async move {
-                            if let Err(error) = service.evaluate_for_project(project_id, cause).await {
-                                tracing::warn!(%error, "project hook evaluation failed");
-                            }
-                        });
-                    }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+                    let Some((project_id, cause)) = evaluation_cause_from_event(&event) else {
+                        continue;
+                    };
+                    let service = Arc::clone(&self);
+                    evaluations.spawn(async move {
+                        if let Err(error) = service.evaluate_for_project(project_id, cause).await {
+                            tracing::warn!(%error, "project hook evaluation failed");
+                        }
+                    });
                 }
             }
+        }
 
-            // A shutdown can race with a child evaluation that is blocked on
-            // storage or an action. Do not drop the JoinSet with work still
-            // in flight: abort and join every child before the worker exits.
-            evaluations.abort_all();
-            while let Some(result) = evaluations.join_next().await {
-                if let Err(error) = result {
-                    tracing::debug!(%error, "project hook evaluation task stopped");
-                }
+        // A shutdown can race with a child evaluation that is blocked on
+        // storage or an action. Do not drop the JoinSet with work still
+        // in flight: abort and join every child before the worker exits.
+        evaluations.abort_all();
+        while let Some(result) = evaluations.join_next().await {
+            if let Err(error) = result {
+                tracing::debug!(%error, "project hook evaluation task stopped");
             }
-        })
+        }
     }
 
     pub async fn evaluate_for_project(

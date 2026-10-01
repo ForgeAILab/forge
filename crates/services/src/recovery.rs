@@ -483,18 +483,130 @@ impl HeartbeatMonitor {
         // Heartbeat staleness can precede the socket's close/timeout. Persist
         // owner suspension before Agent or WorkspaceLease recovery sees it.
         let now = now_rfc3339();
-        for execution in ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await? {
-            if !is_unclaimed_dispatch_marker(&execution, &now) {
-                if let Err(error) =
-                    suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await
-                {
-                    tracing::warn!(execution_id = %execution.id, %error, "owner suspension remains pending");
+        let owner_suspension = async {
+            for execution in ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await? {
+                if !is_unclaimed_dispatch_marker(&execution, &now) {
+                    if let Err(error) =
+                        suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await
+                    {
+                        tracing::warn!(execution_id = %execution.id, %error, "owner suspension remains pending");
+                    }
                 }
             }
+            Ok::<(), ServiceError>(())
         }
+        .await;
+        let owner_suspension_succeeded = match owner_suspension {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "expired owner suspension pass failed");
+                false
+            }
+        };
         if let Err(error) = self.suspend_unreachable_placements().await {
             tracing::warn!(%error, "placement suspension remains pending");
         }
+        let timed_out = self
+            .check_agent_timeouts_for_tick(owner_suspension_succeeded)
+            .await;
+
+        if timed_out > 0 {
+            tracing::info!(
+                timed_out_agents = timed_out,
+                "heartbeat monitor detected timed out agents"
+            );
+        }
+        let workspace_lease_renewal_succeeded = match renew_workspace_leases(&self.db).await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "workspace lease renewal pass failed");
+                false
+            }
+        };
+        let progress_warnings = match self.check_stale_progress().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "execution progress warning pass failed");
+                0
+            }
+        };
+        let stalled = match self.check_stalled_executions().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "execution owner lease expiry pass failed");
+                0
+            }
+        };
+        let expired = self
+            .expire_workspace_leases_for_tick(workspace_lease_renewal_succeeded)
+            .await;
+        // Owner RPCs run after the core liveness pass. A bad placement cannot
+        // abort heartbeat recovery, and each owner gets a bounded attempt.
+        let reservations =
+            match crate::placement::admission::sweep_expired_reservations(&self.db, &now).await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::warn!(%error, "reservation sweep remains pending");
+                    0
+                }
+            };
+        let placements = match self.check_workspace_placements().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "placement sweep remains pending");
+                0
+            }
+        };
+        Ok(reservations + placements + timed_out + progress_warnings + stalled + expired)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn check_timeouts(&self) -> Result<()> {
+        self.check_once().await.map(|_| ())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_busy_agents(&self) -> Result<Vec<Agent>> {
+        let mut agents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = AgentRepo::list(
+                &*self.db,
+                AgentListQuery {
+                    status: Some(AgentStatus::Busy),
+                    executor_type: None,
+                    capabilities: Vec::new(),
+                    page: page_request(cursor),
+                },
+            )
+            .await?;
+            agents.extend(page.items);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(agents)
+    }
+
+    async fn check_agent_timeouts_for_tick(&self, owner_suspension_succeeded: bool) -> u64 {
+        if !owner_suspension_succeeded {
+            tracing::warn!(
+                "agent heartbeat timeout pass skipped because expired owner suspension failed"
+            );
+            return 0;
+        }
+
+        match self.check_agent_timeouts().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "agent heartbeat timeout pass failed");
+                0
+            }
+        }
+    }
+
+    async fn check_agent_timeouts(&self) -> Result<u64> {
         let agents = self.list_busy_agents().await?;
         let mut timed_out = 0;
 
@@ -580,70 +692,32 @@ impl HeartbeatMonitor {
             timed_out += 1;
         }
 
-        if timed_out > 0 {
-            tracing::info!(
-                timed_out_agents = timed_out,
-                "heartbeat monitor detected timed out agents"
+        Ok(timed_out)
+    }
+
+    async fn expire_workspace_leases_for_tick(&self, renewal_succeeded: bool) -> u64 {
+        if !renewal_succeeded {
+            tracing::warn!(
+                "workspace lease expiry pass skipped because workspace lease renewal failed"
             );
+            return 0;
         }
-        renew_workspace_leases(&self.db).await?;
-        let progress_warnings = self.check_stale_progress().await?;
-        let stalled = self.check_stalled_executions().await?;
-        let expired = expire_workspace_leases(
+
+        match expire_workspace_leases(
             &self.db,
             &self.event_bus,
             self.task_executor.as_deref(),
             self.task_service.as_deref(),
             true,
         )
-        .await?;
-        // Owner RPCs run after the core liveness pass. A bad placement cannot
-        // abort heartbeat recovery, and each owner gets a bounded attempt.
-        let reservations =
-            match crate::placement::admission::sweep_expired_reservations(&self.db, &now).await {
-                Ok(count) => count,
-                Err(error) => {
-                    tracing::warn!(%error, "reservation sweep remains pending");
-                    0
-                }
-            };
-        let placements = match self.check_workspace_placements().await {
+        .await
+        {
             Ok(count) => count,
             Err(error) => {
-                tracing::warn!(%error, "placement sweep remains pending");
+                tracing::warn!(%error, "workspace lease expiry pass failed");
                 0
             }
-        };
-        Ok(reservations + placements + timed_out + progress_warnings + stalled + expired)
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn check_timeouts(&self) -> Result<()> {
-        self.check_once().await.map(|_| ())
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_busy_agents(&self) -> Result<Vec<Agent>> {
-        let mut agents = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = AgentRepo::list(
-                &*self.db,
-                AgentListQuery {
-                    status: Some(AgentStatus::Busy),
-                    executor_type: None,
-                    capabilities: Vec::new(),
-                    page: page_request(cursor),
-                },
-            )
-            .await?;
-            agents.extend(page.items);
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
-            }
         }
-        Ok(agents)
     }
 
     async fn check_stalled_executions(&self) -> Result<u64> {
@@ -2519,7 +2593,7 @@ pub(crate) async fn apply_owner_cleanup(
                 placement_update(&placement, PlacementState::Cleaned, None),
             )
             .await?;
-            sqlx::query("UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?")
+            sqlx::query("UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, cleanup_attempts = 0, last_cleanup_error = NULL, error = NULL, updated_at = ? WHERE id = ?")
                 .bind(now_rfc3339()).bind(&placement.workspace_id).execute(&mut *transaction).await?;
             transaction.commit().await?;
             return Ok(DaemonTerminalDisposition::Acknowledge);
@@ -5786,6 +5860,116 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_skips_agent_timeout_when_owner_suspension_fails() {
+        let db = Arc::new(sqlite_db().await);
+        let agent = seed_agent(
+            &db,
+            AgentStatus::Busy,
+            Some("1970-01-01T00:00:00+00:00".to_owned()),
+        )
+        .await;
+        let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(16)));
+
+        assert_eq!(monitor.check_agent_timeouts_for_tick(false).await, 0);
+        assert_eq!(
+            AgentRepo::get_by_id(&*db, &agent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_skips_workspace_lease_expiry_when_renewal_fails() {
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::new(16));
+        let (task, placement, execution) = daemon_owned_fixture(&db).await;
+        let grant = expired_owner_grant(&db, &task, &placement, &execution).await;
+        let monitor = HeartbeatMonitor::new(db.clone(), bus);
+
+        assert_eq!(monitor.expire_workspace_leases_for_tick(false).await, 0);
+        assert_eq!(
+            WorkspaceLeaseRepo::get_by_id(&*db, &grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_robustness_heartbeat_runs_lease_expiry_after_early_failure() {
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::new(32));
+        let (task, placement, execution) = daemon_owned_fixture(&db).await;
+        let ready = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let db::ExecutionLeaseMutation::Updated(execution) = ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: execution.lease_owner.clone().unwrap(),
+                lease_expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: execution.hard_deadline_at.clone(),
+                now: now.to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("execution lease updates");
+        };
+        let grant = expired_owner_grant(&db, &task, &ready, &execution).await;
+        sqlx::query(
+            "UPDATE agent_identity
+             SET status = 'busy', heartbeat_interval_seconds = 'invalid'
+             WHERE id = ?",
+        )
+        .bind(execution.agent_id.as_deref().unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        HeartbeatMonitor::new(db.clone(), bus)
+            .check_once()
+            .await
+            .expect("later heartbeat passes still run");
+
+        assert_eq!(
+            WorkspaceLeaseRepo::get_by_id(&*db, &grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_owned_workspace_lease_expiry_before_socket_disconnect_reconciles_terminal_once()
     {
         assert_owner_disconnect_order(false).await;
@@ -7165,6 +7349,15 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE workspace
+             SET cleanup_attempts = 4, last_cleanup_error = 'prior cleanup failure'
+             WHERE id = ?",
+        )
+        .bind(&placement.workspace_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let mut report: api_types::WorkspaceCleanupResult = serde_json::from_value(json!({
             "entry_id": new_uuid_v4(), "operation_id": new_uuid_v4(),
             "workspace_handle": placement.workspace_handle, "generation": 2, "cleaned": true,
@@ -7212,14 +7405,13 @@ pub(crate) mod tests {
                 .state,
             PlacementState::Cleaned
         );
-        assert_eq!(
-            WorkspaceRepo::get_by_id(&*db, &placement.workspace_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            WorkspaceStatus::Cleaned
-        );
+        let workspace = WorkspaceRepo::get_by_id(&*db, &placement.workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+        assert_eq!(workspace.cleanup_attempts, 0);
+        assert!(workspace.last_cleanup_error.is_none());
     }
 
     #[tokio::test]
