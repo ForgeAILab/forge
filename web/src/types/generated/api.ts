@@ -233,6 +233,8 @@ export interface TaskRoleAssignmentResponse {
   updated_at: string
 }
 
+export type EffectiveCoderSource = 'own' | 'inherited_from_root'
+
 export interface RetryBudgets {
   review?: number | null
   merge_fix?: number | null
@@ -590,6 +592,8 @@ export interface Task {
   board_position: number
   subtask_order?: number | null
   role_assignments: TaskRoleAssignmentResponse[]
+  effective_coder: TaskRoleAssignmentResponse | null
+  effective_coder_source: EffectiveCoderSource | null
   remaining_retries: Record<string, number>
   execution_actions?: ExecutionAction[]
   awaiting_human?: boolean

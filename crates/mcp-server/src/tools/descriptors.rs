@@ -304,12 +304,12 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_create_sub_tasks",
-            "Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; children share its workspace, run serially in array order, and can be assigned to different agents. Responses include each child's role_assignments. Array order is not a dependency graph.",
+            "Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; its coder is retained as the default worker, while children may override it. Children share the root workspace and run serially in array order. Responses include each child's stored role_assignments. Array order is not a dependency graph.",
             json!({
                 "parent_task_id": { "type": "string", "description": "Root coordination task; nested subtasks are not supported" },
                 "subtasks": {
                     "type": "array",
-                    "description": "Children in execution order. Assign implementation agents per child, not to the coordination root.",
+                    "description": "Children in execution order. A child assignee overrides the coordination root's coder default worker.",
                     "items": {
                         "type": "object",
                         "properties": {

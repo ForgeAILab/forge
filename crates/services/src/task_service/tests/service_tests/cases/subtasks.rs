@@ -25,6 +25,7 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
     let root = service
         .create_task(
             project_id.clone(),
@@ -39,6 +40,14 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
         )
         .await
         .expect("root task creates");
+    service
+        .reassign_role(
+            role_assignment_input(&root.id, "coder", Some(agent_id.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("root coder assignment succeeds");
 
     let subtask = service
         .create_task(
@@ -57,6 +66,18 @@ async fn create_task_assigns_subtask_order_and_rejects_nested_subtask() {
 
     assert_eq!(subtask.parent_task_id.as_deref(), Some(root.id.as_str()));
     assert_eq!(subtask.subtask_order, Some(0));
+    let root_coder = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &root.id, "coder")
+        .await
+        .expect("root coder loads")
+        .expect("root coder is retained");
+    assert_eq!(root_coder.assignee_id.as_deref(), Some(agent_id.as_str()));
+    assert!(
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &subtask.id, "coder")
+            .await
+            .expect("child coder loads")
+            .is_none(),
+        "conversion must not copy the default worker onto the child"
+    );
 
     let result = service
         .create_task(
@@ -126,6 +147,11 @@ async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_at
         .await
         .expect("subtask roles load");
     assert!(subtask_roles.is_empty());
+    let root_coder = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &root.id, "coder")
+        .await
+        .expect("root coder loads")
+        .expect("root coder remains the default worker");
+    assert_eq!(root_coder.assignee_id.as_deref(), Some(agent_a.as_str()));
 
     let after = TaskRepo::list_subtasks_ordered(&*db, &root.id)
         .await

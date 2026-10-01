@@ -1238,15 +1238,9 @@ impl SqliteDb {
         } else {
             input.agent_id.clone()
         };
-        let assignment = sqlx::query(
-            "SELECT id, assignee_type, assignee_id, updated_at
-             FROM task_role_assignment
-             WHERE task_id = ? AND role_name = ?",
-        )
-        .bind(task_id)
-        .bind(assignment_role)
-        .fetch_optional(&mut **transaction)
-        .await?;
+        let assignment =
+            task::effective_execution_assignment_in_tx(transaction, task_id, assignment_role)
+                .await?;
         // ReviewRunner's CI-only pass is a deliberately synthetic reviewer:
         // it has no Agent principal and therefore no assignment row to
         // compare. Keep this exception scoped to the canonical reviewer

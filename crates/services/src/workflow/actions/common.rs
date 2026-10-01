@@ -3,7 +3,7 @@ use std::sync::Arc;
 use db::{
     new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
     ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    TaskRoleAssignment, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
@@ -26,11 +26,11 @@ pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
 ) -> Result<Option<TaskRoleAssignment>, String> {
-    match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role).await {
-        Ok(assignment) => Ok(assignment),
-        Err(DbError::NotFound) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let task = task(ctx).await?;
+    crate::task_hierarchy::effective_role_assignment(&ctx.db, &task, role)
+        .await
+        .map(|resolved| resolved.map(|resolved| resolved.assignment))
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {

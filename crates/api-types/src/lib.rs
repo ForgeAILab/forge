@@ -125,6 +125,7 @@ fn export_typescript() {
     Task::export().expect("export Task");
     TaskAction::export().expect("export TaskAction");
     TaskActionsResponse::export().expect("export TaskActionsResponse");
+    EffectiveCoderSource::export().expect("export EffectiveCoderSource");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
     RecoveryAction::export().expect("export RecoveryAction");

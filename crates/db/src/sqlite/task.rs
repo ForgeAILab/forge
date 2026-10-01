@@ -5,6 +5,37 @@ use crate::{
 };
 use std::collections::HashSet;
 
+/// Load the assignment that authorizes an execution while holding the same
+/// writer transaction that will create it. Coder rows resolve child first,
+/// then direct parent; every other role remains Task-local.
+pub(super) async fn effective_execution_assignment_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<Option<SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT assignment.id,
+                assignment.assignee_type,
+                assignment.assignee_id,
+                assignment.updated_at
+         FROM task
+         JOIN task_role_assignment AS assignment
+           ON assignment.role_name = ?
+          AND (assignment.task_id = task.id
+               OR (? = 'coder'
+                   AND task.parent_task_id IS NOT NULL
+                   AND assignment.task_id = task.parent_task_id))
+         WHERE task.id = ?
+         ORDER BY CASE WHEN assignment.task_id = task.id THEN 0 ELSE 1 END
+         LIMIT 1",
+    )
+    .bind(role_name)
+    .bind(role_name)
+    .bind(task_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
@@ -118,6 +149,11 @@ async fn latest_execution_authority_matches_in_tx(
             {
                 return Ok(false);
             }
+        } else if assignment_role == "coder" && task.parent_task_id.is_some() {
+            // Mirrors `TaskService::execution_owns_current_role_attempt`: an
+            // inherited root default worker is admission authority, not live
+            // ownership, so a started child with no coder of its own keeps
+            // its current attempt through completion.
         } else if authority.agent_id.is_some() {
             return Ok(false);
         }
@@ -1964,14 +2000,11 @@ impl TaskRepo for SqliteDb {
                 } else {
                     input.execution.role.as_str()
                 };
-                let assignment = sqlx::query(
-                    "SELECT id, assignee_type, assignee_id, updated_at
-                     FROM task_role_assignment
-                     WHERE task_id = ? AND role_name = ?",
+                let assignment = effective_execution_assignment_in_tx(
+                    transaction,
+                    &input.task_id,
+                    assignment_role,
                 )
-                .bind(&input.task_id)
-                .bind(assignment_role)
-                .fetch_optional(&mut **transaction)
                 .await?;
                 match (
                     admission.expected_assignment_id.as_deref(),

@@ -3,8 +3,8 @@
 #[cfg(test)]
 use std::collections::HashSet;
 
-use api_types::{CanonicalPhase, StateKind, WorkflowDefinition};
-use db::{ProjectRepo, SqliteDb, Task, TaskRepo};
+use api_types::{CanonicalPhase, EffectiveCoderSource, StateKind, WorkflowDefinition};
+use db::{ProjectRepo, SqliteDb, Task, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo};
 use sqlx::SqliteConnection;
 
 use crate::{
@@ -55,7 +55,8 @@ impl<'a> RootRolePolicy<'a> {
 
     /// Return whether `role` may be assigned to a coordination root.
     pub(crate) fn allows_assignment(&self, role: &str) -> bool {
-        self.implementation_role() != Some(role) && self.is_aggregate_review_role(role)
+        role == crate::workflow::default_roles::CODER
+            || (self.implementation_role() != Some(role) && self.is_aggregate_review_role(role))
     }
 
     /// Return the only role that may execute on a coordination root in
@@ -74,14 +75,83 @@ impl<'a> RootRolePolicy<'a> {
 
     /// Return whether `role` may execute on a coordination root in `state_name`.
     pub(crate) fn allows_execution(&self, state_name: &str, role: &str) -> bool {
-        self.execution_role_for_state(state_name) == Some(role)
+        role != crate::workflow::default_roles::CODER
+            && self.implementation_role() != Some(role)
+            && self.execution_role_for_state(state_name) == Some(role)
     }
 }
 
 /// Error returned when a role may not be assigned to a coordination root.
 pub(crate) fn root_assignment_denied() -> ServiceError {
     ServiceError::invalid_operation(
-        "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
+        "coordination roots accept only the coder default worker and aggregate review roles",
+    )
+}
+
+/// A Task's resolved coder assignment and the row that supplied it.
+#[derive(Debug, Clone)]
+pub struct EffectiveCoderAssignment {
+    pub assignment: TaskRoleAssignment,
+    pub source: EffectiveCoderSource,
+}
+
+/// Resolve coder authority without materializing inherited rows on children.
+///
+/// A child's own row wins even when its assignee is empty. Only the absence of
+/// an own row falls back to the direct coordination root.
+pub async fn effective_coder_assignment(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    if let Some(assignment) = TaskRoleAssignmentRepo::get_by_task_and_role(
+        db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await?
+    {
+        return Ok(Some(EffectiveCoderAssignment {
+            assignment,
+            source: EffectiveCoderSource::Own,
+        }));
+    }
+
+    let Some(parent_task_id) = task.parent_task_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(TaskRoleAssignmentRepo::get_by_task_and_role(
+        db,
+        parent_task_id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await?
+    .map(|assignment| EffectiveCoderAssignment {
+        assignment,
+        source: EffectiveCoderSource::InheritedFromRoot,
+    }))
+}
+
+/// Resolve an execution role, applying root inheritance only to `coder`.
+pub async fn effective_role_assignment(
+    db: &SqliteDb,
+    task: &Task,
+    role: &str,
+) -> Result<Option<EffectiveCoderAssignment>> {
+    let canonical_role = if role == "executor" {
+        crate::workflow::default_roles::CODER
+    } else {
+        role
+    };
+    if canonical_role == crate::workflow::default_roles::CODER {
+        return effective_coder_assignment(db, task).await;
+    }
+    Ok(
+        TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, canonical_role)
+            .await?
+            .map(|assignment| EffectiveCoderAssignment {
+                assignment,
+                source: EffectiveCoderSource::Own,
+            }),
     )
 }
 
@@ -462,14 +532,14 @@ mod tests {
     }
 
     #[test]
-    fn task_hierarchy_root_role_policy_allows_only_aggregate_review() {
+    fn task_hierarchy_root_role_policy_allows_default_worker_and_aggregate_review() {
         let mut workflow = crate::workflow::default_workflow::default_workflow();
         let policy = RootRolePolicy::for_workflow(&workflow);
 
         assert_eq!(policy.implementation_role(), Some("coder"));
         assert!(policy.is_aggregate_review_role("reviewer"));
         assert!(policy.allows_assignment("reviewer"));
-        assert!(!policy.allows_assignment("coder"));
+        assert!(policy.allows_assignment("coder"));
         assert!(!policy.allows_assignment("planner"));
 
         workflow
@@ -480,7 +550,8 @@ mod tests {
             .role = Some("coder".to_owned());
         let policy = RootRolePolicy::for_workflow(&workflow);
         assert!(policy.is_aggregate_review_role("coder"));
-        assert!(!policy.allows_assignment("coder"));
+        assert!(policy.allows_assignment("coder"));
+        assert!(!policy.allows_execution(default_states::REVIEW, "coder"));
     }
 
     #[test]

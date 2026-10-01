@@ -80,6 +80,8 @@ function task(
         updated_at: '',
       },
     ],
+    effective_coder: null,
+    effective_coder_source: null,
     remaining_retries: {},
     version: 1,
     created_at: '',

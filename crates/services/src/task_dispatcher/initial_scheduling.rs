@@ -179,14 +179,18 @@ impl TaskDispatcher {
                 continue;
             }
             // Creation gives a Task the Project's default assignees, so a Task
-            // with no role assignment at all was proposed before those
-            // defaults existed in Project settings (e.g. while the Project
-            // was still paused for having no repository). Apply them now
-            // rather than skipping the Task on every scan with nothing in
-            // the log.
+            // with neither stored assignments nor an inherited root coder was
+            // proposed before those defaults existed in Project settings
+            // (e.g. while the Project was still paused for having no
+            // repository). Apply them now rather than skipping the Task on
+            // every scan with nothing in the log. An inherited coder must not
+            // be materialized as a child assignment here.
             if TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
                 .await?
                 .is_empty()
+                && crate::task_hierarchy::effective_coder_assignment(&self.db, &task)
+                    .await?
+                    .is_none()
             {
                 if let Err(error) = self.task_service.assign_project_default_roles(&task).await {
                     tracing::warn!(task_id = %task.id, %error, "Task has no role assignments and the Project defaults could not be applied");
@@ -370,8 +374,9 @@ impl TaskDispatcher {
                 return Ok(None);
             };
             let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
+                crate::task_hierarchy::effective_role_assignment(&self.db, task, role_name)
+                    .await?
+                    .map(|resolved| resolved.assignment);
             match assignment {
                 Some(assignment)
                     if assignment.assignee_type == Some(db::AssigneeKind::Agent)

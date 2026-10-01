@@ -842,3 +842,89 @@ async fn metadata_increment_and_compare_mutate_are_atomic_and_conditional() {
     assert_eq!(no_op.updated_at, cleared.updated_at);
     assert_eq!(no_op.metadata_json, cleared.metadata_json);
 }
+
+#[tokio::test]
+async fn latest_execution_claim_accepts_a_child_running_under_the_inherited_root_worker() {
+    let db = database().await;
+    let project_id = new_uuid_v4();
+    let root_id = new_uuid_v4();
+    let child_id = new_uuid_v4();
+    let standalone_id = new_uuid_v4();
+    let time = "2026-09-30T00:00:00Z";
+    project(&db, &project_id, time).await;
+    task(&db, &project_id, &root_id, time).await;
+    task(&db, &project_id, &child_id, time).await;
+    task(&db, &project_id, &standalone_id, time).await;
+    sqlx::query("UPDATE task SET parent_task_id = ?, status = 'in_progress' WHERE id = ?")
+        .bind(&root_id)
+        .bind(&child_id)
+        .execute(db.pool())
+        .await
+        .expect("child links to root");
+    TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: root_id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some("agent-root-worker".to_owned()),
+            created_at: time.to_owned(),
+            updated_at: time.to_owned(),
+        },
+    )
+    .await
+    .expect("root default worker assigns");
+
+    let project_version = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .version;
+    let completed_at = "2026-09-30T00:05:00Z";
+    let mut claims = Vec::new();
+    for task_id in [&child_id, &standalone_id] {
+        let execution_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO execution (id, task_id, role, status, created_at, updated_at)
+             VALUES (?, ?, 'coder', 'completed', ?, ?)",
+        )
+        .bind(&execution_id)
+        .bind(task_id)
+        .bind(time)
+        .bind(completed_at)
+        .execute(db.pool())
+        .await
+        .expect("execution seeds");
+        let task = TaskRepo::get_by_id(&db, task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        claims.push(
+            TaskRepo::claim_metadata_for_latest_execution(
+                &db,
+                db::LatestExecutionMetadataClaim {
+                    task_id: task_id.clone(),
+                    expected_task_version: task.version,
+                    authority: db::LatestExecutionAuthority {
+                        execution_id,
+                        role: "coder".to_owned(),
+                        agent_id: Some("agent-root-worker".to_owned()),
+                        execution_updated_at: completed_at.to_owned(),
+                        expected_project_version: project_version,
+                    },
+                    key: "plan_publication_claim".to_owned(),
+                    value: json!({"claimed": true}),
+                    updated_at: completed_at.to_owned(),
+                },
+            )
+            .await,
+        );
+    }
+
+    // The child has no coder of its own; the root's default worker admitted
+    // it, so its completed attempt keeps authority through settlement.
+    assert!(claims[0].is_ok(), "child claim failed: {:?}", claims[0]);
+    // A standalone Task has no inherited authority to fall back on.
+    assert!(matches!(claims[1], Err(DbError::VersionConflict)));
+}

@@ -1204,9 +1204,9 @@ impl TaskService {
         let Some(role) = role else {
             return Ok(None);
         };
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+        crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
             .await
-            .map_err(Into::into)
+            .map(|resolved| resolved.map(|resolved| resolved.assignment))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -8,6 +8,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Assigning `coder` on a coordination root now sets the default worker for
+  subtasks instead of returning an error; converting a Task into a
+  coordination root keeps its `coder` assignment instead of deleting it.
 - Projects now default to `settings.max_active_tasks = 5`, including existing
   Projects. Planning, implementation, review, merging, and conflict repair
   hold slots unless parked; new admission also stops at twice the limit parked.

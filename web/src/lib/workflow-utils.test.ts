@@ -123,6 +123,8 @@ describe('task interruption annotations', () => {
       priority: 0,
       board_position: 0,
       role_assignments: [],
+      effective_coder: null,
+      effective_coder_source: null,
       remaining_retries: {},
       blocked: null,
       failed: null,
