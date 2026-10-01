@@ -38,7 +38,18 @@ struct Migration {
     path: PathBuf,
 }
 
+#[cfg(feature = "test-template")]
+mod template;
+
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    #[cfg(feature = "test-template")]
+    if template::try_restore(pool).await? {
+        return Ok(());
+    }
+    run_migrations_replay(pool).await
+}
+
+async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     ensure_migration_table(pool).await?;
 
     let mut migrations: Vec<(Migration, String)> = MIGRATIONS_DIR
@@ -382,18 +393,16 @@ async fn pending_migrations<T>(
     Ok(pending)
 }
 
-async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        r#"
+const MIGRATION_TABLE_SQL: &str = r#"
         CREATE TABLE IF NOT EXISTS _migration (
             version     INTEGER PRIMARY KEY,
             name        TEXT NOT NULL,
             applied_at  TEXT NOT NULL
         )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+        "#;
+
+async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(MIGRATION_TABLE_SQL).execute(pool).await?;
     Ok(())
 }
 

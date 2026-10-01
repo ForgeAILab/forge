@@ -25,5 +25,6 @@ uuid = "1"
 workspace = true
 
 [dev-dependencies]
+db = { path = "../db", features = ["test-template"] }
 forge-agent-host = { path = "../agent-host" }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }

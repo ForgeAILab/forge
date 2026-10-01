@@ -7,6 +7,10 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Test processes share a migrated image; normal builds retain migration replay.
+test-template = ["dep:rusqlite", "dep:tempfile", "dep:tokio"]
+
 [dependencies]
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -21,7 +25,13 @@ hex = "0.4"
 include_dir = "0.7"
 sha2 = "0.11"
 
+# Keep the same libsqlite3-sys version as sqlx 0.8; no raw/unsafe handles.
+rusqlite = { version = "0.32.1", default-features = false, features = ["backup"], optional = true }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+
 [dev-dependencies]
+db = { path = ".", features = ["test-template"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 workspace = { path = "../workspace" }
 sha2 = "0.11"

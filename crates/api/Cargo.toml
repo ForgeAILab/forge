@@ -44,7 +44,7 @@ async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cli-adapters = { path = "../cli-adapters" }
-db = { path = "../db" }
+db = { path = "../db", features = ["test-template"] }
 events = { path = "../events" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -36,3 +36,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Migration replay and DB-backed tests spend most of their time in these crates.
+# The test profile inherits dev package overrides; workspace code stays in debug.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.dev.package.sqlx-sqlite]
+opt-level = 3
+
+[profile.dev.package.sqlx-core]
+opt-level = 3
