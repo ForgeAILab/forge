@@ -7,6 +7,11 @@ pushes do not trigger it, so a PR runs the suite once. A newer run cancels an
 unfinished pull-request run for the same PR. Every `main` commit keeps its own
 run, because a release tag needs a successful run on its exact commit.
 
+`.cargo/config.toml` sets `RUST_MIN_STACK` to 16 MiB for every `cargo`
+invocation, local and CI, so test threads have the same stack as the server's
+runtime threads. With the default 2 MiB a deep dispatch future aborts the whole
+test binary on Linux, and the tests after it never run.
+
 The [release workflow](../.github/workflows/release.yml) does not re-run the
 Rust or web test suites. Its `verify-ci` gate looks up the CI run for the
 tagged commit on `main` and waits for it to finish, so a tag can be pushed
