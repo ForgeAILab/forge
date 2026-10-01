@@ -1,4 +1,3 @@
-use super::workspace::prepare_workspace_owned;
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
 use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
@@ -174,14 +173,11 @@ impl TaskService {
             admission
         });
         let previous_status = task.status.clone();
-        let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
-            &self.db,
-            &self.workspace_root,
-            &task,
-            &task_id,
-            self.repo_cache_locks.clone(),
-        )
-        .await?;
+        let workspace_admission = self
+            .reserve_claim_workspace(&task, agent.as_ref(), &claim_execution_role)
+            .await?;
+        let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
+        let workspace = &workspace_admission.workspace;
         let now = now_rfc3339();
         let execution_id = new_uuid_v4();
         let executor_config_snapshot_json = match agent.as_ref() {
@@ -193,7 +189,7 @@ impl TaskService {
                             &self.db,
                             &task_id,
                             agent,
-                            &workspace,
+                            workspace,
                             &execution_id,
                             error.to_string(),
                         )
@@ -231,19 +227,13 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let execution_lease = match self.initial_execution_lease(&execution).await {
-            Ok(lease) => lease,
-            Err(error) => {
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
-                return Err(error);
-            }
-        };
+        let execution_lease = self.initial_execution_lease(&execution).await?;
         let mut transaction = db::begin_immediate(self.db.pool())
             .await
             .map_err(DbError::from)?;
+        self.check_claim_placement_in_tx(&mut transaction, &task, &workspace_admission)
+            .await?;
+        self.check_placement_lease_owner(&workspace_admission.placement, &execution_lease)?;
         let claimed = TaskRepo::claim(
             &*self.db,
             &mut transaction,
@@ -267,10 +257,6 @@ impl TaskService {
             Ok(claimed) => claimed,
             Err(error) => {
                 drop(transaction);
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
                 return Err(error.into());
             }
         };
@@ -285,7 +271,7 @@ impl TaskService {
                 .issue_workspace_lease_in_tx(
                     &mut transaction,
                     &claimed.task,
-                    &workspace,
+                    workspace,
                     target_role.as_deref().unwrap_or("executor"),
                     agent_id.as_deref(),
                     &execution_id,
@@ -295,10 +281,6 @@ impl TaskService {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     drop(transaction);
-                    if workspace_created_by_attempt {
-                        self.cleanup_fresh_execution_workspace(&task, &workspace)
-                            .await;
-                    }
                     return Err(error);
                 }
             }
@@ -313,10 +295,6 @@ impl TaskService {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     drop(transaction);
-                    if workspace_created_by_attempt {
-                        self.cleanup_fresh_execution_workspace(&task, &workspace)
-                            .await;
-                    }
                     return Err(ServiceError::invalid_operation(format!(
                         "invalid executor config snapshot for usage admission: {error}"
                     )));
@@ -333,23 +311,17 @@ impl TaskService {
             .await
             {
                 drop(transaction);
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(&task, &workspace)
-                        .await;
-                }
                 return Err(error);
             }
         }
+        crate::placement::admission::resolve_workspace_attention_in_tx(&mut transaction, &task_id)
+            .await?;
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can
             // never retain repository authority.
             if let Some(lease) = lease.as_ref() {
                 self.revoke_workspace_lease(lease).await;
-            }
-            if workspace_created_by_attempt {
-                self.cleanup_fresh_execution_workspace(&task, &workspace)
-                    .await;
             }
             return Err(error.into());
         }
@@ -446,6 +418,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             workspace_id,
             agent_id: task.assignee_id.clone(),
             execution_id: Some(execution_id.to_owned()),

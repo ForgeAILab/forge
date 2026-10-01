@@ -14,7 +14,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo};
+use db::{
+    AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo, WorkspaceRepo,
+};
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
     LogKind, ProviderCallAdmission, TaskExecutor, UsageCounters, UsageReport, UsageTelemetryState,
@@ -230,6 +232,7 @@ pub struct EmbeddedTaskExecutor {
     db: Arc<SqliteDb>,
     embedded_agents: Arc<EmbeddedAgentService>,
     backend: Arc<NativeAgentRuntimeBackend>,
+    workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
     provider_admissions: Arc<StdMutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>>,
 }
@@ -259,15 +262,52 @@ impl std::fmt::Debug for EmbeddedTaskExecutor {
 }
 
 impl EmbeddedTaskExecutor {
-    pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        embedded_agents: Arc<EmbeddedAgentService>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         let backend = embedded_agents.native_backend();
         Self {
             db,
             embedded_agents,
             backend,
+            workspace_backend_router,
             active: Arc::new(RwLock::new(HashMap::new())),
             provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        Self::new_for_test(db, embedded_agents)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        let backend = embedded_agents.native_backend();
+        let workspace_backend_router =
+            crate::lifecycle::context::embedded_workspace_router_for_test(
+                Arc::clone(&db),
+                crate::task_service::workspace::default_workspace_root(),
+                None,
+            );
+        Self {
+            db,
+            embedded_agents,
+            backend,
+            workspace_backend_router,
+            active: Arc::new(RwLock::new(HashMap::new())),
+            provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_workspace_backend_router(
+        mut self,
+        router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
+        self.workspace_backend_router = router;
+        self
     }
 
     async fn run_native_turn(
@@ -342,13 +382,30 @@ impl EmbeddedTaskExecutor {
             .map(str::to_owned);
 
         let role = canonical_task_role(task_role)?;
+        let execution = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", ctx.execution_id.clone()))?;
+        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("embedded execution missing workspace_id")
+        })?;
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            &workspace,
+            &crate::task_service::workspace::default_workspace_root(),
+        )
+        .await?;
+        let worktree_path = resolved.embedded_path()?;
         let worktree_read_only =
             is_read_only_task_role(role) || executors::is_worktree_read_only(&ctx.agent_config);
         let before_sha = if worktree_read_only {
             None
         } else {
             Some(
-                git::get_current_sha(Path::new(&ctx.worktree_path))
+                git::get_current_sha(&worktree_path)
                     .await
                     .map_err(ServiceError::from)?,
             )
@@ -448,7 +505,7 @@ impl EmbeddedTaskExecutor {
                     WorkspaceAccess::TaskWrite
                 },
             },
-            workspace_path: Some(ctx.worktree_path.clone()),
+            workspace_path: Some(worktree_path.to_string_lossy().into_owned()),
             provider: native_provider.clone(),
             system_prompt: system_prompt.clone(),
             history: Vec::new(),
@@ -634,14 +691,12 @@ impl EmbeddedTaskExecutor {
         let agent_session_id = output.runtime_session_id;
         let summary = output.text;
         let after_sha = if let Some(before_sha) = before_sha.as_deref() {
-            match validate_write_capable_delivery(Path::new(&ctx.worktree_path), before_sha).await {
+            match validate_write_capable_delivery(&worktree_path, before_sha).await {
                 Ok(after_sha) => after_sha,
                 Err(error) => {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
-                        after_sha: git::get_current_sha(Path::new(&ctx.worktree_path))
-                            .await
-                            .ok(),
+                        after_sha: git::get_current_sha(&worktree_path).await.ok(),
                         agent_session_id: Some(agent_session_id),
                         summary: Some(summary),
                         error: Some(error.to_string()),
@@ -656,7 +711,7 @@ impl EmbeddedTaskExecutor {
                 }
             }
         } else {
-            git::get_current_sha(Path::new(&ctx.worktree_path))
+            git::get_current_sha(&worktree_path)
                 .await
                 .map_err(ServiceError::from)?
         };

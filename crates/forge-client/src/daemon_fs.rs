@@ -27,6 +27,7 @@ const SKIP_NAMES: &[&str] = &[
     ".venv",
     "venv",
     ".git",
+    ".forge",
 ];
 
 pub type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
@@ -116,8 +117,7 @@ pub async fn list_branches(
 
 pub fn validate_within_root(requested: &Path, root: &Path) -> CommandResult<PathBuf> {
     let resolved = resolve_requested_path(requested, root)?;
-    // Execution dispatch is scoped to server-managed local daemons: the target path must
-    // already exist on the daemon host so canonicalization can enforce containment.
+    // Existing paths are canonicalized so symlinks cannot bypass containment.
     let canonical = resolved.canonicalize().map_err(|error| {
         path_guardrail_error(format!(
             "failed to resolve path '{}': {error}",

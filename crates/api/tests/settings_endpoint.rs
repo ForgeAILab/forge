@@ -122,7 +122,7 @@ async fn test_app(
     let db = Arc::new(db::SqliteDb::new(pool));
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     let event_bus = Arc::new(events::EventBus::new(16));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),

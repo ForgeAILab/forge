@@ -130,6 +130,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let defer_dispatch_until = options
             .defer_dispatch_seconds
@@ -407,6 +408,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         engine
             .manual_override_transition_with_authority(
@@ -487,12 +489,21 @@ impl TaskService {
             ));
         };
 
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
+        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        let bytes = match resolved
+            .backend
+            .read(&resolved.placement, "../plan.md", 1_048_576)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(&*error, ServiceError::InvalidOperation { message } if message == "plan artifact not found") =>
+            {
                 return Err(ServiceError::invalid_operation(
                     "planning cannot be approved before a plan artifact exists",
                 ));
@@ -503,6 +514,12 @@ impl TaskService {
                 )));
             }
         };
+        let content = String::from_utf8(bytes).map_err(|_| {
+            ServiceError::invalid_operation(
+                "planning plan artifact is unreadable: failed to read plan artifact: stream did not contain valid UTF-8",
+            )
+        })?;
+        let artifact = crate::plan_artifact::parse_plan_markdown(&content);
         let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
         if summary.total == 0 {
             return Err(ServiceError::invalid_operation(
@@ -776,6 +793,7 @@ impl TaskService {
                 tracing::warn!(task_id = %task.id, %error, "failed to re-project cancelled prerequisite onto dependents");
             }
             self.reconcile_terminal_subtask(&task).await;
+            crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
             return TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task.id));
@@ -801,6 +819,7 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
         // Re-read after the root transition hooks and cancel once more. Any
         // child execution that committed between the pre-cancel snapshot and
         // the root transition is now visible, while the transactional parent
@@ -880,6 +899,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let result = engine
             .manual_override_transition_with_authority(

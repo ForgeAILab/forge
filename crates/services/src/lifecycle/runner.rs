@@ -13,6 +13,9 @@ use tokio::{process::Command, time::timeout};
 use tracing::{error, info, warn};
 
 use crate::lifecycle::{LifecycleHookContext, PluginRegistry, PluginResult};
+use crate::workspace_backend::{
+    ResolvedWorkspace, RunSpec, WorkspaceBackendError, WorkspaceRunPurpose,
+};
 
 pub struct LifecycleHookRunner;
 
@@ -39,6 +42,24 @@ impl LifecycleHookRunner {
         hooks: &[api_types::LifecycleHookDef],
         plugin_registry: Arc<PluginRegistry>,
     ) {
+        Self::run_hooks_inner(ctx, hooks, plugin_registry, None).await;
+    }
+
+    pub async fn run_workspace_hooks(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        plugin_registry: Arc<PluginRegistry>,
+        workspace: &ResolvedWorkspace,
+    ) {
+        Self::run_hooks_inner(ctx, hooks, plugin_registry, Some(workspace)).await;
+    }
+
+    async fn run_hooks_inner(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        plugin_registry: Arc<PluginRegistry>,
+        workspace: Option<&ResolvedWorkspace>,
+    ) {
         for (index, hook) in hooks.iter().enumerate() {
             match hook {
                 api_types::LifecycleHookDef::Script {
@@ -55,9 +76,16 @@ impl LifecycleHookRunner {
                         );
                         continue;
                     }
-                    let mut run =
-                        Self::run_script_hook(&ctx, index, command, *timeout_seconds).await;
-                    run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
+                    match Self::run_script(&ctx, index, command, *timeout_seconds, workspace).await
+                    {
+                        Ok(mut run) => {
+                            run.log_path = Self::write_log_entry(&ctx, index, &run.entry)
+                        }
+                        Err(error) => warn!(
+                            event = %event_name(&ctx.event), task_id = %ctx.task_id,
+                            hook_index = index, %error, "lifecycle workspace hook unavailable"
+                        ),
+                    }
                 }
                 api_types::LifecycleHookDef::Plugin {
                     name,
@@ -74,8 +102,14 @@ impl LifecycleHookRunner {
                         continue;
                     }
 
-                    let entry =
-                        Self::run_plugin_hook(&ctx, index, name, plugin_registry.as_ref()).await;
+                    let entry = Self::run_plugin_hook(
+                        &ctx,
+                        index,
+                        name,
+                        plugin_registry.as_ref(),
+                        workspace,
+                    )
+                    .await;
                     Self::write_log_entry(&ctx, index, &entry);
                 }
             }
@@ -102,15 +136,45 @@ impl LifecycleHookRunner {
             if !blocking {
                 continue;
             }
-
             let mut run = Self::run_script_hook(&ctx, index, command, *timeout_seconds).await;
             run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
             if run.status != "success" {
                 return Some(run);
             }
         }
-
         None
+    }
+
+    pub async fn run_blocking_workspace_hooks(
+        ctx: LifecycleHookContext,
+        hooks: &[api_types::LifecycleHookDef],
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<Option<LifecycleHookRun>> {
+        if ctx.event != api_types::LifecycleEvent::BeforeWork {
+            return Ok(None);
+        }
+
+        for (index, hook) in hooks.iter().enumerate() {
+            let api_types::LifecycleHookDef::Script {
+                command,
+                timeout_seconds,
+                blocking,
+            } = hook
+            else {
+                continue;
+            };
+            if !blocking {
+                continue;
+            }
+            let mut run =
+                Self::run_workspace_script_hook(&ctx, index, command, *timeout_seconds, workspace)
+                    .await?;
+            run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
+            if run.status != "success" {
+                return Ok(Some(run));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn test_script_hook(
@@ -122,6 +186,147 @@ impl LifecycleHookRunner {
         let mut run = Self::run_script_hook(ctx, index, command, timeout_seconds).await;
         run.log_path = Self::write_log_entry(ctx, index, &run.entry);
         run
+    }
+
+    pub async fn test_workspace_script_hook(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<LifecycleHookRun> {
+        let mut run =
+            Self::run_workspace_script_hook(ctx, index, command, timeout_seconds, workspace)
+                .await?;
+        run.log_path = Self::write_log_entry(ctx, index, &run.entry);
+        Ok(run)
+    }
+
+    async fn run_script(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: Option<&ResolvedWorkspace>,
+    ) -> crate::Result<LifecycleHookRun> {
+        match workspace {
+            Some(workspace) => {
+                Self::run_workspace_script_hook(ctx, index, command, timeout_seconds, workspace)
+                    .await
+            }
+            None => Ok(Self::run_script_hook(ctx, index, command, timeout_seconds).await),
+        }
+    }
+
+    async fn run_workspace_script_hook(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        command: &str,
+        timeout_seconds: u64,
+        workspace: &ResolvedWorkspace,
+    ) -> crate::Result<LifecycleHookRun> {
+        let start = Instant::now();
+        let working_dir = working_dir(ctx);
+        let environment_preview = environment_preview(ctx);
+        let mut env = ctx.env.clone();
+        env.extend(environment_preview.clone());
+        let result = workspace
+            .backend
+            .run(
+                &workspace.placement,
+                &RunSpec {
+                    purpose: WorkspaceRunPurpose::Hook,
+                    command: command.to_owned(),
+                    env,
+                    timeout_secs: if timeout_seconds == 0 {
+                        30
+                    } else {
+                        timeout_seconds
+                    },
+                    // Hook output is collected before its historical 10 KiB prefix
+                    // is retained; conformance commands have separate size budgets.
+                    max_output_bytes: isize::MAX as usize,
+                },
+            )
+            .await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let returned_output = result.is_ok();
+        let (exit_code, timed_out, stdout, stderr, error) = match result {
+            Ok(result) => {
+                let exit_code = (result.exit_code >= 0).then_some(result.exit_code);
+                let error = match exit_code {
+                    Some(0) => None,
+                    Some(code) => Some(format!("exit code {code}")),
+                    None => Some("terminated by signal".to_owned()),
+                };
+                (
+                    exit_code,
+                    false,
+                    truncate_output(&executors::environment::redact_environment_values(
+                        &result.stdout_tail,
+                        &ctx.env,
+                    )),
+                    truncate_output(&executors::environment::redact_environment_values(
+                        &result.stderr_tail,
+                        &ctx.env,
+                    )),
+                    error,
+                )
+            }
+            Err(WorkspaceBackendError::Other(error)) => {
+                let error = match *error {
+                    crate::ServiceError::InvalidOperation { message } => message,
+                    error => return Err(error),
+                };
+                let timed_out = error == "review command timed out";
+                let error = if timed_out {
+                    "timeout".to_owned()
+                } else {
+                    error
+                };
+                (None, timed_out, String::new(), String::new(), Some(error))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = if error.is_none() { "success" } else { "failed" };
+        let mut entry = json!({
+            "event": event_name(&ctx.event),
+            "hook_type": "script",
+            "command": command,
+            "duration_ms": duration_ms,
+            "status": status,
+            "working_dir": working_dir,
+            "timeout": timed_out,
+            "environment": environment_preview.clone(),
+        });
+        if let Some(error) = error.as_ref() {
+            entry["error"] = json!(error);
+            warn!(event = %event_name(&ctx.event), task_id = %ctx.task_id, hook_index = index,
+                %command, duration_ms, %error, "lifecycle script hook failed");
+        } else {
+            info!(event = %event_name(&ctx.event), task_id = %ctx.task_id, hook_index = index,
+                %command, duration_ms, "lifecycle script hook completed");
+        }
+        if returned_output {
+            entry["exit_code"] = json!(exit_code);
+            entry["stdout"] = json!(stdout);
+            entry["stderr"] = json!(stderr);
+        }
+        Ok(LifecycleHookRun {
+            index,
+            entry,
+            status: status.to_owned(),
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+            error,
+            command: Some(command.to_owned()),
+            working_dir,
+            duration_ms,
+            log_path: None,
+            environment_preview,
+        })
     }
 
     async fn run_script_hook(
@@ -397,6 +602,7 @@ impl LifecycleHookRunner {
         index: usize,
         name: &str,
         plugin_registry: &PluginRegistry,
+        workspace: Option<&ResolvedWorkspace>,
     ) -> Value {
         let start = Instant::now();
         let Some(plugin) = plugin_registry.get(name) else {
@@ -437,7 +643,11 @@ impl LifecycleHookRunner {
             });
         }
 
-        match plugin.execute(ctx).await {
+        let result = match workspace {
+            Some(workspace) => plugin.execute_in_workspace(ctx, workspace).await,
+            None => plugin.execute(ctx).await,
+        };
+        match result {
             Ok(PluginResult::Success) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
                 info!(

@@ -1128,7 +1128,7 @@ impl SoloBootstrapService {
             });
         }
 
-        match compute_effective_status(&self.db, &agent).await? {
+        match compute_effective_status(&self.db, &agent, None).await? {
             EffectiveStatus::Active => {
                 candidate.health = SoloAgentHealth::Healthy;
                 candidate.eligible = true;
@@ -2224,9 +2224,12 @@ fn status_next_step(status: &EffectiveStatus) -> &'static str {
         }
         EffectiveStatus::ConnectionDegraded => "repair the local CLI connection and retry",
         EffectiveStatus::Paused => "unpause the Agent and retry discovery",
-        EffectiveStatus::Error => "repair the Agent error and retry discovery",
         EffectiveStatus::Deactivated => "refresh the local CLI harness configuration",
         EffectiveStatus::Active | EffectiveStatus::Busy => "",
+        EffectiveStatus::DaemonUpgradeRequired => {
+            "upgrade the local Forge daemon and retry discovery"
+        }
+        EffectiveStatus::Error => "repair the Agent error and retry discovery",
     }
 }
 

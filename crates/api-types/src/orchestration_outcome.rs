@@ -269,7 +269,7 @@ pub enum RetryScope {
 #[serde(try_from = "String", into = "String")]
 #[ts(
     export,
-    type = "`permission_missing(${string})` | `project_paused(${string})` | \"target_agent_paused\" | \"identity_paused\" | \"charter_not_adopted\" | \"operation_not_in_scope\" | \"profile_not_selected\" | \"task_terminal\" | \"reviewer_read_only\" | \"independent_approval_required\" | \"user_request_required\" | \"leased_turn_required\" | \"charter_adoption_not_applicable\" | \"read_boundary_required\" | \"direct_command_not_admitted\" | \"review_assignment_required\" | \"unspecified\""
+    type = "`permission_missing(${string})` | `project_paused(${string})` | \"target_agent_paused\" | \"identity_paused\" | \"charter_not_adopted\" | \"operation_not_in_scope\" | \"profile_not_selected\" | \"task_terminal\" | \"reviewer_read_only\" | \"independent_approval_required\" | \"user_request_required\" | \"leased_turn_required\" | \"charter_adoption_not_applicable\" | \"read_boundary_required\" | \"direct_command_not_admitted\" | \"review_assignment_required\" | \"placement_unavailable\" | \"daemon_upgrade_required\" | \"workspace_reset_required\" | \"unspecified\""
 )]
 pub enum DeniedBy {
     PermissionMissing(String),
@@ -288,6 +288,9 @@ pub enum DeniedBy {
     ReadBoundaryRequired,
     DirectCommandNotAdmitted,
     ReviewAssignmentRequired,
+    PlacementUnavailable,
+    DaemonUpgradeRequired,
+    WorkspaceResetRequired,
     Unspecified,
 }
 
@@ -353,6 +356,9 @@ impl std::fmt::Display for DeniedBy {
             Self::ReadBoundaryRequired => "read_boundary_required",
             Self::DirectCommandNotAdmitted => "direct_command_not_admitted",
             Self::ReviewAssignmentRequired => "review_assignment_required",
+            Self::PlacementUnavailable => "placement_unavailable",
+            Self::DaemonUpgradeRequired => "daemon_upgrade_required",
+            Self::WorkspaceResetRequired => "workspace_reset_required",
             Self::Unspecified => "unspecified",
         };
         f.write_str(name)
@@ -397,6 +403,9 @@ impl std::str::FromStr for DeniedBy {
             "read_boundary_required" => Self::ReadBoundaryRequired,
             "direct_command_not_admitted" => Self::DirectCommandNotAdmitted,
             "review_assignment_required" => Self::ReviewAssignmentRequired,
+            "placement_unavailable" => Self::PlacementUnavailable,
+            "daemon_upgrade_required" => Self::DaemonUpgradeRequired,
+            "workspace_reset_required" => Self::WorkspaceResetRequired,
             "unspecified" => Self::Unspecified,
             _ => return Err("unknown denial cause"),
         })

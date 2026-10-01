@@ -82,6 +82,80 @@ impl DaemonExecutionEventHandler for ConflictHandler {
     }
 }
 
+struct IgnoreHandler;
+
+#[async_trait]
+impl DaemonExecutionEventHandler for IgnoreHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(DaemonTerminalDisposition::Ignore)
+    }
+}
+
+#[derive(Default)]
+struct JournalReadinessHandler {
+    ready: std::sync::atomic::AtomicBool,
+    committed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl DaemonExecutionEventHandler for JournalReadinessHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(if self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            DaemonTerminalDisposition::Acknowledge
+        } else if self.committed.load(std::sync::atomic::Ordering::Acquire) {
+            DaemonTerminalDisposition::AwaitingCascade
+        } else {
+            DaemonTerminalDisposition::Pending
+        })
+    }
+}
+
 fn make_registry() -> Arc<DaemonConnectionRegistry> {
     let event_bus = Arc::new(EventBus::new(16));
     let handler = Arc::new(NoopHandler) as Arc<dyn DaemonExecutionEventHandler>;
@@ -362,7 +436,7 @@ async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
     let api_types::DaemonFrame::Error { error, .. } = rejection else {
         panic!("expected protocol rejection error");
     };
-    assert_eq!(error.code, api_types::DAEMON_PROTOCOL_INCOMPATIBLE);
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
     assert!(!registry.is_connected("daemon-incompatible"));
 
     let result: Result<TestResponse, ServiceError> = registry
@@ -386,8 +460,8 @@ async fn pre_handshake_dispatch_is_rejected_without_sending_a_request() {
         .await;
     assert!(matches!(
         result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+        Err(ServiceError::DaemonNotReady { daemon_id })
+            if daemon_id == "daemon-pre-handshake"
     ));
     assert!(matches!(
         outbound.try_recv(),
@@ -427,16 +501,15 @@ async fn terminal_success_sends_ack_and_conflict_does_not() {
     let api_types::DaemonFrame::Request { id, method, params } = ack else {
         panic!("expected terminal acknowledgement request");
     };
-    assert_eq!(method, api_types::METHOD_EXECUTION_TERMINAL_ACK);
-    assert_eq!(params["terminal_report_id"], "terminal-report-1");
+    assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+    assert_eq!(params["entry_id"], "terminal-report-1");
     registry.dispatch_incoming_for_connection(
         "daemon-terminal-ack",
         connection_id,
         api_types::DaemonFrame::Response {
             id,
             result: json!({
-                "terminal_report_id": "terminal-report-1",
-                "execution_id": "execution-1",
+                "entry_id": "terminal-report-1",
                 "acknowledged": true
             }),
         },
@@ -817,4 +890,274 @@ async fn execution_terminal_from_non_owner_daemon_is_rejected() {
         .expect("execution loads")
         .expect("execution exists");
     assert_eq!(unchanged.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
+async fn connection_snapshot_retains_handshake_facts_only_for_current_incarnation() {
+    let registry = make_registry();
+    let (connection, _outbound) = DaemonConnection::new("snapshot-owner".to_owned());
+    let first_id = connection.id();
+    registry.register("snapshot-owner".to_owned(), connection.clone());
+    let handshake = json!({"protocol_revision": 3,
+        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+        "executor_capabilities": {"codex": {"resume": true, "usage": true}},
+        "workspace_run_policy": {"allowed_purposes": ["ci_step", "hook"]}});
+    registry.dispatch_incoming_for_connection(
+        "snapshot-owner",
+        first_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: handshake.clone(),
+        },
+    );
+    let snapshots = registry.connection_snapshots();
+    let facts = &snapshots["snapshot-owner"];
+    assert_eq!(facts.connection_id, first_id);
+    assert!(!facts.workspace_incapable);
+    assert!(facts.handshake.executor_capabilities["codex"].resume);
+    assert_eq!(
+        facts.handshake.workspace_run_policy.allowed_purposes,
+        vec![
+            api_types::WorkspaceRunPurpose::CiStep,
+            api_types::WorkspaceRunPurpose::Hook
+        ]
+    );
+    let (replacement, _replacement_outbound) = DaemonConnection::new("snapshot-owner".to_owned());
+    registry.register("snapshot-owner".to_owned(), replacement);
+    assert!(registry.connection_snapshots().is_empty());
+    assert!(connection.snapshot().is_none());
+    assert!(!registry.dispatch_incoming_for_connection(
+        "snapshot-owner",
+        first_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: handshake,
+        }
+    ));
+    assert!(registry.connection_snapshots().is_empty());
+}
+
+#[tokio::test]
+async fn connection_snapshot_revision_two_needs_upgrade_and_cannot_dispatch() {
+    let registry = make_registry();
+    let (connection, _outbound) = DaemonConnection::new("old-owner".to_owned());
+    let id = connection.id();
+    registry.register("old-owner".to_owned(), connection);
+    registry.dispatch_incoming_for_connection("old-owner", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+        params: json!({"protocol_revision": 2, "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack", "workspace.v1"]}),
+    });
+    assert!(registry.is_connected("old-owner"));
+    assert!(registry.connection_snapshots().is_empty());
+    let connection = registry.get("old-owner").unwrap();
+    assert!(connection.needs_upgrade());
+    assert!(!connection.protocol_allows_dispatch());
+    let result: Result<TestResponse, ServiceError> = registry
+        .send_request("old-owner", "execution.start", json!({}), 1)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::DaemonUpgradeRequired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
+    let handler = Arc::new(JournalReadinessHandler::default());
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        handler.clone(),
+    ));
+    let (connection, mut outbound) = DaemonConnection::new("journal-owner".to_owned());
+    let connection_id = connection.id();
+    registry.register("journal-owner".to_owned(), connection);
+    accept_protocol_handshake(&registry, "journal-owner", connection_id);
+    let notification: api_types::ExecutionTerminalNotification = serde_json::from_value(json!({
+        "terminal_report_id": "report-journal", "execution_id": "execution-journal", "exit_code": 0,
+        "ts": now_rfc3339(), "status": "completed", "usage_reports": [],
+    }))
+    .unwrap();
+    super::lock(&registry.inner.journal_terminals).insert(
+        (
+            "journal-owner".to_owned(),
+            connection_id,
+            notification.execution_id.clone(),
+        ),
+        notification,
+    );
+    let execution_ids = vec!["execution-journal".to_owned()];
+    assert!(!registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    assert!(outbound.try_recv().is_err());
+    // Durable terminal settlement allows reconciliation to continue, while
+    // the owner retains its report until the cascade can commit.
+    handler
+        .committed
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    assert!(outbound.try_recv().is_err());
+    assert!(
+        super::lock(&registry.inner.journal_terminals).contains_key(&(
+            "journal-owner".to_owned(),
+            connection_id,
+            "execution-journal".to_owned()
+        ))
+    );
+    handler
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
+    let responder = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, params } =
+                outbound.recv().await.unwrap()
+            else {
+                panic!("journal ack");
+            };
+            assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+            assert_eq!(params["entry_id"], "report-journal");
+            registry.dispatch_incoming_for_connection(
+                "journal-owner",
+                connection_id,
+                api_types::DaemonFrame::Response {
+                    id,
+                    result: json!({"entry_id": "report-journal", "acknowledged": true}),
+                },
+            );
+        })
+    };
+    assert!(registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_transport_request_removes_pending_sender_for_each_request_path() {
+    for pinned in [false, true] {
+        let registry = make_registry();
+        let (connection, mut outbound) = DaemonConnection::new("cancelled-owner".to_owned());
+        let connection_id = connection.id();
+        registry.register("cancelled-owner".to_owned(), connection.clone());
+        accept_protocol_handshake(&registry, "cancelled-owner", connection_id);
+        let request = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                if pinned {
+                    registry
+                        .send_request_for_connection::<_, TestResponse>(
+                            "cancelled-owner",
+                            connection_id,
+                            "test.echo",
+                            json!({}),
+                            30,
+                        )
+                        .await
+                } else {
+                    registry
+                        .send_request::<_, TestResponse>(
+                            "cancelled-owner",
+                            "test.echo",
+                            json!({}),
+                            30,
+                        )
+                        .await
+                }
+            })
+        };
+        outbound.recv().await.unwrap();
+        assert_eq!(super::lock(&connection.pending).len(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(super::lock(&connection.pending).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn daemon_transport_ignored_terminal_is_acknowledged() {
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        Arc::new(IgnoreHandler),
+    ));
+    let daemon_id = "ignored-owner";
+    let (connection, mut outbound) = DaemonConnection::new(daemon_id.into());
+    let connection_id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    accept_protocol_handshake(&registry, daemon_id, connection_id);
+    let notification = serde_json::from_value(json!({"terminal_report_id": "ignored-report",
+        "execution_id": "late-execution", "exit_code": 0, "status": "completed", "ts": now_rfc3339(), "usage_reports": []})).unwrap();
+    let attempt = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .apply_journal_terminal(daemon_id, connection_id, notification)
+                .await
+                .unwrap()
+        })
+    };
+    let api_types::DaemonFrame::Request { id, method, params } =
+        tokio::time::timeout(Duration::from_secs(30), outbound.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected acknowledgement");
+    };
+    assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+    assert_eq!(params["entry_id"], "ignored-report");
+    registry.dispatch_incoming_for_connection(
+        daemon_id,
+        connection_id,
+        api_types::DaemonFrame::Response {
+            id,
+            result: json!({"entry_id": "ignored-report", "acknowledged": true}),
+        },
+    );
+    assert_eq!(attempt.await.unwrap(), DaemonTerminalDisposition::Ignore);
+}
+
+#[tokio::test]
+async fn revision_two_refuses_all_commands_but_an_unknown_handshake_is_not_an_upgrade() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("old-owner".into());
+    let id = connection.id();
+    registry.register("old-owner".into(), connection);
+    let not_ready: Result<serde_json::Value, _> = registry
+        .send_request("old-owner", api_types::METHOD_FS_LIST, json!({}), 1)
+        .await;
+    assert!(matches!(
+        not_ready,
+        Err(ServiceError::DaemonNotReady { .. })
+    ));
+    assert!(!registry.get("old-owner").unwrap().needs_upgrade());
+    assert!(outbound.try_recv().is_err());
+    registry.dispatch_incoming_for_connection("old-owner", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+    });
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("upgrade notice");
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    for method in [
+        api_types::METHOD_EXECUTION_START,
+        api_types::METHOD_REPO_LOCATION_VERIFY,
+        api_types::METHOD_FS_LIST,
+        api_types::METHOD_FS_BRANCHES,
+        api_types::METHOD_TERMINAL_START,
+    ] {
+        let result: Result<serde_json::Value, _> = registry
+            .send_request("old-owner", method, json!({}), 1)
+            .await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, ServiceError::DaemonUpgradeRequired { .. }));
+        assert!(error.to_string().contains("upgrade the daemon"));
+    }
+    assert!(outbound.try_recv().is_err());
 }

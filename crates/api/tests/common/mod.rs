@@ -59,7 +59,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -74,19 +74,25 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
         Arc::clone(&event_bus),
         Arc::clone(&adapter_registry),
     ));
-    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
-        db,
-        event_bus,
-        true,
-        adapter_registry,
-        merge_service,
-        cleanup_scheduler,
-        review_runner,
-        api::state::ShutdownSignal::new(),
-        api::state::test_workflows_dir(),
-        api::state::test_jwt_secret(),
-        api::state::test_bcrypt_cost(),
-    ));
+    let mut config = config::ForgeConfig::default();
+    config.forge.data_dir = workspace_root.join("test-data");
+    config.workspace.root = workspace_root.to_path_buf();
+    let state = Arc::new(
+        AppState::with_adapter_registry_services_and_shutdown(
+            db,
+            event_bus,
+            true,
+            adapter_registry,
+            merge_service,
+            cleanup_scheduler,
+            review_runner,
+            api::state::ShutdownSignal::new(),
+            api::state::test_workflows_dir(),
+            api::state::test_jwt_secret(),
+            api::state::test_bcrypt_cost(),
+        )
+        .with_effective_config(config),
+    );
 
     let web_dist_dir = TestDir::new(&format!("{prefix}-web"));
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
@@ -226,7 +232,7 @@ pub async fn configure_execution_test_setup(
         .expect("test worker lookup")
         .expect("test worker exists");
     assert_eq!(
-        services::agent_service::compute_effective_status(db, &worker)
+        services::agent_service::compute_effective_status(db, &worker, None)
             .await
             .expect("test worker effective status"),
         services::agent_service::EffectiveStatus::Active,
@@ -238,7 +244,7 @@ pub async fn configure_execution_test_setup(
             .expect("test reviewer lookup")
             .expect("test reviewer exists");
         assert_eq!(
-            services::agent_service::compute_effective_status(db, &reviewer)
+            services::agent_service::compute_effective_status(db, &reviewer, None)
                 .await
                 .expect("test reviewer effective status"),
             services::agent_service::EffectiveStatus::Active,

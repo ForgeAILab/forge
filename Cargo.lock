@@ -246,6 +246,7 @@ dependencies = [
  "events",
  "executors",
  "forge-agent-host",
+ "forge-client",
  "futures-util",
  "git",
  "hex",
@@ -1372,6 +1373,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
  "tabled",
  "tempfile",
  "time",
@@ -1379,7 +1382,9 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "url",
+ "uuid",
  "which",
+ "workspace",
 ]
 
 [[package]]
@@ -1609,6 +1614,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "url",
 ]
 
 [[package]]

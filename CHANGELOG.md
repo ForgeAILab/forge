@@ -26,7 +26,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `retry.action: none` where it used to say `reauthorize`. Public web search
   and operations outside the orchestration contract return the same structured
   outcome where they used to return an error string.
-
 - Retrying an Agent Chat turn now requires `expected_version` and
   `idempotency_key`. A refused retry returns 409 `turn_not_retryable` or
   `another_turn_live`, and a turn that is waiting for input now blocks a
@@ -45,6 +44,59 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   an authority refusal or a provider rejection that cannot be retried. It used
   to raise one for every turn that failed terminally. The item recommends
   `retry_turn`.
+- Unpinned CLI Agents now run on the owner recorded in their Task's workspace
+  placement: the server, or a daemon that owns the workspace. A claim with no
+  compatible owner returns 409 `placement_unavailable` with a reason per
+  candidate, where it used to fall back to embedded execution. Daemon-owned
+  workspaces require direct-merge repositories and CLI Agents for every
+  assigned worktree role. See [workspace placement](docs/architecture.md#workspace-placement).
+- Claim now reserves capacity and prepares the workspace before it creates the
+  Task claim, the Execution or the lease. A failed preparation creates no
+  Execution and spends no retry budget. Several refusals changed with it:
+  - an Agent or daemon at capacity returns 409 `placement_unavailable` with
+    `agent_capacity` or `daemon_capacity`, where it returned
+    `agent_at_capacity`;
+  - a CLI Agent whose executor is not installed, not signed in, disabled or
+    paused is refused at claim with `executor_unavailable`, where the failure
+    used to appear at launch;
+  - a second claim into a shared root workspace that has a running Execution
+    returns 409 `execution_already_running`, where it used to wait;
+  - a workspace that is being cleaned, or whose earlier preparation failed,
+    returns 409 `WORKSPACE_RESET_REQUIRED`; workspaces left in `error` before
+    the upgrade need `reset_to_initial`;
+  - if the server stops in the middle of preparing a workspace, claims for
+    that Task are refused for up to ten minutes.
+- Daemon protocol revision 3 is required for every daemon command: execution,
+  repository verification, filesystem browsing, workspace operations and
+  terminals. A revision-2 daemon stays connected so the upgrade can be
+  diagnosed, and every command returns `daemon_upgrade_required`. Upgrade the
+  server first, then each daemon from the same release, keeping its workspace
+  root. `journal.ack { entry_id }` replaces `execution.terminal.ack`.
+- A claim returns `daemon_upgrade_required` when the only owner that could
+  take the Task is blocked solely by needing that upgrade. The Task waits
+  without an Execution and resumes by itself once the daemon reconnects at
+  revision 3.
+- When a remote daemon disconnects, its running Executions are suspended on
+  the same owner for up to `workspace.max_disconnect_seconds`
+  (`FORGE_MAX_DISCONNECT_SECONDS`, default 24 hours). This covers
+  daemon-owned workspaces and server-owned workspaces on a shared mount; the
+  latter used to fail after about two minutes. Expiry records
+  `owner_disconnected_timeout` and spends no retry budget. Execution hard
+  deadlines still apply.
+- Agents pinned to a remote daemon need a verified `shared_mount` repository
+  location to run in a server-owned workspace; matching absolute paths alone
+  no longer qualify. Every location on a daemon is verified again when the
+  daemon reconnects. A location that fails that check stays unavailable until
+  the next reconnect or a manual verify, and claims for it are refused with
+  `location_not_ready`.
+- Executor snapshots replace `resolved_daemon_id` with `placement_id`. Task
+  and Workspace responses gain a `placement` object with the owner and state.
+  `repo_location.last_error` is a JSON string (cause, attempts, retry time,
+  redacted message) after a failed clone.
+- Daemons read a local `daemon.yaml` policy (`workspace.run.allow`, default
+  `[ci_step]`); hooks and environment setup need opt-in. The terminal store
+  moves into `<workspace-root>/.forge/journal/` on startup and keeps pending
+  reports. See [daemon configuration and migration](docs/getting-started.md#daemon-run-policy).
 
 ### Changed
 
@@ -109,6 +161,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   where it used to resend the message as a new one. Solo offers retry for a
   cancelled turn. CLI chat executors defer on usage exhaustion. A server
   shutdown re-queues a leased turn without spending an attempt.
+- Managed Codex resolves symlinked package cache directories before granting
+  them to the sandbox, so a relocated `~/.npm` no longer stops it from
+  starting. A cache directory is refused when it resolves to your home
+  directory or a parent of it, to a Task or managed-home directory, or into a
+  credential directory (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`,
+  `.config/gh`, `.codex`, `.claude`, `.forge`). A cache reached through a
+  symlink is also refused when it resolves to the root of a mounted volume. A
+  cache moved with an environment variable is exempt from that last rule.
+- The daemon documentation states that anyone who can edit server-side review
+  steps, hooks or environment checks can run commands on the daemon, that the
+  run policy is not a security boundary against a malicious server, and that
+  the server can read files under the daemon's workspace root.
 
 ### Added
 
@@ -123,6 +187,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `review_needs_owner` without coder dispatch or review retry budget spent,
   and `defer_to_follow_up` recovery with a required reason. Deferring atomically
   creates a linked backlog Task and records a manual review pass for the original.
+- A Task whose owner is offline or at capacity waits without an Execution and
+  without spending retry budget. A first-time wait for an offline owner shows
+  an attention item and blocks the Task after `workspace.max_disconnect_seconds`.
+- On a daemon-owned or remote-provider workspace, review CI that cannot reach
+  its owner is retried with backoff and spends no review budget. After five
+  failed attempts while the owner is connected, the Task is parked with a
+  blocker and an attention item naming the cause. A real CI failure is charged
+  as before.
+- The daemon deletes an operation's receipt once the server has recorded its
+  result and acknowledged it. Journal files and the workspace registry share a
+  32 MiB budget, and the journal holds at most 1,024 entries. CI output keeps
+  the last 1 MiB per stream; the exit code decides the verdict even when the
+  log was shortened.
+- The daemon replaces the values of a request's environment variables with
+  `[REDACTED]` in the commands, output, error messages and terminal reports it
+  stores, and stores only the variable names. Other secrets written inline in
+  a command are stored as written.
 
 ### Fixed
 
@@ -139,6 +220,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `validation_error` with the reason, and a failure to load
   `project.current_state` returns `internal_failure`; both used to be reported
   as `policy_denied`.
+- Shell Agents re-dispatched by the workflow (re-execute, rework after review)
+  now run the Task's command again instead of executing the LLM role prompt as
+  a shell script.
+- A remote Execution's result that arrives while its daemon was frozen or
+  disconnected is applied once after the daemon reconnects, without a reset.
+- Workspace reconciliation that is waiting on an operator `reset_to_initial`
+  no longer logs a warning every recovery tick.
+
+### Known issues
+
+- A damaged worktree on a daemon owner is not repaired; the Task needs
+  `reset_to_initial`. A deleted worktree is recreated from the Task branch.
+- Claims for a location that failed re-verification after a reconnect are
+  refused and not queued.
 
 ## [0.13.12] - 2026-10-01
 

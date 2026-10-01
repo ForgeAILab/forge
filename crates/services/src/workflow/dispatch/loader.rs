@@ -66,7 +66,10 @@ pub async fn load_agent_dispatch_context(
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(task_id);
         match WorkspaceRepo::get_by_task_id(&*db, workspace_task_id).await? {
             Some(workspace) => crate::plan_artifact::read_canonical_plan_text(
-                std::path::Path::new(&workspace.worktree_path),
+                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                    &db, &workspace,
+                )
+                .await?,
             )
             .map_err(|error| {
                 ServiceError::invalid_operation(format!(

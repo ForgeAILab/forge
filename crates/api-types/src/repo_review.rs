@@ -67,6 +67,8 @@ pub struct DiffEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct ProjectEnvironmentPause {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub checks: Vec<String>,
     pub role: Option<String>,
     pub output: String,

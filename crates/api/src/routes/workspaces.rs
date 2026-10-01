@@ -14,10 +14,13 @@ pub async fn get_workspace_diff(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<DiffEnvelope>> {
-    let diff = DiffService::new(std::sync::Arc::clone(&state.db))
-        .workspace_diff(&id)
-        .await
-        .map_err(map_diff_error)?;
+    let diff = DiffService::new_with_router(
+        std::sync::Arc::clone(&state.db),
+        std::sync::Arc::clone(&state.workspace_backend_router),
+    )
+    .workspace_diff(&id)
+    .await
+    .map_err(map_diff_error)?;
     Ok(Json(DiffEnvelope { data: diff }))
 }
 

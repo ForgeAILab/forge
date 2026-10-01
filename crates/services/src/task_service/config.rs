@@ -244,17 +244,13 @@ pub(super) async fn build_executor_config_snapshot(
             "hard_deadline_seconds must be greater than zero when set; omit it for no limit",
         ));
     }
-    // Native profiles are hosted by Forge itself and deliberately have no
-    // daemon authority.  CLI profiles retain the existing daemon resolution
-    // and snapshot provenance.
-    let resolved_daemon_id = if agent.backend_kind == "native" {
-        None
-    } else {
-        Some(
-            crate::agent_service::resolve_daemon_for_agent(db, agent)
-                .await?
-                .id,
-        )
+    let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+    let workspace = WorkspaceRepo::get_by_task_id(db, workspace_task_id).await?;
+    let placement_id = match workspace.as_ref() {
+        Some(workspace) => db::WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id)
+            .await?
+            .map(|placement| placement.id),
+        None => None,
     };
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     // Extract before normalization: the typed config round-trip drops
@@ -300,12 +296,15 @@ pub(super) async fn build_executor_config_snapshot(
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
-        "resolved_daemon_id": resolved_daemon_id,
+        "placement_id": placement_id,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
     });
     if let Some(seconds) = hard_deadline_seconds {
         snapshot["hard_deadline_seconds"] = json!(seconds);
+    }
+    if workspace.is_none() && agent.backend_kind == "cli" {
+        snapshot["daemon_id"] = json!(agent.daemon_id);
     }
     if let Some(routing) = routing_snapshot_value(kind, &snapshot["config"], &fallbacks)? {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;

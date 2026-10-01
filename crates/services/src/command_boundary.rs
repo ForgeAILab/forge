@@ -335,6 +335,12 @@ pub fn outcome_for_service_error_with_correction(
         ServiceError::TurnFailure { error, .. } => {
             return outcome_for_service_error_with_correction(error, context, current, retry)
         }
+        ServiceError::Db(db::DbError::TurnNotRetryable | db::DbError::ChatTurnLive) => (
+            OutcomeCode::ValidationError,
+            "Agent Chat turn cannot be retried in its current state",
+            None,
+            None,
+        ),
         ServiceError::Db(db::DbError::IdempotencyConflict) => (
             OutcomeCode::IdempotencyConflict,
             "the idempotency key is already bound to different command input",
@@ -409,7 +415,22 @@ pub fn outcome_for_service_error_with_correction(
                 None,
             )
         }
-        ServiceError::DaemonUnavailable { .. }
+        ServiceError::DaemonUpgradeRequired { .. } => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::PlacementUnavailable(error) if error.needs_daemon_upgrade() => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::DaemonNotReady { .. }
+        | ServiceError::DaemonUnavailable { .. }
+        | ServiceError::PlacementUnavailable(_)
+        | ServiceError::PrepareFailed { .. }
         | ServiceError::DaemonTimeout { .. }
         | ServiceError::TerminalDaemonUnavailable { .. }
         | ServiceError::TerminalActiveExecution { .. }
@@ -466,6 +487,20 @@ pub fn outcome_for_service_error_with_correction(
         }));
     }
 
+    outcome.denied_by = match error {
+        ServiceError::PlacementUnavailable(refusal) if refusal.needs_daemon_upgrade() => {
+            Some(api_types::DeniedBy::DaemonUpgradeRequired)
+        }
+        ServiceError::PlacementUnavailable(_) => Some(api_types::DeniedBy::PlacementUnavailable),
+        ServiceError::DaemonUpgradeRequired { .. } => {
+            Some(api_types::DeniedBy::DaemonUpgradeRequired)
+        }
+        ServiceError::WorkspaceResetRequired { .. } => {
+            Some(api_types::DeniedBy::WorkspaceResetRequired)
+        }
+        _ => None,
+    };
+
     let allows_correction = matches!(
         code,
         OutcomeCode::VersionConflict | OutcomeCode::DigestConflict | OutcomeCode::SetupRequired
@@ -507,6 +542,38 @@ mod tests {
             CanonicalScopeRef::new(OutcomeScopeType::Project, "project-1"),
             "correlation-1",
         )
+    }
+
+    #[test]
+    fn daemon_target_refusals_preserve_their_specific_cause() {
+        for (error, cause) in [
+            (
+                ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                    task_id: "task".into(),
+                    repo_id: "repo".into(),
+                    rejected_candidates: vec![],
+                }),
+                api_types::DeniedBy::PlacementUnavailable,
+            ),
+            (
+                ServiceError::DaemonUpgradeRequired {
+                    daemon_id: "owner".into(),
+                },
+                api_types::DeniedBy::DaemonUpgradeRequired,
+            ),
+            (
+                ServiceError::WorkspaceResetRequired {
+                    task_id: "task".into(),
+                    reason: "lost".into(),
+                },
+                api_types::DeniedBy::WorkspaceResetRequired,
+            ),
+        ] {
+            let outcome = outcome_for_service_error(&error, &outcome_context());
+            assert_eq!(outcome.denied_by, Some(cause.clone()));
+            assert!(!cause.withdraws_operation());
+            assert_ne!(outcome.code, OutcomeCode::InternalFailure);
+        }
     }
 
     #[test]

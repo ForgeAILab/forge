@@ -306,7 +306,7 @@ async fn fixture_with_permissions(permissions: &str) -> Fixture {
     .await;
     seed_milestone(&db).await;
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
-    provider.set_task_service(Arc::new(TaskService::new(
+    provider.set_task_service(Arc::new(TaskService::new_for_test(
         Arc::clone(&db),
         Arc::new(EventBus::new(32)),
     )));
@@ -1932,7 +1932,7 @@ async fn recovery_fixture() -> (Fixture, tempfile::TempDir, String, String, Stri
         tasks.push(task);
     }
     fixture.provider.set_task_service(Arc::new(
-        TaskService::new(fixture.db.clone(), Arc::new(EventBus::new(32)))
+        TaskService::new_for_test(fixture.db.clone(), Arc::new(EventBus::new(32)))
             .with_workspace_root(temp.path().join("workspaces")),
     ));
     (fixture, temp, worker, tasks.remove(0), tasks.remove(0))

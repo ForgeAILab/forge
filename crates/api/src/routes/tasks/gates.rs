@@ -89,8 +89,13 @@ async fn transition_gate(
         {
             let (task, _) = state.task_service.approve_review(task_id).await?;
             let awaiting_human = state.task_service.is_task_awaiting_human(&task).await?;
-            let response =
-                task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
+            let response = task_response_with_awaiting_human(
+                &state.db,
+                &state.workspace_backend_router,
+                task,
+                awaiting_human,
+            )
+            .await?;
             return Ok(response);
         }
     }
@@ -114,8 +119,13 @@ async fn transition_gate(
         .task_service
         .is_task_awaiting_human(&result.task)
         .await?;
-    let response =
-        task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
+    let response = task_response_with_awaiting_human(
+        &state.db,
+        &state.workspace_backend_router,
+        result.task,
+        awaiting_human,
+    )
+    .await?;
     Ok(response)
 }
 

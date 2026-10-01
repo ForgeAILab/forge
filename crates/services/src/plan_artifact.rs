@@ -3,7 +3,10 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
+use crate::workspace_backend::{ResolvedWorkspace, WorkspaceBackendError, WorkspaceBackendRouter};
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{SqliteDb, WorkspaceRepo};
 
@@ -63,6 +66,7 @@ pub enum PlanArtifactError {
     StagedConflict { path: PathBuf },
     IoError(io::Error),
     DbError(db::DbError),
+    BackendError(WorkspaceBackendError),
     FileTooLarge { size: u64, max: u64 },
 }
 
@@ -103,6 +107,11 @@ impl fmt::Display for PlanArtifactError {
             ),
             Self::IoError(error) => write!(f, "plan artifact I/O failed: {error}"),
             Self::DbError(error) => write!(f, "failed to read workspace: {error}"),
+            Self::BackendError(WorkspaceBackendError::Other(error)) => match error.as_ref() {
+                crate::ServiceError::InvalidOperation { message } => write!(f, "{message}"),
+                error => write!(f, "{error}"),
+            },
+            Self::BackendError(error) => write!(f, "{error}"),
             Self::FileTooLarge { size, max } => write!(
                 f,
                 "plan artifact is too large: {size} bytes exceeds {max} bytes"
@@ -116,6 +125,7 @@ impl Error for PlanArtifactError {
         match self {
             Self::IoError(error) => Some(error),
             Self::DbError(error) => Some(error),
+            Self::BackendError(error) => Some(error),
             _ => None,
         }
     }
@@ -130,6 +140,23 @@ impl From<io::Error> for PlanArtifactError {
 impl From<db::DbError> for PlanArtifactError {
     fn from(error: db::DbError) -> Self {
         Self::DbError(error)
+    }
+}
+
+impl From<WorkspaceBackendError> for PlanArtifactError {
+    fn from(error: WorkspaceBackendError) -> Self {
+        match error {
+            WorkspaceBackendError::Other(error) => match *error {
+                crate::ServiceError::Db(error) => Self::DbError(error),
+                crate::ServiceError::InvalidOperation { ref message }
+                    if message == "plan artifact not found" =>
+                {
+                    Self::NotFound
+                }
+                error => Self::BackendError(error.into()),
+            },
+            error => Self::BackendError(error),
+        }
     }
 }
 
@@ -150,8 +177,18 @@ pub fn parse_plan_markdown(content: &str) -> ParsedPlanArtifact {
     ParsedPlanArtifact { items, warnings }
 }
 
-pub async fn read_plan_for_workspace(
+#[cfg(test)]
+async fn read_plan_for_workspace(
     db: &SqliteDb,
+    workspace_id: &str,
+) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
+    let router = crate::diff::embedded_read_router_for_test(Arc::new(db.clone()));
+    read_plan_with_router(db, &router, workspace_id).await
+}
+
+pub async fn read_plan_with_router(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
     workspace_id: &str,
 ) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
     let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
@@ -159,13 +196,42 @@ pub async fn read_plan_for_workspace(
         .ok_or_else(|| PlanArtifactError::WorkspaceNotFound {
             workspace_id: workspace_id.to_string(),
         })?;
-    let worktree_path = Path::new(&workspace.worktree_path);
+    let resolved = router.resolve(db, &workspace).await?;
+    read_plan_for_resolved_workspace(&resolved).await
+}
 
-    match read_plan_artifact(worktree_path, None) {
+pub(crate) async fn read_plan_for_resolved_workspace(
+    resolved: &ResolvedWorkspace,
+) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
+    let artifact = match resolved
+        .backend
+        .read(
+            &resolved.placement,
+            "../plan.md",
+            MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        )
+        .await
+    {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(|content| parse_plan_markdown(&content))
+            .map_err(|_| {
+                PlanArtifactError::IoError(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ))
+            }),
+        Err(error) => Err(error.into()),
+    };
+    match artifact {
         Ok(artifact) => {
-            let source_path = default_plan_artifact_path(worktree_path)
-                .to_string_lossy()
-                .to_string();
+            let source_path = match resolved.placement.owner_kind {
+                db::PlacementOwnerKind::Server => {
+                    default_plan_artifact_path(&resolved.embedded_path()?)
+                        .to_string_lossy()
+                        .to_string()
+                }
+                db::PlacementOwnerKind::Daemon => "../plan.md".to_owned(),
+            };
             Ok(Some((
                 to_plan_progress_summary(&artifact),
                 to_plan_artifact_detail(&artifact, Some(source_path), None),
@@ -190,6 +256,66 @@ pub fn read_plan_artifact(
     };
     let content = read_bounded_plan_text(&candidate, allowed_root, false)?;
     Ok(parse_plan_markdown(&content))
+}
+
+/// Read a bounded owner-relative file with plan containment and file-type checks.
+pub(crate) fn read_workspace_bytes(
+    workspace_root: &Path,
+    rel_path: &str,
+    limit: u64,
+) -> Result<Vec<u8>, PlanArtifactError> {
+    let plan_path = if rel_path == "../plan.md" {
+        None
+    } else {
+        Some(rel_path)
+    };
+    let path = bounded_artifact_path(workspace_root, plan_path, limit)?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(PlanArtifactError::FileTooLarge {
+            size: bytes.len() as u64,
+            max: limit,
+        });
+    }
+    Ok(bytes)
+}
+
+fn bounded_artifact_path(
+    workspace_root: &Path,
+    plan_path: Option<&str>,
+    limit: u64,
+) -> Result<PathBuf, PlanArtifactError> {
+    let candidate = match plan_path {
+        Some(plan_path) => workspace_root.join(plan_path),
+        None => default_plan_artifact_path(workspace_root),
+    };
+    let allowed_root = match plan_path {
+        Some(_) => workspace_root,
+        None => workspace_root.parent().unwrap_or(workspace_root),
+    };
+    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            PlanArtifactError::NotFound
+        } else {
+            PlanArtifactError::IoError(error)
+        }
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(PlanArtifactError::InvalidFileType { path: candidate });
+    }
+    let canonical = candidate.canonicalize()?;
+    if !canonical.starts_with(allowed_root.canonicalize()?) {
+        return Err(PlanArtifactError::PathEscape { path: canonical });
+    }
+    let size = fs::metadata(&canonical)?.len();
+    if size > limit {
+        return Err(PlanArtifactError::FileTooLarge { size, max: limit });
+    }
+    Ok(candidate)
 }
 
 /// Read the canonical Task plan text for dispatch without bypassing the plan

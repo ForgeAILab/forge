@@ -1,7 +1,6 @@
 use api_types::ProjectSettings;
 use chrono::{DateTime, Utc};
 use db::Project;
-use executors::environment::run_environment_checks;
 
 use crate::{
     project_environment::{
@@ -90,15 +89,13 @@ impl TaskDispatcher {
         let project_id = project.id.clone();
         let job = tokio::spawn(async move {
             let _guard = guard;
-            let checkout = service.environment_check_checkout(&project).await?;
-            let mut failures = Vec::new();
-            for check in checks {
-                if let Some(failure) =
-                    run_environment_checks(&checkout, &environment.env, &[check], "").await
-                {
-                    failures.push(failure);
-                }
-            }
+            let (results, policy_denied) = service
+                .run_project_environment_checks(&project, &checks)
+                .await?;
+            let failures: Vec<_> = results
+                .into_iter()
+                .filter(|result| !result.passed)
+                .collect();
             if failures.is_empty() {
                 return service.clear_environment_pause(&project).await;
             }
@@ -112,6 +109,11 @@ impl TaskDispatcher {
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
+            if policy_denied {
+                detail.checks.clear();
+                detail.output =
+                    bounded_output_tail(&format!("{}\n{NO_RERUNNABLE_CHECK}", detail.output));
+            }
             service.update_environment_pause(&project, &detail).await?;
             Ok(false)
         });

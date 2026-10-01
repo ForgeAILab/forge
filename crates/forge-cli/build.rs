@@ -54,7 +54,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", web_dir.join("src").display());
 
     if env_is_truthy("FORGE_SKIP_WEB_BUILD") {
-        println!("cargo:warning=skipping web build (FORGE_SKIP_WEB_BUILD set)");
         return;
     }
 

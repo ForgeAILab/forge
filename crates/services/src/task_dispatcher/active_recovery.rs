@@ -7,7 +7,7 @@ use db::{
 };
 
 use crate::{
-    agent_capacity::has_running_execution_capacity,
+    agent_capacity::has_execution_capacity,
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
     workflow::{
@@ -39,6 +39,8 @@ impl TaskDispatcher {
         project: &Project,
         workflow: &WorkflowDefinition,
     ) -> Result<u64> {
+        crate::placement::admission::sweep_expired_reservations(&self.db, &db::now_rfc3339())
+            .await?;
         let mut active_states: Vec<String> = workflow
             .states
             .iter()
@@ -64,292 +66,360 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            if deferred_dispatch::queued_recovery(&task).is_some() {
-                continue;
-            }
-            task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                &self.db, &task,
-            )
-            .await
-            {
-                Ok(task) => task,
-                Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(task_id = %task.id, "stale plan-publication cleanup lost version race");
-                    continue;
+            let task_id = task.id.clone();
+            let result: Result<()> = async {
+                if self.task_service.expire_owner_wait(&task).await? {
+                    return Ok(());
                 }
-                Err(error) => {
-                    tracing::warn!(task_id = %task.id, %error, "stale plan-publication cleanup failed");
-                    continue;
+                if db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+                    .is_some_and(|placement| matches!(placement.state, db::PlacementState::Disconnected | db::PlacementState::Cleaning)) {
+                    return Ok(());
                 }
-            };
-            let task_workflow = WorkflowEngine::resolve_workflow_for_task(
-                &task,
-                &project.workflow_definition,
-                &Actor::system(SystemComponent::TaskDispatcher),
-            );
-            let recovery_role = task_workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-                .and_then(effective_role);
-            if crate::deferred_dispatch::paused_integration(&task).is_some() {
-                if helpers::has_blocking_annotation(&task) {
-                    continue;
+                if task.entry_barrier_json.is_some()
+                    && task
+                        .error_annotation
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|annotation| {
+                            annotation["blocking_reason"] == "review_ci_infrastructure"
+                        })
+                {
+                    if db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+                        .await?
+                        .is_some_and(|placement| placement.state == db::PlacementState::Disconnected)
+                    {
+                        return Ok(());
+                    }
+                    if !deferred_dispatch::is_pending(&task, chrono::Utc::now()) {
+                        match self
+                            .task_service
+                            .recover_task(
+                                task.id.clone(),
+                                api_types::RecoveryAction::RetryHook,
+                                Some("retry review CI infrastructure".into()),
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(_) => dispatched += 1,
+                            Err(error) => {
+                                tracing::warn!(task_id = %task.id, %error, "review CI retry remains pending")
+                            }
+                        }
+                    }
+                    return Ok(());
                 }
-                match self.task_service.retry_paused_integration(&task).await {
-                    Ok(true) => dispatched += 1,
+                if deferred_dispatch::queued_recovery(&task).is_some() {
+                    return Ok(());
+                }
+                task = match crate::task_service::execution::clear_stale_plan_publication_claim(
+                    &self.db, &task,
+                )
+                .await
+                {
+                    Ok(task) => task,
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(task_id = %task.id, "stale plan-publication cleanup lost version race");
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(task_id = %task.id, %error, "stale plan-publication cleanup failed");
+                        return Ok(());
+                    }
+                };
+                let task_workflow = WorkflowEngine::resolve_workflow_for_task(
+                    &task,
+                    &project.workflow_definition,
+                    &Actor::system(SystemComponent::TaskDispatcher),
+                );
+                let recovery_role = task_workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == task.status)
+                    .and_then(effective_role);
+                if crate::deferred_dispatch::paused_integration(&task).is_some() {
+                    if helpers::has_blocking_annotation(&task) {
+                        return Ok(());
+                    }
+                    match self.task_service.retry_paused_integration(&task).await {
+                        Ok(true) => dispatched += 1,
+                        Ok(false) => {}
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(
+                                task_id = %task.id,
+                                from_state = %task.status,
+                                "paused integration recovery lost version race"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                from_state = %task.status,
+                                %error,
+                                "paused integration recovery failed"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                if crate::workflow::review_refresh_transition_pending(&self.db, &task.id, &task.status)
+                    .await?
+                {
+                    let Some(target) =
+                        crate::workflow::review_refresh_target(&task_workflow, &task.status)
+                    else {
+                        tracing::error!(
+                            task_id = %task.id,
+                            state = %task.status,
+                            "review-refresh task has no reviewer transition"
+                        );
+                        return Ok(());
+                    };
+                    match self
+                        .task_service
+                        .transition(
+                            task.id.clone(),
+                            target.clone(),
+                            crate::task_service::TransitionOptions {
+                                version: task.version,
+                                reason: Some(format!(
+                                    "{} recover interrupted review refresh",
+                                    crate::workflow::REVIEW_REFRESH_MARKER
+                                )),
+                                triggered_by: Actor::system(SystemComponent::TaskDispatcher),
+                                rejection: false,
+                                defer_dispatch_seconds: None,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => dispatched += 1,
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(task_id = %task.id, "review-refresh recovery lost version race");
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                from_state = %task.status,
+                                to_state = %target,
+                                %error,
+                                "review-refresh recovery failed"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let Some(state) = task_workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == task.status)
+                else {
+                    return Ok(());
+                };
+                if effective_role(state) == Some(crate::workflow::default_roles::REVIEWER) {
+                    match self.recover_failed_review(&task).await {
+                        Ok(true) => {
+                            dispatched += 1;
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(task_id = %task.id, "failed review recovery lost version race");
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, %error, "failed review recovery failed");
+                            return Ok(());
+                        }
+                    }
+                }
+                if state.kind == StateKind::Gate
+                    && state
+                        .hooks
+                        .on_enter
+                        .iter()
+                        .any(|hook| hook.action == "run_merge")
+                {
+                    match self
+                        .recover_merge_gate(project, &task_workflow, state, &task)
+                        .await
+                    {
+                        Ok(true) => dispatched += 1,
+                        Ok(false) => {}
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(task_id = %task.id, "merge gate recovery lost version race");
+                        }
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, %error, "merge gate recovery failed");
+                        }
+                    }
+                    return Ok(());
+                }
+                let active_plan_claim =
+                    crate::task_service::execution::active_plan_publication_claim_owner(&task)?;
+                if helpers::has_blocking_annotation(&task) && active_plan_claim.is_none() {
+                    return Ok(());
+                }
+                if let Some(role_name) = effective_role(state) {
+                    let reconciliation_result = if role_name == crate::workflow::default_roles::REVIEWER
+                    {
+                        self.reconcile_terminal_reviewer_execution(&task.id, project.version)
+                            .await
+                    } else {
+                        self.reconcile_terminal_role_execution(&task, role_name, project.version)
+                            .await
+                    };
+                    let reconciliation = match reconciliation_result {
+                        Ok(reconciliation) => reconciliation,
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(task_id = %task.id, "terminal reconciliation lost version race");
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                task_id = %task.id,
+                                target_role = role_name,
+                                %error,
+                                "terminal execution reconciliation failed"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    if reconciliation == ReviewerReconciliation::Reconciled {
+                        // Settle a lost terminal cascade before any dispatch-only
+                        // eligibility checks can hide it or launch a replacement.
+                        return Ok(());
+                    }
+                    if role_name != crate::workflow::default_roles::REVIEWER
+                        && helpers::awaiting_human(&task)
+                    {
+                        if helpers::awaiting_human_is_authoritative(&task, state, role_name)
+                            && crate::task_service::execution::planning_review_matches_current_state_entry(
+                                &self.db,
+                                &task,
+                            )
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                        task = crate::task_service::execution::clear_stale_planning_review_metadata(
+                            &self.db, &task,
+                        )
+                        .await?;
+                    }
+                }
+
+                let is_coordination_root =
+                    crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
+                let sequence_complete = is_coordination_root
+                    && crate::task_hierarchy::coordination_root_sequence_complete(
+                        &self.db, &task, workflow,
+                    )
+                    .await?;
+                let needs_recovery_advance = sequence_complete
+                    && workflow.canonical_phase_for_state(&task.status)
+                        != api_types::CanonicalPhase::Review
+                    && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
+                if is_coordination_root
+                    && (crate::task_service::coordination_review_pending(&task)
+                        || needs_recovery_advance)
+                {
+                    dispatched += self.advance_coordination_root_once(&task).await?;
+                    return Ok(());
+                }
+                if deferred_dispatch::dispatch_disposition_is_current(&task, &task.status) {
+                    // An unchanged deterministic blocker was already observed for
+                    // this exact Task version and capability — skip the attempt
+                    // and its warning entirely (F11). See the matching check in
+                    // `dispatch_initial_tasks`.
+                    return Ok(());
+                }
+                match self
+                    .recover_active_task(project, &task_workflow, &task)
+                    .await
+                {
+                    Ok(true) => {
+                        self.clear_dispatch_disposition(&task).await?;
+                        dispatched += 1;
+                    }
                     Ok(false) => {}
                     Err(ServiceError::Db(DbError::VersionConflict)) => {
                         tracing::debug!(
                             task_id = %task.id,
                             from_state = %task.status,
-                            "paused integration recovery lost version race"
+                            target_role = recovery_role.unwrap_or("none"),
+                            "task dispatcher recovery lost version race"
                         );
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            from_state = %task.status,
-                            %error,
-                            "paused integration recovery failed"
-                        );
+                    Err(ref error @ ServiceError::WorkspaceResetRequired { .. }) => {
+                        tracing::warn!(task_id = %task.id, %error, "task branch lost, blocking for user reset");
+                        if let Err(block_error) =
+                            self.block_task_for_workspace_reset(&task, error).await
+                        {
+                            tracing::warn!(task_id = %task.id, %block_error, "failed to block task for workspace reset");
+                        }
                     }
-                }
-                continue;
-            }
-            if crate::workflow::review_refresh_transition_pending(&self.db, &task.id, &task.status)
-                .await?
-            {
-                let Some(target) =
-                    crate::workflow::review_refresh_target(&task_workflow, &task.status)
-                else {
-                    tracing::error!(
-                        task_id = %task.id,
-                        state = %task.status,
-                        "review-refresh task has no reviewer transition"
-                    );
-                    continue;
-                };
-                match self
-                    .task_service
-                    .transition(
-                        task.id.clone(),
-                        target.clone(),
-                        crate::task_service::TransitionOptions {
-                            version: task.version,
-                            reason: Some(format!(
-                                "{} recover interrupted review refresh",
-                                crate::workflow::REVIEW_REFRESH_MARKER
-                            )),
-                            triggered_by: Actor::system(SystemComponent::TaskDispatcher),
-                            rejection: false,
-                            defer_dispatch_seconds: None,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => dispatched += 1,
-                    Err(ServiceError::Db(DbError::VersionConflict)) => {
-                        tracing::debug!(task_id = %task.id, "review-refresh recovery lost version race");
+                    Err(error)
+                        if crate::placement::admission_refusal_is_retryable(
+                            &self.db, &task.id, &error,
+                        )
+                        .await? =>
+                    {
+                        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                            .await?
+                            .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                        self.task_service
+                            .defer_placement_refusal(&current, &error)
+                            .await?;
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            from_state = %task.status,
-                            to_state = %target,
-                            %error,
-                            "review-refresh recovery failed"
-                        );
+                    Err(error) if helpers::is_io_or_workspace_error(&error) => {
+                        tracing::error!(task_id = %task.id, %error, "task dispatcher recovery blocked task due to workspace error");
+                        if let Err(block_error) =
+                            self.block_task_on_workspace_error(&task, &error).await
+                        {
+                            tracing::warn!(task_id = %task.id, %block_error, "failed to block task after workspace error");
+                        }
                     }
-                }
-                continue;
-            }
-
-            let Some(state) = task_workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-            else {
-                continue;
-            };
-            if effective_role(state) == Some(crate::workflow::default_roles::REVIEWER) {
-                match self.recover_failed_review(&task).await {
-                    Ok(true) => {
-                        dispatched += 1;
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(ServiceError::Db(DbError::VersionConflict)) => {
-                        tracing::debug!(task_id = %task.id, "failed review recovery lost version race");
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(task_id = %task.id, %error, "failed review recovery failed");
-                        continue;
-                    }
-                }
-            }
-            if state.kind == StateKind::Gate
-                && state
-                    .hooks
-                    .on_enter
-                    .iter()
-                    .any(|hook| hook.action == "run_merge")
-            {
-                match self
-                    .recover_merge_gate(project, &task_workflow, state, &task)
-                    .await
-                {
-                    Ok(true) => dispatched += 1,
-                    Ok(false) => {}
-                    Err(ServiceError::Db(DbError::VersionConflict)) => {
-                        tracing::debug!(task_id = %task.id, "merge gate recovery lost version race");
-                    }
-                    Err(error) => {
-                        tracing::warn!(task_id = %task.id, %error, "merge gate recovery failed");
-                    }
-                }
-                continue;
-            }
-            let active_plan_claim =
-                crate::task_service::execution::active_plan_publication_claim_owner(&task)?;
-            if helpers::has_blocking_annotation(&task) && active_plan_claim.is_none() {
-                continue;
-            }
-            if let Some(role_name) = effective_role(state) {
-                let reconciliation_result = if role_name == crate::workflow::default_roles::REVIEWER
-                {
-                    self.reconcile_terminal_reviewer_execution(&task.id, project.version)
-                        .await
-                } else {
-                    self.reconcile_terminal_role_execution(&task, role_name, project.version)
-                        .await
-                };
-                let reconciliation = match reconciliation_result {
-                    Ok(reconciliation) => reconciliation,
-                    Err(ServiceError::Db(DbError::VersionConflict)) => {
-                        tracing::debug!(task_id = %task.id, "terminal reconciliation lost version race");
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            target_role = role_name,
-                            %error,
-                            "terminal execution reconciliation failed"
-                        );
-                        continue;
-                    }
-                };
-                if reconciliation == ReviewerReconciliation::Reconciled {
-                    // Settle a lost terminal cascade before any dispatch-only
-                    // eligibility checks can hide it or launch a replacement.
-                    continue;
-                }
-                if role_name != crate::workflow::default_roles::REVIEWER
-                    && helpers::awaiting_human(&task)
-                {
-                    if helpers::awaiting_human_is_authoritative(&task, state, role_name)
-                        && crate::task_service::execution::planning_review_matches_current_state_entry(
+                    Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                        deferred_dispatch::record_dispatch_disposition(
                             &self.db,
                             &task,
+                            &task.status,
+                            &error.to_string(),
                         )
-                        .await?
-                    {
-                        continue;
+                        .await?;
+                        crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                            &self.db,
+                            &task.id,
+                            &task.status,
+                            &error,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            from_state = %task.status,
+                            target_role = recovery_role.unwrap_or("none"),
+                            %error,
+                            "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
+                        );
                     }
-                    task = crate::task_service::execution::clear_stale_planning_review_metadata(
-                        &self.db, &task,
-                    )
-                    .await?;
-                }
-            }
-
-            let is_coordination_root =
-                crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
-            let sequence_complete = is_coordination_root
-                && crate::task_hierarchy::coordination_root_sequence_complete(
-                    &self.db, &task, workflow,
-                )
-                .await?;
-            let needs_recovery_advance = sequence_complete
-                && workflow.canonical_phase_for_state(&task.status)
-                    != api_types::CanonicalPhase::Review
-                && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
-            if is_coordination_root
-                && (crate::task_service::coordination_review_pending(&task)
-                    || needs_recovery_advance)
-            {
-                dispatched += self.advance_coordination_root_once(&task).await?;
-                continue;
-            }
-            if deferred_dispatch::dispatch_disposition_is_current(&task, &task.status) {
-                // An unchanged deterministic blocker was already observed for
-                // this exact Task version and capability — skip the attempt
-                // and its warning entirely (F11). See the matching check in
-                // `dispatch_initial_tasks`.
-                continue;
-            }
-            match self
-                .recover_active_task(project, &task_workflow, &task)
-                .await
-            {
-                Ok(true) => {
-                    self.clear_dispatch_disposition(&task).await?;
-                    dispatched += 1;
-                }
-                Ok(false) => {}
-                Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        target_role = recovery_role.unwrap_or("none"),
-                        "task dispatcher recovery lost version race"
-                    );
-                }
-                Err(ref error @ ServiceError::WorkspaceResetRequired { .. }) => {
-                    tracing::warn!(task_id = %task.id, %error, "task branch lost, blocking for user reset");
-                    if let Err(block_error) =
-                        self.block_task_for_workspace_reset(&task, error).await
-                    {
-                        tracing::warn!(task_id = %task.id, %block_error, "failed to block task for workspace reset");
+                    Err(error) => {
+                        // Potentially transient: no disposition, so the next scan
+                        // retries instead of stalling on a momentary failure.
+                        tracing::warn!(
+                            task_id = %task.id,
+                            from_state = %task.status,
+                            target_role = recovery_role.unwrap_or("none"),
+                            %error,
+                            "task dispatcher recovery failed"
+                        );
                     }
                 }
-                Err(error) if helpers::is_io_or_workspace_error(&error) => {
-                    tracing::error!(task_id = %task.id, %error, "task dispatcher recovery blocked task due to workspace error");
-                    if let Err(block_error) =
-                        self.block_task_on_workspace_error(&task, &error).await
-                    {
-                        tracing::warn!(task_id = %task.id, %block_error, "failed to block task after workspace error");
-                    }
-                }
-                Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
-                    deferred_dispatch::record_dispatch_disposition(
-                        &self.db,
-                        &task,
-                        &task.status,
-                        &error.to_string(),
-                    )
-                    .await?;
-                    tracing::warn!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        target_role = recovery_role.unwrap_or("none"),
-                        %error,
-                        "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
-                    );
-                }
-                Err(error) => {
-                    // Potentially transient: no disposition, so the next scan
-                    // retries instead of stalling on a momentary failure.
-                    tracing::warn!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        target_role = recovery_role.unwrap_or("none"),
-                        %error,
-                        "task dispatcher recovery failed"
-                    );
-                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%task_id, %error, "Task scan failed; continuing with the next Task");
             }
         }
         Ok(dispatched)
@@ -804,6 +874,27 @@ impl TaskDispatcher {
             return Ok(false);
         }
 
+        let workspace = db::WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await?;
+        if let Some(workspace) = workspace.as_ref() {
+            if db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &workspace.id)
+                .await?
+                .is_some_and(|placement| {
+                    matches!(
+                        placement.state,
+                        db::PlacementState::Disconnected
+                            | db::PlacementState::Cleaning
+                            | db::PlacementState::Reserved
+                            | db::PlacementState::Preparing
+                    )
+                })
+            {
+                return Ok(false);
+            }
+        }
         let state_config =
             helpers::merged_state_config(state, project, task.task_state_config.as_deref());
         if task.entry_barrier_json.is_some() {
@@ -818,18 +909,19 @@ impl TaskDispatcher {
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        match compute_effective_status(&self.db, &agent).await? {
-            EffectiveStatus::Error
-            | EffectiveStatus::Paused
-            | EffectiveStatus::DaemonOffline
-            | EffectiveStatus::DaemonUnavailable
-            | EffectiveStatus::ConnectionDegraded
-            | EffectiveStatus::ConnectionUnavailable
-            | EffectiveStatus::SourceDisabled
-            | EffectiveStatus::Deactivated => return Ok(false),
-            EffectiveStatus::Active | EffectiveStatus::Busy => {}
+        if !matches!(
+            compute_effective_status(&self.db, &agent, None).await?,
+            EffectiveStatus::Active | EffectiveStatus::Busy
+        ) {
+            return Ok(false);
         }
-        if !has_running_execution_capacity(&self.db, &agent).await? {
+        if !has_execution_capacity(
+            &self.db,
+            &agent,
+            workspace.as_ref().map(|workspace| workspace.id.as_str()),
+        )
+        .await?
+        {
             return Ok(false);
         }
         if deferred_dispatch::pending_until(task).is_some() {

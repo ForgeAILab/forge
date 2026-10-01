@@ -1,12 +1,11 @@
 use std::{path::Path, sync::Arc};
 
 use api_types::{
-    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionStartParams,
-    ExecutionTerminalAckParams, FsBranchesParams, FsListParams, TerminalInputParams,
-    TerminalResizeParams, TerminalStartParams, TerminalTerminateParams, INVALID_FRAME,
-    METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL_ACK,
-    METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
-    METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
+    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionStartParams, FsBranchesParams,
+    FsListParams, JournalAckParams, TerminalInputParams, TerminalResizeParams, TerminalStartParams,
+    TerminalTerminateParams, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START,
+    METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_JOURNAL_ACK, METHOD_TERMINAL_INPUT,
+    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -144,24 +143,41 @@ pub async fn handle_request_with_terminal(
             },
             Err(frame) => frame,
         },
-        METHOD_EXECUTION_TERMINAL_ACK => {
-            match decode_params::<ExecutionTerminalAckParams>(&id, params) {
-                Ok(params) => match daemon_runtime {
-                    Some(runtime) => match runtime.acknowledge_terminal(params).await {
-                        Ok(result) => response_frame(id, result),
-                        Err(error) => DaemonFrame::Error {
-                            id: Some(id),
-                            error,
-                        },
+        METHOD_JOURNAL_ACK => match decode_params::<JournalAckParams>(&id, params) {
+            Ok(params) => match daemon_runtime {
+                Some(runtime) => match runtime.acknowledge_journal(params).await {
+                    Ok(result) => response_frame(id, result),
+                    Err(error) => DaemonFrame::Error {
+                        id: Some(id),
+                        error,
                     },
-                    None => error_frame(
-                        Some(id),
-                        UNSUPPORTED_METHOD,
-                        "execution.terminal.ack is not available in this daemon command context",
-                        None,
-                    ),
                 },
-                Err(frame) => frame,
+                None => error_frame(
+                    Some(id),
+                    UNSUPPORTED_METHOD,
+                    "journal.ack is not available in this daemon command context",
+                    None,
+                ),
+            },
+            Err(frame) => frame,
+        },
+        method if forge_client::daemon_workspace::DaemonWorkspaceBackend::supports(method) => {
+            match daemon_runtime {
+                Some(runtime) => {
+                    runtime
+                        .handle_request(DaemonFrame::Request {
+                            id,
+                            method: method.to_owned(),
+                            params,
+                        })
+                        .await
+                }
+                None => error_frame(
+                    Some(id),
+                    UNSUPPORTED_METHOD,
+                    "workspace support is not available in this daemon command context",
+                    None,
+                ),
             }
         }
         _ => error_frame(
@@ -383,16 +399,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_ack_is_routed_to_runtime_store() {
+    async fn journal_ack_is_routed_to_runtime_store() {
         let dir = create_test_root("terminal-ack");
         let (responses_tx, _responses_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = forge_client::daemon_runtime::DaemonRuntime::new(responses_tx, dir.clone());
         let frame = DaemonFrame::Request {
             id: "cmd-terminal-ack".to_owned(),
-            method: api_types::METHOD_EXECUTION_TERMINAL_ACK.to_owned(),
+            method: api_types::METHOD_JOURNAL_ACK.to_owned(),
             params: json!({
-                "terminal_report_id": "missing-report",
-                "execution_id": "execution-1"
+                "entry_id": "missing-report"
             }),
         };
 
@@ -402,6 +417,37 @@ mod tests {
         };
         assert_eq!(result["acknowledged"], false);
 
+        remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_request_is_routed_to_runtime_backend() {
+        let dir = create_test_root("workspace-command");
+        let (responses_tx, _responses_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+            responses_tx,
+            dir.clone(),
+            forge_client::daemon_runtime::ActiveExecutionTracker::default(),
+            "daemon-1".into(),
+            forge_client::daemon_config::DaemonConfig::default().run_policy(),
+        )
+        .unwrap();
+        let response = handle_request_with_terminal(
+            DaemonFrame::Request {
+                id: "workspace-describe".into(),
+                method: api_types::METHOD_WORKSPACE_DESCRIBE.into(),
+                params: json!({"daemon_id":"daemon-1", "runtime_id":"runtime-1", "placement_id":"placement-1", "workspace_handle":"unknown", "generation":1}),
+            },
+            &dir,
+            None,
+            Some(&runtime),
+        )
+        .await;
+        let DaemonFrame::Error { id, error } = response else {
+            panic!("expected unknown-handle error from workspace backend");
+        };
+        assert_eq!(id.as_deref(), Some("workspace-describe"));
+        assert_eq!(error.code, api_types::INVALID_INPUT);
         remove_dir(&dir);
     }
 

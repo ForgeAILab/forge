@@ -10,6 +10,7 @@ import {
 import { Link } from '@tanstack/react-router'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import type { Task, TaskStatus } from '@/types/generated'
@@ -120,6 +121,11 @@ export function TaskDetailSidebar({
           </>
         ) : null}
       </div>
+      {task && (task.placement ?? task.workspace?.placement) ? (
+        <div className="border-b p-4">
+          <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
+        </div>
+      ) : null}
       <nav className="flex gap-0.5 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-visible">
         {navItems.map(({ id, label, Icon: NavIcon, badge }) => (
           <Link

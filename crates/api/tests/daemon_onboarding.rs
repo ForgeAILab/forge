@@ -199,7 +199,14 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         .await
         .expect("workspace query succeeds")
         .expect("claim created a workspace");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("create shell worktree");
+    std::fs::create_dir_all(
+        state
+            .workspace_backend_router
+            .embedded_path(&state.db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("create shell worktree");
 
     let completed_execution = poll_execution_status(
         &app,

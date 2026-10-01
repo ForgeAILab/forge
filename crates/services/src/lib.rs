@@ -51,6 +51,7 @@ pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod orchestration_authorization;
+pub mod placement;
 pub mod plan_artifact;
 pub mod pr_service;
 pub mod pricing;
@@ -79,6 +80,7 @@ pub mod prompt_preview;
 pub mod provider_authorization;
 pub mod provider_health;
 pub mod recovery;
+pub mod repo_location;
 pub mod runtime;
 pub mod shared_media_cleanup;
 pub mod shutdown;
@@ -94,6 +96,7 @@ pub mod types;
 pub mod usage_projection;
 pub mod wake_turn_consumer;
 pub mod workflow;
+pub mod workspace_backend;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
 
@@ -347,6 +350,15 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error(transparent)]
+    PlacementUnavailable(#[from] placement::PlacementUnavailable),
+
+    #[error("workspace preparation failed for placement {placement_id}: {message}")]
+    PrepareFailed {
+        placement_id: String,
+        message: String,
+    },
+
     #[error("dependency gate")]
     DependencyGate,
 
@@ -406,6 +418,15 @@ pub enum ServiceError {
 
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },
+
+    #[error("daemon_not_ready: daemon {daemon_id} has not sent its command handshake")]
+    DaemonNotReady { daemon_id: String },
+
+    #[error(
+        "daemon_upgrade_required: daemon {daemon_id}: {}",
+        api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+    )]
+    DaemonUpgradeRequired { daemon_id: String },
 
     #[error("daemon command timed out for daemon {daemon_id}: {method}")]
     DaemonTimeout { daemon_id: String, method: String },
@@ -507,6 +528,15 @@ impl From<git::GitError> for ServiceError {
 impl From<review::ReviewError> for ServiceError {
     fn from(error: review::ReviewError) -> Self {
         match error {
+            review::ReviewError::OwnerUnavailable { daemon_id } => {
+                Self::DaemonUnavailable { daemon_id }
+            }
+            review::ReviewError::WorkspaceInfrastructure(message) => {
+                Self::invalid_operation(message)
+            }
+            review::ReviewError::Db(db::DbError::VersionConflict) => {
+                Self::Db(db::DbError::VersionConflict)
+            }
             review::ReviewError::Db(db::DbError::ProjectPaused { project_id }) => {
                 Self::ProjectPaused { project_id }
             }

@@ -1,5 +1,6 @@
 use api_types::{
-    AgentResponse, DaemonResponse, ProjectResponse, RepoResponse, TaskListItemResponse,
+    AgentResponse, DaemonResponse, ProjectResponse, RepoLocationResponse, RepoResponse,
+    TaskListItemResponse,
 };
 use serde::Serialize;
 use tabled::Table;
@@ -114,6 +115,50 @@ fn repo_source(value: &RepoResponse) -> String {
             .or(value.local_path.as_deref())
             .unwrap_or("—")
     )
+}
+
+pub fn print_table_repo_locations(items: &[RepoLocationResponse]) {
+    let rows = items
+        .iter()
+        .map(|location| {
+            vec![
+                location.id.clone(),
+                serialized_label(&location.owner_kind),
+                location.daemon_id.clone().unwrap_or_else(|| "-".to_owned()),
+                location
+                    .runtime_id
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+                location.path.clone(),
+                serialized_label(&location.kind),
+                location.is_default.to_string(),
+                serialized_label(&location.status),
+                location.version.to_string(),
+                location
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        Table::from_rows(
+            &[
+                "ID",
+                "Owner",
+                "DaemonID",
+                "RuntimeID",
+                "Path",
+                "Kind",
+                "Default",
+                "Status",
+                "Version",
+                "LastError"
+            ],
+            rows
+        )
+    );
 }
 
 fn short_id(value: &str) -> String {

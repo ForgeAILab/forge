@@ -8,6 +8,7 @@ use crate::{
         default_states,
         engine::{WorkflowAuthority, WorkflowEngine},
     },
+    workspace_backend::{EmbeddedWorkspaceBackend, WorkspaceBackendRouter},
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
@@ -416,7 +417,10 @@ pub struct TaskService {
     workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    test_workspace_backend: bool,
     workspace_root: PathBuf,
+    workspace_max_disconnect: Duration,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Task IDs whose completion cascade is running right now. Shared by
@@ -489,8 +493,14 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+    /// Production services receive the runtime's shared owner router.
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    ) -> Self {
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
+        let workspace_root = default_workspace_root();
         Self {
             db,
             event_bus,
@@ -502,7 +512,10 @@ impl TaskService {
             workspace_exec_locks: None,
             terminal_activity: None,
             repo_cache_locks: None,
-            workspace_root: default_workspace_root(),
+            workspace_backend_router,
+            test_workspace_backend: false,
+            workspace_root,
+            workspace_max_disconnect: Duration::from_secs(::config::DEFAULT_MAX_DISCONNECT_SECONDS),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
@@ -512,9 +525,60 @@ impl TaskService {
         }
     }
 
+    /// Embedded-only fixture constructor for tests outside this crate.
+    pub fn new_for_test(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let router = crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            default_workspace_root(),
+            None,
+        );
+        let mut service = Self::new_with_router(db, event_bus, router);
+        service.test_workspace_backend = true;
+        service
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self::new_for_test(db, event_bus)
+    }
+
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {
         self.merge_service = Some(merge_service);
+        self.configure_workspace_backend();
         self
+    }
+
+    /// Inject the graph's shared router after configuring workspace dependencies.
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self.test_workspace_backend = false;
+        self
+    }
+
+    pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
+        Arc::clone(&self.workspace_backend_router)
+    }
+
+    fn configure_workspace_backend(&mut self) {
+        if !self.test_workspace_backend {
+            return;
+        }
+        let merge_service = self.merge_service.clone().unwrap_or_else(|| {
+            Arc::new(MergeService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                self.workspace_root.clone(),
+            ))
+        });
+        let mut embedded = EmbeddedWorkspaceBackend::new(
+            Arc::clone(&self.db),
+            merge_service,
+            self.workspace_root.clone(),
+        );
+        if let Some(locks) = &self.repo_cache_locks {
+            embedded = embedded.with_repo_cache_locks(Arc::clone(locks));
+        }
+        self.workspace_backend_router = Arc::new(WorkspaceBackendRouter::new(Arc::new(embedded)));
     }
 
     pub(crate) async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
@@ -561,6 +625,7 @@ impl TaskService {
             scheduler.set_repo_cache_locks(Arc::clone(&locks));
         }
         self.repo_cache_locks = Some(locks);
+        self.configure_workspace_backend();
         self
     }
 
@@ -575,8 +640,14 @@ impl TaskService {
         self
     }
 
+    pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {
+        self.workspace_max_disconnect = timeout;
+        self
+    }
+
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = workspace_root;
+        self.configure_workspace_backend();
         self
     }
 
@@ -691,24 +762,24 @@ impl TaskService {
         .unwrap_or(Value::Null);
         let hard_deadline_at = execution::execution_deadline_seconds(&snapshot)
             .map(|seconds| execution::rfc3339_after(&input.updated_at, i64::from(seconds)));
-        let remote_owner = if let Some(agent_id) = input.agent_id.as_deref() {
-            AgentRepo::get_by_id(&*self.db, agent_id)
-                .await?
-                .and_then(|agent| {
-                    agent.daemon_id.as_deref().and_then(|daemon_id| {
-                        self.daemon_connections.as_ref().and_then(|registry| {
-                            registry.get(daemon_id).map(|connection| {
-                                crate::daemon_transport::execution_lease_owner(
-                                    daemon_id,
-                                    connection.id(),
-                                )
-                            })
-                        })
-                    })
-                })
-        } else {
-            None
+        let placement = match input.workspace_id.as_deref() {
+            Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id).await?,
+            None => None,
         };
+        let daemon_id = placement.as_ref().and_then(|placement| {
+            placement
+                .execution_daemon_id
+                .as_deref()
+                .or(placement.daemon_id.as_deref())
+        });
+        let remote_owner = daemon_id.and_then(|daemon_id| {
+            self.daemon_connections
+                .as_ref()
+                .and_then(|registry| registry.get(daemon_id))
+                .map(|connection| {
+                    crate::daemon_transport::execution_lease_owner(daemon_id, connection.id())
+                })
+        });
         let (owner, lease_expires_at) = match remote_owner {
             Some(owner) => (
                 owner,
@@ -873,15 +944,21 @@ impl TaskService {
                 admission.expected_auditor_execution_id = auditor_execution_id;
             }
         }
-        self.create_running_execution_with_admission(input, workspace_created_by_attempt, admission)
-            .await
+        self.create_running_execution_with_admission(
+            input,
+            workspace_created_by_attempt,
+            admission,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn create_running_execution_with_admission(
+    async fn create_running_execution_with_admission(
         &self,
         mut input: CreateExecution,
         workspace_created_by_attempt: bool,
         mut admission: Option<ExecutionAdmission>,
+        workspace_admission: Option<&workspace::WorkspaceAdmission>,
     ) -> Result<Execution> {
         // Replay authority follows this call chain only; spawned execution
         // runners and unrelated API requests do not inherit the task-local.
@@ -950,18 +1027,68 @@ impl TaskService {
             }
         }
 
-        let create_result = if input.status == ExecutionStatus::Running {
-            let lease = self.initial_execution_lease(&input).await?;
-            ExecutionRepo::create_with_lease_and_admission(
-                &*self.db,
-                input.clone(),
-                lease,
-                admission,
-            )
-            .await
-        } else {
-            ExecutionRepo::create(&*self.db, input.clone()).await
-        };
+        let create_result: Result<Execution> = async {
+            if input.status == ExecutionStatus::Running {
+                let (task, workspace) = repository_context
+                    .as_ref()
+                    .expect("repository context loaded");
+                let prepared_admission;
+                let workspace_admission = match workspace_admission {
+                    Some(admission) => admission,
+                    None => {
+                        let agent = match input.agent_id.as_deref() {
+                            Some(id) => {
+                                Some(AgentRepo::get_by_id(&*self.db, id).await?.ok_or_else(
+                                    || ServiceError::not_found("agent", id.to_owned()),
+                                )?)
+                            }
+                            None => None,
+                        };
+                        // Placement adds a large reserve/prepare future to every
+                        // recovery path; keep it off the enclosing admission frame.
+                        let reservation = Box::pin(self.reserve_claim_workspace(
+                            task,
+                            agent.as_ref(),
+                            &input.role,
+                        ))
+                        .await?;
+                        prepared_admission =
+                            Box::pin(self.prepare_claim_workspace(reservation)).await?;
+                        &prepared_admission
+                    }
+                };
+                if workspace.id != workspace_admission.workspace.id {
+                    return Err(DbError::VersionConflict.into());
+                }
+                let lease = self.initial_execution_lease(&input).await?;
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                self.check_claim_placement_in_tx(&mut transaction, task, workspace_admission)
+                    .await?;
+                self.check_placement_lease_owner(&workspace_admission.placement, &lease)?;
+                let execution = ExecutionRepo::create_with_lease_and_admission_in_tx(
+                    &*self.db,
+                    &mut transaction,
+                    input.clone(),
+                    lease,
+                    admission,
+                )
+                .await?;
+                self.issue_workspace_lease_in_tx(
+                    &mut transaction,
+                    task,
+                    &workspace_admission.workspace,
+                    &input.role,
+                    input.agent_id.as_deref(),
+                    &input.id,
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(execution)
+            } else {
+                Ok(ExecutionRepo::create(&*self.db, input.clone()).await?)
+            }
+        }
+        .await;
         let execution = match create_result {
             Ok(execution) => execution,
             Err(error) => {
@@ -972,47 +1099,10 @@ impl TaskService {
                     )
                     .await;
                 }
-                return Err(error.into());
-            }
-        };
-        if let Some((task, workspace)) = repository_context.as_ref() {
-            if let Err(error) = self
-                .issue_workspace_lease(
-                    task,
-                    workspace,
-                    &input.role,
-                    input.agent_id.as_deref(),
-                    &input.id,
-                )
-                .await
-            {
-                if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, error.to_string())
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %mark_error,
-                        "failed to terminalize execution after WorkspaceLease rejection"
-                    );
-                }
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(task, workspace)
-                        .await;
-                }
                 return Err(error);
             }
-        }
+        };
         Ok(execution)
-    }
-
-    pub(crate) async fn cleanup_fresh_execution_workspace(
-        &self,
-        task: &Task,
-        workspace: &Workspace,
-    ) {
-        self.cleanup_fresh_execution_workspace_by_id(&task.id, Some(&workspace.id))
-            .await;
     }
 
     async fn cleanup_fresh_execution_workspace_by_id(
@@ -1028,6 +1118,16 @@ impl TaskService {
                 .flatten()
         } else {
             None
+        };
+        // Capture the server path while its placement row still exists. The
+        // conditional DELETE below is the admission/concurrent-launch fence.
+        let worktree_path = match workspace.as_ref() {
+            Some(workspace) => self
+                .workspace_backend_router
+                .embedded_path(&self.db, workspace)
+                .await
+                .ok(),
+            None => None,
         };
         if let Some(workspace_id) = workspace_id {
             // Delete only our workspace row and only while no execution has
@@ -1063,6 +1163,9 @@ impl TaskService {
             let Some(workspace) = workspace else {
                 return;
             };
+            let Some(worktree_path) = worktree_path else {
+                return;
+            };
             let source = match RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await {
                 Ok(Some(repo)) => {
                     match project_agent_workspace::resolve_repo_source(&repo, &self.workspace_root)
@@ -1078,11 +1181,7 @@ impl TaskService {
                 _ => return,
             };
             if let Err(cleanup_error) = manager
-                .cleanup_worktree(
-                    task_id,
-                    std::path::Path::new(&source),
-                    std::path::Path::new(&workspace.worktree_path),
-                )
+                .cleanup_worktree(task_id, std::path::Path::new(&source), &worktree_path)
                 .await
             {
                 tracing::warn!(
@@ -1675,7 +1774,14 @@ impl TaskService {
 
         if execution.status != ExecutionStatus::Completed {
             if let Some(workspace) = workspace.as_ref() {
-                execution::discard_execution_plan_stage(&workspace.worktree_path, &execution.id);
+                if let Ok(path) =
+                    crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                        &self.db, workspace,
+                    )
+                    .await
+                {
+                    execution::discard_execution_plan_stage(&path.to_string_lossy(), &execution.id);
+                }
             }
         }
 

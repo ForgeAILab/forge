@@ -665,7 +665,13 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
-                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                    if crate::placement::admission_refusal_is_retryable(
+                        &self.db,
+                        &current.id,
+                        &error,
+                    )
+                    .await?
+                    {
                         return self
                             .queue_resume_for_capacity(
                                 &current,
@@ -710,18 +716,23 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
-                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                    if crate::placement::admission_refusal_is_retryable(
+                        &self.db,
+                        &current.id,
+                        &error,
+                    )
+                    .await?
+                    {
                         let role = if execution.role == "executor" {
                             crate::workflow::default_roles::CODER
                         } else {
                             &execution.role
                         };
-                        let assigned_agent = TaskRoleAssignmentRepo::get_by_task_and_role(
-                            &*self.db,
-                            &current.id,
-                            role,
+                        let assigned_agent = crate::task_hierarchy::effective_role_assignment(
+                            &self.db, &current, role,
                         )
                         .await?
+                        .map(|resolved| resolved.assignment)
                         .filter(|assignment| assignment.assignee_type == Some(AssigneeKind::Agent))
                         .and_then(|assignment| assignment.assignee_id)
                         .or_else(|| execution.agent_id.clone());
@@ -765,7 +776,9 @@ impl TaskService {
             Err(error) => {
                 self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), role)
                     .await;
-                if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                if crate::placement::admission_refusal_is_retryable(&self.db, &current.id, &error)
+                    .await?
+                {
                     return self
                         .queue_resume_for_capacity(&current, Some(&agent_id), context)
                         .await;

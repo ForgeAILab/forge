@@ -258,7 +258,7 @@ async fn fixture_with_allowed_operations(
     .await
     .expect("root governance");
 
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(32)));
     (db, service)
 }
 

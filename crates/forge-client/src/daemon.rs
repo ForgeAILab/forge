@@ -268,14 +268,21 @@ async fn run_daemon_loop(
         config.initial_credentials.token.clone(),
     );
     let active_executions = config.active_executions.clone();
-    let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+    let run_policy =
+        crate::daemon_config::DaemonConfig::load(config.credentials_path)?.run_policy();
+    let mut connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
         active_executions.clone(),
+        run_policy,
     ));
     loop {
         tokio::select! {
+            result = &mut connect_handle => {
+                result.context("daemon command stream task failed")??;
+                return Err(anyhow!("daemon command stream stopped unexpectedly"));
+            }
             result = tokio::signal::ctrl_c() => {
                 result.context("listen for Ctrl-C")?;
                 let _ = shutdown_tx.send(true);

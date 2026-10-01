@@ -274,6 +274,9 @@ mod subtask_hook_test_support {
                 project_id,
                 from_state: from_state.to_owned(),
                 to_state: to_state.to_owned(),
+                workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(
+                    &db,
+                )),
                 db,
                 event_bus,
                 gate_config: None,

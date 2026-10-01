@@ -512,4 +512,47 @@ mod tests {
         let slots = load_project_slots(&db, &project).await.unwrap();
         assert_eq!((slots.active, slots.parked), (5, 1));
     }
+    #[tokio::test]
+    async fn placement_waits_hold_slots_and_owner_blockers_share_the_aggregate() {
+        let (db, project) = fixture().await;
+        for key in ["owner_wait", "deferred_dispatch"] {
+            let waiting = task(&db, &project, "in_progress", None).await;
+            sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+                .bind(
+                    serde_json::json!({key: {"daemon_id":"offline", "target_state":"in_progress"}})
+                        .to_string(),
+                )
+                .bind(&waiting.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let kinds = [
+            "owner_disconnected_timeout",
+            "review_ci_infrastructure",
+            "review_ci_infrastructure_exhausted",
+            "review_ci_unavailable",
+            "workspace_reset_required",
+            "recovery_required",
+            "before_work_hook_failed",
+        ];
+        for kind in kinds {
+            assert!(helpers::is_blocking_annotation_type(kind));
+            let parked = task(&db, &project, "review", None).await;
+            sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                .bind(serde_json::json!({"type":kind}).to_string())
+                .bind(&parked.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let parked = TaskRepo::get_by_id(&db, &parked.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(helpers::has_blocking_annotation(&parked));
+        }
+        let slots = load_project_slots(&db, &project).await.unwrap();
+        assert_eq!((slots.active, slots.parked), (2, kinds.len() as u32));
+        assert_eq!(slots, walk_project_slots(&db, &project).await.unwrap());
+    }
 }

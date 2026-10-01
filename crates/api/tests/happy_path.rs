@@ -362,7 +362,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         &format!("/api/v1/projects/{project_id}/tasks"),
         json!({
             "title": "Autonomous validation retry",
-            "description": "printf 'validation retry\\n' > autonomous-ci-retry.txt && git add autonomous-ci-retry.txt && git commit --allow-empty -m autonomous-ci-retry",
+            "description": "printf 'validation retry\\n' > autonomous-ci-retry.txt && git add autonomous-ci-retry.txt && git commit -m autonomous-ci-retry",
             "review_config": { "ci_steps": ["false"] }
         }),
         StatusCode::OK,
@@ -394,7 +394,11 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         StatusCode::OK,
     )
     .await;
-    assert_eq!(after_ci_failure.status, "working".to_owned());
+    assert_eq!(
+        after_ci_failure.status,
+        "working".to_owned(),
+        "Task after CI failure: {after_ci_failure:?}"
+    );
     assert!(!after_ci_failure.awaiting_human);
 
     let passing_review_config = serde_json::to_string(&json!({
@@ -520,7 +524,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -828,7 +832,21 @@ async fn poll_until_task_status(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("task did not reach {expected_status:?} within timeout");
+    let last: TaskResponse = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}/executions"),
+        StatusCode::OK,
+    )
+    .await;
+    panic!("task did not reach {expected_status:?} within timeout; last Task: {last:?}; executions: {executions:?}");
 }
 
 async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResponse {

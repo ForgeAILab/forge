@@ -45,6 +45,7 @@ async fn pause_environment(harness: &common::Harness, id: &str) {
         .unwrap();
     let now = now_rfc3339();
     let detail = ProjectEnvironmentPause {
+        workspace_id: None,
         checks: vec!["disk".to_owned()],
         role: Some("coder".to_owned()),
         output: "root free: 7G".to_owned(),
