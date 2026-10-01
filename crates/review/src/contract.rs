@@ -32,11 +32,15 @@ Also check:
 - Scope: the delta stays inside the Task. Unrelated refactors, renames, formatting churn, new dependencies, or edits to files the Task does not need are a blocking problem; name the files and why they are outside scope.
 Stop once you can answer these. Do not audit unchanged code or fail on style preferences.
 Write your review in Markdown: for each requirement say whether it is met and what you ran to show it, and for each problem say what was expected, what you observed, and where (command output, screenshot, or file and line). Then end your reply with exactly one JSON object on its own:
-{"result": "pass", "reason": "one sentence"}
+{"result": "pass", "reason": "one sentence", "fixable_by": "coder", "repeat": false}
 result is one of:
 - "pass": every requirement is met, verified by running it, and nothing blocks the Task.
-- "fail": the implementation is wrong, incomplete, untested, or out of scope; the reason and your review go to the coder to fix.
+- "fail": the implementation is wrong, incomplete, untested, or out of scope; coder-fixable findings go to the coder, while owner-only or repeated findings may park for the owner.
 - "blocked": you could not reach a verdict because of the review environment, not the code (for example the toolchain or dependencies are missing). Explain what is missing; the project owner resolves it.
+fixable_by is "coder" (default) or "owner". Use "owner" only when the blocking finding needs something the coder cannot provide in this Task: another OS or hardware, an external service or credential, Forge-side metadata or links, a scope/product decision, or a change to acceptance criteria; otherwise use "coder".
+repeat defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
+Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
+Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}.
 Do not pass work you could not check."#;
 
 pub async fn load_context(
@@ -1123,7 +1127,7 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     if message.len() > MAX_REPORT_BYTES {
         return Err("review report exceeds size budget".into());
     }
-    let (span, result, reason) = message
+    let (span, result, reason, fixable_by, repeat) = message
         .match_indices('{')
         .rev()
         .find_map(|(open, _)| {
@@ -1131,7 +1135,22 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
                 serde_json::Deserializer::from_str(&message[open..]).into_iter::<Value>();
             let value = values.next()?.ok()?;
             let (result, reason) = result_block(&value)?;
-            Some(((open, open + values.byte_offset()), result, reason))
+            let fixable_by = match value.get("fixable_by").and_then(Value::as_str) {
+                Some(value) if value.trim().eq_ignore_ascii_case("owner") => FixableBy::Owner,
+                _ => FixableBy::Coder,
+            };
+            let repeat = match value.get("repeat") {
+                Some(Value::Bool(value)) => *value,
+                Some(Value::String(value)) => value.trim().eq_ignore_ascii_case("true"),
+                _ => false,
+            };
+            Some((
+                (open, open + values.byte_offset()),
+                result,
+                reason,
+                fixable_by,
+                repeat,
+            ))
         })
         .ok_or(
             "review must end with one result block: {\"result\": \"pass|fail|blocked\", \
@@ -1140,6 +1159,8 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     Ok(ReviewAssessment {
         result,
         reason,
+        fixable_by,
+        repeat,
         report: report_without_block(message, span),
     })
 }
@@ -1586,6 +1607,55 @@ mod tests {
         let verdict = parse_assessment("{\"verdict\": \"passed\"}").unwrap();
         assert_eq!(verdict.result, ReviewResult::Pass);
         assert_eq!(verdict.reason, "");
+        assert_eq!(verdict.fixable_by, FixableBy::Coder);
+        assert!(!verdict.repeat);
+    }
+
+    #[test]
+    fn finding_routing_fields_are_read_leniently_from_the_last_result() {
+        let owner = parse_assessment(
+            r#"{"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"OWNER"}"#,
+        )
+        .unwrap();
+        assert_eq!(owner.fixable_by, FixableBy::Owner);
+        assert!(!owner.repeat);
+        for repeat in [json!(true), json!("true"), json!(" TRUE ")] {
+            let parsed = parse_assessment(
+                &json!({
+                    "result": "failed", "fixable_by": "CoDeR", "repeat": repeat,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.fixable_by, FixableBy::Coder);
+            assert!(parsed.repeat);
+        }
+        for unknown in [json!(null), json!(7), json!("unknown"), json!({})] {
+            let parsed = parse_assessment(
+                &json!({
+                    "result": "fail", "fixable_by": unknown, "repeat": unknown,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.fixable_by, FixableBy::Coder);
+            assert!(!parsed.repeat);
+        }
+        for repeat in [json!(false), json!("false"), json!("FALSE")] {
+            assert!(
+                !parse_assessment(&json!({"result":"fail", "repeat":repeat}).to_string())
+                    .unwrap()
+                    .repeat
+            );
+        }
+        let last = parse_assessment(
+            "{\"result\":\"fail\",\"fixable_by\":\"owner\",\"repeat\":true}\n\
+             {\"result\":\"fail\",\"reason\":\"last result\"}",
+        )
+        .unwrap();
+        assert_eq!(last.reason, "last result");
+        assert_eq!(last.fixable_by, FixableBy::Coder);
+        assert!(!last.repeat);
     }
 
     #[test]
@@ -1885,6 +1955,9 @@ mod tests {
         let prompt = contract_prompt(&c);
         assert_eq!(prompt.matches(&c.context.source_digest).count(), 1);
         assert!(!prompt.contains("Forge governing context"));
+        assert!(prompt.contains("fixable_by is \"coder\" (default) or \"owner\""));
+        assert!(prompt.contains("repeat defaults to false"));
+        assert!(prompt.contains("Owner example:") && prompt.contains("Repeat example:"));
         assert!(prompt.len() <= serialized.len() + RESPONSE_INSTRUCTION.len() + 64);
         assert!(prompt.len() <= MAX_PREPARED_PROMPT_BYTES);
     }

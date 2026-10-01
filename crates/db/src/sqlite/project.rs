@@ -409,6 +409,7 @@ impl ProjectRepo for SqliteDb {
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
             project.system_pause_reason = None;
+            project.environment_pause_json = None;
         }
         if let Some(project_hooks_json) = project_hooks_json {
             project.project_hooks_json = project_hooks_json;
@@ -417,7 +418,7 @@ impl ProjectRepo for SqliteDb {
         let result = sqlx::query(
             "UPDATE project
              SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
-                 system_pause_reason = ?, project_hooks_json = ?, version = version + 1, updated_at = ?
+                 system_pause_reason = ?, environment_pause_json = ?, project_hooks_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?",
         )
         .bind(&project.name)
@@ -425,6 +426,7 @@ impl ProjectRepo for SqliteDb {
         .bind(project.primary_repo_id.as_deref())
         .bind(project.paused_at.as_deref())
         .bind(project.system_pause_reason.as_deref())
+        .bind(project.environment_pause_json.as_deref())
         .bind(&project.project_hooks_json)
         .bind(&project.updated_at)
         .bind(&project.id)
@@ -535,7 +537,7 @@ impl ProjectRepo for SqliteDb {
         let updated_at = now_rfc3339();
         let result = sqlx::query(
             "UPDATE project
-             SET paused_at = ?, system_pause_reason = NULL, version = version + 1,
+             SET paused_at = ?, system_pause_reason = NULL, environment_pause_json = NULL, version = version + 1,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -601,6 +603,60 @@ impl ProjectRepo for SqliteDb {
         Ok(paused)
     }
 
+    async fn set_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let updated_at = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE project
+             SET paused_at = ?, system_pause_reason = 'environment_not_ready',
+                 environment_pause_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND paused_at IS NULL
+               AND system_pause_reason IS NULL",
+        )
+        .bind(paused_at)
+        .bind(detail_json)
+        .bind(&updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        let paused = result.rows_affected() > 0;
+        if paused {
+            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        }
+        transaction.commit().await?;
+        Ok(paused)
+    }
+
+    async fn update_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE project
+             SET environment_pause_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND paused_at = ?
+               AND system_pause_reason = 'environment_not_ready'",
+        )
+        .bind(detail_json)
+        .bind(now_rfc3339())
+        .bind(id)
+        .bind(expected_version)
+        .bind(expected_paused_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn clear_system_pause_if_unchanged(
         &self,
         id: &str,
@@ -613,7 +669,7 @@ impl ProjectRepo for SqliteDb {
         let updated_at = now_rfc3339();
         let result = sqlx::query(
             "UPDATE project
-             SET paused_at = NULL, system_pause_reason = NULL, version = version + 1,
+             SET paused_at = NULL, system_pause_reason = NULL, environment_pause_json = NULL, version = version + 1,
                  updated_at = ?
              WHERE id = ? AND version = ? AND primary_repo_id = ?
                AND paused_at = ? AND system_pause_reason = ?

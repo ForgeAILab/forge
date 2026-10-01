@@ -195,12 +195,33 @@ pub fn derive_workflow_health(
         );
     }
 
-    // The dispatcher has parked this Task: it recorded the refusal and will
-    // not attempt the capability again until the Task changes or something
-    // wakes it. That is not queueing, and reporting it as "Waiting for Agent"
-    // or "Idle" is how a Task that will never move on its own hides in a
-    // saturated board.
+    // Capacity waits are reconsidered each tick. Deterministic role refusals
+    // stay parked until the Task changes or something wakes it, so show that
+    // distinction instead of hiding them as ordinary queueing.
     if let Some(disposition) = crate::deferred_dispatch::current_dispatch_disposition(task) {
+        if disposition.capability == "project_capacity" {
+            let (reason, message) = disposition
+                .safe_message
+                .split_once(": ")
+                .unwrap_or(("project_at_capacity", &disposition.safe_message));
+            let label = if reason == "project_waiting_on_owner" {
+                "Waiting on Owner"
+            } else {
+                "Waiting for a Slot"
+            };
+            return health(
+                WorkflowHealthKind::WaitingForAgent,
+                HealthSeverity::Info,
+                label,
+                Some(message.to_owned()),
+                task,
+                role,
+                latest_execution.map(|execution| execution.id.clone()),
+                latest_review.map(|review| review.id.clone()),
+                disposition.recorded_at,
+                Some(reason.to_owned()),
+            );
+        }
         return health(
             WorkflowHealthKind::Stuck,
             HealthSeverity::Warning,
@@ -1343,7 +1364,10 @@ fn annotation_actions(
         .copied()
         .map(|kind| {
             let terminal = task_is_terminal(workflow, task);
-            let manual_review_pass = kind == RecoveryAction::MarkReviewed;
+            let manual_review_pass = matches!(
+                kind,
+                RecoveryAction::MarkReviewed | RecoveryAction::DeferToFollowUp
+            );
             let manual_review_pass_available = task.status
                 == crate::workflow::default_states::REVIEW
                 && latest_failed_review(latest_review).is_some();
@@ -1450,7 +1474,7 @@ fn annotation_actions(
                 kind,
                 if guided_review_retry {
                     "Retry Review with Guidance"
-                } else if manual_review_pass {
+                } else if kind == RecoveryAction::MarkReviewed {
                     "Pass Review Manually"
                 } else {
                     recovery_label(kind)
@@ -1459,7 +1483,9 @@ fn annotation_actions(
                 disabled_reason,
                 matches!(
                     kind,
-                    RecoveryAction::ProceedOnce | RecoveryAction::MarkReviewed
+                    RecoveryAction::ProceedOnce
+                        | RecoveryAction::MarkReviewed
+                        | RecoveryAction::DeferToFollowUp
                 ),
                 matches!(kind, RecoveryAction::ProceedOnce) || guided_review_retry,
                 matches!(
@@ -1467,6 +1493,7 @@ fn annotation_actions(
                     RecoveryAction::ResumeSession
                         | RecoveryAction::Reexecute
                         | RecoveryAction::MarkReviewed
+                        | RecoveryAction::DeferToFollowUp
                         | RecoveryAction::ProceedOnce
                         | RecoveryAction::ResumeProcess
                         | RecoveryAction::RetryHook
@@ -1656,6 +1683,7 @@ fn recovery_label(kind: RecoveryAction) -> &'static str {
         RecoveryAction::ResetToInitial => "Reset to Initial",
         RecoveryAction::CancelTask => "Cancel Task",
         RecoveryAction::MarkReviewed => "Pass Review Manually",
+        RecoveryAction::DeferToFollowUp => "Defer to Follow-up Task",
         RecoveryAction::RetryHook => "Retry Hook",
         RecoveryAction::ResumeProcess => "Resume Process",
         RecoveryAction::UpdateWorkspaceAndRetryHook => "Update Workspace and Retry Hook",

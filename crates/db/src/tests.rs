@@ -5789,6 +5789,8 @@ async fn seed_review_digest_contract(
         assessment: Some(api_types::ReviewAssessment {
             result: api_types::ReviewResult::Pass,
             reason: "checked".into(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: String::new(),
         }),
         checks: Vec::new(),
@@ -5837,9 +5839,9 @@ async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
             name: None,
             settings: Some(
                 serde_json::json!({
-                    "max_active_tasks": 7, "recheck_interval_seconds": 30,
+                    "max_active_tasks": 7,
                     "default_review_config": {"ci_steps": ["true"]},
-                    "environment": {"env": {"TOKEN": "rotated-secret"}},
+                    "environment": {"env": {"TOKEN": "rotated-secret"}, "recheck_interval_seconds": 1200},
                 })
                 .to_string(),
             ),
@@ -5888,6 +5890,68 @@ async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
         db.review_carry_base(&task_id).await.unwrap().contract,
         contract
     );
+}
+
+#[tokio::test]
+async fn review_digest_flow_settings_preserve_passed_contract() {
+    for (key, value) in [
+        ("max_active_tasks", serde_json::json!(7)),
+        (
+            "environment.recheck_interval_seconds",
+            serde_json::json!(1200),
+        ),
+    ] {
+        let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+        let project = ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut settings: serde_json::Value = serde_json::from_str(&project.settings).unwrap();
+        if key == "max_active_tasks" {
+            settings[key] = value;
+        } else {
+            settings["environment"]["recheck_interval_seconds"] = value;
+        }
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id,
+                name: None,
+                settings: Some(settings.to_string()),
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_review_digest_integrates(&db, &task_id).await;
+        // Carry verifies the previous attempt when a new Review is running.
+        let now = now_rfc3339();
+        ReviewRepo::create(
+            &db,
+            CreateReview {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                execution_id: contract.execution_id.clone(),
+                attempt_number: 2,
+                status: ReviewStatus::Running,
+                step_results_json: "{}".into(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.review_carry_base(&task_id).await.unwrap().contract,
+            contract,
+            "{key}"
+        );
+    }
 }
 
 #[tokio::test]

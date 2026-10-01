@@ -187,7 +187,7 @@ async fn run_execution_applies_the_project_environment() {
 }
 
 #[tokio::test]
-async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
+async fn a_failed_environment_check_pauses_the_project_without_blocking_the_task() {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (task, execution, workspace) = claim_shell_task_with_environment(
@@ -215,6 +215,7 @@ async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
         .expect("dispatch settles");
 
     assert_eq!(execution.status, ExecutionStatus::Failed);
+    assert_eq!(execution.resume_policy, Some(db::ResumePolicy::Auto));
     assert!(
         !std::path::Path::new(&workspace.worktree_path)
             .join("agent-ran")
@@ -225,32 +226,40 @@ async fn a_failed_environment_check_parks_the_task_before_the_agent_runs() {
         .await
         .expect("task loads")
         .expect("task exists");
+    assert_eq!(current.status, before.status);
     assert_eq!(
-        current.version,
-        before.version + 1,
-        "the typed environment block is the only Task projection"
+        current.version, before.version,
+        "environment failure does not mutate the Task"
     );
-    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
-        current
-            .error_annotation
-            .as_deref()
-            .expect("the Task is parked for its owner"),
-    )
-    .expect("annotation parses");
+    assert!(current.error_annotation.is_none());
+    assert!(current.blocked_json.is_none());
+    assert!(current.failed_json.is_none());
+    assert!(execution
+        .error
+        .as_deref()
+        .unwrap()
+        .starts_with("environment not ready: "));
+    let project = ProjectRepo::get_by_id(&*db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        annotation.annotation_type,
-        api_types::FailureKind::EnvironmentNotReady
+        project.system_pause_reason.as_deref(),
+        Some("environment_not_ready")
     );
-    let message = annotation.message.expect("message is set");
-    assert!(message.contains("'browser' exited 4"), "{message}");
-    assert!(message.contains("chromium is not installed"), "{message}");
+    let detail: api_types::ProjectEnvironmentPause =
+        serde_json::from_str(project.environment_pause_json.as_deref().unwrap()).unwrap();
+    assert_eq!(detail.checks, vec!["browser"]);
+    assert_eq!(detail.role.as_deref(), Some(execution.role.as_str()));
+    assert!(detail.output.contains("chromium is not installed"));
     assert_eq!(
-        annotation.blocked_execution_id.as_deref(),
-        Some(execution.id.as_str())
+        project.paused_at.as_deref(),
+        Some(detail.paused_at.as_str())
     );
-    assert!(annotation
-        .recovery_actions
-        .contains(&api_types::RecoveryAction::Reexecute));
+    assert_eq!(detail.paused_at, detail.last_checked_at);
+    let last = chrono::DateTime::parse_from_rfc3339(&detail.last_checked_at).unwrap();
+    let next = chrono::DateTime::parse_from_rfc3339(&detail.next_check_at).unwrap();
+    assert_eq!((next - last).num_seconds(), 600);
 }
 
 #[tokio::test]
@@ -3859,6 +3868,702 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
         "Provider check was verified manually"
     );
     assert!(manual_transition.triggered_by.starts_with("user:"));
+}
+
+/// Insert the preceding attempt without changing the current execution binding.
+async fn seed_previous_review_attempt(db: &SqliteDb, task_id: &str, status: ReviewStatus) {
+    let failed = status == ReviewStatus::Failed;
+    let current = ReviewRepo::list_by_task(db, task_id)
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query("UPDATE review SET attempt_number = 2 WHERE id = ?")
+        .bind(&current.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    ReviewRepo::create(
+        db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            execution_id: current.execution_id,
+            attempt_number: 1,
+            status,
+            step_results_json: json!({"conformance": {"status":"failed", "contract":null,
+                "checks":[], "reason":"previous finding", "assessment":{"result":"fail", "reason":"previous finding"}}}).to_string(),
+            started_at: current.started_at,
+            created_at: current.created_at,
+            updated_at: current.updated_at,
+        },
+    )
+    .await
+    .unwrap();
+    if failed {
+        TransitionLogRepo::insert(
+            db,
+            db::CreateTransitionLog {
+                id: new_uuid_v4(),
+                task_id: task_id.to_owned(),
+                from_state: crate::workflow::default_states::REVIEW.to_owned(),
+                to_state: crate::workflow::default_states::IN_PROGRESS.to_owned(),
+                trigger_name: Some("reject".to_owned()),
+                triggered_by: "system:workflow".to_owned(),
+                trigger_reason: "previous review failed".to_owned(),
+                hook_results_json: None,
+                rejection: true,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+async fn assert_owner_review_park(db: &SqliteDb, task_id: &str, message: &str) {
+    let task = TaskRepo::get_by_id(db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, crate::workflow::default_states::REVIEW);
+    assert!(task.review_passed_at.is_none());
+    let annotation: api_types::TaskBlockingAnnotation =
+        serde_json::from_str(task.error_annotation.as_deref().expect("owner annotation")).unwrap();
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::ReviewNeedsOwner
+    );
+    assert_eq!(annotation.blocking_reason, "review_needs_owner");
+    assert_eq!(annotation.message.as_deref(), Some(message));
+    assert_eq!(
+        annotation.recovery_actions,
+        vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::MarkReviewed,
+            api_types::RecoveryAction::DeferToFollowUp,
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    );
+    let blocked: Value = serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
+    assert_eq!(blocked["kind"], "review_needs_owner");
+    assert!(task.failed_json.is_none());
+    let reviews = ReviewRepo::list_by_task(db, task_id).await.unwrap();
+    let latest = reviews
+        .iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
+    assert_eq!(latest.status, ReviewStatus::Failed);
+    assert!(latest.finished_at.is_some());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(db, task_id, crate::workflow::default_roles::CODER,)
+            .await
+            .unwrap(),
+        1,
+        "only the seeded candidate coder execution exists"
+    );
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &[],
+        Some(latest),
+        None,
+        &std::collections::HashMap::new(),
+    )
+    .expect("owner exception");
+    let defer = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::DeferToFollowUp)
+        .expect("defer action");
+    assert_eq!(defer.label, "Defer to Follow-up Task");
+    assert!(defer.enabled && defer.requires_reason && defer.propagates);
+}
+
+#[tokio::test]
+async fn review_finding_routing_owner_parks_without_spending_budget() {
+    let (db, service, task, execution, _repo_dir) =
+        seed_admitted_review_with(r#"{"retry_budgets":{"execution":3,"review":1}}"#).await;
+    let before = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner"}"#,
+    )
+    .await;
+    assert_owner_review_park(
+        &db,
+        &task.id,
+        "fixable by owner: Forge linked_documents is empty",
+    )
+    .await;
+    let after = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "parking creates no rejection transition"
+    );
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: Value = serde_json::from_str(current.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["execution_retry_count"], 0);
+    let version = current.version;
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        version,
+        "duplicate completion leaves the owner park unchanged"
+    );
+}
+
+#[tokio::test]
+async fn review_finding_routing_repeat_after_failed_attempt_parks() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    seed_previous_review_attempt(&db, &task.id, ReviewStatus::Failed).await;
+    let before = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Cross-platform measurements remain missing","repeat":true}"#,
+    )
+    .await;
+    assert_owner_review_park(
+        &db,
+        &task.id,
+        "repeated finding: Cross-platform measurements remain missing",
+    )
+    .await;
+    let after = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "repeat park spends no review budget"
+    );
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &after,
+            crate::workflow::default_states::REVIEW,
+        ),
+        1,
+        "only the preceding failure spent budget"
+    );
+}
+
+#[tokio::test]
+async fn review_finding_routing_repeat_requires_previous_reviewer_finding() {
+    for details in [
+        json!({"auditor":{"verdict":"fail", "reason":"reviewer crashed"}}),
+        json!({"ci_steps":[{"exit_code":1}]}),
+        json!({"conformance":{"status":"unverified", "contract":null, "checks":[], "reason":"no result"}}),
+        json!({"conformance":{"status":"failed", "contract":null,
+            "checks":[{"check_id":"ci", "command":"false", "exit_code":1, "output":"failed"}],
+            "reason":"CI failed", "assessment":{"result":"fail", "reason":"finding"}}}),
+    ] {
+        let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+        seed_previous_review_attempt(&db, &task.id, ReviewStatus::Failed).await;
+        sqlx::query(
+            "UPDATE review SET step_results_json = ? WHERE task_id = ? AND attempt_number = 1",
+        )
+        .bind(details.to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        complete_review_with(
+            &db,
+            &service,
+            &execution,
+            r#"{"result":"fail","reason":"Null input crashes","repeat":true}"#,
+        )
+        .await;
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+        assert!(current.blocked_json.is_none());
+    }
+}
+
+#[tokio::test]
+async fn review_finding_routing_first_attempt_repeat_returns_to_coder() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Null input still crashes","repeat":true}"#,
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+    assert!(current.blocked_json.is_none());
+    assert!(current.error_annotation.is_none());
+    let transitions = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &transitions,
+            crate::workflow::default_states::REVIEW,
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn review_finding_routing_repeat_after_cancelled_attempt_returns_to_coder() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    seed_previous_review_attempt(&db, &task.id, ReviewStatus::Cancelled).await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Null input crashes","repeat":true}"#,
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+    assert!(current.blocked_json.is_none());
+}
+
+#[tokio::test]
+async fn review_finding_routing_legacy_fail_returns_to_coder() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Null input crashes"}"#,
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+    assert!(current.blocked_json.is_none());
+}
+
+#[tokio::test]
+async fn review_finding_routing_forge_checks_override_owner_and_repeat() {
+    for checks in [
+        r#"{"review":{"setup_steps":["exit 1"]},"retry_budgets":{"review":3}}"#,
+        r#"{"review":{"ci_steps":["exit 1"]},"retry_budgets":{"review":3}}"#,
+    ] {
+        let (db, service, task, execution, _repo_dir) = seed_admitted_review_with(checks).await;
+        seed_previous_review_attempt(&db, &task.id, ReviewStatus::Failed).await;
+        complete_review_with(&db, &service, &execution,
+            r#"{"result":"fail","reason":"Owner needs external credentials","fixable_by":"owner","repeat":true}"#,
+        ).await;
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+        assert!(current.blocked_json.is_none());
+    }
+}
+
+#[tokio::test]
+async fn review_finding_routing_settled_owner_failure_reconciles_to_park() {
+    let (db, service, task, execution, repo_dir) = seed_admitted_review().await;
+    let reply = r#"{"result":"fail","reason":"Hardware measurements needed","fixable_by":"owner"}"#;
+    let conformance = ::review::contract::evaluate(&db, &execution.id, repo_dir.path(), reply)
+        .await
+        .unwrap();
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let now = now_rfc3339();
+    ReviewRepo::update_status(
+        &*db,
+        &review.id,
+        ReviewStatus::Failed,
+        json!({"ci_steps":[], "conformance":conformance}).to_string(),
+        Some(now.clone()),
+        &now,
+    )
+    .await
+    .unwrap();
+    complete_review_with(&db, &service, &execution, reply).await;
+    assert_owner_review_park(
+        &db,
+        &task.id,
+        "fixable by owner: Hardware measurements needed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn review_finding_routing_owner_manual_pass_clears_the_park() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Hardware measurements needed","fixable_by":"owner"}"#,
+    )
+    .await;
+    let recovered = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::MarkReviewed,
+            Some("Owner verified the hardware measurements".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.status, crate::workflow::default_states::MERGING);
+    assert!(recovered.review_passed_at.is_some());
+    assert!(recovered.blocked_json.is_none() && recovered.error_annotation.is_none());
+    assert_eq!(
+        ReviewRepo::list_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        ReviewStatus::Passed
+    );
+}
+
+#[tokio::test]
+async fn review_finding_routing_defer_follow_up_is_charter_dispatchable() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Owner must collect measurements","fixable_by":"owner"}"#,
+    )
+    .await;
+    let now = now_rfc3339();
+    let owner = new_uuid_v4();
+    let charter = new_uuid_v4();
+    let revision = new_uuid_v4();
+    sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES (?, ?, 'unused', ?, ?)")
+        .bind(&owner).bind(format!("{owner}@example.com")).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&owner)
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO project_charter (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
+                 VALUES (?, ?, ?, 'compact', 'prototype', 'attached', ?, ?)")
+        .bind(&charter).bind(&owner).bind(&task.project_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO project_charter_revision (id, charter_id, revision, lifecycle, schema_version, render_version,
+                 content_json, rendered_view, author_type, source_refs_json, content_digest, rendered_digest, created_at)
+                 VALUES (?, ?, 1, 'approved', 'forge.project-charter/v1', 'forge.project-charter-render/v1', '{}', '# Charter', 'user', '[]', 'content', 'render', ?)")
+        .bind(&revision).bind(&charter).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE project_charter SET current_approved_revision_id = ? WHERE id = ?")
+        .bind(&revision)
+        .bind(&charter)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project SET current_charter_id = ?, current_charter_revision_id = ?,
+                 current_charter_version = 1, charter_status = 'charter_backed', charter_setup_required = 0,
+                 version = version + 1 WHERE id = ?")
+        .bind(&charter).bind(&revision).bind(&task.project_id).execute(db.pool()).await.unwrap();
+    let project = ProjectRepo::get_by_id(&*db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let governance = service
+        .prepare_task_governance(&project, "task", None)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service
+        .insert_task_governance(&mut tx, &task.id, &project.id, governance, &now)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("Schedule the measurements separately".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let follow_ups = TaskRepo::list_by_project_with_metadata_key(&*db, &project.id, "follow_up_of")
+        .await
+        .unwrap();
+    assert_eq!(follow_ups.len(), 1);
+    let follow_up = &follow_ups[0];
+    service
+        .ensure_task_runnable(follow_up)
+        .await
+        .expect("follow-up passes normal Charter dispatch admission");
+    let current = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.project_work_epoch, project.project_work_epoch + 1);
+    let governance: (String, i64) = sqlx::query_as(
+        "SELECT charter_revision_id, runnable FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&follow_up.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(governance, (revision, 1));
+}
+
+#[tokio::test]
+async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Required cross-platform measurements","fixable_by":"owner"}"#,
+    )
+    .await;
+    let before = ReviewRepo::list_by_task(&*db, &task.id).await.unwrap();
+    for reason in [None, Some("  \n ".to_owned())] {
+        let error = service
+            .recover_task(
+                task.id.clone(),
+                api_types::RecoveryAction::DeferToFollowUp,
+                reason,
+                None,
+            )
+            .await
+            .expect_err("defer requires reason");
+        assert!(error
+            .to_string()
+            .contains("defer_to_follow_up requires a recovery reason"));
+    }
+    let mut events = service.event_bus.subscribe();
+    let recovered = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("macOS/Windows runs need a human".to_owned()),
+            None,
+        )
+        .await
+        .expect("defer succeeds");
+    assert_eq!(recovered.status, crate::workflow::default_states::MERGING);
+    assert!(recovered.review_passed_at.is_some());
+    assert!(recovered.blocked_json.is_none() && recovered.error_annotation.is_none());
+    let follow_ups =
+        TaskRepo::list_by_project_with_metadata_key(&*db, &task.project_id, "follow_up_of")
+            .await
+            .unwrap();
+    assert_eq!(follow_ups.len(), 1);
+    let follow_up = &follow_ups[0];
+    assert_eq!(follow_up.project_id, task.project_id);
+    assert_eq!(follow_up.status, "backlog");
+    assert_eq!(
+        follow_up.title,
+        format!(
+            "Follow-up: {} — Required cross-platform measurements",
+            task.title
+        )
+    );
+    let metadata: Value =
+        serde_json::from_str(follow_up.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["follow_up_of"], task.id);
+    let description = follow_up.description.as_deref().unwrap();
+    for expected in [
+        task.id.as_str(),
+        "Required cross-platform measurements",
+        "macOS/Windows runs need a human",
+    ] {
+        assert!(description.contains(expected));
+    }
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id).await.unwrap();
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(reviews[0], before[0], "failed assessment remains intact");
+    assert_eq!(reviews[1].status, ReviewStatus::Passed);
+    let details: Value = serde_json::from_str(&reviews[1].step_results_json).unwrap();
+    assert_eq!(details["manual_override"]["action"], "defer_to_follow_up");
+    let pass_reason = details["manual_override"]["reason"].as_str().unwrap();
+    assert!(pass_reason.contains(&follow_up.id) && pass_reason.contains(&follow_up.title));
+    assert!(pass_reason.contains("macOS/Windows runs need a human"));
+    let transitions = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &transitions,
+            crate::workflow::default_states::REVIEW,
+        ),
+        0
+    );
+    let mut created = false;
+    let mut updated = false;
+    while let Ok(event) = events.try_recv() {
+        created |= event.event_type == "task.created" && event.entity_id == follow_up.id;
+        updated |= event.event_type == "task.updated" && event.entity_id == task.id;
+    }
+    assert!(
+        created && updated,
+        "created/updated events follow the atomic commit"
+    );
+    assert!(service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("duplicate defer".to_owned()),
+            None
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        TaskRepo::list_by_project_with_metadata_key(&*db, &task.project_id, "follow_up_of")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn review_finding_routing_defer_uses_workflow_backlog_and_bounds_unicode_title() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    let first_line = "测".repeat(100);
+    let finding = format!("{first_line}\nSecond line of the parked finding");
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        &json!({
+            "result": "fail", "reason": finding, "fixable_by": "owner",
+        })
+        .to_string(),
+    )
+    .await;
+    let project = ProjectRepo::get_by_id(&*db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        if state.name == "backlog" {
+            state.name = "waiting".to_owned();
+        }
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "backlog" {
+                trigger.to = "waiting".to_owned();
+            }
+        }
+    }
+    sqlx::query("UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("Collect hardware evidence separately".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let follow_ups =
+        TaskRepo::list_by_project_with_metadata_key(&*db, &task.project_id, "follow_up_of")
+            .await
+            .unwrap();
+    assert_eq!(follow_ups.len(), 1);
+    assert_eq!(follow_ups[0].status, "waiting");
+    assert_eq!(
+        follow_ups[0].title,
+        format!("Follow-up: {} — {}…", task.title, "测".repeat(80))
+    );
+    assert!(follow_ups[0]
+        .description
+        .as_deref()
+        .unwrap()
+        .contains(&finding));
+}
+
+#[tokio::test]
+async fn review_finding_routing_defer_rolls_back_follow_up_when_manual_pass_fails() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Hardware measurements needed","fixable_by":"owner"}"#,
+    )
+    .await;
+    let before = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    // Invalidate the candidate so the authority check fails after follow-up insertion.
+    sqlx::query("UPDATE execution SET status = 'failed' WHERE id = ?")
+        .bind(execution.parent_execution_id.as_deref().unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut events = service.event_bus.subscribe();
+    service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("human follow-up required".to_owned()),
+            None,
+        )
+        .await
+        .expect_err("invalid candidate rejects the manual pass");
+    assert!(
+        TaskRepo::list_by_project_with_metadata_key(&*db, &task.project_id, "follow_up_of")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id).await.unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, ReviewStatus::Failed);
+    assert!(
+        events.try_recv().is_err(),
+        "rolled-back mutations publish no events"
+    );
 }
 
 async fn assert_failed_reviewer_disposition(

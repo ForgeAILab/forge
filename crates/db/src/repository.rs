@@ -18,6 +18,16 @@ pub trait TaskRepo: Send + Sync {
         include_deleted: bool,
     ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
+    /// One aggregate over visible Tasks and their latest Reviews. Workflow maps
+    /// carry effective state kinds and whether the state holds root-owned work.
+    /// Returns (active, parked, queued), without loading Task or Review bodies.
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<(i64, i64, i64)>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
     /// independently of the current workflow's state classification.
@@ -150,6 +160,15 @@ pub trait TaskRepo: Send + Sync {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task>;
+    /// Also report whether the mutations changed stored metadata, under the
+    /// same write lock. Conditional no-ops must not trigger refresh events.
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)>;
     /// Apply key-level metadata mutations under a Task version CAS and bump
     /// that version when anything changes. Use this for metadata that grants
     /// exclusive authority over a subsequent side effect: an already-started
@@ -1783,6 +1802,13 @@ pub trait ReviewRepo: Send + Sync {
         &self,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)>;
+    /// Transactional variant used to commit a linked follow-up Task together
+    /// with the manual pass. The caller owns commit and post-commit events.
+    async fn create_manual_pass_with_task_authority_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)>;
     /// Atomically reserve the next Review attempt with its Running execution
     /// and initial lease. The attempt number is allocated under the same
     /// writer transaction as both inserts, so a failed Review insert cannot
@@ -2176,6 +2202,24 @@ pub trait ProjectRepo: Send + Sync {
         repository_linked: bool,
         paused_at: &str,
         reason: &str,
+    ) -> Result<bool>;
+    /// Pause only an unchanged, unpaused Project. User and other system
+    /// pauses always win; a stale snapshot is a benign no-op.
+    async fn set_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool>;
+    /// Refresh the check detail only while the observed environment pause
+    /// remains current. Does not change the pause's original timestamp.
+    async fn update_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_paused_at: &str,
+        detail_json: &str,
     ) -> Result<bool>;
     /// Clear a dispatcher-owned Project pause only when the exact pause
     /// snapshot that the dispatcher observed is still current.  This is the

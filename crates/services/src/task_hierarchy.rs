@@ -1,5 +1,8 @@
 //! Root-Task and ordered-subtask classification and policy.
 
+#[cfg(test)]
+use std::collections::HashSet;
+
 use api_types::{CanonicalPhase, StateKind, WorkflowDefinition};
 use db::{ProjectRepo, SqliteDb, Task, TaskRepo};
 use sqlx::SqliteConnection;
@@ -155,6 +158,27 @@ pub(crate) async fn coordination_root_has_subtasks(db: &SqliteDb, task: &Task) -
         return Ok(false);
     }
     Ok(!ordered_children(db, &task.id).await?.is_empty())
+}
+
+/// Project-scoped batch form of `coordination_root_has_subtasks`, with the
+/// same visible-child semantics, for slot counting without a query per root.
+#[cfg(test)]
+pub(crate) async fn coordination_root_ids_with_subtasks(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<HashSet<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT root.id FROM task AS root
+         WHERE root.project_id = ? AND root.parent_task_id IS NULL
+           AND root.deleted_at IS NULL
+           AND EXISTS (SELECT 1 FROM task AS child
+                       WHERE child.parent_task_id = root.id AND child.deleted_at IS NULL)",
+    )
+    .bind(project_id)
+    .fetch_all(db.pool())
+    .await?
+    .into_iter()
+    .collect())
 }
 
 /// Check coordination-root status inside an existing write transaction.

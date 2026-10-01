@@ -23,6 +23,17 @@ describe('environment settings text', () => {
     expect(parseEnvironmentText(text)).toEqual({ ok: true, value: environment })
   })
 
+  it('keeps the interval in its separate field instead of the JSON editor', () => {
+    const settings = {
+      environment: { env: { TOOL: 'tool' }, assets: [], checks: [], recheck_interval_seconds: 600 },
+    }
+    expect(parseEnvironmentText(environmentTextFromSettings(settings))).toEqual({
+      ok: true,
+      value: { env: { TOOL: 'tool' }, assets: [], checks: [] },
+    })
+    expect(settings.environment.recheck_interval_seconds).toBe(600)
+  })
+
   it('clears on empty text and refuses non-objects', () => {
     expect(parseEnvironmentText('  ')).toEqual({ ok: true, value: null })
     expect(parseEnvironmentText('[]')).toMatchObject({ ok: false })

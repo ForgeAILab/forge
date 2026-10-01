@@ -396,6 +396,7 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
                 | "target_repo_dirty"
                 | "executor_failed"
                 | "review_budget_exhausted"
+                | "review_needs_owner"
                 | "merge_fix_budget_exhausted"
                 | "merge_fix_ci_failed"
         )
@@ -421,6 +422,8 @@ pub struct TaskService {
     /// every clone, so competing terminal completions cannot apply effects
     /// to the same Task at once.
     completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Shared with manual checks: a Project has at most one host re-check.
+    environment_rechecks: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Wakes completion cascades that arrived while another execution for
     /// the same Task was settling. Waiters retry the Task slot after every
     /// release, so a successor completion is never silently dropped.
@@ -502,6 +505,7 @@ impl TaskService {
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
+            environment_rechecks: Arc::default(),
             completion_cascade_released: Arc::default(),
             credential_env: None,
         }

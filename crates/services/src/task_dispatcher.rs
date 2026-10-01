@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -18,9 +18,11 @@ use tracing::Instrument;
 use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
 
 mod active_recovery;
+mod environment_pause_sync;
 mod helpers;
 mod initial_scheduling;
 mod repo_pause_sync;
+pub mod slots;
 mod workspace_blocking;
 
 pub struct TaskDispatcher {
@@ -33,6 +35,7 @@ pub struct TaskDispatcher {
     /// Primary Repo snapshots (`id@updated_at`) already verified ready by
     /// `sync_repository_pause`.
     ready_repositories: Mutex<HashSet<String>>,
+    environment_rechecks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<bool>>>>,
 }
 
 impl TaskDispatcher {
@@ -60,6 +63,7 @@ impl TaskDispatcher {
             stopped: AtomicBool::new(false),
             stop_notify: Notify::new(),
             ready_repositories: Mutex::new(HashSet::new()),
+            environment_rechecks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -110,6 +114,17 @@ impl TaskDispatcher {
             // shows up. Either direction leaves this scan's in-memory
             // `project` stale, so skip acting on it this tick either way.
             let pause_changed = self.sync_repository_pause(&project).await?;
+            let pause_changed = if pause_changed {
+                true
+            } else {
+                match self.sync_environment_pause(&project).await {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        tracing::warn!(project_id = %project.id, %error, "environment pause synchronization failed; skipping Project");
+                        continue;
+                    }
+                }
+            };
             dispatched += self.reconcile_plan_publication_claims(&project).await?;
             if pause_changed {
                 continue;
@@ -128,7 +143,12 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
+            match self.dispatch_initial_tasks(&project, &workflow).await {
+                Ok(count) => dispatched += count,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "initial scheduling failed; skipping Project")
+                }
+            }
         }
 
         tracing::info!(

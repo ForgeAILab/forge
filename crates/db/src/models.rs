@@ -22,10 +22,11 @@ pub struct Project {
     pub workflow_template_name: Option<String>,
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
-    /// Set only alongside `paused_at` by the Task dispatcher's own
-    /// auto-pause (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None` for a user's
-    /// own pause. See migration V128.
+    /// Set alongside `paused_at` for a repository or environment auto-pause;
+    /// `None` for a user's own pause. See migrations V128 and V202610010410.
     pub system_pause_reason: Option<String>,
+    /// Durable detail and schedule for an environment-owned Project pause.
+    pub environment_pause_json: Option<String>,
     pub owner_id: Option<String>,
     pub project_hooks_json: String,
     pub project_work_epoch: i64,

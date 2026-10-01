@@ -110,6 +110,7 @@ export function TaskReviewTab({
       ) : null}
       <WorkflowExceptionPanel
         task={task}
+        assessment={latestReview?.details.conformance.assessment}
         actions={workflowExceptionActions}
         recoverPending={recoverPending}
         terminal={terminal}
@@ -144,19 +145,21 @@ export function TaskReviewTab({
 
             {/* Actions grouped together */}
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={!canAct || triggerReviewPending}
-                onClick={onRerunReview}
-              >
-                {triggerReviewPending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ArrowCounterClockwise className="h-3.5 w-3.5" />
-                )}
-                Re-run review
-              </Button>
+              {task.workflow_exception?.type !== 'review_needs_owner' ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!canAct || triggerReviewPending}
+                  onClick={onRerunReview}
+                >
+                  {triggerReviewPending ? (
+                    <Spinner className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ArrowCounterClockwise className="h-3.5 w-3.5" />
+                  )}
+                  Re-run review
+                </Button>
+              ) : null}
             </div>
           </div>
         </div>

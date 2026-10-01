@@ -686,7 +686,8 @@ workflow.
 
 #### Project environment
 
-`ProjectSettings.environment` (`env`, `assets`, `checks`) is applied at the
+`ProjectSettings.environment` (`env`, `assets`, `checks`,
+`recheck_interval_seconds`) is applied at the
 single local launch point, `TaskService::run_execution`, after the workspace
 lock and the final WorkspaceLease verification and before ledger admission
 (`task_service/execution/environment.rs`). The env map is stamped onto the
@@ -698,9 +699,38 @@ executor set it on the child process before Forge's own variables. Assets are
 copied through a sibling staging path and atomically renamed only when the
 target is absent; symlink traversal and recursive/overlapping declarations are
 refused. A failing check terminalizes the execution through the dedicated
-pre-dispatch environment failure path and parks the Task with a
-`FailureKind::EnvironmentNotReady` annotation (`reexecute`, `cancel_task`),
-so no agent run or retry budget is spent. Review steps and conformance checks
+pre-dispatch environment failure path and pauses the Project with
+`system_pause_reason = "environment_not_ready"`, without changing the Task's
+workflow state or adding a Task annotation. No provider call or retry budget
+is spent. The stopped execution is tagged as an environment pre-dispatch
+failure so it does not block re-dispatch after resume. User and repository
+pauses are never overwritten. Pause detail (check names, triggering role,
+bounded output, pause/last-check/next-check times) persists in
+`project.environment_pause_json` and is returned as `environment_pause`.
+Migration V202610010410 clears legacy Task environment annotations without deleting
+Tasks or their execution history.
+
+`environment_pause_sync` starts a background job for recorded failing checks
+when due in the primary checkout, with Project `env` and without assets. The tick
+only starts or observes a job; operations refresh does not wait for host checks.
+Scheduled and manual re-checks share single-flight ownership per Project. Results
+use the original Project version and pause timestamp in the existing CAS, so a
+new pause, settings edit, or user pause wins over stale results. Check timeouts
+accept 1–300 seconds (default 120); execution clamps legacy stored values too.
+The interval defaults to 600 seconds (60–86400). Failure refreshes detail and schedules another check;
+success compare-and-clears only the environment pause and publishes a Project
+resumed event. The next tick re-dispatches Tasks in their current states.
+`POST /projects/{id}/environment/recheck` runs every configured check immediately
+and returns per-check results plus the Project; all passing clears a matching
+environment pause. A manual check returns HTTP 409 immediately if another
+re-check is running. An empty check list never resumes automatically: asset-copy
+failures and removed probes stay paused with an explicit manual-resume message.
+Checks that were already passing do not resume such a pause on a timer; the
+owner's own "Check now" runs every configured check and resumes when all pass.
+Manual resume clears the pause too; another failing launch pauses the Project
+again. Running executions are left to finish.
+
+Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks
 (`LifecycleHookContext.env`) receive the same env; the clean conformance
 checkout also receives the assets. `execution_start_params` stamps only `env`
@@ -2090,6 +2120,12 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `backlog → todo → planning → in_progress → review → merging → done` and
 `merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
 
+Project environment pauses do not add Task failure states. A `review_needs_owner`
+annotation parks a Task in `review`, freeing its active slot until the owner
+acts; the failed Review remains in history. Retry with guidance re-enters normal
+recovery, while a manual pass or deferred follow-up lets the Task proceed to
+merge without spending review-remediation budget.
+
 The built-in workflow choices are:
 
 - `default` / **Agent review** — the assigned reviewer Agent accepts or rejects.
@@ -2349,6 +2385,42 @@ serialized write transaction immediately before Git integration. After resume,
 the dispatcher consumes the marker and retries the exact `review` or `merging`
 capability without creating another reviewer execution.
 
+The per-Project `check_once` order is repository pause synchronization,
+environment pause synchronization (if the repository pause did not change),
+plan-publication reconciliation, the paused-Project skip, recovery of admitted
+work, then slot-gated initial scheduling. A changed pause skips dispatch for
+that tick so the next scan reads the updated Project. Repository and environment
+synchronizers only clear the system pause reason they own. Invalid environment
+pause/settings JSON or a failed slot projection is logged and skips that Project;
+later Projects still get their dispatch scan.
+
+Initial scheduling admits ready Tasks in the existing queue order only while
+`active < settings.max_active_tasks` and `parked < 2 * limit`. The default limit
+is 5 for new and existing Projects; 0 disables both gates. Slot counting follows
+the effective workflow's `active` and `gate` kinds, excludes blocking annotations
+and awaiting-human Reviews. One SQL aggregate reads the counts without loading
+Task or Review bodies; unlimited Projects skip it and report zero counts, and
+dispatch skips it when no initial Task waits for admission. Coordination roots
+whose children hold active slots do not consume another slot; once no child is
+active, a root's own running execution, review, or merge holds one slot.
+Planning, implementation, review, merging, and conflict repair therefore hold
+slots, even without a running execution. Agent concurrency remains a separate
+limit. Recovery and re-dispatch of already-admitted work never fail for Project
+capacity, even if un-parking temporarily exceeds the limit.
+
+The Project response exposes `{limit, active, parked, queued}` as `slots`.
+Capacity waits record `project_capacity` dispatch dispositions with
+`project_at_capacity` or `project_waiting_on_owner`; `workflow_health` projects
+the current message and reason to cards and Task detail. Unlike sticky role
+refusals, these waits are reconsidered every tick as other Tasks free capacity.
+Recording a changed capacity disposition or clearing one publishes `task.updated`
+to refresh cards, Task detail, and Project slot usage; unchanged ticks emit nothing.
+Each visible Task is counted once by its effective state: `queued` counts initial
+states, while admitted recovery waiting for Agent capacity still counts as active
+unless parked. A durable `queued_recovery` wait reports `Retry Queued`; a Project
+admission wait reports `Waiting for a Slot` or `Waiting on Owner`. Both are carried
+in the compact Task list's existing `workflow_health` projection.
+
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
 1. Load task, check optimistic version, validate that `A` and `B` are defined
@@ -2400,6 +2472,9 @@ An abandoned running entry barrier is cleared if its checks already produced
 that failed verdict; a newer entry retry remains fenced. Recovery rechecks the
 latest Review and running executions after claiming the Task snapshot.
 User routing overrides and historical verdicts from earlier entries are excluded.
+If failed-review recovery cannot parse details or conformance, it logs a warning
+and uses plain review-failure remediation without finding routing. Live reviewer
+completion retains strict parsing.
 
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
@@ -3001,7 +3076,11 @@ reviewed as the current Task outcome, never as evidence that pre-existing conten
 was introduced by that Task.
 
 The reviewer answers in free Markdown and ends with one small result block,
-`{"result": "pass|fail|blocked", "reason": "..."}`. The response format is kept
+`{"result": "pass|fail|blocked", "reason": "...", "fixable_by": "coder|owner", "repeat": false}`.
+`fixable_by` and `repeat` are optional, defaulting to `coder` and `false`;
+unknown values use those defaults. Owner-only findings need authority or
+resources outside the coder's Task; repeats identify a finding left unaddressed
+from the previous attempt. The response format is kept
 this small on purpose so any model can review: an earlier contract demanded one
 JSON object with per-requirement dispositions and exact file/commit citations,
 and live reviewers lost whole reviews to an invented extra field or a truncated
@@ -3038,6 +3117,24 @@ A reply with no readable result block, or a review whose context or commit
 changed underneath it, is `unverified`: it uses the bounded reviewer
 execution-retry path, eventually creates a durable execution blocker, and never
 dispatches a coder.
+
+Before coder remediation, a reviewer `fail` tagged `fixable_by: owner`, or a
+`repeat: true` failure after the immediately preceding attempt recorded a
+reviewer `fail` assessment, parks the Task
+with `FailureKind::ReviewNeedsOwner`. The annotation message records
+`fixable by owner` or `repeated finding` plus the reason. Forge does not dispatch
+the coder or consume review retry budget. A first-attempt repeat does not park,
+and failures from Forge's own checks retain their normal routing. Reviewer
+crashes, unverified results, and CI-only failures are not prior findings. The dispatcher
+uses this same routing for stranded failed Reviews after the base's recovery
+grace and authority fences; failed non-user review-entry CI still consumes the
+review retry budget and records exhaustion when appropriate. Owner recovery
+actions are `reexecute` with guidance, `mark_reviewed` with a reason,
+`defer_to_follow_up`, `open_interactive`, and `cancel_task`.
+Deferring requires a reason and atomically creates a linked backlog Task carrying
+the finding and records a manual pass naming it, allowing the original to merge.
+The follow-up uses normal service insertion, including current-Charter governance
+and a Project work-epoch increment, in that same transaction.
 
 Before an embedded reviewer run completes, Forge parses its reply with the same
 parser; a reply with no readable result block gets up to two short follow-up
@@ -3094,7 +3191,10 @@ Project environment variables are injected into review commands, so their names
 are fingerprinted, never their values. Whole Project settings/workflow blobs,
 reviewer assignments, worklog/media evidence, and other audit metadata do not
 enter the v2 digest. Changing unrelated settings or other workflow states does
-not revoke a v2 approval.
+not revoke a v2 approval. In particular, `max_active_tasks` and
+`environment.recheck_interval_seconds` govern admission and pause scheduling,
+so neither enters review authority. Finding routing adds assessment fields,
+not a review configuration input.
 
 A missing `source_digest_version` means v1. Such contracts still verify with
 `legacy_v1_source_digest`, the exact whole-source algorithm used when they were

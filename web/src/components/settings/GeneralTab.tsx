@@ -33,6 +33,10 @@ interface GeneralTabProps {
   agentsIsError: boolean
   automaticRecoveryEnabled: boolean
   automaticRecoveryAgentId: string
+  maxActiveTasks: string
+  activeLimitError: string | null
+  saveError: string | null
+  onMaxActiveTasksChange: (value: string) => void
   onNameChange: (v: string) => void
   onTogglePaused: () => void
   onCiStepsChange: (steps: string[]) => void
@@ -60,6 +64,10 @@ export function GeneralTab({
   agentsIsError,
   automaticRecoveryEnabled,
   automaticRecoveryAgentId,
+  maxActiveTasks,
+  activeLimitError,
+  saveError,
+  onMaxActiveTasksChange,
   onNameChange,
   onTogglePaused,
   onCiStepsChange,
@@ -145,6 +153,42 @@ export function GeneralTab({
           >
             <CiStepsEditor steps={ciSteps} onChange={onCiStepsChange} />
           </SettingsSection>
+          <SettingsSection
+            title="Active task limit"
+            description="Cap new task admission for this project."
+          >
+            <div className="space-y-2">
+              <Label htmlFor="project-active-task-limit">Active task limit</Label>
+              <Input
+                id="project-active-task-limit"
+                type="number"
+                min={0}
+                max={1000}
+                step={1}
+                value={maxActiveTasks}
+                onChange={(event) => onMaxActiveTasksChange(event.target.value)}
+                aria-invalid={Boolean(activeLimitError)}
+                aria-describedby={
+                  activeLimitError
+                    ? 'project-active-task-limit-help project-active-task-limit-error'
+                    : 'project-active-task-limit-help'
+                }
+              />
+              <p id="project-active-task-limit-help" className="text-xs text-muted-foreground">
+                0 = unlimited. Tasks in planning, in progress, review, merging or conflict repair
+                take a slot; parked tasks don&apos;t.
+              </p>
+              {activeLimitError ? (
+                <p
+                  id="project-active-task-limit-error"
+                  role="alert"
+                  className="text-xs text-destructive"
+                >
+                  {activeLimitError}
+                </p>
+              ) : null}
+            </div>
+          </SettingsSection>
           {(roleAssignmentsLoading || roles.length > 0) && (
             <SettingsSection
               title="Default role assignments"
@@ -218,9 +262,16 @@ export function GeneralTab({
             </div>
           </SettingsSection>
           <div className="flex justify-end py-6">
-            <Button disabled={isSaving || !canSave} onClick={onSave}>
-              {isSaving ? 'Saving...' : 'Save'}
-            </Button>
+            <div className="space-y-2">
+              {saveError ? (
+                <p role="alert" className="text-xs text-destructive">
+                  {saveError}
+                </p>
+              ) : null}
+              <Button disabled={isSaving || !canSave || Boolean(activeLimitError)} onClick={onSave}>
+                {isSaving ? 'Saving...' : 'Save'}
+              </Button>
+            </div>
           </div>
         </>
       )}

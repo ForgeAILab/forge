@@ -272,9 +272,8 @@ impl TaskService {
     }
 
     /// Terminalize a pre-dispatch execution while leaving its Task projection
-    /// to the caller. Environment failures use their own typed blocking
-    /// annotation and must not briefly publish the generic executor-failed
-    /// projection first.
+    /// to the caller. Environment failures pause the Project and must not
+    /// publish a generic executor-failed Task blocker.
     pub(super) async fn fail_execution_before_dispatch_without_task_block(
         &self,
         execution_id: &str,
@@ -297,7 +296,11 @@ impl TaskService {
         // so these stay auto-resumable; anything else waits for a human.
         let transient_authority_race =
             error.contains("WorkspaceLease") || error.contains("version conflict");
-        let resume_policy = if transient_authority_race {
+        // Environment preflights recover through the Project pause rather
+        // than a Task recovery action or execution retry budget.
+        let environment_pre_dispatch =
+            error.starts_with(crate::project_environment::ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX);
+        let resume_policy = if transient_authority_race || environment_pre_dispatch {
             db::ResumePolicy::Auto
         } else {
             db::ResumePolicy::Manual

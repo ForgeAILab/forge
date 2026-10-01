@@ -79,6 +79,7 @@ pub enum RecoveryAction {
     ResetToInitial,
     CancelTask,
     MarkReviewed,
+    DeferToFollowUp,
     RetryHook,
     ResumeProcess,
     UpdateWorkspaceAndRetryHook,
@@ -162,6 +163,9 @@ pub enum FailureKind {
     /// The reviewer could not reach a verdict because of its environment
     /// (missing toolchain, dependencies, or access). The owner resolves it.
     ReviewBlocked,
+    /// A blocking review finding requires owner input, or repeats an
+    /// unaddressed finding from the previous failed Review attempt.
+    ReviewNeedsOwner,
     /// A Project environment check failed before an execution launched, so
     /// no agent run was spent. The owner fixes the host or the Project's
     /// `environment` settings and re-executes.
@@ -452,6 +456,7 @@ mod failure_kind_tests {
             (FailureKind::TargetRepoDirty, "\"target_repo_dirty\""),
             (FailureKind::CiFailed, "\"ci_failed\""),
             (FailureKind::ReviewGateFailed, "\"review_gate_failed\""),
+            (FailureKind::ReviewNeedsOwner, "\"review_needs_owner\""),
             (FailureKind::RetryExhausted, "\"retry_exhausted\""),
             (
                 FailureKind::MergeFixBudgetExhausted,
