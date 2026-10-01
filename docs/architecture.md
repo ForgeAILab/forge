@@ -388,7 +388,7 @@ Charter amendment rotates current binding/approval pointers while retaining the
 same receipt. Already admitted retrying turns continue to use their frozen
 binding/Profile/skill provenance.
 
-The Project operating skill (`forge.project.orchestration/v1@17`) is a
+The Project operating skill (`forge.project.orchestration/v1@18`) is a
 doctrine index, not a doctrine dump: the resident prompt carries the mission,
 authority boundaries, standing invariants, and autonomous-drive rules, plus an
 index of server-owned doctrine sections (`research`, `documents`,
@@ -417,6 +417,14 @@ It retains previous revision rows, session prompts, and frozen turn admissions.
 The compiled baseline retains exact bodies for revisions @1–@3; unknown
 revisions still fail closed. These instructions guide agents; they do not
 change merge, rebase, review, or enforce file ownership as a capability grant.
+
+Migration `V202610010550__chat_session_denied_operations.sql` derives Project
+revision @18 by replacing the attention-wake rule in the immutable @17 body.
+The previous body stays resolvable as `LEGACY_V17_PROJECT_PROTOCOL`; frozen
+admissions still render their admitted revision. Recovery, resumption, and
+re-execution require an offered operation and an addressed cause. A denial
+marked `retry: none` is final for the turn; the Agent uses offered alternatives
+and escalates to the user only what its authority cannot cover.
 
 An autonomous `delivery_followup` admission also freezes a typed postcondition
 on its server-authored trigger: one Project-scoped event must commit at a
@@ -1244,6 +1252,21 @@ with a digest of its summary. The runtime still owns final request budgeting
 and serialization. Chat prompt assembly is tested through the production
 service loader; there is no public chat prompt-preview endpoint.
 
+Capability-wide native denials appear only in the trailing state card, in
+`### Unavailable in this session` with `<operation> (<reason>)` list entries.
+The session-local `chat_session_denied_operation` records include `created_at`
+and are bound to the authenticated chat, identity, and resolved Forge session
+(native runtime IDs are resolved inside that scope). Records are read after
+session creation/resumption so a rotation cannot expose the old session's
+reminders. Permission reminders are rechecked against the current identity,
+selected Profile, and active binding ceilings; Charter reminders are rechecked
+against current Charter status and pointers. Stored pause candidates are
+shown only while the identity is paused/archived or the bound Project remains
+paused, with current Project pause detail. Cleared causes are deleted when
+read, and successful calls delete records for that operation. Turn-scoped
+refusals are never stored. Session rotation starts without reminders. These
+mutable values never enter the system prompt or alter its bytes.
+
 Actionable optimistic versions remain in the card: Project version for
 Project metadata/configuration CAS; Charter and approved Document versions
 and revision IDs for artifact edits; milestone version and definition revision
@@ -1315,6 +1338,43 @@ canonical principal and scope have been authorized and only for state the
 caller may inspect; idempotency conflicts do not load current state. Models
 must use the stable code and typed fields rather than infer corrections from
 prose.
+
+Native policy refusals carry a typed `DeniedBy` cause, serialized as a safe
+string. Its `scope()` and `clears()` rules are shared by the native adapter,
+host cache, and service reader. Only `permission_missing`,
+`charter_not_adopted`, `identity_paused`, `project_paused`, and the catalog's
+`operation_not_in_scope` withdraw an operation. These session-scoped causes
+carry `retry: {action: "none", retryable: false, scope: "session", ...}` and
+say that repeating the call will be refused while its cause holds. Other
+specific causes apply to the request for the turn and are neither cached nor
+recorded. A paused target Agent returns `target_agent_paused`; a Project
+pause on `task.recover` is turn-scoped because it does not block every recovery
+action. Neither withdraws the operation. Unknown prose maps to `unspecified`:
+a neutral turn-scoped refusal with `retry.action: none` and `retryable: false`.
+Subsequent calls are evaluated normally; only invalid arguments suggest
+`correct_input`. Input-shaped errors return validation outcomes, while
+current-state load errors return internal failures. Known own-scope evaluator
+reasons stay precise; protected detail stays redacted with existing
+missing/inaccessible-scope equivalence. Server-side diagnostics retain the
+original reason and mapped cause. A held, useful `message.send` alternative
+is included when policy admits it; only then does the message suggest
+escalation to the user.
+
+`ScopeToolComposition` shares an allowlisted denial cache across native
+operation tools, keyed by runtime session, turn, and operation. Calls check
+the cache, release the lock before provider invocation, then lock to store
+completed denials. Later calls return the exact original terminal denial;
+already-running parallel calls evaluate independently. A failed reminder
+write is logged and still returns the denial. The Agent Runtime seals and
+caches tool schemas at registration, so the advertised operation enum cannot
+be withdrawn between model calls without a runtime change. Forge retains
+the catalog and fails repeated calls fast; a new turn evaluates normally and
+receives only still-valid session reminders. The database loads reminder rows
+without a transaction. Services recheck permission and Charter causes through
+the real operation policy, then delete expired rows in separate statements.
+Read/recheck failures are logged and produce an empty reminder list. Success
+clears only a reminder found by the turn's state-card read; the host parses
+structured outcomes only for failed calls.
 
 After that transaction commits, `project_provisioning` reconciles execution
 setup as one durable, leased, finite, idempotent operation (also resumed on

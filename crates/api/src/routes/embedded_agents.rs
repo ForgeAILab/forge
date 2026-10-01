@@ -433,6 +433,8 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
             )
         }
         AgentHostError::CredentialNotFound
+        | AgentHostError::AgentPaused { .. }
+        | AgentHostError::ProjectPaused { .. }
         | AgentHostError::Runtime(_)
         | AgentHostError::RuntimeWithUsage { .. }
         | AgentHostError::TurnLimitReached { .. }

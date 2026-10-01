@@ -7,7 +7,7 @@
 //! retain an `AgentAction` envelope.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Read,
     net::{IpAddr, Ipv6Addr},
@@ -19,7 +19,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use api_types::{
-    ApprovalTarget, CanonicalScopeRef as OutcomeScopeRef, CurrentVersionOrRevision,
+    ApprovalTarget, CanonicalScopeRef as OutcomeScopeRef, CurrentVersionOrRevision, DeniedBy,
     OrchestrationOutcome, OutcomeCode, OutcomeScopeType, OutcomeStatus, RetryAction,
     RetryInstruction, SetupRequirement,
 };
@@ -248,6 +248,8 @@ impl AdaptiveTaskPayload {
     }
 }
 
+type SessionDenialRows = BTreeMap<(String, String), Vec<db::ChatSessionDenial>>;
+
 /// Forge-owned provider injected into native Agent Runtime compositions.
 #[derive(Clone)]
 pub struct CoordinationToolProvider {
@@ -258,6 +260,9 @@ pub struct CoordinationToolProvider {
     main_queries: MainOrchestrationQueryService,
     project_actions: ProjectOrchestrationActionService,
     public_search: Arc<RwLock<Option<PublicSearchConfig>>>,
+    /// Reminders seen by the resolved turn's state-card read. Success only
+    /// deletes a durable reminder when that read actually found one.
+    read_session_denials: Arc<RwLock<SessionDenialRows>>,
     /// Shared TaskService used to execute directly admitted `task.propose` and
     /// `task.adaptive` commands inline, so native proposals materialize
     /// through the durable command receipt path without a separate caller.
@@ -289,11 +294,128 @@ impl CoordinationToolProvider {
             main_queries: MainOrchestrationQueryService::new(Arc::clone(&db)),
             project_actions: ProjectOrchestrationActionService::new(Arc::clone(&db)),
             public_search: Arc::new(RwLock::new(None)),
+            read_session_denials: Arc::new(RwLock::new(BTreeMap::new())),
             task_service: Arc::new(RwLock::new(None)),
             media_root: Arc::new(RwLock::new(None)),
             inquiry_runner: Arc::new(RwLock::new(None)),
             db,
         }
+    }
+
+    /// Recheck stored causes through the same policy used by native calls.
+    /// Reminders are advisory: a read, recheck or deletion failure cannot fail
+    /// turn admission or hide the agent's normal state card.
+    pub async fn chat_session_denials(
+        &self,
+        identity_id: &str,
+        profile_id: &str,
+        chat_id: &str,
+        session_id: Option<&str>,
+    ) -> Vec<(String, DeniedBy)> {
+        let key = (identity_id.to_owned(), chat_id.to_owned());
+        if session_id.is_some() {
+            if let Ok(mut read) = self.read_session_denials.write() {
+                read.remove(&key);
+            }
+        }
+        match self
+            .recheck_session_denials(identity_id, profile_id, chat_id, session_id)
+            .await
+        {
+            Ok((unavailable, rows)) => {
+                if session_id.is_some() {
+                    if let Ok(mut read) = self.read_session_denials.write() {
+                        read.insert(key, rows);
+                    }
+                }
+                unavailable
+            }
+            Err(error) => {
+                tracing::warn!(identity_id, chat_id, error = %error, "could not read native denial reminders");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn recheck_session_denials(
+        &self,
+        identity_id: &str,
+        profile_id: &str,
+        chat_id: &str,
+        session_id: Option<&str>,
+    ) -> crate::Result<(Vec<(String, DeniedBy)>, Vec<db::ChatSessionDenial>)> {
+        use db::ChatSessionDenialRepo;
+        let rows = self
+            .db
+            .chat_session_denials(identity_id, profile_id, chat_id, session_id)
+            .await?;
+        let mut unavailable = Vec::new();
+        let mut holding_rows = Vec::new();
+        for row in rows {
+            let mut cause = row.denied_by.parse::<DeniedBy>().ok();
+            let holds = match cause.as_ref() {
+                Some(DeniedBy::OperationNotInScope) => true,
+                Some(DeniedBy::ProjectPaused(_)) if row.operation != TASK_RECOVER_OPERATION => {
+                    let scope = CanonicalScope {
+                        scope_type: CanonicalScopeType::AgentChat,
+                        scope_id: chat_id.to_owned(),
+                        workspace_access: WorkspaceAccess::Deny,
+                    };
+                    let project_id = self
+                        .authorization
+                        .project_orchestration_target(identity_id, &scope)
+                        .await?;
+                    let pause = sqlx::query_scalar::<_, Option<String>>(
+                        "SELECT system_pause_reason FROM project WHERE id = ? AND paused_at IS NOT NULL",
+                    ).bind(project_id).fetch_optional(self.db.pool()).await?;
+                    if let Some(reason) = pause {
+                        cause = Some(db::project_pause_denial(reason.as_deref()));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Some(cause) if cause.withdraws_operation() && cause.clears() => {
+                    if let Some(permission) =
+                        operation_permission(CanonicalScopeType::AgentChat, &row.operation)
+                    {
+                        let (result, reason) = self
+                            .actions
+                            .evaluate_direct_command_policy(
+                                identity_id,
+                                "agent_chat",
+                                chat_id,
+                                permission,
+                                &row.operation,
+                                None,
+                            )
+                            .await?;
+                        result == AgentActionPolicyResult::Denied
+                            && reason
+                                .as_deref()
+                                .map(|reason| native_denial_cause(reason, Some(permission)))
+                                .as_ref()
+                                == Some(cause)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if holds {
+                let entry = (
+                    row.operation.clone(),
+                    cause.expect("holding cause is parsed"),
+                );
+                if !unavailable.contains(&entry) {
+                    unavailable.push(entry);
+                }
+                holding_rows.push(row);
+            } else {
+                self.db.delete_chat_session_denial(&row).await?;
+            }
+        }
+        Ok((unavailable, holding_rows))
     }
 
     /// Attach the shared TaskService so admitted Task commands execute inline
@@ -737,7 +859,8 @@ impl CoordinationToolProvider {
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
                 let root = self.task_workspace_root(&task_id).await?;
-                let resolved = resolve_workspace_artifact(&root, path)?;
+                let resolved =
+                    resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
                 let bytes = read_bounded_regular_file(
                     &resolved,
                     &root,
@@ -1463,7 +1586,8 @@ impl CoordinationToolProvider {
                 let root = self
                     .project_verify_workspace_root(actor_identity_id, scope)
                     .await?;
-                let resolved = resolve_workspace_artifact(&root, path)?;
+                let resolved =
+                    resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
                 let bytes = read_bounded_regular_file(
                     &resolved,
                     &root,
@@ -1940,13 +2064,13 @@ impl CoordinationToolProvider {
             .map(|value| value.clamp(1, 64));
         let projection = load_effective_project_state(&self.db, &project_id, limit)
             .await
-            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         let execution_setup = crate::load_project_execution_setup(&self.db, &project_id)
             .await
-            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         let adoption_charter = load_project_adoption_charter(&self.db, &project_id)
             .await
-            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
         serde_json::to_value(ProjectCurrentStateResponse {
             scope: "project".to_owned(),
             effective_state: projection,
@@ -1971,7 +2095,7 @@ impl CoordinationToolProvider {
             .get("project_id")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| AgentHostError::Authority("project_id is required".to_owned()))?;
+            .ok_or_else(|| invalid_arguments("project_id is required".to_owned()))?;
         let row = sqlx::query(
             "SELECT p.id, p.name, p.paused_at, p.created_at, p.updated_at,
                     COUNT(t.id) AS task_count
@@ -1985,7 +2109,7 @@ impl CoordinationToolProvider {
         .fetch_optional(self.db.pool())
         .await
         .map_err(|_| AgentHostError::ProtectedPersistence)?
-        .ok_or_else(|| AgentHostError::Authority("Project summary is unavailable".to_owned()))?;
+        .ok_or_else(|| invalid_arguments("Project summary is unavailable".to_owned()))?;
         Ok(json!({
             "id": row.try_get::<String, _>("id").unwrap_or_default(),
             "name": row.try_get::<String, _>("name").unwrap_or_default(),
@@ -2372,9 +2496,14 @@ impl CoordinationToolProvider {
                 ));
             }
             OperationClassification::Denied => {
-                return Err(AgentHostError::Authority(
-                    "operation is denied by the canonical Forge operation catalog".to_owned(),
-                ));
+                return Err(AgentHostError::StructuredOutcome(Box::new(
+                    OrchestrationOutcome::terminal_denial(
+                        operation,
+                        outcome_scope(scope),
+                        correlation_id(&arguments, operation, scope),
+                        DeniedBy::OperationNotInScope,
+                    ),
+                )));
             }
             OperationClassification::DirectCommand
             | OperationClassification::ApprovalRequiredAction => {}
@@ -2648,6 +2777,14 @@ impl CoordinationToolProvider {
             })
             .await
             .map_err(service_error)?;
+        if action.policy_result == AgentActionPolicyResult::Denied {
+            return Err(AgentHostError::Authority(
+                action
+                    .policy_reason
+                    .clone()
+                    .unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
+            ));
+        }
         let mut response = action_value(&action);
         if operation_contract(operation).is_some() {
             // A proposal row is not a domain success. Protected Main
@@ -2721,7 +2858,7 @@ impl CoordinationToolProvider {
                     "task review command policy denied"
                 );
                 return Err(AgentHostError::Authority(
-                    "Task review command policy did not admit execution".to_owned(),
+                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let result = task_service
@@ -2836,7 +2973,7 @@ impl CoordinationToolProvider {
                     "task recovery command policy denied"
                 );
                 return Err(AgentHostError::Authority(
-                    "Task recovery command policy did not admit execution".to_owned(),
+                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let task = task_service
@@ -2889,7 +3026,7 @@ impl CoordinationToolProvider {
                     "Task cancellation command policy denied"
                 );
                 return Err(AgentHostError::Authority(
-                    "Task cancellation command policy did not admit execution".to_owned(),
+                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let result = task_service
@@ -2949,7 +3086,7 @@ impl CoordinationToolProvider {
                     "Task dependency command policy denied"
                 );
                 return Err(AgentHostError::Authority(
-                    "Task dependency command policy did not admit execution".to_owned(),
+                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let task = task_service
@@ -2999,7 +3136,7 @@ impl CoordinationToolProvider {
             let receipt_exists = self
                 .adaptive_receipt_exists(actor_identity_id, &project_id, &idempotency_key)
                 .await?;
-            let (policy_result, _policy_reason) = if receipt_exists {
+            let (policy_result, policy_reason) = if receipt_exists {
                 (AgentActionPolicyResult::Allowed, None)
             } else {
                 self.actions
@@ -3016,7 +3153,7 @@ impl CoordinationToolProvider {
             };
             if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
                 return Err(AgentHostError::Authority(
-                    "adaptive Task command policy did not admit execution".to_owned(),
+                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let result: AdaptiveTaskCommandResult = task_service
@@ -3442,12 +3579,12 @@ impl CoordinationToolProvider {
         limit: u64,
     ) -> Result<Value, AgentHostError> {
         if query.trim().is_empty() || query.chars().count() > 512 {
-            return Err(AgentHostError::Authority(
+            return Err(invalid_arguments(
                 "search query must contain 1 to 512 characters".to_owned(),
             ));
         }
         if !(1..=10).contains(&limit) {
-            return Err(AgentHostError::Authority(
+            return Err(invalid_arguments(
                 "search result limit must be between 1 and 10".to_owned(),
             ));
         }
@@ -3635,7 +3772,7 @@ impl CoordinationToolProvider {
             })?;
         if !permission_set(&ceiling).contains("propose_task") {
             return Err(AgentHostError::Authority(
-                "Project Agent Chat binding does not admit Task management".to_owned(),
+                "permission propose_task is outside the server-issued identity/profile/scope ceiling".to_owned(),
             ));
         }
         Ok(project_id)
@@ -3707,6 +3844,42 @@ impl CoordinationToolProvider {
         serde_json::to_value(outcome).map_err(|_| AgentHostError::ProtectedPersistence)
     }
 
+    async fn project_pause_cause(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        paused_project_id: Option<&str>,
+    ) -> DeniedBy {
+        let project_id = if scope.scope_type == CanonicalScopeType::Task {
+            sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                .bind(&scope.scope_id)
+                .fetch_optional(self.db.pool())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            self.authorization
+                .project_orchestration_target(actor_identity_id, scope)
+                .await
+                .ok()
+        };
+        let Some(project_id) =
+            project_id.filter(|id| paused_project_id.is_none_or(|paused| paused == id))
+        else {
+            return DeniedBy::Unspecified;
+        };
+        let reason = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT system_pause_reason FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        db::project_pause_denial(reason.as_deref())
+    }
+
     /// Build a structured failure after the command boundary has established
     /// the canonical actor/scope.  Current state is loaded only after that
     /// authorization check and only for the Project resource named by a
@@ -3723,6 +3896,8 @@ impl CoordinationToolProvider {
         let error_kind = match &error {
             AgentHostError::StructuredOutcome(outcome) => outcome.code.as_str(),
             AgentHostError::Authority(_) => "authority",
+            AgentHostError::AgentPaused { .. } => "agent_paused",
+            AgentHostError::ProjectPaused { .. } => "project_paused",
             AgentHostError::Configuration(_) => "configuration",
             AgentHostError::SessionNotFound => "session_not_found",
             AgentHostError::CredentialNotFound => "credential_not_found",
@@ -3770,45 +3945,39 @@ impl CoordinationToolProvider {
                 outcome.retry = Some(RetryInstruction::new(RetryAction::CompleteSetup, false));
                 outcome
             }
-            AgentHostError::Authority(detail) => {
-                let validation_failed = operation == TASK_PROPOSE_OPERATION
-                    || operation == MAIN_CHARTER_DRAFT_OPERATION
-                    || arguments
-                        .get("payload")
-                        .filter(|payload| payload.is_object())
-                        .is_some_and(|payload| {
-                            validate_proposal_payload(operation, payload).is_err()
-                        });
-                let (code, message, retry) = if validation_failed {
-                    // The contract reason is server-authored and names only
-                    // the offending field, so it is safe to return and is the
-                    // only way the model can correct the call. Without it the
-                    // model retries the same rejected shape indefinitely.
-                    (
-                        OutcomeCode::ValidationError,
-                        format!(
-                            "the operation or arguments are not valid for this Forge surface ({detail})"
-                        ),
-                        Some(RetryInstruction::new(RetryAction::CorrectInput, false)),
-                    )
+            AgentHostError::AgentPaused { agent_id } => OrchestrationOutcome::terminal_denial(
+                operation,
+                outcome_scope(scope),
+                &correlation_id,
+                if agent_id == actor_identity_id {
+                    DeniedBy::IdentityPaused
                 } else {
-                    // Policy denials stay generic: the reason can describe
-                    // authority the caller is not entitled to observe.
-                    (
-                        OutcomeCode::PolicyDenied,
-                        "the operation is not admitted for the current Forge scope".to_owned(),
-                        Some(RetryInstruction::new(RetryAction::Reauthorize, false)),
-                    )
-                };
-                let mut outcome = OrchestrationOutcome::failed(
-                    code,
+                    DeniedBy::TargetAgentPaused
+                },
+            ),
+            AgentHostError::ProjectPaused { project_id } => OrchestrationOutcome::terminal_denial(
+                operation,
+                outcome_scope(scope),
+                &correlation_id,
+                self.project_pause_cause(actor_identity_id, scope, Some(&project_id))
+                    .await,
+            ),
+            AgentHostError::Authority(detail) => {
+                let mut cause =
+                    native_denial_cause(&detail, operation_permission(scope.scope_type, operation));
+                if matches!(cause, DeniedBy::ProjectPaused(_)) {
+                    cause = self
+                        .project_pause_cause(actor_identity_id, scope, None)
+                        .await;
+                }
+                tracing::warn!(diagnostic = %detail, denied_by = %cause, operation,
+                    "native policy refusal; diagnostic is server-only");
+                OrchestrationOutcome::terminal_denial(
                     operation,
                     outcome_scope(scope),
                     &correlation_id,
-                    message,
-                );
-                outcome.retry = retry;
-                outcome
+                    cause,
+                )
             }
             AgentHostError::Unsupported(detail) => {
                 let mut outcome = OrchestrationOutcome::failed(
@@ -3856,6 +4025,51 @@ impl CoordinationToolProvider {
         outcome.scope = outcome_scope(scope);
         outcome.correlation_id = correlation_id;
 
+        if outcome.code == OutcomeCode::PolicyDenied && outcome.denied_by.is_none() {
+            outcome = OrchestrationOutcome::terminal_denial(
+                operation,
+                outcome_scope(scope),
+                &outcome.correlation_id,
+                DeniedBy::Unspecified,
+            );
+        }
+        if outcome
+            .denied_by
+            .as_ref()
+            .is_some_and(DeniedBy::withdraws_operation)
+            && operation != "message.send"
+            && self
+                .authorization
+                .project_orchestration_target(actor_identity_id, scope)
+                .await
+                .is_ok()
+        {
+            if let Some(permission) = operation_permission(scope.scope_type, "message.send") {
+                if self
+                    .actions
+                    .evaluate_direct_command_policy(
+                        actor_identity_id,
+                        scope_type_name(scope.scope_type),
+                        &scope.scope_id,
+                        permission,
+                        "message.send",
+                        None,
+                    )
+                    .await
+                    .is_ok_and(|(result, _)| {
+                        matches!(
+                            result,
+                            AgentActionPolicyResult::Allowed
+                                | AgentActionPolicyResult::ApprovalRequired
+                        )
+                    })
+                {
+                    outcome.alternatives = Some(vec!["message.send".to_owned()]);
+                    outcome.safe_message.push_str(" Use message.send to escalate to the user only what your authority cannot cover.");
+                }
+            }
+        }
+
         if matches!(outcome.code, OutcomeCode::VersionConflict) {
             let current = match self
                 .authorization
@@ -3894,6 +4108,81 @@ impl CoordinationToolProvider {
 
 #[async_trait]
 impl ForgeToolProvider for CoordinationToolProvider {
+    async fn record_terminal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+        denied_by: &DeniedBy,
+    ) -> Result<(), AgentHostError> {
+        if matches!(denied_by, DeniedBy::PermissionMissing(name)
+            if operation_permission(scope.scope_type, operation) != Some(name.as_str()))
+        {
+            return Ok(());
+        }
+        if scope.scope_type == CanonicalScopeType::AgentChat {
+            db::ChatSessionDenialRepo::record_chat_session_denial(
+                &*self.db,
+                actor_identity_id,
+                &scope.scope_id,
+                session_token,
+                operation,
+                denied_by,
+            )
+            .await
+            .map_err(|error| service_error(error.into()))?;
+        }
+        Ok(())
+    }
+
+    async fn clear_terminal_denials(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        if scope.scope_type == CanonicalScopeType::AgentChat {
+            let rows = self
+                .read_session_denials
+                .read()
+                .ok()
+                .and_then(|read| {
+                    read.get(&(actor_identity_id.to_owned(), scope.scope_id.clone()))
+                        .map(|rows| {
+                            rows.iter()
+                                .filter(|row| {
+                                    row.operation == operation
+                                        && (row.session_id == session_token
+                                            || row.runtime_session_id.as_deref()
+                                                == Some(session_token))
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .unwrap_or_default();
+            for row in rows {
+                db::ChatSessionDenialRepo::delete_chat_session_denial(&*self.db, &row)
+                    .await
+                    .map_err(|error| service_error(error.into()))?;
+                if let Ok(mut read) = self.read_session_denials.write() {
+                    if let Some(rows) =
+                        read.get_mut(&(actor_identity_id.to_owned(), scope.scope_id.clone()))
+                    {
+                        rows.retain(|stored| {
+                            stored.session_id != row.session_id
+                                || stored.operation != row.operation
+                                || stored.denied_by != row.denied_by
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn observe_command(
         &self,
         actor_identity_id: &str,
@@ -3902,14 +4191,29 @@ impl ForgeToolProvider for CoordinationToolProvider {
     ) -> Result<Value, AgentHostError> {
         // The observation belongs to the Project this session is bound to;
         // the binding, not the payload, says which Project that is.
-        let project_id = self
+        let arguments =
+            json!({"session_id": observation.session_id, "turn_id": observation.turn_id});
+        let project_id = match self
             .authorization
             .project_orchestration_target(actor_identity_id, scope)
             .await
-            .map_err(service_error)?;
+        {
+            Ok(project_id) => project_id,
+            Err(error) => {
+                return Err(self
+                    .structured_boundary_error(
+                        actor_identity_id,
+                        scope,
+                        "observe_command",
+                        &arguments,
+                        service_error(error),
+                    )
+                    .await)
+            }
+        };
         let id = db::new_uuid_v4();
         let now = db::now_rfc3339();
-        sqlx::query(
+        let saved = sqlx::query(
             "INSERT INTO project_command_observation (
                 id, project_id, actor_identity_id, scope_type, scope_id, session_id, turn_id,
                 program, args_json, exit_code, success, output_digest, stdout_excerpt,
@@ -3932,8 +4236,18 @@ impl ForgeToolProvider for CoordinationToolProvider {
         .bind(&observation.stderr_excerpt)
         .bind(&now)
         .execute(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        .await;
+        if let Err(error) = saved {
+            return Err(self
+                .structured_boundary_error(
+                    actor_identity_id,
+                    scope,
+                    "observe_command",
+                    &arguments,
+                    AgentHostError::Runtime(error.to_string()),
+                )
+                .await);
+        }
         Ok(json!({"observation_id": id, "recorded_at": now}))
     }
 
@@ -3950,8 +4264,21 @@ impl ForgeToolProvider for CoordinationToolProvider {
         query: &str,
         limit: u64,
     ) -> Result<Value, AgentHostError> {
-        self.run_public_search(actor_identity_id, scope, search_scope, query, limit)
-            .await
+        let result = self
+            .run_public_search(actor_identity_id, scope, search_scope, query, limit)
+            .await;
+        match result {
+            Err(error) => Err(self
+                .structured_boundary_error(
+                    actor_identity_id,
+                    scope,
+                    forge_agent_host::FORGE_PUBLIC_WEB_SEARCH_TOOL,
+                    &json!({"query": query, "limit": limit}),
+                    error,
+                )
+                .await),
+            other => other,
+        }
     }
 
     async fn read(
@@ -3965,9 +4292,14 @@ impl ForgeToolProvider for CoordinationToolProvider {
         match operation_descriptor(scope.scope_type, operation, None).classification {
             OperationClassification::Query => {}
             OperationClassification::Denied => {
-                return Err(AgentHostError::Authority(
-                    "operation is denied by the canonical Forge operation catalog".to_owned(),
-                ));
+                return Err(AgentHostError::StructuredOutcome(Box::new(
+                    OrchestrationOutcome::terminal_denial(
+                        operation,
+                        outcome_scope(scope),
+                        correlation_id(&arguments, operation, scope),
+                        DeniedBy::OperationNotInScope,
+                    ),
+                )));
             }
             OperationClassification::DirectCommand
             | OperationClassification::ApprovalRequiredAction => {
@@ -4062,7 +4394,28 @@ impl ForgeToolProvider for CoordinationToolProvider {
                     .await),
             }
         } else {
-            result.map_err(non_orchestration_error)
+            match result {
+                Err(error)
+                    if matches!(&error, AgentHostError::Authority(_))
+                        || matches!(
+                            &error,
+                            AgentHostError::StructuredOutcome(_)
+                                | AgentHostError::AgentPaused { .. }
+                                | AgentHostError::ProjectPaused { .. }
+                        ) =>
+                {
+                    Err(self
+                        .structured_boundary_error(
+                            actor_identity_id,
+                            scope,
+                            operation,
+                            &boundary_arguments,
+                            error,
+                        )
+                        .await)
+                }
+                other => other,
+            }
         }
     }
 
@@ -4113,7 +4466,28 @@ impl ForgeToolProvider for CoordinationToolProvider {
                     .await),
             }
         } else {
-            result.map_err(non_orchestration_error)
+            match result {
+                Err(error)
+                    if matches!(&error, AgentHostError::Authority(_))
+                        || matches!(
+                            &error,
+                            AgentHostError::StructuredOutcome(_)
+                                | AgentHostError::AgentPaused { .. }
+                                | AgentHostError::ProjectPaused { .. }
+                        ) =>
+                {
+                    Err(self
+                        .structured_boundary_error(
+                            actor_identity_id,
+                            scope,
+                            operation,
+                            &arguments,
+                            error,
+                        )
+                        .await)
+                }
+                other => other,
+            }
         }
     }
 }
@@ -4172,15 +4546,6 @@ fn outcome_scope(scope: &CanonicalScope) -> OutcomeScopeRef {
         CanonicalScopeType::Task => OutcomeScopeType::Task,
     };
     OutcomeScopeRef::new(scope_type, scope.scope_id.clone())
-}
-
-fn non_orchestration_error(error: AgentHostError) -> AgentHostError {
-    match error {
-        AgentHostError::StructuredOutcome(_) => {
-            AgentHostError::Runtime("Forge tool provider failed".to_owned())
-        }
-        other => other,
-    }
 }
 
 fn correlation_id(arguments: &Value, operation: &str, scope: &CanonicalScope) -> String {
@@ -4677,6 +5042,61 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
     Ok(())
 }
 
+/// Translate only known server-authored reasons about the caller's own authority.
+/// Unknown reasons may describe another scope and retain the generic redaction.
+fn native_denial_cause(reason: &str, permission: Option<&str>) -> DeniedBy {
+    if let Ok(cause) = reason.parse::<DeniedBy>() {
+        return match cause {
+            DeniedBy::PermissionMissing(name) if name == "unknown" => permission
+                .map(|name| DeniedBy::PermissionMissing(name.to_owned()))
+                .unwrap_or(DeniedBy::Unspecified),
+            cause => cause,
+        };
+    }
+    if let Some(name) = reason
+        .strip_prefix("permission ")
+        .and_then(|rest| {
+            rest.strip_suffix(" is outside the server-issued identity/profile/scope ceiling")
+        })
+        .filter(|name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        })
+    {
+        return DeniedBy::PermissionMissing(name.to_owned());
+    }
+    match reason {
+        "requested permission is outside the Project binding ceiling"
+        | "requested permission is outside the Agent Chat binding ceiling"
+        | "direct Project command permission is outside the account ceiling"
+        | "direct Project command permission is outside the selected profile ceiling"
+        | "direct Project command permission is outside the active binding ceiling" => {
+            permission.map(|name| DeniedBy::PermissionMissing(name.to_owned())).unwrap_or(DeniedBy::Unspecified)
+        }
+        "actor identity is paused or archived"
+        | "Project Agent is paused or archived"
+        | "direct Project command principal is paused or archived"
+        | "agent principal is paused or archived" => DeniedBy::IdentityPaused,
+        "direct Project command has no selected active profile" => DeniedBy::ProfileNotSelected,
+        "the bound Project has no approved Charter"
+        | "Project orchestration remains blocked until a user-approved Charter adoption is committed"
+        | "direct Project command is blocked by current Charter state" => DeniedBy::CharterNotAdopted,
+        "the Task workflow no longer admits writes in its terminal state" => DeniedBy::TaskTerminal,
+        "reviewer assignments cannot perform Task writes" => DeniedBy::ReviewerReadOnly,
+        "protected mutation requires an independent approval" => DeniedBy::IndependentApprovalRequired,
+        "genesis.start requires an explicit user request to create or start a new Project" => DeniedBy::UserRequestRequired,
+        "genesis.start requires the currently leased Main Chat turn" => DeniedBy::LeasedTurnRequired,
+        "Project Charter adoption is not valid for the current Project state" => DeniedBy::CharterAdoptionNotApplicable,
+        "query operations execute through the read boundary" => DeniedBy::ReadBoundaryRequired,
+        "direct command is not admitted for this permission or payload" => DeniedBy::DirectCommandNotAdmitted,
+        "the Task assignment does not admit review proposals" => DeniedBy::ReviewAssignmentRequired,
+        "direct Project commands require the propose_project permission" => DeniedBy::PermissionMissing("propose_project".to_owned()),
+        "Product Genesis start requires propose_discovery"
+        | "Main Charter draft requires the propose_discovery permission" => DeniedBy::PermissionMissing("propose_discovery".to_owned()),
+        "operation is denied by the canonical native operation catalog" => DeniedBy::OperationNotInScope,
+        _ => DeniedBy::Unspecified,
+    }
+}
+
 fn native_scope_error(error: crate::ServiceError) -> AgentHostError {
     match error {
         crate::ServiceError::AuthorizationDenied { message }
@@ -4709,6 +5129,27 @@ fn invalid_arguments(message: String) -> AgentHostError {
 }
 
 fn service_error(error: crate::ServiceError) -> AgentHostError {
+    match &error {
+        crate::ServiceError::AuthorizationDenied { message } => {
+            return AgentHostError::Authority(message.clone());
+        }
+        crate::ServiceError::AgentPaused { agent_id } => {
+            return AgentHostError::AgentPaused {
+                agent_id: agent_id.clone(),
+            };
+        }
+        crate::ServiceError::ProjectPaused { project_id } => {
+            return AgentHostError::ProjectPaused {
+                project_id: project_id.clone(),
+            };
+        }
+        crate::ServiceError::Db(db::DbError::Check(message))
+            if native_denial_cause(message, Some("propose_project")) != DeniedBy::Unspecified =>
+        {
+            return AgentHostError::Authority(message.clone());
+        }
+        _ => {}
+    }
     // A validation reason from the command boundary names the offending
     // input, so it returns to the model verbatim. Collapsing it to a bare
     // "not valid" leaves the model retrying the same rejected shape with
@@ -4790,15 +5231,7 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
             None,
             None,
         ),
-        crate::ServiceError::AuthorizationDenied { message } => {
-            tracing::warn!(diagnostic = %message, "orchestration authorization denied");
-            (
-                OutcomeCode::PolicyDenied,
-                "the operation is not admitted for the current Forge scope",
-                None,
-                Some(RetryInstruction::new(RetryAction::Reauthorize, false)),
-            )
-        }
+        crate::ServiceError::AuthorizationDenied { .. } => unreachable!("handled above"),
         crate::ServiceError::InvalidOperation { .. }
         | crate::ServiceError::TerminalInvalidInput { .. } => (
             OutcomeCode::ValidationError,
@@ -5074,8 +5507,7 @@ fn resolve_outbox_artifact(
 ) -> Result<(PathBuf, PathBuf, bool), String> {
     if !Path::new(path).is_absolute() {
         return resolve_workspace_artifact(worktree, path)
-            .map(|path| (path, worktree.to_path_buf(), false))
-            .map_err(|error| error.to_string());
+            .map(|path| (path, worktree.to_path_buf(), false));
     }
     let canonical_outbox = outbox
         .canonicalize()
@@ -5176,53 +5608,39 @@ const MAX_INLINE_ARTIFACT_CHARS: usize = 8_000;
 /// Resolve a caller-supplied artifact path inside the Task workspace.
 /// Traversal, absolute paths, and symlinked escapes are all rejected: the
 /// capture surface must never read a file the Task session could not read.
-fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, AgentHostError> {
+fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
-        return Err(AgentHostError::Authority(
-            "captured artifact path must be workspace-relative".to_owned(),
-        ));
+        return Err("captured artifact path must be workspace-relative".to_owned());
     }
     if candidate
         .components()
         .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
     {
-        return Err(AgentHostError::Authority(
-            "captured artifact path escapes the Task workspace".to_owned(),
-        ));
+        return Err("captured artifact path escapes the Task workspace".to_owned());
     }
     let joined = root.join(candidate);
-    let root_metadata = fs::symlink_metadata(root).map_err(|error| {
-        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
-    })?;
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("Task workspace is unavailable: {error}"))?;
     if !root_metadata.file_type().is_dir() {
-        return Err(AgentHostError::Authority(
-            "Task workspace must be a real directory".to_owned(),
-        ));
+        return Err("Task workspace must be a real directory".to_owned());
     }
-    let leaf_metadata = fs::symlink_metadata(&joined).map_err(|error| {
-        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
-    })?;
+    let leaf_metadata = fs::symlink_metadata(&joined)
+        .map_err(|error| format!("captured artifact does not exist: {error}"))?;
     if !leaf_metadata.file_type().is_file() {
-        return Err(AgentHostError::Authority(
-            "captured artifact must be a regular file, not a symlink".to_owned(),
-        ));
+        return Err("captured artifact must be a regular file, not a symlink".to_owned());
     }
-    let canonical_root = root.canonicalize().map_err(|error| {
-        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
-    })?;
-    let canonical = joined.canonicalize().map_err(|error| {
-        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
-    })?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("Task workspace is unavailable: {error}"))?;
+    let canonical = joined
+        .canonicalize()
+        .map_err(|error| format!("captured artifact does not exist: {error}"))?;
     if !canonical.starts_with(&canonical_root) {
-        return Err(AgentHostError::Authority(
-            "captured artifact path escapes the Task workspace".to_owned(),
-        ));
+        return Err("captured artifact path escapes the Task workspace".to_owned());
     }
     if !canonical.is_file() {
-        return Err(AgentHostError::Runtime(
-            "captured artifact is not a file".to_owned(),
-        ));
+        return Err("captured artifact is not a file".to_owned());
     }
     Ok(joined)
 }
@@ -5282,6 +5700,14 @@ mod tests {
     }
 
     async fn native_plan_fixture(task_role: &str, execution_role: &str) -> NativePlanFixture {
+        native_plan_fixture_with_permissions(task_role, execution_role, "{}").await
+    }
+
+    async fn native_plan_fixture_with_permissions(
+        task_role: &str,
+        execution_role: &str,
+        permissions: &str,
+    ) -> NativePlanFixture {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -5402,7 +5828,7 @@ mod tests {
                 paused: false,
                 owner_id: None,
                 visibility: "global".to_owned(),
-                account_permission_ceiling: "{}".to_owned(),
+                account_permission_ceiling: permissions.to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
@@ -5417,7 +5843,7 @@ mod tests {
                 permission_policy: None,
                 prompt_template: None,
                 capabilities_json: "{}".to_owned(),
-                tool_policy_json: "{}".to_owned(),
+                tool_policy_json: permissions.to_owned(),
                 config_json: "{}".to_owned(),
                 credential_ref: None,
                 daemon_id: None,
@@ -6228,6 +6654,531 @@ mod tests {
         );
     }
 
+    async fn assert_terminal_native_denial(reason: &str, expected: &str) {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let provider = CoordinationToolProvider::new(Arc::new(SqliteDb::new(pool)));
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "own-chat".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let error = provider
+            .structured_boundary_error(
+                "own-identity",
+                &scope,
+                TASK_RECOVER_OPERATION,
+                &json!({}),
+                service_error(crate::ServiceError::AuthorizationDenied {
+                    message: reason.to_owned(),
+                }),
+            )
+            .await;
+        let AgentHostError::StructuredOutcome(outcome) = error else {
+            panic!("typed denial")
+        };
+        assert_eq!(outcome.code, OutcomeCode::PolicyDenied);
+        assert_eq!(
+            outcome
+                .denied_by
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(expected)
+        );
+        let generic = expected == "unspecified";
+        assert_eq!(outcome.safe_message.contains("Do not retry"), !generic);
+        let retry = outcome.retry.unwrap();
+        assert_eq!(retry.action, RetryAction::None);
+        assert!(!retry.retryable);
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_missing_permission() {
+        assert_terminal_native_denial(
+            "permission propose_task is outside the server-issued identity/profile/scope ceiling",
+            "permission_missing(propose_task)",
+        )
+        .await;
+        assert_terminal_native_denial(
+            "requested permission is outside the Agent Chat binding ceiling",
+            "permission_missing(propose_task)",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_paused_identity() {
+        assert_terminal_native_denial("actor identity is paused or archived", "identity_paused")
+            .await;
+        assert_terminal_native_denial("agent principal is paused or archived", "identity_paused")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_unadopted_charter() {
+        assert_terminal_native_denial(
+            "Project orchestration remains blocked until a user-approved Charter adoption is committed",
+            "charter_not_adopted",
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_operation_scope() {
+        assert_terminal_native_denial(
+            "operation is denied by the canonical native operation catalog",
+            "operation_not_in_scope",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_other_safe_evaluator_causes() {
+        for (reason, cause) in [
+            (
+                "the Task workflow no longer admits writes in its terminal state",
+                "task_terminal",
+            ),
+            (
+                "reviewer assignments cannot perform Task writes",
+                "reviewer_read_only",
+            ),
+            (
+                "protected mutation requires an independent approval",
+                "independent_approval_required",
+            ),
+            (
+                "genesis.start requires an explicit user request to create or start a new Project",
+                "user_request_required",
+            ),
+            (
+                "genesis.start requires the currently leased Main Chat turn",
+                "leased_turn_required",
+            ),
+            (
+                "Project Charter adoption is not valid for the current Project state",
+                "charter_adoption_not_applicable",
+            ),
+            (
+                "query operations execute through the read boundary",
+                "read_boundary_required",
+            ),
+            (
+                "direct command is not admitted for this permission or payload",
+                "direct_command_not_admitted",
+            ),
+            (
+                "the Task assignment does not admit review proposals",
+                "review_assignment_required",
+            ),
+            (
+                "direct Project command has no selected active profile",
+                "profile_not_selected",
+            ),
+        ] {
+            assert_terminal_native_denial(reason, cause).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_maps_real_policy_evaluator_causes() {
+        // These reasons come from the real evaluator, so a producer wording
+        // change cannot silently turn a capability denial into an unknown one.
+        for (operation, permission, paused, permissions, expected) in [
+            (
+                "task.recover",
+                "propose_task",
+                false,
+                r#"{"permissions":[]}"#,
+                DeniedBy::PermissionMissing("propose_task".to_owned()),
+            ),
+            (
+                "task.recover",
+                "propose_task",
+                true,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::IdentityPaused,
+            ),
+            (
+                "project.document",
+                "propose_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::CharterNotAdopted,
+            ),
+            (
+                "project.charter.adoption",
+                "propose_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::CharterAdoptionNotApplicable,
+            ),
+            (
+                "unlisted.operation",
+                "read_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::OperationNotInScope,
+            ),
+            (
+                "project.current_state",
+                "read_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::ReadBoundaryRequired,
+            ),
+            (
+                "task.recover",
+                "read_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::DirectCommandNotAdmitted,
+            ),
+            (
+                "review.request",
+                "read_project",
+                false,
+                r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
+                DeniedBy::IndependentApprovalRequired,
+            ),
+        ] {
+            let fixture =
+                native_plan_fixture_with_permissions("worker", "coder", permissions).await;
+            let profile_id: String =
+                sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
+                    .bind(&fixture.agent_id)
+                    .fetch_one(fixture.db.pool())
+                    .await
+                    .unwrap();
+            let project = db::ProjectRepo::create_with_agent_binding(
+                &*fixture.db,
+                db::CreateProject {
+                    id: db::new_uuid_v4(),
+                    name: "Policy Project".to_owned(),
+                    settings: "{}".to_owned(),
+                    workflow_definition: "{}".to_owned(),
+                    primary_repo_id: None,
+                    owner_id: None,
+                    created_at: db::now_rfc3339(),
+                    updated_at: db::now_rfc3339(),
+                },
+                Some(fixture.agent_id.clone()),
+                Some(profile_id.clone()),
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE agent_identity SET paused = ?, account_permission_ceiling = ? WHERE id = ?",
+            )
+            .bind(i64::from(paused))
+            .bind(permissions)
+            .bind(&fixture.agent_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = ? WHERE project_id = ? AND state = 'active'")
+                .bind(permissions).bind(&project.id).execute(fixture.db.pool()).await.unwrap();
+            if expected == DeniedBy::CharterAdoptionNotApplicable {
+                // Exercise the evaluator's inconsistent-state guard rather
+                // than inventing its prose. Normal writes enforce this invariant.
+                sqlx::query("DROP TRIGGER project_charter_pointer_guard_update")
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE project SET charter_setup_required = 0 WHERE id = ?")
+                    .bind(&project.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            let (_, reason) = fixture
+                .provider
+                .actions
+                .evaluate_direct_command_policy(
+                    &fixture.agent_id,
+                    "project",
+                    &project.id,
+                    permission,
+                    operation,
+                    Some(r#"{"action":"draft_revision"}"#),
+                )
+                .await
+                .unwrap();
+            let scope = CanonicalScope {
+                scope_type: CanonicalScopeType::Project,
+                scope_id: project.id,
+                workspace_access: WorkspaceAccess::Deny,
+            };
+            let error = fixture
+                .provider
+                .structured_boundary_error(
+                    &fixture.agent_id,
+                    &scope,
+                    operation,
+                    &json!({}),
+                    AgentHostError::Authority(reason.expect("real evaluator cause")),
+                )
+                .await;
+            let AgentHostError::StructuredOutcome(outcome) = error else {
+                panic!("typed denial")
+            };
+            assert_eq!(outcome.denied_by, Some(expected));
+            assert_eq!(outcome.retry.unwrap().action, RetryAction::None);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_maps_real_repository_profile_guard() {
+        let fixture = native_plan_fixture_with_permissions(
+            "worker",
+            "coder",
+            r#"{"permissions":["propose_project"]}"#,
+        )
+        .await;
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_identity SET selected_profile_id = NULL WHERE id = ?")
+            .bind(&fixture.agent_id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let refusal = db::ProjectOrchestrationRepo::create_project_document_shell_command(
+            &*fixture.db,
+            db::CreateProjectDocumentShellCommand {
+                document: db::CreateProjectDocument {
+                    id: db::new_uuid_v4(),
+                    project_id: project_id.clone(),
+                    kind: "research".to_owned(),
+                    title: "Profile guard".to_owned(),
+                    approval_policy: "user".to_owned(),
+                    created_at: db::now_rfc3339(),
+                    updated_at: db::now_rfc3339(),
+                },
+                expected_project_version: 1,
+                action_execution: None,
+                command_receipt: Some(db::CreateCommandReceipt {
+                    id: db::new_uuid_v4(),
+                    principal_type: "agent".to_owned(),
+                    principal_id: fixture.agent_id.clone(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id.clone(),
+                    operation: "project.document".to_owned(),
+                    idempotency_key: "missing-profile".to_owned(),
+                    input_digest: "input-digest".to_owned(),
+                    policy_result: "allowed".to_owned(),
+                    correlation_id: "missing-profile".to_owned(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    event_id: db::new_uuid_v4(),
+                    agent_action_execution_id: None,
+                    outcome_json: "{}".to_owned(),
+                    committed_at: db::now_rfc3339(),
+                }),
+            },
+        )
+        .await
+        .expect_err("real repository evaluator rejects the missing selected Profile");
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Project,
+            scope_id: project_id,
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let error = fixture
+            .provider
+            .structured_boundary_error(
+                &fixture.agent_id,
+                &scope,
+                "project.document",
+                &json!({}),
+                service_error(refusal.into()),
+            )
+            .await;
+        let AgentHostError::StructuredOutcome(outcome) = error else {
+            panic!("typed denial")
+        };
+        assert_eq!(outcome.denied_by, Some(DeniedBy::ProfileNotSelected));
+        assert_eq!(
+            outcome.retry.unwrap().scope,
+            Some(api_types::RetryScope::Turn)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_maps_real_task_assignment_causes() {
+        for (status, role, permission, expected) in [
+            ("done", "worker", "task_write", DeniedBy::TaskTerminal),
+            ("todo", "reviewer", "task_write", DeniedBy::ReviewerReadOnly),
+            (
+                "todo",
+                "worker",
+                "propose_review",
+                DeniedBy::ReviewAssignmentRequired,
+            ),
+        ] {
+            let fixture = native_plan_fixture("worker", "coder").await;
+            sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(&fixture.task_id)
+                .execute(fixture.db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, 'agent', ?, ?, ?)")
+                .bind(db::new_uuid_v4()).bind(&fixture.task_id).bind(role).bind(&fixture.agent_id)
+                .bind(db::now_rfc3339()).bind(db::now_rfc3339()).execute(fixture.db.pool()).await.unwrap();
+            let (_, reason) = fixture
+                .provider
+                .actions
+                .evaluate_direct_command_policy(
+                    &fixture.agent_id,
+                    "task",
+                    &fixture.task_id,
+                    permission,
+                    "review.request",
+                    None,
+                )
+                .await
+                .unwrap();
+            let error = fixture
+                .provider
+                .structured_boundary_error(
+                    &fixture.agent_id,
+                    &fixture.scope,
+                    "review.request",
+                    &json!({}),
+                    AgentHostError::Authority(reason.expect("assignment evaluator reason")),
+                )
+                .await;
+            let AgentHostError::StructuredOutcome(outcome) = error else {
+                panic!("typed denial")
+            };
+            assert_eq!(outcome.denied_by, Some(expected));
+            assert_eq!(
+                outcome.retry.unwrap().scope,
+                Some(api_types::RetryScope::Turn)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_names_own_project_pause() {
+        let fixture = native_plan_fixture("worker", "coder").await;
+        let profile_id: String =
+            sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
+                .bind(&fixture.agent_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+        let now = db::now_rfc3339();
+        let project = db::ProjectRepo::create_with_agent_binding(
+            &*fixture.db,
+            db::CreateProject {
+                id: db::new_uuid_v4(),
+                name: "own paused Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            Some(fixture.agent_id.clone()),
+            Some(profile_id),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE project SET paused_at = 'now', system_pause_reason = 'environment_not_ready' WHERE id = ?")
+            .bind(&project.id).execute(fixture.db.pool()).await.unwrap();
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Project,
+            scope_id: project.id,
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let paused_task = db::new_uuid_v4();
+        sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Paused work', 'todo', ?, ?)")
+            .bind(&paused_task).bind(&scope.scope_id).bind(db::now_rfc3339()).bind(db::now_rfc3339())
+            .execute(fixture.db.pool()).await.unwrap();
+        let refusal = TaskService::new(fixture.db.clone(), Arc::new(events::EventBus::new(16)))
+            .claim_task(
+                paused_task,
+                crate::Assignee::Agent(fixture.agent_id.clone()),
+                None,
+            )
+            .await
+            .expect_err("real claim evaluator rejects the paused Project");
+        let error = fixture
+            .provider
+            .structured_boundary_error(
+                &fixture.agent_id,
+                &scope,
+                TASK_RECOVER_OPERATION,
+                &json!({}),
+                service_error(refusal),
+            )
+            .await;
+        let AgentHostError::StructuredOutcome(outcome) = error else {
+            panic!("typed denial")
+        };
+        assert_eq!(
+            outcome
+                .denied_by
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("project_paused(environment_not_ready)")
+        );
+        assert!(outcome.safe_message.contains("Do not retry"));
+        assert_eq!(
+            outcome.retry.unwrap().scope,
+            Some(api_types::RetryScope::Turn)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_keeps_cross_scope_reasons_redacted() {
+        assert_terminal_native_denial(
+            "another Project private-project-secret is paused: confidential-detail",
+            "unspecified",
+        )
+        .await;
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let provider = CoordinationToolProvider::new(Arc::new(SqliteDb::new(pool)));
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Project,
+            scope_id: "opaque-target".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let mut values = Vec::new();
+        for error in [
+            native_scope_error(crate::ServiceError::not_found("project", "opaque-target")),
+            native_scope_error(crate::ServiceError::AuthorizationDenied {
+                message: "Project Agent binding does not own this Project scope".to_owned(),
+            }),
+        ] {
+            let AgentHostError::StructuredOutcome(outcome) = provider
+                .structured_boundary_error(
+                    "actor",
+                    &scope,
+                    PROJECT_CURRENT_STATE_OPERATION,
+                    &json!({"correlation_id":"same-correlation"}),
+                    error,
+                )
+                .await
+            else {
+                panic!("typed redacted outcome")
+            };
+            values.push(serde_json::to_value(outcome).unwrap());
+        }
+        assert_eq!(
+            values[0], values[1],
+            "missing and inaccessible scopes remain indistinguishable"
+        );
+        assert!(!values[0].to_string().contains("binding"));
+    }
+
     #[test]
     fn argument_shape_rejections_are_correctable_validation_outcomes() {
         // A Project Agent that sends `task.recover` with an unknown action
@@ -6671,7 +7622,108 @@ mod tests {
         let error = resolve_workspace_artifact(workspace.path(), "capture")
             .expect_err("leaf symlink fails closed");
 
-        assert!(matches!(error, AgentHostError::Authority(_)));
+        assert_eq!(
+            error,
+            "captured artifact must be a regular file, not a symlink"
+        );
+    }
+
+    #[test]
+    fn outbox_artifact_rejection_preserves_plain_reason() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outbox = workspace.path().join("outbox");
+        let error = resolve_outbox_artifact(workspace.path(), &outbox, "../secret").unwrap_err();
+        assert_eq!(error, "captured artifact path escapes the Task workspace");
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_project_pause_uses_bound_project_and_task_own_project() {
+        let fixture = native_plan_fixture("worker", "coder").await;
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE project SET paused_at = 'now', system_pause_reason = 'environment_not_ready' WHERE id = ?")
+            .bind(&project_id).execute(fixture.db.pool()).await.unwrap();
+        for (paused_project, expected) in [
+            (
+                project_id.as_str(),
+                db::project_pause_denial(Some("environment_not_ready")),
+            ),
+            ("unrelated-project", DeniedBy::Unspecified),
+        ] {
+            let error = fixture
+                .provider
+                .structured_boundary_error(
+                    &fixture.agent_id,
+                    &fixture.scope,
+                    TASK_EVIDENCE_OPERATION,
+                    &json!({}),
+                    service_error(crate::ServiceError::ProjectPaused {
+                        project_id: paused_project.to_owned(),
+                    }),
+                )
+                .await;
+            let AgentHostError::StructuredOutcome(outcome) = error else {
+                panic!("structured refusal")
+            };
+            assert_eq!(outcome.denied_by, Some(expected));
+            assert!(!outcome.safe_message.contains("unrelated-project"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_search_validation_and_observation_refusal_have_boundary_metadata() {
+        let fixture = native_plan_fixture("worker", "coder").await;
+        let search = fixture
+            .provider
+            .public_search(
+                &fixture.agent_id,
+                &fixture.scope,
+                PublicSearchScope::Project,
+                "",
+                5,
+            )
+            .await
+            .unwrap_err();
+        let AgentHostError::StructuredOutcome(search) = search else {
+            panic!("structured validation")
+        };
+        assert_eq!(search.code, OutcomeCode::ValidationError);
+        assert_eq!(
+            search.operation,
+            forge_agent_host::FORGE_PUBLIC_WEB_SEARCH_TOOL
+        );
+        assert_eq!(search.scope, outcome_scope(&fixture.scope));
+        assert!(!search.correlation_id.is_empty());
+        let observation = fixture
+            .provider
+            .observe_command(
+                &fixture.agent_id,
+                &fixture.scope,
+                CommandObservation {
+                    session_id: fixture.runtime_session_id.clone(),
+                    turn_id: Some("turn".to_owned()),
+                    program: "git".to_owned(),
+                    args: vec![],
+                    exit_code: Some(0),
+                    success: true,
+                    output_digest: "digest".to_owned(),
+                    stdout_excerpt: String::new(),
+                    stderr_excerpt: String::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        let AgentHostError::StructuredOutcome(observation) = observation else {
+            panic!("structured refusal")
+        };
+        assert_eq!(observation.denied_by, Some(DeniedBy::Unspecified));
+        assert_eq!(observation.operation, "observe_command");
+        assert_eq!(observation.scope, outcome_scope(&fixture.scope));
+        assert!(!observation.correlation_id.is_empty());
+        assert!(!observation.safe_message.contains("corrected input"));
     }
 
     #[tokio::test]

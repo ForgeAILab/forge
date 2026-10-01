@@ -392,6 +392,18 @@ impl EmbeddedAgentService {
         .map_err(redacted_host_error)
     }
 
+    pub async fn chat_session_denials(
+        &self,
+        identity_id: &str,
+        profile_id: &str,
+        chat_id: &str,
+        session_id: Option<&str>,
+    ) -> Vec<(String, api_types::DeniedBy)> {
+        self.tool_provider
+            .chat_session_denials(identity_id, profile_id, chat_id, session_id)
+            .await
+    }
+
     /// Attach the inquiry runner so a Main Chat can dispatch ephemeral
     /// research sub-agents. Wired after construction because the runner needs
     /// a handle back to this service.
@@ -2870,6 +2882,12 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
         | forge_agent_host::AgentHostError::Configuration(message)
         | forge_agent_host::AgentHostError::Unsupported(message) => {
             ServiceError::invalid_operation(message)
+        }
+        forge_agent_host::AgentHostError::AgentPaused { agent_id } => {
+            ServiceError::AgentPaused { agent_id }
+        }
+        forge_agent_host::AgentHostError::ProjectPaused { project_id } => {
+            ServiceError::ProjectPaused { project_id }
         }
         forge_agent_host::AgentHostError::Runtime(_) => {
             ServiceError::Domain("embedded runtime failed".to_owned())

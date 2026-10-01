@@ -1181,7 +1181,15 @@ impl FederatedAgentChatTurnRunner {
 
     #[cfg(any(test, feature = "test-support"))]
     pub async fn preview_prompt(&self, job: &AgentChatTurnJob) -> Result<AgentChatPromptPreview> {
-        let turn = self.load_turn_context(job).await?;
+        let mut turn = self.load_turn_context(job).await?;
+        self.append_session_denials(
+            &mut turn.state_card,
+            &turn.agent.id,
+            &turn.profile.id,
+            &job.chat_id,
+            None,
+        )
+        .await?;
         Ok(AgentChatPromptPreview {
             system_prompt: compose_system_prompt(
                 turn.profile.prompt_template.as_deref(),
@@ -1238,7 +1246,7 @@ impl FederatedAgentChatTurnRunner {
             input,
             history,
             operating_instruction,
-            state_card,
+            mut state_card,
             operating_context_sources,
             frozen_authority,
         } = self.load_turn_context(job).await?;
@@ -1275,6 +1283,14 @@ impl FederatedAgentChatTurnRunner {
                 })
                 .await?
         };
+        self.append_session_denials(
+            &mut state_card,
+            &agent.id,
+            &profile.id,
+            &job.chat_id,
+            Some(&session.id),
+        )
+        .await?;
         Ok(LoadedAgentChatTurn {
             agent,
             profile,
@@ -1285,6 +1301,27 @@ impl FederatedAgentChatTurnRunner {
             state_card,
             operating_context_sources,
         })
+    }
+
+    async fn append_session_denials(
+        &self,
+        state_card: &mut String,
+        identity_id: &str,
+        profile_id: &str,
+        chat_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let unavailable = self
+            .embedded_agents
+            .chat_session_denials(identity_id, profile_id, chat_id, session_id)
+            .await;
+        if !unavailable.is_empty() {
+            state_card.push_str("\n### Unavailable in this session\n");
+            for (operation, cause) in unavailable {
+                state_card.push_str(&format!("- {operation} ({cause})\n"));
+            }
+        }
+        Ok(())
     }
 
     async fn load_turn_context(&self, job: &AgentChatTurnJob) -> Result<LoadedAgentChatContext> {

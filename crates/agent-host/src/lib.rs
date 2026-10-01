@@ -423,6 +423,10 @@ pub enum AgentHostError {
     Configuration(String),
     #[error("runtime authority denied: {0}")]
     Authority(String),
+    #[error("agent is paused")]
+    AgentPaused { agent_id: String },
+    #[error("Project is paused")]
+    ProjectPaused { project_id: String },
     #[error("runtime session not found")]
     SessionNotFound,
     #[error("credential handle not found")]

@@ -336,6 +336,8 @@ fn export_typescript() {
     SetupRequirement::export().expect("export SetupRequirement");
     CurrentVersionOrRevision::export().expect("export CurrentVersionOrRevision");
     RetryAction::export().expect("export RetryAction");
+    DeniedBy::export().expect("export DeniedBy");
+    RetryScope::export().expect("export RetryScope");
     RetryInstruction::export().expect("export RetryInstruction");
     OrchestrationOutcome::export().expect("export OrchestrationOutcome");
     ToolResultSummary::export().expect("export ToolResultSummary");

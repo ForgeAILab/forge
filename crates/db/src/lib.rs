@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_chat_topic_repository;
+mod chat_session_denials;
 mod connection;
 mod error;
 mod ids;
@@ -17,6 +18,7 @@ mod tests;
 mod time;
 
 pub use agent_chat_topic_repository::*;
+pub use chat_session_denials::*;
 pub use connection::{
     begin_immediate, convert_sqlite_to_incremental, create_sqlite_pool, incremental_vacuum,
     sqlite_storage_status,

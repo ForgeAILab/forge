@@ -3565,26 +3565,29 @@ The envelope has these fields:
 
 ```json
 {
-  "code": "ok",
-  "status": "succeeded",
+  "code": "policy_denied",
+  "status": "failed",
   "operation": "project.document",
   "scope": { "scope_type": "project", "scope_id": "project-uuid" },
-  "result": {},
+  "result": null,
   "approval_target": null,
   "setup_requirements": null,
   "current_version_or_revision": null,
-  "retry": null,
+  "retry": { "action": "none", "retryable": false, "scope": "session", "arguments": {} },
+  "denied_by": "permission_missing(propose_project)",
+  "alternatives": ["message.send"],
   "details": null,
-  "safe_message": "command completed",
+  "safe_message": "Operation refused: permission_missing(propose_project). Do not retry: repeating this call will be refused again in this session while this cause holds.",
   "correlation_id": "correlation-uuid",
   "replayed": false,
-  "receipt_id": "receipt-uuid",
-  "event_id": "event-uuid"
+  "receipt_id": null,
+  "event_id": null
 }
 ```
 
 `result`, `approval_target`, `setup_requirements`,
-`current_version_or_revision`, `retry`, `details`, `receipt_id`, and `event_id` are
+`current_version_or_revision`, `retry`, `denied_by`, `alternatives`, `details`,
+`receipt_id`, and `event_id` are
 optional and omitted when they do not apply; the `null` entries above are
 schema placeholders. `scope.scope_type` is one of `account`,
 `project`, `agent_chat`, or `task`. `result` is the operation-specific
@@ -3623,12 +3626,47 @@ The optional corrective fields are typed and bounded:
   resource, role/capability, and permitted remediation action.
 - `current_version_or_revision` contains only an authorized resource identity,
   current version/revision, and applicable content/render digests.
-- `retry` contains an action, `retryable`, optional `after_seconds`, and a
-  typed `arguments` map. Actions include `refresh_and_retry`,
+- `retry` contains an action, `retryable`, optional `scope` (`turn` or `session`),
+  optional `after_seconds`, and a
+  typed `arguments` map. Actions include `none`, `refresh_and_retry`,
   `use_new_idempotency_key`, `repropose`, `reauthorize`, `complete_setup`,
   `retry_after`, `correct_input`, `select_worker`,
   `select_independent_reviewer`, `attach_repository`, and
   `retry_provisioning`.
+
+Native policy refusals use the typed `DeniedBy` vocabulary, serialized as
+strings such as `permission_missing(propose_task)`, `identity_paused`,
+`charter_not_adopted`, `project_paused(environment_not_ready)`, and
+`operation_not_in_scope`. Only these capability-wide causes withdraw an
+operation. `operation_not_in_scope` is reserved for the canonical catalog.
+They carry `retry.action: none`, `retryable: false`, and `scope: session`;
+pauses apply only while their current cause holds. Other specific refusals
+are turn-scoped and never cached or recorded. A paused target Agent uses
+`target_agent_paused`. A Project pause on `task.recover` is also turn-scoped:
+re-execution may be refused while cancellation remains available. An unknown
+refusal uses `denied_by: unspecified`, `retry.action: none`, and neutral text:
+"Refused for this request. Repeating the identical call will be refused again."
+These request-specific causes leave subsequent calls subject to normal evaluation.
+`correct_input` is reserved for invalid arguments. Invalid project IDs and
+artifact paths return `validation_error`;
+state-load failures return `internal_failure`.
+
+`alternatives` lists useful operations the caller holds, when available
+(for example `message.send`); escalation text appears only with that offered
+alternative. Cross-scope detail stays redacted, including existing
+missing/inaccessible-scope equivalence. After a capability-wide denial
+completes, repeated calls in its turn return the original denial without
+policy evaluation. Calls already in flight evaluate independently.
+
+Session reminders appear under `### Unavailable in this session` in the
+trailing state card, after the session is resolved. The reader rechecks
+identity and Project pauses and uses the real operation policy for permission
+and Charter refusals, deleting reminders whose cause has cleared. Read/recheck
+failures are logged and leave an empty reminder list. A successful operation
+removes a reminder only when this turn's state-card read found the row. Turn-scoped refusals are never persisted. System prompt
+bytes remain stable across turns. REST routes and MCP's existing denial
+behavior remain unchanged; the shared schema additions support the native
+envelope.
 
 Current-state and corrective data are loaded only after the caller's identity
 and canonical scope have been authorized, and only for resources that caller

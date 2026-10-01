@@ -1744,9 +1744,8 @@ async fn scope_composition_preserves_replay_approval_policy_version_and_idempote
     .expect("policy denial remains in-band");
     assert_structured_error(&denied, PROJECT_DOCUMENT_OPERATION, "policy_denied");
 
-    // Restore the binding for the version and idempotency cases.  The
-    // composition remains the same server-derived registry; only the durable
-    // policy row is changed between calls.
+    // Restoring live policy does not lift an operation-wide denial in its
+    // existing turn. Start a new turn composition for subsequent cases.
     sqlx::query(
         "UPDATE project_agent_binding SET permission_ceiling_json = ?
          WHERE project_id = ? AND state = 'active'",
@@ -1756,6 +1755,29 @@ async fn scope_composition_preserves_replay_approval_policy_version_and_idempote
     .execute(fixture.db.pool())
     .await
     .expect("restore Project policy");
+
+    let still_denied = invoke_tool(
+        &project,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        document_arguments(
+            "composition-restored",
+            "Restored policy",
+            "another-document",
+        ),
+        "composition-restored",
+    )
+    .await
+    .expect("same-turn denial remains in-band");
+    assert_eq!(still_denied.value, denied.value);
+    let project = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .expect("next-turn Project composition");
 
     let stale = invoke_tool(
         &project,
