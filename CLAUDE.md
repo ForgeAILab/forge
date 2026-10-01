@@ -81,7 +81,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 - **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Update all four in one change.
 - **State-machine changes** must keep `crates/api/tests/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
-- **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
+- **Migrations** after V149 are named `V{YYYYMMDDHHMM}__{name}.sql`, using the UTC time you create the file, so parallel branches never pick the same version. Add a new file; don't edit historical migrations even during beta — users have running databases. The runner refuses to start on two files with one version, or on a database that applied a different migration under a version the build uses.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
 - **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.
 - **Pagination**: opaque cursors, response field is `items` (not `data`). Many repository lists use offset cursors; dedicated artifact lists use keysets. Filter visibility before pagination/counts and fetch `limit + 1` to compute `has_more`; clients must not decode cursors.
@@ -111,7 +111,7 @@ forge-cli → api → services → db
 
 ## Database
 
-SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are numbered `V{NNN}__{name}.sql` and tracked in `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
+SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are named `V{version}__{name}.sql` (sequential up to V149, UTC timestamps `VYYYYMMDDHHMM` after that) and tracked by version and name in the `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=5000` per connection.
 

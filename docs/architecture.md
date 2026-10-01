@@ -2606,9 +2606,28 @@ require `WHERE version = ?` and increment on success. Version mismatch →
 ## Database
 
 SQLite with WAL mode. Schema in
-`crates/db/migrations/V001__initial_schema.sql`. Migrations are numbered
-`V{NNN}__{name}.sql` and tracked in `_migration` table. All primary keys are
+`crates/db/migrations/V001__initial_schema.sql`. All primary keys are
 app-generated UUID v4; all timestamps are app-generated RFC3339.
+
+Migrations are files named `V{version}__{name}.sql`, embedded in the binary
+and recorded by version and name in the `_migration` table. Versions up to
+V149 are sequential. Later migrations use their UTC creation time
+(`VYYYYMMDDHHMM`), so branches written in parallel cannot claim the same
+version. The runner applies every missing version in ascending order, so a
+branch that merges after a newer-stamped migration still runs. It refuses to
+start, before applying anything, in two cases:
+
+- two bundled files share a version;
+- the database already applied a different migration under a version this
+  build uses.
+
+Without that check, the second migration would be skipped without an error and
+its schema would never exist. The one known reconciled exception is a V053
+`integration_credentials` row from early hosts, which V054 repairs.
+
+To recover a refused host, compare `SELECT version, name FROM _migration` with
+`crates/db/migrations/`. Apply the build's migration by hand if its schema is
+missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=5000` per connection.

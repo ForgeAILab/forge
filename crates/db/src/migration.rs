@@ -3,6 +3,7 @@ use include_dir::{include_dir, Dir};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -13,8 +14,22 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V146 (drop execution progress events).
+// Embedded migration bundle revision: V149 (LCM timeline session owner).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
+
+/// Last migration numbered with the old sequential scheme. Every later
+/// migration takes its UTC creation time as its version
+/// (`VYYYYMMDDHHMM__name.sql`), so branches written in parallel cannot claim
+/// the same number. The runner applies any missing version in order, so a
+/// branch that merges after a newer-stamped one still runs.
+#[cfg(test)]
+const LAST_SEQUENTIAL_VERSION: i64 = 149;
+
+/// Applied migrations recorded under a version this build uses for a
+/// different file, where a later migration already reconciles the schema.
+/// Early hosts applied an `integration_credentials` migration as V053; V054
+/// re-applies V053's `cursor_executor_type` change for them.
+const RECONCILED_APPLIED_NAMES: &[(i64, &str)] = &[(53, "integration_credentials")];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Migration {
@@ -43,10 +58,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
 
     migrations.sort_by_key(|(migration, _)| migration.version);
 
-    for (migration, sql) in migrations {
-        if is_applied(pool, migration.version).await? {
-            continue;
-        }
+    for (migration, sql) in pending_migrations(pool, migrations).await? {
         apply_migration_sql(pool, &migration, &sql).await?;
     }
 
@@ -312,15 +324,62 @@ async fn reconcile_project_admission_bindings(pool: &SqlitePool) -> Result<()> {
 pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Path>) -> Result<()> {
     ensure_migration_table(pool).await?;
 
-    let migrations = discover_migrations(migration_dir.as_ref())?;
-    for migration in migrations {
-        if is_applied(pool, migration.version).await? {
-            continue;
-        }
+    let migrations = discover_migrations(migration_dir.as_ref())?
+        .into_iter()
+        .map(|migration| (migration, ()))
+        .collect();
+    for (migration, ()) in pending_migrations(pool, migrations).await? {
         apply_migration(pool, &migration).await?;
     }
 
     Ok(())
+}
+
+/// Return the migrations the database has not applied, in version order.
+///
+/// The `_migration` table records applied versions by number. Two files with
+/// the same number, or a database that applied a different migration under a
+/// number this build uses, would otherwise make the runner skip a migration
+/// without any error and leave its schema missing. Both are refused before
+/// anything runs. `migrations` must be sorted by version.
+async fn pending_migrations<T>(
+    pool: &SqlitePool,
+    migrations: Vec<(Migration, T)>,
+) -> Result<Vec<(Migration, T)>> {
+    if let Some(pair) = migrations
+        .windows(2)
+        .find(|pair| pair[0].0.version == pair[1].0.version)
+    {
+        return Err(DbError::DuplicateMigrationVersion {
+            version: pair[0].0.version,
+            first: pair[0].0.name.clone(),
+            second: pair[1].0.name.clone(),
+        });
+    }
+
+    let applied: HashMap<i64, String> =
+        sqlx::query_as::<_, (i64, String)>("SELECT version, name FROM _migration")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    let mut pending = Vec::new();
+    for (migration, payload) in migrations {
+        match applied.get(&migration.version) {
+            Some(name)
+                if *name == migration.name
+                    || RECONCILED_APPLIED_NAMES.contains(&(migration.version, name.as_str())) => {}
+            Some(name) => {
+                return Err(DbError::AppliedMigrationMismatch {
+                    version: migration.version,
+                    applied: name.clone(),
+                    bundled: migration.name,
+                });
+            }
+            None => pending.push((migration, payload)),
+        }
+    }
+    Ok(pending)
 }
 
 async fn ensure_migration_table(pool: &SqlitePool) -> Result<()> {
@@ -391,14 +450,6 @@ fn parse_migration_path(path: PathBuf) -> Result<Migration> {
     })
 }
 
-async fn is_applied(pool: &SqlitePool, version: i64) -> Result<bool> {
-    let applied = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _migration WHERE version = ?")
-        .bind(version)
-        .fetch_one(pool)
-        .await?;
-    Ok(applied > 0)
-}
-
 async fn apply_migration(pool: &SqlitePool, migration: &Migration) -> Result<()> {
     let sql = fs::read_to_string(&migration.path).map_err(|source| DbError::ReadMigrationFile {
         path: migration.path.clone(),
@@ -439,4 +490,49 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
     // migrations that rebuild referenced tables must run directly on a single
     // connection instead of inside the default transaction wrapper.
     sql.to_ascii_lowercase().contains("pragma foreign_keys")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_migrations_have_unique_versions_and_timestamp_numbers_after_v149() {
+        let mut versions: Vec<(i64, String)> = MIGRATIONS_DIR
+            .files()
+            .filter(|file| file.path().extension().and_then(|ext| ext.to_str()) == Some("sql"))
+            .map(|file| {
+                let migration = parse_migration_path(file.path().to_path_buf())
+                    .expect("bundled migration filename parses");
+                (migration.version, migration.name)
+            })
+            .collect();
+        versions.sort();
+        for pair in versions.windows(2) {
+            assert_ne!(
+                pair[0].0, pair[1].0,
+                "`{}` and `{}` share a version",
+                pair[0].1, pair[1].1
+            );
+        }
+        for (version, name) in versions
+            .iter()
+            .filter(|(version, _)| *version > LAST_SEQUENTIAL_VERSION)
+        {
+            let digits = version.to_string();
+            let valid = digits.len() == 12
+                && (2026..2100).contains(&digits[0..4].parse::<u32>().unwrap_or(0))
+                && (1..=12).contains(&digits[4..6].parse::<u32>().unwrap_or(0))
+                && (1..=31).contains(&digits[6..8].parse::<u32>().unwrap_or(0))
+                && digits[8..10].parse::<u32>().is_ok_and(|hour| hour < 24)
+                && digits[10..12]
+                    .parse::<u32>()
+                    .is_ok_and(|minute| minute < 60);
+            assert!(
+                valid,
+                "migration `{name}` uses version {version}; migrations after V{LAST_SEQUENTIAL_VERSION} \
+                 must use their UTC creation time (VYYYYMMDDHHMM__name.sql)"
+            );
+        }
+    }
 }
