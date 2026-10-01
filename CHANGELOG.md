@@ -20,6 +20,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   individual Tasks with `environment_not_ready`. Migration V202610010410 clears legacy
   Task environment blocks; Tasks keep their workflow states and re-dispatch
   after the Project resumes.
+- A native Forge operation that policy refuses now returns a failed structured
+  outcome that names the cause. The outcome gains `denied_by`, `alternatives`
+  and `retry.scope`, and a refusal that cannot succeed on a repeat uses
+  `retry.action: none` where it used to say `reauthorize`. Public web search
+  and operations outside the orchestration contract return the same structured
+  outcome where they used to return an error string.
 
 ### Changed
 
@@ -58,6 +64,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and context-manifest references are no longer shown to the agent; they are
   still recorded in each turn's context manifest, and the agent reads current
   state through its tools.
+- A Project Agent or Main Agent that is refused an operation for a reason that
+  covers the whole operation (a missing permission, its own identity paused,
+  no adopted Charter, a paused Project, an operation outside its scope) gets
+  the same refusal immediately if it calls the operation again in that turn.
+  Later turns list the operation under "Unavailable in this session" in the
+  state card for as long as the cause still holds. A refusal about one target
+  or one argument does not block other calls. The operation stays in the tool
+  list, because the runtime fixes the tool list when a turn starts.
+- The Project operating skill is now revision 18: it tells the agent to
+  recover or re-execute a Task only when the operation is offered and the
+  earlier cause is addressed, and to treat a final refusal as final. Turns
+  admitted before the upgrade keep revision 17.
 
 ### Added
 
@@ -81,6 +99,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the upgrade moves the Project Agent to a newer operating-skill revision. The
   turn runs with the revision it was admitted under, and its context manifest
   records that revision.
+- An invalid artifact path or `project.summary` id now returns
+  `validation_error` with the reason, and a failure to load
+  `project.current_state` returns `internal_failure`; both used to be reported
+  as `policy_denied`.
 
 ## [0.13.12] - 2026-10-01
 
