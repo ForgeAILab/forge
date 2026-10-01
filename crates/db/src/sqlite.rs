@@ -103,6 +103,7 @@ mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
+mod outbox;
 mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;

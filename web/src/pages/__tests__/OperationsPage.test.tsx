@@ -71,6 +71,18 @@ const usageSummary: UsageAggregate = {
 
 const degradedStatus: OperatorStatusResponse = {
   overall_severity: 'error',
+  database: { incremental_vacuum: false, free_pages: 42 },
+  event_consumers: [
+    {
+      consumer_name: 'sse-broadcast',
+      last_sequence: 10,
+      lag: 5,
+      last_advanced_at: '2026-04-29T11:50:00Z',
+      oldest_unprocessed_at: '2026-04-29T11:55:00Z',
+      oldest_unprocessed_age_seconds: 300,
+      stalled: true,
+    },
+  ],
   computed_at: '2026-04-29T12:00:00Z',
   active_executions: [
     {
@@ -258,6 +270,16 @@ describe('OperationsPage', () => {
     render(<OperationsPage />)
 
     expect(screen.getByText('High Risk')).toBeTruthy()
+  })
+
+  it('renders consumer lag, stalled status and database reclamation diagnostics', () => {
+    render(<OperationsPage />)
+    expect(screen.getByText('sse-broadcast')).toBeTruthy()
+    expect(screen.getByText('Sequence lag 5')).toBeTruthy()
+    expect(screen.getByText('Stalled')).toBeTruthy()
+    expect(screen.getByText('Conversion required')).toBeTruthy()
+    expect(screen.getByText('42')).toBeTruthy()
+    expect(screen.queryByText('All systems healthy')).toBeNull()
   })
 
   it('renders recent error rows as task drill-down links', () => {

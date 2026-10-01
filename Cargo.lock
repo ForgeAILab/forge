@@ -1325,6 +1325,7 @@ dependencies = [
  "config",
  "db",
  "events",
+ "fs2",
  "review",
  "services",
  "tokio",

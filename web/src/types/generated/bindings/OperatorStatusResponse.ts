@@ -4,10 +4,12 @@ import type { AgentPressureSummary } from "./AgentPressureSummary";
 import type { BlockedTaskSummary } from "./BlockedTaskSummary";
 import type { DaemonIssueSummary } from "./DaemonIssueSummary";
 import type { DaemonPressureSummary } from "./DaemonPressureSummary";
+import type { DatabaseStorageStatus } from "./DatabaseStorageStatus";
+import type { EventConsumerStatus } from "./EventConsumerStatus";
 import type { OperatorSeverity } from "./OperatorSeverity";
 import type { RecentErrorSummary } from "./RecentErrorSummary";
 import type { RetryPressureSummary } from "./RetryPressureSummary";
 import type { UsageSummary } from "./UsageSummary";
 import type { WorkspaceCleanupSummary } from "./WorkspaceCleanupSummary";
 
-export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, recent_errors: Array<RecentErrorSummary>, computed_at: string, };
+export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, recent_errors: Array<RecentErrorSummary>, event_consumers: Array<EventConsumerStatus>, database: DatabaseStorageStatus, computed_at: string, };

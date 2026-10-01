@@ -33,6 +33,13 @@ struct Cli {
     /// Defaults to ~/.forge. Use --data-dir ./test for local testing.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Cursor inactivity threshold for stalled event consumers, in seconds.
+    #[arg(long)]
+    event_consumer_stall_seconds: Option<u32>,
+    /// Convert an existing database to incremental auto-vacuum, then exit.
+    /// Stop Forge first. Full VACUUM locks the database and needs extra disk space.
+    #[arg(long, conflicts_with_all = ["demo", "no_mcp", "no_embedded_daemon"])]
+    convert_db_to_incremental_vacuum: bool,
 }
 
 fn main() {
@@ -51,10 +58,32 @@ async fn run() {
         ConfigOverrides {
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
+            event_consumer_stall_seconds: cli.event_consumer_stall_seconds,
             ..Default::default()
         },
     )
     .expect("Failed to load config");
+
+    // The offline conversion and all Forge runtimes share this data-root
+    // process lock. Hold it through shutdown (the OS releases it on crashes).
+    let _runtime_lock = acquire_runtime_lock(&config.forge.data_dir).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    if cli.convert_db_to_incremental_vacuum {
+        let db_path = config.db_path();
+        let database_url = format!("sqlite:{}", db_path.display());
+        eprintln!("Converting {}: full VACUUM holds an exclusive database lock and may need up to twice the database size in additional free disk space.", db_path.display());
+        if let Err(error) = db::convert_sqlite_to_incremental(&database_url).await {
+            eprintln!("Database conversion failed: {error}");
+            std::process::exit(1);
+        }
+        println!(
+            "Database is in incremental auto-vacuum mode: {}",
+            db_path.display()
+        );
+        return;
+    }
 
     init_tracing(&config.forge.data_dir.join("logs"));
 
@@ -472,13 +501,63 @@ fn local_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
+fn acquire_runtime_lock(data_dir: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("Failed to create {}: {error}", data_dir.display()))?;
+    let path = data_dir.join("runtime.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| format!(
+        "Cannot lock {}: another Forge runtime or database conversion may be running. Stop it before retrying ({error}).", path.display()
+    ))?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{absolute_path, media_storage_root, server_url_for_addr, web_dist_dir};
+    use super::{
+        absolute_path, acquire_runtime_lock, media_storage_root, server_url_for_addr, web_dist_dir,
+        Cli,
+    };
+    use clap::Parser;
     use std::{
         net::SocketAddr,
         path::{Path, PathBuf},
     };
+
+    #[test]
+    fn storage_cli_parses_stall_setting_and_offline_conversion() {
+        let cli = Cli::try_parse_from(["forge", "--event-consumer-stall-seconds", "60"]).unwrap();
+        assert_eq!(cli.event_consumer_stall_seconds, Some(60));
+        assert!(
+            Cli::try_parse_from(["forge", "--convert-db-to-incremental-vacuum"])
+                .unwrap()
+                .convert_db_to_incremental_vacuum
+        );
+        assert!(
+            Cli::try_parse_from(["forge", "--convert-db-to-incremental-vacuum", "--demo"]).is_err()
+        );
+    }
+
+    #[test]
+    fn storage_conversion_runtime_lock_excludes_a_live_server() {
+        let dir = std::env::temp_dir().join(format!("forge-outbox-lock-{}", db::new_uuid_v4()));
+        let first = acquire_runtime_lock(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(first.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(acquire_runtime_lock(&dir).is_err());
+        drop(first);
+        drop(acquire_runtime_lock(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn absolute_path_preserves_absolute_paths() {

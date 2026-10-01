@@ -4847,3 +4847,18 @@ pub struct CreateCostEstimateRevision {
     pub estimate_digest: String,
     pub created_at: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainEventConsumerLag {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub lag: i64,
+    pub last_advanced_at: Option<String>,
+    pub oldest_unprocessed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteStorageStatus {
+    pub incremental_vacuum: bool,
+    pub free_pages: i64,
+}

@@ -2716,6 +2716,36 @@ Response is a single `MemorySearchResultDto`:
 Errors: `400` for invalid query parameters, `404` for an unknown memory id or
 an item in a project the caller cannot access.
 
+## Operator status
+
+`GET /api/v1/operations/status` requires an administrator. The existing execution,
+capacity, cleanup, retry, usage, and error summaries now also include:
+
+| Field | Meaning |
+| --- | --- |
+| `database.incremental_vacuum` | Whether SQLite `auto_vacuum` is `INCREMENTAL` (mode 2). |
+| `database.free_pages` | SQLite `freelist_count`; pages available for reuse or incremental reclamation. |
+| `event_consumers[]` | Durable consumers belonging to workers started by this process. Missing expected cursors are included with sequence 0; cursors for other workers are omitted. |
+| `event_consumers[].consumer_name` | Durable consumer identity. |
+| `event_consumers[].last_sequence` | Last checkpointed sequence. |
+| `event_consumers[].lag` | `max(domain_event.sequence) - last_sequence`, clamped to zero for an empty event table. This is sequence distance, so deleted gaps count; it is not a pending-row count. |
+| `event_consumers[].oldest_unprocessed_at` | Earliest creation timestamp among remaining events beyond the cursor, or `null` when caught up. |
+| `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
+| `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
+| `event_consumers[].stalled` | Remaining unprocessed events exist and the cursor has not advanced for more than `server.event_consumer_stall_seconds` (default 300). For a missing cursor, inactivity starts at the oldest pending event. Idle, caught-up consumers are never stalled. |
+
+A stalled consumer raises `overall_severity` to at least `attention` and appears
+in the existing `recent_errors` operator issue list with `entity_type:
+"event_consumer"`, its consumer name as `entity_id`, and `severity: "attention"`.
+This current alert clears when the cursor recovers. Existing execution failures
+still raise `error`; blocked tasks still raise `blocked`. The Operations page
+shows the lag, oldest pending age, stall state, vacuum mode, and free pages and
+uses its existing 30-second status polling to notice a dead consumer.
+
+`POST /api/v1/operations/refresh` retains its existing dispatch-refresh behavior;
+storage maintenance runs only in the background worker or offline conversion
+command.
+
 ## Notifications
 
 Notifications are created server-side from workflow events and delivered both
