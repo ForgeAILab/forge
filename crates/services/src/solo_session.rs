@@ -8,9 +8,7 @@
 //! * [`SoloSessionService`] binds every read and command to one owner,
 //!   Project, repository, and Project Agent Chat;
 //! * [`SoloSessionSnapshot`] contains only bounded, redaction-safe values
-//!   suitable for any presentation; and
-//! * [`SoloProjection`] treats live events as invalidation hints and always
-//!   obtains rendered state from an authoritative refresh.
+//!   suitable for any presentation.
 //!
 //! Runtime composition and the `forge-solo` crate can construct this facade
 //! after bootstrap without introducing a second persistence boundary.
@@ -171,20 +169,6 @@ impl SoloSessionDependencies {
     #[must_use]
     pub fn with_execution_logs_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.execution_logs_root = Some(root.into());
-        self
-    }
-
-    /// Attach the protected runtime interaction broker and its exact durable
-    /// Agent Session identifier.  An empty session identifier is rejected at
-    /// command time and is not persisted in a presentation object.
-    #[must_use]
-    pub fn with_interaction_broker(
-        mut self,
-        broker: InteractionBrokerHandle,
-        forge_session_id: impl Into<String>,
-    ) -> Self {
-        self.interaction_broker = Some(broker);
-        self.forge_session_id = Some(forge_session_id.into());
         self
     }
 }
@@ -734,13 +718,6 @@ pub struct SoloCharterApprovalResult {
     pub project_chat_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SoloProjectionInvalidation {
-    pub event_type: String,
-    pub entity_id: Option<String>,
-    pub lagged: bool,
-}
-
 #[derive(Clone)]
 pub struct SoloSessionService {
     scope: SoloSessionScope,
@@ -785,16 +762,10 @@ impl SoloSessionService {
         &self.scope
     }
 
-    /// Subscribe to invalidation hints for this Project Chat.  The receiver
-    /// is also available through [`SoloProjection::new`].
+    /// Subscribe to invalidation hints for this Project Chat.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ForgeEvent> {
         self.event_bus.subscribe()
-    }
-
-    #[must_use]
-    pub fn projection(&self) -> SoloProjection {
-        SoloProjection::new(Arc::new(self.clone()))
     }
 
     /// Read every visible Solo surface from current authoritative records.
@@ -1695,93 +1666,6 @@ impl SoloSessionService {
     }
 }
 
-/// Event-backed projection.  Events only mark this object dirty; rendering
-/// code receives no event payload and therefore cannot mistake a delta for an
-/// authoritative state transition.
-pub struct SoloProjection {
-    service: Arc<SoloSessionService>,
-    receiver: broadcast::Receiver<ForgeEvent>,
-    invalidated: bool,
-    snapshot: Option<SoloSessionSnapshot>,
-}
-
-impl fmt::Debug for SoloProjection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SoloProjection")
-            .field("invalidated", &self.invalidated)
-            .field("has_snapshot", &self.snapshot.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl SoloProjection {
-    #[must_use]
-    pub fn new(service: Arc<SoloSessionService>) -> Self {
-        let receiver = service.subscribe();
-        Self {
-            service,
-            receiver,
-            invalidated: true,
-            snapshot: None,
-        }
-    }
-
-    #[must_use]
-    pub fn is_invalidated(&self) -> bool {
-        self.invalidated
-    }
-
-    pub async fn refresh(&mut self) -> Result<SoloSessionSnapshot> {
-        let snapshot = self.service.refresh().await?;
-        self.snapshot = Some(snapshot.clone());
-        self.invalidated = false;
-        Ok(snapshot)
-    }
-
-    pub async fn refresh_if_invalidated(&mut self) -> Result<Option<SoloSessionSnapshot>> {
-        if self.invalidated || self.snapshot.is_none() {
-            return self.refresh().await.map(Some);
-        }
-        Ok(None)
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> Option<&SoloSessionSnapshot> {
-        self.snapshot.as_ref()
-    }
-
-    /// Wait for the next relevant event. A lagged receiver is itself a dirty
-    /// signal: the next refresh reads all state instead of trying to replay a
-    /// partial event stream.
-    pub async fn next_invalidation(&mut self) -> Option<SoloProjectionInvalidation> {
-        loop {
-            match self.receiver.recv().await {
-                Ok(event) => {
-                    let Some(entity_id) = relevant_event_entity(&self.service.scope, &event) else {
-                        continue;
-                    };
-                    self.invalidated = true;
-                    return Some(SoloProjectionInvalidation {
-                        event_type: safe_identifier(&event.event_type),
-                        entity_id,
-                        lagged: false,
-                    });
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    self.invalidated = true;
-                    return Some(SoloProjectionInvalidation {
-                        event_type: "events.lagged".to_owned(),
-                        entity_id: None,
-                        lagged: true,
-                    });
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    }
-}
-
 struct AuthorizedScopeRecords {
     project: Project,
     repo: Repo,
@@ -2629,60 +2513,6 @@ fn tool_result_summary(value: Option<&Value>) -> Option<String> {
         .and_then(|value| safe_diagnostic(&value))
 }
 
-fn relevant_event_entity(scope: &SoloSessionScope, event: &ForgeEvent) -> Option<Option<String>> {
-    let context = serde_json::to_value(&event.context).ok()?;
-    let entity_hint = || safe_event_entity_id(&event.entity_id);
-    let exact_project = context
-        .get("project_id")
-        .and_then(Value::as_str)
-        .is_some_and(|project_id| project_id == scope.project_id)
-        || (context.get("scope_type").and_then(Value::as_str) == Some("project")
-            && context
-                .get("scope_id")
-                .and_then(Value::as_str)
-                .is_some_and(|scope_id| scope_id == scope.project_id));
-    if exact_project {
-        return Some(entity_hint());
-    }
-    let exact_chat = context
-        .get("chat_id")
-        .and_then(Value::as_str)
-        .is_some_and(|chat_id| chat_id == scope.project_chat_id)
-        || (context.get("scope_type").and_then(Value::as_str) == Some("agent_chat")
-            && context
-                .get("scope_id")
-                .and_then(Value::as_str)
-                .is_some_and(|scope_id| scope_id == scope.project_chat_id));
-    if exact_chat {
-        return Some(entity_hint());
-    }
-    if event.entity_id == scope.project_id {
-        return Some(Some(scope.project_id.clone()));
-    }
-    // Task/review/execution events often carry only a Task id.  They are
-    // harmless invalidation hints; do not echo that opaque id to the TUI until
-    // an authoritative refresh proves it belongs to this Project.
-    if event.event_type.starts_with("task.")
-        || event.event_type.starts_with("review.")
-        || event.event_type.starts_with("execution.")
-    {
-        return Some(None);
-    }
-    None
-}
-
-fn safe_event_entity_id(entity_id: &str) -> Option<String> {
-    if entity_id.trim().is_empty()
-        || entity_id.chars().count() > SOLO_MAX_ID_CHARS
-        || entity_id.chars().any(char::is_control)
-        || contains_secret_marker(entity_id)
-    {
-        None
-    } else {
-        Some(safe_identifier(entity_id))
-    }
-}
-
 fn visible_content(content: &str, sensitivity: &str) -> (String, bool) {
     let protected_sensitivity = matches!(
         sensitivity.to_ascii_lowercase().as_str(),
@@ -2808,7 +2638,6 @@ fn bounded_limit(name: &str, value: i64, max: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use events::EventContext;
 
     #[test]
     fn finite_turn_states_keep_terminal_and_waiting_distinct() {
@@ -2908,20 +2737,6 @@ mod tests {
         assert!(!redacted);
         assert!(contains_secret_marker("sk-live-secret"));
         assert!(!contains_secret_marker("task-123"));
-    }
-
-    #[test]
-    fn unrelated_project_events_are_not_projected_as_entity_hints() {
-        let scope = SoloSessionScope::new("owner", "project", "repo", "chat");
-        let event = ForgeEvent {
-            event_type: "task.updated".to_owned(),
-            entity_id: "task-other".to_owned(),
-            timestamp: "2026-01-01T00:00:00Z".to_owned(),
-            context: EventContext::TaskUpdated {
-                project_id: "other-project".to_owned(),
-            },
-        };
-        assert_eq!(relevant_event_entity(&scope, &event), Some(None));
     }
 
     #[test]

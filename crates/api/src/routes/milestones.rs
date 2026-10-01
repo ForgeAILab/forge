@@ -100,20 +100,6 @@ pub async fn create_milestone(
     Ok((StatusCode::CREATED, Json(milestone)))
 }
 
-pub async fn list_milestone_revisions(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id)): Path<(String, String)>,
-) -> ApiResult<Json<MilestoneDefinitionRevisionListResponse>> {
-    list_milestone_revisions_with_query(
-        State(state),
-        user,
-        Path((project_id, milestone_id)),
-        Query(MilestoneListQuery::default()),
-    )
-    .await
-}
-
 pub async fn list_milestone_revisions_with_query(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -452,20 +438,6 @@ pub async fn save_milestone_revision(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found("milestone_definition_revision", revision.id))?;
     Ok((StatusCode::CREATED, Json(revision)))
-}
-
-pub async fn list_milestones(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(project_id): Path<String>,
-) -> ApiResult<Json<ProjectMilestoneListResponse>> {
-    list_milestones_with_query(
-        State(state),
-        user,
-        Path(project_id),
-        Query(MilestoneListQuery::default()),
-    )
-    .await
 }
 
 pub async fn list_milestones_with_query(

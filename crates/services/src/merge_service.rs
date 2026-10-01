@@ -7,7 +7,6 @@ use db::{
     WorkspaceRepo,
 };
 use events::EventBus;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -110,15 +109,6 @@ pub enum ReviewCarryFacts {
     },
     /// The candidate cannot be integrated without a fresh review.
     Unavailable { reason: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum MergeStrategy {
-    #[default]
-    Merge,
-    Rebase,
 }
 
 impl MergeService {

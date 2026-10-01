@@ -2037,21 +2037,6 @@ fn native_authorization(
     }
 }
 
-fn build_revision_provenance() -> RevisionProvenance {
-    RevisionProvenance {
-        author: api_types::PrincipalRef {
-            kind: api_types::PrincipalKind::Agent,
-            id: String::new(),
-            display_name: None,
-        },
-        source_refs: Vec::new(),
-        change_summary: "Project Agent authored a typed milestone definition".to_owned(),
-        profile_revision: None,
-        operating_skill_revision: None,
-        material_diff: None,
-    }
-}
-
 fn native_revision_provenance(
     action: &AgentAction,
     context: &CommandContext,
@@ -2172,11 +2157,4 @@ fn map_readiness(row: sqlx::sqlite::SqliteRow) -> Result<ProjectReadinessSnapsho
         idempotency_key: row.try_get("idempotency_key")?,
         created_at: row.try_get("created_at")?,
     })
-}
-
-impl ProjectMilestoneDefinitionCommand {
-    #[must_use]
-    pub fn native_provenance() -> RevisionProvenance {
-        build_revision_provenance()
-    }
 }

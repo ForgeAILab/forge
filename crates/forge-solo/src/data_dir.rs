@@ -70,33 +70,13 @@ impl SoloDataPaths {
     }
 
     #[must_use]
-    pub fn protected_store_path(&self) -> &Path {
-        &self.protected_store
-    }
-
-    #[must_use]
     pub fn logs_path(&self) -> &Path {
         &self.logs
     }
 
     #[must_use]
-    pub fn media_path(&self) -> &Path {
-        &self.media
-    }
-
-    #[must_use]
     pub fn credentials_path(&self) -> &Path {
         &self.credentials
-    }
-
-    #[must_use]
-    pub fn worktrees_path(&self) -> &Path {
-        &self.worktrees
-    }
-
-    #[must_use]
-    pub fn runtime_lock_path(&self) -> &Path {
-        &self.runtime_lock
     }
 
     /// Check an existing root before acquiring the runtime lock or publishing
@@ -297,39 +277,6 @@ pub fn default_solo_data_root(forge_data_root: &Path, repository_id: Uuid) -> Pa
     forge_data_root
         .join(SOLO_DATA_DIR_NAME)
         .join(repository_id.to_string())
-}
-
-/// Resolve the exact root selected by `--data-dir`, or the configured Forge
-/// root's repository-scoped default when the option is absent.
-#[must_use]
-pub fn resolve_solo_data_root(
-    forge_data_root: &Path,
-    repository_id: Uuid,
-    data_dir_override: Option<&Path>,
-) -> PathBuf {
-    let root = data_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_solo_data_root(forge_data_root, repository_id));
-    absolute_path(
-        &root,
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    )
-}
-
-/// Resolve paths using `FORGE_DATA_DIR`/the normal Forge default as the parent
-/// of `solo/<repository-id>` when no explicit override is supplied.
-pub fn resolve_data_paths(
-    repository_root: &Path,
-    repository_id: Uuid,
-    data_dir_override: Option<&Path>,
-) -> Result<SoloDataPaths> {
-    let forge_data_root = config::data_dir_from_env();
-    resolve_data_paths_with_forge_root(
-        repository_root,
-        repository_id,
-        &forge_data_root,
-        data_dir_override,
-    )
 }
 
 /// Resolve and validate the state root against a repository using an explicit
@@ -838,15 +785,11 @@ mod tests {
     }
 
     #[test]
-    fn default_root_is_repository_scoped_and_exact_override_is_not_nested() {
+    fn default_root_is_repository_scoped() {
         let forge_root = Path::new("/tmp/forge");
         assert_eq!(
             default_solo_data_root(forge_root, id()),
             PathBuf::from("/tmp/forge/solo/00000000-0000-4000-8000-000000000001")
-        );
-        assert_eq!(
-            resolve_solo_data_root(forge_root, id(), Some(Path::new("/tmp/custom"))),
-            PathBuf::from("/tmp/custom")
         );
     }
 

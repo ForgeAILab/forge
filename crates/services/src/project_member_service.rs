@@ -126,14 +126,6 @@ impl ProjectMemberService {
         Ok(())
     }
 
-    pub async fn get_own_membership(
-        &self,
-        project_id: &str,
-        caller_user_id: &str,
-    ) -> Result<ProjectMember> {
-        self.require_member(project_id, caller_user_id).await
-    }
-
     pub async fn check_access(&self, project_id: &str, user_id: &str) -> Result<ProjectMember> {
         self.require_member(project_id, user_id).await
     }

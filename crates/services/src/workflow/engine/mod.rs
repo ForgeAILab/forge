@@ -749,30 +749,6 @@ impl WorkflowEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn manual_override_transition(
-        &self,
-        task_id: &str,
-        target_state: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: Actor,
-        reason: &str,
-        rejection: bool,
-    ) -> crate::Result<TransitionResult> {
-        self.manual_override_transition_with_authority(
-            task_id,
-            target_state,
-            version,
-            workflow,
-            actor,
-            reason,
-            rejection,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn manual_override_transition_with_authority(
         &self,
         task_id: &str,
@@ -805,36 +781,6 @@ impl WorkflowEngine {
         .await
     }
 
-    pub async fn retry_entry_barrier(
-        &self,
-        task_id: &str,
-        version: i64,
-        workflow: &WorkflowDefinition,
-        actor: &Actor,
-        reason: &str,
-    ) -> crate::Result<TransitionResult> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        self.retry_entry_barrier_with_authority(
-            task_id,
-            version,
-            workflow,
-            actor,
-            reason,
-            WorkflowAuthority {
-                project_version: project.version,
-                workflow_definition: project.workflow_definition,
-                clear_review_passed_at_on_commit: false,
-            },
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn retry_entry_barrier_with_authority(
         &self,
         task_id: &str,

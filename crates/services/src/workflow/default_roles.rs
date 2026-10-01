@@ -8,5 +8,4 @@ pub const REVIEWER: &str = "reviewer";
 pub const AUDITOR: &str = "auditor";
 pub const ASSIGNEE: &str = "assignee";
 pub const INTERACTIVE: &str = "interactive";
-pub const MERGE_FIXER: &str = "merge_fixer";
 pub const SYSTEM: &str = "system";

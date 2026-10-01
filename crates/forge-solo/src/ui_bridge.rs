@@ -96,9 +96,6 @@ pub struct AppReducer {
     setup_candidates: Vec<AgentCandidate>,
 }
 
-/// Product-oriented alias for callers that prefer the Solo name.
-pub type SoloAppReducer = AppReducer;
-
 impl Default for AppReducer {
     fn default() -> Self {
         Self::new(AppState::new())
@@ -120,13 +117,6 @@ impl AppReducer {
         }
     }
 
-    /// Install the physical-key policy used when converting controller keys
-    /// to `AppInput`.  The policy remains independent of crossterm events.
-    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
-        self.keymap = keymap;
-        self
-    }
-
     /// Seed or replace the structured setup candidates discovered by
     /// bootstrap.  The backend snapshot intentionally carries only the
     /// selected Agent, while discovery/authentication stays at bootstrap.
@@ -135,20 +125,12 @@ impl AppReducer {
         self
     }
 
-    pub fn set_setup_candidates(&mut self, candidates: Vec<AgentCandidate>) {
-        self.setup_candidates = candidates;
-    }
-
     pub fn state(&self) -> &AppState {
         &self.state
     }
 
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
-    }
-
-    pub fn into_state(self) -> AppState {
-        self.state
     }
 
     pub fn scope(&self) -> Option<&SoloScope> {
@@ -2000,10 +1982,9 @@ mod tests {
     }
 
     #[test]
-    fn charter_drafting_admits_chat_but_not_task_mutation() {
+    fn charter_drafting_admits_chat() {
         let readiness = to_app_readiness(BackendProjectReadiness::AwaitingCharter);
         assert!(readiness.allows_chat());
-        assert!(!readiness.allows_mutating_tasks());
     }
 
     #[test]

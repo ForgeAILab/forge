@@ -83,11 +83,6 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     }
 }
 
-/// Alias with a descriptive name for embedders that call the module directly.
-pub fn render_app(frame: &mut Frame<'_>, state: &AppState) {
-    render(frame, state);
-}
-
 fn composer_height(state: &AppState, area: Rect) -> u16 {
     // Keep enough room for a two-line draft and status, while allowing very
     // short terminals to preserve the composer over optional rail details.

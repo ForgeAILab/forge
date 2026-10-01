@@ -1154,53 +1154,6 @@ impl TaskService {
         }
     }
 
-    pub async fn unblock_task(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.blocked_json.is_none() {
-            return Err(ServiceError::invalid_operation("task is not blocked"));
-        }
-        let previous_reason = interruption_reason(task.blocked_json.as_deref());
-        let updated = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(None),
-                blocked_json: Some(None),
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        super::clear_execution_retry_metadata(&self.db, &updated).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.unblocked".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskUnblocked {
-                project_id: updated.project_id.clone(),
-                previous_reason: previous_reason.clone(),
-            },
-        });
-        tracing::info!(
-            task_id = %updated.id,
-            status = %updated.status,
-            previous_reason = ?previous_reason,
-            "task unblocked"
-        );
-        Ok(updated)
-    }
-
     pub async fn fail_task(
         &self,
         task_id: impl Into<String>,
@@ -1256,53 +1209,6 @@ impl TaskService {
             kind = ?kind,
             execution_id = ?execution_id,
             "task marked as failed"
-        );
-        Ok(updated)
-    }
-
-    pub async fn restart_failed_task(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.failed_json.is_none() {
-            return Err(ServiceError::invalid_operation("task has not failed"));
-        }
-        let previous_reason = interruption_reason(task.failed_json.as_deref());
-        let updated = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(None),
-                blocked_json: None,
-                failed_json: Some(None),
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        self.publish(ForgeEvent {
-            event_type: "task.restarted".to_owned(),
-            entity_id: updated.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskRestarted {
-                project_id: updated.project_id.clone(),
-                previous_reason: previous_reason.clone(),
-                new_execution_id: None,
-            },
-        });
-        tracing::info!(
-            task_id = %updated.id,
-            status = %updated.status,
-            previous_reason = ?previous_reason,
-            "failed task restarted"
         );
         Ok(updated)
     }

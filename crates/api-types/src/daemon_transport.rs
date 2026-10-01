@@ -468,14 +468,6 @@ pub enum WorkspaceOwnerOperation {
     RestoreCandidate {
         commit_sha: String,
     },
-    WriteKnowledge {
-        files: Vec<WorkspaceFileContent>,
-        create_new: bool,
-        /// Best-effort docs/knowledge commit, matching the capture plugin.
-        commit_task_id: Option<String>,
-        /// Knowledge injection falls back to the verified repository location.
-        repository: bool,
-    },
     RebaseTarget {
         target_branch: String,
         handoff_conflicts: bool,
@@ -1525,7 +1517,7 @@ mod tests {
         assert_round_trip::<WorkspaceInspectParams>(request);
         let mut request = workspace.clone();
         request["operation"] = json!("files");
-        request["path"] = json!("docs/knowledge");
+        request["path"] = json!("docs");
         request["repository"] = json!(true);
         request["max_entries"] = json!(5);
         request["max_bytes"] = json!(8192);

@@ -2441,38 +2441,6 @@ async fn system_review_ci_failure_records_review_budget_exhausted_blocker() {
 }
 
 #[tokio::test]
-async fn retry_review_entry_ci_failure_routes_to_coder_with_rejection() {
-    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
-    sqlx::query("UPDATE task SET status = 'review', entry_barrier_json = ? WHERE id = ?")
-        .bind(json!({"state":"review", "status":"blocked", "started_at":now_rfc3339()}).to_string())
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    let result = fixture
-        .engine
-        .retry_entry_barrier(
-            &fixture.task.id,
-            fixture.task.version,
-            &fixture.workflow,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            "retry checks",
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.task.status, "in_progress");
-    assert!(result.task.entry_barrier_json.is_none());
-    assert_eq!(result.review.unwrap().status, db::ReviewStatus::Failed);
-    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
-        1
-    );
-}
-
-#[tokio::test]
 async fn user_review_ci_success_still_waits_for_human() {
     let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
     sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")

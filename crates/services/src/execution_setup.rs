@@ -144,11 +144,6 @@ pub struct ExecutionRoleResolution {
 
 impl ExecutionRoleResolution {
     #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.requirements.is_empty()
-    }
-
-    #[must_use]
     pub fn default_role_assignments(&self) -> Vec<Value> {
         let mut assignments = Vec::new();
         if let (Some(role), Some(identity_id)) = (

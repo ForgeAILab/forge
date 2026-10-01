@@ -202,7 +202,7 @@ impl ResolvedWorkspace {
     ) -> Result<Vec<WorkspaceFileContent>> {
         if self.placement.owner_kind == db::PlacementOwnerKind::Daemon {
             return self
-                .read_owner_files(relative, max_entries, max_bytes, false)
+                .read_owner_files(relative, max_entries, max_bytes)
                 .await;
         }
         let root = self.embedded_path()?.canonicalize()?;
@@ -259,22 +259,11 @@ impl ResolvedWorkspace {
         Ok(files)
     }
 
-    pub(crate) async fn read_repository_files(
-        &self,
-        relative: &str,
-        max_entries: usize,
-        max_bytes: usize,
-    ) -> Result<Vec<WorkspaceFileContent>> {
-        self.read_owner_files(relative, max_entries, max_bytes, true)
-            .await
-    }
-
     async fn read_owner_files(
         &self,
         relative: &str,
         max_entries: usize,
         max_bytes: usize,
-        repository: bool,
     ) -> Result<Vec<WorkspaceFileContent>> {
         let reference = self.owner_reference()?;
         match self
@@ -284,7 +273,7 @@ impl ResolvedWorkspace {
                 WorkspaceInspectParams::Files {
                     workspace: reference.clone(),
                     path: relative.into(),
-                    repository,
+                    repository: false,
                     max_entries: max_entries as u64,
                     max_bytes: max_bytes as u64,
                 },
@@ -302,65 +291,6 @@ impl ResolvedWorkspace {
                 ServiceError::invalid_operation("owner returned invalid workspace files").into(),
             ),
         }
-    }
-
-    pub async fn write_knowledge(
-        &self,
-        files: Vec<WorkspaceFileContent>,
-        create_new: bool,
-        commit_task_id: Option<String>,
-    ) -> Result<()> {
-        if self.placement.owner_kind == db::PlacementOwnerKind::Daemon {
-            self.apply_owner_change(WorkspaceOwnerOperation::WriteKnowledge {
-                files,
-                create_new,
-                commit_task_id,
-                repository: false,
-            })
-            .await?;
-            return Ok(());
-        }
-        let root = self.embedded_path()?;
-        for file in files {
-            let relative = std::path::Path::new(&file.path);
-            if relative.is_absolute()
-                || relative.components().any(|part| {
-                    matches!(
-                        part,
-                        std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                    )
-                })
-                || !(relative.starts_with("docs/knowledge")
-                    || relative == std::path::Path::new(".forge/knowledge-context.md"))
-            {
-                return Err(ServiceError::invalid_operation("invalid knowledge file path").into());
-            }
-            let path = root.join(relative);
-            if create_new && tokio::fs::try_exists(&path).await? {
-                continue;
-            }
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(path, file.bytes).await?;
-        }
-        if let Some(task_id) = commit_task_id {
-            let _ = crate::lifecycle::knowledge_capture::git_commit(&root, &task_id).await;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn write_repository_knowledge(
-        &self,
-        files: Vec<WorkspaceFileContent>,
-    ) -> Result<()> {
-        self.apply_owner_change(WorkspaceOwnerOperation::WriteKnowledge {
-            files,
-            create_new: false,
-            commit_task_id: None,
-            repository: true,
-        })
-        .await
     }
 
     async fn apply_owner_change(&self, operation: WorkspaceOwnerOperation) -> Result<()> {

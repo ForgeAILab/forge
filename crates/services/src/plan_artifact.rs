@@ -33,14 +33,6 @@ pub(crate) const MAX_PLAN_ARTIFACT_SIZE_BYTES: u64 = 1_048_576;
 const PLAN_STAGE_DIR: &str = ".forge-plan-staging";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanArtifactMetadata {
-    pub task_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub execution_id: Option<String>,
-    pub source_path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPlanItem {
     pub checked: bool,
     pub label: String,
@@ -242,22 +234,6 @@ pub(crate) async fn read_plan_for_resolved_workspace(
     }
 }
 
-pub fn read_plan_artifact(
-    workspace_root: &Path,
-    plan_path: Option<&str>,
-) -> Result<ParsedPlanArtifact, PlanArtifactError> {
-    let candidate = match plan_path {
-        Some(plan_path) => workspace_root.join(plan_path),
-        None => default_plan_artifact_path(workspace_root),
-    };
-    let allowed_root = match plan_path {
-        Some(_) => workspace_root,
-        None => workspace_root.parent().unwrap_or(workspace_root),
-    };
-    let content = read_bounded_plan_text(&candidate, allowed_root, false)?;
-    Ok(parse_plan_markdown(&content))
-}
-
 /// Read a bounded owner-relative file with plan containment and file-type checks.
 pub(crate) fn read_workspace_bytes(
     workspace_root: &Path,
@@ -417,20 +393,6 @@ pub fn write_execution_outbox_plan(
     read_bounded_plan_text(&destination, &outbox, true)?;
     sync_parent_directory(&outbox)?;
     Ok(())
-}
-
-/// Validate whether an authorized execution left a publishable plan candidate.
-pub fn validate_execution_outbox_plan(outbox: &Path) -> Result<bool, PlanArtifactError> {
-    let path = outbox.join(DEFAULT_PLAN_ARTIFACT_PATH);
-    let content = match read_bounded_plan_text(&path, outbox, true) {
-        Ok(content) => content,
-        Err(PlanArtifactError::NotFound) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if parse_plan_markdown(&content).items.is_empty() {
-        return Err(PlanArtifactError::MissingChecklist { path });
-    }
-    Ok(true)
 }
 
 /// Freeze one validated candidate outside the agent-writable outbox.
@@ -1123,30 +1085,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absent_plan_returns_not_found() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("missing plan fails");
-
-        assert!(matches!(error, PlanArtifactError::NotFound));
-    }
-
-    #[test]
-    fn empty_file_returns_empty_items() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(tempdir.path().join("plan.md"), "").expect("write plan");
-
-        let artifact = read_plan_artifact(&worktree, None).expect("read plan");
-
-        assert!(artifact.items.is_empty());
-        assert!(artifact.warnings.is_empty());
-    }
-
-    #[test]
     fn valid_nested_checklist_with_mixed_levels() {
         let content = "\
 # Plan
@@ -1204,76 +1142,6 @@ mod tests {
         assert_eq!(artifact.items.len(), 1);
         assert_eq!(artifact.items[0].label, "valid");
         assert_eq!(artifact.warnings.len(), 3);
-    }
-
-    #[test]
-    fn large_file_returns_file_too_large() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(
-            tempdir.path().join("plan.md"),
-            vec![b'a'; MAX_PLAN_ARTIFACT_SIZE_BYTES as usize + 1],
-        )
-        .expect("write large plan");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("large plan fails");
-
-        assert!(matches!(
-            error,
-            PlanArtifactError::FileTooLarge {
-                size,
-                max: MAX_PLAN_ARTIFACT_SIZE_BYTES
-            } if size == MAX_PLAN_ARTIFACT_SIZE_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn path_escape_returns_path_escape() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-
-        let error = read_plan_artifact(tempdir.path(), Some("../outside-plan.md"))
-            .expect_err("escape fails");
-
-        assert!(matches!(error, PlanArtifactError::PathEscape { .. }));
-    }
-
-    #[test]
-    fn non_regular_plan_is_rejected() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::create_dir(tempdir.path().join("plan.md")).expect("create plan directory");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("directory plan fails");
-
-        assert!(matches!(error, PlanArtifactError::InvalidFileType { .. }));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plan_reader_rejects_leaf_and_intermediate_symlink_escapes() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(outside.path().join("secret.md"), "- [ ] secret\n").expect("outside plan");
-
-        symlink(
-            outside.path().join("secret.md"),
-            tempdir.path().join("plan.md"),
-        )
-        .expect("leaf symlink");
-        let leaf = read_plan_artifact(&worktree, None).expect_err("leaf symlink fails");
-        assert!(matches!(leaf, PlanArtifactError::InvalidFileType { .. }));
-
-        fs::remove_file(tempdir.path().join("plan.md")).expect("remove leaf symlink");
-        symlink(outside.path(), worktree.join("linked")).expect("intermediate symlink");
-        let intermediate = read_plan_artifact(&worktree, Some("linked/secret.md"))
-            .expect_err("intermediate escape fails");
-        assert!(matches!(intermediate, PlanArtifactError::PathEscape { .. }));
     }
 
     #[test]
@@ -1359,36 +1227,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn outbox_plan_validation_rejects_symlinks_and_hard_links() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        let outbox = tempdir.path().join("outbox");
-        fs::create_dir_all(&outbox).expect("create outbox");
-        let outside_plan = outside.path().join("plan.md");
-        fs::write(&outside_plan, "- [ ] outside\n").expect("outside plan");
-        symlink(&outside_plan, outbox.join("plan.md")).expect("source symlink");
-
-        let symlink_error =
-            validate_execution_outbox_plan(&outbox).expect_err("source symlink fails");
-        assert!(matches!(
-            symlink_error,
-            PlanArtifactError::InvalidFileType { .. }
-        ));
-
-        fs::remove_file(outbox.join("plan.md")).expect("remove source symlink");
-        fs::hard_link(&outside_plan, outbox.join("plan.md")).expect("source hard link");
-        let hard_link_error =
-            validate_execution_outbox_plan(&outbox).expect_err("source hard link fails");
-        assert!(matches!(
-            hard_link_error,
-            PlanArtifactError::MultipleHardLinks { .. }
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn plan_outbox_creation_rejects_symlinked_root_and_execution_directory() {
         use std::os::unix::fs::symlink;
 
@@ -1425,33 +1263,6 @@ mod tests {
             "untouched\n"
         );
         assert!(!outside.path().join(DEFAULT_PLAN_ARTIFACT_PATH).exists());
-    }
-
-    #[test]
-    fn outbox_plan_validation_rejects_oversize_invalid_utf8_and_empty_checklist() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let outbox = tempdir.path().join("outbox");
-        fs::create_dir_all(&outbox).expect("create outbox");
-        let plan = outbox.join("plan.md");
-
-        fs::write(&plan, vec![b'a'; MAX_PLAN_ARTIFACT_SIZE_BYTES as usize + 1])
-            .expect("oversize plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("oversize fails"),
-            PlanArtifactError::FileTooLarge { .. }
-        ));
-
-        fs::write(&plan, [0xff, 0xfe]).expect("invalid UTF-8 plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("invalid UTF-8 fails"),
-            PlanArtifactError::InvalidUtf8 { .. }
-        ));
-
-        fs::write(&plan, "# No checklist\n").expect("empty checklist plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("empty checklist fails"),
-            PlanArtifactError::MissingChecklist { .. }
-        ));
     }
 
     #[cfg(unix)]

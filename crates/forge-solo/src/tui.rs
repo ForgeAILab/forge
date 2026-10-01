@@ -352,7 +352,6 @@ pub fn map_crossterm_key_event(key: CrosstermKeyEvent) -> Option<InputEvent> {
 /// lets the normal shutdown path restore the terminal.  Dropping the source
 /// aborts the signal task.
 pub struct SignalInputSource {
-    sender: mpsc::Sender<SourceMessage>,
     receiver: Option<mpsc::Receiver<SourceMessage>>,
     task: Option<JoinHandle<()>>,
 }
@@ -364,17 +363,11 @@ impl SignalInputSource {
             io::Error::other("termination signal source requires an active Tokio runtime")
         })?;
         let (sender, receiver) = mpsc::channel(normalized_capacity(capacity));
-        let task = spawn_signal_task(sender.clone())?;
+        let task = spawn_signal_task(sender)?;
         Ok(Self {
-            sender,
             receiver: Some(receiver),
             task: Some(task),
         })
-    }
-
-    /// Whether the receiver is still available for controller polling.
-    pub fn is_open(&self) -> bool {
-        self.receiver.is_some() && !self.sender.is_closed()
     }
 
     /// Stop listening for signals.  This is also performed by `Drop`.

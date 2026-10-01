@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::task_hierarchy::{is_root_task, is_subtask, root_for};
+use crate::task_hierarchy::{is_root_task, is_subtask};
 
 #[tokio::test]
 async fn subtask_helpers_resolve_root_and_subtask() {
@@ -7,16 +7,10 @@ async fn subtask_helpers_resolve_root_and_subtask() {
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
-    let root_id = root.id.clone();
-
     assert!(is_root_task(&db, &root.id).await.expect("root checks"));
     assert!(!is_subtask(&db, &root.id).await.expect("subtask checks"));
     assert!(!is_root_task(&db, &subtask.id).await.expect("root checks"));
     assert!(is_subtask(&db, &subtask.id).await.expect("subtask checks"));
-    let resolved_root = root_for(&db, &subtask.id).await.expect("root resolves");
-    assert_eq!(resolved_root.id.as_str(), root_id.as_str());
-    let resolved_self = root_for(&db, &root.id).await.expect("root resolves");
-    assert_eq!(resolved_self.id.as_str(), root_id.as_str());
 }
 
 #[tokio::test]

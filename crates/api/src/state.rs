@@ -287,22 +287,6 @@ impl AppState {
         self.effective_config = Arc::new(config);
         self
     }
-
-    pub fn with_task_dispatcher(mut self, task_dispatcher: Arc<services::TaskDispatcher>) -> Self {
-        self.task_dispatcher = Some(task_dispatcher);
-        self
-    }
-
-    /// Overrides the production catalog client for deterministic API tests.
-    /// The normal constructor still creates exactly one client and transport
-    /// for each AppState instance.
-    pub fn with_models_dev_client(
-        mut self,
-        client: Arc<services::pricing::ModelsDevClient>,
-    ) -> Self {
-        self.models_dev_client = client;
-        self
-    }
 }
 
 fn default_workspace_root() -> PathBuf {

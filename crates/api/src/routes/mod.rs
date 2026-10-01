@@ -3,9 +3,9 @@ use std::{collections::HashMap, str::FromStr};
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse,
     ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
-    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
-    UsageAggregate, WorkspacePlacementResponse, WorkspaceResponse,
+    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, TaskAnnotation,
+    TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType, UsageAggregate,
+    WorkspacePlacementResponse, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -925,45 +925,6 @@ fn parse_task_type(task_type: &str) -> TaskType {
     }
 }
 
-pub fn task_wire(task: Task, agent_name: Option<String>) -> ApiTask {
-    let task_type = parse_task_type(&task.task_type);
-    let agent_id = if task.assignee_type.as_deref() == Some("agent") {
-        task.assignee_id
-    } else {
-        None
-    };
-    ApiTask {
-        id: task.id,
-        project_id: task.project_id,
-        title: task.title,
-        description: task.description,
-        status: task.status,
-        task_type,
-        priority: task.priority.try_into().unwrap_or_else(|_| {
-            if task.priority.is_negative() {
-                i32::MIN
-            } else {
-                i32::MAX
-            }
-        }),
-        board_position: task.board_position,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        agent_id,
-        agent_name,
-        external_issue_number: None,
-        external_issue_url: None,
-        version: task.version,
-        updated_at: task.updated_at,
-    }
-}
-
 pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRoleAssignmentResponse {
     TaskRoleAssignmentResponse {
         id: assignment.id,
@@ -1494,20 +1455,6 @@ where
                 .map_err(|_| ApiError::bad_request(format!("invalid {field}: {item}")))
         })
         .collect()
-}
-
-pub fn parse_optional<T>(value: Option<&String>, field: &str) -> ApiResult<Option<T>>
-where
-    T: FromStr,
-    <T as FromStr>::Err: std::fmt::Display,
-{
-    value
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| ApiError::bad_request(format!("invalid {field}: {value}")))
-        })
-        .transpose()
 }
 
 fn parse_json_value(value: impl Into<String>) -> Value {

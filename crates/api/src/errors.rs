@@ -70,15 +70,6 @@ impl ApiError {
         }
     }
 
-    pub fn method_not_allowed(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            code,
-            message: message.into(),
-            details: None,
-        }
-    }
-
     pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         let id = id.into();
         Self {

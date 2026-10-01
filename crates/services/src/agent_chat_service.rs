@@ -707,78 +707,6 @@ where
         Ok(result)
     }
 
-    pub async fn append_success(
-        &self,
-        job: &AgentChatTurnJob,
-        lease_owner: &str,
-        response: AppendAgentChatSuccessInput,
-    ) -> Result<CommittedAgentChatResponse> {
-        if job.status != AgentChatTurnState::Leased
-            || job.lease_owner.as_deref() != Some(lease_owner)
-        {
-            return Err(ServiceError::Conflict(
-                "Agent Chat turn lease is no longer active".to_owned(),
-            ));
-        }
-        let AppendAgentChatSuccessInput {
-            content,
-            model,
-            session_id,
-            context_manifest_id,
-            token_usage_json,
-            duration_ms,
-        } = response;
-        let guarded = guard_agent_chat_content(&content)?;
-        let now = now_rfc3339();
-        let message_id = new_uuid_v4();
-        let completed = AgentChatTransactionRepo::complete_agent_chat_turn(
-            &*self.db,
-            CompleteAgentChatTurn {
-                turn_job_id: job.id.clone(),
-                expected_version: job.version,
-                lease_owner: lease_owner.to_owned(),
-                response: CreateAgentChatMessage {
-                    id: message_id,
-                    chat_id: job.chat_id.clone(),
-                    // The SQLite composite allocates the response sequence in
-                    // the same transaction as the terminal job update.
-                    sequence: 0,
-                    author_type: AgentChatMessageAuthorType::Agent,
-                    author_id: job.responder_identity_id.clone(),
-                    content: guarded.content,
-                    content_guard_json: guarded.guard_json,
-                    sensitivity: guarded.sensitivity,
-                    status: AgentChatMessageStatus::Complete,
-                    outcome: Some("completed".to_owned()),
-                    model,
-                    profile_id: job.profile_id.clone(),
-                    session_id,
-                    context_manifest_id,
-                    token_usage_json,
-                    duration_ms,
-                    error: None,
-                    correlation_id: job.correlation_id.clone(),
-                    causation_id: job.causation_id.clone(),
-                    handoff_id: None,
-                    source_type: "native".to_owned(),
-                    source_id: Some(job.id.clone()),
-                    source_message_id: Some(job.triggering_message_id.clone()),
-                    source_room_id: None,
-                    source_conversation_id: None,
-                    source_sequence: None,
-                    source_metadata_json: "{}".to_owned(),
-                    created_at: now.clone(),
-                },
-                updated_at: now,
-            },
-        )
-        .await?;
-        Ok(CommittedAgentChatResponse {
-            message: completed.response,
-            turn_job: completed.turn,
-        })
-    }
-
     /// Commit a response and the observed provider-attempt reports in one
     /// SQLite composite. The legacy JSON field is intentionally left empty on
     /// this typed path; ledger events are the accounting authority.
@@ -853,34 +781,6 @@ where
             message: completed.response,
             turn_job: completed.turn,
         })
-    }
-
-    pub async fn append_awaiting_input(
-        &self,
-        job: &AgentChatTurnJob,
-        lease_owner: &str,
-        pending_interaction_id: &str,
-    ) -> Result<AgentChatTurnJob> {
-        if job.status != AgentChatTurnState::Leased
-            || job.lease_owner.as_deref() != Some(lease_owner)
-        {
-            return Err(ServiceError::Conflict(
-                "Agent Chat turn lease is no longer active".to_owned(),
-            ));
-        }
-        let now = now_rfc3339();
-        AgentChatTransactionRepo::park_agent_chat_turn(
-            &*self.db,
-            db::ParkAgentChatTurn {
-                turn_job_id: job.id.clone(),
-                expected_version: job.version,
-                lease_owner: lease_owner.to_owned(),
-                pending_interaction_id: pending_interaction_id.to_owned(),
-                updated_at: now,
-            },
-        )
-        .await
-        .map_err(Into::into)
     }
 
     pub async fn append_awaiting_input_with_usage(

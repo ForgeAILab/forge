@@ -235,40 +235,12 @@ async fn review_diff_uses_three_dot_fallback_and_utf8_truncation_marker() {
 }
 
 #[tokio::test]
-async fn file_inspection_and_knowledge_changes_are_confined_and_bounded() {
+async fn file_inspection_is_confined_and_bounded() {
     let fixture = Fixture::new().await;
-    let handle = &fixture.prepared.workspace.workspace_handle;
-    let files = vec![WorkspaceFileContent {
-        path: "docs/knowledge/note.md".into(),
-        bytes: b"owner knowledge".to_vec(),
-    }];
-    owner(
-        &fixture,
-        "write-note",
-        handle,
-        WorkspaceOwnerOperation::WriteKnowledge {
-            files: files.clone(),
-            create_new: true,
-            commit_task_id: Some("task-1".into()),
-            repository: false,
-        },
-    )
-    .await;
-    owner(
-        &fixture,
-        "keep-note",
-        handle,
-        WorkspaceOwnerOperation::WriteKnowledge {
-            files: vec![WorkspaceFileContent {
-                path: files[0].path.clone(),
-                bytes: b"replacement".to_vec(),
-            }],
-            create_new: true,
-            commit_task_id: None,
-            repository: false,
-        },
-    )
-    .await;
+    std::fs::create_dir(fixture.path().join("docs")).unwrap();
+    std::fs::write(fixture.path().join("docs/note.md"), "workspace note\n").unwrap();
+    std::fs::create_dir(fixture.repo.join("docs")).unwrap();
+    std::fs::write(fixture.repo.join("docs/note.md"), "repository note\n").unwrap();
     let read_files = |path: &str, repository, max_entries, max_bytes| {
         serde_json::to_value(WorkspaceInspectParams::Files {
             workspace: fixture.reference(),
@@ -284,23 +256,23 @@ async fn file_inspection_and_knowledge_changes_are_confined_and_bounded() {
             .backend
             .handle(
                 METHOD_WORKSPACE_READ,
-                read_files("docs/knowledge", false, 2, 100),
+                read_files("docs", false, 2, 100),
                 Vec::new,
             )
             .await
             .unwrap(),
     )
     .unwrap() else {
-        panic!("knowledge files")
+        panic!("workspace files")
     };
     assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].path, files[0].path);
-    assert_eq!(captured[0].bytes, files[0].bytes);
+    assert_eq!(captured[0].path, "docs/note.md");
+    assert_eq!(captured[0].bytes, b"workspace note\n");
     assert!(fixture
         .backend
         .handle(
             METHOD_WORKSPACE_READ,
-            read_files("docs/knowledge", false, 0, 100),
+            read_files("docs", false, 0, 100),
             Vec::new
         )
         .await
@@ -309,8 +281,8 @@ async fn file_inspection_and_knowledge_changes_are_confined_and_bounded() {
         .backend
         .handle(
             METHOD_WORKSPACE_READ,
-            read_files("docs/knowledge", false, 2, 2),
-            Vec::new
+            read_files("docs", false, 2, 2),
+            Vec::new,
         )
         .await
         .is_err());
@@ -327,33 +299,21 @@ async fn file_inspection_and_knowledge_changes_are_confined_and_bounded() {
             .code,
         OUTSIDE_WORKSPACE_ROOT
     );
-    owner(
-        &fixture,
-        "repository-note",
-        handle,
-        WorkspaceOwnerOperation::WriteKnowledge {
-            files: files.clone(),
-            create_new: false,
-            commit_task_id: None,
-            repository: true,
-        },
-    )
-    .await;
     let WorkspaceInspectResult::Files { files: captured } = decode(
         fixture
             .backend
             .handle(
                 METHOD_WORKSPACE_READ,
-                read_files("docs/knowledge", true, 2, 100),
+                read_files("docs", true, 2, 100),
                 Vec::new,
             )
             .await
             .unwrap(),
     )
     .unwrap() else {
-        panic!("repository knowledge")
+        panic!("repository files")
     };
-    assert_eq!(captured[0].bytes, files[0].bytes);
+    assert_eq!(captured[0].bytes, b"repository note\n");
     let paths: WorkspaceInspectResult = decode(
         fixture
             .backend
@@ -383,28 +343,17 @@ async fn owner_operations_reject_file_and_asset_path_escape() {
     std::fs::write(outside.path().join("secret"), "outside").unwrap();
     std::os::unix::fs::symlink(outside.path(), fixture.path().join("escape")).unwrap();
     let handle = &fixture.prepared.workspace.workspace_handle;
-    for (index, operation) in [
-        WorkspaceOwnerOperation::WriteKnowledge {
-            files: vec![WorkspaceFileContent {
-                path: "docs/knowledge/../../escape/secret".into(),
-                bytes: b"changed".to_vec(),
+    for (index, operation) in [WorkspaceOwnerOperation::MaterializeAssets {
+        environment: ProjectEnvironment {
+            recheck_interval_seconds: 600,
+            env: BTreeMap::new(),
+            checks: Vec::new(),
+            assets: vec![api_types::EnvironmentAsset {
+                source: outside.path().join("secret").to_string_lossy().into_owned(),
+                target: "asset".into(),
             }],
-            create_new: false,
-            commit_task_id: None,
-            repository: false,
         },
-        WorkspaceOwnerOperation::MaterializeAssets {
-            environment: ProjectEnvironment {
-                recheck_interval_seconds: 600,
-                env: BTreeMap::new(),
-                checks: Vec::new(),
-                assets: vec![api_types::EnvironmentAsset {
-                    source: outside.path().join("secret").to_string_lossy().into_owned(),
-                    target: "asset".into(),
-                }],
-            },
-        },
-    ]
+    }]
     .into_iter()
     .enumerate()
     {
