@@ -88,6 +88,8 @@ pub mod task_diagnostics;
 pub mod task_dispatcher;
 pub mod task_hierarchy;
 pub mod task_service;
+#[cfg(any(test, feature = "test-support"))]
+pub mod task_usage_fixture;
 pub mod terminal_service;
 pub mod turn_log_sink;
 pub mod types;

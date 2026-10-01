@@ -334,6 +334,9 @@ pub(super) async fn complete_agent_chat_turn_with_usage(
             current.causation_depth,
         )
         .await?;
+    } else {
+        db.append_agent_chat_turn_status_in_tx(&mut transaction, &terminal.turn_job_id)
+            .await?;
     }
     settle_source_in_tx(
         db,
@@ -480,6 +483,8 @@ pub(super) async fn complete_agent_chat_control_transfer_with_usage(
     if updated.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
+    db.append_agent_chat_turn_status_in_tx(&mut transaction, &terminal.turn_job_id)
+        .await?;
 
     DomainEventRepo::append_event_in_tx(
         db,
@@ -667,6 +672,8 @@ pub(super) async fn park_agent_chat_turn_with_usage(
     if updated.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
+    db.append_agent_chat_turn_status_in_tx(&mut transaction, &terminal.turn_job_id)
+        .await?;
     let turn = current_chat_turn(&mut transaction, &terminal.turn_job_id).await?;
     super::agent_chat::append_agent_chat_turn_awaiting_event(db, &mut transaction, &turn).await?;
     settle_source_in_tx(

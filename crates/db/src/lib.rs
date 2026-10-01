@@ -31,7 +31,7 @@ pub use orchestration::*;
 pub use pagination::*;
 pub use repository::*;
 pub use review_conformance::*;
-pub use sqlite::{supported_main_baseline_revision, SqliteDb};
+pub use sqlite::{supported_main_baseline_revision, SqliteDb, TaskListRead};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;

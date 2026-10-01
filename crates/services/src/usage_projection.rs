@@ -93,13 +93,7 @@ pub async fn usage_aggregate_for_source_state(
     pending: bool,
 ) -> Result<UsageAggregate> {
     let invocations = UsageLedgerRepo::list_usage_invocations_for_source(db, source_id).await?;
-    let mut events_by_invocation = HashMap::new();
-    for invocation in &invocations {
-        events_by_invocation.insert(
-            invocation.id.clone(),
-            list_effective_usage_events(db, invocation).await?,
-        );
-    }
+    let events_by_invocation = effective_usage_events_for_invocations(db, &invocations).await?;
     let surface = invocations
         .first()
         .map(|invocation| invocation.surface)
@@ -123,9 +117,12 @@ pub async fn usage_breakdowns_for_source(
     source_id: &str,
 ) -> Result<Vec<UsageBreakdown>> {
     let invocations = UsageLedgerRepo::list_usage_invocations_for_source(db, source_id).await?;
+    let mut events_by_invocation = effective_usage_events_for_invocations(db, &invocations).await?;
     let mut rows = Vec::new();
     for invocation in invocations {
-        let events = list_effective_usage_events(db, &invocation).await?;
+        let events = events_by_invocation
+            .remove(&invocation.id)
+            .unwrap_or_default();
         rows.extend(usage_breakdowns_for_effective_invocation(
             &invocation,
             &events,
@@ -274,8 +271,15 @@ async fn load_event_source_metadata(
     .fetch_one(db.pool())
     .await?;
 
-    let rate_source_kind: Option<String> = sqlx::Row::try_get(&row, "rate_source_kind")?;
-    let selection_source_kind: Option<String> = sqlx::Row::try_get(&row, "selection_source_kind")?;
+    event_source_metadata_from_row(&row, event)
+}
+
+fn event_source_metadata_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    event: &UsageEvent,
+) -> Result<EventSourceMetadata> {
+    let rate_source_kind: Option<String> = sqlx::Row::try_get(row, "rate_source_kind")?;
+    let selection_source_kind: Option<String> = sqlx::Row::try_get(row, "selection_source_kind")?;
     let source_kind = rate_source_kind
         .or(selection_source_kind)
         .map(|value| match value.as_str() {
@@ -285,19 +289,18 @@ async fn load_event_source_metadata(
         })
         .transpose()?;
     let selection_freshness: Option<String> =
-        sqlx::Row::try_get(&row, "selection_catalog_freshness")?;
-    let estimate_freshness: Option<String> =
-        sqlx::Row::try_get(&row, "estimate_catalog_freshness")?;
+        sqlx::Row::try_get(row, "selection_catalog_freshness")?;
+    let estimate_freshness: Option<String> = sqlx::Row::try_get(row, "estimate_catalog_freshness")?;
     let freshness = estimate_freshness
         .or(selection_freshness)
         .map(|value| parse_source_freshness(&value))
         .transpose()?;
     let selection_rate_revision_id: Option<String> =
-        sqlx::Row::try_get(&row, "selection_rate_revision_id")?;
+        sqlx::Row::try_get(row, "selection_rate_revision_id")?;
     let selection_catalog_snapshot_id: Option<String> =
-        sqlx::Row::try_get(&row, "selection_catalog_snapshot_id")?;
+        sqlx::Row::try_get(row, "selection_catalog_snapshot_id")?;
     let rate_catalog_snapshot_id: Option<String> =
-        sqlx::Row::try_get(&row, "rate_catalog_snapshot_id")?;
+        sqlx::Row::try_get(row, "rate_catalog_snapshot_id")?;
     let rate_revision_id = event
         .rate_revision_id
         .clone()
@@ -307,9 +310,9 @@ async fn load_event_source_metadata(
         .clone()
         .or(rate_catalog_snapshot_id)
         .or(selection_catalog_snapshot_id);
-    let catalog_digest: Option<String> = sqlx::Row::try_get(&row, "catalog_digest")?;
-    let effective_at: Option<String> = sqlx::Row::try_get(&row, "rate_effective_at")?;
-    let fetched_at: Option<String> = sqlx::Row::try_get(&row, "catalog_fetched_at")?;
+    let catalog_digest: Option<String> = sqlx::Row::try_get(row, "catalog_digest")?;
+    let effective_at: Option<String> = sqlx::Row::try_get(row, "rate_effective_at")?;
+    let fetched_at: Option<String> = sqlx::Row::try_get(row, "catalog_fetched_at")?;
     Ok(EventSourceMetadata {
         source_kind,
         rate_revision_id,
@@ -928,6 +931,99 @@ pub async fn usage_aggregate_for_agent(
 /// Collect the execution attempts belonging to one Task.  Runtime rows are
 /// included as domain runs even when no invocation was admitted, preserving
 /// no-provider and active/pending coverage in Task observability.
+// Separate branches keep every predicate backed by its task/execution/source index.
+const TASK_USAGE_SOURCES_SQL: &str = "
+    SELECT source_id FROM usage_invocation WHERE task_id = ?
+    UNION SELECT source_id FROM usage_invocation WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_invocation WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_event WHERE task_id = ?
+    UNION SELECT source_id FROM usage_event WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_event WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
+    ORDER BY source_id";
+
+async fn effective_usage_events_for_invocations(
+    db: &db::SqliteDb,
+    invocations: &[UsageInvocation],
+) -> Result<HashMap<String, Vec<EffectiveUsageEvent>>> {
+    let ids = invocations.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+    let events = db.usage_events_for_invocations(&ids).await?;
+    let mut applied = HashMap::new();
+    for revision in db.cost_estimate_revisions_for_invocations(&ids).await? {
+        if revision.state == CostEstimateRevisionState::Applied {
+            applied
+                .entry(revision.usage_event_id.clone())
+                .or_insert(revision);
+        }
+    }
+    let mut effective = Vec::with_capacity(events.len());
+    for mut event in events {
+        let revision_id = if let Some(revision) = applied.remove(&event.id) {
+            if event.cost_kind == UsageCostKind::ProviderReported {
+                return Err(invalid_transition());
+            }
+            event.estimated_nano_usd =
+                Some(revision.estimated_nano_usd.ok_or_else(invalid_transition)?);
+            event.cost_kind = UsageCostKind::Estimated;
+            event.rate_revision_id = revision.rate_revision_id.or(event.rate_revision_id);
+            event.catalog_snapshot_id = revision.catalog_snapshot_id.or(event.catalog_snapshot_id);
+            event.formula_revision = revision.formula_revision.or(event.formula_revision);
+            event.retrospective = revision.retrospective;
+            Some(revision.id)
+        } else {
+            None
+        };
+        effective.push((event, revision_id));
+    }
+    let mut metadata = HashMap::new();
+    for chunk in effective.chunks(150) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "WITH requested(event_id, invocation_id, rate_id, catalog_id, revision_id) AS (",
+        );
+        query.push_values(chunk, |mut row, (event, revision)| {
+            row.push_bind(&event.id)
+                .push_bind(&event.invocation_id)
+                .push_bind(event.rate_revision_id.as_deref())
+                .push_bind(event.catalog_snapshot_id.as_deref())
+                .push_bind(revision.as_deref());
+        });
+        query.push(") SELECT requested.event_id,
+             ps.source_kind AS selection_source_kind,
+             ps.catalog_freshness AS selection_catalog_freshness,
+             ps.rate_revision_id AS selection_rate_revision_id,
+             ps.catalog_snapshot_id AS selection_catalog_snapshot_id,
+             r.source_kind AS rate_source_kind,
+             r.catalog_snapshot_id AS rate_catalog_snapshot_id,
+             r.effective_at AS rate_effective_at,
+             c.revision_digest AS catalog_digest,
+             c.fetched_at AS catalog_fetched_at,
+             ep.catalog_freshness AS estimate_catalog_freshness
+         FROM requested JOIN usage_invocation i ON i.id = requested.invocation_id
+         LEFT JOIN pricing_selection ps ON ps.id = i.pricing_selection_id
+         LEFT JOIN cost_estimate_revision er ON er.id = requested.revision_id
+         LEFT JOIN cost_estimation_run erun ON erun.id = er.run_id
+         LEFT JOIN cost_estimation_preview ep ON ep.id = erun.preview_id
+         LEFT JOIN pricing_rate_revision r ON r.id = COALESCE(requested.rate_id, ps.rate_revision_id)
+         LEFT JOIN pricing_catalog_snapshot c ON c.id = COALESCE(requested.catalog_id, r.catalog_snapshot_id, ps.catalog_snapshot_id)");
+        for row in query.build().fetch_all(db.pool()).await? {
+            let id: String = sqlx::Row::try_get(&row, "event_id")?;
+            metadata.insert(id, row);
+        }
+    }
+    let mut result = HashMap::<String, Vec<EffectiveUsageEvent>>::new();
+    for (event, _) in effective {
+        let row = metadata.remove(&event.id).ok_or_else(invalid_transition)?;
+        let source = event_source_metadata_from_row(&row, &event)?;
+        result
+            .entry(event.invocation_id.clone())
+            .or_default()
+            .push(EffectiveUsageEvent {
+                source: event_source_with_metadata(&event, Some(&source))?,
+                event,
+            });
+    }
+    Ok(result)
+}
+
 pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Result<UsageAggregate> {
     let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE task_id = ?")
         .bind(task_id)
@@ -946,51 +1042,43 @@ pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Resul
         });
     }
 
-    let source_rows = sqlx::query(
-        "SELECT DISTINCT source_id FROM usage_invocation
-         WHERE task_id = ?
-            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
-         UNION SELECT DISTINCT source_id FROM usage_event
-         WHERE task_id = ?
-            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
-         ORDER BY source_id ASC",
-    )
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .fetch_all(db.pool())
-    .await?;
+    let source_rows = sqlx::query(TASK_USAGE_SOURCES_SQL)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(task_id)
+        .bind(task_id)
+        .fetch_all(db.pool())
+        .await?;
+    let source_ids = source_rows
+        .iter()
+        .map(|row| sqlx::Row::try_get(row, "source_id"))
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    let candidates = db.usage_invocations_for_sources(&source_ids).await?;
+    let mut batched_events = effective_usage_events_for_invocations(db, &candidates).await?;
     let mut invocations = Vec::new();
     let mut events_by_invocation = HashMap::new();
-    for row in source_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
-        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
-        {
-            let invocation_matches = invocation.task_id.as_deref() == Some(task_id)
-                || execution_ids.contains(&invocation.source_id);
-            let events = list_effective_usage_events(db, &invocation).await?;
-            let events = if invocation_matches {
-                events
-            } else {
-                events
-                    .into_iter()
-                    .filter(|effective| {
-                        effective.event.task_id.as_deref() == Some(task_id)
-                            || execution_ids.contains(&effective.event.source_id)
-                    })
-                    .collect()
-            };
-            if !invocation_matches && events.is_empty() {
-                continue;
-            }
-            events_by_invocation.insert(invocation.id.clone(), events);
-            invocations.push(invocation);
+    for invocation in candidates {
+        let invocation_matches = invocation.task_id.as_deref() == Some(task_id)
+            || execution_ids.contains(&invocation.source_id);
+        let events = batched_events.remove(&invocation.id).unwrap_or_default();
+        let events = if invocation_matches {
+            events
+        } else {
+            events
+                .into_iter()
+                .filter(|effective| {
+                    effective.event.task_id.as_deref() == Some(task_id)
+                        || execution_ids.contains(&effective.event.source_id)
+                })
+                .collect()
+        };
+        if !invocation_matches && events.is_empty() {
+            continue;
         }
+        events_by_invocation.insert(invocation.id.clone(), events);
+        invocations.push(invocation);
     }
     aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
 }
@@ -1656,108 +1744,11 @@ fn reason_order(code: CostCoverageReasonCode) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use crate::task_usage_fixture as fixture;
+
     use super::*;
 
-    fn invocation(id: &str) -> UsageInvocation {
-        UsageInvocation {
-            id: id.to_owned(),
-            owner_user_id: None,
-            project_id: Some("project".to_owned()),
-            domain_kind: db::PricingDomainKind::Execution,
-            surface: DbUsageSurface::TaskExecution,
-            source_id: format!("source-{id}"),
-            execution_id: Some(format!("source-{id}")),
-            task_id: Some("task".to_owned()),
-            domain_idempotency_key: format!("key-{id}"),
-            candidate_key: Some(format!("candidate-{id}")),
-            attempt_ordinal: 0,
-            pricing_selection_id: format!("selection-{id}"),
-            admitted_provider_id: Some("provider".to_owned()),
-            admitted_model_id: Some("model".to_owned()),
-            admitted_runtime_model: None,
-            pricing_subject_id: None,
-            pricing_subject_revision_id: None,
-            subject_revision_digest: None,
-            agent_id: Some("agent".to_owned()),
-            profile_id: Some("profile".to_owned()),
-            agent_name_snapshot: None,
-            project_name_snapshot: None,
-            executor_type: Some("executor".to_owned()),
-            backend_kind: Some("backend".to_owned()),
-            provenance_kind: db::PricingAdmissionProvenanceKind::Runtime,
-            lifecycle: UsageInvocationLifecycle::Settled,
-            telemetry_state: DbUsageTelemetryState::Metered,
-            terminal_reason: None,
-            version: 1,
-            admitted_at: "2026-01-01T00:00:00Z".to_owned(),
-            started_at: Some("2026-01-01T00:00:01Z".to_owned()),
-            settled_at: Some("2026-01-01T00:00:02Z".to_owned()),
-            created_at: "2026-01-01T00:00:00Z".to_owned(),
-            updated_at: "2026-01-01T00:00:02Z".to_owned(),
-        }
-    }
-
-    fn event(id: &str, invocation_id: &str) -> UsageEvent {
-        UsageEvent {
-            id: id.to_owned(),
-            invocation_id: invocation_id.to_owned(),
-            owner_user_id: None,
-            project_id: Some("project".to_owned()),
-            surface: DbUsageSurface::TaskExecution,
-            source_id: format!("source-{invocation_id}"),
-            execution_id: Some(format!("source-{invocation_id}")),
-            task_id: Some("task".to_owned()),
-            event_idempotency_key: format!("event-key-{id}"),
-            source_report_id: format!("report-{id}"),
-            report_sequence: 0,
-            report_mode: db::UsageEventReportMode::Delta,
-            provenance_kind: UsageEventProvenanceKind::RuntimeReport,
-            legacy_source_table: None,
-            legacy_source_id: None,
-            legacy_provider_raw: None,
-            legacy_provider_sqlite_type: None,
-            legacy_provider_sql_literal: None,
-            legacy_model_raw: None,
-            legacy_model_sqlite_type: None,
-            legacy_model_sql_literal: None,
-            legacy_counter_values_json: "{}".to_owned(),
-            legacy_cost_usd_raw: None,
-            legacy_created_at_raw: None,
-            legacy_project_owner_raw: None,
-            legacy_invalid_usage: false,
-            provider_id: Some("provider".to_owned()),
-            model_id: Some("model".to_owned()),
-            runtime_model: None,
-            candidate_key: Some("candidate".to_owned()),
-            attempt_ordinal: 0,
-            agent_id: Some("agent".to_owned()),
-            profile_id: Some("profile".to_owned()),
-            agent_name_snapshot: None,
-            project_name_snapshot: None,
-            executor_type: Some("executor".to_owned()),
-            pricing_subject_revision_id: None,
-            subject_revision_digest: None,
-            telemetry_state: DbUsageTelemetryState::Metered,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            context_tokens: None,
-            selected_tier: None,
-            provider_reported_nano_usd: Some(0),
-            legacy_reported_cost_usd: None,
-            estimated_nano_usd: None,
-            cost_kind: UsageCostKind::ProviderReported,
-            rate_revision_id: None,
-            catalog_snapshot_id: None,
-            formula_revision: None,
-            retrospective: false,
-            coverage_reason_code: None,
-            occurred_at: "2026-01-01T00:00:02Z".to_owned(),
-            created_at: "2026-01-01T00:00:02Z".to_owned(),
-        }
-    }
-
+    use fixture::{event, invocation};
     #[test]
     fn money_keeps_explicit_zero_and_sub_cent_values_decimal() {
         assert_eq!(money(Some(0)).expect("zero").decimal, "0");
@@ -1897,5 +1888,166 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(source.freshness, CostSourceFreshness::RefreshFailed);
+    }
+}
+
+#[cfg(test)]
+async fn old_usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Result<UsageAggregate> {
+    let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_all(db.pool())
+        .await?;
+    let mut execution_ids = BTreeSet::new();
+    let mut domain_runs = Vec::with_capacity(execution_rows.len());
+    for row in execution_rows {
+        let id: String = sqlx::Row::try_get(&row, "id")?;
+        let status: String = sqlx::Row::try_get(&row, "status")?;
+        execution_ids.insert(id.clone());
+        domain_runs.push(UsageDomainRun {
+            surface: DbUsageSurface::TaskExecution,
+            source_id: id,
+            pending: status == "running",
+        });
+    }
+
+    let source_rows = sqlx::query(
+        "SELECT DISTINCT source_id FROM usage_invocation
+         WHERE task_id = ?
+            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
+         UNION SELECT DISTINCT source_id FROM usage_event
+         WHERE task_id = ?
+            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
+         ORDER BY source_id ASC",
+    )
+    .bind(task_id)
+    .bind(task_id)
+    .bind(task_id)
+    .bind(task_id)
+    .bind(task_id)
+    .bind(task_id)
+    .fetch_all(db.pool())
+    .await?;
+    let mut invocations = Vec::new();
+    let mut events_by_invocation = HashMap::new();
+    for row in source_rows {
+        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
+        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
+        {
+            let invocation_matches = invocation.task_id.as_deref() == Some(task_id)
+                || execution_ids.contains(&invocation.source_id);
+            let events = list_effective_usage_events(db, &invocation).await?;
+            let events = if invocation_matches {
+                events
+            } else {
+                events
+                    .into_iter()
+                    .filter(|effective| {
+                        effective.event.task_id.as_deref() == Some(task_id)
+                            || execution_ids.contains(&effective.event.source_id)
+                    })
+                    .collect()
+            };
+            if !invocation_matches && events.is_empty() {
+                continue;
+            }
+            events_by_invocation.insert(invocation.id.clone(), events);
+            invocations.push(invocation);
+        }
+    }
+    aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
+}
+
+#[cfg(test)]
+mod task_read_tests {
+    use super::*;
+    #[tokio::test]
+    async fn usage_projection_task_union_matches_reference_and_uses_indexes() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('usage-project', 'Usage', 'now', 'now')").execute(db.pool()).await.unwrap();
+        for t in 0..200 {
+            let task = format!("task-{t}");
+            sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, 'usage-project', ?, 'todo', 'now', 'now')").bind(&task).bind(&task).execute(db.pool()).await.unwrap();
+            for attempt in 0..3 {
+                let execution = format!("execution-{t}-{attempt}");
+                sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES (?, ?, 'coder', 'completed', 'now', 'now')")
+                    .bind(&execution).bind(&task).execute(db.pool()).await.unwrap();
+                crate::task_usage_fixture::seed(&db, &task, &execution, attempt, 5).await;
+            }
+        }
+        let start = std::time::Instant::now();
+        let old = old_usage_aggregate_for_task(&db, "task-0").await.unwrap();
+        let before = start.elapsed();
+        let start = std::time::Instant::now();
+        let new = usage_aggregate_for_task(&db, "task-0").await.unwrap();
+        println!(
+            "usage aggregate: before={before:?}, after={:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::to_value(new).unwrap()
+        );
+        // The execution aggregate now uses the same batched event/provenance path.
+        // Compare it independently against the original per-invocation loads.
+        for attempt in 0..3 {
+            let source = format!("execution-0-{attempt}");
+            let invocations = UsageLedgerRepo::list_usage_invocations_for_source(&db, &source)
+                .await
+                .unwrap();
+            let mut events = HashMap::new();
+            for invocation in &invocations {
+                events.insert(
+                    invocation.id.clone(),
+                    list_effective_usage_events(&db, invocation).await.unwrap(),
+                );
+            }
+            let reference = aggregate_usage_with_sources(
+                &invocations,
+                &events,
+                &[UsageDomainRun {
+                    surface: DbUsageSurface::TaskExecution,
+                    source_id: source.clone(),
+                    pending: false,
+                }],
+            )
+            .unwrap();
+            let aggregate = usage_aggregate_for_source(&db, &source).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(reference).unwrap(),
+                serde_json::to_value(aggregate).unwrap()
+            );
+        }
+        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {TASK_USAGE_SOURCES_SQL}"))
+            .bind("task-0")
+            .bind("task-0")
+            .bind("task-0")
+            .bind("task-0")
+            .bind("task-0")
+            .bind("task-0")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let plans = rows
+            .iter()
+            .map(|r| sqlx::Row::get::<String, _>(r, "detail"))
+            .collect::<Vec<_>>();
+        println!("{}", plans.join("\n"));
+        assert!(plans
+            .iter()
+            .all(|p| !p.contains("SCAN usage_invocation") && !p.contains("SCAN usage_event")));
+        for index in [
+            "idx_usage_invocation_task",
+            "idx_usage_invocation_execution",
+            "idx_usage_invocation_source",
+            "idx_usage_event_task",
+            "idx_usage_event_execution",
+            "idx_usage_event_source",
+        ] {
+            assert!(plans.iter().any(|p| p.contains(index)), "missing {index}");
+        }
     }
 }

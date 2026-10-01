@@ -900,114 +900,8 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {
-        let offset = decode_offset(&query.page.cursor)?;
-        let mut where_parts = vec!["project_id = ?"];
-        if !query.include_deleted {
-            where_parts.push("deleted_at IS NULL");
-        }
-        if !query.include_archived {
-            where_parts.push("archived_at IS NULL");
-        }
-        if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
-            where_parts.push("status != 'cancelled'");
-        }
-        if !query.statuses.is_empty() {
-            where_parts.push("status IN (__STATUSES__)");
-        }
-        if !query.agent_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
-        }
-        if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
-        }
-        if query.priority.is_some() {
-            where_parts.push("priority = ?");
-        }
-        let search_pattern = query
-            .q
-            .as_deref()
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .map(search_like_pattern);
-        if search_pattern.is_some() {
-            where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
-        }
-        let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
-        let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
-        let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
-        let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
-        let assignee_type_filter = if query.assignee_types.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_type IN ({assignee_type_placeholders})")
-        };
-        let assignee_id_filter = if query.assignee_ids.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_id IN ({assignee_id_placeholders})")
-        };
-        let where_sql = where_parts
-            .join(" AND ")
-            .replace("__STATUSES__", &status_placeholders)
-            .replace("__AGENTS__", &agent_placeholders)
-            .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
-            .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
-            where_sql,
-            order_clause(&query.page)
-        );
-        let mut q = sqlx::query(&sql).bind(&query.project_id);
-        for status in &query.statuses {
-            q = q.bind(status);
-        }
-        for agent_id in &query.agent_ids {
-            q = q.bind(agent_id);
-        }
-        for assignee_type in &query.assignee_types {
-            q = q.bind(assignee_type);
-        }
-        for assignee_id in &query.assignee_ids {
-            q = q.bind(assignee_id);
-        }
-        if let Some(priority) = query.priority {
-            q = q.bind(priority);
-        }
-        if let Some(search_pattern) = search_pattern.as_ref() {
-            q = q.bind(search_pattern).bind(search_pattern);
-        }
-        let rows = q
-            .bind(limit(&query.page) + 1)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
-        let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
-        let total = if query.page.include_total {
-            let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
-            let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
-            for status in &query.statuses {
-                q = q.bind(status);
-            }
-            for agent_id in &query.agent_ids {
-                q = q.bind(agent_id);
-            }
-            for assignee_type in &query.assignee_types {
-                q = q.bind(assignee_type);
-            }
-            for assignee_id in &query.assignee_ids {
-                q = q.bind(assignee_id);
-            }
-            if let Some(priority) = query.priority {
-                q = q.bind(priority);
-            }
-            if let Some(search_pattern) = search_pattern.as_ref() {
-                q = q.bind(search_pattern).bind(search_pattern);
-            }
-            Some(q.fetch_one(&self.pool).await?)
-        } else {
-            None
-        };
-        page_from_items(items, &query.page, offset, total)
+        let mut connection = self.pool.acquire().await?;
+        list_page(&mut connection, query).await
     }
 
     async fn list_by_project_with_metadata_key(
@@ -2289,4 +2183,118 @@ fn search_like_pattern(term: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+pub(super) async fn list_page(
+    connection: &mut sqlx::SqliteConnection,
+    query: TaskListQuery,
+) -> Result<Page<Task>> {
+    let offset = decode_offset(&query.page.cursor)?;
+    let mut where_parts = vec!["project_id = ?"];
+    if !query.include_deleted {
+        where_parts.push("deleted_at IS NULL");
+    }
+    if !query.include_archived {
+        where_parts.push("archived_at IS NULL");
+    }
+    if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
+        where_parts.push("status != 'cancelled'");
+    }
+    if !query.statuses.is_empty() {
+        where_parts.push("status IN (__STATUSES__)");
+    }
+    if !query.agent_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
+    }
+    if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
+    }
+    if query.priority.is_some() {
+        where_parts.push("priority = ?");
+    }
+    let search_pattern = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(search_like_pattern);
+    if search_pattern.is_some() {
+        where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
+    }
+    let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
+    let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
+    let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
+    let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
+    let assignee_type_filter = if query.assignee_types.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_type IN ({assignee_type_placeholders})")
+    };
+    let assignee_id_filter = if query.assignee_ids.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_id IN ({assignee_id_placeholders})")
+    };
+    let where_sql = where_parts
+        .join(" AND ")
+        .replace("__STATUSES__", &status_placeholders)
+        .replace("__AGENTS__", &agent_placeholders)
+        .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
+        .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
+        where_sql,
+        order_clause(&query.page)
+    );
+    let mut q = sqlx::query(&sql).bind(&query.project_id);
+    for status in &query.statuses {
+        q = q.bind(status);
+    }
+    for agent_id in &query.agent_ids {
+        q = q.bind(agent_id);
+    }
+    for assignee_type in &query.assignee_types {
+        q = q.bind(assignee_type);
+    }
+    for assignee_id in &query.assignee_ids {
+        q = q.bind(assignee_id);
+    }
+    if let Some(priority) = query.priority {
+        q = q.bind(priority);
+    }
+    if let Some(search_pattern) = search_pattern.as_ref() {
+        q = q.bind(search_pattern).bind(search_pattern);
+    }
+    let rows = q
+        .bind(limit(&query.page) + 1)
+        .bind(offset)
+        .fetch_all(&mut *connection)
+        .await?;
+    let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
+    let total = if query.page.include_total {
+        let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
+        let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
+        for status in &query.statuses {
+            q = q.bind(status);
+        }
+        for agent_id in &query.agent_ids {
+            q = q.bind(agent_id);
+        }
+        for assignee_type in &query.assignee_types {
+            q = q.bind(assignee_type);
+        }
+        for assignee_id in &query.assignee_ids {
+            q = q.bind(assignee_id);
+        }
+        if let Some(priority) = query.priority {
+            q = q.bind(priority);
+        }
+        if let Some(search_pattern) = search_pattern.as_ref() {
+            q = q.bind(search_pattern).bind(search_pattern);
+        }
+        Some(q.fetch_one(&mut *connection).await?)
+    } else {
+        None
+    };
+    page_from_items(items, &query.page, offset, total)
 }

@@ -804,6 +804,20 @@ impl AgentChatMessageRepo for SqliteDb {
             allocate_chat_sequence(&mut transaction, &input.chat_id, &input.created_at).await?;
         let input = CreateAgentChatMessage { sequence, ..input };
         let message = insert_chat_message(&mut transaction, &input).await?;
+        super::chat_read_events::append(
+            self,
+            &mut transaction,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.message.appended",
+                entity_type: "agent_chat_message",
+                entity_id: &input.id,
+                chat_id: &input.chat_id,
+                status: Some(input.status.to_string().as_str()),
+                dedupe_key: Some(format!("chat-message:{}", input.id)),
+                created_at: &crate::now_rfc3339(),
+            },
+        )
+        .await?;
         transaction.commit().await?;
         Ok(message)
     }
@@ -917,7 +931,7 @@ impl AgentChatTurnJobRepo for SqliteDb {
         } else {
             (lease_owner, leased_until)
         };
-        let updated = sqlx::query(
+        let updated = self.execute_agent_chat_turn_status_update(&input.id, sqlx::query(
             "UPDATE agent_chat_turn_job
              SET status = ?, pending_interaction_id = ?, lease_owner = ?, leased_until = ?, attempt_count = ?,
                  next_attempt_at = ?, response_message_id = ?, error_code = ?,
@@ -939,7 +953,7 @@ impl AgentChatTurnJobRepo for SqliteDb {
         .bind(&input.updated_at)
         .bind(&input.id)
         .bind(input.expected_version)
-        .execute(&self.pool)
+        )
         .await?;
         if updated.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -1336,6 +1350,8 @@ impl AgentChatTransactionRepo for SqliteDb {
             if updated.rows_affected() == 0 {
                 return Err(DbError::VersionConflict);
             }
+            self.append_agent_chat_turn_status_in_tx(&mut transaction, &input.turn_job_id)
+                .await?;
             let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
                 .bind(&input.turn_job_id)
                 .fetch_one(&mut *transaction)
@@ -1489,6 +1505,8 @@ impl AgentChatTransactionRepo for SqliteDb {
         if updated.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
+        self.append_agent_chat_turn_status_in_tx(&mut transaction, &input.turn_job_id)
+            .await?;
 
         DomainEventRepo::append_event_in_tx(
             self,
@@ -1609,6 +1627,8 @@ impl AgentChatTransactionRepo for SqliteDb {
         if updated.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        self.append_agent_chat_turn_status_in_tx(&mut transaction, &input.turn_job_id)
+            .await?;
         let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
             .bind(&input.turn_job_id)
             .fetch_one(&mut *transaction)

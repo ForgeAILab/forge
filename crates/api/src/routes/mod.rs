@@ -110,7 +110,7 @@ pub(crate) fn client_idempotency_key(stored_key: &str) -> String {
     stored_key.to_owned()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListParams {
     pub cursor: Option<String>,
     pub limit: Option<i64>,

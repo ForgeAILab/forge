@@ -202,20 +202,8 @@ impl TaskRoleAssignmentRepo for SqliteDb {
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TaskRoleAssignment>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
-             FROM task_role_assignment WHERE task_id IN (",
-        );
-        let mut ids = query.separated(", ");
-        for task_id in task_ids {
-            ids.push_bind(*task_id);
-        }
-        ids.push_unseparated(") ORDER BY task_id, role_name");
-        let rows = query.build().fetch_all(&self.pool).await?;
-        rows.into_iter().map(map_task_role_assignment_row).collect()
+        let mut connection = self.pool.acquire().await?;
+        roles_for_tasks(&mut connection, task_ids).await
     }
 
     async fn remove(&self, task_id: &str, role_name: &str) -> std::result::Result<(), DbError> {
@@ -468,21 +456,8 @@ impl TransitionLogRepo for SqliteDb {
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by,
-                    trigger_reason, hook_results_json, rejection, created_at
-             FROM transition_log WHERE task_id IN (",
-        );
-        let mut ids = query.separated(", ");
-        for task_id in task_ids {
-            ids.push_bind(*task_id);
-        }
-        ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
-        let rows = query.build().fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(map_transition_log_row).collect())
+        let mut connection = self.pool.acquire().await?;
+        transitions_for_tasks(&mut connection, task_ids).await
     }
 
     async fn count_gate_rejections(
@@ -559,4 +534,45 @@ impl TransitionLogRepo for SqliteDb {
 
         Ok(())
     }
+}
+
+pub(super) async fn roles_for_tasks(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<TaskRoleAssignment>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id IN (",
+    );
+    let mut ids = query.separated(", ");
+    for task_id in task_ids {
+        ids.push_bind(*task_id);
+    }
+    ids.push_unseparated(") ORDER BY task_id, role_name");
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_task_role_assignment_row).collect()
+}
+
+pub(super) async fn transitions_for_tasks(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<TransitionLog>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by,
+                    trigger_reason, hook_results_json, rejection, created_at
+             FROM transition_log WHERE task_id IN (",
+    );
+    let mut ids = query.separated(", ");
+    for task_id in task_ids {
+        ids.push_bind(*task_id);
+    }
+    ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    Ok(rows.into_iter().map(map_transition_log_row).collect())
 }

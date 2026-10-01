@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610010600 (typed chat turn failures, bounded deferrals, and invocation backfill).
+// Embedded migration bundle revision: V202610011636 (usage indexes, independent list revision, guarded JSON probe).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -504,6 +504,87 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn task_list_revision_triggers_exist_after_bundled_migrations() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        let expected: std::collections::BTreeSet<String> =
+            include_str!("../migrations/V202610011636__task_list_revisions.sql")
+                .lines()
+                .filter_map(|line| line.strip_prefix("CREATE TRIGGER "))
+                .filter_map(|line| line.split_whitespace().next())
+                .filter(|name| name.starts_with("task_list_revision_"))
+                .map(str::to_owned)
+                .collect();
+        assert!(!expected.is_empty());
+        let actual: std::collections::BTreeSet<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name GLOB 'task_list_revision_*'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn task_list_revision_migration_accepts_malformed_metadata() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        ensure_migration_table(&pool).await.unwrap();
+        let mut bundle: Vec<_> = MIGRATIONS_DIR
+            .files()
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "sql"))
+            .map(|file| {
+                (
+                    parse_migration_path(file.path().to_path_buf()).unwrap(),
+                    file.contents_utf8().unwrap(),
+                )
+            })
+            .collect();
+        bundle.sort_by_key(|(migration, _)| migration.version);
+        for (migration, sql) in bundle
+            .iter()
+            .filter(|(migration, _)| migration.version < 202610011636)
+        {
+            apply_migration_sql(&pool, migration, sql).await.unwrap();
+        }
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('malformed-project', 'Malformed metadata', 'now', 'now')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task (id, project_id, title, metadata_json, created_at, updated_at) VALUES ('empty', 'malformed-project', 'Empty', '', 'now', 'now'), ('invalid', 'malformed-project', 'Invalid', 'not JSON', 'now', 'now')").execute(&pool).await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task (id, project_id, title, metadata_json, created_at, updated_at) VALUES ('after', 'malformed-project', 'After', 'still not JSON', 'now', 'now')").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE task SET metadata_json = '' WHERE id = 'after'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json = 'not JSON either' WHERE id = 'empty'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let metadata: Vec<String> = sqlx::query_scalar(
+            "SELECT metadata_json FROM task WHERE project_id = 'malformed-project' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(metadata, ["", "not JSON either", "not JSON"]);
+        let db = crate::SqliteDb::new(pool.clone());
+        assert!(
+            db.begin_task_list_read("malformed-project")
+                .await
+                .unwrap()
+                .conditional_safe
+        );
+        let plans = sqlx::query("EXPLAIN QUERY PLAN SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL AND deleted_at IS NULL)")
+            .bind("malformed-project").fetch_all(&pool).await.unwrap();
+        assert!(
+            plans.iter().any(|row| row
+                .get::<String, _>("detail")
+                .contains("idx_task_deferred_dispatch_project")),
+            "the guarded probe must use idx_task_deferred_dispatch_project"
+        );
+    }
 
     #[tokio::test]
     async fn typed_turn_failure_migration_preserves_historical_outcomes() {

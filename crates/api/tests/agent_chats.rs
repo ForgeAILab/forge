@@ -301,6 +301,14 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .await;
     assert_eq!(cancelled.status, AgentChatTurnStatus::Cancelled);
     assert_eq!(cancelled.version, first_turn.version + 1);
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+    )
+    .bind(&first_turn.id)
+    .fetch_all(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(events, ["agent_chat.turn.cancelled"]);
 
     let replay: AgentChatTurnJobResponse = common::json_request_with_bearer(
         &harness.app,
@@ -469,6 +477,32 @@ async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
         turns[0].pending_interaction_id.as_deref(),
         Some("test-interaction-1")
     );
+
+    // Preserve the baseline's best-effort supersede: a failed parked-turn
+    // statement must not reject the newer user message's admission.
+    sqlx::raw_sql("CREATE TRIGGER reject_supersede BEFORE UPDATE ON agent_chat_turn_job WHEN NEW.error_code = 'superseded_by_user_message' BEGIN SELECT RAISE(ABORT, 'supersede unavailable'); END;")
+        .execute(harness.state.db.pool()).await.unwrap();
+    let newer: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content":"Newer user message"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert!(newer.turn_job.is_some());
+    let unchanged =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &parked.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged.status, db::AgentChatTurnState::AwaitingInput);
+    assert_eq!(unchanged.version, parked.version);
+    sqlx::query("DROP TRIGGER reject_supersede")
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
 
     // Cancel while parked in awaiting_input
     let cancelled: AgentChatTurnJobResponse = common::json_request_with_bearer(
@@ -930,4 +964,294 @@ async fn typed_turn_failure_response_and_redrive_require_version_and_replay_one_
     )
     .await;
     assert_eq!(superseded.code, "turn_not_retryable");
+}
+
+#[tokio::test]
+async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
+    let dir = common::TestDir::new("chat-read-events");
+    let h = common::test_app(dir.path(), "chat-read-events").await;
+    let token = common::test_jwt();
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
+        &h.app,
+        &token,
+        "read-events-agent",
+        "read-events",
+        "read-events-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(
+        &h.app, Method::PUT, "/api/v1/account/main-agent", &token,
+        json!({"identity_id": connected.agent.id, "profile_id": connected.profile.id, "expected_version": 0, "autonomy_policy": {}}),
+        StatusCode::OK,
+    ).await;
+    let sent: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &h.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content":"private message body", "dedupe_key":"read-event-message"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn = sent.turn_job.unwrap();
+    let admission_events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+    )
+    .bind(&sent.message.id)
+    .fetch_all(h.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admission_events, ["agent_chat.message.admitted"]);
+    // Exercise the worker's transactional status-notification seam without running a turn.
+    let mut tx = db::begin_immediate(h.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'reader', leased_until = '2099-01-01T00:00:00Z', version = version + 1, updated_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z").bind(&turn.id).execute(&mut *tx).await.unwrap();
+    h.state
+        .db
+        .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = h.state.db.pool().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_chat_turn_job SET status = 'retry_wait', version = version + 1 WHERE id = ?",
+    )
+    .bind(&turn.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    h.state
+        .db
+        .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent_chat.turn.status_changed' AND entity_id = ?")
+        .bind(&turn.id).fetch_one(h.state.db.pool()).await.unwrap();
+    assert_eq!(count, 1, "rolled-back status has no durable notification");
+    let inquiry = db::AgentInquiryRepo::create_agent_inquiry(
+        &*h.state.db,
+        db::CreateAgentInquiry {
+            id: db::new_uuid_v4(),
+            chat_id: binding.chat_id.clone(),
+            turn_job_id: Some(turn.id.clone()),
+            identity_id: connected.agent.id,
+            owner_user_id: "test-user-id".to_owned(),
+            title: "Read event".to_owned(),
+            question: "private inquiry body".to_owned(),
+            workspace_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::AgentInquiryRepo::cancel_agent_inquiry(&*h.state.db, &inquiry.id, inquiry.version)
+        .await
+        .unwrap();
+    // Status writes need neither a version bump nor an updated_at write to notify.
+    for status in ["retry_wait", "leased", "cancelled"] {
+        let mut tx = db::begin_immediate(h.state.db.pool()).await.unwrap();
+        sqlx::query("UPDATE agent_chat_turn_job SET status = ?, lease_owner = NULL, leased_until = NULL WHERE id = ?")
+            .bind(status).bind(&turn.id).execute(&mut *tx).await.unwrap();
+        h.state
+            .db
+            .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let status_events: Vec<(String, String)> = sqlx::query_as("SELECT payload_json, created_at FROM domain_event WHERE event_type = 'agent_chat.turn.status_changed' AND entity_id = ? ORDER BY sequence")
+        .bind(&turn.id).fetch_all(h.state.db.pool()).await.unwrap();
+    assert_eq!(
+        status_events.len(),
+        4,
+        "each status write gets its own event"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&status_events[3].0).unwrap()["status"],
+        "cancelled"
+    );
+    let stored_updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&turn.id)
+            .fetch_one(h.state.db.pool())
+            .await
+            .unwrap();
+    assert_ne!(status_events[3].1, stored_updated_at);
+    assert!(status_events[3].1 >= stored_updated_at);
+    let _: api_types::StartAgentChatTopicResponse = common::json_request_with_bearer(
+        &h.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/topics", binding.chat_id),
+        &token,
+        json!({"label":"Next", "summary":null}),
+        StatusCode::OK,
+    )
+    .await;
+    let appended_system: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event e JOIN agent_chat_message m ON m.id = e.entity_id WHERE e.event_type = 'agent_chat.message.appended' AND m.chat_id = ? AND m.author_type = 'system'")
+        .bind(&binding.chat_id).fetch_one(h.state.db.pool()).await.unwrap();
+    assert!(
+        appended_system > 0,
+        "system appends also reach the durable relay"
+    );
+    let payloads: Vec<String> = sqlx::query_scalar("SELECT payload_json FROM domain_event WHERE scope_id = ? AND event_type IN ('agent_chat.message.appended', 'agent_chat.turn.status_changed', 'agent_chat.inquiry.updated', 'agent_chat.topic.started')")
+        .bind(&binding.chat_id).fetch_all(h.state.db.pool()).await.unwrap();
+    for payload in payloads {
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(payload.as_object().unwrap().keys().all(|key| [
+            "chat_id",
+            "id",
+            "message_id",
+            "turn_id",
+            "status"
+        ]
+        .contains(&key.as_str())));
+    }
+    let mut receiver = h.state.event_bus.subscribe();
+    let relay =
+        services::DomainEventBroadcastConsumer::new(h.state.db.clone(), h.state.event_bus.clone());
+    let emitted = relay.broadcast_once(100).await.unwrap();
+    let mut kinds = std::collections::HashSet::new();
+    for _ in 0..emitted {
+        let event = receiver.try_recv().unwrap();
+        let value = serde_json::to_value(event).unwrap();
+        assert!(!value.to_string().contains("private message body"));
+        assert!(!value.to_string().contains("private inquiry body"));
+        if value["scope_type"] == "agent_chat" {
+            kinds.insert(value["domain_event_type"].as_str().unwrap().to_owned());
+        }
+    }
+    for kind in [
+        "agent_chat.message.admitted",
+        "agent_chat.message.appended",
+        "agent_chat.turn.status_changed",
+        "agent_chat.inquiry.updated",
+        "agent_chat.topic.started",
+    ] {
+        assert!(kinds.contains(kind), "missing {kind}");
+    }
+    let service = services::agent_chat_service::AgentChatService::new(h.state.db.clone());
+    for ledger in [false, true] {
+        for terminal in ["completed", "failed", "cancelled"] {
+            let admitted: SendAgentChatMessageResponse = common::json_request_with_bearer(
+                &h.app,
+                Method::POST,
+                &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+                &token,
+                json!({"content":"Lifecycle event coverage"}),
+                StatusCode::CREATED,
+            )
+            .await;
+            let turn = admitted.turn_job.unwrap();
+            let admitted_events: Vec<String> = sqlx::query_scalar(
+                "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+            )
+            .bind(&admitted.message.id)
+            .fetch_all(h.state.db.pool())
+            .await
+            .unwrap();
+            assert_eq!(admitted_events, ["agent_chat.message.admitted"]);
+            let job = db::AgentChatTurnJobRepo::update_agent_chat_turn_job(
+                &*h.state.db,
+                db::UpdateAgentChatTurnJob {
+                    id: turn.id.clone(),
+                    expected_version: turn.version,
+                    status: db::AgentChatTurnState::Leased,
+                    lease_owner: Some(Some("reader".to_owned())),
+                    leased_until: Some(Some("2099-01-01T00:00:00Z".to_owned())),
+                    attempt_count: Some(1),
+                    pending_interaction_id: None,
+                    next_attempt_at: None,
+                    response_message_id: None,
+                    error_code: None,
+                    error_message: None,
+                    updated_at: db::now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            let before: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+                .fetch_one(h.state.db.pool())
+                .await
+                .unwrap();
+            let expected = match terminal {
+                "completed" => {
+                    let response = services::agent_chat_service::AppendAgentChatSuccessInput {
+                        content: "Completed response".to_owned(),
+                        model: None,
+                        session_id: None,
+                        context_manifest_id: None,
+                        token_usage_json: None,
+                        duration_ms: None,
+                    };
+                    if ledger {
+                        service
+                            .append_success_with_usage(&job, "reader", response, vec![])
+                            .await
+                            .unwrap();
+                    } else {
+                        service
+                            .append_success(&job, "reader", response)
+                            .await
+                            .unwrap();
+                    }
+                    "agent_chat.response.completed"
+                }
+                "failed" => {
+                    if ledger {
+                        service
+                            .append_failure_with_usage(
+                                &job,
+                                "reader",
+                                &api_types::TurnFailure::Configuration,
+                                "Configuration failed",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        service
+                            .append_failure(
+                                &job,
+                                "reader",
+                                &api_types::TurnFailure::Configuration,
+                                "Configuration failed",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "agent_chat.turn.failed"
+                }
+                _ => {
+                    let input = db::CancelAgentChatTurn {
+                        turn_job_id: job.id.clone(),
+                        expected_version: job.version,
+                        actor_user_id: "test-user-id".to_owned(),
+                        idempotency_key: db::new_uuid_v4(),
+                        updated_at: db::now_rfc3339(),
+                    };
+                    if ledger {
+                        db::AgentChatTransactionRepo::cancel_agent_chat_turn_with_usage(
+                            &*h.state.db,
+                            db::CancelAgentChatTurnWithUsage {
+                                terminal: input,
+                                settlements: vec![],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        db::AgentChatTransactionRepo::cancel_agent_chat_turn(&*h.state.db, input)
+                            .await
+                            .unwrap();
+                    }
+                    "agent_chat.turn.cancelled"
+                }
+            };
+            let events: Vec<String> = sqlx::query_scalar("SELECT event_type FROM domain_event WHERE scope_type = 'agent_chat' AND scope_id = ? AND sequence > ? ORDER BY sequence")
+                .bind(&binding.chat_id).bind(before).fetch_all(h.state.db.pool()).await.unwrap();
+            assert_eq!(events, [expected], "{terminal}, ledger={ledger}");
+        }
+    }
 }

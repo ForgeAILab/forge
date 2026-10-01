@@ -1062,12 +1062,23 @@ would pin that consumer's cursor at the event forever. Events publish after
 their transaction and invalidate the exact query keys they affect; the client
 invalidates active authoritative queries once per stream
 open, reconnect, or resync, and reconciles a live optimistic turn with a
-bounded watchdog. The watchdog follows both a locally optimistic admission and
-an authoritative cached server turn while either is live, actively refetches
-messages and turns even when the document is hidden, and stops only at the
-terminal or control-transfer state. An expired event-stream token therefore
-cannot leave a backgrounded `retry_wait` turn visibly stuck after REST truth
-has advanced to `failed`.
+bounded foreground watchdog. The watchdog follows both a locally optimistic
+admission and an authoritative cached server turn while either is live, refetches
+messages and turns every 15 seconds, pauses while the document is hidden, and
+checks immediately when the document becomes visible. These explicit reads
+reconcile stale live turns and can refresh an expired access token; global
+refetch-on-focus is disabled. It stops at a terminal or control-transfer state.
+Chat and handoff queries use SSE invalidation with 15-second foreground interval
+fallbacks; reconnect/resync invalidates active queries. Minimal durable
+notifications cover message appends without a same-transaction admission or
+completion event (including system/Charter anchors), turn status writes without
+a same-transaction completion,
+failure or cancellation event (including worker claims/recovery), inquiry
+creation/non-ledger terminal writes, and topic rotation. Existing outbox consumers
+relay these committed ID/status records to SSE without message bodies. Rust
+writers append these notifications transactionally with app-generated IDs and
+timestamps. Activity JSONL has no event source: turn/inquiry activity polls every
+1.5 seconds only while live, and pauses in the background.
 
 When Task creation omits an explicit governance envelope, Forge derives one
 from the Project's current approved Charter. The approved Charter makes a
@@ -2034,8 +2045,8 @@ and completion-storage errors are surfaced rather than reported as invented
 terminal outcomes. Existing inquiry sessions with obsolete persistence
 capabilities rotate through the normal versioned path without deleting history.
 
-While mounted, the inquiry list polls every three seconds even when its cached
-list is empty or all runs are terminal, so it can discover the next inquiry.
+Committed inquiry events invalidate the mounted inquiry list, including discovery
+from an empty or all-terminal cache. A 15-second foreground poll remains a fallback.
 An expanded log view refetches the final tail when its run becomes terminal;
 if collapsed, it performs that final fetch when reopened.
 
@@ -2680,8 +2691,21 @@ that defers dispatch) clears the annotation.
 
 Board moves use the same engine through `TaskService::move_task` and its board
 persistence seam. A project owns a monotonic `board_revision`, advanced by
-database triggers for board-affecting task inserts, deletes, status/position
-updates, archives, and soft deletes. The public move command compares both the
+its original Task insert/delete and status/position/delete/archive update
+triggers. A separate `list_revision` tracks changes to persisted list projection
+inputs through narrow null-safe triggers; execution heartbeats, leases, progress,
+and log-path writes leave both revisions unchanged. The ETag includes that list
+revision, a projection version and the complete request parameters. The task
+list reads the revisions, page and batched decorations in one deferred WAL
+transaction, so the old list `409 board_snapshot_changed` is unreachable and
+removed. `TaskListRead` holds its pooled connection for the request; an in-memory
+pool has only one connection. Matching conditional requests read an indexed
+Project row and probe a partial index for non-deleted deferred-dispatch metadata,
+which disables conditional reads because retry health also changes with the
+clock. The index and probe both guard JSON access with `json_valid`, preserving
+malformed legacy task metadata. The migration installs the list index/triggers
+once; a bundle test checks that all defined list triggers survive later migrations.
+The public move command compares both the
 task version and board revision after acquiring the SQLite write lock, validates
 the destination workflow column and adjacent neighbor IDs, and writes status
 plus board position once in a single transaction. Tight numeric gaps are

@@ -3549,3 +3549,83 @@ impl RetrospectiveEstimateRepo for SqliteDb {
         .collect()
     }
 }
+
+// Narrow concrete batch readers for task observability; no ledger rollup or trait changes.
+impl SqliteDb {
+    pub async fn usage_invocations_for_sources(
+        &self,
+        source_ids: &[String],
+    ) -> Result<Vec<UsageInvocation>> {
+        let mut result = Vec::new();
+        for chunk in source_ids.chunks(400) {
+            let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+                "SELECT * FROM usage_invocation WHERE source_id IN (",
+            );
+            let mut ids = query.separated(", ");
+            for id in chunk {
+                ids.push_bind(id);
+            }
+            ids.push_unseparated(") ORDER BY source_id, attempt_ordinal ASC, id ASC");
+            result.extend(
+                query
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(map_invocation)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(result)
+    }
+    pub async fn usage_events_for_invocations(
+        &self,
+        invocation_ids: &[String],
+    ) -> Result<Vec<UsageEvent>> {
+        let mut result = Vec::new();
+        for chunk in invocation_ids.chunks(400) {
+            let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+                "SELECT * FROM usage_event WHERE invocation_id IN (",
+            );
+            let mut ids = query.separated(", ");
+            for id in chunk {
+                ids.push_bind(id);
+            }
+            ids.push_unseparated(") ORDER BY invocation_id, occurred_at, id");
+            result.extend(
+                query
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(map_usage_event)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(result)
+    }
+    pub async fn cost_estimate_revisions_for_invocations(
+        &self,
+        invocation_ids: &[String],
+    ) -> Result<Vec<CostEstimateRevision>> {
+        let mut result = Vec::new();
+        for chunk in invocation_ids.chunks(400) {
+            let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT revision.* FROM usage_event event JOIN cost_estimate_revision revision ON revision.usage_event_id = event.id WHERE event.invocation_id IN (");
+            let mut ids = query.separated(", ");
+            for id in chunk {
+                ids.push_bind(id);
+            }
+            ids.push_unseparated(") ORDER BY revision.usage_event_id, revision.revision DESC, revision.created_at DESC, revision.id DESC");
+            result.extend(
+                query
+                    .build()
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(map_estimate_revision)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(result)
+    }
+}

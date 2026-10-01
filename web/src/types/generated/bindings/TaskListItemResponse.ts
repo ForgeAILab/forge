@@ -10,5 +10,7 @@ import type { WorkflowHealthSummary } from "./WorkflowHealthSummary";
 
 /**
  * Board/list projection. Full content and accounting are loaded from task detail.
+ * The collection supports ETag/If-None-Match with Cache-Control: private, no-cache.
+ * A 304 has no JSON body; list validators are independent of board_revision.
  */
 export type TaskListItemResponse = { id: string, project_id: string, parent_task_id: string | null, assignee_type: string | null, assignee_id: string | null, title: string, task_type: TaskType, status: string, canonical_phase: CanonicalPhase, awaiting_human: boolean, priority: bigint, board_position: number, subtask_order: bigint | null, role_assignments: Array<TaskRoleAssignmentResponse>, remaining_retries: Record<string, number>, error_annotation: TaskAnnotation | null, blocked: InterruptionMetadata | null, failed: InterruptionMetadata | null, workflow_health: WorkflowHealthSummary | null, workflow_exception: WorkflowExceptionSummary | null, review_passed_at: string | null, archived_at: string | null, external_issue_number: bigint | null, external_issue_url: string | null, execution_observability: TaskListExecutionObservability, version: bigint, created_at: string, updated_at: string, };

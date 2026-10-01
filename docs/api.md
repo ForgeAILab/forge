@@ -2678,11 +2678,86 @@ The Project list omits `description`, `task_state_config`, `workspace`,
 `GET /api/v1/tasks/{id}/detail` response's `task` for that content. Single-Task
 responses and `GET /api/v1/agents/{id}/tasks` retain `TaskResponse`.
 
-The revision is a monotonic project token for task creation/deletion and
-changes to status, board position, archive state, or soft-deletion state. Each
-page is assembled against one stable revision. Revisions can skip values when
-position renormalization updates several rows. A board may enable ordering only
-after it has loaded all pages and every page carries the same revision.
+`board_revision` remains the board move/subtask reorder concurrency token. Its
+original Task insert/delete and status/position/delete/archive update triggers
+are unchanged. Running executions, reviews, and other list decorations do not
+advance this token. A board may enable ordering only after all loaded pages carry
+the same board revision.
+
+Each page and all its decorations are read in one deferred SQLite transaction
+(one WAL snapshot). Revision bracketing and retries are removed: the former list
+`409 board_snapshot_changed` response is impossible within this snapshot and is
+no longer returned. Move/reorder concurrency conflicts still return `409`.
+`TaskListRead` holds a pooled connection for the request; in-memory SQLite pools
+have one connection, which cannot serve another read until the snapshot is dropped.
+
+The list returns a weak `ETag` scoped to the project, a separate internal
+`list_revision`, a projection-version constant, and all request filter, sort and
+pagination parameters (including `include_total`). The projection version is
+bumped when derived labels/behavior change across deployments. Send the ETag in
+`If-None-Match` on the same request. Matching validators (including weak/strong
+equivalents, comma-separated tags, or `*`) return `304 Not Modified` with the ETag
+and an empty body. Both `200` and `304` send `Cache-Control: private, no-cache`
+and `Vary: Authorization`. Authentication runs before the
+conditional response; this route has no separate project-authorization check
+(pre-existing behavior). Cache pages separately by complete request parameters.
+No list item fields change.
+
+The conditional path reads one indexed project row and probes the partial
+`task(project_id)` index for non-deleted deferred-dispatch metadata. Both the
+index predicate and the probe guard JSON access with `json_valid(metadata_json)`,
+so malformed legacy metadata does not block migration, task writes or list reads. It does not
+load Task rows or decorations. Unlike a project-row marker, this probe requires
+no project-wide JSON scan on task writes.
+
+Revision coverage for `TaskListItemResponse`:
+
+| Fields | Persisted list revision source |
+|--------|--------------------------------|
+| `id`, `project_id` | Task insert/delete; project moves invalidate both projects |
+| `parent_task_id`, `assignee_type`, `assignee_id`, `title`, `task_type`, `status`, `priority`, `board_position`, `subtask_order` | Changes to these Task columns |
+| `canonical_phase` | Task status/type/parent/config updates and Project `workflow_definition` updates |
+| `awaiting_human` | Constant `false` in this list projection; review/metadata-driven waiting is shown in `workflow_health` |
+| `role_assignments` | Role assignment insert/update/delete |
+| `remaining_retries` | Transition-log insert/update/delete, Task annotations/config, Project workflow changes |
+| `error_annotation`, `blocked`, `failed`, `review_passed_at`, `archived_at`, `version`, `created_at`, `updated_at` | Changes to their Task columns (including metadata-only writes without a Task version increment) |
+| `workflow_health`, `workflow_exception` | Task annotations/metadata/config, role assignments, review projection fields, execution projection fields, and Project workflow changes |
+| `external_issue_number`, `external_issue_url` | External-link insert/update/delete |
+| `execution_observability.latest_execution_id` | Execution insert/delete and task/creation-order changes |
+
+Task triggers use `UPDATE OF` and null-safe `OLD.x IS NOT NEW.x` comparisons.
+Description changes advance the list revision because `q` searches descriptions;
+role mutations cover agent/assignee filters and sorting. Execution insert/delete
+coverage applies while the owning Task exists: a cascaded execution deletion
+adds nothing after the Task row is gone; the Task delete trigger already
+invalidates that project. Execution updates cover only `task_id`, `status`,
+`role`, `agent_id`, `agent_session_id`, `resume_policy`, `stop_reason`, `error`,
+`stopped_at`, `created_at`, `executor_config_snapshot_json`, and `updated_at`
+for stopped executions (health timestamps). Heartbeats, lease renewals, progress,
+and `logs_path` writes on running executions advance neither revision. Review
+updates cover `status`, `finished_at` and the diagnostic/selection inputs
+`task_id`, `created_at`, `execution_id`, `step_results_json`, `attempt_number`,
+`reviewer_execution_id`, and `auditor_execution_id`; unrelated review bookkeeping
+does not advance the token. The migration installs the list index/triggers once;
+a migration-bundle test guards against later migrations dropping those triggers.
+
+Health capacity/blocker reasons derive from persisted Task metadata. Deferred
+retry health additionally changes when `not_before` is reached, without a write.
+Projects containing any non-deleted Task with `deferred_dispatch` metadata
+conservatively omit ETag and always return `200`, even for `If-None-Match: *`.
+Clearing all such metadata re-enables conditional reads.
+
+The web client keeps its cached page on `304`. Task-list fallback invalidations
+are throttled to 1.5 seconds. Same-status moves on complete unfiltered pages patch
+position/version/order locally without a list fetch only when the event revision
+is exactly the cached revision plus one and no project task-list request is in
+flight. Revision gaps retain the cached revision and schedule the throttled
+authoritative fallback; an in-flight request also schedules that fallback so an
+older response cannot leave the patch overwritten. Events carrying a new
+status/position paint those fields immediately. Membership
+and order uncertainty on filtered or partial pages, and status changes that also
+affect diagnostics, schedule a deferred 1.5-second authoritative fallback. Events
+lacking the required patch input use the ordinary throttled fallback.
 
 `POST /api/v1/tasks/{id}/move` replaces the removed
 `PUT /api/v1/tasks/{id}/position` endpoint. It accepts one idempotent atomic
@@ -3799,6 +3874,38 @@ context contains `project_id`, `operation_id`, `old_status`, `new_status`,
 lifecycle consumers as normal transitions but do not also publish a direct
 `task.status_changed` event. Synchronous cascades remain separate transitions
 and can publish their own status events.
+
+Agent Chat events already committed to the durable outbox (message admission,
+response completion, awaiting-input, failure, cancellation, retry, and control
+transfer) are delivered by the existing post-commit relay as
+`domain_event.committed`. Its `domain_event_type`, `domain_entity_id`,
+`entity_type`, `scope_type: "agent_chat"`, and `scope_id` identify the changed
+projection. Message bodies are never copied into this transport envelope.
+When a write has no admission/completion/failure/cancellation event in the same
+chat transaction, additional durable notifications cover `agent_chat.message.appended`
+(including system/Charter appends outside admission/completion),
+`agent_chat.turn.status_changed` (including worker claims and recovery status
+changes), `agent_chat.inquiry.updated` (creation and non-ledger
+terminal updates), and `agent_chat.topic.started`. Their stored payloads contain
+only chat/entity IDs and optional status; the SSE wrapper retains its existing
+ID/scope fields. Ledger inquiry completion/failure/cancellation events already use
+that same chat scope. Message-appended and turn-status notifications are appended
+by Rust writers in the write transaction with app-generated IDs/timestamps,
+independent of row version or `updated_at`. Lease renewal alone emits no status
+notification.
+
+The web SSE router invalidates the affected chat's messages, turns, topics,
+inquiries and turn activity, plus the chat switcher and handoff queries. Inquiry
+events also invalidate the individual inquiry/activity prefix. Messages, turns,
+inquiry lists, switcher, topics and handoffs retain only a 15-second foreground
+polling fallback. Activity polls at
+1.5 seconds only while its turn/inquiry is live, because activity JSONL writes
+have no SSE event. All query intervals set
+`refetchIntervalInBackground: false`; the live-turn watchdog also pauses while the
+document is hidden and immediately checks for stale live turns when the document
+becomes visible. Those explicit message/turn reads reconcile missed chat events
+and can refresh an expired access token without waiting for the next tick.
+Reconnect/resync invalidates active queries; global refetch-on-focus is disabled.
 
 ## MCP tools
 

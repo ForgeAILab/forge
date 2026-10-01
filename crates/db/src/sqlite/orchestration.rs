@@ -3876,6 +3876,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .execute(&mut *tx)
             .await
             .map_err(orchestration_write_error)?;
+            super::chat_read_events::append(
+                self,
+                &mut tx,
+                super::chat_read_events::ChatReadEvent {
+                    event_type: "agent_chat.message.appended",
+                    entity_type: "agent_chat_message",
+                    entity_id: &message_id,
+                    chat_id: &project_chat_id,
+                    status: Some("complete"),
+                    dedupe_key: Some(format!("chat-message:{message_id}")),
+                    created_at: &now_rfc3339(),
+                },
+            )
+            .await?;
             Some(message_id)
         } else {
             if input.bootstrap_message_id.is_some()
@@ -9799,6 +9813,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
+        super::chat_read_events::append(
+            self,
+            &mut tx,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.message.appended",
+                entity_type: "agent_chat_message",
+                entity_id: &input.target_message_id,
+                chat_id: &project_chat_id,
+                status: Some("complete"),
+                dedupe_key: Some(format!("chat-message:{}", input.target_message_id)),
+                created_at: &now_rfc3339(),
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO agent_chat_turn_job (
                 id, chat_id, triggering_message_id, responder_identity_id, profile_id,

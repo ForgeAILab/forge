@@ -1119,31 +1119,8 @@ impl ReviewRepo for SqliteDb {
     }
 
     async fn list_latest_reviews_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Review>> {
-        if task_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT * FROM (
-                SELECT review.*,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY task_id
-                           ORDER BY attempt_number DESC, created_at DESC, id DESC
-                       ) AS rn
-                FROM review
-                WHERE task_id IN (",
-        );
-        let mut separated = query.separated(", ");
-        for task_id in task_ids {
-            separated.push_bind(*task_id);
-        }
-        separated.push_unseparated(
-            ")
-            ) ranked
-            WHERE rn = 1
-            ORDER BY task_id ASC",
-        );
-        let rows = query.build().fetch_all(&self.pool).await?;
-        rows.into_iter().map(map_review).collect()
+        let mut connection = self.pool.acquire().await?;
+        latest_reviews(&mut connection, task_ids).await
     }
 
     async fn next_attempt_number(&self, task_id: &str) -> Result<i64> {
@@ -1155,4 +1132,35 @@ impl ReviewRepo for SqliteDb {
         .await?;
         Ok(latest.unwrap_or(0) + 1)
     }
+}
+
+pub(super) async fn latest_reviews(
+    connection: &mut sqlx::SqliteConnection,
+    task_ids: &[&str],
+) -> Result<Vec<Review>> {
+    if task_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT * FROM (
+                SELECT review.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY attempt_number DESC, created_at DESC, id DESC
+                       ) AS rn
+                FROM review
+                WHERE task_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for task_id in task_ids {
+        separated.push_bind(*task_id);
+    }
+    separated.push_unseparated(
+        ")
+            ) ranked
+            WHERE rn = 1
+            ORDER BY task_id ASC",
+    );
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_review).collect()
 }

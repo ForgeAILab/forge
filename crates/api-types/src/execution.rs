@@ -124,6 +124,8 @@ pub struct TaskResponse {
 }
 
 /// Board/list projection. Full content and accounting are loaded from task detail.
+/// The collection supports ETag/If-None-Match with Cache-Control: private, no-cache.
+/// A 304 has no JSON body; list validators are independent of board_revision.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskListItemResponse {

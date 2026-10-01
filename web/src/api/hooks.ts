@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import {
   type InfiniteData,
+  replaceEqualDeep,
   useInfiniteQuery,
   useMutation,
   useQuery,
@@ -10,6 +11,8 @@ import {
   ApiError,
   getAccountUsageAnalytics,
   apiFetch,
+  fetchTaskList,
+  retainTaskListEtag,
   addDependency,
   addMember,
   searchUsers,
@@ -512,13 +515,28 @@ export function useTasksQuery(
   search: TaskSearch,
   options: { enabled?: boolean } = {},
 ) {
+  const queryClient = useQueryClient()
+  const queryKey = qk.tasks(projectId, filterKey(search))
   return useInfiniteQuery({
-    queryKey: qk.tasks(projectId, filterKey(search)),
-    queryFn: ({ pageParam, signal }) =>
-      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
-        search: { ...search, cursor: pageParam as string | undefined },
+    queryKey,
+    queryFn: ({ pageParam, signal }) => {
+      const cached = queryClient.getQueryData<{ pages: TasksResponse[]; pageParams: unknown[] }>(
+        queryKey,
+      )
+      const index = cached?.pageParams.findIndex((cursor) => cursor === pageParam) ?? -1
+      return fetchTaskList(
+        projectId,
+        { ...search, cursor: pageParam },
+        cached?.pages[index],
         signal,
-      }),
+      )
+    },
+    structuralSharing: (previous, incoming) => {
+      const data = incoming as InfiniteData<TasksResponse>
+      const shared = replaceEqualDeep(previous, data)
+      data.pages.forEach((page, index) => retainTaskListEtag(page, shared.pages[index]))
+      return shared
+    },
     enabled: options.enabled ?? true,
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
@@ -1980,9 +1998,9 @@ export function useRemoveMember(projectId: string) {
 // not a work item: the only mutation is cancel, and only while running.
 
 const AGENT_INQUIRY_LIST_LIMIT = 50
-const AGENT_INQUIRY_POLL_INTERVAL = 3_000
+const AGENT_INQUIRY_POLL_INTERVAL = 15_000
 /** A running inquiry's activity (tool calls, reasoning, reply deltas) is followed at this cadence. */
-const AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL = 1_000
+const AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL = 1_500
 const AGENT_INQUIRY_LOG_PAGE_LIMIT = 1_000
 const AGENT_INQUIRY_LOG_MAX_PAGES_PER_FETCH = 20
 
@@ -2038,6 +2056,7 @@ export function useAgentInquiryLogsQuery(
   return useQuery({
     queryKey,
     enabled: Boolean(inquiryId) && (options.enabled ?? true),
+    refetchIntervalInBackground: false,
     refetchInterval: (query) =>
       query.state.status === 'error' || !options.live
         ? false
@@ -2059,8 +2078,8 @@ export function useAgentInquiriesQuery(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: Boolean(chatId),
-    // Creation has no event notification. Keep discovering runs while this
-    // list is mounted, including from an empty or all-terminal cache.
+    // SSE drives updates; polling is a slow foreground fallback.
+    refetchIntervalInBackground: false,
     refetchInterval: (query) =>
       query.state.status === 'error' ? false : AGENT_INQUIRY_POLL_INTERVAL,
   })

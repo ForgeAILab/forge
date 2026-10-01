@@ -1397,6 +1397,7 @@ export interface ReorderSubtasksRequest {
 export type ExecutionsResponse = PaginatedResponse<ExecutionSummary>
 export type AgentsResponse = PaginatedResponse<Agent>
 export type ProjectsResponse = PaginatedResponse<Project>
+// GET task lists support ETag/If-None-Match with private, no-cache; 304 preserves the cached page.
 export type TasksResponse = PaginatedResponse<TaskListItem> & { board_revision: number }
 
 // --- Events (matches events::ForgeEvent/EventContext) ---

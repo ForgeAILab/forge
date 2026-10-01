@@ -285,10 +285,10 @@ describe('AgentChatTimeline polling', () => {
 
     turnComplete = true
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_000)
+      await vi.advanceTimersByTimeAsync(15_000)
     })
 
-    expect(screen.getByText('assistant response arrived')).toBeTruthy()
+    await vi.waitFor(() => expect(screen.getByText('assistant response arrived')).toBeTruthy())
     // A succeeded turn whose response message is in the timeline stays silent —
     // the agent message itself is the visible outcome.
     expect(screen.queryByText('Succeeded')).toBeNull()

@@ -46,7 +46,8 @@ impl AgentInquiryRepo for SqliteDb {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, 0, 0, 0, 1, ?, ?, ?, ?)
              RETURNING {AGENT_INQUIRY_COLUMNS}"
         );
-        sqlx::query(&sql)
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let record = sqlx::query(&sql)
             .bind(&input.id)
             .bind(&input.chat_id)
             .bind(input.turn_job_id.as_deref())
@@ -58,10 +59,13 @@ impl AgentInquiryRepo for SqliteDb {
             .bind(&now)
             .bind(&now)
             .bind(input.workspace_path.as_deref())
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *transaction)
             .await
             .map_err(DbError::from)
-            .and_then(map_agent_inquiry)
+            .and_then(map_agent_inquiry)?;
+        append_inquiry_read_event(self, &mut transaction, &record).await?;
+        transaction.commit().await?;
+        Ok(record)
     }
 
     async fn get_agent_inquiry(&self, id: &str) -> Result<Option<AgentInquiry>> {
@@ -142,6 +146,7 @@ impl AgentInquiryRepo for SqliteDb {
              WHERE id = ? AND version = ? AND status = 'running'
              RETURNING {AGENT_INQUIRY_COLUMNS}"
         );
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let updated = sqlx::query(&sql)
             .bind(input.status.to_string())
             .bind(input.findings.as_deref())
@@ -156,15 +161,19 @@ impl AgentInquiryRepo for SqliteDb {
             .bind(&now)
             .bind(&input.id)
             .bind(input.expected_version)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await?;
-        match updated {
-            Some(row) => map_agent_inquiry(row),
-            None => match self.get_agent_inquiry(&input.id).await? {
+        let Some(row) = updated else {
+            transaction.rollback().await?;
+            return match self.get_agent_inquiry(&input.id).await? {
                 None => Err(DbError::NotFound),
                 Some(_) => Err(DbError::VersionConflict),
-            },
-        }
+            };
+        };
+        let record = map_agent_inquiry(row)?;
+        append_inquiry_read_event(self, &mut transaction, &record).await?;
+        transaction.commit().await?;
+        Ok(record)
     }
 
     async fn complete_agent_inquiry_with_usage(
@@ -190,21 +199,26 @@ impl AgentInquiryRepo for SqliteDb {
              WHERE id = ? AND version = ? AND status = 'running'
              RETURNING {AGENT_INQUIRY_COLUMNS}"
         );
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let updated = sqlx::query(&sql)
             .bind(&now)
             .bind(&now)
             .bind(&now)
             .bind(id)
             .bind(expected_version)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await?;
-        match updated {
-            Some(row) => map_agent_inquiry(row),
-            None => match self.get_agent_inquiry(id).await? {
+        let Some(row) = updated else {
+            transaction.rollback().await?;
+            return match self.get_agent_inquiry(id).await? {
                 None => Err(DbError::NotFound),
                 Some(_) => Err(DbError::VersionConflict),
-            },
-        }
+            };
+        };
+        let record = map_agent_inquiry(row)?;
+        append_inquiry_read_event(self, &mut transaction, &record).await?;
+        transaction.commit().await?;
+        Ok(record)
     }
 
     async fn cancel_agent_inquiry_with_usage(
@@ -240,4 +254,28 @@ pub(super) fn map_agent_inquiry(row: SqliteRow) -> Result<AgentInquiry> {
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
     })
+}
+
+async fn append_inquiry_read_event(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    record: &AgentInquiry,
+) -> Result<()> {
+    super::chat_read_events::append(
+        db,
+        transaction,
+        super::chat_read_events::ChatReadEvent {
+            event_type: "agent_chat.inquiry.updated",
+            entity_type: "agent_inquiry",
+            entity_id: &record.id,
+            chat_id: &record.chat_id,
+            status: Some(&record.status.to_string()),
+            dedupe_key: Some(format!(
+                "chat-read:agent_chat.inquiry.updated:{}:{}",
+                record.id, record.version
+            )),
+            created_at: &record.updated_at,
+        },
+    )
+    .await
 }

@@ -198,6 +198,21 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         .execute(&mut *transaction)
         .await?;
 
+        super::chat_read_events::append(
+            self,
+            &mut transaction,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.message.appended",
+                entity_type: "agent_chat_message",
+                entity_id: &input.divider_message.id,
+                chat_id: &input.topic.chat_id,
+                status: Some(input.divider_message.status.to_string().as_str()),
+                dedupe_key: Some(format!("chat-message:{}", input.divider_message.id)),
+                created_at: &crate::now_rfc3339(),
+            },
+        )
+        .await?;
+
         sqlx::query(
             "INSERT INTO agent_chat_topic (
                 id, chat_id, sequence, label, summary, starting_message_id,
@@ -230,6 +245,23 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
             .map_err(DbError::from)
             .and_then(map_agent_chat_message)?;
 
+        super::chat_read_events::append(
+            self,
+            &mut transaction,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.topic.started",
+                entity_type: "agent_chat_topic",
+                entity_id: &topic_row.id,
+                chat_id: &topic_row.chat_id,
+                status: None,
+                dedupe_key: Some(format!(
+                    "chat-read:agent_chat.topic.started:{}:{}",
+                    topic_row.id, topic_row.sequence
+                )),
+                created_at: &topic_row.created_at,
+            },
+        )
+        .await?;
         transaction.commit().await?;
         Ok(Ok(RotatedAgentChatTopic {
             topic: topic_row,

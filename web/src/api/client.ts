@@ -19,6 +19,7 @@ import type {
   SaveWorkflowTemplateRequest,
   SettingsResponse,
   Task,
+  TasksResponse,
   TokenResponse,
   UnreadCountResponse,
   UpdateSettingsRequest,
@@ -41,6 +42,7 @@ export function recheckProjectEnvironment(projectId: string) {
 
 type ApiFetchInit = RequestInit & {
   search?: Record<string, string | number | boolean | undefined>
+  allowNotModified?: boolean
 }
 
 export class ApiError extends Error {
@@ -82,7 +84,7 @@ function parseErrorResponse(text: string): ErrorResponse | undefined {
 
 async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response> {
   const url = new URL(`${API_BASE}${path}`, window.location.origin)
-  const { search, headers, ...fetchInit } = init ?? {}
+  const { search, headers, allowNotModified, ...fetchInit } = init ?? {}
   if (search) {
     for (const [key, value] of Object.entries(search)) {
       if (value !== undefined && value !== '') {
@@ -128,6 +130,8 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
       headers: makeHeaders(newToken),
     })
   }
+
+  if (allowNotModified && response.status === 304) return response
 
   if (!response.ok) {
     const text = await response.text()
@@ -412,4 +416,36 @@ export function updateMemberRole(
 
 export function removeMember(projectId: string, userId: string): Promise<void> {
   return apiFetch<void>(`/projects/${projectId}/members/${userId}`, { method: 'DELETE' })
+}
+
+// Validators belong to the exact server page object. Patching a page drops its
+// validator, so a later request cannot validate a locally modified representation.
+const taskListEtags = new WeakMap<TasksResponse, string>()
+
+/** Structural sharing can rebuild the page while preserving its representation.
+ * Transfer only a server page's validator; local cache writes clear it. */
+export function retainTaskListEtag(incoming: TasksResponse, shared: TasksResponse): void {
+  const etag = taskListEtags.get(incoming)
+  if (etag) taskListEtags.set(shared, etag)
+  else taskListEtags.delete(shared)
+}
+
+export async function fetchTaskList(
+  projectId: string,
+  search: NonNullable<ApiFetchInit['search']>,
+  cached?: TasksResponse,
+  signal?: AbortSignal,
+): Promise<TasksResponse> {
+  const etag = cached && taskListEtags.get(cached)
+  const response = await apiResponse(`/projects/${projectId}/tasks`, {
+    search,
+    signal,
+    headers: etag ? { 'If-None-Match': etag } : undefined,
+    allowNotModified: Boolean(etag),
+  })
+  if (response.status === 304 && cached) return cached
+  const page = (await response.json()) as TasksResponse
+  const nextEtag = response.headers.get('etag')
+  if (nextEtag) taskListEtags.set(page, nextEtag)
+  return page
 }

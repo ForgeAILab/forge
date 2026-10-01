@@ -3825,6 +3825,11 @@ impl AgentChatTurnWorker {
         .bind(&now)
         .fetch_optional(&mut *transaction)
         .await?;
+        if let Some(id) = id.as_deref() {
+            self.db
+                .append_agent_chat_turn_status_in_tx(&mut transaction, id)
+                .await?;
+        }
         transaction.commit().await?;
         let Some(id) = id else { return Ok(None) };
         AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &id)
@@ -3866,25 +3871,36 @@ impl AgentChatTurnWorker {
                 api_types::AgentChatTurnStatus::Failed => "failed",
                 _ => "retry_wait",
             };
-            let updated = sqlx::query(
-                "UPDATE agent_chat_turn_job
+            let updated = async {
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                let updated = sqlx::query(
+                    "UPDATE agent_chat_turn_job
                  SET status = ?, lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = ?, error_code = 'lease_expired',
                      error_message = ?, failure_class_json = ?, retry_decision = ?,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'leased' AND leased_until IS NOT NULL
                    AND leased_until <= ?",
-            )
-            .bind(status)
-            .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
-            .bind(decision.error)
-            .bind(&failure_json)
-            .bind(decision.retry_decision.as_str())
-            .bind(&now)
-            .bind(&id)
-            .bind(version)
-            .bind(&now)
-            .execute(self.db.pool())
+                )
+                .bind(status)
+                .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
+                .bind(decision.error)
+                .bind(&failure_json)
+                .bind(decision.retry_decision.as_str())
+                .bind(&now)
+                .bind(&id)
+                .bind(version)
+                .bind(&now)
+                .execute(&mut *transaction)
+                .await?;
+                if updated.rows_affected() != 0 {
+                    self.db
+                        .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                        .await?;
+                }
+                transaction.commit().await?;
+                Ok::<_, ServiceError>(updated)
+            }
             .await?;
             if updated.rows_affected() == 1 {
                 // A lease expiry is the recovery boundary for an invocation
@@ -3938,20 +3954,31 @@ impl AgentChatTurnWorker {
             let version: i64 = row.try_get("version")?;
 
             let Some(interaction_id) = pending_interaction_id else {
-                let _ = sqlx::query(
-                    "UPDATE agent_chat_turn_job
+                let _ = async {
+                    let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                    let updated = sqlx::query(
+                        "UPDATE agent_chat_turn_job
                      SET status = 'failed', error_code = 'interaction_orphaned',
                          error_message = 'turn parked without interaction reference',
                          failure_class_json = ?, retry_decision = ?,
                          version = version + 1, updated_at = ?
                      WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                )
-                .bind(&failure_json)
-                .bind(api_types::TurnRetryDecision::Fail.as_str())
-                .bind(&now)
-                .bind(&id)
-                .bind(version)
-                .execute(self.db.pool())
+                    )
+                    .bind(&failure_json)
+                    .bind(api_types::TurnRetryDecision::Fail.as_str())
+                    .bind(&now)
+                    .bind(&id)
+                    .bind(version)
+                    .execute(&mut *transaction)
+                    .await?;
+                    if updated.rows_affected() != 0 {
+                        self.db
+                            .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                            .await?;
+                    }
+                    transaction.commit().await?;
+                    Ok::<_, ServiceError>(updated)
+                }
                 .await;
                 continue;
             };
@@ -3964,39 +3991,63 @@ impl AgentChatTurnWorker {
 
             match interaction {
                 None => {
-                    let _ = sqlx::query(
-                        "UPDATE agent_chat_turn_job
+                    let _ = async {
+                        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                        let updated = sqlx::query(
+                            "UPDATE agent_chat_turn_job
                          SET status = 'failed', error_code = 'interaction_orphaned',
                              error_message = 'pending interaction not found',
                              failure_class_json = ?, retry_decision = ?,
                              version = version + 1, updated_at = ?
                          WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                    )
-                    .bind(&failure_json)
-                    .bind(api_types::TurnRetryDecision::Fail.as_str())
-                    .bind(&now)
-                    .bind(&id)
-                    .bind(version)
-                    .execute(self.db.pool())
+                        )
+                        .bind(&failure_json)
+                        .bind(api_types::TurnRetryDecision::Fail.as_str())
+                        .bind(&now)
+                        .bind(&id)
+                        .bind(version)
+                        .execute(&mut *transaction)
+                        .await?;
+                        if updated.rows_affected() != 0 {
+                            self.db
+                                .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                                .await?;
+                        }
+                        transaction.commit().await?;
+                        Ok::<_, ServiceError>(updated)
+                    }
                     .await;
                 }
                 Some(irow) => {
                     let istatus: String = irow.try_get("status")?;
                     let expires_at: Option<String> = irow.try_get("expires_at")?;
                     if istatus == "answered" {
-                        let _ = sqlx::query(
-                            "UPDATE agent_chat_turn_job
+                        let _ = async {
+                            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                            let updated = sqlx::query(
+                                "UPDATE agent_chat_turn_job
                              SET status = 'queued', pending_interaction_id = NULL,
                                  next_attempt_at = NULL, version = version + 1, updated_at = ?
                              WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                        )
-                        .bind(&now)
-                        .bind(&id)
-                        .bind(version)
-                        .execute(self.db.pool())
+                            )
+                            .bind(&now)
+                            .bind(&id)
+                            .bind(version)
+                            .execute(&mut *transaction)
+                            .await?;
+                            if updated.rows_affected() != 0 {
+                                self.db
+                                    .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                                    .await?;
+                            }
+                            transaction.commit().await?;
+                            Ok::<_, ServiceError>(updated)
+                        }
                         .await;
                     } else if istatus == "cancelled" {
-                        let _ = sqlx::query(
+                        let _ = async {
+            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+            let updated = sqlx::query(
                             "UPDATE agent_chat_turn_job
                              SET status = 'cancelled', pending_interaction_id = NULL,
                                  error_code = 'interaction_cancelled', failure_class_json = NULL, retry_decision = NULL,
@@ -4007,27 +4058,44 @@ impl AgentChatTurnWorker {
                         .bind(&now)
                         .bind(&id)
                         .bind(version)
-                        .execute(self.db.pool())
+                        .execute(&mut *transaction).await?;
+            if updated.rows_affected() != 0 {
+                self.db.append_agent_chat_turn_status_in_tx(&mut transaction, &id).await?;
+            }
+            transaction.commit().await?;
+            Ok::<_, ServiceError>(updated)
+        }
                         .await;
                     } else if istatus == "expired"
                         || (expires_at.as_deref().is_some()
                             && expires_at.as_deref().unwrap() <= now.as_str())
                     {
-                        let _ = sqlx::query(
-                            "UPDATE agent_chat_turn_job
+                        let _ = async {
+                            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                            let updated = sqlx::query(
+                                "UPDATE agent_chat_turn_job
                              SET status = 'failed', pending_interaction_id = NULL,
                                  error_code = 'interaction_expired',
                                  error_message = 'pending interaction expired',
                                  failure_class_json = ?, retry_decision = ?,
                                  version = version + 1, updated_at = ?
                              WHERE id = ? AND version = ? AND status = 'awaiting_input'",
-                        )
-                        .bind(&failure_json)
-                        .bind(api_types::TurnRetryDecision::Fail.as_str())
-                        .bind(&now)
-                        .bind(&id)
-                        .bind(version)
-                        .execute(self.db.pool())
+                            )
+                            .bind(&failure_json)
+                            .bind(api_types::TurnRetryDecision::Fail.as_str())
+                            .bind(&now)
+                            .bind(&id)
+                            .bind(version)
+                            .execute(&mut *transaction)
+                            .await?;
+                            if updated.rows_affected() != 0 {
+                                self.db
+                                    .append_agent_chat_turn_status_in_tx(&mut transaction, &id)
+                                    .await?;
+                            }
+                            transaction.commit().await?;
+                            Ok::<_, ServiceError>(updated)
+                        }
                         .await;
                     }
                 }
@@ -4132,13 +4200,21 @@ impl AgentChatTurnWorker {
     }
 
     async fn release_shutdown_lease(&self, job: &AgentChatTurnJob) -> Result<()> {
-        sqlx::query("UPDATE agent_chat_turn_job SET status = 'queued',
+        async {
+            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+            let updated = sqlx::query("UPDATE agent_chat_turn_job SET status = 'queued',
             lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
             attempt_count = MAX(0, attempt_count - 1), failure_class_json = NULL, retry_decision = NULL,
             error_code = NULL, error_message = NULL, version = version + 1, updated_at = ?
             WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?")
             .bind(now_rfc3339()).bind(&job.id).bind(job.version).bind(&self.lease_owner)
-            .execute(self.db.pool()).await?;
+            .execute(&mut *transaction).await?;
+            if updated.rows_affected() != 0 {
+                self.db.append_agent_chat_turn_status_in_tx(&mut transaction, &job.id).await?;
+            }
+            transaction.commit().await?;
+            Ok::<_, ServiceError>(updated)
+        }.await?;
         Ok(())
     }
 
