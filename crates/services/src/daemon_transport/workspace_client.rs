@@ -514,6 +514,7 @@ impl DaemonWorkspaceClient {
         let value = serde_json::json!({"entry_id": entry_id, "operation_id": params["operation_id"], "error": error});
         self.retain_receipt(daemon_id, method, params, &value, "error")
             .await?;
+        self.acknowledge_recorded(daemon_id, &value).await;
         Ok(())
     }
 
@@ -771,8 +772,9 @@ impl DaemonWorkspaceClient {
                 .ok_or_else(|| ServiceError::invalid_operation("workspace intent has no method"))?;
             let value = match self.reconcile(daemon_id, method, params).await {
                 Ok(value) => value,
-                Err(WorkspaceClientError::Daemon(error)) => {
-                    self.retain_error(daemon_id, method, params, &error).await?;
+                Err(WorkspaceClientError::Daemon(_)) => {
+                    // reconcile() already retained and attempted this ACK;
+                    // retry only when that acknowledgement was interrupted.
                     self.retry_acknowledgements(daemon_id).await?;
                     continue;
                 }
@@ -1299,6 +1301,200 @@ pub(crate) mod tests {
             base_ref: "main".to_owned(),
             branch: "task/test".to_owned(),
         }
+    }
+
+    fn run_params(
+        placement: &db::WorkspacePlacement,
+        operation_id: &str,
+        purpose: WorkspaceRunPurpose,
+    ) -> WorkspaceRunParams {
+        WorkspaceRunParams {
+            fence: WorkspaceMutationFence {
+                daemon_id: placement.daemon_id.clone().unwrap(),
+                runtime_id: placement.runtime_id.clone().unwrap(),
+                placement_id: placement.id.clone(),
+                operation_id: operation_id.to_owned(),
+                generation: u64::try_from(placement.generation).unwrap(),
+                expected: WorkspaceOperationExpected::BaseSha {
+                    sha: "base-head".to_owned(),
+                },
+            },
+            workspace_handle: placement.workspace_handle.clone().unwrap(),
+            purpose,
+            command: "printf should-not-run".to_owned(),
+            env: vec![],
+            timeout_secs: 1,
+            max_output_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_run_error_is_recorded_before_journal_ack() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let (_, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let client = DaemonWorkspaceClient::new(registry.clone()).with_receipts(db.clone());
+        let operation_id = "policy-error-operation";
+        let params = run_params(&placement, operation_id, WorkspaceRunPurpose::Hook);
+        let responder = {
+            let registry = registry.clone();
+            let daemon_id = daemon_id.clone();
+            tokio::spawn(async move {
+                let DaemonFrame::Request { id, method, params } = outbound.recv().await.unwrap()
+                else {
+                    panic!("workspace run request")
+                };
+                assert_eq!(method, METHOD_WORKSPACE_RUN);
+                registry.dispatch_incoming_for_connection(
+                    &daemon_id,
+                    connection_id,
+                    DaemonFrame::Error {
+                        id: Some(id),
+                        error: DaemonErrorPayload {
+                            code: PURPOSE_DENIED.to_owned(),
+                            message: "hook denied".to_owned(),
+                            details: Some(json!({
+                                "entry_id": "policy-error-entry",
+                                "operation_id": params["operation_id"],
+                            })),
+                        },
+                    },
+                );
+                let DaemonFrame::Request { id, method, params } = outbound.recv().await.unwrap()
+                else {
+                    panic!("journal acknowledgement")
+                };
+                assert_eq!(method, METHOD_JOURNAL_ACK);
+                assert_eq!(params["entry_id"], "policy-error-entry");
+                registry.dispatch_incoming_for_connection(
+                    &daemon_id,
+                    connection_id,
+                    DaemonFrame::Response {
+                        id,
+                        result: json!({
+                            "entry_id": "policy-error-entry",
+                            "acknowledged": true,
+                        }),
+                    },
+                );
+            })
+        };
+
+        assert!(matches!(
+            client.run(&daemon_id, params).await,
+            Err(WorkspaceClientError::Daemon(error)) if error.code == PURPOSE_DENIED
+        ));
+        responder.await.unwrap();
+        let operations: Vec<String> = sqlx::query_scalar(
+            "SELECT operation FROM command_receipt WHERE idempotency_key = ? ORDER BY operation",
+        )
+        .bind("policy-error-entry")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            operations,
+            vec!["daemon.workspace.run", "daemon.workspace.run.ack"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciled_workspace_run_error_is_recorded_before_journal_ack() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let (_, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let client = DaemonWorkspaceClient::new(registry.clone()).with_receipts(db.clone());
+        let operation_id = "interrupted-error-operation";
+        let params = run_params(&placement, operation_id, WorkspaceRunPurpose::CiStep);
+        let responder = {
+            let registry = registry.clone();
+            let daemon_id = daemon_id.clone();
+            tokio::spawn(async move {
+                let mut methods = Vec::new();
+                for step in 0..3 {
+                    let DaemonFrame::Request { id, method, params } =
+                        outbound.recv().await.unwrap()
+                    else {
+                        panic!("workspace reconciliation request")
+                    };
+                    methods.push(method.clone());
+                    let frame = match step {
+                        0 => DaemonFrame::Error {
+                            id: Some(id),
+                            error: DaemonErrorPayload {
+                                code: DAEMON_UNAVAILABLE.to_owned(),
+                                message: "interrupted".to_owned(),
+                                details: Some(json!({
+                                    "entry_id": "interrupted-intent-entry",
+                                    "interrupted": true,
+                                })),
+                            },
+                        },
+                        1 => DaemonFrame::Response {
+                            id,
+                            result: json!({
+                                "entry_id": "interrupted-error-entry",
+                                "operation_id": params["operation_id"],
+                                "outcome": {
+                                    "kind": "error",
+                                    "error": {
+                                        "code": DAEMON_UNAVAILABLE,
+                                        "message": "command outcome unknown",
+                                        "details": null,
+                                    },
+                                },
+                            }),
+                        },
+                        _ => {
+                            assert_eq!(params["entry_id"], "interrupted-error-entry");
+                            DaemonFrame::Response {
+                                id,
+                                result: json!({
+                                    "entry_id": "interrupted-error-entry",
+                                    "acknowledged": true,
+                                }),
+                            }
+                        }
+                    };
+                    registry.dispatch_incoming_for_connection(&daemon_id, connection_id, frame);
+                }
+                methods
+            })
+        };
+
+        assert!(matches!(
+            client.run(&daemon_id, params).await,
+            Err(WorkspaceClientError::Daemon(error)) if error.code == DAEMON_UNAVAILABLE
+        ));
+        assert_eq!(
+            responder.await.unwrap(),
+            vec![
+                METHOD_WORKSPACE_RUN,
+                METHOD_WORKSPACE_DESCRIBE,
+                METHOD_JOURNAL_ACK,
+            ]
+        );
+        let operations: Vec<String> = sqlx::query_scalar(
+            "SELECT operation FROM command_receipt WHERE idempotency_key = ? ORDER BY operation",
+        )
+        .bind("interrupted-error-entry")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            operations,
+            vec!["daemon.workspace.run", "daemon.workspace.run.ack"]
+        );
     }
 
     #[tokio::test(start_paused = true)]

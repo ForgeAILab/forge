@@ -2419,7 +2419,9 @@ at the next physical line after malformed input, and retain unknown evidence
 kinds as `other` with the original kind in the caption. Entry positions use
 stable `line` or `line:column` strings for ingestion receipts. Terminal and cleanup
 results replay after reconnect until `journal.ack { entry_id }`. The server must
-persist a result before acknowledging it. The daemon then deletes the receipt; repeated acks are
+persist a result, including a terminal operation error, before acknowledging it.
+Exact terminal replays are coalesced while retained so a describe-triggered replay
+cannot compete with the reconciliation drain. The daemon then deletes the receipt; repeated acks are
 idempotent. Unacknowledged results survive a crash between completion and ack.
 For a successful write-capable execution, the daemon records the worktree's
 actual Git HEAD when the selected adapter does not return one, so reconnect
@@ -2594,8 +2596,9 @@ owner to be online and advertise `resume` for the snapshot's executor.
 Cleanup goes through the placement backend. An offline owner's placement stays
 `cleaning` and visible until the owner acknowledges removal; only then is it
 `cleaned`. Immediate cleanup retries a placement version conflict within its
-existing timeout, so concurrent disconnect or reconciliation does not discard
-the cleanup request. A retry of an already cleaned daemon workspace also drains
+existing timeout, including when the owner's unsolicited cleanup notification
+commits `cleaned` before the matching RPC response is applied, so concurrent
+disconnect or reconciliation does not discard the cleanup request. A retry of an already cleaned daemon workspace also drains
 retained journal acknowledgements. With a persisted `cleaning` intent, an owner's
 `invalid_input: unknown workspace_handle` response means cleanup already finished;
 other unknown-handle responses remain errors. Cleanup acknowledgements report

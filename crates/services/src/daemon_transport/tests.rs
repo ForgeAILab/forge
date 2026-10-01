@@ -115,6 +115,42 @@ impl DaemonExecutionEventHandler for IgnoreHandler {
 }
 
 #[derive(Default)]
+struct AwaitingCascadeHandler {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl DaemonExecutionEventHandler for AwaitingCascadeHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(DaemonTerminalDisposition::AwaitingCascade)
+    }
+}
+
+#[derive(Default)]
 struct JournalReadinessHandler {
     ready: std::sync::atomic::AtomicBool,
     committed: std::sync::atomic::AtomicBool,
@@ -1035,6 +1071,52 @@ async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
         .await
         .unwrap());
     responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_terminal_replay_does_not_compete_with_reconciliation_drain() {
+    let handler = Arc::new(AwaitingCascadeHandler::default());
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        handler.clone(),
+    ));
+    let (connection, _outbound) = DaemonConnection::new("journal-owner".to_owned());
+    let connection_id = connection.id();
+    registry.register("journal-owner".to_owned(), connection);
+    accept_protocol_handshake(&registry, "journal-owner", connection_id);
+    let notification: api_types::ExecutionTerminalNotification = serde_json::from_value(json!({
+        "terminal_report_id": "report-journal", "execution_id": "execution-journal", "exit_code": 0,
+        "ts": now_rfc3339(), "status": "completed", "usage_reports": [],
+    }))
+    .unwrap();
+    for _ in 0..2 {
+        registry.dispatch_incoming_for_connection(
+            "journal-owner",
+            connection_id,
+            api_types::DaemonFrame::Notification {
+                method: api_types::METHOD_EXECUTION_TERMINAL.to_owned(),
+                params: serde_json::to_value(&notification).unwrap(),
+            },
+        );
+    }
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        handler.calls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the describe-triggered exact replay reuses the retained notification"
+    );
+
+    assert!(registry
+        .drain_execution_journal("journal-owner", connection_id, &[notification.execution_id])
+        .await
+        .unwrap());
+    assert_eq!(
+        handler.calls.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "reconciliation owns the next application of the retained report"
+    );
 }
 
 #[tokio::test]
