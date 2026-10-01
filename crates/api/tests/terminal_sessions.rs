@@ -191,7 +191,6 @@ async fn seed_task(harness: &Harness) -> SeededTask {
             name: "repo".to_owned(),
             remote_url: Some("file:///tmp/repo".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

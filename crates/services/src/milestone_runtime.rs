@@ -2375,7 +2375,7 @@ impl MilestoneRuntime {
         let mut context = Vec::new();
         for task in tasks {
             let rows = sqlx::query(
-                "SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
+                "SELECT repo.id AS repo_id, repo.name AS repository_name,
                         CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END AS remote_url,
                         repo.default_branch,
                         e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
@@ -2417,7 +2417,6 @@ impl MilestoneRuntime {
                 task_version: task.version,
                 repository_id: row.try_get("repo_id")?,
                 repository_name: row.try_get("repository_name")?,
-                repository_kind: row.try_get("repository_kind")?,
                 remote_url: db::normalize_repo_remote_url(row.try_get("remote_url")?),
                 default_branch: row.try_get("default_branch")?,
                 execution_id: row.try_get("execution_id")?,
@@ -3474,7 +3473,6 @@ struct RepositoryContextReference {
     task_version: i64,
     repository_id: String,
     repository_name: String,
-    repository_kind: String,
     remote_url: Option<String>,
     default_branch: String,
     execution_id: Option<String>,
@@ -3502,7 +3500,6 @@ fn validate_repository_context_reference(
         || reference.task_version <= 0
         || reference.repository_id.trim().is_empty()
         || reference.repository_name.trim().is_empty()
-        || reference.repository_kind.trim().is_empty()
         || reference.default_branch.trim().is_empty()
         || reference.observed_at.trim().is_empty()
         || reference
@@ -4734,7 +4731,6 @@ mod tests {
                     name: "Local Repo".to_owned(),
                     remote_url: remote_url.map(str::to_owned),
                     local_path: Some("/tmp/local-repo".to_owned()),
-                    work_mode: db::WorkMode::DirectMerge,
                     default_branch: "main".to_owned(),
                     created_at: now.to_owned(),
                     updated_at: now.to_owned(),

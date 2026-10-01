@@ -5504,8 +5504,6 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
         | crate::ServiceError::MissingPrimaryRepo { .. }
         | crate::ServiceError::PrimaryRepoNotFound { .. }
         | crate::ServiceError::RepoMismatch { .. }
-        | crate::ServiceError::PrProviderMissing { .. }
-        | crate::ServiceError::PrProviderTokenMissing { .. }
         | crate::ServiceError::TerminalWorkspaceNotReady
         | crate::ServiceError::TerminalDisabled => (
             OutcomeCode::SetupRequired,
@@ -6007,7 +6005,6 @@ mod tests {
                 name: "repo".to_owned(),
                 remote_url: Some("https://example.invalid/repo.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

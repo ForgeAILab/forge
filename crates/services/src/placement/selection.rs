@@ -6,7 +6,7 @@ use api_types::{
 };
 use db::{
     Agent, PlacementOwnerKind, PlacementSelectedBy, PlacementState, Repo, RepoLocation,
-    RepoLocationKind, RepoLocationOwnerKind, RepoLocationStatus, SqliteDb, Task, WorkMode,
+    RepoLocationKind, RepoLocationOwnerKind, RepoLocationStatus, SqliteDb, Task,
     WorkspacePlacement, WorkspacePlacementRepo,
 };
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,6 @@ pub enum PlacementFilterCode {
     PinMismatch,
     AgentCapacity,
     DaemonCapacity,
-    WorkModeUnsupported,
     NativeBackendUnsupported,
     RunPurposeDenied,
     NotVisible,
@@ -483,9 +482,6 @@ fn filter_candidate(
             .is_none_or(|capacity| !capacity.has_capacity())
     {
         filters.insert(DaemonCapacity);
-    }
-    if daemon_owned && context.repo.work_mode != WorkMode::DirectMerge {
-        filters.insert(WorkModeUnsupported);
     }
     if (!daemon_owned || owner_facts_known)
         && context
@@ -942,7 +938,6 @@ mod tests {
                 name: "Repo".to_owned(),
                 remote_url: Some("https://example.test/repo.git".to_owned()),
                 local_path: None,
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: NOW.to_owned(),
                 updated_at: NOW.to_owned(),
@@ -1165,25 +1160,6 @@ mod tests {
         let mut context = context();
         context.claiming_agent.agent.backend_kind = "native".to_owned();
         rejected(&context, PlacementFilterCode::NativeBackendUnsupported);
-    }
-
-    #[test]
-    fn pull_request_daemon_placement_is_rejected() {
-        let mut context = context();
-        context.repo.work_mode = WorkMode::PullRequest;
-        rejected(&context, PlacementFilterCode::WorkModeUnsupported);
-    }
-
-    #[test]
-    fn server_locations_allow_native_roles_and_pull_requests() {
-        let mut context = context();
-        context.repo.work_mode = WorkMode::PullRequest;
-        context.worktree_agents[0].agent.backend_kind = "native".to_owned();
-        context.candidates = vec![candidate(&context, "server", None)];
-        assert_eq!(
-            selected(&context).candidate.location.owner_kind,
-            RepoLocationOwnerKind::Server
-        );
     }
 
     #[test]

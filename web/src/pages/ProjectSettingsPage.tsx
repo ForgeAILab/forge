@@ -606,9 +606,6 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
         name: nextForm.name.trim() || null,
         local_path: nextForm.source_mode === 'local' ? localPath : null,
         default_branch: nextForm.default_branch.trim() || 'main',
-        work_mode: nextForm.work_mode,
-        pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-        pr_provider_config: null,
       },
       {
         onError: (error) => toast.error(settingsErrorMessage(error, 'Repository creation failed')),

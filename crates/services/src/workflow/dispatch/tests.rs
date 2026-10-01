@@ -855,7 +855,6 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
             name: "repo".to_owned(),
             remote_url: Some("https://example.com/repo.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

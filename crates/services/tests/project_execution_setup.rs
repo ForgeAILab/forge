@@ -12,7 +12,7 @@ use db::{
     CreateAgentIdentity, CreateAgentProfile, CreateCommandReceipt, CreateProject, CreateRepo,
     CreateTask, DbError, Project, ProjectExecutionSetupCommandRepo, ProjectProvisioningRepo,
     ProjectRepo, RepoRepo, ScheduleProjectProvisioningRetry, SqliteDb, TaskRepo,
-    UpsertAgentConnectionHealth, WorkMode,
+    UpsertAgentConnectionHealth,
 };
 use serde_json::json;
 use services::{
@@ -128,7 +128,6 @@ async fn repo_with_local_path(db: &SqliteDb, project_id: &str, local_path: Optio
             name: "setup-repo".to_owned(),
             remote_url: Some("https://example.invalid/setup-repo".to_owned()),
             local_path: local_path.map(str::to_owned),
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,

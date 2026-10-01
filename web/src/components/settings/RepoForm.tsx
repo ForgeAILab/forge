@@ -9,7 +9,7 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
-import type { Daemon, WorkMode } from '@/types/generated/api'
+import type { Daemon } from '@/types/generated/api'
 import {
   ArrowCounterClockwise,
   CaretRight,
@@ -28,11 +28,6 @@ export type RepoFormState = {
   local_path: string
   remote_url: string
   default_branch: string
-  work_mode: WorkMode
-  pr_provider: string
-  pr_base_url: string
-  pr_token: string
-  pr_polling_interval_seconds: string
 }
 
 export const emptyRepoForm: RepoFormState = {
@@ -41,11 +36,6 @@ export const emptyRepoForm: RepoFormState = {
   local_path: '',
   remote_url: '',
   default_branch: 'main',
-  work_mode: 'direct_merge',
-  pr_provider: 'github',
-  pr_base_url: '',
-  pr_token: '',
-  pr_polling_interval_seconds: '60',
 }
 
 type RepoFormProps = {
@@ -277,8 +267,6 @@ export function RepoForm({
   }
 
   const crumbs = breadcrumbs(displayPath)
-  const showPrProvider = form.work_mode === 'pull_request'
-
   return (
     <>
       <div className="mt-4 grid gap-4">
@@ -526,82 +514,6 @@ export function RepoForm({
             )}
           </div>
         </div>
-
-        <div className="space-y-1.5">
-          <Label htmlFor="repo-work-mode">Work mode</Label>
-          <Select
-            id="repo-work-mode"
-            value={form.work_mode}
-            options={[
-              { value: 'direct_merge', label: 'Direct merge' },
-              { value: 'pull_request', label: 'Pull request' },
-            ]}
-            onChange={(value) => updateForm({ work_mode: value as WorkMode })}
-          />
-          <p className="text-xs text-muted-foreground">
-            {form.work_mode === 'pull_request'
-              ? 'Tasks open a pull request and wait for a human merge before completing.'
-              : 'Changes are merged directly to the default branch on completion.'}
-          </p>
-        </div>
-
-        {showPrProvider ? (
-          <div className="space-y-3 rounded-md border p-3">
-            <div>
-              <p className="text-sm font-medium">PR provider</p>
-              <p className="text-xs text-muted-foreground">
-                Pull request tasks wait for a human merge before completion.
-              </p>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label htmlFor="repo-pr-provider">Provider type</Label>
-                <Select
-                  id="repo-pr-provider"
-                  value={form.pr_provider}
-                  options={[
-                    { value: 'github', label: 'GitHub' },
-                    { value: 'gitea', label: 'Gitea' },
-                  ]}
-                  onChange={(value) => updateForm({ pr_provider: value })}
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="repo-pr-polling">Polling interval seconds</Label>
-                <Input
-                  id="repo-pr-polling"
-                  min={1}
-                  type="number"
-                  value={form.pr_polling_interval_seconds}
-                  onChange={(event) =>
-                    updateForm({ pr_polling_interval_seconds: event.target.value })
-                  }
-                />
-              </div>
-            </div>
-            {form.pr_provider !== 'github' ? (
-              <div className="space-y-1.5">
-                <Label htmlFor="repo-pr-base-url">Base URL</Label>
-                <Input
-                  id="repo-pr-base-url"
-                  placeholder="https://git.example.com"
-                  value={form.pr_base_url}
-                  onChange={(event) => updateForm({ pr_base_url: event.target.value })}
-                />
-              </div>
-            ) : null}
-            <div className="space-y-1.5">
-              <Label htmlFor="repo-pr-token">Token</Label>
-              <Input
-                id="repo-pr-token"
-                type="password"
-                autoComplete="off"
-                value={form.pr_token}
-                onChange={(event) => updateForm({ pr_token: event.target.value })}
-              />
-            </div>
-          </div>
-        ) : null}
       </div>
 
       <div className="mt-6 flex justify-end gap-2">

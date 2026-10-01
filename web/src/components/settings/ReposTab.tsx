@@ -9,12 +9,8 @@ import {
   Database,
   FolderOpen,
   GitBranch,
-  GitMerge,
-  GitPullRequest,
-  Key,
   LinkSimple,
   PencilSimple,
-  Timer,
   X,
 } from '@phosphor-icons/react'
 import { listBranches } from '@/api/client'
@@ -164,31 +160,11 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
     }
     const remoteUrl = remoteUrlInput || null
     const defaultBranch = nextForm.default_branch.trim() || 'main'
-    const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
-    const pollingInterval = Number(pollingIntervalInput)
-    if (
-      nextForm.work_mode === 'pull_request' &&
-      (!pollingIntervalInput || !Number.isInteger(pollingInterval) || pollingInterval < 1)
-    ) {
-      toast.error('Polling interval must be 1 or greater')
-      return null
-    }
     return {
       remote_url: remoteUrl,
       name: nextForm.name.trim() || null,
       local_path: nextForm.source_mode === 'local' ? localPath : null,
       default_branch: defaultBranch,
-      work_mode: nextForm.work_mode,
-      pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-      pr_provider_config:
-        nextForm.work_mode === 'pull_request'
-          ? {
-              base_url:
-                nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
-              polling_interval_seconds: pollingInterval,
-              token: nextForm.pr_token.trim() || null,
-            }
-          : null,
     }
   }
 
@@ -205,31 +181,11 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
     }
     const remoteUrl = remoteUrlInput || null
     const defaultBranch = nextForm.default_branch.trim() || 'main'
-    const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
-    const pollingInterval = Number(pollingIntervalInput)
-    if (
-      nextForm.work_mode === 'pull_request' &&
-      (!pollingIntervalInput || !Number.isInteger(pollingInterval) || pollingInterval < 1)
-    ) {
-      toast.error('Polling interval must be 1 or greater')
-      return null
-    }
     return {
       remote_url: remoteUrl,
       name: nextForm.name.trim() || null,
       local_path: nextForm.source_mode === 'local' ? localPath : null,
       default_branch: defaultBranch,
-      work_mode: nextForm.work_mode,
-      pr_provider: nextForm.work_mode === 'pull_request' ? nextForm.pr_provider : null,
-      pr_provider_config:
-        nextForm.work_mode === 'pull_request'
-          ? {
-              base_url:
-                nextForm.pr_provider === 'github' ? null : nextForm.pr_base_url.trim() || null,
-              polling_interval_seconds: pollingInterval,
-              token: nextForm.pr_token.trim() || null,
-            }
-          : null,
     }
   }
 
@@ -257,9 +213,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       })
     }
   }
-
-  const workModeLabel = (mode: Repo['work_mode']) =>
-    mode === 'pull_request' ? 'Pull request' : 'Direct merge'
 
   const isPending = editingRepoId ? updateRepo.isPending : createRepo.isPending
 
@@ -312,14 +265,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
                   <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
                     <Badge variant="outline" className="text-xs">
                       {primaryRepo.local_path ? 'Local' : 'Remote'}
-                    </Badge>
-                    <Badge variant="secondary" className="text-xs">
-                      {primaryRepo.work_mode === 'pull_request' ? (
-                        <GitPullRequest size={10} className="mr-1" />
-                      ) : (
-                        <GitMerge size={10} className="mr-1" />
-                      )}
-                      {workModeLabel(primaryRepo.work_mode)}
                     </Badge>
                   </div>
                 </div>
@@ -446,46 +391,6 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
                 </div>
               </div>
             </div>
-
-            {/* PR provider section */}
-            {primaryRepo.work_mode === 'pull_request' ? (
-              <div className="border-t bg-muted/20 px-4 py-3">
-                <p className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">
-                  PR Provider
-                </p>
-                <div className="flex flex-wrap gap-3">
-                  <div className="flex items-center gap-1.5">
-                    <Badge variant="outline" className="text-xs capitalize">
-                      {primaryRepo.pr_provider_status?.provider_type ??
-                        primaryRepo.pr_provider ??
-                        'Not configured'}
-                    </Badge>
-                  </div>
-                  {primaryRepo.pr_provider_status ? (
-                    <>
-                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Key size={12} />
-                        <span
-                          className={
-                            primaryRepo.pr_provider_status.has_token
-                              ? 'text-green-600 dark:text-green-400'
-                              : 'text-destructive'
-                          }
-                        >
-                          {primaryRepo.pr_provider_status.has_token ? 'Token saved' : 'No token'}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Timer size={12} />
-                        <span>
-                          Polls every {primaryRepo.pr_provider_status.polling_interval_seconds}s
-                        </span>
-                      </div>
-                    </>
-                  ) : null}
-                </div>
-              </div>
-            ) : null}
           </div>
           <IntegrationsTab
             embedded

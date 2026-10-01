@@ -2423,12 +2423,11 @@ pub trait ProjectHookRunRepo: Send + Sync {
 #[async_trait]
 pub trait RepoRepo: Send + Sync {
     async fn create(&self, input: CreateRepo) -> Result<Repo>;
-    /// Create a primary repository, optional provider configuration, and the
-    /// Project's primary-repository link plus dispatch wake atomically.
+    /// Create a primary repository and the Project's primary-repository link
+    /// plus dispatch wake atomically.
     async fn create_primary_for_project(
         &self,
         input: CreateRepo,
-        provider_config: Option<CreatePrProviderConfig>,
         expected_project_version: i64,
         project_updated_at: String,
     ) -> Result<Repo>;
@@ -2448,22 +2447,6 @@ pub trait RepoLocationRepo: Send + Sync {
     async fn delete(&self, id: &str) -> Result<()>;
     /// Supplies the Task identity for the delete-in-use response.
     async fn get_blocking_placement(&self, id: &str) -> Result<Option<WorkspacePlacement>>;
-}
-
-#[async_trait]
-pub trait PrProviderConfigRepo: Send + Sync {
-    async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig>;
-    async fn get_by_repo_id(&self, repo_id: &str) -> Result<Option<PrProviderConfig>>;
-    async fn update(&self, input: UpdatePrProviderConfig) -> Result<PrProviderConfig>;
-    async fn delete(&self, id: &str) -> Result<()>;
-}
-
-#[async_trait]
-pub trait PrMetadataRepo: Send + Sync {
-    async fn create(&self, input: CreatePrMetadata) -> Result<PrMetadata>;
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>>;
-    async fn update(&self, input: UpdatePrMetadata) -> Result<PrMetadata>;
-    async fn delete(&self, id: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -2606,7 +2589,6 @@ pub struct CreateRepo {
     pub name: String,
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
-    pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -2618,7 +2600,6 @@ pub struct UpdateRepo {
     pub name: Option<String>,
     pub local_path: Option<Option<String>>,
     pub remote_url: Option<Option<String>>,
-    pub work_mode: Option<WorkMode>,
     pub default_branch: Option<String>,
     pub updated_at: String,
 }
@@ -2650,58 +2631,6 @@ pub struct UpdateRepoLocation {
     pub status: Option<RepoLocationStatus>,
     pub last_verified_at: Option<Option<String>>,
     pub last_error: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePrProviderConfig {
-    pub id: String,
-    pub repo_id: String,
-    pub provider_type: String,
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: i64,
-    pub token_secret_ref: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdatePrProviderConfig {
-    pub id: String,
-    pub provider_type: Option<String>,
-    pub base_url: Option<Option<String>>,
-    pub polling_interval_seconds: Option<i64>,
-    pub token_secret_ref: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePrMetadata {
-    pub id: String,
-    pub task_id: String,
-    pub provider_type: String,
-    pub provider_pr_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub pr_state: String,
-    pub merge_status: String,
-    pub last_synced_at: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdatePrMetadata {
-    pub id: String,
-    pub provider_type: Option<String>,
-    pub provider_pr_id: Option<Option<String>>,
-    pub pr_url: Option<Option<String>>,
-    pub source_branch: Option<String>,
-    pub target_branch: Option<String>,
-    pub pr_state: Option<String>,
-    pub merge_status: Option<String>,
-    pub last_synced_at: Option<Option<String>>,
     pub updated_at: String,
 }
 

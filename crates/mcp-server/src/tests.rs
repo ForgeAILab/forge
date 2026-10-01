@@ -421,7 +421,6 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
             name: "forge".to_owned(),
             local_path: None,
             remote_url: Some("https://example.com/forge.git".to_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,

@@ -578,7 +578,6 @@ test.describe('lifecycle hook blocking flow (integration)', () => {
           name: `blocked-hook-app-${runId}`,
           remote_url: fixturePath,
           local_path: fixturePath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         },
       )
@@ -697,7 +696,6 @@ test.describe('lifecycle hook blocking flow (integration)', () => {
           name: `skip-hook-live-agent-app-${runId}`,
           remote_url: fixturePath,
           local_path: fixturePath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         },
       )

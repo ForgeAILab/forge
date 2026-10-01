@@ -243,21 +243,12 @@ async fn assert_no_authoritative_records(fixture: &Fixture) {
         0
     );
 
-    // Validation, repository/merge metadata, and Task evidence.
+    // Validation and Task evidence.
     assert_eq!(
         count(
             &fixture.db,
             "SELECT COUNT(*) FROM project_milestone_check_result WHERE project_id = ?",
             PROJECT_ID,
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        count(
-            &fixture.db,
-            "SELECT COUNT(*) FROM pr_metadata WHERE task_id = ?",
-            TASK_ID,
         )
         .await,
         0

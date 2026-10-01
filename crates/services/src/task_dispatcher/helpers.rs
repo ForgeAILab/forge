@@ -46,8 +46,7 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::DependencyGate
         | ServiceError::MissingPrimaryRepo { .. }
         | ServiceError::PrimaryRepoNotFound { .. }
-        | ServiceError::RepoMismatch { .. }
-        | ServiceError::PrProviderMissing { .. } => true,
+        | ServiceError::RepoMismatch { .. } => true,
         ServiceError::DaemonUpgradeRequired { .. } => true,
         ServiceError::PlacementUnavailable(error) => error.needs_daemon_upgrade(),
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",

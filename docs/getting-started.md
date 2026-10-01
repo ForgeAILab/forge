@@ -1036,7 +1036,7 @@ diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
 `GET /api/v1/tasks/{id}/diff`.
 
 After an attempt starts, its Workspace/lease repository identity is immutable
-provenance for diff, review, pull request, evidence, and release records. A
+provenance for diff, review, evidence, and release records. A
 later Project repository change does not rewrite that history, and Forge does
 not silently reuse an old-Repo Workspace for a new attempt.
 
@@ -1257,10 +1257,9 @@ does not need access to that machine's checkout or worktree paths.
    and has a matching remote when present. `unverified`, `unavailable`, and
    `invalid` locations cannot receive work; inspect the last error and retry
    verification after fixing the checkout or reconnecting the daemon.
-4. Use a direct-merge repository and CLI Agents for every assigned worktree role
-   (coder, reviewer, planner). Install, authenticate, and enable their executors
-   on that daemon, and allow the configured run purposes below. Daemon-owned
-   pull-request delivery and native Agents are outside this slice.
+4. Use CLI Agents for every assigned worktree role (coder, reviewer, planner).
+   Install, authenticate, and enable their executors on that daemon, and allow
+   the configured run purposes below. Native Agents are outside this slice.
 
 Claim reserves capacity, prepares the workspace on its owner, then creates the
 Task claim, Running Execution, and lease. Preparation failure creates no

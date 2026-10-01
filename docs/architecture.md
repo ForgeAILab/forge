@@ -1127,8 +1127,8 @@ for proof.
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
 Repository/build context permits an absent remote URL for local-only
 repositories; blank remote URLs normalize to `NULL`/`None` at repository writes
-and context reads. Repository identity, name, work mode, default branch, Task
-version, and observed timestamp remain required immutable metadata.
+and context reads. Repository identity, name, default branch, Task version, and
+observed timestamp remain required immutable metadata.
 
 Each snapshot records the exact input manifest, source versions, evidence attachment
 IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
@@ -2209,9 +2209,9 @@ An Agent pinned to this server's registered embedded machine can use a server
 placement without a shared mount. Admission records that embedded daemon as
 `execution_daemon_id`, including for existing server workspaces without a
 recorded provider; the workspace owner and handle stay on the server.
-Daemon placements require direct-merge repositories and CLI Agents for every
-assigned worktree role (coder, reviewer, planner); pull-request mode and native
-Agents are rejected with `work_mode_unsupported` or `native_backend_unsupported`.
+Daemon placements require CLI Agents for every assigned worktree role (coder,
+reviewer, planner); native Agents are rejected with
+`native_backend_unsupported`.
 
 Agent claims, initial launches, re-execution, resume, and follow-ups refuse a
 paused Project with `ProjectPaused` before placement selection, reservation,
@@ -2624,7 +2624,7 @@ the shell, allowing the blocking PTY reader to exit during runtime shutdown.
 backlog ──► todo ──► planning ──► in_progress ──► review ──► merging ──► done
    ▲          │                           ▲           │          │
    └──────────┘                           └───────────┘          ▼
-                                                       merge_failed ──► blocked
+                                                       merge_failed
 
                          any non-terminal state ──► cancelled
 ```
@@ -2633,7 +2633,10 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `cancelled`. The default workflow lives in
 `crates/services/src/workflow/default_workflow.rs` with sequence
 `backlog → todo → planning → in_progress → review → merging → done` and
-`merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
+`merge_failed` and `cancelled` as failure/terminal states. A `merge_failed`
+Task can return to `review` after repair or retry from `in_progress`; typed
+blocking annotations park a Task in its current state and are not states
+themselves.
 
 Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
@@ -3019,8 +3022,7 @@ completion retains strict parsing.
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
 blocking annotation or running entry barrier, and no execution, merge hook, or
-completion cascade is running for the Task. Human approval gates and published
-pull requests awaiting a human/provider merge remain parked.
+completion cascade is running for the Task. Human approval gates remain parked.
 Recovery uses the same versioned, same-state engine entry path as paused
 integration retries, so entry hooks and their normal success/failure cascades
 run again; a version conflict skips the tick. The merge hook is tracked through
@@ -3457,8 +3459,8 @@ Migration `V138__project_owned_task_repository.sql` removes the nullable
 `task.repo_id` column and its index without rewriting Task rows or historical
 execution records. Workspace-lease guards instead require the Project's current
 primary Repo to exist in that Project and to match both the new lease binding
-and execution Workspace. Workspace, lease, review, pull-request, evidence,
-release, and extra unselected Repo rows retain their repository identities;
+and execution Workspace. Workspace, lease, review, evidence, release, and extra
+unselected Repo rows retain their repository identities;
 removing Project repository setup no longer deletes Tasks through a Repo
 foreign-key cascade.
 
@@ -3481,17 +3483,18 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   checkpoints, capability-aware native/CLI Agent Chat backends, content guards,
   and scope-derived workspace adapters.
 - **services** — `TaskService.transition()` handles side effects (event
-  emission, counter increments, `ReviewRunner` on `→ review`, `MergeService`
-  on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
+  emission, counter increments, workflow entry hooks on `→ review`,
+  `MergeService` on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
   `→ cancelled`). Background tasks: `CrashRecovery` at startup (orphan
   execution recovery and stale-annotation sweep), `HeartbeatMonitor` (owner
   lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
-- **review** — `ReviewRunner` prepares the Task worktree by running
-  `task.review_config.setup_steps`, then runs `ci_steps` as `bash -lc` commands.
-  Task configuration overrides the Project's `default_review_config`; otherwise
-  the Project defaults are inherited. A ready Project Agent can replace both
+- **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
+  runs configured checks before ordinary reviewer dispatch. `ReviewRunner`
+  owns reviewer/auditor execution and explicit review reruns. Task configuration
+  overrides the Project's `default_review_config`; otherwise the Project
+  defaults are inherited. A ready Project Agent can replace both
   default lists through the versioned, receipt-atomic `project.review_config`
   command and reads them from `project.current_state`. Discovery, planning, and
   explicitly read-only Tasks suppress both implementation lists. Empty steps
@@ -3582,8 +3585,8 @@ candidate route instead of a single adapter:
   equality is not sufficient).
 - **mcp-server** — JSON-RPC dispatch over `POST /mcp` with its own `McpState`.
   Does not depend on the `api` crate.
-- **workspace** — File-based locking via `.forge.lock`. Path validation
-  prevents traversal escapes.
+- **workspace** — Keyed in-process locks serialize repository-cache/integration
+  and Workspace execution operations. Path validation prevents traversal escapes.
 - **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
   file > defaults. Default bind uses loopback with an OS-selected port, then
   persists the selected port under the Forge data directory.
@@ -3777,10 +3780,8 @@ object, and checks the resulting head. Stale review authority and a clean target
 rebase enter a marked review-refresh route; they do not consume merge-fix budget
 or dispatch a coder. Actual conflicts enter bounded merge repair. Changed content
 must receive a new semantic review, regardless of `review_passed_at`, except for
-the mechanical carry below. PR publication pushes the immutable reviewed object and
-rechecks authority; the external provider's final merge remains a human/provider
-operation. Explicit human and no-agent-review workflows remain separate and
-cannot manufacture an automated Charter assessment.
+the mechanical carry below. Explicit human and no-agent-review workflows remain
+separate and cannot manufacture an automated Charter assessment.
 
 **Review authority carry.** A Task that loses merge races on shared hub files
 would otherwise pay a full reviewer run per lost race. The `review` state's
@@ -3819,8 +3820,8 @@ engine stops running `on_enter` hooks after a cascade, so no reviewer is
 dispatched. `lock_review_integration` keeps every existing check and exposes the
 effective candidate: the newest carry row whose `contract_execution_id` is the
 current passed contract's, else the contract's own `commit_sha`/`base_sha`.
-Integration and PR publication compare `HEAD` and the target tip with that
-candidate, so a newer real review (a different contract execution) supersedes
+Integration compares `HEAD` and the target tip with that candidate, so a newer
+real review (a different contract execution) supersedes
 all earlier carries automatically. A stored workflow change (such as migration
 `V148`) forces a fresh v1 review; for v2, only a change to review authority
 invalidates the source digest.

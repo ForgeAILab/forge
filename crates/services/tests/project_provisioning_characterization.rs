@@ -15,7 +15,7 @@ use db::{
     AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateProject,
     CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
     CreateRepo, Project, ProjectOrchestrationRepo, ProjectRepo, RepoRepo, SqliteDb,
-    UpsertAgentConnectionHealth, User, UserRepo, WorkMode,
+    UpsertAgentConnectionHealth, User, UserRepo,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -470,7 +470,6 @@ async fn repository_row_without_project_link_is_reused_without_a_duplicate_row()
             name: project_slug(&fixture.project.name),
             remote_url: Some(fixture.repo_path.to_string_lossy().into_owned()),
             local_path: Some(fixture.repo_path.to_string_lossy().into_owned()),
-            work_mode: WorkMode::DirectMerge,
             default_branch: DEFAULT_BRANCH.to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -517,7 +516,6 @@ async fn remote_repository_ready_backfill_is_verified_without_local_reprovisioni
             name: "remote-repository".to_owned(),
             remote_url: Some("https://example.invalid/remote-repository.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: DEFAULT_BRANCH.to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

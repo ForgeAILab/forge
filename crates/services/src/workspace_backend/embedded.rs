@@ -490,15 +490,6 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
         spec: &MergeSpec,
     ) -> Result<MergeOutcome> {
         let workspace = self.workspace(placement).await?;
-        if RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
-            .await?
-            .is_some_and(|repo| repo.work_mode == db::WorkMode::PullRequest)
-        {
-            return Ok(self
-                .merge_service
-                .publish_workspace_pr(&placement.task_id, self.path(placement, &workspace))
-                .await?);
-        }
         let location = self.location(placement, &workspace).await?;
         let source = self.repo_source(&location).await?;
         Ok(self

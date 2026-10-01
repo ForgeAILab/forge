@@ -391,8 +391,8 @@ Repository locations identify a checkout on the server or a particular daemon
 runtime. Register daemon checkouts through `repo location add` and verify them
 before placement. A daemon may execute a server-owned workspace only through
 a verified `shared_mount` location; matching absolute paths alone are
-insufficient. Daemon-owned placement requires a direct-merge repository and
-CLI Agents for every role that touches its worktree.
+insufficient. Daemon-owned placement requires CLI Agents for every role that
+touches its worktree.
 
 The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
 (default: `[ci_step]`). Hook and environment setup purposes require local opt-in.

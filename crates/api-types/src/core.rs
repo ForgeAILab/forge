@@ -13,15 +13,6 @@ pub enum TaskType {
     Discovery,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum WorkMode {
-    #[default]
-    DirectMerge,
-    PullRequest,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -174,7 +165,6 @@ pub enum FailureKind {
     MergeFixBudgetExhausted,
     WorkflowGuardRejected,
     InternalCommandFailed,
-    PrClosedWithoutMerge,
     ExecutorFailed,
     WorkspaceFailed,
     WorkspaceResetRequired,

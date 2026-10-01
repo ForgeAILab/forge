@@ -404,7 +404,6 @@ pub struct Repo {
     pub name: String,
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
-    pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -412,12 +411,6 @@ pub struct Repo {
 
 pub fn normalize_repo_remote_url(remote_url: Option<String>) -> Option<String> {
     remote_url.filter(|value| !value.trim().is_empty())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkMode {
-    DirectMerge,
-    PullRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,34 +448,6 @@ pub struct RepoLocation {
     pub last_verified_at: Option<String>,
     pub last_error: Option<String>,
     pub version: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrProviderConfig {
-    pub id: String,
-    pub repo_id: String,
-    pub provider_type: String,
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: i64,
-    pub token_secret_ref: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrMetadata {
-    pub id: String,
-    pub task_id: String,
-    pub provider_type: String,
-    pub provider_pr_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub pr_state: String,
-    pub merge_status: String,
-    pub last_synced_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2547,11 +2512,6 @@ macro_rules! enum_strings {
         }
     };
 }
-
-enum_strings!(WorkMode {
-    DirectMerge => "direct_merge",
-    PullRequest => "pull_request",
-});
 
 enum_strings!(RepoLocationOwnerKind {
     Server => "server",

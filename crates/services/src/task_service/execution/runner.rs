@@ -1667,7 +1667,7 @@ mod tests {
     use super::*;
     use db::{
         AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-        CreateTask, ExecutionRepo, ProjectRepo, RepoRepo, TaskRepo, WorkMode,
+        CreateTask, ExecutionRepo, ProjectRepo, RepoRepo, TaskRepo,
     };
 
     const T0: &str = "2025-01-01T00:00:00+00:00";
@@ -1786,7 +1786,6 @@ mod tests {
                 name: "heartbeat-test".to_owned(),
                 remote_url: Some("https://example.invalid/heartbeat.git".to_owned()),
                 local_path: None,
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: T0.to_owned(),
                 updated_at: T0.to_owned(),

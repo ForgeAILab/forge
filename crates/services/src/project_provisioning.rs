@@ -28,7 +28,6 @@ use db::{
     ProjectProvisioningRepo, ProjectRepo, ReconcileProjectProvisioningCheckpoint,
     ReconcileProjectProvisioningMetadata, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
     UpdateProject, UpdateProjectProvisioningOperation, UpsertProjectProvisioningCheckpoint,
-    WorkMode,
 };
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -1900,7 +1899,6 @@ async fn find_or_register_repository(
         name: repo_directory_name(&project.name, &project.id),
         local_path: Some(local_path.clone()),
         remote_url: Some(local_path.clone()),
-        work_mode: WorkMode::DirectMerge,
         default_branch: DEFAULT_BRANCH.to_owned(),
         created_at: now.clone(),
         updated_at: now,

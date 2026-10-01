@@ -5,13 +5,12 @@ use crate::now_rfc3339;
 impl RepoRepo for SqliteDb {
     async fn create(&self, input: CreateRepo) -> Result<Repo> {
         let remote_url = normalize_repo_remote_url(input.remote_url);
-        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
             .bind(&remote_url)
             .bind(&input.local_path)
-            .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
             .bind(&input.created_at)
             .bind(&input.updated_at)
@@ -26,19 +25,9 @@ impl RepoRepo for SqliteDb {
     async fn create_primary_for_project(
         &self,
         input: CreateRepo,
-        provider_config: Option<CreatePrProviderConfig>,
         expected_project_version: i64,
         project_updated_at: String,
     ) -> Result<Repo> {
-        if provider_config
-            .as_ref()
-            .is_some_and(|config| config.repo_id != input.id)
-        {
-            return Err(DbError::Check(
-                "PR provider configuration must belong to the created repository".to_owned(),
-            ));
-        }
-
         let remote_url = normalize_repo_remote_url(input.remote_url);
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let project_row = sqlx::query("SELECT version, primary_repo_id FROM project WHERE id = ?")
@@ -52,36 +41,18 @@ impl RepoRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
             .bind(&remote_url)
             .bind(&input.local_path)
-            .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await
             .map_err(check_error)?;
-
-        if let Some(config) = provider_config {
-            sqlx::query(
-                "INSERT INTO pr_provider_config (id, repo_id, provider_type, base_url, polling_interval_seconds, token_secret_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&config.id)
-            .bind(&config.repo_id)
-            .bind(&config.provider_type)
-            .bind(&config.base_url)
-            .bind(config.polling_interval_seconds)
-            .bind(&config.token_secret_ref)
-            .bind(&config.created_at)
-            .bind(&config.updated_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(check_error)?;
-        }
 
         let result = sqlx::query(
             "UPDATE project
@@ -161,20 +132,16 @@ impl RepoRepo for SqliteDb {
         if let Some(remote_url) = input.remote_url {
             repo.remote_url = normalize_repo_remote_url(remote_url);
         }
-        if let Some(work_mode) = input.work_mode {
-            repo.work_mode = work_mode;
-        }
         if let Some(default_branch) = input.default_branch {
             repo.default_branch = default_branch;
         }
         repo.updated_at = input.updated_at;
         sqlx::query(
-            "UPDATE repo SET name = ?, remote_url = ?, local_path = ?, work_mode = ?, default_branch = ?, updated_at = ? WHERE id = ?",
+            "UPDATE repo SET name = ?, remote_url = ?, local_path = ?, default_branch = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&repo.name)
         .bind(&repo.remote_url)
         .bind(&repo.local_path)
-        .bind(repo.work_mode.to_string())
         .bind(&repo.default_branch)
         .bind(&repo.updated_at)
         .bind(&repo.id)

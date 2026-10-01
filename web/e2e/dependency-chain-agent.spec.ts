@@ -155,7 +155,6 @@ test.describe('dependency chain agent flow (integration)', () => {
           name: `dep-agent-repo-${runId}`,
           remote_url: fixturePath,
           local_path: fixturePath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         })
 

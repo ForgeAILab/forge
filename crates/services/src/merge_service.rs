@@ -3,8 +3,7 @@ use crate::{
     Result, ServiceError,
 };
 use db::{
-    now_rfc3339, ExecutionRepo, RepoRepo, ReviewConformanceRepo, SqliteDb, TaskRepo, WorkMode,
-    WorkspaceRepo,
+    now_rfc3339, ExecutionRepo, RepoRepo, ReviewConformanceRepo, SqliteDb, TaskRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -71,11 +70,6 @@ pub enum MergeOutcome {
         before_sha: String,
         after_sha: String,
         branch: String,
-    },
-    PullRequest {
-        pr_url: Option<String>,
-        branch: String,
-        target_branch: String,
     },
     /// Only an unreviewed-by-agent candidate (no review contract) takes the
     /// plain merge path that can produce this; the caller rebases it onto
@@ -154,7 +148,7 @@ impl MergeService {
 
     /// Handed-off conflict files whose current `HEAD` still adds Git conflict
     /// markers relative to the target branch. Empty when the Task was never
-    /// handed a conflict, delivers through a pull request, or has no workspace.
+    /// handed a conflict or has no workspace.
     /// Lets the workflow reject an unresolved repair before it is re-reviewed;
     /// [`MergeService::merge`] repeats the same check as the final guard.
     pub async fn unresolved_handoff_markers(&self, task_id: &str) -> Result<Vec<String>> {
@@ -176,9 +170,6 @@ impl MergeService {
         else {
             return Ok(Vec::new());
         };
-        if repo.work_mode == WorkMode::PullRequest {
-            return Ok(Vec::new());
-        }
         let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
         let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
             self.workspace_backend_router()?.as_ref(),
@@ -235,9 +226,6 @@ impl MergeService {
         else {
             return Ok(unavailable("repository not found"));
         };
-        if repo.work_mode == WorkMode::PullRequest {
-            return Ok(unavailable("pull request delivery is not carried"));
-        }
         let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
         let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
             self.workspace_backend_router()?.as_ref(),
@@ -437,18 +425,13 @@ impl MergeService {
             ));
         }
         let repo_id = workspace.repo_id.as_str();
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+        RepoRepo::get_by_id(&*self.db, repo_id)
             .await?
             .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::NotFound {
                 entity: "repo",
                 id: repo_id.to_owned(),
             })?;
-        if repo.work_mode == WorkMode::PullRequest {
-            return self
-                .publish_workspace_pr(&task_id, input.worktree_path)
-                .await;
-        }
         let target_branch = input.spec.target_branch.clone();
         let repo_path = input.repo_path;
         let worktree_path = input.worktree_path;
@@ -653,119 +636,6 @@ impl MergeService {
         }
     }
 
-    pub async fn publish_pr(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
-        let task_id = task_id.into();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.parent_task_id.is_some() {
-            return Err(ServiceError::invalid_operation(
-                "subtasks do not publish pull requests; only root tasks publish",
-            ));
-        }
-        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
-            })?;
-        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
-        let router = self.workspace_backend_router()?;
-        let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
-            &router,
-            &self.db,
-            &workspace,
-            &self.workspace_root,
-        )
-        .await?;
-        let path = resolved.embedded_path()?;
-        self.publish_workspace_pr(&task_id, &path).await
-    }
-
-    pub(crate) async fn publish_workspace_pr(
-        &self,
-        task_id: &str,
-        worktree_path: &Path,
-    ) -> Result<MergeOutcome> {
-        let task_id = task_id.to_owned();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.parent_task_id.is_some() {
-            return Err(ServiceError::invalid_operation(
-                "subtasks do not publish pull requests; only root tasks publish",
-            ));
-        }
-        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
-            .await?
-            .ok_or_else(|| ServiceError::InvalidOperation {
-                message: format!("task {task_id} has no executor execution"),
-            })?;
-        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
-        let repo_id = workspace.repo_id.as_str();
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
-            .await?
-            .filter(|repo| repo.project_id == task.project_id)
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
-        if repo.work_mode != WorkMode::PullRequest {
-            return Err(ServiceError::invalid_operation(
-                "publish_pr requires pull_request work mode",
-            ));
-        }
-        let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
-        let source_branch = workspace::task_branch_name(&task_id);
-
-        if !git::is_worktree_clean(worktree_path).await? {
-            return Ok(MergeOutcome::Dirty {
-                files: git::status_porcelain(worktree_path).await?,
-            });
-        }
-
-        let _integration_lock = self.integration_locks.acquire(repo_id).await;
-        let guard = match self.db.lock_review_integration(&task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => {
-                return Ok(MergeOutcome::ReviewRequired { reason });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let candidate = if let Some(candidate) = &guard.candidate {
-            let head = git::get_current_sha(worktree_path).await?;
-            if head != candidate.commit_sha {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: "PR candidate changed since review".into(),
-                });
-            }
-            Some(candidate.commit_sha.clone())
-        } else {
-            None
-        };
-        // Remote publication is not local integration. Push the exact accepted
-        // object, then recheck authority before recording the PR publication.
-        guard.release().await?;
-        let refspec = candidate
-            .as_ref()
-            .map(|sha| format!("{sha}:refs/heads/{source_branch}"));
-        push_branch(worktree_path, refspec.as_deref().unwrap_or(&source_branch)).await?;
-        let guard = match self.db.lock_review_integration(&task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => {
-                return Ok(MergeOutcome::ReviewRequired { reason });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        guard.release().await?;
-        let pr_service = crate::pr_service::PrService::new(Arc::clone(&self.db));
-        let published = pr_service
-            .publish_pr(&task, &repo, &source_branch, &target_branch)
-            .await?;
-
-        Ok(MergeOutcome::PullRequest {
-            pr_url: published.pr_url,
-            branch: source_branch,
-            target_branch,
-        })
-    }
-
     pub(crate) async fn resolve_repo_source(&self, repo: &db::Repo) -> Result<String> {
         if let Some(local_path) = repo
             .local_path
@@ -859,27 +729,6 @@ async fn ensure_managed_clone(remote_url: &str, clone_path: &Path) -> Result<Str
         )));
     }
     Ok(clone_path.to_string_lossy().into_owned())
-}
-
-async fn push_branch(worktree_path: &Path, branch: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["push", "-u", "origin", branch])
-        .current_dir(worktree_path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!("failed to push branch: {error}"))
-        })?;
-    if !output.status.success() {
-        return Err(ServiceError::invalid_operation(format!(
-            "failed to push branch {branch}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
 }
 
 async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
@@ -1031,7 +880,6 @@ mod tests {
                 name: "repo".to_owned(),
                 remote_url: Some(repo_path.to_string_lossy().into_owned()),
                 local_path: Some(repo_path.to_string_lossy().into_owned()),
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1169,7 +1017,6 @@ mod tests {
                 name: "replacement".to_owned(),
                 remote_url: Some(temp.path().join("replacement.git").display().to_string()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "trunk".to_owned(),
                 created_at: now.clone(),
                 updated_at: now,

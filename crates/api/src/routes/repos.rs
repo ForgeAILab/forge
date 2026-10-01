@@ -4,15 +4,15 @@ use api_types::{
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use db::{
-    new_uuid_v4, normalize_repo_remote_url, now_rfc3339, CreatePrProviderConfig, CreateRepo,
-    ProjectRepo, RepoRepo, UpdateRepo, WorkMode,
+    new_uuid_v4, normalize_repo_remote_url, now_rfc3339, CreateRepo, ProjectRepo, RepoRepo,
+    UpdateRepo,
 };
 
 use crate::{
     errors::{ApiError, ApiResult},
+    json::Json,
     path_input::canonical_directory,
     routes::{page_request, paginated, repo_response, ListParams},
     state::AppState,
@@ -50,37 +50,13 @@ pub async fn create_repo(
         name,
         local_path,
         remote_url,
-        work_mode: request
-            .work_mode
-            .map(work_mode_domain)
-            .unwrap_or(WorkMode::DirectMerge),
         default_branch: request.default_branch.unwrap_or_else(|| "main".to_owned()),
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-    let provider_config = request.pr_provider.map(|provider_type| {
-        let pr_config = request.pr_provider_config.as_ref();
-        CreatePrProviderConfig {
-            id: new_uuid_v4(),
-            repo_id,
-            provider_type,
-            base_url: pr_config.and_then(|config| config.base_url.clone()),
-            polling_interval_seconds: pr_config
-                .and_then(|config| config.polling_interval_seconds)
-                .unwrap_or(300),
-            token_secret_ref: pr_config.and_then(|config| config.token.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        }
-    });
-    let repo = RepoRepo::create_primary_for_project(
-        &*state.db,
-        repo,
-        provider_config,
-        project.version,
-        now_rfc3339(),
-    )
-    .await?;
+    let repo =
+        RepoRepo::create_primary_for_project(&*state.db, repo, project.version, now_rfc3339())
+            .await?;
     Ok(Json(repo_response(repo)))
 }
 
@@ -116,7 +92,6 @@ pub async fn update_repo(
             name: request.name,
             local_path,
             remote_url: request.remote_url.map(normalize_repo_remote_url),
-            work_mode: request.work_mode.map(work_mode_domain),
             default_branch: request.default_branch,
             updated_at: now_rfc3339(),
         },
@@ -195,11 +170,4 @@ fn repo_name_from_remote_url(remote_url: &str) -> String {
         .next()
         .unwrap_or(remote_url);
     segment.strip_suffix(".git").unwrap_or(segment).to_owned()
-}
-
-fn work_mode_domain(work_mode: api_types::WorkMode) -> WorkMode {
-    match work_mode {
-        api_types::WorkMode::DirectMerge => WorkMode::DirectMerge,
-        api_types::WorkMode::PullRequest => WorkMode::PullRequest,
-    }
 }

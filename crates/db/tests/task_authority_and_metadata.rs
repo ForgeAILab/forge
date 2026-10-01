@@ -1,7 +1,7 @@
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
     CreateTask, CreateTaskRoleAssignment, DbError, ProjectRepo, RepoRepo, SqliteDb,
-    TaskMetadataMutation, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateRepo, WorkMode,
+    TaskMetadataMutation, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateRepo,
 };
 use serde_json::json;
 
@@ -492,7 +492,6 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         name: "stale".to_owned(),
         remote_url: Some("https://example.test/stale.git".to_owned()),
         local_path: None,
-        work_mode: WorkMode::DirectMerge,
         default_branch: "main".to_owned(),
         created_at: "2026-09-12T00:05:00Z".to_owned(),
         updated_at: "2026-09-12T00:05:00Z".to_owned(),
@@ -501,7 +500,6 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     let stale_repo_result = RepoRepo::create_primary_for_project(
         &db,
         stale_repo,
-        None,
         project_after_workflow.version - 1,
         "2026-09-12T00:05:00Z".to_owned(),
     )
@@ -534,12 +532,10 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
             name: "primary".to_owned(),
             remote_url: Some("https://example.test/primary.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: "2026-09-12T00:06:00Z".to_owned(),
             updated_at: "2026-09-12T00:06:00Z".to_owned(),
         },
-        None,
         project_before_repo.version,
         "2026-09-12T00:06:00Z".to_owned(),
     )
@@ -563,7 +559,6 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
             name: Some("renamed".to_owned()),
             local_path: None,
             remote_url: None,
-            work_mode: None,
             default_branch: None,
             updated_at: "2026-09-12T00:07:00Z".to_owned(),
         },

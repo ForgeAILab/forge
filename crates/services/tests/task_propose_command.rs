@@ -140,7 +140,6 @@ async fn seed_project(
             name: format!("{project_id}-repo"),
             remote_url: Some(format!("file:///tmp/{repo_id}")),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),

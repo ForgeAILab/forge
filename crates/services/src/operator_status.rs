@@ -877,8 +877,8 @@ mod tests {
         .expect("project inserts");
 
         sqlx::query(
-            "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
-             VALUES (?, ?, ?, ?, NULL, 'direct_merge', 'main', ?, ?)",
+            "INSERT INTO repo (id, project_id, name, remote_url, local_path, default_branch, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 'main', ?, ?)",
         )
         .bind(&repo_id)
         .bind(&project_id)

@@ -21,7 +21,7 @@ use db::{
     CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, CreateWorkspace,
     CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionLeaseMutation,
     ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, UserRepo, WorkMode,
+    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, UserRepo,
     WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -853,7 +853,6 @@ pub async fn seed_startable_execution_for_daemon(
             name: "execution-repo".to_owned(),
             remote_url: Some("file:///tmp/execution-repo".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1094,7 +1093,6 @@ pub async fn seed_terminal_task_for_daemon(
             name: "terminal-repo".to_owned(),
             remote_url: Some("file:///tmp/terminal-repo".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

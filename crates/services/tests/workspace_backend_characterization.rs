@@ -141,7 +141,6 @@ async fn seed(fixture: &Fixture, review_config: Option<String>) -> Arc<SqliteDb>
             name: "repo".to_owned(),
             remote_url: Some(fixture.repo.display().to_string()),
             local_path: Some(fixture.repo.display().to_string()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),
