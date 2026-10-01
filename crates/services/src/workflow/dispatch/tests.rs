@@ -1058,6 +1058,18 @@ fn cli_delivery_prompts_name_the_outbox_instead_of_native_tools() {
             system.contains("$FORGE_OUTBOX/evidence.jsonl"),
             "{builder_id}"
         );
+        assert!(
+            system.contains("one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl`"),
+            "{builder_id}"
+        );
+        assert!(
+            system.contains("one JSON object per line to `$FORGE_OUTBOX/evidence.jsonl`"),
+            "{builder_id}"
+        );
+        assert!(
+            system.contains("`screenshot`, `walkthrough_video`, `log`, `report`, or `other`"),
+            "{builder_id}"
+        );
         assert!(!system.contains("`task.worklog`"), "{builder_id}");
         assert!(!system.contains("`task.evidence`"), "{builder_id}");
     }

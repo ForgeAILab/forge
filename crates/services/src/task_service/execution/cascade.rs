@@ -1868,11 +1868,16 @@ impl TaskService {
         }
         let final_message = reviewer_final_message(execution).await?;
         let workspace_path = match execution.workspace_id.as_deref() {
-            Some(id) => Some(
-                WorkspaceRepo::get_by_id(&*self.db, id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("workspace", id.to_owned()))?
-                    .worktree_path,
+            Some(_) => Some(
+                prepare_workspace(
+                    &self.db,
+                    &self.workspace_root,
+                    &task,
+                    &task.id,
+                    self.repo_cache_locks.clone(),
+                )
+                .await?
+                .worktree_path,
             ),
             None => None,
         };
@@ -2402,7 +2407,7 @@ impl TaskService {
         let review_state = workflow
             .states
             .iter()
-            .find(|state| state.name == crate::workflow::default_states::REVIEW);
+            .find(|state| state.name == task.status);
         let budget = crate::task_service::config::runtime_retry_budget(
             task,
             crate::task_service::config::RetryBudgetKind::Review,
@@ -2410,10 +2415,8 @@ impl TaskService {
             review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
         let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let existing_count = crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &entries,
-            crate::workflow::default_states::REVIEW,
-        );
+        let existing_count =
+            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, &task.status);
         if existing_count + 1 >= i64::from(budget) {
             let reason = "review retry budget exhausted";
             if let Some((task, recovery_reason)) = self
@@ -2453,42 +2456,27 @@ impl TaskService {
                     api_types::RecoveryAction::OpenInteractive,
                 ],
             });
-            let mut current = task.clone();
-            let mut updated = None;
-            for attempt in 0..3 {
-                match TaskRepo::update(
-                    &*self.db,
-                    UpdateTask {
-                        id: current.id.clone(),
-                        expected_version: current.version,
-                        title: None,
-                        description: None,
-                        priority: None,
-                        merge_config: None,
-                        plan: None,
-                        error_annotation: Some(Some(annotation.to_string())),
-                        blocked_json: Some(Some(blocked_meta.to_string())),
-                        failed_json: Some(None),
-                        task_state_config: None,
-                        parent_task_id: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await
-                {
-                    Ok(task) => {
-                        updated = Some(task);
-                        break;
-                    }
-                    Err(DbError::VersionConflict) if attempt < 2 => {
-                        current = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                            .await?
-                            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            let task = updated.ok_or(ServiceError::Db(DbError::VersionConflict))?;
+            // A stale recovery snapshot must not annotate a successor state
+            // or execution. Let the caller retry from current authority.
+            let task = TaskRepo::update(
+                &*self.db,
+                UpdateTask {
+                    id: task.id.clone(),
+                    expected_version: task.version,
+                    title: None,
+                    description: None,
+                    priority: None,
+                    merge_config: None,
+                    plan: None,
+                    error_annotation: Some(Some(annotation.to_string())),
+                    blocked_json: Some(Some(blocked_meta.to_string())),
+                    failed_json: Some(None),
+                    task_state_config: None,
+                    parent_task_id: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
             self.publish(ForgeEvent {
                 event_type: "task.blocked".to_owned(),
                 entity_id: task.id.clone(),
@@ -2503,7 +2491,10 @@ impl TaskService {
             });
             Ok((task, None, reason.to_owned()))
         } else {
-            let target = crate::workflow::default_states::IN_PROGRESS.to_owned();
+            let target = review_state
+                .and_then(|state| state.gate_config.as_ref())
+                .and_then(|gate| gate.reject_target.clone())
+                .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
             tracing::debug!(
                 task_id = %task.id,
                 rejections = existing_count,

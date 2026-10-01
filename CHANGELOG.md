@@ -6,6 +6,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Failed CI checks on non-user review entry now return the Task to its
+  configured remediation state through the normal review retry budget, or
+  record `review_budget_exhausted`. The dispatcher also recovers unblocked
+  failed reviews after two minutes, without rerouting user-entered reviews,
+  human decisions, or running work.
+
+- Review reruns, review-entry CI, and reviewer conformance checks now recover
+  deleted Task worktrees from the existing branch through the same workspace
+  preparation path used by executor dispatch.
+
 ## [0.13.11] - 2026-09-30
 
 ### Added
@@ -42,7 +54,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   without a running execution or merge hook, using the normal versioned entry
   path. A candidate already merged into the target completes idempotently,
   including when sibling Tasks have advanced the target since it landed.
-
 - A resumed or follow-up execution whose session began before the upgrade to
   0.13.10 no longer wedges its Task. Its copied executor snapshot lacked
   `backend_kind`/`plan_delivery`, so Forge discarded the finished run's result

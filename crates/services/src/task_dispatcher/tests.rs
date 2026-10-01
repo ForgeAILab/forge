@@ -1,5 +1,6 @@
 use std::{future::pending, path::Path, sync::Arc};
 
+use api_types::{Actor, SystemComponent};
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
@@ -14,7 +15,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
-use crate::deferred_dispatch;
+use crate::{deferred_dispatch, ServiceError};
 
 use super::*;
 
@@ -1451,6 +1452,315 @@ struct MergeGateFixture {
     task: Task,
     merge_service: Arc<crate::merge_service::MergeService>,
     dispatcher: TaskDispatcher,
+}
+
+struct FailedReviewFixture {
+    db: Arc<db::SqliteDb>,
+    task: Task,
+    dispatcher: TaskDispatcher,
+    _repo_dir: TempDir,
+}
+
+async fn failed_review_fixture(failed_ago: chrono::Duration, budget: i32) -> FailedReviewFixture {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
+    let task = seed_task(&db, &project_id, "stranded failed CI", "review", 0).await;
+    let candidate = seed_completed_coder_execution(&db, &task.id).await;
+    let failed_at = (chrono::Utc::now() - failed_ago).to_rfc3339();
+    let entered_at = (chrono::Utc::now() - failed_ago - chrono::Duration::seconds(1)).to_rfc3339();
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate,
+            attempt_number: 1,
+            status: ReviewStatus::Failed,
+            step_results_json: r#"{"ci_steps":[{"index":0,"command":"false","exit_code":1}]}"#
+                .to_owned(),
+            started_at: failed_at.clone(),
+            created_at: failed_at.clone(),
+            updated_at: failed_at,
+        },
+    )
+    .await
+    .unwrap();
+    TransitionLogRepo::insert(
+        &*db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "merge_failed".to_owned(),
+            to_state: "review".to_owned(),
+            trigger_name: None,
+            triggered_by: Actor::system(SystemComponent::Workflow).display(),
+            trigger_reason: "user action".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: entered_at,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(serde_json::json!({"retry_budgets":{"review":budget}}).to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+    let dispatcher = TaskDispatcher::new(Arc::clone(&db), event_bus, service);
+    FailedReviewFixture {
+        db,
+        task,
+        dispatcher,
+        _repo_dir: repo_dir,
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_recovers_after_grace_idempotently() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(current.blocked_json.is_none());
+    assert!(current.review_passed_at.is_none());
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        1
+    );
+    // The remediation transition fences a duplicate delivery of this entry.
+    assert!(!fixture
+        .dispatcher
+        .recover_failed_review(&fixture.task)
+        .await
+        .unwrap());
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()[0]
+            .status,
+        ReviewStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_records_exhausted_budget_once() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 1).await;
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "review");
+    let annotation: serde_json::Value =
+        serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["type"], "review_budget_exhausted");
+    assert!(!fixture
+        .dispatcher
+        .recover_failed_review(&current)
+        .await
+        .unwrap());
+    let unchanged = TaskRepo::get_by_id(&*fixture.db, &current.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version, current.version);
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_respects_grace_and_recovery_fences() {
+    for fence in [
+        "grace",
+        "annotation",
+        "blocked",
+        "running",
+        "awaiting_human",
+        "user",
+        "barrier",
+        "cascade",
+        "old_review",
+        "new_review",
+    ] {
+        let age = if fence == "grace" {
+            chrono::Duration::seconds(30)
+        } else {
+            chrono::Duration::minutes(3)
+        };
+        let fixture = failed_review_fixture(age, 3).await;
+        let cascade_slot = if fence == "cascade" {
+            fixture
+                .dispatcher
+                .task_service
+                .claim_completion_cascade(&fixture.task.id)
+        } else {
+            None
+        };
+        match fence {
+            "annotation" => {
+                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                    .bind(r#"{"type":"review_blocked","message":"owner action required"}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "blocked" => {
+                sqlx::query("UPDATE task SET blocked_json = '{}' WHERE id = ?")
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "running" => {
+                let agent =
+                    seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+                seed_running_execution(&fixture.db, &fixture.task.id, &agent, "coder").await;
+            }
+            "awaiting_human" => {
+                sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+                    .bind(r#"{"awaiting_human":true}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "user" => {
+                sqlx::query("UPDATE transition_log SET triggered_by = 'user:override:api' WHERE task_id = ?")
+                .bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
+            }
+            "barrier" => {
+                sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+                    .bind(serde_json::json!({"state":"review","status":"running","retry_started_at":now_rfc3339()}).to_string())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "old_review" => {
+                sqlx::query("UPDATE transition_log SET created_at = ? WHERE task_id = ?")
+                    .bind(now_rfc3339())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "new_review" => {
+                let candidate = seed_completed_coder_execution(&fixture.db, &fixture.task.id).await;
+                let now = now_rfc3339();
+                ReviewRepo::create(
+                    &*fixture.db,
+                    db::CreateReview {
+                        id: new_uuid_v4(),
+                        task_id: fixture.task.id.clone(),
+                        execution_id: candidate,
+                        attempt_number: 2,
+                        status: ReviewStatus::Running,
+                        step_results_json: r#"{"ci_steps":[]}"#.to_owned(),
+                        started_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            _ => {}
+        }
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !fixture
+                .dispatcher
+                .recover_failed_review(&task)
+                .await
+                .unwrap(),
+            "{fence}"
+        );
+        let current = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, task.version, "{fence}");
+        assert_eq!(current.status, "review", "{fence}");
+        drop(cascade_slot);
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_clears_abandoned_running_entry_barrier() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
+    sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({"state":"review", "status":"running",
+            "started_at":(chrono::Utc::now() - chrono::Duration::minutes(4)).to_rfc3339()})
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(current.entry_barrier_json.is_none());
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_rejects_stale_task_version() {
+    for budget in [1, 3] {
+        let fixture = failed_review_fixture(chrono::Duration::minutes(3), budget).await;
+        sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let error = fixture
+            .dispatcher
+            .recover_failed_review(&fixture.task)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Db(db::DbError::VersionConflict)
+        ));
+        let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, "review");
+        assert!(current.blocked_json.is_none());
+    }
 }
 
 async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {

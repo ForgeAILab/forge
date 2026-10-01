@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use db::{
-    now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo, TransitionLogRepo, WorkspaceRepo,
-};
+use db::{now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo, TransitionLogRepo};
 use serde_json::{json, Value};
 
 use crate::workflow::{
@@ -46,7 +44,7 @@ impl HookAction for RunCiSteps {
             };
         }
 
-        let Some(workspace_id) = workspace_id(ctx).await else {
+        let Some(_) = workspace_id(ctx).await else {
             return HookResult::Skipped {
                 reason: "no workspace".to_string(),
             };
@@ -64,13 +62,16 @@ impl HookAction for RunCiSteps {
             };
         };
 
-        let workspace = match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => {
-                return HookResult::Skipped {
-                    reason: "workspace not found".to_string(),
-                };
-            }
+        let workspace = match crate::task_service::workspace::prepare_workspace(
+            &ctx.db,
+            &ctx.workspace_root,
+            &task,
+            &task.id,
+            ctx.repo_cache_locks.clone(),
+        )
+        .await
+        {
+            Ok(workspace) => workspace,
             Err(error) => {
                 return HookResult::Failed {
                     reason: error.to_string(),
@@ -176,7 +177,7 @@ impl HookAction for RunCiSteps {
                 tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
             }
             publish_review_failed(ctx, &review, failed_step_index);
-            if had_review_passed {
+            if had_review_passed && ctx.triggered_by.is_user() {
                 let reason = "merge-fix follow-up failed: ci";
                 if let Err(error) = block_task(
                     ctx,
