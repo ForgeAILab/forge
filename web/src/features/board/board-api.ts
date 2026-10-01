@@ -1,7 +1,8 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
-import type { MoveTaskRequest, MoveTaskResponse, TasksResponse } from '@/types/generated'
+import type { MoveTaskRequest, MoveTaskResponse } from '@/types/generated'
+import type { TaskListResponse } from '@/types/task-list'
 
 export type BoardTaskSearch = {
   q?: string
@@ -24,7 +25,7 @@ export function useBoardTasks(projectId: string, search: BoardTaskSearch) {
   return useInfiniteQuery({
     queryKey: qk.tasks(projectId, `board:${stableSearchKey(search)}`),
     queryFn: ({ pageParam, signal }) =>
-      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
+      apiFetch<TaskListResponse>(`/projects/${projectId}/tasks`, {
         search: { ...search, cursor: pageParam as string | undefined },
         signal,
       }),

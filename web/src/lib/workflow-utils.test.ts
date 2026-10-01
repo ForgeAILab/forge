@@ -163,6 +163,17 @@ describe('task interruption annotations', () => {
     }
   }
 
+  it('uses compact list observability to identify stale annotations', () => {
+    const fullTask = taskWithExecutionIds('execution-old', 'execution-new')
+    const task = {
+      ...fullTask,
+      execution_observability: { latest_execution_id: 'execution-new' },
+    }
+    expect(taskHasError(task)).toBe(false)
+    expect(getBlockingAnnotation(task)).toBeNull()
+    expect(getStaleBlockingAnnotation(task)?.message).toBe('Previous execution failed')
+  })
+
   it('treats annotations from older executions as historical warnings', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
 

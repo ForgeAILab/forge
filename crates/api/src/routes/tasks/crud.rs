@@ -1,5 +1,4 @@
 use super::*;
-use futures_util::stream::{StreamExt, TryStreamExt};
 
 pub async fn create_task(
     State(state): State<AppState>,
@@ -119,49 +118,128 @@ pub async fn list_tasks(
                 .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
             project_workflow_definition = Some(project.workflow_definition);
         }
-        let task_ids = page
+        let project_workflow_definition =
+            project_workflow_definition.as_deref().unwrap_or_default();
+        let project_workflow = std::sync::Arc::new(WorkflowEngine::resolve_workflow(
+            project_workflow_definition,
+        ));
+        let tasks = page
             .items
-            .iter()
-            .map(|task| task.id.as_str())
+            .into_iter()
+            .map(|task| {
+                let workflow = if task.parent_task_id.is_none() {
+                    project_workflow.clone()
+                } else {
+                    std::sync::Arc::new(WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        project_workflow_definition,
+                        &Actor::system(SystemComponent::General),
+                    ))
+                };
+                (task, workflow)
+            })
             .collect::<Vec<_>>();
-        let latest_reviews = ReviewRepo::list_latest_reviews_for_tasks(&*state.db, &task_ids)
-            .await?
+        let task_ids = tasks
+            .iter()
+            .map(|(task, _)| task.id.as_str())
+            .collect::<Vec<_>>();
+        let retry_task_ids = tasks
+            .iter()
+            .filter(|(_, workflow)| {
+                workflow.states.iter().any(|state| {
+                    state.kind == StateKind::Gate
+                        && state
+                            .gate_config
+                            .as_ref()
+                            .and_then(|config| config.max_rejections)
+                            .is_some()
+                })
+            })
+            .map(|(task, _)| task.id.as_str())
+            .collect::<Vec<_>>();
+        let execution_queries = tasks
+            .iter()
+            .map(|(task, workflow)| db::TaskExecutionProjectionQuery {
+                task_id: task.id.clone(),
+                current_role: workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == task.status)
+                    .and_then(services::workflow::effective_role)
+                    .map(str::to_owned),
+                blocked_execution_id: crate::routes::task_list_blocking_execution_id(task),
+            })
+            .collect::<Vec<_>>();
+        let db = &*state.db;
+        let (reviews, executions, assignments, transitions, links) = tokio::try_join!(
+            ReviewRepo::list_latest_reviews_for_tasks(db, &task_ids),
+            ExecutionRepo::list_task_projection_executions(db, &execution_queries),
+            TaskRoleAssignmentRepo::list_by_tasks(db, &task_ids),
+            TransitionLogRepo::list_by_tasks(db, &retry_task_ids),
+            db::ExternalLinkRepo::list_latest_links_for_tasks(db, &task_ids),
+        )?;
+        let reviews = reviews
             .into_iter()
             .map(|review| (review.task_id.clone(), review))
             .collect::<std::collections::HashMap<_, _>>();
-        let latest_executions =
-            ExecutionRepo::list_latest_executions_for_tasks(&*state.db, &task_ids)
-                .await?
-                .into_iter()
-                .map(|execution| (execution.task_id.clone(), execution))
-                .collect::<std::collections::HashMap<_, _>>();
-        let project_workflow_definition = project_workflow_definition
-            .as_deref()
-            .unwrap_or_default()
-            .to_owned();
-        let db = &*state.db;
-        let items = futures_util::stream::iter(page.items.into_iter().map(|task| {
-            let latest_review = latest_reviews.get(&task.id).cloned();
-            let latest_execution = latest_executions.get(&task.id).cloned();
-            let workflow = WorkflowEngine::resolve_workflow_for_task(
-                &task,
-                &project_workflow_definition,
-                &Actor::system(SystemComponent::General),
-            );
-            async move {
-                task_response_light_with_latest_and_workflow(
-                    db,
+        let links = links
+            .into_iter()
+            .map(|link| (link.task_id.clone(), link))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut executions_by_task = std::collections::HashMap::<_, Vec<_>>::new();
+        for execution in executions {
+            executions_by_task
+                .entry(execution.task_id.clone())
+                .or_default()
+                .push(execution);
+        }
+        let mut assignments_by_task = std::collections::HashMap::<_, Vec<_>>::new();
+        for assignment in assignments {
+            assignments_by_task
+                .entry(assignment.task_id.clone())
+                .or_default()
+                .push(assignment);
+        }
+        let mut transitions_by_task = std::collections::HashMap::<_, Vec<_>>::new();
+        for transition in transitions {
+            transitions_by_task
+                .entry(transition.task_id.clone())
+                .or_default()
+                .push(transition);
+        }
+        let items = tasks
+            .into_iter()
+            .map(|(task, workflow)| {
+                let executions = executions_by_task.remove(&task.id).unwrap_or_default();
+                let latest_execution = executions.iter().max_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                let running_executions = executions
+                    .iter()
+                    .filter(|execution| execution.status == db::ExecutionStatus::Running)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
+                let transitions = transitions_by_task.remove(&task.id).unwrap_or_default();
+                let latest_review = reviews.get(&task.id);
+                let external_link = links.get(&task.id);
+                crate::routes::task_projection::task_list_response(
                     task,
-                    latest_review,
-                    latest_execution,
                     &workflow,
+                    crate::routes::task_projection::TaskDiagnosticRows {
+                        role_assignments: &assignments,
+                        transition_logs: &transitions,
+                        latest_review,
+                        latest_execution,
+                        execution_authority: &executions,
+                        running_executions: &running_executions,
+                    },
+                    external_link,
                 )
-                .await
-            }
-        }))
-        .buffered(4)
-        .try_collect::<Vec<_>>()
-        .await?;
+            })
+            .collect();
         let current_revision = TaskBoardRepo::board_revision(&*state.db, &project_id).await?;
         if current_revision == board_revision {
             return Ok(Json(TasksResponse {

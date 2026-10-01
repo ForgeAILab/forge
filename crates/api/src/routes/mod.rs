@@ -73,6 +73,7 @@ pub mod repos;
 pub mod reviews;
 pub mod scoped_memory;
 pub mod settings;
+mod task_projection;
 pub mod tasks;
 pub mod terminals;
 pub mod workflow;
@@ -290,25 +291,6 @@ pub async fn task_response_with_awaiting_human(
     )
 }
 
-pub(crate) async fn task_response_light_with_latest_and_workflow(
-    db: &db::SqliteDb,
-    task: Task,
-    latest_review: Option<Review>,
-    latest_execution: Option<Execution>,
-    workflow: &api_types::WorkflowDefinition,
-) -> ApiResult<TaskResponse> {
-    task_response_inner(
-        db,
-        task,
-        false,
-        false,
-        latest_review,
-        latest_execution,
-        workflow,
-    )
-    .await
-}
-
 async fn task_workflow_for_response(
     db: &db::SqliteDb,
     task: &Task,
@@ -349,25 +331,6 @@ async fn task_response_inner(
         .map(task_role_assignment_response)
         .collect();
 
-    let error_annotation = task.error_annotation.as_deref().map(|s| {
-        serde_json::from_str::<TaskAnnotation>(s)
-            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
-    });
-    let blocked_metadata_annotation = blocked_metadata_annotation(&task);
-    let error_blocking_annotation = match error_annotation.as_ref() {
-        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-        _ => None,
-    };
-    // A populated typed annotation is the current recovery contract. Legacy
-    // blocked metadata only fills the gap for old/empty annotations; it must
-    // never override or widen the explicit action set used by the recovery
-    // service and workflow-exception projection.
-    let blocking_annotation = blocking_annotation_for_projection(
-        &task,
-        blocked_metadata_annotation.as_ref(),
-        error_blocking_annotation,
-    );
-    let canonical_phase = workflow.canonical_phase_for_state(&task.status);
     let has_retry_budget = workflow.states.iter().any(|state| {
         state.kind == StateKind::Gate
             && state
@@ -381,31 +344,6 @@ async fn task_response_inner(
     } else {
         Vec::new()
     };
-    let mut remaining_retries = HashMap::new();
-    for state in &workflow.states {
-        if state.kind != StateKind::Gate {
-            continue;
-        }
-        let Some(max_rejections) = state
-            .gate_config
-            .as_ref()
-            .and_then(|config| config.max_rejections)
-        else {
-            continue;
-        };
-        let count = count_gate_rejections_since_boundary(&transition_logs, &state.name);
-        let exhausted = blocking_annotation.is_some_and(|annotation| {
-            retry_budget_exhausted_for_state(&task.status, state, annotation)
-        });
-        remaining_retries.insert(
-            state.name.clone(),
-            if exhausted {
-                0
-            } else {
-                (i64::from(max_rejections) - count).max(0)
-            },
-        );
-    }
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
@@ -421,93 +359,33 @@ async fn task_response_inner(
         .iter()
         .find(|state| state.name == task.status)
         .and_then(services::workflow::effective_role);
-    let blocked_execution_id =
-        blocking_annotation.and_then(|annotation| annotation.blocked_execution_id.as_deref());
-    // Load the same bounded role-aware execution authority used by the
-    // execution-action resolver even for light Task responses: workflow
-    // exceptions still expose Open Interactive, whose follow-up target must
-    // not come from the arbitrary newest history row.
+    let blocking_annotation = task_list_blocking_execution_id(&task);
     let execution_authority =
-        list_execution_action_authority(db, &task.id, current_role, blocked_execution_id).await?;
-    let open_interactive_target =
-        select_open_interactive_target(&execution_authority, current_role, blocked_execution_id);
-    let open_interactive_launch_authority = has_open_interactive_launch_authority(
-        &execution_authority,
-        &task_role_assignments,
-        current_role,
-        blocked_execution_id,
-    );
-    let execution_actions = if include_actions {
-        resolve_execution_actions(
-            &task,
-            workflow,
-            &execution_authority,
-            blocking_annotation,
-            latest_review.as_ref(),
-        )
-    } else {
-        Vec::new()
-    };
+        list_execution_action_authority(db, &task.id, current_role, blocking_annotation.as_deref())
+            .await?;
     let execution_observability = task_execution_observability(db, &task.id).await?;
-    // The latest execution is a history projection, not a live-occupancy
-    // projection. Keep the interactive and current-role running rows
-    // separate so a newer unrelated role cannot hide either authority.
     let running_executions = db::ExecutionRepo::list_running_by_task(db, &task.id).await?;
-    let running_interactive_execution = running_executions
-        .iter()
-        .filter(|execution| execution.role == "interactive")
-        .max_by(|left, right| compare_running_execution_authority(left, right))
-        .cloned();
-    let running_current_role_execution = current_role.and_then(|role| {
-        running_executions
-            .iter()
-            .filter(|execution| {
-                execution.role == role
-                    || (role == services::workflow::default_roles::CODER
-                        && execution.role == "executor")
-            })
-            .max_by(|left, right| compare_running_execution_authority(left, right))
-            .cloned()
-    });
-    let active_execution = execution_observability
-        .active_execution_id
-        .as_deref()
-        .and_then(|execution_id| {
-            running_executions
-                .iter()
-                .find(|execution| execution.id == execution_id)
-                .cloned()
-        });
-    let health_execution = running_interactive_execution
-        .clone()
-        .or(running_current_role_execution)
-        .or(active_execution)
-        .or_else(|| latest_execution.clone());
-    let running_role_execution = running_executions
-        .iter()
-        .filter(|execution| execution.role != "interactive")
-        .max_by(|left, right| compare_running_execution_authority(left, right));
-    let workflow_exception = derive_workflow_exception_with_running_interactive(
+    let task_projection::TaskDiagnosticProjection {
+        canonical_phase,
+        remaining_retries,
+        execution_actions,
+        error_annotation,
+        workflow_health,
+        workflow_exception,
+    } = task_projection::task_diagnostic_projection(
         &task,
         workflow,
-        &task_role_assignments,
-        latest_review.as_ref(),
-        latest_execution.as_ref(),
-        running_interactive_execution.as_ref(),
-        open_interactive_target,
-        open_interactive_launch_authority,
-        &remaining_retries,
-    )
-    .map(|exception| disable_recovery_while_running(exception, running_role_execution));
-    let workflow_health = Some(derive_workflow_health(
-        &task,
-        workflow,
-        &task_role_assignments,
-        latest_review.as_ref(),
-        health_execution.as_ref(),
+        task_projection::TaskDiagnosticRows {
+            role_assignments: &task_role_assignments,
+            transition_logs: &transition_logs,
+            latest_review: latest_review.as_ref(),
+            latest_execution: latest_execution.as_ref(),
+            execution_authority: &execution_authority,
+            running_executions: &running_executions,
+        },
+        include_actions,
         awaiting_human,
-        workflow_exception.as_ref(),
-    ));
+    );
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
     // Canonical execution evidence/blocker (D16/D17, F12): computed once here
     // so Task detail, banner, and chat context all render the same server-
@@ -560,6 +438,20 @@ async fn task_response_inner(
         created_at: task.created_at,
         updated_at: task.updated_at,
     })
+}
+
+fn task_list_blocking_execution_id(task: &Task) -> Option<String> {
+    let error_annotation = task
+        .error_annotation
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<TaskAnnotation>(json).ok());
+    let blocked_metadata = blocked_metadata_annotation(task);
+    let error_blocking = match error_annotation.as_ref() {
+        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
+        _ => None,
+    };
+    blocking_annotation_for_projection(task, blocked_metadata.as_ref(), error_blocking)
+        .and_then(|annotation| annotation.blocked_execution_id.clone())
 }
 
 /// Resolve the blocker authority shared by the Task response projections.

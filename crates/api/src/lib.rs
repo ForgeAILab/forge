@@ -1119,11 +1119,14 @@ pub fn api_router(state: AppState) -> Router {
                     })
                     .unwrap_or_else(|| "unknown".to_owned());
 
+                let (client_addr, forwarded_for) = middleware::request_address_fields(request);
                 tracing::info_span!(
                     "http.trace",
                     request_id = %request_id,
                     method = %request.method(),
                     path = %middleware::request_log_path(request.uri()),
+                    client_addr = client_addr.as_deref(),
+                    forwarded_for,
                 )
             })
             .on_response(DefaultOnResponse::new().level(Level::INFO)),
@@ -1160,9 +1163,12 @@ pub async fn serve_with_listener<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, build_router(state, web_dist_dir))
-        .with_graceful_shutdown(shutdown_signal)
-        .await
+    axum::serve(
+        listener,
+        build_router(state, web_dist_dir).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await
 }
 
 async fn healthz() -> impl IntoResponse {

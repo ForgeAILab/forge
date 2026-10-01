@@ -1,4 +1,5 @@
-import type { MoveTaskRequest, Task, TasksResponse } from '@/types/generated'
+import type { TaskListItem as Task, TaskListResponse } from '@/types/task-list'
+import type { MoveTaskRequest } from '@/types/generated'
 
 export type BoardSnapshot = {
   tasks: Task[]
@@ -25,7 +26,7 @@ export type BoardMovePlan = {
   changed: boolean
 }
 
-export function assembleBoardSnapshot(pages: TasksResponse[] | undefined): BoardSnapshot {
+export function assembleBoardSnapshot(pages: TaskListResponse[] | undefined): BoardSnapshot {
   if (!pages || pages.length === 0) {
     return { tasks: [], boardRevision: 0, complete: false, mixedRevisions: false }
   }

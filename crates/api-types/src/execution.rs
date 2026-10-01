@@ -112,6 +112,87 @@ pub struct TaskResponse {
     pub updated_at: String,
 }
 
+/// Board/list projection. Full content and accounting are loaded from task detail.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskListItemResponse {
+    pub id: String,
+    pub project_id: String,
+    pub parent_task_id: Option<String>,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub title: String,
+    pub task_type: TaskType,
+    pub status: TaskStatus,
+    pub canonical_phase: CanonicalPhase,
+    #[serde(default)]
+    pub awaiting_human: bool,
+    pub priority: i64,
+    pub board_position: f64,
+    pub subtask_order: Option<i64>,
+    #[serde(default)]
+    pub role_assignments: Vec<TaskRoleAssignmentResponse>,
+    #[serde(default)]
+    #[ts(type = "Record<string, number>")]
+    pub remaining_retries: std::collections::HashMap<String, i64>,
+    pub error_annotation: Option<TaskAnnotation>,
+    pub blocked: Option<InterruptionMetadata>,
+    pub failed: Option<InterruptionMetadata>,
+    pub workflow_health: Option<WorkflowHealthSummary>,
+    pub workflow_exception: Option<WorkflowExceptionSummary>,
+    pub review_passed_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub external_issue_number: Option<i64>,
+    pub external_issue_url: Option<String>,
+    pub execution_observability: TaskListExecutionObservability,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskListExecutionObservability {
+    pub latest_execution_id: Option<String>,
+}
+
+impl From<TaskResponse> for TaskListItemResponse {
+    fn from(task: TaskResponse) -> Self {
+        Self {
+            id: task.id,
+            project_id: task.project_id,
+            parent_task_id: task.parent_task_id,
+            assignee_type: task.assignee_type,
+            assignee_id: task.assignee_id,
+            title: task.title,
+            task_type: task.task_type,
+            status: task.status,
+            canonical_phase: task.canonical_phase,
+            awaiting_human: task.awaiting_human,
+            priority: task.priority,
+            board_position: task.board_position,
+            subtask_order: task.subtask_order,
+            role_assignments: task.role_assignments,
+            remaining_retries: task.remaining_retries,
+            error_annotation: task.error_annotation,
+            blocked: task.blocked,
+            failed: task.failed,
+            workflow_health: task.workflow_health,
+            workflow_exception: task.workflow_exception,
+            review_passed_at: task.review_passed_at,
+            archived_at: task.archived_at,
+            external_issue_number: task.external_issue_number,
+            external_issue_url: task.external_issue_url,
+            version: task.version,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            execution_observability: TaskListExecutionObservability {
+                latest_execution_id: task.execution_observability.latest_execution_id,
+            },
+        }
+    }
+}
+
 /// Compact execution projection used by collection and task-bootstrap
 /// endpoints. Large diagnostics remain available from `GET /executions/{id}`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

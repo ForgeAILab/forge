@@ -2,7 +2,8 @@ import type { MouseEvent, ReactNode, RefObject } from 'react'
 import { DragDropContext, type DragStart, type DragUpdate, type DropResult } from '@hello-pangea/dnd'
 import { KanbanColumn } from '@/components/kanban-column'
 import type { ColumnGroup } from '@/lib/workflow-utils'
-import type { Agent, Task } from '@/types/generated'
+import type { Agent } from '@/types/generated'
+import type { TaskListItem as Task } from '@/types/task-list'
 
 export function BoardView({
   columns,

@@ -1,5 +1,7 @@
+use std::net::SocketAddr;
+
 use axum::{
-    extract::Request,
+    extract::{ConnectInfo, Request},
     http::{header::HeaderName, HeaderMap, HeaderValue},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -37,11 +39,14 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     req.extensions_mut()
         .insert(RequestId::new(request_id.clone()));
 
+    let (client_addr, forwarded_for) = request_address_fields(&req);
     let span = tracing::info_span!(
         "http.request",
         request_id = %request_id,
         method = %method,
         path = %path,
+        client_addr = client_addr.as_deref(),
+        forwarded_for,
     );
 
     let mut response = CURRENT_REQUEST_ID
@@ -60,6 +65,18 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
 
 pub(crate) fn request_log_path(uri: &axum::http::Uri) -> &str {
     uri.path()
+}
+
+pub(crate) fn request_address_fields(request: &Request) -> (Option<String>, Option<&str>) {
+    let client_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.to_string());
+    let forwarded_for = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok());
+    (client_addr, forwarded_for)
 }
 
 fn request_id_from_headers(headers: &HeaderMap) -> String {
@@ -245,4 +262,36 @@ fn unauthorized_response_with_challenge(
             .insert(axum::http::header::WWW_AUTHENTICATE, value);
     }
     response
+}
+
+#[cfg(test)]
+mod request_address_tests {
+    use super::*;
+
+    #[test]
+    fn request_address_fields_keep_peer_and_untrusted_forwarded_header_separate() {
+        let peer: SocketAddr = "127.0.0.1:43210".parse().unwrap();
+        let mut request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.8, 10.0.0.2")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        let (client_addr, forwarded_for) = request_address_fields(&request);
+        assert_eq!(client_addr.as_deref(), Some("127.0.0.1:43210"));
+        assert_eq!(forwarded_for, Some("198.51.100.8, 10.0.0.2"));
+    }
+
+    #[test]
+    fn request_address_fields_do_not_infer_peer_from_forwarded_header() {
+        let request = Request::builder()
+            .header("x-forwarded-for", "198.51.100.8")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            request_address_fields(&request),
+            (None, Some("198.51.100.8"))
+        );
+        let request = Request::new(axum::body::Body::empty());
+        assert_eq!(request_address_fields(&request), (None, None));
+    }
 }

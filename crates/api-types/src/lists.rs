@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{InterruptionMetadata, TaskResponse, TaskStatus, TaskType};
+use crate::{InterruptionMetadata, TaskListItemResponse, TaskResponse, TaskStatus, TaskType};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -27,7 +27,7 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TasksResponse {
-    pub items: Vec<TaskResponse>,
+    pub items: Vec<TaskListItemResponse>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub total_count: Option<u64>,

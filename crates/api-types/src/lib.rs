@@ -133,6 +133,8 @@ fn export_typescript() {
     TaskAnnotation::export().expect("export TaskAnnotation");
     TaskExecutionObservability::export().expect("export TaskExecutionObservability");
     TaskResponse::export().expect("export TaskResponse");
+    TaskListItemResponse::export().expect("export TaskListItemResponse");
+    TaskListExecutionObservability::export().expect("export TaskListExecutionObservability");
     TaskRelationSummary::export().expect("export TaskRelationSummary");
     TaskRelationsResponse::export().expect("export TaskRelationsResponse");
     ExecutionStatus::export().expect("export ExecutionStatus");

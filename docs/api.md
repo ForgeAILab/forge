@@ -2440,6 +2440,20 @@ normal pagination fields:
 }
 ```
 
+`items` contains `TaskListItemResponse` objects: identity, title/type/status,
+canonical phase, assignment and ordering fields, retry budgets, annotations,
+workflow health/exception, review/archive timestamps, issue links, version, and
+creation/update timestamps. `execution_observability` contains only
+`latest_execution_id`, used to identify stale annotations. Page decoration batches
+reviews, execution authority/running rows, roles, retry transitions, and issue
+links for all Tasks on the page.
+
+The Project list omits `description`, `task_state_config`, `workspace`,
+`plan_progress`, `plan_artifact`, `execution_actions`, `execution_evidence`, and
+`execution_blocker`, plus usage/cost/runtime observability fields. Load the existing
+`GET /api/v1/tasks/{id}/detail` response's `task` for that content. Single-Task
+responses and `GET /api/v1/agents/{id}/tasks` retain `TaskResponse`.
+
 The revision is a monotonic project token for task creation/deletion and
 changes to status, board position, archive state, or soft-deletion state. Each
 page is assembled against one stable revision. Revisions can skip values when

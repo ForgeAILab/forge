@@ -2340,6 +2340,265 @@ async fn seed_ordered_task(
 }
 
 #[tokio::test]
+async fn task_page_projection_batches_roles_and_retry_history() {
+    let db = sqlite_db().await;
+    let (project_id, _, agent_id) = seed_project_repo_agent(&db).await;
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let task_id = seed_task(
+            &db,
+            &project_id,
+            Some(&agent_id),
+            "todo".to_owned(),
+            &format!("Task {index}"),
+        )
+        .await;
+        for (role, to_state, rejection) in
+            [("reviewer", "review", true), ("auditor", "todo", false)]
+        {
+            TaskRoleAssignmentRepo::assign(
+                &db,
+                CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    role_name: role.to_owned(),
+                    assignee_type: None,
+                    assignee_id: None,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            TransitionLogRepo::insert(
+                &db,
+                CreateTransitionLog {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    from_state: "review".to_owned(),
+                    to_state: to_state.to_owned(),
+                    trigger_name: Some("reject".to_owned()),
+                    triggered_by: "system".to_owned(),
+                    trigger_reason: "test".to_owned(),
+                    hook_results_json: Some("{}".to_owned()),
+                    rejection,
+                    created_at: "2026-09-30T00:00:00Z".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        task_ids.push(task_id);
+    }
+    let ids = task_ids[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    let roles = TaskRoleAssignmentRepo::list_by_tasks(&db, &ids)
+        .await
+        .unwrap();
+    let transitions = TransitionLogRepo::list_by_tasks(&db, &ids).await.unwrap();
+    assert_eq!(roles.len(), 6);
+    assert_eq!(transitions.len(), 4);
+    for task_id in ids {
+        let actual_roles = roles
+            .iter()
+            .filter(|row| row.task_id == task_id)
+            .collect::<Vec<_>>();
+        let expected_roles = TaskRoleAssignmentRepo::list_by_task(&db, task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual_roles).unwrap(),
+            serde_json::to_value(expected_roles).unwrap()
+        );
+        let actual_transitions = transitions
+            .iter()
+            .filter(|row| row.task_id == task_id)
+            .collect::<Vec<_>>();
+        let expected_transitions = TransitionLogRepo::list_by_task(&db, task_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual_transitions).unwrap(),
+            serde_json::to_value(expected_transitions).unwrap()
+        );
+    }
+    assert!(TaskRoleAssignmentRepo::list_by_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(TransitionLogRepo::list_by_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn task_page_projection_executions_preserve_authority_with_bounded_history() {
+    let db = sqlite_db().await;
+    let (project_id, _, agent_id) = seed_project_repo_agent(&db).await;
+    let first = seed_task(&db, &project_id, None, "todo".to_owned(), "First").await;
+    let second = seed_task(&db, &project_id, None, "todo".to_owned(), "Second").await;
+    let hidden = seed_task(&db, &project_id, None, "todo".to_owned(), "Not on page").await;
+    for task_id in [&first, &second, &hidden] {
+        // The older coder alias session and explicit blocked row must survive
+        // more than 100 newer unrelated terminal rows.
+        for (id, role, status, session, agent, created_at) in [
+            (
+                format!("{task_id}-blocked"),
+                "auditor",
+                "completed",
+                None,
+                None,
+                "2026-09-01T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-resume"),
+                "executor",
+                "completed",
+                Some("coder-session"),
+                Some(agent_id.as_str()),
+                "2026-09-02T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-interactive"),
+                "interactive",
+                "running",
+                Some("live-session"),
+                None,
+                "2026-09-03T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-lease"),
+                "interactive",
+                "running",
+                None,
+                None,
+                "2026-09-04T00:00:00Z",
+            ),
+        ] {
+            sqlx::query("INSERT INTO execution (id, task_id, role, status, agent_session_id, agent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(id).bind(task_id).bind(role).bind(status).bind(session).bind(agent)
+                .bind(created_at).bind(created_at).execute(db.pool()).await.unwrap();
+        }
+        for index in 0..105 {
+            sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES (?, ?, 'reviewer', 'completed', ?, ?)")
+                .bind(format!("{task_id}-history-{index:03}")).bind(task_id)
+                .bind("2026-09-05T00:00:00Z").bind("2026-09-05T00:00:00Z")
+                .execute(db.pool()).await.unwrap();
+        }
+    }
+    let queries = [&first, &second]
+        .into_iter()
+        .map(|task_id| crate::TaskExecutionProjectionQuery {
+            task_id: task_id.clone(),
+            current_role: Some("coder".to_owned()),
+            blocked_execution_id: Some(format!("{task_id}-blocked")),
+        })
+        .collect::<Vec<_>>();
+    let rows = ExecutionRepo::list_task_projection_executions(&db, &queries)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        10,
+        "five representatives per Task, not all history"
+    );
+    for task_id in [&first, &second] {
+        let ids = rows
+            .iter()
+            .filter(|row| &row.task_id == task_id)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        for suffix in ["blocked", "resume", "interactive", "lease", "history-104"] {
+            assert!(ids.contains(&format!("{task_id}-{suffix}").as_str()));
+        }
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    assert!(rows.iter().all(|row| row.task_id != hidden));
+    assert!(ExecutionRepo::list_task_projection_executions(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn task_page_projection_links_select_latest_per_task() {
+    use crate::{
+        CreateProjectIntegration, CreateTaskExternalLink, ExternalLinkRepo, IntegrationPlatform,
+        IntegrationRepo,
+    };
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Links", None).await;
+    let integration_id = new_uuid_v4();
+    let now = now_rfc3339();
+    IntegrationRepo::create_integration(
+        &db,
+        CreateProjectIntegration {
+            id: integration_id.clone(),
+            project_id: project_id.clone(),
+            platform: IntegrationPlatform::Github,
+            base_url: "https://api.github.com".to_owned(),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            token_secret_ref: "test".to_owned(),
+            poll_interval_secs: 60,
+            sync_filter: "{}".to_owned(),
+            default_task_state: None,
+            default_assignee_type: None,
+            default_assignee_id: None,
+            enabled: false,
+            last_polled_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Links").await;
+        for issue in 1..=2 {
+            ExternalLinkRepo::create_link(
+                &db,
+                CreateTaskExternalLink {
+                    id: format!("{task_id}-link-{issue}"),
+                    task_id: task_id.clone(),
+                    integration_id: integration_id.clone(),
+                    platform: "github".to_owned(),
+                    remote_owner: "owner".to_owned(),
+                    remote_repo: "repo".to_owned(),
+                    remote_issue_number: index * 2 + issue,
+                    remote_url: format!("https://example.com/{index}/{issue}"),
+                    global_id: format!("link-{index}-{issue}"),
+                    synced_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        task_ids.push(task_id);
+    }
+    let ids = task_ids[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    let links = ExternalLinkRepo::list_latest_links_for_tasks(&db, &ids)
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 2);
+    for task_id in ids {
+        let latest = ExternalLinkRepo::get_by_task_id(&db, task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            links.iter().find(|link| link.task_id == task_id),
+            Some(&latest)
+        );
+    }
+    assert!(ExternalLinkRepo::list_latest_links_for_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn task_list_hides_cancelled_and_archived_by_default() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;

@@ -215,6 +215,48 @@ impl ExecutionRepo for SqliteDb {
         rows.into_iter().map(map_execution).collect()
     }
 
+    async fn list_task_projection_executions(
+        &self,
+        tasks: &[crate::TaskExecutionProjectionQuery],
+    ) -> Result<Vec<Execution>> {
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+            "WITH requested(task_id, current_role, blocked_execution_id) AS (",
+        );
+        query.push_values(tasks, |mut row, task| {
+            row.push_bind(&task.task_id)
+                .push_bind(task.current_role.as_deref())
+                .push_bind(task.blocked_execution_id.as_deref());
+        });
+        query.push(
+            ") SELECT execution.* FROM execution WHERE id IN (
+                 SELECT candidate.id FROM execution candidate
+                 JOIN requested ON candidate.task_id = requested.task_id
+                 WHERE candidate.status = 'running'
+                    OR candidate.id = requested.blocked_execution_id",
+        );
+        // Each class contributes one representative, regardless of history length.
+        // Running rows are kept separately for session-aware health precedence.
+        for predicate in [
+            "1 = 1",
+            "candidate.status != 'running'",
+            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL",
+            "candidate.agent_id IS NOT NULL",
+            "candidate.status != 'running' AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+            "candidate.status != 'running' AND candidate.agent_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+        ] {
+            query.push(" UNION SELECT (SELECT candidate.id FROM execution candidate WHERE candidate.task_id = requested.task_id AND ")
+                .push(predicate)
+                .push(" ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1) FROM requested");
+        }
+        query.push(") ORDER BY execution.task_id, execution.id");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
     async fn list_by_task_and_role(
         &self,
         task_id: &str,

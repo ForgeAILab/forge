@@ -20,7 +20,8 @@ import {
   matchesFilters,
 } from '@/lib/workflow-utils'
 import { useFilterStore } from '@/stores/filters'
-import type { Task, WorkflowDefinition } from '@/types/generated'
+import type { WorkflowDefinition } from '@/types/generated'
+import type { TaskListItem as Task } from '@/types/task-list'
 import type { BoardFilterPatch } from './BoardToolbar'
 import { orderingEligibility } from './board-ordering'
 import { useBoardData } from './useBoardData'
