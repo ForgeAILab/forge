@@ -332,6 +332,9 @@ pub fn outcome_for_service_error_with_correction(
     retry: Option<RetryInstruction>,
 ) -> OrchestrationOutcome {
     let (code, safe_message, default_retry, setup_requirements) = match error {
+        ServiceError::TurnFailure { error, .. } => {
+            return outcome_for_service_error_with_correction(error, context, current, retry)
+        }
         ServiceError::Db(db::DbError::IdempotencyConflict) => (
             OutcomeCode::IdempotencyConflict,
             "the idempotency key is already bound to different command input",

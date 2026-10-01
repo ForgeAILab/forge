@@ -1,5 +1,22 @@
 use super::*;
+use crate::RetryAgentChatTurn;
 use sha2::{Digest, Sha256};
+
+// Insertion order distinguishes retries/continuations even when timestamps tie.
+pub(super) const AGENT_CHAT_TURN_WITH_RETRY_STATE: &str = "SELECT t.*, (
+    EXISTS (
+        SELECT 1 FROM agent_chat_turn_job newer
+        WHERE newer.chat_id = t.chat_id
+          AND newer.triggering_message_id = t.triggering_message_id
+          AND newer.rowid > t.rowid
+    ) OR EXISTS (
+        SELECT 1 FROM agent_chat_message m
+        WHERE m.chat_id = t.chat_id AND m.sequence > (
+            SELECT original.sequence FROM agent_chat_message original
+            WHERE original.id = t.triggering_message_id
+        )
+    )
+) AS retry_superseded FROM agent_chat_turn_job t WHERE t.id = ?";
 
 #[async_trait]
 impl AccountMainAgentBindingRepo for SqliteDb {
@@ -795,7 +812,7 @@ impl AgentChatMessageRepo for SqliteDb {
 #[async_trait]
 impl AgentChatTurnJobRepo for SqliteDb {
     async fn get_agent_chat_turn_job(&self, id: &str) -> Result<Option<AgentChatTurnJob>> {
-        sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+        sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -804,10 +821,10 @@ impl AgentChatTurnJobRepo for SqliteDb {
     }
 
     async fn list_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<Vec<AgentChatTurnJob>> {
-        sqlx::query(
-            "SELECT * FROM agent_chat_turn_job
-             WHERE chat_id = ? ORDER BY created_at ASC, id ASC",
-        )
+        sqlx::query(&AGENT_CHAT_TURN_WITH_RETRY_STATE.replace(
+            "WHERE t.id = ?",
+            "WHERE t.chat_id = ? ORDER BY t.created_at ASC, t.id ASC",
+        ))
         .bind(chat_id)
         .fetch_all(&self.pool)
         .await?
@@ -904,7 +921,8 @@ impl AgentChatTurnJobRepo for SqliteDb {
             "UPDATE agent_chat_turn_job
              SET status = ?, pending_interaction_id = ?, lease_owner = ?, leased_until = ?, attempt_count = ?,
                  next_attempt_at = ?, response_message_id = ?, error_code = ?,
-                 error_message = ?, version = version + 1, updated_at = ?
+                 error_message = ?, failure_class_json = CASE WHEN ? THEN NULL ELSE failure_class_json END,
+                 retry_decision = CASE WHEN ? THEN NULL ELSE retry_decision END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?",
         )
         .bind(input.status.to_string())
@@ -916,6 +934,8 @@ impl AgentChatTurnJobRepo for SqliteDb {
         .bind(response_message_id.as_deref())
         .bind(error_code.as_deref())
         .bind(error_message.as_deref())
+        .bind(input.status == AgentChatTurnState::Cancelled)
+        .bind(input.status == AgentChatTurnState::Cancelled)
         .bind(&input.updated_at)
         .bind(&input.id)
         .bind(input.expected_version)
@@ -1066,7 +1086,7 @@ pub(super) async fn admit_agent_chat_turn_in_tx(
                 "UPDATE agent_chat_turn_job
                  SET status = 'cancelled', pending_interaction_id = NULL,
                      error_code = 'superseded_by_user_message',
-                     error_message = 'superseded by newer user message',
+                     error_message = 'superseded by newer user message', failure_class_json = NULL, retry_decision = NULL,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'awaiting_input'",
             )
@@ -1301,7 +1321,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                  SET status = 'succeeded', response_message_id = ?,
                      lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = NULL, error_code = NULL,
-                     error_message = NULL,
+                     error_message = NULL, failure_class_json = NULL, retry_decision = NULL,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ?
                    AND status = 'leased' AND lease_owner = ?",
@@ -1340,7 +1360,7 @@ impl AgentChatTransactionRepo for SqliteDb {
              SET status = 'succeeded', response_message_id = ?,
                  lease_owner = NULL, leased_until = NULL,
                  next_attempt_at = NULL, error_code = NULL,
-                 error_message = NULL,
+                 error_message = NULL, failure_class_json = NULL, retry_decision = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?
                AND status = 'leased' AND lease_owner = ?",
@@ -1456,7 +1476,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             "UPDATE agent_chat_turn_job
              SET status = 'succeeded', response_message_id = NULL,
                  lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
-                 error_code = NULL, error_message = NULL,
+                 error_code = NULL, error_message = NULL, failure_class_json = NULL, retry_decision = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
         )
@@ -1524,7 +1544,8 @@ impl AgentChatTransactionRepo for SqliteDb {
             "UPDATE agent_chat_turn_job
              SET status = ?, lease_owner = NULL, leased_until = NULL,
                  attempt_count = ?, next_attempt_at = ?, error_code = ?,
-                 error_message = ?, version = version + 1, updated_at = ?
+                 error_message = ?, failure_class_json = ?, retry_decision = ?,
+                 pre_provider_failure_count = ?, usage_limit_deferral_count = ?, usage_limit_first_deferred_at = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
         )
         .bind(input.status.to_string())
@@ -1532,6 +1553,14 @@ impl AgentChatTransactionRepo for SqliteDb {
         .bind(input.next_attempt_at.as_deref())
         .bind(&error_code)
         .bind(&error_message)
+        .bind(
+            serde_json::to_string(&input.failure_class)
+                .map_err(|error| DbError::Check(error.to_string()))?,
+        )
+        .bind(input.retry_decision.as_str())
+        .bind(input.pre_provider_failure_count)
+        .bind(input.usage_limit_deferral_count)
+        .bind(&input.usage_limit_first_deferred_at)
         .bind(&input.updated_at)
         .bind(&input.turn_job_id)
         .bind(input.expected_version)
@@ -1541,7 +1570,7 @@ impl AgentChatTransactionRepo for SqliteDb {
         if updated.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+        let turn = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
             .bind(&input.turn_job_id)
             .fetch_one(&mut *transaction)
             .await
@@ -1567,7 +1596,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                  lease_owner = NULL, leased_until = NULL,
                  attempt_count = MAX(0, attempt_count - 1),
                  next_attempt_at = NULL, error_code = NULL,
-                 error_message = NULL, version = version + 1, updated_at = ?
+                 error_message = NULL, failure_class_json = NULL, retry_decision = NULL, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
         )
         .bind(&input.pending_interaction_id)
@@ -1598,6 +1627,93 @@ impl AgentChatTransactionRepo for SqliteDb {
         super::chat_ledger::park_agent_chat_turn_with_usage(self, input).await
     }
 
+    async fn retry_agent_chat_turn(&self, input: RetryAgentChatTurn) -> Result<AgentChatTurnJob> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let key = format!(
+            "agent-chat-turn-retry:{}:{}",
+            input.turn_job_id, input.idempotency_key
+        );
+        if let Some(result_id) = sqlx::query_scalar::<_, String>(
+            "SELECT entity_id FROM domain_event WHERE dedupe_key = ?",
+        )
+        .bind(&key)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            let job = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
+                .bind(&result_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            let job = map_agent_chat_turn_job(job)?;
+            transaction.commit().await?;
+            return Ok(job);
+        }
+        let current = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
+            .bind(&input.turn_job_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)
+            .and_then(map_agent_chat_turn_job)?;
+        if current.version != input.expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        if current.retry_action().is_none() {
+            return Err(DbError::TurnNotRetryable);
+        }
+        let busy: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_chat_turn_job WHERE chat_id = ?
+             AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')",
+        )
+        .bind(&current.chat_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if busy > 0 {
+            return Err(DbError::ChatTurnLive);
+        }
+        let updated = sqlx::query("UPDATE agent_chat_turn_job SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?")
+            .bind(&input.updated_at).bind(&current.id).bind(input.expected_version)
+            .execute(&mut *transaction).await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        let turn = AgentChatTransactionRepo::admit_agent_chat_continuation_in_tx(
+            self,
+            &mut transaction,
+            input.new_turn,
+        )
+        .await?;
+        DomainEventRepo::append_event_in_tx(
+            self,
+            &mut transaction,
+            &CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "agent_chat.turn.retried".to_owned(),
+                entity_type: "agent_chat_turn_job".to_owned(),
+                entity_id: turn.id.clone(),
+                actor_type: "user".to_owned(),
+                actor_id: Some(input.actor_user_id),
+                scope_type: "agent_chat".to_owned(),
+                scope_id: turn.chat_id.clone(),
+                correlation_id: turn.correlation_id.clone(),
+                causation_id: turn.causation_id.clone(),
+                causation_depth: turn.causation_depth,
+                dedupe_key: Some(key),
+                payload_json: serde_json::json!({
+                    "turn_job_id": turn.id,
+                    "chat_id": turn.chat_id,
+                    "version": turn.version,
+                    "status": "queued",
+                    "source_turn_job_id": current.id,
+                })
+                .to_string(),
+                created_at: input.updated_at.clone(),
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(turn)
+    }
+
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let dedupe_key = format!(
@@ -1621,7 +1737,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                     "turn cancellation idempotency key belongs to another turn".to_owned(),
                 ));
             }
-            let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+            let turn = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
                 .bind(&input.turn_job_id)
                 .fetch_one(&mut *transaction)
                 .await
@@ -1631,7 +1747,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             return Ok(turn);
         }
 
-        let current = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+        let current = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
             .bind(&input.turn_job_id)
             .fetch_optional(&mut *transaction)
             .await?
@@ -1654,7 +1770,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             "UPDATE agent_chat_turn_job
              SET status = 'cancelled', lease_owner = NULL, leased_until = NULL,
                  next_attempt_at = NULL, error_code = 'cancelled_by_user',
-                 error_message = 'cancelled by user', version = version + 1,
+                 error_message = 'cancelled by user', failure_class_json = NULL, retry_decision = NULL, version = version + 1,
                  updated_at = ?
              WHERE id = ? AND version = ?
                AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')",
@@ -1668,7 +1784,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+        let turn = sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
             .bind(&input.turn_job_id)
             .fetch_one(&mut *transaction)
             .await
@@ -1958,6 +2074,10 @@ pub(super) async fn append_agent_chat_turn_failure_event(
             "max_attempts": turn.max_attempts,
             "error_code": error_code,
             "error_message": error_message,
+            "failure_class": turn.failure_class,
+            "retry_decision": turn.retry_decision,
+            "pre_provider_failure_count": turn.pre_provider_failure_count,
+            "retry_action": turn.retry_action(),
             "next_attempt_at": turn.next_attempt_at,
             "version": turn.version,
         })
@@ -2232,6 +2352,26 @@ pub(super) fn map_agent_chat_message(row: SqliteRow) -> Result<AgentChatMessage>
 }
 
 pub(super) fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob> {
+    let failure_class = row
+        .try_get::<Option<String>, _>("failure_class_json")?
+        .map(|json| serde_json::from_str::<api_types::TurnFailure>(&json))
+        .transpose();
+    let retry_decision = row
+        .try_get::<Option<String>, _>("retry_decision")?
+        .map(|value| {
+            serde_json::from_value::<api_types::TurnRetryDecision>(serde_json::Value::String(value))
+        })
+        .transpose();
+    let (failure_class, retry_decision) = match (failure_class, retry_decision) {
+        (Ok(class), Ok(decision)) => (class, decision),
+        _ => {
+            tracing::warn!(
+                turn_id = row.get::<String, _>("id"),
+                "unknown stored chat turn failure evidence; loading without class or decision"
+            );
+            (None, None)
+        }
+    };
     Ok(AgentChatTurnJob {
         id: row.try_get("id")?,
         chat_id: row.try_get("chat_id")?,
@@ -2262,6 +2402,13 @@ pub(super) fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob
         response_message_id: row.try_get("response_message_id")?,
         error_code: row.try_get("error_code")?,
         error_message: row.try_get("error_message")?,
+        failure_class,
+        retry_decision,
+        retry_superseded: row.try_get("retry_superseded").unwrap_or(false),
+        usage_limit_deferral_count: row.try_get("usage_limit_deferral_count")?,
+        usage_limit_first_deferred_at: row.try_get("usage_limit_first_deferred_at")?,
+        pre_provider_failure_count: row.try_get("pre_provider_failure_count")?,
+        invocation_count: row.try_get("invocation_count")?,
         correlation_id: row.try_get("correlation_id")?,
         causation_id: row.try_get("causation_id")?,
         causation_depth: row.try_get("causation_depth")?,

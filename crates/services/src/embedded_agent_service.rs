@@ -513,6 +513,13 @@ impl EmbeddedAgentService {
         }
     }
 
+    /// Inject an embedded backend while retaining the service's authority graph.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_native_backend(mut self, backend: Arc<NativeAgentRuntimeBackend>) -> Self {
+        self.native_backend = backend;
+        self
+    }
+
     pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
         Arc::clone(&self.native_backend)
     }
@@ -2939,6 +2946,23 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn non_chat_host_errors_keep_their_service_variants() {
+        assert!(matches!(
+            redacted_host_error(forge_agent_host::AgentHostError::CredentialNotFound),
+            ServiceError::NotFound {
+                entity: "protected_runtime_resource",
+                ..
+            }
+        ));
+        assert!(matches!(
+            redacted_host_error(forge_agent_host::AgentHostError::Configuration(
+                "invalid".into()
+            )),
+            ServiceError::InvalidOperation { .. }
+        ));
+    }
 
     #[test]
     fn native_task_capabilities_keep_sessions_but_disable_lcm() {

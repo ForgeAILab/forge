@@ -282,6 +282,7 @@ impl From<ServiceError> for ApiError {
                     "reason": reason,
                 }),
             ),
+            ServiceError::TurnFailure { error, .. } => Self::from(*error),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
             ServiceError::ProductGenesisActiveSession { session_id } => {
                 Self::conflict_with_code_and_details(
@@ -446,6 +447,8 @@ impl From<DbError> for ApiError {
                 message: "resource not found".to_owned(),
                 details: None,
             },
+            DbError::TurnNotRetryable => Self::conflict_with_code("turn_not_retryable", "Agent Chat turn is not retryable"),
+            DbError::ChatTurnLive => Self::conflict_with_code("another_turn_live", "another Agent Chat turn is live"),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",

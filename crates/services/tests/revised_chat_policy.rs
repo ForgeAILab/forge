@@ -2,7 +2,7 @@ use api_types::AgentChatTurnStatus;
 use chrono::{DateTime, Utc};
 use services::agent_chat_policy::guard_agent_chat_content;
 use services::{
-    claim_agent_chat_turn, fail_agent_chat_turn, recover_expired_agent_chat_turn,
+    claim_agent_chat_turn, fail_agent_chat_turn_after_claim, recover_expired_agent_chat_turn,
     AgentChatOperation, AgentChatPolicyError, AgentChatScope,
 };
 
@@ -90,11 +90,27 @@ fn chat_turn_recovery_is_finite_and_does_not_reinvoke_after_budget() {
         .expect("queued turn is claimable");
     assert_eq!(lease.status, AgentChatTurnStatus::Leased);
 
-    let first_failure = fail_agent_chat_turn(0, 2, now, "provider\nerror");
+    let first_failure = fail_agent_chat_turn_after_claim(
+        &api_types::TurnFailure::Unclassified,
+        1,
+        2,
+        0,
+        services::agent_chat_turn_policy::UsageLimitDeferrals::default(),
+        now,
+        "provider\nerror",
+    );
     assert_eq!(first_failure.status, AgentChatTurnStatus::RetryWait);
     assert_eq!(first_failure.attempt_count, 1);
     assert_eq!(first_failure.error, "providererror");
-    let terminal = fail_agent_chat_turn(first_failure.attempt_count, 2, at(105), "last");
+    let terminal = fail_agent_chat_turn_after_claim(
+        &api_types::TurnFailure::Unclassified,
+        first_failure.attempt_count + 1,
+        2,
+        0,
+        services::agent_chat_turn_policy::UsageLimitDeferrals::default(),
+        at(105),
+        "last",
+    );
     assert_eq!(terminal.status, AgentChatTurnStatus::Failed);
     assert_eq!(terminal.attempt_count, 2);
     assert!(terminal.next_attempt_at.is_none());

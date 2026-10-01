@@ -1666,8 +1666,12 @@ pub trait AgentChatTransactionRepo: Send + Sync {
     ) -> Result<AgentChatTurnJob> {
         self.park_agent_chat_turn(input.terminal).await
     }
+    /// Fence the terminal source and atomically admit a fresh retry with a
+    /// durable idempotency event. Authority is prepared by the admission service.
+    async fn retry_agent_chat_turn(&self, input: RetryAgentChatTurn) -> Result<AgentChatTurnJob>;
+
     /// Cancel a queued/leased/retry-wait turn and append the cancellation
-    /// event in the same transaction.  The idempotency key is represented by
+    /// event in the same transaction. The idempotency key is represented by
     /// the event dedupe key so retries do not require a second turn-job store.
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob>;
     async fn cancel_agent_chat_turn_with_usage(
@@ -3324,6 +3328,11 @@ pub struct FailAgentChatTurn {
     pub next_attempt_at: Option<String>,
     pub error_code: String,
     pub error_message: String,
+    pub failure_class: api_types::TurnFailure,
+    pub retry_decision: api_types::TurnRetryDecision,
+    pub pre_provider_failure_count: i64,
+    pub usage_limit_deferral_count: i64,
+    pub usage_limit_first_deferred_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -3350,6 +3359,16 @@ pub struct ParkAgentChatTurnWithUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelAgentChatTurn {
+    pub turn_job_id: String,
+    pub expected_version: i64,
+    pub actor_user_id: String,
+    pub idempotency_key: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryAgentChatTurn {
+    pub new_turn: CreateAgentChatTurnJob,
     pub turn_job_id: String,
     pub expected_version: i64,
     pub actor_user_id: String,

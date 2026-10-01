@@ -1843,6 +1843,7 @@ async fn message_response(
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
     let error = job.error_message.clone().or_else(|| job.error_code.clone());
+    let retry_action = job.retry_action();
     AgentChatTurnJobResponse {
         id: job.id,
         chat_id: job.chat_id,
@@ -1866,6 +1867,10 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         response_message_id: job.response_message_id,
         error_code: job.error_code,
         error_message: job.error_message,
+        failure_class: job.failure_class,
+        retry_decision: job.retry_decision,
+        pre_provider_failure_count: job.pre_provider_failure_count,
+        retry_action,
         error,
         correlation_id: job.correlation_id,
         version: job.version,

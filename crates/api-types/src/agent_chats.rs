@@ -245,6 +245,10 @@ pub struct AgentChatTurnJobResponse {
     pub error_code: Option<String>,
     /// Bounded provider/runtime detail for the latest failed attempt.
     pub error_message: Option<String>,
+    pub failure_class: Option<TurnFailure>,
+    pub retry_decision: Option<TurnRetryDecision>,
+    pub pre_provider_failure_count: i64,
+    pub retry_action: Option<RetryTurnAction>,
     /// Human-facing fallback retained for clients that need one line.
     pub error: Option<String>,
     pub correlation_id: String,
@@ -274,6 +278,118 @@ pub struct SendAgentChatMessageResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct CancelAgentChatTurnRequest {
+    pub expected_version: i64,
+    pub idempotency_key: String,
+}
+
+/// Typed evidence from the backend. Delays are milliseconds and reset
+/// timestamps are Unix milliseconds; a missing hint never means capacity reset.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum TurnFailure {
+    ProviderRejected {
+        retryable: bool,
+        retry_after: Option<u64>,
+    },
+    ContextOverflow,
+    Authority,
+    Configuration,
+    TurnLimit {
+        cause: TurnLimitCause,
+    },
+    Transient {
+        retry_after: Option<u64>,
+    },
+    UsageLimit {
+        resets_at: Option<u64>,
+    },
+    PostconditionUnmet {
+        event: String,
+    },
+    EmptyResponse,
+    PreProviderAdmission,
+    Unclassified,
+}
+
+impl TurnFailure {
+    pub fn requires_attention(&self) -> bool {
+        matches!(
+            self,
+            Self::Configuration
+                | Self::Authority
+                | Self::ProviderRejected {
+                    retryable: false,
+                    ..
+                }
+        )
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ProviderRejected { .. } => "provider_rejected",
+            Self::ContextOverflow => "context_overflow",
+            Self::Authority => "authority_denied",
+            Self::Configuration => "configuration_invalid",
+            Self::TurnLimit { .. } => "turn_limit",
+            Self::Transient { .. } => "transient",
+            Self::UsageLimit { .. } => "usage_limit",
+            Self::PostconditionUnmet { .. } => "delivery_followup_postcondition_failed",
+            Self::EmptyResponse => "empty_response",
+            Self::PreProviderAdmission => "pre_provider_admission",
+            Self::Unclassified => "backend_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TurnLimitCause {
+    ProviderAttempts,
+    ToolSteps,
+    Time,
+    Output,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TurnRetryDecision {
+    Fail,
+    Retry,
+    Defer,
+}
+
+impl TurnRetryDecision {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Retry => "retry",
+            Self::Defer => "defer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct RetryTurnAction {
+    pub kind: RetryTurnActionKind,
+    pub chat_id: String,
+    pub turn_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RetryTurnActionKind {
+    RetryTurn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct RetryAgentChatTurnRequest {
     pub expected_version: i64,
     pub idempotency_key: String,
 }

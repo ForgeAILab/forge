@@ -920,7 +920,7 @@ pub fn to_projection_snapshot(snapshot: &SoloSnapshot) -> ProjectionSnapshot {
         setup: to_setup_state(snapshot),
         timeline: snapshot.chat.messages.iter().map(to_chat_message).collect(),
         live_activity,
-        retryable_turn: latest_retryable_failed_turn(&snapshot.chat.active_turns)
+        retryable_turn: latest_retryable_terminal_turn(&snapshot.chat.active_turns)
             .map(to_turn_reference),
         tasks: snapshot.tasks.iter().map(to_task_summary).collect(),
         review_cards: snapshot
@@ -958,10 +958,13 @@ fn projected_activity_for_turn(
         .or_else(|| turn_is_activity_visible(turn.state).then(|| to_turn_activity(turn)))
 }
 
-fn latest_retryable_failed_turn(turns: &[TurnSnapshot]) -> Option<&TurnSnapshot> {
-    turns
-        .last()
-        .filter(|turn| turn.state == BackendTurnState::Failed && turn.retryable)
+fn latest_retryable_terminal_turn(turns: &[TurnSnapshot]) -> Option<&TurnSnapshot> {
+    turns.last().filter(|turn| {
+        matches!(
+            turn.state,
+            BackendTurnState::Failed | BackendTurnState::Cancelled
+        ) && turn.retryable
+    })
 }
 
 fn turn_is_activity_visible(state: BackendTurnState) -> bool {
@@ -1857,6 +1860,36 @@ mod tests {
             effect,
             ControllerEffect::Command(BackendCommand::RetryTurn(request))
                 if request.turn_id == "failed" && request.expected_version == 9
+        )));
+    }
+
+    #[test]
+    fn cancelled_snapshot_reaches_retry_command() {
+        let mut snapshot = snapshot();
+        snapshot.project.readiness = BackendProjectReadiness::Operational;
+        snapshot.chat.interactions.clear();
+        snapshot.chat.active_turns = vec![turn("cancelled", BackendTurnState::Cancelled, 9, true)];
+        snapshot.live_activity.clear();
+        let mut reducer = AppReducer::new(AppState::new());
+        reducer.reduce(ControllerEvent::SnapshotUpdated {
+            request: SnapshotRequest::default(),
+            result: Ok(snapshot),
+        });
+        assert_eq!(reducer.state().live_turn_id(), None);
+        assert_eq!(
+            reducer.state().retryable_turn.as_ref().unwrap().turn_id,
+            "cancelled"
+        );
+        reducer.reduce(ControllerEvent::Input(InputEvent::Key(
+            ControllerKeyEvent::new(ControllerKeyCode::Tab),
+        )));
+        let effects = reducer.reduce(ControllerEvent::Input(InputEvent::Key(
+            ControllerKeyEvent::new(ControllerKeyCode::Char('r')),
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ControllerEffect::Command(BackendCommand::RetryTurn(request))
+                if request.turn_id == "cancelled" && request.expected_version == 9
         )));
     }
 

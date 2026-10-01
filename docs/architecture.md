@@ -372,10 +372,47 @@ operating-skill revision, policy/tool digests, and canonical scope, then freezes
 those values and the admission digest on the queued job. The shared
 `AgentChatTurnRunner` abstraction (the configured implementation is
 `FederatedAgentChatTurnRunner`) runs native or constrained CLI backends for
-all admitted turns. An explicit retry reclaims the same turn job and frozen
-provenance; it is not a second responder resolution or a new model admission.
+all admitted turns. An explicit manual retry admits a new turn for the same
+triggering message, resolving current Profile, binding and policy through
+`AgentTurnAdmissionService`. Automatic retries keep the same frozen admission.
 A Profile edit or binding replacement therefore affects the next admitted turn
 only, never an already queued/leased turn.
+
+The typed `TurnFailure` crosses the Agent Runtime host boundary before any
+human-readable error formatting. `ProviderAttemptFinished.error` retains the
+provider kind, retryability, delay, and usage reset hint; `BudgetFailure(Input)`
+identifies context overflow. The turn policy owns all automatic retry decisions.
+Deterministic configuration, authority, and request rejection fail immediately;
+context overflow also fails because the host exposes no forced compaction.
+A provider's prompt-too-long HTTP 400 is reported as `provider_rejected` because
+no typed evidence distinguishes it from other request rejections; a retry fails
+the same way until the context shrinks.
+Transient/retryable request rejection, empty response, turn limits, unclassified
+and postcondition failures use the existing three-attempt budget.
+Postcondition retries keep the existing instruction overlay. Usage limits refund
+the claim's attempt and defer with a separately counted floor (1, 5, 15, 30, then
+60 minutes),
+a fifteen-minute missing/past reset fallback, and a six-hour per-wait ceiling.
+The 24th deferral or 24 hours from the first deferral terminalizes the turn with
+`usage_limit`; no scheduled time exceeds that deadline. Chat provider health
+uses the typed failure and the turn's resume time, with no message classifier.
+Task and connection-test health retain message parsing and their 24-hour ceiling.
+Pre-provider admission failures refund the attempt and stop at a separate cap of
+three. A monotonic invocation counter keeps accounting identities distinct when
+a charged attempt is refunded. Leases continue to fence every failure settlement.
+
+Migration `V202610010600__chat_turn_failure_class.sql` adds nullable typed failure
+and retry decision columns plus admission-failure, usage-deferral and invocation
+counters. Old error codes/messages stay readable without invented typed evidence.
+Deterministic failures raise one cause-naming Attention item and offer a typed manual retry.
+Manual retry remains available for every failed or cancelled turn, including
+historical untyped failures. The versioned, idempotent command admits a new turn
+with current authority and resolves the incident through Attention's resolver.
+A later turn for the same triggering message or any later chat message (including
+a topic divider) supersedes the old retry action and incident.
+It does not run automatically on configuration changes. The composer remains
+disabled during a usage-limit deferral because that turn still occupies the
+chat's single live-turn slot; the timeline names the reason and resume time.
 
 For a Charter-backed Project, fresh turn admission checks the active binding
 against the Project's current Charter pointers and its stable admission
@@ -458,8 +495,8 @@ A native profile uses the embedded host and an Agent Chat-scoped continuity
 timeline; a safely migrated CLI profile may use an explicit constrained chat
 backend and must advertise its actual limitations. CLI execution is derived
 from the admitted immutable Profile's top-level model, reasoning effort, and
-permission policy plus its bounded `config_json`; retry never re-reads the
-current Profile. Adapter discovery also preserves model-to-provider identity,
+permission policy plus its bounded `config_json`; automatic retry never re-reads
+the current Profile. Adapter discovery also preserves model-to-provider identity,
 so a Smith model such as `gpt-5.6-terra` remains bound to its discovered
 `chatgpt` provider rather than an adapter default. Main and Project chats have
 deny-all filesystem access. Project Agent Task actions go through the existing

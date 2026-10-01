@@ -126,7 +126,7 @@ and keep the five lane counts visible above it.
 | `t`, `a`, `v` (Kanban) | Open Tasks, Attention, or Approvals. |
 | `a` (Main Chat, outside composer) | Expand/collapse the live activity row when one is present. |
 | `Shift+R` (outside composer) | Expand/collapse ordinary reasoning (collapsed by default). |
-| `r` | Retry the current eligible failed turn; when setup is unavailable and retryable, refresh setup. |
+| `r` | Retry the current failed or cancelled turn if it has not been superseded; when setup is unavailable and retryable, refresh setup. |
 | `?` (outside composer), `F1` | Open help when no other modal is active; close help when it is focused. |
 | `Esc` | Close the focused modal; in the setup picker it returns focus without changing the selected candidate; otherwise it is ignored. It never cancels a live turn by itself. |
 | `Ctrl+C` (when no modal is active) | With a live turn, open cancellation for that exact turn; otherwise request quit. During bounded shutdown, a second `Ctrl+C` forces terminal restoration and leaves durable recovery for the next launch. |

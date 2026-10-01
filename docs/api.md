@@ -257,6 +257,7 @@ succeeds. The connection test itself updates the health row.
 | GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
 | GET    | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs` | One keyset page of the turn's durable activity log (reasoning, tool calls with bounded results, reply deltas) in the `/executions/{id}/logs` shape; a turn that has not started reads as an empty page |
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
+| POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/retry` | Admit a new turn for a failed or cancelled turn’s triggering message using current authority; requires `expected_version` and `idempotency_key` |
 | GET    | `/api/v1/analytics/usage` | Read account-scoped typed usage/cost analytics across Task, Project/Main/Genesis Chat, and Main inquiry surfaces |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
 | POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a new topic epoch in the same chat; denied while a turn is live or a Genesis session/approval needs an explicit decision |
@@ -1210,6 +1211,68 @@ REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
 `AgentChatTurnJobResponse` and its finite turn status, while setup blockers use
 the Project execution-setup projection and documented REST error details.
+Each turn response exposes nullable `failure_class` (a tagged `TurnFailure`
+with `kind`), `retry_decision` (`fail`, `retry`, or `defer`), and
+`pre_provider_failure_count`. Provider delay hints (`retry_after`) and usage
+reset hints (`resets_at`) are milliseconds (delay and Unix timestamp,
+respectively). Historical jobs retain their original codes/messages and have
+null typed evidence; message text is never used to infer a class.
+
+Non-retryable provider rejection, configuration, authority, and context overflow
+fail immediately. Overflow cannot force session compaction through the current
+host. Postcondition failures use the ordinary attempt budget with the existing
+corrective overlay. Transient and retryable provider rejection use the ordinary three-attempt budget and a provider delay
+hint when present. Empty response, turn limits, and unclassified failures retain
+that budget. Ordinary retries wait at least `5 seconds × 2^(attempt_count - 1)`,
+capped at five minutes. A provider delay hint can lengthen that wait, up to six
+hours, but cannot shorten the exponential-backoff floor. Usage limits defer
+without charging the attempt: reset hints have
+a floor of 1, 5, 15, 30, then 60 minutes, counted separately from attempts,
+and a six-hour ceiling per wait. Missing or past reset hints use a fifteen-minute
+cooldown raised to that floor. A turn fails with `usage_limit` on its 24th deferral
+or after 24 hours from its first deferral; each scheduled time is capped at that
+deadline. Chat provider health uses this typed failure and the same resume time;
+message parsing remains only for Task and connection-test paths without typed
+turn evidence (their provider-health ceiling remains 24 hours). Pre-provider
+admission failures also refund the attempt, back off, and stop at three admission failures. Invocation identities advance
+independently of the charged budget, preserving usage accounting on resumption.
+
+Every failed or cancelled turn that has not been superseded exposes
+`retry_action: {kind: "retry_turn", chat_id, turn_id, expected_version}`.
+`POST /api/v1/agent-chats/{chat_id}/turns/{turn_id}/retry` requires
+`{expected_version, idempotency_key}` (a nonempty key of at most 256 characters).
+It admits a **new** turn for the same triggering message through
+`AgentTurnAdmissionService`, resolving the current Profile, binding and policy.
+The old turn's message, failure, and frozen provenance remain available.
+
+Stale versions return 409 `version_conflict`. A nonterminal or superseded source
+returns 409 `turn_not_retryable`; another live or parked turn returns
+409 `another_turn_live`. A turn is retryable only while it is the newest turn
+for its triggering message and no later message exists in the chat (including a
+topic divider). Superseded terminal turns have no retry action and their
+Attention incidents resolve.
+Replay of a committed key returns its admitted turn, even after authority changes,
+without another admission or event. After a retry is admitted, the source turn
+cannot be retried with a fresh key; a failed or cancelled retry child may itself
+be retried while it remains eligible.
+Configuration changes never trigger automatic retry. The request body is a
+breaking change from the previous bodyless endpoint.
+
+Only configuration, authority and non-retryable provider rejection raise a typed
+Attention incident. Manual retry and supersession resolve it through the
+Attention resolver, clearing snoozes. During usage-limit deferral Chat displays
+the reason and resume time. The deferred turn still occupies the single live-turn
+slot, so the composer remains disabled until it resumes, finishes, or is cancelled.
+
+`agent_chat.turn.failed` carries `failure_class`, `retry_decision`,
+`pre_provider_failure_count`, and `retry_action` alongside the existing message,
+status, attempt counters, schedule, and version. Deterministic failures project
+one Attention incident naming the cause, with the same typed retry action in
+`details.retry_action` and `recommended_action = "retry_turn"`. Retry resolves
+that incident through Attention’s resolver and emits `agent_chat.turn.retried`
+with the new turn/chat IDs, queued status, new version, and `source_turn_job_id`.
+The Chat timeline and Mission Control Attention buttons invoke this action without resending user text.
+
 Each turn response also exposes the latest stable `error_code` and bounded
 `error_message`; the legacy one-line `error` remains a display fallback. A
 provider turn that returns no text terminates with `error_code =

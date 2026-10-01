@@ -177,6 +177,8 @@ mod tests {
     async fn a_failed_correction_keeps_the_report_and_its_usage() {
         let output = correct_report(turn("bad", "first"), problem_unless_valid, |_, _| async {
             Err(AgentHostError::RuntimeWithUsage {
+                failure: api_types::TurnFailure::Unclassified,
+                provider_auth_rejected: false,
                 message: "provider failed".to_owned(),
                 usage_reports: turn("", "failed-attempt").usage_reports,
             })

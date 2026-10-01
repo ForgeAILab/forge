@@ -369,3 +369,10 @@ export type { PricingResolutionStatus } from './bindings/PricingResolutionStatus
 export type { PricingSettings } from './bindings/PricingSettings'
 export type { SubjectPricingResponse } from './bindings/SubjectPricingResponse'
 export type { UpdatePricingSettingsRequest } from './bindings/UpdatePricingSettingsRequest'
+
+export type { RetryAgentChatTurnRequest } from './bindings/RetryAgentChatTurnRequest'
+export type { RetryTurnAction } from './bindings/RetryTurnAction'
+export type { RetryTurnActionKind } from './bindings/RetryTurnActionKind'
+export type { TurnFailure } from './bindings/TurnFailure'
+export type { TurnLimitCause } from './bindings/TurnLimitCause'
+export type { TurnRetryDecision } from './bindings/TurnRetryDecision'

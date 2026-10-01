@@ -134,6 +134,10 @@ const queuedTurn: AgentChatTurn = {
   response_message_id: null,
   error_code: null,
   error_message: null,
+  failure_class: null,
+  retry_decision: null,
+  pre_provider_failure_count: 0n,
+  retry_action: null,
   error: null,
   correlation_id: 'correlation-1',
   version: 1n,
@@ -153,10 +157,12 @@ function renderTimeline({
   isSending = false,
   handoffProjectIds,
   onCancelTurn,
+  onRetryTurn,
 }: {
   onSend?: (content: string) => Promise<void>
   isSending?: boolean
   handoffProjectIds?: string[]
+  onRetryTurn?: (turnId: string, expectedVersion: number) => Promise<void>
   onCancelTurn?: (turnId: string, expectedVersion: number) => Promise<void>
 } = {}) {
   const queryClient = new QueryClient({
@@ -172,6 +178,7 @@ function renderTimeline({
         isSending={isSending}
         onSend={onSend}
         onCancelTurn={onCancelTurn}
+        onRetryTurn={onRetryTurn}
       />
     </QueryClientProvider>,
   )
@@ -305,11 +312,25 @@ describe('AgentChatTimeline polling', () => {
         has_more: false,
       })
       mocks.listAgentChatTurns.mockResolvedValue([
-        { ...queuedTurn, status, error: status === 'failed' ? 'Provider timed out' : null },
+        {
+          ...queuedTurn,
+          status,
+          error: status === 'failed' ? 'Provider timed out' : null,
+          retry_action:
+            status === 'failed' || status === 'cancelled'
+              ? {
+                  kind: 'retry_turn',
+                  chat_id: chat.id,
+                  turn_id: queuedTurn.id,
+                  expected_version: 1n,
+                }
+              : null,
+        },
       ])
 
       const onSend = vi.fn(async () => undefined)
-      renderTimeline({ onSend })
+      const onRetryTurn = vi.fn(async () => undefined)
+      renderTimeline({ onSend, onRetryTurn })
       await act(async () => {
         await vi.runOnlyPendingTimersAsync()
         await Promise.resolve()
@@ -320,12 +341,57 @@ describe('AgentChatTimeline polling', () => {
       if (status === 'failed' || status === 'cancelled') {
         const retry = screen.getByRole('button', { name: 'Retry turn' })
         fireEvent.click(retry)
-        await vi.waitFor(() => expect(onSend).toHaveBeenCalledWith('queued request'))
+        await vi.waitFor(() => expect(onRetryTurn).toHaveBeenCalledWith(queuedTurn.id, 1))
+        expect(onSend).not.toHaveBeenCalled()
       } else {
         expect(screen.queryByRole('button', { name: 'Retry turn' })).toBeNull()
       }
     },
   )
+
+  it('offers no retry action for a superseded terminal failure', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [userMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+    mocks.listAgentChatTurns.mockResolvedValue([
+      { ...queuedTurn, status: 'failed', retry_action: null },
+    ])
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(screen.getByText('Turn failed')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Retry turn' })).toBeNull()
+  })
+
+  it('shows the usage-limit deferral and resume time without an active retry label', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [userMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+    mocks.listAgentChatTurns.mockResolvedValue([
+      {
+        ...queuedTurn,
+        status: 'retry_wait',
+        failure_class: { kind: 'usage_limit', resets_at: null },
+        retry_decision: 'defer',
+        next_attempt_at: '2026-10-01T12:00:00Z',
+      },
+    ])
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+    })
+    expect(screen.getByText(/Usage limit reached.*Resumes/)).toBeTruthy()
+    expect(screen.queryByText('Retrying…')).toBeNull()
+    expect(screen.getByRole('textbox').hasAttribute('disabled')).toBe(true)
+  })
 
   it('keeps a sending state visible while admission is in flight', async () => {
     mocks.listAgentChatMessages.mockResolvedValue({ items: [], next_cursor: null, has_more: false })

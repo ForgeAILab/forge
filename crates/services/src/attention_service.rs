@@ -259,6 +259,7 @@ impl AttentionService {
     /// Every event is checkpointed only after its projection has committed, so
     /// a crash leaves the event eligible for an idempotent replay.
     pub async fn project_once(&self, limit: i64) -> Result<AttentionProjectionRun> {
+        self.resolve_superseded_turn_incidents().await?;
         let result = self.project_batch(limit).await;
         if let Err(error) = &result {
             let writes = self.health_writes.lock().await;
@@ -1792,6 +1793,35 @@ impl AttentionService {
         ))
     }
 
+    async fn resolve_superseded_turn_incidents(&self) -> Result<()> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT a.dedupe_key, e.entity_id, e.id, e.payload_json FROM attention_projection a
+             JOIN domain_event e ON e.id = a.source_event_id
+             WHERE a.status <> 'resolved' AND e.event_type = 'agent_chat.turn.failed'",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        for (key, turn_id, event_id, payload) in rows {
+            if let Some(turn) =
+                db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &turn_id).await?
+            {
+                let version = serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .and_then(|value| value.get("version").and_then(Value::as_i64));
+                if turn.retry_action().is_none() || version.is_some_and(|v| v != turn.version) {
+                    AttentionRepo::resolve_attention_by_dedupe(
+                        &*self.db,
+                        &key,
+                        &event_id,
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn project_event(&self, event: &DomainEvent) -> Result<ProjectionOutcome> {
         let transition_attention = if event.event_type.eq_ignore_ascii_case("task.transitioned") {
             Some(task_transition_attention(event))
@@ -1821,6 +1851,43 @@ impl AttentionService {
             let identity_id = self.wake_identity_for_event(event).await?;
             let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             let (priority, summary, recommended_action) = category_metadata(category);
+            let failed_turn = if event.event_type == "agent_chat.turn.failed" {
+                db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &event.entity_id)
+                    .await?
+            } else {
+                None
+            };
+            // Re-drive or completion may precede this consumer's projection.
+            if failed_turn.as_ref().is_some_and(|turn| {
+                turn.retry_action().is_none()
+                    || serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|value| value.get("version").and_then(Value::as_i64))
+                        .is_some_and(|v| v != turn.version)
+            }) {
+                return Ok(ProjectionOutcome::Completed);
+            }
+            let retry_action = failed_turn
+                .as_ref()
+                .and_then(db::AgentChatTurnJob::retry_action);
+            let cause = failed_turn
+                .as_ref()
+                .and_then(|turn| turn.failure_class.as_ref());
+            let summary = if retry_action.is_some() {
+                format!(
+                    "Agent Chat turn failed: {}",
+                    cause
+                        .map(api_types::TurnFailure::code)
+                        .unwrap_or("backend_failed")
+                )
+            } else {
+                summary.to_owned()
+            };
+            let recommended_action = if retry_action.is_some() {
+                "retry_turn"
+            } else {
+                recommended_action
+            };
             let task_context = if event.entity_type == "task" {
                 sqlx::query("SELECT title, status, version FROM task WHERE id = ?")
                     .bind(&event.entity_id)
@@ -1879,6 +1946,9 @@ impl AttentionService {
                 "scope_type": scope_type,
                 "scope_id": scope_id,
                 "task": task_context,
+                "failure_class": cause,
+                "retry_decision": failed_turn.as_ref().and_then(|turn| turn.retry_decision.as_ref()),
+                "retry_action": retry_action,
                 "decision": decision_context,
                 "role": event_payload.get("role").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "stop_reason": event_payload.get("stop_reason").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
@@ -1902,7 +1972,7 @@ impl AttentionService {
                     source_event_id: event.id.clone(),
                     priority,
                     status: "open".to_owned(),
-                    summary: bounded_summary(summary),
+                    summary: bounded_summary(&summary),
                     details_json,
                     dedupe_key: incident_key.clone(),
                     occurred_at: event.created_at.clone(),
@@ -1916,6 +1986,26 @@ impl AttentionService {
                 },
             )
             .await?;
+
+            // A re-drive can win between reading the job and inserting the
+            // projection. Resolve that stale row instead of reviving an incident.
+            if let Some(turn) = failed_turn.as_ref() {
+                if db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &turn.id)
+                    .await?
+                    .is_some_and(|current| {
+                        current.retry_action().is_none() || current.version != turn.version
+                    })
+                {
+                    AttentionRepo::resolve_attention_by_dedupe(
+                        &*self.db,
+                        &incident_key,
+                        &event.id,
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                    return Ok(ProjectionOutcome::Completed);
+                }
+            }
 
             if !review_is_current {
                 AttentionRepo::resolve_attention_by_dedupe(
@@ -3329,15 +3419,12 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
         return Some("human_input_required");
     }
     if event_type == "agent_chat.turn.failed" {
-        let status = serde_json::from_str::<Value>(&event.payload_json)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        return (status.as_deref() == Some("failed")).then_some("retry_exhausted");
+        let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
+        let failure: api_types::TurnFailure =
+            serde_json::from_value(payload.get("failure_class")?.clone()).ok()?;
+        return (payload.get("status").and_then(Value::as_str) == Some("failed")
+            && failure.requires_attention())
+        .then_some("retry_exhausted");
     }
     if event_type.contains("validation")
         && (event_type.contains("fail") || event_type.contains("error"))
@@ -3772,6 +3859,23 @@ fn bounded_error_message(error: &ServiceError) -> String {
         }
     }
     bounded_text(message)
+}
+
+/// Close a Chat turn incident through Attention's resolver so snoozes are cleared.
+pub(crate) async fn resolve_turn_incident<D: db::AttentionRepo>(
+    db: &D,
+    chat_id: &str,
+    turn_id: &str,
+    event_id: &str,
+) -> Result<()> {
+    db::AttentionRepo::resolve_attention_by_dedupe(
+        db,
+        &format!("attention:retry_exhausted:agent_chat:{chat_id}:agent_chat_turn_job:{turn_id}"),
+        event_id,
+        &now_rfc3339(),
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

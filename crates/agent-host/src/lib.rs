@@ -445,18 +445,43 @@ pub enum AgentHostError {
     TurnLimitReached { limit: AgentTurnLimit },
     #[error("runtime failed: {0}")]
     Runtime(String),
-    /// The runtime reached a terminal failure after one or more provider
-    /// attempts had already emitted usage telemetry.  The normal `Runtime`
-    /// variant intentionally remains the compact error used by callers that
-    /// do not need accounting; chat and Task adapters can drain these reports
+    /// A runtime failure with typed turn evidence and any usage telemetry
+    /// collected before failure. Chat and Task adapters can drain reports
     /// without reconstructing them from the mutable session snapshot.
     #[error("runtime failed: {message}")]
     RuntimeWithUsage {
         message: String,
+        failure: api_types::TurnFailure,
+        /// The last provider attempt rejected the credential, rather than local config.
+        provider_auth_rejected: bool,
         usage_reports: Vec<AgentTurnUsageReport>,
     },
     #[error("protected persistence failed")]
     ProtectedPersistence,
+}
+
+impl AgentHostError {
+    pub fn turn_failure(&self) -> api_types::TurnFailure {
+        use api_types::{TurnFailure, TurnLimitCause};
+        match self {
+            Self::Authority(_) | Self::AgentPaused { .. } | Self::ProjectPaused { .. } => {
+                TurnFailure::Authority
+            }
+            Self::Configuration(_) | Self::CredentialNotFound | Self::Unsupported(_) => {
+                TurnFailure::Configuration
+            }
+            Self::TurnLimitReached { limit } => TurnFailure::TurnLimit {
+                cause: match limit {
+                    AgentTurnLimit::ProviderAttempts => TurnLimitCause::ProviderAttempts,
+                    AgentTurnLimit::ToolSteps => TurnLimitCause::ToolSteps,
+                    AgentTurnLimit::Time => TurnLimitCause::Time,
+                    AgentTurnLimit::Output => TurnLimitCause::Output,
+                },
+            },
+            Self::RuntimeWithUsage { failure, .. } => failure.clone(),
+            _ => TurnFailure::Unclassified,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 //! atomic Agent Chat service composite.  A failed adapter call is persisted on
 //! the job with a bounded error and a finite retry budget.
 
+use api_types::TurnFailure;
 use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -592,6 +593,7 @@ pub trait AgentChatTurnRunner: Send + Sync {
                 usage_reports: Vec::new(),
             },
             Err(error) => AgentChatTurnRunOutcome::Failed {
+                failure: TurnFailure::Unclassified,
                 error,
                 usage_reports: Vec::new(),
             },
@@ -606,9 +608,53 @@ pub enum AgentChatTurnRunOutcome {
         usage_reports: Vec<executors::UsageReport>,
     },
     Failed {
+        failure: TurnFailure,
         error: ServiceError,
         usage_reports: Vec<executors::UsageReport>,
     },
+}
+
+#[derive(Debug)]
+struct TurnRunError {
+    failure: TurnFailure,
+    error: ServiceError,
+}
+impl TurnRunError {
+    fn configuration(message: &str) -> Self {
+        Self {
+            failure: TurnFailure::Configuration,
+            error: ServiceError::invalid_operation(message),
+        }
+    }
+}
+impl From<ServiceError> for TurnRunError {
+    fn from(error: ServiceError) -> Self {
+        let failure = match &error {
+            ServiceError::TurnFailure { failure, .. } => failure.clone(),
+            ServiceError::AgentPaused { .. }
+            | ServiceError::ProjectPaused { .. }
+            | ServiceError::AuthorizationDenied { .. }
+            | ServiceError::Db(
+                db::DbError::AgentPaused { .. } | db::DbError::ProjectPaused { .. },
+            ) => TurnFailure::Authority,
+            ServiceError::NotFound {
+                entity: "agent_profile" | "agent_identity",
+                ..
+            } => TurnFailure::Configuration,
+            ServiceError::RateLimited {
+                retry_after_seconds,
+            } => TurnFailure::Transient {
+                retry_after: Some(retry_after_seconds.saturating_mul(1000)),
+            },
+            _ => TurnFailure::Unclassified,
+        };
+        Self { failure, error }
+    }
+}
+impl From<db::DbError> for TurnRunError {
+    fn from(error: db::DbError) -> Self {
+        ServiceError::from(error).into()
+    }
 }
 
 /// Narrow legacy CLI adapter for migrated Agent Chats. It deliberately uses a
@@ -827,8 +873,8 @@ impl FederatedAgentChatTurnRunner {
             None,
             None,
         ));
-        if job.attempt_count > 1 {
-            if let Err(error) = sink.write_attempt_divider(job.attempt_count).await {
+        if job.invocation_count > 1 {
+            if let Err(error) = sink.write_attempt_divider(job.invocation_count).await {
                 tracing::debug!(
                     job_id = %job.id,
                     %error,
@@ -1357,7 +1403,16 @@ impl FederatedAgentChatTurnRunner {
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
         let frozen_authority = self
             .load_frozen_authority(&chat, job, &agent, &profile)
-            .await?;
+            .await
+            .map_err(|error| match error {
+                ServiceError::InvalidOperation { .. } | ServiceError::Conflict(_) => {
+                    ServiceError::TurnFailure {
+                        failure: TurnFailure::Authority,
+                        error: Box::new(error),
+                    }
+                }
+                other => other,
+            })?;
 
         // The Project operating skill is admitted before session creation or
         // any model call.  A Project Chat is never allowed to fall back to a
@@ -2902,12 +2957,30 @@ impl FederatedAgentChatTurnRunner {
         })
     }
 
+    async fn run_typed_turn(
+        &self,
+        job: &AgentChatTurnJob,
+        cancellation: CancellationToken,
+    ) -> std::result::Result<CompletedAgentChatTurn, TurnRunError> {
+        let turn = self.load_turn(job).await?;
+        match turn.profile.backend_kind.as_str() {
+            "native" => self.run_native(job, turn, cancellation).await,
+            "cli" => self.run_cli(job, turn, cancellation).await,
+            _ => Err(TurnRunError {
+                failure: TurnFailure::Configuration,
+                error: ServiceError::invalid_operation(
+                    "selected Agent Chat backend is unsupported",
+                ),
+            }),
+        }
+    }
+
     async fn run_native(
         &self,
         job: &AgentChatTurnJob,
         turn: LoadedAgentChatTurn,
         cancellation: CancellationToken,
-    ) -> Result<CompletedAgentChatTurn> {
+    ) -> std::result::Result<CompletedAgentChatTurn, TurnRunError> {
         let LoadedAgentChatTurn {
             agent,
             profile,
@@ -2918,28 +2991,28 @@ impl FederatedAgentChatTurnRunner {
             state_card,
             operating_context_sources,
         } = turn;
-        let owner_user_id = agent
-            .owner_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent identity has no owner"))?;
+        let owner_user_id = agent.owner_id.as_deref().ok_or_else(|| TurnRunError {
+            failure: TurnFailure::Authority,
+            error: ServiceError::invalid_operation("Agent identity has no owner"),
+        })?;
         let credential_ref = profile
             .credential_ref
             .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no credential"))?;
+            .ok_or_else(|| TurnRunError::configuration("Agent profile has no credential"))?;
         let config: NativeProfileConfig = serde_json::from_str(&profile.config_json)
-            .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
+            .map_err(|_| TurnRunError::configuration("Agent profile config is invalid"))?;
         let runtime_session_id = session
             .runtime_session_id
             .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent session has no runtime id"))?;
+            .ok_or_else(|| TurnRunError::configuration("Agent session has no runtime id"))?;
         let provider = profile
             .provider
             .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no provider"))?;
+            .ok_or_else(|| TurnRunError::configuration("Agent profile has no provider"))?;
         let model = profile
             .model
             .clone()
-            .ok_or_else(|| ServiceError::invalid_operation("Agent profile has no model"))?;
+            .ok_or_else(|| TurnRunError::configuration("Agent profile has no model"))?;
         let provider_account_id =
             CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
                 .await?
@@ -3028,41 +3101,51 @@ impl FederatedAgentChatTurnRunner {
             .await
         {
             Ok(output) => output,
-            Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
-                message,
-                usage_reports,
-            }) => {
-                let mapped = usage_reports
-                    .iter()
-                    .enumerate()
-                    .map(|(sequence, report)| {
-                        crate::chat_usage::usage_report_from_host(
-                            report,
-                            "chat",
-                            job.attempt_count.checked_sub(1).ok_or_else(|| {
-                                ServiceError::invalid_operation("chat attempt count is invalid")
-                            })?,
-                            u32::try_from(sequence).map_err(|_| {
-                                ServiceError::invalid_operation("usage report sequence overflows")
-                            })?,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                self.remember_usage(&job.id, mapped).await;
-                return Err(ServiceError::invalid_operation(format!(
-                    "native Agent Chat turn failed: {message}"
-                )));
-            }
             Err(error) => {
-                tracing::warn!(
-                    job_id = %job.id,
-                    chat_id = %job.chat_id,
-                    %error,
-                    "native Agent Chat turn failed"
-                );
-                return Err(ServiceError::invalid_operation(format!(
-                    "native Agent Chat turn failed: {error}"
-                )));
+                let failure = error.turn_failure();
+                if matches!(
+                    &error,
+                    forge_agent_host::AgentHostError::RuntimeWithUsage {
+                        provider_auth_rejected: true,
+                        ..
+                    }
+                ) {
+                    if let Err(health_error) =
+                        crate::provider_health::record_chat_auth_rejection(&self.db, credential_ref)
+                            .await
+                    {
+                        tracing::warn!(turn_job_id = %job.id, error = %health_error, "provider auth health could not be recorded");
+                    }
+                }
+                let message = error.to_string();
+                if let forge_agent_host::AgentHostError::RuntimeWithUsage {
+                    usage_reports, ..
+                } = &error
+                {
+                    let mapped = usage_reports
+                        .iter()
+                        .enumerate()
+                        .map(|(sequence, report)| {
+                            crate::chat_usage::usage_report_from_host(
+                                report,
+                                "chat",
+                                job.invocation_count.saturating_sub(1),
+                                u32::try_from(sequence).map_err(|_| {
+                                    ServiceError::invalid_operation(
+                                        "usage report sequence overflows",
+                                    )
+                                })?,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    self.remember_usage(&job.id, mapped).await;
+                }
+                return Err(TurnRunError {
+                    failure,
+                    error: ServiceError::invalid_operation(format!(
+                        "native Agent Chat turn failed: {message}"
+                    )),
+                });
             }
         };
         let mut usage_reports = output
@@ -3073,7 +3156,7 @@ impl FederatedAgentChatTurnRunner {
                 crate::chat_usage::usage_report_from_host(
                     report,
                     "chat",
-                    job.attempt_count.checked_sub(1).ok_or_else(|| {
+                    job.invocation_count.checked_sub(1).ok_or_else(|| {
                         ServiceError::invalid_operation("chat attempt count is invalid")
                     })?,
                     u32::try_from(sequence).map_err(|_| {
@@ -3084,7 +3167,7 @@ impl FederatedAgentChatTurnRunner {
             .collect::<Result<Vec<_>>>()?;
         if usage_reports.is_empty() {
             let attempt_ordinal = job
-                .attempt_count
+                .invocation_count
                 .checked_sub(1)
                 .ok_or_else(|| ServiceError::invalid_operation("chat attempt count is invalid"))?;
             let counters = executors::UsageCounters {
@@ -3378,7 +3461,7 @@ impl FederatedAgentChatTurnRunner {
         job: &AgentChatTurnJob,
         turn: LoadedAgentChatTurn,
         cancellation: CancellationToken,
-    ) -> Result<CompletedAgentChatTurn> {
+    ) -> std::result::Result<CompletedAgentChatTurn, TurnRunError> {
         let LoadedAgentChatTurn {
             agent,
             profile,
@@ -3396,7 +3479,10 @@ impl FederatedAgentChatTurnRunner {
             &input.content,
             Some(&state_card),
         );
-        let config = cli_profile_execution_config(&profile)?;
+        let config = cli_profile_execution_config(&profile).map_err(|error| TurnRunError {
+            failure: TurnFailure::Configuration,
+            error,
+        })?;
         // The CLI adapter streams its own events into the turn log; only the
         // attempt divider comes from Forge, so a retry reads the same way on
         // both backends.
@@ -3441,7 +3527,7 @@ impl FederatedAgentChatTurnRunner {
             )
             .await?;
         let attempt_ordinal = job
-            .attempt_count
+            .invocation_count
             .checked_sub(1)
             .ok_or_else(|| ServiceError::invalid_operation("chat attempt count is invalid"))?;
         for report in &mut result.usage_reports {
@@ -3451,7 +3537,9 @@ impl FederatedAgentChatTurnRunner {
         }
         self.remember_usage(&job.id, result.usage_reports.clone())
             .await;
-        let content = cli_result_content(result)?;
+        let failure = cli_turn_failure(&result);
+        let content =
+            cli_result_content(result).map_err(|error| TurnRunError { failure, error })?;
         guard_agent_chat_content(&content)?;
         let context_manifest_id = if operating_context_sources.is_empty() {
             None
@@ -3540,15 +3628,9 @@ impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
         job: &AgentChatTurnJob,
         cancellation: CancellationToken,
     ) -> Result<CompletedAgentChatTurn> {
-        let turn = self.load_turn(job).await?;
-        let backend_kind = turn.profile.backend_kind.clone();
-        match backend_kind.as_str() {
-            "native" => self.run_native(job, turn, cancellation).await,
-            "cli" => self.run_cli(job, turn, cancellation).await,
-            _ => Err(ServiceError::invalid_operation(
-                "selected Agent Chat backend is unsupported",
-            )),
-        }
+        self.run_typed_turn(job, cancellation)
+            .await
+            .map_err(|error| error.error)
     }
 
     async fn run_turn_with_usage(
@@ -3556,7 +3638,7 @@ impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
         job: &AgentChatTurnJob,
         cancellation: CancellationToken,
     ) -> AgentChatTurnRunOutcome {
-        let result = self.run_turn(job, cancellation).await;
+        let result = self.run_typed_turn(job, cancellation).await;
         let usage_reports = self.take_usage(&job.id).await;
         match result {
             Ok(turn) => AgentChatTurnRunOutcome::Completed {
@@ -3564,7 +3646,8 @@ impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
                 usage_reports,
             },
             Err(error) => AgentChatTurnRunOutcome::Failed {
-                error,
+                failure: error.failure,
+                error: error.error,
                 usage_reports,
             },
         }
@@ -3658,8 +3741,13 @@ impl AgentChatTurnWorker {
     }
 
     pub async fn run_once(&self) -> Result<usize> {
+        self.run_once_at(Utc::now()).await
+    }
+
+    /// Select due work at an explicit clock instant; leases retain real time.
+    pub async fn run_once_at(&self, now: chrono::DateTime<Utc>) -> Result<usize> {
         self.recover_expired().await?;
-        let jobs = self.claim_available(1).await?;
+        let jobs: Vec<_> = self.claim_one_at(now).await?.into_iter().collect();
         let count = jobs.len();
         for job in jobs {
             self.process_claimed(job, CancellationToken::new()).await;
@@ -3680,7 +3768,11 @@ impl AgentChatTurnWorker {
     }
 
     async fn claim_one(&self) -> Result<Option<AgentChatTurnJob>> {
-        let now = now_rfc3339();
+        self.claim_one_at(Utc::now()).await
+    }
+
+    async fn claim_one_at(&self, now: chrono::DateTime<Utc>) -> Result<Option<AgentChatTurnJob>> {
+        let now = now.to_rfc3339();
         let leased_until = lease_deadline();
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let id = sqlx::query_scalar::<_, String>(
@@ -3720,7 +3812,7 @@ impl AgentChatTurnWorker {
              )
              UPDATE agent_chat_turn_job
              SET status = 'leased', lease_owner = ?, leased_until = ?,
-                 attempt_count = attempt_count + 1, next_attempt_at = NULL,
+                 attempt_count = attempt_count + 1, invocation_count = invocation_count + 1, next_attempt_at = NULL,
                  version = version + 1, updated_at = ?
              WHERE id = (SELECT id FROM candidate)
                AND status IN ('queued', 'retry_wait')
@@ -3743,8 +3835,10 @@ impl AgentChatTurnWorker {
 
     async fn recover_expired(&self) -> Result<()> {
         let now = now_rfc3339();
+        let failure_json = serde_json::to_string(&TurnFailure::Unclassified)
+            .map_err(|error| ServiceError::Domain(error.to_string()))?;
         let expired = sqlx::query(
-            "SELECT id, attempt_count, max_attempts
+            "SELECT id, attempt_count, max_attempts, pre_provider_failure_count, version
              FROM agent_chat_turn_job
              WHERE status = 'leased' AND leased_until IS NOT NULL AND leased_until <= ?
              ORDER BY created_at ASC, id ASC",
@@ -3757,9 +3851,14 @@ impl AgentChatTurnWorker {
             let id: String = row.try_get("id")?;
             let attempt_count: i64 = row.try_get("attempt_count")?;
             let max_attempts: i64 = row.try_get("max_attempts")?;
+            let pre_provider_failures: i64 = row.try_get("pre_provider_failure_count")?;
+            let version: i64 = row.try_get("version")?;
             let decision = failure_after_claim(
+                &TurnFailure::Unclassified,
                 attempt_count,
                 max_attempts,
+                pre_provider_failures,
+                crate::agent_chat_turn_policy::UsageLimitDeferrals::default(),
                 decision_time,
                 "Agent Chat lease expired",
             );
@@ -3771,15 +3870,19 @@ impl AgentChatTurnWorker {
                 "UPDATE agent_chat_turn_job
                  SET status = ?, lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = ?, error_code = 'lease_expired',
-                     error_message = ?, version = version + 1, updated_at = ?
-                 WHERE id = ? AND status = 'leased' AND leased_until IS NOT NULL
+                     error_message = ?, failure_class_json = ?, retry_decision = ?,
+                     version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ? AND status = 'leased' AND leased_until IS NOT NULL
                    AND leased_until <= ?",
             )
             .bind(status)
             .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
             .bind(decision.error)
+            .bind(&failure_json)
+            .bind(decision.retry_decision.as_str())
             .bind(&now)
             .bind(&id)
+            .bind(version)
             .bind(&now)
             .execute(self.db.pool())
             .await?;
@@ -3818,6 +3921,8 @@ impl AgentChatTurnWorker {
 
     async fn recover_parked(&self) -> Result<()> {
         let now = now_rfc3339();
+        let failure_json = serde_json::to_string(&TurnFailure::Unclassified)
+            .map_err(|error| ServiceError::Domain(error.to_string()))?;
         let parked_rows = sqlx::query(
             "SELECT id, pending_interaction_id, version
              FROM agent_chat_turn_job
@@ -3837,9 +3942,12 @@ impl AgentChatTurnWorker {
                     "UPDATE agent_chat_turn_job
                      SET status = 'failed', error_code = 'interaction_orphaned',
                          error_message = 'turn parked without interaction reference',
+                         failure_class_json = ?, retry_decision = ?,
                          version = version + 1, updated_at = ?
                      WHERE id = ? AND version = ? AND status = 'awaiting_input'",
                 )
+                .bind(&failure_json)
+                .bind(api_types::TurnRetryDecision::Fail.as_str())
                 .bind(&now)
                 .bind(&id)
                 .bind(version)
@@ -3860,9 +3968,12 @@ impl AgentChatTurnWorker {
                         "UPDATE agent_chat_turn_job
                          SET status = 'failed', error_code = 'interaction_orphaned',
                              error_message = 'pending interaction not found',
+                             failure_class_json = ?, retry_decision = ?,
                              version = version + 1, updated_at = ?
                          WHERE id = ? AND version = ? AND status = 'awaiting_input'",
                     )
+                    .bind(&failure_json)
+                    .bind(api_types::TurnRetryDecision::Fail.as_str())
                     .bind(&now)
                     .bind(&id)
                     .bind(version)
@@ -3888,7 +3999,7 @@ impl AgentChatTurnWorker {
                         let _ = sqlx::query(
                             "UPDATE agent_chat_turn_job
                              SET status = 'cancelled', pending_interaction_id = NULL,
-                                 error_code = 'interaction_cancelled',
+                                 error_code = 'interaction_cancelled', failure_class_json = NULL, retry_decision = NULL,
                                  error_message = 'pending interaction was cancelled',
                                  version = version + 1, updated_at = ?
                              WHERE id = ? AND version = ? AND status = 'awaiting_input'",
@@ -3907,9 +4018,12 @@ impl AgentChatTurnWorker {
                              SET status = 'failed', pending_interaction_id = NULL,
                                  error_code = 'interaction_expired',
                                  error_message = 'pending interaction expired',
+                                 failure_class_json = ?, retry_decision = ?,
                                  version = version + 1, updated_at = ?
                              WHERE id = ? AND version = ? AND status = 'awaiting_input'",
                         )
+                        .bind(&failure_json)
+                        .bind(api_types::TurnRetryDecision::Fail.as_str())
                         .bind(&now)
                         .bind(&id)
                         .bind(version)
@@ -4017,6 +4131,17 @@ impl AgentChatTurnWorker {
         Ok(())
     }
 
+    async fn release_shutdown_lease(&self, job: &AgentChatTurnJob) -> Result<()> {
+        sqlx::query("UPDATE agent_chat_turn_job SET status = 'queued',
+            lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
+            attempt_count = MAX(0, attempt_count - 1), failure_class_json = NULL, retry_decision = NULL,
+            error_code = NULL, error_message = NULL, version = version + 1, updated_at = ?
+            WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?")
+            .bind(now_rfc3339()).bind(&job.id).bind(job.version).bind(&self.lease_owner)
+            .execute(self.db.pool()).await?;
+        Ok(())
+    }
+
     async fn process_claimed(&self, job: AgentChatTurnJob, cancellation: CancellationToken) {
         // RetryWait is a retry of this same logical admission, not a new turn.
         // Keep the claimed job (including its frozen responder/Profile/policy
@@ -4024,6 +4149,32 @@ impl AgentChatTurnWorker {
         // status, attempt count, and version, but must never re-resolve the
         // current binding or Profile here.
         if cancellation.is_cancelled() {
+            let _ = self.release_shutdown_lease(&job).await;
+            return;
+        }
+        // A deferred capacity window has its own deadline, independent of
+        // charged attempts. Expiry must not make one more provider call.
+        let capacity_expired = job
+            .usage_limit_first_deferred_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|first| Utc::now() >= first + ChronoDuration::hours(24));
+        if matches!(job.failure_class, Some(TurnFailure::UsageLimit { .. }))
+            && (capacity_expired
+                || job.usage_limit_deferral_count
+                    >= crate::agent_chat_turn_policy::MAX_USAGE_LIMIT_DEFERRALS)
+        {
+            let _ = self
+                .chat_service
+                .append_failure(
+                    &job,
+                    &self.lease_owner,
+                    job.failure_class
+                        .as_ref()
+                        .expect("usage-limit evidence checked"),
+                    "Agent Chat usage-limit deferral budget exhausted",
+                )
+                .await;
             return;
         }
         if let Err(error) = self.validate_usage_admission_authority(&job).await {
@@ -4033,7 +4184,14 @@ impl AgentChatTurnWorker {
                 .append_failure(
                     &job,
                     &self.lease_owner,
-                    "usage_admission_authority_failed",
+                    &match &error {
+                        ServiceError::AgentPaused { .. }
+                        | ServiceError::ProjectPaused { .. }
+                        | ServiceError::Db(
+                            db::DbError::AgentPaused { .. } | db::DbError::ProjectPaused { .. },
+                        ) => TurnFailure::Authority,
+                        _ => TurnFailure::PreProviderAdmission,
+                    },
                     "Agent Chat authority could not be verified before provider admission",
                 )
                 .await;
@@ -4041,15 +4199,24 @@ impl AgentChatTurnWorker {
         }
         if let Err(error) = self.runner.validate_provider_availability(&job).await {
             tracing::warn!(job_id = %job.id, error = %error, "Agent Chat provider unavailable before usage admission");
-            let _ = self
-                .chat_service
-                .append_failure(
-                    &job,
-                    &self.lease_owner,
-                    "provider_unavailable",
-                    "Agent Chat provider is unavailable before provider admission",
-                )
-                .await;
+            let _ =
+                self.chat_service
+                    .append_failure(
+                        &job,
+                        &self.lease_owner,
+                        &match &error {
+                            ServiceError::InvalidOperation { .. }
+                            | ServiceError::NotFound { .. } => TurnFailure::Configuration,
+                            ServiceError::AgentPaused { .. }
+                            | ServiceError::ProjectPaused { .. }
+                            | ServiceError::Db(
+                                db::DbError::AgentPaused { .. } | db::DbError::ProjectPaused { .. },
+                            ) => TurnFailure::Authority,
+                            _ => TurnFailure::PreProviderAdmission,
+                        },
+                        "Agent Chat provider is unavailable before provider admission",
+                    )
+                    .await;
             return;
         }
         let admission = match crate::chat_usage::admit_chat_usage(&self.db, &job).await {
@@ -4061,7 +4228,7 @@ impl AgentChatTurnWorker {
                     .append_failure(
                         &job,
                         &self.lease_owner,
-                        "usage_admission_failed",
+                        &TurnFailure::PreProviderAdmission,
                         "Agent Chat usage admission could not be committed",
                     )
                     .await;
@@ -4116,20 +4283,37 @@ impl AgentChatTurnWorker {
         let _ = renewal.await;
         let provider_outcome = match result.as_ref() {
             Some(AgentChatTurnRunOutcome::Completed { .. }) => Some(Ok(())),
-            Some(AgentChatTurnRunOutcome::Failed { error, .. }) => Some(Err(error.to_string())),
+            Some(AgentChatTurnRunOutcome::Failed { failure, .. }) => Some(Err(failure)),
             None => None,
         };
-        if let (Some(outcome), Some(responder)) =
-            (provider_outcome, job.responder_identity_id.as_deref())
-        {
-            if let Err(error) = crate::provider_health::record_agent_outcome(
-                &self.db,
-                responder,
-                outcome.as_ref().map(|_| ()).map_err(String::as_str),
-            )
-            .await
-            {
-                tracing::warn!(job_id = %job.id, error = %error, "provider health could not be recorded");
+        if let (Some(outcome), Some(profile)) = (provider_outcome, job.profile_id.as_deref()) {
+            let resume_at = outcome.err().and_then(|failure| {
+                crate::agent_chat_turn_policy::failure_after_claim(
+                    failure,
+                    job.attempt_count,
+                    job.max_attempts,
+                    job.pre_provider_failure_count,
+                    crate::agent_chat_turn_policy::UsageLimitDeferrals {
+                        count: job.usage_limit_deferral_count,
+                        first_at: job
+                            .usage_limit_first_deferred_at
+                            .as_deref()
+                            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                            .map(|at| at.with_timezone(&Utc)),
+                    },
+                    Utc::now(),
+                    "",
+                )
+                .next_attempt_at
+            });
+            if !cancellation.is_cancelled() {
+                if let Err(error) = crate::provider_health::record_chat_outcome(
+                    &self.db, profile, outcome, resume_at,
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %job.id, error = %error, "provider health could not be recorded");
+                }
             }
         }
         // Renewal is versioned. Re-read after the backend stops so a long
@@ -4140,6 +4324,26 @@ impl AgentChatTurnWorker {
             .ok()
             .flatten()
             .unwrap_or(job.clone());
+        if cancellation.is_cancelled() && commit_job.status == db::AgentChatTurnState::Leased {
+            if let Some(
+                AgentChatTurnRunOutcome::Completed { usage_reports, .. }
+                | AgentChatTurnRunOutcome::Failed { usage_reports, .. },
+            ) = result.as_ref()
+            {
+                if let Err(error) = crate::chat_usage::settle_late_chat_usage(
+                    &self.db,
+                    &job.id,
+                    usage_reports,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %job.id, %error, "shutdown usage settlement failed");
+                }
+            }
+            let _ = self.release_shutdown_lease(&commit_job).await;
+            return;
+        }
         if baseline_turn && control_transfer.is_none() {
             control_transfer = self
                 .find_genesis_control_transfer(&commit_job.id)
@@ -4262,7 +4466,7 @@ impl AgentChatTurnWorker {
                             .append_failure_with_usage(
                                 &commit_job,
                                 &self.lease_owner,
-                                "awaiting_input_commit_failed",
+                                &TurnFailure::Unclassified,
                                 "Agent Chat awaiting input state could not be committed",
                                 settlements.clone(),
                             )
@@ -4281,7 +4485,7 @@ impl AgentChatTurnWorker {
                         .append_failure_with_usage(
                             &commit_job,
                             &self.lease_owner,
-                            "empty_response",
+                            &TurnFailure::EmptyResponse,
                             "Agent returned no text response",
                             settlements.clone(),
                         )
@@ -4311,7 +4515,7 @@ impl AgentChatTurnWorker {
                                     .append_failure_with_usage(
                                         &commit_job,
                                         &self.lease_owner,
-                                        "response_commit_failed",
+                                        &TurnFailure::Unclassified,
                                         "Agent Chat response could not be committed",
                                         settlements.clone(),
                                     )
@@ -4334,7 +4538,12 @@ impl AgentChatTurnWorker {
                                 .append_failure_with_usage(
                                     &commit_job,
                                     &self.lease_owner,
-                                    DELIVERY_FOLLOWUP_POSTCONDITION_FAILED,
+                                    &TurnFailure::PostconditionUnmet {
+                                        event: self
+                                            .required_postcondition_event(&commit_job)
+                                            .await
+                                            .unwrap_or_default(),
+                                    },
                                     DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE,
                                     settlements.clone(),
                                 )
@@ -4353,7 +4562,7 @@ impl AgentChatTurnWorker {
                                 .append_failure_with_usage(
                                     &commit_job,
                                     &self.lease_owner,
-                                    "turn_postcondition_check_failed",
+                                    &TurnFailure::Unclassified,
                                     "Agent Chat turn postcondition could not be verified",
                                     settlements.clone(),
                                 )
@@ -4369,6 +4578,7 @@ impl AgentChatTurnWorker {
                 }
             }
             AgentChatTurnRunOutcome::Failed {
+                failure,
                 error,
                 usage_reports,
             } => {
@@ -4378,7 +4588,6 @@ impl AgentChatTurnWorker {
                         .await;
                     return;
                 }
-                let code = classify_turn_error(&error);
                 let message = bounded_error_message(&error.to_string());
                 let settlements = match crate::chat_usage::build_chat_usage_settlements(
                     &self.db,
@@ -4402,7 +4611,7 @@ impl AgentChatTurnWorker {
                     .append_failure_with_usage(
                         &commit_job,
                         &self.lease_owner,
-                        code,
+                        &failure,
                         &message,
                         settlements,
                     )
@@ -4512,6 +4721,18 @@ impl AgentChatTurnWorker {
                 settlements,
             )
             .await
+    }
+
+    async fn required_postcondition_event(&self, job: &AgentChatTurnJob) -> Result<String> {
+        let message =
+            AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
+                })?;
+        Ok(delivery_followup_postcondition(&message)?
+            .map(|condition| condition.required_event_type)
+            .unwrap_or_default())
     }
 
     async fn turn_postcondition_satisfied(&self, job: &AgentChatTurnJob) -> Result<bool> {
@@ -5699,6 +5920,41 @@ fn main_operating_context_sources(
     Ok(sources)
 }
 
+fn cli_turn_failure(result: &ExecutionResult) -> TurnFailure {
+    if result
+        .route_attempts
+        .iter()
+        .any(|attempt| attempt.outcome == executors::RouteAttemptOutcome::UsageExhausted)
+    {
+        return TurnFailure::UsageLimit {
+            resets_at: result
+                .retry_after
+                .and_then(|delay| chrono::Duration::from_std(delay).ok())
+                .map(|delay| Utc::now() + delay)
+                .and_then(|at| u64::try_from(at.timestamp_millis()).ok()),
+        };
+    }
+    if result.failure_class == Some(executors::ExecutionFailureClass::ExecutorUnavailable)
+        && result.retry_after.is_some()
+    {
+        return TurnFailure::Transient {
+            retry_after: result
+                .retry_after
+                .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+        };
+    }
+    if result.status == ExecutionOutcome::Completed
+        && result
+            .assistant_output
+            .as_ref()
+            .or(result.summary.as_ref())
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        return TurnFailure::EmptyResponse;
+    }
+    TurnFailure::Unclassified
+}
+
 fn cli_result_content(result: ExecutionResult) -> Result<String> {
     let content = match result.status {
         ExecutionOutcome::Completed => result
@@ -5783,29 +6039,6 @@ fn bounded_error_message(value: &str) -> String {
     value.chars().take(MAX_ERROR_CHARS).collect()
 }
 
-fn classify_turn_error(error: &ServiceError) -> &'static str {
-    let text = error.to_string().to_ascii_lowercase();
-    if text.contains("usage limit") || text.contains("limit exhausted") {
-        "usage_limit"
-    } else if text.contains("credential") {
-        "credential_unavailable"
-    } else if text.contains("cancel") {
-        "cancelled"
-    } else if text.contains("scope")
-        || text.contains("permission")
-        || text.contains("binding")
-        || text.contains("charter")
-        || text.contains("operating-skill")
-        || text.contains("handoff")
-    {
-        "authority_denied"
-    } else if text.contains("profile") || text.contains("config") {
-        "configuration_invalid"
-    } else {
-        "backend_failed"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5831,6 +6064,76 @@ mod tests {
             .expect("in-memory pool");
         db::run_migrations(&pool).await.expect("migrations apply");
         Arc::new(SqliteDb::new(pool))
+    }
+
+    #[test]
+    fn load_turn_errors_preserve_typed_authority_and_configuration() {
+        for error in [
+            ServiceError::AgentPaused {
+                agent_id: "agent".into(),
+            },
+            ServiceError::ProjectPaused {
+                project_id: "project".into(),
+            },
+            ServiceError::AuthorizationDenied {
+                message: "denied".into(),
+            },
+        ] {
+            assert_eq!(TurnRunError::from(error).failure, TurnFailure::Authority);
+        }
+        for entity in ["agent_profile", "agent_identity"] {
+            assert_eq!(
+                TurnRunError::from(ServiceError::not_found(entity, "missing")).failure,
+                TurnFailure::Configuration
+            );
+        }
+        assert_eq!(
+            TurnRunError::from(ServiceError::TurnFailure {
+                failure: TurnFailure::Configuration,
+                error: Box::new(ServiceError::invalid_operation("typed evidence"))
+            })
+            .failure,
+            TurnFailure::Configuration
+        );
+        assert_eq!(
+            TurnRunError::from(ServiceError::invalid_operation(
+                "config usage limit credential"
+            ))
+            .failure,
+            TurnFailure::Unclassified
+        );
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_refunds_claim_without_changing_invocation_identity() {
+        let db = worker_test_db().await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('shutdown-owner', 'shutdown@example.test', 'test', ?, ?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let chat = db::AgentChatRepo::get_main_chat(&*db, "shutdown-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("INSERT INTO agent_chat_message (id, chat_id, sequence, author_type, author_id, content, status, correlation_id, created_at) VALUES ('shutdown-message', ?, 1, 'user', 'shutdown-owner', 'hello', 'complete', 'shutdown-correlation', ?)")
+            .bind(&chat.id).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_chat_turn_job (id, chat_id, triggering_message_id, canonical_scope_type, canonical_scope_id, dedupe_key, correlation_id, created_at, updated_at) VALUES ('shutdown-turn', ?, 'shutdown-message', 'agent_chat', ?, 'shutdown-key', 'shutdown-correlation', ?, ?)")
+            .bind(&chat.id).bind(&chat.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let worker = AgentChatTurnWorker::with_runner(db.clone(), Arc::new(AuthorityOnlyRunner));
+        let job = worker.claim_one().await.unwrap().unwrap();
+        assert_eq!(job.attempt_count, 1);
+        let token = CancellationToken::new();
+        token.cancel();
+        worker.process_claimed(job, token).await;
+        let recovered = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, "shutdown-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, db::AgentChatTurnState::Queued);
+        assert_eq!(recovered.attempt_count, 0);
+        assert_eq!(recovered.invocation_count, 1);
+        assert!(recovered.lease_owner.is_none());
+        assert!(recovered.failure_class.is_none());
+        assert!(recovered.retry_decision.is_none());
     }
 
     #[test]
@@ -6152,21 +6455,34 @@ mod tests {
     }
 
     #[test]
-    fn errors_are_bounded_and_classified_without_body_leak() {
+    fn cli_failure_uses_typed_route_evidence_only() {
+        assert_eq!(
+            cli_turn_failure(&ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                error: Some("config credential usage limit".into()),
+                ..Default::default()
+            }),
+            TurnFailure::Unclassified
+        );
+        assert_eq!(
+            cli_turn_failure(&ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                route_attempts: vec![executors::RouteAttempt {
+                    candidate_key: "chat".into(),
+                    outcome: executors::RouteAttemptOutcome::UsageExhausted
+                }],
+                ..Default::default()
+            }),
+            TurnFailure::UsageLimit { resets_at: None }
+        );
+    }
+
+    #[test]
+    fn errors_are_bounded_without_body_leak() {
         let error = ServiceError::invalid_operation("x".repeat(2048));
         assert_eq!(
             bounded_error_message(&error.to_string()).chars().count(),
             MAX_ERROR_CHARS
-        );
-        assert_eq!(
-            classify_turn_error(&ServiceError::invalid_operation("credential unavailable")),
-            "credential_unavailable"
-        );
-        assert_eq!(
-            classify_turn_error(&ServiceError::invalid_operation(
-                "Project Agent Charter pointer is stale"
-            )),
-            "authority_denied"
         );
     }
 

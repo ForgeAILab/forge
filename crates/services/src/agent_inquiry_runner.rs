@@ -352,6 +352,7 @@ Your inquiry id is {inquiry_id}."
                     Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
                         message,
                         usage_reports,
+                        ..
                     }) => {
                         let mapped = usage_reports
                             .iter()

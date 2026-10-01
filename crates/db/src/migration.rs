@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610010550 (typed terminal denials, live invalidation, and Project doctrine).
+// Embedded migration bundle revision: V202610010600 (typed chat turn failures, bounded deferrals, and invocation backfill).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -504,6 +504,43 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typed_turn_failure_migration_preserves_historical_outcomes() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE agent_chat_turn_job (id TEXT PRIMARY KEY, attempt_count INTEGER NOT NULL, error_code TEXT, error_message TEXT); CREATE TABLE usage_invocation (source_id TEXT, attempt_ordinal INTEGER); INSERT INTO agent_chat_turn_job VALUES ('old', 3, 'configuration_invalid', 'old provider failure'), ('parked', 0, NULL, NULL); INSERT INTO usage_invocation VALUES ('parked', 0), ('parked', 4), ('old', 1);")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610010600__chat_turn_failure_class.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let row = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = 'old'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let parked_count: i64 = sqlx::query_scalar(
+            "SELECT invocation_count FROM agent_chat_turn_job WHERE id = 'parked'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            parked_count, 5,
+            "parked invocations must never reuse ledger ordinals"
+        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 3);
+        assert_eq!(row.get::<i64, _>("invocation_count"), 3);
+        assert_eq!(row.get::<i64, _>("pre_provider_failure_count"), 0);
+        assert_eq!(row.get::<String, _>("error_code"), "configuration_invalid");
+        assert_eq!(
+            row.get::<String, _>("error_message"),
+            "old provider failure"
+        );
+        assert!(row.get::<Option<String>, _>("failure_class_json").is_none());
+        assert!(row.get::<Option<String>, _>("retry_decision").is_none());
+    }
 
     #[test]
     fn bundled_migrations_have_unique_versions_and_timestamp_numbers_after_v149() {

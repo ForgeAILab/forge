@@ -1,6 +1,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   cancelAgentChatTurn,
+  retryAgentChatTurn,
   createAgentHandoff,
   getAgentChat,
   getAgentHandoff,
@@ -15,6 +16,7 @@ import type {
   AgentChatMessageInput,
   AgentChatTurn,
   AgentChatTurnCancelInput,
+  AgentChatTurnRetryInput,
   AgentHandoffInput,
 } from './types'
 import type { LogEntry } from '@/types/generated'
@@ -160,6 +162,31 @@ export function useCancelAgentChatTurnMutation(chatId: string | undefined) {
       void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.messages(chatId) })
       void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.turns(chatId) })
       void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.chats })
+    },
+  })
+}
+
+export function useRetryAgentChatTurnMutation(chatId: string | undefined) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ turnId, input }: { turnId: string; input: AgentChatTurnRetryInput }) =>
+      retryAgentChatTurn(chatId!, turnId, input),
+    onSuccess: (retriedTurn) => {
+      if (!chatId) return
+      queryClient.setQueryData<AgentChatTurn[] | undefined>(
+        agentChatQueryKeys.turns(chatId),
+        (turns) => {
+          if (!turns) return turns
+          return turns.some((turn) => turn.id === retriedTurn.id)
+            ? turns.map((turn) => (turn.id === retriedTurn.id ? retriedTurn : turn))
+            : [...turns, retriedTurn]
+        },
+      )
+      void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.chat(chatId) })
+      void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.messages(chatId) })
+      void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.turns(chatId) })
+      void queryClient.invalidateQueries({ queryKey: agentChatQueryKeys.chats })
+      void queryClient.invalidateQueries({ queryKey: ['mission-control'] })
     },
   })
 }

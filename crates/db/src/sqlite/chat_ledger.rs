@@ -159,7 +159,7 @@ async fn current_chat_turn(
     transaction: &mut Transaction<'_, Sqlite>,
     id: &str,
 ) -> Result<AgentChatTurnJob> {
-    sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+    sqlx::query(super::agent_chat::AGENT_CHAT_TURN_WITH_RETRY_STATE)
         .bind(id)
         .fetch_optional(&mut **transaction)
         .await?
@@ -310,7 +310,7 @@ pub(super) async fn complete_agent_chat_turn_with_usage(
          SET status = 'succeeded', response_message_id = ?,
              lease_owner = NULL, leased_until = NULL,
              next_attempt_at = NULL, error_code = NULL,
-             error_message = NULL, version = version + 1, updated_at = ?
+             error_message = NULL, failure_class_json = NULL, retry_decision = NULL, version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
     )
     .bind(&response.id)
@@ -467,7 +467,7 @@ pub(super) async fn complete_agent_chat_control_transfer_with_usage(
         "UPDATE agent_chat_turn_job
          SET status = 'succeeded', response_message_id = NULL,
              lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
-             error_code = NULL, error_message = NULL,
+             error_code = NULL, error_message = NULL, failure_class_json = NULL, retry_decision = NULL,
              version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
     )
@@ -539,6 +539,11 @@ pub(super) async fn fail_agent_chat_turn_with_usage(
         && current.next_attempt_at == terminal.next_attempt_at
         && current.error_code.as_deref() == Some(error_code.as_str())
         && current.error_message.as_deref() == Some(error_message.as_str())
+        && current.failure_class.as_ref() == Some(&terminal.failure_class)
+        && current.retry_decision.as_ref() == Some(&terminal.retry_decision)
+        && current.pre_provider_failure_count == terminal.pre_provider_failure_count
+        && current.usage_limit_deferral_count == terminal.usage_limit_deferral_count
+        && current.usage_limit_first_deferred_at == terminal.usage_limit_first_deferred_at
     {
         settle_source_in_tx(
             db,
@@ -562,7 +567,8 @@ pub(super) async fn fail_agent_chat_turn_with_usage(
         "UPDATE agent_chat_turn_job
          SET status = ?, lease_owner = NULL, leased_until = NULL,
              attempt_count = ?, next_attempt_at = ?, error_code = ?,
-             error_message = ?, version = version + 1, updated_at = ?
+             error_message = ?, failure_class_json = ?, retry_decision = ?,
+                 pre_provider_failure_count = ?, usage_limit_deferral_count = ?, usage_limit_first_deferred_at = ?, version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
     )
     .bind(terminal.status.to_string())
@@ -570,6 +576,14 @@ pub(super) async fn fail_agent_chat_turn_with_usage(
     .bind(terminal.next_attempt_at.as_deref())
     .bind(&error_code)
     .bind(&error_message)
+    .bind(
+        serde_json::to_string(&terminal.failure_class)
+            .map_err(|error| DbError::Check(error.to_string()))?,
+    )
+    .bind(terminal.retry_decision.as_str())
+    .bind(terminal.pre_provider_failure_count)
+    .bind(terminal.usage_limit_deferral_count)
+    .bind(&terminal.usage_limit_first_deferred_at)
     .bind(&terminal.updated_at)
     .bind(&terminal.turn_job_id)
     .bind(terminal.expected_version)
@@ -639,7 +653,7 @@ pub(super) async fn park_agent_chat_turn_with_usage(
          SET status = 'awaiting_input', pending_interaction_id = ?,
              lease_owner = NULL, leased_until = NULL,
              attempt_count = MAX(0, attempt_count - 1), next_attempt_at = NULL,
-             error_code = NULL, error_message = NULL, version = version + 1,
+             error_code = NULL, error_message = NULL, failure_class_json = NULL, retry_decision = NULL, version = version + 1,
              updated_at = ?
          WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
     )
@@ -710,7 +724,7 @@ pub(super) async fn cancel_agent_chat_turn_with_usage(
         "UPDATE agent_chat_turn_job
          SET status = 'cancelled', lease_owner = NULL, leased_until = NULL,
              next_attempt_at = NULL, error_code = 'cancelled_by_user',
-             error_message = 'cancelled by user', version = version + 1,
+             error_message = 'cancelled by user', failure_class_json = NULL, retry_decision = NULL, version = version + 1,
              updated_at = ?
          WHERE id = ? AND version = ?
            AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')",

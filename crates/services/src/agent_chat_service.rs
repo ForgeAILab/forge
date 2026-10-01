@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crate::{
     agent_chat_policy::{guard_agent_chat_content, AgentChatOperation, AgentChatScope},
-    agent_chat_turn_policy::{bounded_error, failure_after_claim},
+    agent_chat_turn_policy::failure_after_claim,
     agent_turn_admission::{
         content_digest, handoff_content_digest_with_sources, AgentResponderStore,
         AgentTurnAdmissionService, AgentTurnAdmitInput, AgentTurnPrepareInput, AgentTurnTrigger,
@@ -76,6 +76,8 @@ pub struct RetryAgentChatTurnInput {
     pub actor_user_id: String,
     pub chat_id: String,
     pub turn_job_id: String,
+    pub expected_version: i64,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -591,41 +593,44 @@ where
     /// is the point of retrying after a fix: a turn that died because its model,
     /// binding, or policy was wrong must pick up the corrected one, not replay
     /// the configuration that failed.
-    pub async fn retry_turn(&self, input: RetryAgentChatTurnInput) -> Result<AgentChatTurnJob> {
+    pub async fn retry_turn(&self, input: RetryAgentChatTurnInput) -> Result<AgentChatTurnJob>
+    where
+        D: db::DomainEventRepo + db::AttentionRepo,
+    {
         let chat = self
             .get_authorized_chat(&input.actor_user_id, &input.chat_id)
             .await?;
         let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &input.turn_job_id)
             .await?
+            .filter(|job| job.chat_id == chat.id)
             .ok_or_else(|| ServiceError::not_found("agent_chat_turn", input.turn_job_id.clone()))?;
-        if job.chat_id != chat.id {
-            return Err(ServiceError::not_found(
-                "agent_chat_turn",
-                input.turn_job_id,
+        let key = input.idempotency_key.trim();
+        if key.is_empty() || key.chars().count() > MAX_TURN_CANCELLATION_KEY_CHARS {
+            return Err(ServiceError::invalid_operation(
+                "retry idempotency_key must contain 1–256 characters",
             ));
         }
-        if job.status != AgentChatTurnState::Failed {
-            return Err(ServiceError::Conflict(
-                "only a failed Agent Chat turn can be retried".to_owned(),
-            ));
+        let retry_key = format!("agent-chat-turn-retry:{}:{}", job.id, key);
+        // Replay precedes version and authority checks: a completed mutation
+        // must remain replayable after an Agent edit or another turn.
+        if let Some(event) = db::DomainEventRepo::get_event_by_dedupe(&*self.db, &retry_key).await?
+        {
+            crate::attention_service::resolve_turn_incident(
+                &*self.db,
+                &job.chat_id,
+                &job.id,
+                &event.id,
+            )
+            .await?;
+            return AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &event.entity_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent_chat_turn", event.entity_id));
         }
-        // One live turn per chat: retrying while another is in flight would
-        // race two responders onto the same conversation.
-        let in_flight = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &chat.id)
-            .await?
-            .into_iter()
-            .any(|other| {
-                matches!(
-                    other.status,
-                    AgentChatTurnState::Queued
-                        | AgentChatTurnState::Leased
-                        | AgentChatTurnState::RetryWait
-                )
-            });
-        if in_flight {
-            return Err(ServiceError::Conflict(
-                "another Agent Chat turn is already in flight".to_owned(),
-            ));
+        if job.version != input.expected_version {
+            return Err(db::DbError::VersionConflict.into());
+        }
+        if job.retry_action().is_none() {
+            return Err(db::DbError::TurnNotRetryable.into());
         }
         let message =
             AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
@@ -635,8 +640,7 @@ where
                     ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
                 })?;
 
-        let attempt = job.attempt_count.saturating_add(1);
-        let dedupe_key = format!("retry:{}:{}", job.id, attempt);
+        let dedupe_key = retry_key.clone();
         let content_digest = content_digest(&message.content)
             .map_err(|_| ServiceError::invalid_operation("retry content digest failed"))?;
         let prepared = AgentTurnAdmissionService::new(Arc::clone(&self.db))
@@ -678,9 +682,29 @@ where
             created_at: now.clone(),
             updated_at: now,
         })?;
-        AgentChatTurnJobRepo::create_agent_chat_turn_job(&*self.db, turn)
-            .await
-            .map_err(Into::into)
+        let result = AgentChatTransactionRepo::retry_agent_chat_turn(
+            &*self.db,
+            db::RetryAgentChatTurn {
+                new_turn: turn,
+                turn_job_id: job.id.clone(),
+                expected_version: input.expected_version,
+                actor_user_id: input.actor_user_id,
+                idempotency_key: key.to_owned(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        let event = db::DomainEventRepo::get_event_by_dedupe(&*self.db, &retry_key)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("retry event missing"))?;
+        crate::attention_service::resolve_turn_incident(
+            &*self.db,
+            &job.chat_id,
+            &job.id,
+            &event.id,
+        )
+        .await?;
+        Ok(result)
     }
 
     pub async fn append_success(
@@ -894,7 +918,7 @@ where
         &self,
         job: &AgentChatTurnJob,
         lease_owner: &str,
-        error_code: &str,
+        failure: &api_types::TurnFailure,
         error_message: &str,
     ) -> Result<AgentChatTurnJob> {
         if job.status != AgentChatTurnState::Leased
@@ -905,7 +929,22 @@ where
             ));
         }
         let now = chrono::Utc::now();
-        let decision = failure_after_claim(job.attempt_count, job.max_attempts, now, error_message);
+        let decision = failure_after_claim(
+            failure,
+            job.attempt_count,
+            job.max_attempts,
+            job.pre_provider_failure_count,
+            crate::agent_chat_turn_policy::UsageLimitDeferrals {
+                count: job.usage_limit_deferral_count,
+                first_at: job
+                    .usage_limit_first_deferred_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .map(|at| at.with_timezone(&chrono::Utc)),
+            },
+            now,
+            error_message,
+        );
         AgentChatTransactionRepo::fail_agent_chat_turn(
             &*self.db,
             FailAgentChatTurn {
@@ -919,7 +958,14 @@ where
                 },
                 attempt_count: decision.attempt_count,
                 next_attempt_at: decision.next_attempt_at.map(|at| at.to_rfc3339()),
-                error_code: bounded_error(error_code),
+                error_code: failure.code().to_owned(),
+                failure_class: failure.clone(),
+                retry_decision: decision.retry_decision,
+                pre_provider_failure_count: decision.pre_provider_failure_count,
+                usage_limit_deferral_count: decision.usage_limit_deferral_count,
+                usage_limit_first_deferred_at: decision
+                    .usage_limit_first_deferred_at
+                    .map(|at| at.to_rfc3339()),
                 error_message: decision.error,
                 updated_at: now.to_rfc3339(),
             },
@@ -932,7 +978,7 @@ where
         &self,
         job: &AgentChatTurnJob,
         lease_owner: &str,
-        error_code: &str,
+        failure: &api_types::TurnFailure,
         error_message: &str,
         settlements: Vec<db::UsageLedgerSettlement>,
     ) -> Result<AgentChatTurnJob> {
@@ -944,7 +990,22 @@ where
             ));
         }
         let now = chrono::Utc::now();
-        let decision = failure_after_claim(job.attempt_count, job.max_attempts, now, error_message);
+        let decision = failure_after_claim(
+            failure,
+            job.attempt_count,
+            job.max_attempts,
+            job.pre_provider_failure_count,
+            crate::agent_chat_turn_policy::UsageLimitDeferrals {
+                count: job.usage_limit_deferral_count,
+                first_at: job
+                    .usage_limit_first_deferred_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .map(|at| at.with_timezone(&chrono::Utc)),
+            },
+            now,
+            error_message,
+        );
         AgentChatTransactionRepo::fail_agent_chat_turn_with_usage(
             &*self.db,
             db::FailAgentChatTurnWithUsage {
@@ -959,7 +1020,14 @@ where
                     },
                     attempt_count: decision.attempt_count,
                     next_attempt_at: decision.next_attempt_at.map(|at| at.to_rfc3339()),
-                    error_code: bounded_error(error_code),
+                    error_code: failure.code().to_owned(),
+                    failure_class: failure.clone(),
+                    retry_decision: decision.retry_decision,
+                    pre_provider_failure_count: decision.pre_provider_failure_count,
+                    usage_limit_deferral_count: decision.usage_limit_deferral_count,
+                    usage_limit_first_deferred_at: decision
+                        .usage_limit_first_deferred_at
+                        .map(|at| at.to_rfc3339()),
                     error_message: decision.error,
                     updated_at: now.to_rfc3339(),
                 },

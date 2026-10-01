@@ -415,6 +415,7 @@ pub struct SoloTurnSnapshot {
     pub response_message_id: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub retry_action: Option<api_types::RetryTurnAction>,
     pub correlation_id: String,
     pub version: i64,
     pub created_at: String,
@@ -910,63 +911,21 @@ impl SoloSessionService {
         Ok(turn_snapshot(&cancelled))
     }
 
-    /// Retry a failed turn from its original triggering message.  The source
-    /// version is checked before any replay, and the canonical deterministic
-    /// child is returned when a prior response was lost.
+    /// Admit a fresh retry through the canonical versioned/idempotent command.
     pub async fn retry_turn(&self, input: SoloRetryTurnInput) -> Result<SoloTurnSnapshot> {
-        let (turn_job_id, _idempotency_key, expected_version) = validate_retry_input(input)?;
-        let job = self.authorized_turn(&turn_job_id).await?;
-        ensure_expected_turn_version(job.version, expected_version)?;
-        if job.status != AgentChatTurnState::Failed {
-            return Err(ServiceError::conflict(
-                "only a failed Agent Chat turn can be retried",
-            ));
-        }
-        if job.attempt_count < 0 {
-            return Err(ServiceError::invalid_operation(
-                "failed Agent Chat turn has an invalid attempt count",
-            ));
-        }
-        let next_attempt = job.attempt_count.checked_add(1).ok_or_else(|| {
-            ServiceError::invalid_operation("failed Agent Chat turn attempt count overflowed")
-        })?;
-        let dedupe_key = retry_dedupe_key(&job.id, next_attempt)?;
-
-        // A response can be lost after the canonical service commits its
-        // child.  Resolve that child before admission so replay converges to
-        // one durable retry rather than attempting a second turn.
-        if let Some(existing) = self.find_retry_child(&job, &dedupe_key).await? {
-            return Ok(turn_snapshot(&existing));
-        }
-
-        let retried = self
+        let (turn_job_id, idempotency_key, expected_version) = validate_retry_input(input)?;
+        self.authorized_turn(&turn_job_id).await?;
+        let turn = self
             .agent_chat_service
             .retry_turn(RetryAgentChatTurnInput {
                 actor_user_id: self.scope.owner_id.clone(),
                 chat_id: self.scope.project_chat_id.clone(),
-                turn_job_id: turn_job_id.clone(),
+                turn_job_id,
+                expected_version,
+                idempotency_key,
             })
-            .await;
-        match retried {
-            Ok(retried) => {
-                // Re-authorize the returned row instead of trusting the
-                // service result's scope metadata at this presentation
-                // boundary.
-                let retried = self.authorized_turn(&retried.id).await?;
-                Ok(turn_snapshot(&retried))
-            }
-            Err(error) => {
-                // A concurrent retry may have won the insert between the
-                // preflight read and the canonical admission.  If its
-                // deterministic child is now durable, return it as the
-                // replay result; otherwise preserve the canonical error.
-                if let Some(existing) = self.find_retry_child(&job, &dedupe_key).await? {
-                    Ok(turn_snapshot(&existing))
-                } else {
-                    Err(error)
-                }
-            }
-        }
+            .await?;
+        Ok(turn_snapshot(&turn))
     }
 
     /// Answer a protected runtime questionnaire only when the exact pending
@@ -1323,31 +1282,6 @@ impl SoloSessionService {
         // turn look Project-scoped merely by sharing the chat id.
         self.load_scope_records().await?;
         Ok(job)
-    }
-
-    async fn find_retry_child(
-        &self,
-        source: &AgentChatTurnJob,
-        dedupe_key: &str,
-    ) -> Result<Option<AgentChatTurnJob>> {
-        let mut matches =
-            AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &self.scope.project_chat_id)
-                .await?
-                .into_iter()
-                .filter(|job| {
-                    job.id != source.id
-                        && job.dedupe_key == dedupe_key
-                        && job.triggering_message_id == source.triggering_message_id
-                        && turn_belongs_to_scope(job, &self.scope)
-                })
-                .collect::<Vec<_>>();
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.pop()),
-            _ => Err(ServiceError::conflict(
-                "multiple deterministic retry children exist for the failed turn",
-            )),
-        }
     }
 
     async fn authorized_task(&self, task_id: &str) -> Result<Task> {
@@ -1986,6 +1920,7 @@ fn turn_snapshot(job: &AgentChatTurnJob) -> SoloTurnSnapshot {
         response_message_id: job.response_message_id.as_deref().map(safe_identifier),
         error_code: job.error_code.as_deref().map(safe_identifier),
         error_message: job.error_message.as_deref().and_then(safe_diagnostic),
+        retry_action: job.retry_action(),
         correlation_id: safe_identifier(&job.correlation_id),
         version: job.version,
         created_at: safe_text(&job.created_at, SOLO_MAX_SHORT_TEXT_CHARS),
@@ -2431,20 +2366,6 @@ fn path_component_id(name: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
-fn retry_dedupe_key(source_id: &str, next_attempt: i64) -> Result<String> {
-    if next_attempt < 1 {
-        return Err(ServiceError::invalid_operation(
-            "retry attempt must be positive",
-        ));
-    }
-    let source_id = path_component_id("turn_job_id", source_id.to_owned())?;
-    bounded_owned(
-        "retry dedupe_key",
-        format!("retry:{source_id}:{next_attempt}"),
-        SOLO_MAX_ID_CHARS,
-    )
-}
-
 fn validate_retry_input(input: SoloRetryTurnInput) -> Result<(String, String, i64)> {
     let turn_job_id = path_component_id("turn_job_id", input.turn_job_id)?;
     let idempotency_key = bounded_owned(
@@ -2458,13 +2379,6 @@ fn validate_retry_input(input: SoloRetryTurnInput) -> Result<(String, String, i6
         ));
     }
     Ok((turn_job_id, idempotency_key, input.expected_version))
-}
-
-fn ensure_expected_turn_version(actual: i64, expected: i64) -> Result<()> {
-    if actual != expected {
-        return Err(ServiceError::Db(db::DbError::VersionConflict));
-    }
-    Ok(())
 }
 
 fn scoped_execution_log_path(
@@ -2944,22 +2858,6 @@ mod tests {
             idempotency_key: "k".repeat(SOLO_MAX_ID_CHARS + 1),
         })
         .is_err());
-        assert!(ensure_expected_turn_version(7, 7).is_ok());
-        assert!(matches!(
-            ensure_expected_turn_version(8, 7),
-            Err(ServiceError::Db(db::DbError::VersionConflict))
-        ));
-    }
-
-    #[test]
-    fn retry_child_dedupe_key_is_deterministic_and_bounded() {
-        assert_eq!(
-            retry_dedupe_key("turn-123", 2).expect("retry key"),
-            "retry:turn-123:2"
-        );
-        assert!(retry_dedupe_key("turn-123", 0).is_err());
-        assert!(retry_dedupe_key("../turn", 2).is_err());
-        assert!(retry_dedupe_key(&"t".repeat(SOLO_MAX_ID_CHARS), 2).is_err());
     }
 
     #[test]

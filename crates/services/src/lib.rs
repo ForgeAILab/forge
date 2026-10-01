@@ -123,13 +123,13 @@ pub use agent_chat_service::{
 };
 pub use agent_chat_turn_policy::{
     bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
-    failure as fail_agent_chat_turn, failure_after_claim as fail_agent_chat_turn_after_claim,
+    failure_after_claim as fail_agent_chat_turn_after_claim,
     recover_expired as recover_expired_agent_chat_turn,
     FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
 };
 pub use agent_chat_turn_worker::{
-    AgentChatTurnLogRoot, AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend,
-    CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
+    AgentChatTurnLogRoot, AgentChatTurnRunOutcome, AgentChatTurnRunner, AgentChatTurnWorker,
+    CliAgentChatSessionBackend, CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
 };
 pub use agent_inquiry_runner::{
     EmbeddedInquiryRunner, InquiryOutcome, InquiryRequest, InquiryRunner,
@@ -367,6 +367,12 @@ pub enum ServiceError {
 
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: String },
+
+    #[error("{error}")]
+    TurnFailure {
+        failure: api_types::TurnFailure,
+        error: Box<ServiceError>,
+    },
 
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },

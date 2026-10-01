@@ -689,7 +689,7 @@ pub(crate) async fn admit_chat_usage(
     create_chat_invocation(
         db,
         &job.id,
-        chat_attempt_ordinal(job.attempt_count)?,
+        chat_attempt_ordinal(job.invocation_count)?,
         PricingDomainKind::Chat,
         &scope,
         &agent,

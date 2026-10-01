@@ -12,7 +12,7 @@ use agent_runtime::{
         catalog::{ModelLimits, ResolvedModelProfile},
         content::{ContentPart, Message, Role, UserInput},
         error::RuntimeError,
-        event::{RuntimeEvent, TurnFinish},
+        event::{BudgetCategory, RuntimeEvent, TurnFinish},
         ids::{SessionId, ToolCallId},
         provider::{ModelId, Provider, ReasoningConfig},
         provider_credential::ProviderCredentialTarget,
@@ -611,7 +611,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                     }),
             )
             .await
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+            .map_err(host_runtime_error)?;
         let mut events = session.subscribe();
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
@@ -644,15 +644,18 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         let input = session.with_history(|history| retry_aware_input(history, request.input));
         let turn = session
             .send(chat_user_input(input, request.server_state_card))
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+            .map_err(host_runtime_error)?;
         let turn_id = turn.id().clone();
-        let mut last_turn_error: Option<String> = None;
+        let mut last_turn_error: Option<RuntimeError> = None;
+        let mut provider_failure = None;
+        let mut provider_auth_rejected = false;
+        let mut context_overflow = false;
         let finish_result = loop {
             tokio::select! {
                 _ = request.cancellation.cancelled() => {
                     turn.interrupt(CancelReason::UserRequested);
                     session.shutdown().await
-                        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+                        .map_err(host_runtime_error)?;
                     break Ok(TurnFinish::Cancelled { reason: CancelReason::UserRequested });
                 }
                 event = events.next() => {
@@ -698,8 +701,17 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                             sink.tool_call_finished(call.as_str(), name, *is_error, &summary)
                                 .await;
                         }
+                        RuntimeEvent::ProviderAttemptFinished { error, .. } => {
+                            provider_failure = error.as_ref().map(provider_turn_failure);
+                            provider_auth_rejected = error.as_ref().is_some_and(|error| {
+                                error.kind == agent_runtime::core::provider::ProviderErrorKind::Auth
+                            });
+                        }
+                        RuntimeEvent::BudgetFailure { category: BudgetCategory::Input, .. } => {
+                            context_overflow = true;
+                        }
                         RuntimeEvent::Error { error } => {
-                            last_turn_error = Some(error.to_string());
+                            last_turn_error = Some(error.clone());
                         }
                         RuntimeEvent::TurnCompleted { finish, .. } => break Ok(finish.clone()),
                         _ => {}
@@ -708,17 +720,11 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             }
         };
         if finish_result.is_err() {
-            session
-                .shutdown()
-                .await
-                .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+            session.shutdown().await.map_err(host_runtime_error)?;
         } else {
             turn.completed().await;
         }
-        let persist_result = session
-            .persist()
-            .await
-            .map_err(|error| AgentHostError::Runtime(error.to_string()));
+        let persist_result = session.persist().await.map_err(host_runtime_error);
         let finish = finish_result?;
         persist_result?;
         active_turn.finish();
@@ -831,20 +837,44 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             TurnFinish::Completed | TurnFinish::NeedsInput { .. } => Ok(output),
             TurnFinish::Cancelled { .. } => Err(AgentHostError::RuntimeWithUsage {
                 message: "turn cancelled".to_owned(),
+                failure: api_types::TurnFailure::Unclassified,
+                provider_auth_rejected: false,
                 usage_reports: output.usage_reports,
             }),
             TurnFinish::LimitReached { limit } => Err(AgentHostError::RuntimeWithUsage {
+                failure: if context_overflow {
+                    api_types::TurnFailure::ContextOverflow
+                } else {
+                    provider_failure.unwrap_or_else(|| {
+                        AgentHostError::TurnLimitReached {
+                            limit: limit.into(),
+                        }
+                        .turn_failure()
+                    })
+                },
                 message: format!(
                     "runtime turn limit reached: {}",
                     AgentTurnLimit::from(limit)
                 ),
+                provider_auth_rejected,
                 usage_reports: output.usage_reports,
             }),
             TurnFinish::Failed => Err(AgentHostError::RuntimeWithUsage {
+                failure: if context_overflow {
+                    api_types::TurnFailure::ContextOverflow
+                } else {
+                    provider_failure.unwrap_or_else(|| {
+                        last_turn_error
+                            .as_ref()
+                            .map(runtime_turn_failure)
+                            .unwrap_or(api_types::TurnFailure::Unclassified)
+                    })
+                },
                 message: match last_turn_error {
                     Some(detail) => format!("turn failed: {detail}"),
                     None => "turn failed".to_owned(),
                 },
+                provider_auth_rejected,
                 usage_reports: output.usage_reports,
             }),
         }
@@ -860,7 +890,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .ok_or(AgentHostError::SessionNotFound)?;
         session
             .interrupt_current_turn(CancelReason::UserRequested)
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+            .map_err(host_runtime_error)?;
         Ok(())
     }
 
@@ -1532,5 +1562,140 @@ mod tool_result_summary_tests {
         assert_eq!(summary.correlation_id, "call-4");
         let serialized = serde_json::to_string(&summary).expect("summary serializes");
         assert!(!serialized.contains("SECRET_TOKEN"));
+    }
+}
+
+// ProviderAttemptFinished retains fields that RuntimeError conversion drops.
+pub(crate) fn provider_turn_failure(
+    error: &agent_runtime::core::provider::ProviderError,
+) -> api_types::TurnFailure {
+    use agent_runtime::core::provider::ProviderErrorKind;
+    use api_types::TurnFailure;
+    match error.kind {
+        ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported => {
+            TurnFailure::ProviderRejected {
+                retryable: error.retryable,
+                retry_after: error.retry_after_ms,
+            }
+        }
+        ProviderErrorKind::Auth => TurnFailure::Configuration,
+        ProviderErrorKind::LimitExhausted => TurnFailure::UsageLimit {
+            resets_at: error.limit_resets_at_ms,
+        },
+        ProviderErrorKind::Timeout
+        | ProviderErrorKind::RateLimited
+        | ProviderErrorKind::Network
+        | ProviderErrorKind::Server => TurnFailure::Transient {
+            retry_after: error.retry_after_ms,
+        },
+        _ if error.retryable => TurnFailure::Transient {
+            retry_after: error.retry_after_ms,
+        },
+        _ => TurnFailure::Unclassified,
+    }
+}
+
+fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
+    use agent_runtime::core::error::ErrorKind;
+    use api_types::TurnFailure;
+    match error.kind {
+        ErrorKind::Config => TurnFailure::Unclassified,
+        ErrorKind::Approval | ErrorKind::Workspace => TurnFailure::Authority,
+        _ if error.retryable => TurnFailure::Transient { retry_after: None },
+        _ => TurnFailure::Unclassified,
+    }
+}
+
+fn host_runtime_error(error: RuntimeError) -> AgentHostError {
+    AgentHostError::Runtime(error.to_string())
+}
+
+#[cfg(test)]
+mod turn_failure_tests {
+    use super::*;
+    use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
+    use api_types::TurnFailure;
+
+    #[test]
+    fn lifecycle_and_runtime_failures_keep_only_typed_evidence() {
+        use agent_runtime::core::error::ErrorKind;
+        for error in [
+            AgentHostError::AgentPaused {
+                agent_id: "agent".into(),
+            },
+            AgentHostError::ProjectPaused {
+                project_id: "project".into(),
+            },
+        ] {
+            assert_eq!(error.turn_failure(), TurnFailure::Authority);
+        }
+        // Session-open failures must remain Runtime for Task dispatch handling.
+        assert!(matches!(
+            host_runtime_error(RuntimeError::new(
+                ErrorKind::Internal,
+                "session open failed"
+            )),
+            AgentHostError::Runtime(_)
+        ));
+        for message in ["compaction planning failed", "configuration invalid"] {
+            assert_eq!(
+                runtime_turn_failure(&RuntimeError::new(ErrorKind::Config, message)),
+                TurnFailure::Unclassified
+            );
+        }
+        assert_eq!(
+            runtime_turn_failure(&RuntimeError::new(ErrorKind::Cancelled, "shutdown")),
+            TurnFailure::Unclassified
+        );
+        assert_eq!(
+            runtime_turn_failure(&RuntimeError::new(ErrorKind::Approval, "paused")),
+            TurnFailure::Authority
+        );
+    }
+
+    #[test]
+    fn provider_failure_fields_survive_without_message_inference() {
+        let cases = [
+            (
+                ProviderError::new(
+                    ProviderErrorKind::BadRequest,
+                    "usage limit config credential",
+                ),
+                TurnFailure::ProviderRejected {
+                    retryable: false,
+                    retry_after: None,
+                },
+            ),
+            (
+                ProviderError::new(ProviderErrorKind::BadRequest, "rejected").retry_after(1200),
+                TurnFailure::ProviderRejected {
+                    retryable: true,
+                    retry_after: Some(1200),
+                },
+            ),
+            (
+                ProviderError::new(ProviderErrorKind::LimitExhausted, "x").limit_resets_at(12345),
+                TurnFailure::UsageLimit {
+                    resets_at: Some(12345),
+                },
+            ),
+            (
+                ProviderError::new(ProviderErrorKind::Network, "x").retry_after(900),
+                TurnFailure::Transient {
+                    retry_after: Some(900),
+                },
+            ),
+            (
+                ProviderError::new(ProviderErrorKind::Auth, "x"),
+                TurnFailure::Configuration,
+            ),
+            (
+                ProviderError::new(ProviderErrorKind::MalformedStream, "config usage limit"),
+                TurnFailure::Unclassified,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(provider_turn_failure(&error), expected);
+        }
     }
 }

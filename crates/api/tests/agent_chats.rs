@@ -650,3 +650,284 @@ async fn agent_chat_turn_logs_serve_the_turns_durable_activity() {
         .expect("router response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn typed_turn_failure_response_and_redrive_require_version_and_replay_one_enqueue() {
+    let workspace = common::TestDir::new("typed-turn-redrive");
+    let harness = common::test_app(workspace.path(), "typed-turn-redrive").await;
+    let token = common::test_jwt();
+    let connected = common::connect_embedded_agent(
+        &harness.app,
+        &token,
+        "typed-turn-agent",
+        "typed-turn",
+        "typed-turn-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(&harness.app, Method::PUT, "/api/v1/account/main-agent", &token,
+        json!({"identity_id": connected.agent.id, "profile_id": connected.profile.id, "expected_version": 0, "autonomy_policy": {}}), StatusCode::OK).await;
+    let admitted: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content": "original request", "dedupe_key": "typed-redrive"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn = admitted.turn_job.unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed', attempt_count = 1, invocation_count = 1, failure_class_json = ?, retry_decision = 'fail', error_code = 'configuration_invalid', error_message = 'provider configuration is invalid', version = version + 1 WHERE id = ?")
+        .bind(serde_json::to_string(&api_types::TurnFailure::Configuration).unwrap()).bind(&turn.id).execute(harness.state.db.pool()).await.unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let failed = &listed[0];
+    assert_eq!(
+        failed.failure_class,
+        Some(api_types::TurnFailure::Configuration)
+    );
+    assert_eq!(
+        failed.retry_decision,
+        Some(api_types::TurnRetryDecision::Fail)
+    );
+    assert_eq!(
+        failed.retry_action.as_ref().unwrap().expected_version,
+        failed.version
+    );
+    let path = format!(
+        "/api/v1/agent-chats/{}/turns/{}/retry",
+        binding.chat_id, turn.id
+    );
+    let stale: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": turn.version, "idempotency_key": "stale"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(stale.code, "version_conflict");
+    let body = json!({"expected_version": failed.version, "idempotency_key": "manual-fix"});
+    let queued: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        body.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let replay: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        body,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(queued, replay);
+    assert_ne!(queued.id, turn.id);
+    assert_eq!(queued.status, AgentChatTurnStatus::Queued);
+    assert_eq!(queued.attempt_count, 0);
+    assert!(queued.retry_action.is_none());
+    let source = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(source.retry_action().is_none());
+    let live_refusal: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "while-live"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(live_refusal.code, "turn_not_retryable");
+    let child_path = format!(
+        "/api/v1/agent-chats/{}/turns/{}/retry",
+        binding.chat_id, queued.id
+    );
+    let not_retryable: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": queued.version, "idempotency_key": "nonterminal"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(not_retryable.code, "turn_not_retryable");
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'succeeded' WHERE id = ?")
+        .bind(&queued.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let after_success: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "after-success"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(after_success.code, "turn_not_retryable");
+
+    // A failed retry child is the sole eligible turn for this message.
+    sqlx::query(
+        "UPDATE agent_chat_turn_job SET status = 'failed', version = version + 1 WHERE id = ?",
+    )
+    .bind(&queued.id)
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|turn| turn.retry_action.is_some())
+            .count(),
+        1
+    );
+    assert!(listed
+        .iter()
+        .find(|turn| turn.id == queued.id)
+        .unwrap()
+        .retry_action
+        .is_some());
+    assert!(listed
+        .iter()
+        .find(|turn| turn.id == source.id)
+        .unwrap()
+        .retry_action
+        .is_none());
+    let child = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &queued.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // An older parked turn still holds the chat's single live slot.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'awaiting_input' WHERE id = ?")
+        .bind(&source.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let parked_refusal: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": child.version, "idempotency_key": "while-parked"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(parked_refusal.code, "another_turn_live");
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed' WHERE id = ?")
+        .bind(&source.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+
+    // Cancellation of the newest turn also permits fresh admission.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'cancelled', failure_class_json = NULL, retry_decision = NULL, version = version + 1 WHERE id = ?")
+        .bind(&child.id).execute(harness.state.db.pool()).await.unwrap();
+    let cancelled =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &child.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let cancelled_retry: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": cancelled.version, "idempotency_key": "cancelled-retry"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(cancelled_retry.id, cancelled.id);
+    assert_eq!(
+        cancelled_retry.input_message_id,
+        cancelled.triggering_message_id
+    );
+    assert_eq!(cancelled_retry.status, AgentChatTurnStatus::Queued);
+    // Historical codes remain visible and the newest historical failure is eligible.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed', failure_class_json = NULL, retry_decision = NULL, error_code = 'credential_unavailable', error_message = 'old failure', version = version + 1 WHERE id = ?")
+        .bind(&cancelled_retry.id).execute(harness.state.db.pool()).await.unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let historical = listed
+        .iter()
+        .find(|turn| turn.id == cancelled_retry.id)
+        .unwrap();
+    assert_eq!(
+        historical.error_code.as_deref(),
+        Some("credential_unavailable")
+    );
+    assert_eq!(historical.error_message.as_deref(), Some("old failure"));
+    assert!(historical.failure_class.is_none());
+    assert!(historical.retry_action.is_some());
+    let messages: AgentChatMessageListResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(messages.items.len(), 1);
+    assert_eq!(messages.items[0].id, admitted.message.id);
+
+    // A topic divider has no turn, but still closes retries into the old topic.
+    let _: api_types::StartAgentChatTopicResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/topics", binding.chat_id),
+        &token,
+        json!({"label": "new topic"}),
+        StatusCode::OK,
+    )
+    .await;
+    let source =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &cancelled_retry.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(source.retry_action().is_none());
+    let superseded: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!(
+            "/api/v1/agent-chats/{}/turns/{}/retry",
+            binding.chat_id, source.id
+        ),
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "too-late"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(superseded.code, "turn_not_retryable");
+}

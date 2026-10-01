@@ -1519,12 +1519,35 @@ pub struct AgentChatTurnJob {
     pub response_message_id: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub failure_class: Option<api_types::TurnFailure>,
+    pub retry_decision: Option<api_types::TurnRetryDecision>,
+    pub pre_provider_failure_count: i64,
+    pub invocation_count: i64,
+    pub usage_limit_deferral_count: i64,
+    pub usage_limit_first_deferred_at: Option<String>,
+    /// Derived from later turns for this message or any later chat message.
+    pub retry_superseded: bool,
     pub correlation_id: String,
     pub causation_id: Option<String>,
     pub causation_depth: i64,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl AgentChatTurnJob {
+    pub fn retry_action(&self) -> Option<api_types::RetryTurnAction> {
+        (matches!(
+            self.status,
+            AgentChatTurnState::Failed | AgentChatTurnState::Cancelled
+        ) && !self.retry_superseded)
+            .then(|| api_types::RetryTurnAction {
+                kind: api_types::RetryTurnActionKind::RetryTurn,
+                chat_id: self.chat_id.clone(),
+                turn_id: self.id.clone(),
+                expected_version: self.version,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

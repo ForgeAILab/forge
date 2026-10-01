@@ -344,6 +344,7 @@ impl From<ServiceError> for McpToolError {
     fn from(error: ServiceError) -> Self {
         let protected_cause = error.to_string();
         let mapped = match error {
+            ServiceError::TurnFailure { error, .. } => return Self::from(*error),
             ServiceError::ExecutionSetupRequired {
                 message,
                 requirements,

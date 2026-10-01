@@ -1,8 +1,11 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { MissionControlPage } from '@/pages/MissionControlPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { MissionControlResponse } from '@/features/federation/types'
+
+const retryTurn = vi.hoisted(() => vi.fn())
+const turnState = vi.hoisted(() => ({ live: false }))
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children, ...props }: { children: React.ReactNode } & Record<string, unknown>) => (
@@ -20,6 +23,17 @@ vi.mock('@/features/federation/hooks', () => ({
   }),
 }))
 vi.mock('@/features/agent-chat/hooks', () => ({
+  useAgentChatTurnsQuery: () => ({
+    data: turnState.live ? [{ status: 'leased' }] : [],
+    isLoading: false,
+    isError: false,
+  }),
+  useRetryAgentChatTurnMutation: () => ({
+    mutate: retryTurn,
+    isPending: false,
+    isSuccess: false,
+    error: null,
+  }),
   useAgentChatsQuery: () => ({
     data: { items: chatEntries },
     isLoading: false,
@@ -253,6 +267,80 @@ describe('MissionControlPage', () => {
       const failureCard = screen.getByText('Task execution failed').closest('article')
       expect(failureCard?.getAttribute('role')).toBeNull()
       expect(failureCard?.className).toContain('bg-destructive/5')
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
+  it('re-drives the typed turn action from Attention with its version', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'retry_exhausted',
+        summary: 'Agent Chat turn failed: configuration_invalid',
+        recommended_action: 'retry_turn',
+        details: {
+          retry_action: {
+            kind: 'retry_turn',
+            chat_id: 'main-chat',
+            turn_id: 'turn-1',
+            expected_version: 4,
+          },
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'Retry turn' }))
+      expect(retryTurn).toHaveBeenCalledWith({
+        turnId: 'turn-1',
+        input: {
+          expected_version: 4,
+          idempotency_key: 'agent-chat-turn-retry:turn-1:4',
+        },
+      })
+    } finally {
+      data.needs_attention = previous
+      retryTurn.mockClear()
+    }
+  })
+
+  it('disables the typed retry action while another turn is live', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'retry_exhausted',
+        summary: 'Agent Chat turn failed: configuration_invalid',
+        recommended_action: 'retry_turn',
+        details: {
+          retry_action: {
+            kind: 'retry_turn',
+            chat_id: 'main-chat',
+            turn_id: 'turn-1',
+            expected_version: 4,
+          },
+        },
+      },
+    ]
+    try {
+      turnState.live = true
+      render(<MissionControlPage />)
+      expect(screen.getByRole('button', { name: 'Retry turn' }).hasAttribute('disabled')).toBe(true)
+    } finally {
+      data.needs_attention = previous
+      retryTurn.mockClear()
+      turnState.live = false
+    }
+  })
+
+  it('does not enable retry from an untyped Attention recommendation', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [{ ...previous[0], recommended_action: 'retry_turn' }]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.queryByRole('button', { name: 'Retry turn' })).toBeNull()
     } finally {
       data.needs_attention = previous
     }

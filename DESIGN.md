@@ -485,6 +485,8 @@ current work`, `Cancel the affected work`, and `Discard the conflicting change`;
   heartbeat could not extend it. For terminal rows show the bounded interruption reason, kind,
   and time, retain the committed terminal result, and offer one authorized `Retry run` or
   `Continue session` action. Late results never overwrite the visible terminal state.
+- **Typed chat failure action:** failed and cancelled turns offer `Retry turn` when the server supplies a retry action. Retry retains the original message and admits a new turn with current authority, uses the displayed version, and disables while pending or another turn is live. A later turn for a newer message removes the older retry action. Configuration, authority, and provider rejection causes stay visible in the existing alert; only those deterministic failures offer the action in Attention.
+- **Usage-limit deferral:** show the capacity reason and resume time in the existing turn status label. Keep the composer disabled while the deferred turn occupies the single live-turn slot.
 - **Retry states:** render `Retrying`, `Retry wait`, and `Retry exhausted` with attempt budget,
   next-at time, and the server's bounded recovery action. Keep the composer/action row disabled
   while a turn is live, retain the original request when a retry is offered, and avoid an

@@ -14,6 +14,12 @@ pub enum DbError {
     #[error("not found")]
     NotFound,
 
+    #[error("Agent Chat turn is not retryable")]
+    TurnNotRetryable,
+
+    #[error("another Agent Chat turn is live")]
+    ChatTurnLive,
+
     #[error("version conflict")]
     VersionConflict,
 
