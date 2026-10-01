@@ -91,6 +91,22 @@ worker handles and one shutdown signal. The server's `AppState` and Solo's
 session facade consume this graph rather than maintaining parallel persistence,
 workflow, retry, or recovery implementations.
 
+The graph shares one `WorkspaceBackendRouter` across Task execution, workflow
+hooks, lifecycle hooks, merge, cleanup, terminals, and operator status. Consumers
+resolve the persisted placement before workspace I/O; the legacy
+`Workspace.worktree_path` field is private to `db` and accessible only through
+its backend accessor. A directly inserted server Workspace without a placement
+receives a server placement on first resolution, without changing an existing
+owner. Embedded hooks and environment checks retain their original stdin,
+Git environment, output collection, and Project-value redaction semantics.
+Review I/O uses `review::ReviewWorkspace`: CI steps remain unbounded, while
+conformance commands keep their timeout and output budgets. Workspace operations
+follow the placement owner through the embedded or daemon backend; see
+[Workspace placement](#workspace-placement).
+Exact review Git evidence, detached conformance checkouts, candidate restoration,
+and unbounded CI use owner-local operations on daemon placements, keeping opaque
+handles separate from server paths.
+
 Both modes run the correctness-critical Forge core: migrations, crash
 recovery, Project and Task lifecycle projection, Agent Chat turns, Task
 dispatch, execution heartbeats, workflow hooks, memory/coordination,
@@ -696,10 +712,13 @@ The scheduler delivers authority through the internal execution channel by
 creating the running execution and lease together; the executor acknowledges
 that delivery by verifying the exact active lease immediately before provider
 start and before execution work. A missing, expired, revoked, reassigned, or
-superseded lease fails closed. Heartbeat/recovery expiry cancels and terminalizes
+superseded lease fails closed. A disconnected daemon placement suspends heartbeat
+expiry until reconciliation or `max_disconnect`; the hard deadline still applies.
+Heartbeat/recovery expiry otherwise cancels and terminalizes
 the running attempt only after a valid running lease can no longer be renewed,
 and records reconciliation; all terminal, failed,
-cancelled, daemon-disconnected, and stalled paths revoke the grant. A retry
+cancelled, and stalled paths revoke the grant. A disconnect suspends the attempt;
+its grant is revoked only when the attempt terminalizes. A retry
 gets a new execution identity and lease. The claim path canonicalizes executor,
 worker, and task-worker aliases to persisted `worker`, while reviewers remain
 `reviewer`. No route, MCP tool, chat context, filesystem path, handle, or bearer
@@ -732,10 +751,11 @@ workflow.
 #### Project environment
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,
-`recheck_interval_seconds`) is applied at the
-single local launch point, `TaskService::run_execution`, after the workspace
-lock and the final WorkspaceLease verification and before ledger admission
-(`task_service/execution/environment.rs`). The env map is stamped onto the
+`recheck_interval_seconds`) is applied before local or daemon execution starts.
+Local preflight runs in `TaskService::run_execution`, after the workspace lock
+and the final WorkspaceLease verification and before ledger admission; remote
+preflight runs before the provider RPC. Both use the placement's workspace
+backend (`task_service/execution/environment.rs`). The env map is stamped onto the
 in-memory executor config under `_forge_task_environment` — runtime authority
 like the Task role, carried through fallback-candidate normalization
 (`executors::adapter::apply_runtime_scope`) but never part of candidate
@@ -749,20 +769,24 @@ pre-dispatch environment failure path and pauses the Project with
 workflow state or adding a Task annotation. No provider call or retry budget
 is spent. The stopped execution is tagged as an environment pre-dispatch
 failure so it does not block re-dispatch after resume. User and repository
-pauses are never overwritten. Pause detail (check names, triggering role,
+pauses are never overwritten. Pause detail (workspace ID, check names, triggering role,
 bounded output, pause/last-check/next-check times) persists in
 `project.environment_pause_json` and is returned as `environment_pause`.
 Migration V202610010410 clears legacy Task environment annotations without deleting
 Tasks or their execution history.
 
 `environment_pause_sync` starts a background job for recorded failing checks
-when due in the primary checkout, with Project `env` and without assets. The tick
+when due on the recorded ready daemon placement, with Project `env` and without
+assets. Embedded work, missing or unresolved workspaces, and daemon placements
+that are not ready or whose owner is unreachable use the primary checkout. The tick
 only starts or observes a job; operations refresh does not wait for host checks.
 Scheduled and manual re-checks share single-flight ownership per Project. Results
 use the original Project version and pause timestamp in the existing CAS, so a
 new pause, settings edit, or user pause wins over stale results. Check timeouts
 accept 1–300 seconds (default 120); execution clamps legacy stored values too.
-The interval defaults to 600 seconds (60–86400). Failure refreshes detail and schedules another check;
+The interval defaults to 600 seconds (60–86400). Failure, including a re-check
+error, refreshes detail and schedules another check; an error is logged once at
+warn and does not skip the Project's plan-publication reconciliation;
 success compare-and-clears only the environment pause and publishes a Project
 resumed event. The next tick re-dispatches Tasks in their current states.
 `POST /projects/{id}/environment/recheck` runs every configured check immediately
@@ -861,7 +885,11 @@ become execution deadlines. The monitor treats an expired owner lease and a
 reached configured deadline as different recovery causes (`execution.stalled`
 with an `execution_lease_expired` reconciliation reason versus
 `execution.hard_deadline_exceeded`) and never treats semantic silence alone as
-expiry.
+expiry for embedded execution. For a daemon-owned placement or a remote daemon
+execution provider, an expired heartbeat lease first suspends the placement as
+`disconnected`, even while its TCP socket is open. The execution remains Running;
+`max_disconnect` bounds that suspension without extending the hard deadline.
+See [Daemon lifecycle and execution recovery](#daemon-lifecycle-and-execution-recovery).
 
 Runner completion, failure, cancellation, daemon-disconnect recovery, and
 monitor expiry all call the same terminal CAS with execution ID, expected
@@ -1625,15 +1653,18 @@ the existing Agent `paused` state controls one identity. Effective health
 intersects these layers, so disabling a source makes every dependent identity
 ineligible for Main, Project, Worker, and reviewer selection without deleting
 configuration, credentials, bindings, or history. Re-enabling recomputes health
-normally. Task concurrency counts only currently Running Task execution rows;
-assigned-but-not-running Tasks and Main/Project Agent chat turns never consume
-the identity's `max_concurrent_tasks` quota. A daemon may independently
+normally. Task concurrency counts Running executions plus `reserved`/`preparing`
+placements that have no Running execution yet. Assigned Tasks without a
+reservation and Main/Project Agent chat turns do not consume the identity's
+`max_concurrent_tasks` quota. A daemon may independently
 advertise a positive session cap through `labels_json` under
 `max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
 `max_concurrent_tasks` key. That daemon cap counts Running Task executions on
-the daemon plus leased/running Agent Chat turns. Both caps are rechecked while
-the `BEGIN IMMEDIATE` transaction that inserts the Running execution holds the
-SQLite writer lock; dispatcher/service prechecks are only early filters. The
+the daemon as identified by placement, including unpinned Agents, plus workspace
+reservations and leased/running Agent Chat turns. A ready placement without a
+Running execution holds no slot. Both caps are checked in the
+`BEGIN IMMEDIATE` reserve transaction and rechecked at execution start;
+dispatcher/service prechecks are only early filters. The
 transaction also rejects an identity paused or switched to a newer selected
 profile after dispatch preflight. Profile replacement covers daemon, provider,
 and executor configuration reassignment even when the numeric task cap is
@@ -2147,22 +2178,296 @@ review-ready and active work, embedded-agent health/current scope/focus,
 commitments, recent outcomes, and capacity; they do not introduce a second
 mutable Task or Agent truth.
 
+### Workspace placement
+
+A repository's logical identity is separate from its machine-local checkouts.
+Each repository location records an owner, path, kind (`primary_checkout`,
+`managed_clone`, or `shared_mount`), default flag, verification status, and
+version. Only `ready` locations are eligible. A daemon verifies its own checkout:
+it must be within the runtime's `workspace_root`, be a Git worktree, resolve the
+repository's default branch, and have a matching remote when one is present.
+Both owners compare normalized repository identities: absolute paths and
+`file://` URLs match, as do SSH (including scp-like syntax) and HTTP URLs for
+the same host and repository path. Host case, default ports, trailing slashes,
+and a terminal `.git` suffix do not affect the comparison; different paths and
+non-default ports still differ.
+The server never opens a daemon-local path. See the
+[repository location commands](cli.md#repository-locations).
+
+Each Task workspace has one persisted placement binding its Agent, owner,
+repository location, execution provider, opaque workspace handle, generation,
+state, and selection reason. Every workspace consumer uses this placement:
+execution start/cancel, terminals, setup, hooks, review and CI, diffs, artifact
+reads, merge, reset, recovery, and cleanup. The executor snapshot records
+`placement_id`; no consumer resolves a daemon again from the Agent after
+admission.
+
+| Owner | Workspace lifecycle | Execution provider |
+| --- | --- | --- |
+| `server` | Embedded backend on the Forge process host | Embedded provider, or a daemon through a verified `shared_mount` location |
+| `daemon` | Daemon backend on one named daemon runtime | That placement's daemon |
+
+A `shared_mount` location requires a server-written probe that the daemon reads
+back at the same path. Matching path strings alone do not qualify. Separate
+machines use daemon-owned locations and workspaces, with no filesystem sync.
+An Agent pinned to this server's registered embedded machine can use a server
+placement without a shared mount. Admission records that embedded daemon as
+`execution_daemon_id`, including for existing server workspaces without a
+recorded provider; the workspace owner and handle stay on the server.
+Daemon placements require direct-merge repositories and CLI Agents for every
+assigned worktree role (coder, reviewer, planner); pull-request mode and native
+Agents are rejected with `work_mode_unsupported` or `native_backend_unsupported`.
+
+Agent claims, initial launches, ordinary re-execution, and resume refuse a
+paused Project with `ProjectPaused` before placement selection, reservation,
+or workspace preparation. Repeating an already queued resume returns the Task
+without placement work, even while paused. Follow-ups check the pause before
+placement work, after transitioning the Task to its role's active state or
+clearing its annotation. Re-execute recovery for a disconnected or timed-out
+owner may update the placement and reconcile the owner before reaching the
+pause guard. The execution admission transaction also checks the pause to
+fence concurrent Project changes. Recovery keeps the `project_paused(<detail>)`
+refusal and still permits other actions, such as cancelling the Task.
+
+Embedded executor availability comes from the runtime's adapter registry.
+Service and API fixtures inject `cli_adapters::test_support::test_registry`:
+availability is fixture-controlled without CLI lookup or home credential
+discovery, while Shell retains its local execution behavior. The fixture registry
+and `TaskService::new_for_test` are gated by the `test-support` Cargo feature;
+unit tests also compile the constructor. Production builds omit the fixture registry.
+
+Claim admission runs **reserve → prepare → start**:
+
+1. Under `BEGIN IMMEDIATE`, select a compatible ready location and persist a
+   `reserved` placement with `reserved_until`. It consumes Agent and daemon
+   capacity, but creates no Execution, lease, or Task status change.
+2. Outside the transaction, the owner prepares the workspace idempotently.
+   Versioned updates move `reserved → preparing → ready` and record the handle
+   and base SHA. Failed or expired preparation releases capacity, records
+   `prepare_failed`, and spends no Task retry budget.
+3. A claim transaction checks the ready placement's version and capacity, then
+   creates the Task claim, Running Execution, and lease together.
+
+Backfilled `preparing` reservations expire after ten minutes. The reservation
+sweep also reclaims crash-orphaned `reserved` or `preparing` rows without an
+explicit expiry after ten minutes from their last update.
+
+Candidates must pass reachability and visibility, executor availability and
+adapter capability facts, daemon `workspace.v1` support, run policy, Agent pin,
+capacity, and the daemon placement limits. Missing adapter facts mean unsupported.
+The embedded provider supplies the server host's adapter facts, including session
+resume for its session-capable executors. Recovery uses those facts for embedded
+execution and the current owner's handshake for daemon execution; no command
+socket is required for the embedded provider.
+Preference is existing placement → inherited root placement → Agent pin →
+default location → server-owned → `(created_at, id)`. The selection reason records
+the winning rule and rejected candidates with filter codes. If no owner is
+eligible, claim returns structured `placement_unavailable`; there is no silent
+fallback.
+Automatic dispatch keeps transient owner-unreachable or capacity refusals queued
+on the same owner. Before the first placement exists, an offline owner creates
+Task-scoped `runtime_offline` Attention and a durable wait bounded by
+`workspace.max_disconnect_seconds`; expiry blocks the Task visibly. Repeated
+identical waits update only their retry time; events, Attention, and Task version
+change on the first deferral or a reason change. Expired waits on failed,
+cleaning, or cleaned placements clear their stale wait and fall through to the
+normal reset-required path. Upgrade annotations replace any stale owner wait. Explicit
+recovery preserves the offline-Agent refusal even at capacity. Capacity recovery
+uses `queued_recovery`; permanent replay refusals restore its original blocker.
+The active scan retries structural placement refusals, because location,
+executor, handshake, and run-policy changes can fix them without editing a Task.
+On state entry, a structural refusal still rolls the transition back with
+`dispatch_failed`; only retryable owner/capacity refusals defer dispatch.
+Stable governance refusals use `metadata.dispatch_disposition` with the safe
+reason, and remain parked until their authority changes or dispatch is woken.
+
+After preparation, placement is sticky through retries, re-review, and recovery.
+A subtask sharing its root workspace inherits the same placement; an incompatible
+Agent fails admission. Reclaim describes the existing ready workspace. If its
+directory was deleted, claim, resume, recovery launch, and review-CI preparation
+recreate the worktree from its surviving Task branch through the recorded owner;
+daemon owners receive a fenced `workspace.prepare` request with the recorded base
+SHA. Embedded owners also repair damaged Git metadata. A damaged worktree on a
+daemon owner requires a reset; other describe failures remain transient errors
+and do not trigger preparation. Missing branches or
+incompatible history require an explicit workspace reset. A child preserves its
+root's shared workspace row when its branch is missing. Merge, target-moved
+rebase, and other gate reads retain their existing reset/readiness behavior.
+States progress from `reserved` to `preparing` to `ready`,
+which can become `disconnected`, then back to `ready` after reconciliation.
+Cleanup moves through `cleaning` to `cleaned`; failures use `failed`.
+Updates use optimistic `version`
+checks (conflicts return HTTP 409); `generation` changes only when the physical
+workspace is recreated on the same owner.
+An explicit daemon workspace reset or Task reset sends `workspace.reset` with
+the next generation, the observed HEAD as its precondition, and the recorded
+base SHA as its target. The returned handle, base, and generation are committed
+with a placement version check. If that check loses after the owner recreates
+the workspace, retry applies the retained reset receipt before using the old
+generation again.
+
+`V202610010400__daemon_owned_workspaces.sql` preserves existing data: server primary
+locations are backfilled from `Repo.local_path`, and non-cleaned workspaces gain
+server placements with `selected_by = backfill` and their existing worktree path
+as the handle. Remote-only repositories gain an `unverified` managed-clone
+location. The first embedded admission clones or verifies it outside the
+admission transaction and marks it ready before selecting it. Verification uses
+the same physical-path lock as clone/worktree writers, checks that a managed
+clone is a checkout with the repository's matching remote, retries location CAS
+conflicts, and persists clone errors with exponential retry backoff. Server paths
+remain embedded backend details, not remote workspace addresses.
+
 ### Daemon command transport
 
 Linked daemons keep a WebSocket command stream open at
 `/api/v1/daemons/{id}/connect`. The API server routes filesystem requests
-(`fs.list`, `fs.branches`) and daemon-owned managed executions
-(`execution.start`, `execution.cancel`) over that stream. The daemon validates
-paths against its advertised workspace root, runs the local CLI adapter, streams
+(`fs.list`, `fs.branches`), placement-routed managed executions
+(`execution.start`, `execution.cancel`), and workspace operations over that stream.
+The daemon validates paths against its advertised workspace root, runs the local
+CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Managed execution dispatch currently assumes the server-created task worktree
-exists at the same absolute path on the daemon host. That covers local daemons
-and containers or hosts with a shared workspace mount. A daemon on a separate
-filesystem can still browse paths under its own `--workspace-root`, but
-`execution.start` rejects server-only worktree paths until Forge has a remote
-workspace sync or git handoff path.
+Protocol revision 3 adds `workspace.v1`: `repo_location.verify`,
+`workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
+`workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+Mutations carry an operation ID, placement generation, expected
+base SHA or version, and handle or placement ID. Duplicate operation IDs return
+the recorded result until acknowledgement; stale generations and wrong owners are rejected. Handles
+map only to workspaces created under the daemon root. Direct merge writes the
+verified primary checkout and refuses a dirty target.
+
+`workspace.read` also accepts fixed Git inspection, owner paths, and bounded
+file-tree reads. Git evidence preserves the complete output, including NUL
+path separators. Review's `workspace.diff` variant uses the same three-dot diff,
+fallback, and UTF-8 truncation marker as server review. Same-generation owner
+operations use `workspace.reset` for assets, knowledge files, candidate restore,
+and rebase. Conformance checks run in the prepared Task checkout through its
+owner, preserving ignored dependency caches. Candidate restoration resets tracked
+files after each check and refuses changes to HEAD or tracked content.
+
+Byte reads resolve relative to the handle's `repo` worktree and stay within its
+daemon-created workspace directory. This includes sibling Forge artifacts such
+as `../plan.md` and the execution outbox. Traversal or symlinks outside that
+directory, including into the daemon journal, are rejected. Missing files return
+`workspace_file_not_found`, mapped to the embedded backend's not-found result;
+an absent plan therefore preserves the plan gate's existing no-plan behavior.
+
+A reviewed merge carries `reviewed_commit_sha` and fences the exact candidate
+and target SHAs before `--ff-only` integration. Without reviewed evidence,
+integration retains normal merge-commit and conflict behavior. Results include
+the before/after SHAs, diffstat, and conflict paths.
+
+Remote integration rechecks review authority after retaining its intent and
+releases the SQLite write lock before awaiting the owner. This lets the socket
+reader persist heartbeats and deliver the queued merge response. Reconciliation
+through `workspace.describe` settles interrupted intents in the journal before replying.
+An interrupted run without a retained exit result remains an infrastructure
+error. Merge success can be reconstructed only when the verified target proves
+the exact frozen candidate was integrated, with a diffstat reconstructed from
+the original target SHA. Interrupted errors carry `entry_id`, `operation_id`,
+and `interrupted: true` in their details.
+
+Terminal reports, bounded worklog/evidence outbox entries, operation results,
+and cleanup acknowledgements share one daemon journal. Both owner harvesters
+accept newline-delimited, concatenated, and pretty-printed JSON objects, resume
+at the next physical line after malformed input, and retain unknown evidence
+kinds as `other` with the original kind in the caption. Entry positions use
+stable `line` or `line:column` strings for ingestion receipts. Terminal and cleanup
+results replay after reconnect until `journal.ack { entry_id }`. The server must
+persist a result before acknowledging it. The daemon then deletes the receipt; repeated acks are
+idempotent. Unacknowledged results survive a crash between completion and ack.
+The journal caps receipts at 1,024 and all persisted journal files (including the
+workspace registry) at 32 MiB, with 16 MiB per receipt. Usage is indexed once and
+updated on writes. Mutation deduplication opens only its operation receipt with
+a buffered reader. `workspace.describe` scans pending entries for terminal IDs,
+then the command runtime scans them again to replay pending notifications.
+CI steps may request `timeout_secs = 0` for unbounded execution time, but output
+is capped at 1 MiB per stream, even with `max_output_bytes = u64::MAX`. Truncated
+log tails start with `[Forge: CI log truncated]` and set the stream's truncation flag.
+Logs keep their UTF-8-safe tail and may be trimmed further, or dropped entirely,
+to fit the shared journal. Admission reserves completion headroom for every run;
+exit code, identity, and flags survive journal pressure. An unbounded CI request
+accepts a truncated tail and retains the actual exit verdict; bounded conformance
+commands still reject output over their budget. If a descendant holds a pipe open
+after shell exit, the two-second drain retains the bytes read and sets
+`stdout_drain_incomplete`/`stderr_drain_incomplete`, independently of size truncation.
+Cleanup retains the handle and its execution IDs until the cleanup receipt is
+acknowledged, so describe-first retries can replay its result. Reset and review release similarly retain retired review handles until their
+receipts are acknowledged, preserving generation fences. Each acknowledgement
+prunes only the handles retired by that operation.
+Corrupt or non-regular `entry-*.json` files are quarantined as
+`corrupt-<original name>` when possible and logged with their paths. Quarantine
+rename or directory-sync failures are logged and skipped; valid entries still replay. A failed command-stream task terminates the
+daemon promptly instead of continuing REST-only reporting.
+Other command purposes require positive time and output budgets. Environment
+values are redacted before journal writes; requests retain variable names and
+a digest of the redacted request for replay identity, never secret values or a
+caller-supplied digest. Owner-operation environments also retain only variable
+names, and their check commands are redacted. Redaction applies to request commands,
+result stdout/stderr, error messages, and terminal output text; identities,
+accounting fields, exit codes, and identity paths are preserved.
+Managed Codex resolves cache symlink chains before granting writable roots. It
+normalizes the macOS `/System/Volumes/Data` prefix before comparisons and rejects
+roots that contain HOME (also comparing device/inode identities of its ancestors),
+the worktree, its parent, or the managed home. It rejects roots inside credential
+directories, `<daemon root>/.forge`, the managed home, or another Task directory.
+The daemon root itself is not protected, so `--workspace-root "$HOME"` permits
+ordinary caches. Default caches are allowed even when mounted. A default cache
+redirected by a symlink is refused only when its resolved path is exactly a mount root. Linux compares `/proc/self/mountinfo` mount-point strings
+without opening the mounts; other platforms infer the mount root from device
+boundaries or the filesystem root. Explicit cache environment-variable relocations
+are exempt from the mount-root rule. Defaults are compared through canonical HOME,
+so a symlink in HOME alone does not count as a cache redirect. Forge's exact
+scratch and execution-outbox directories remain designated grants, and ordinary
+relocated caches are allowed.
+
+Ownership remains fenced per location and workspace handle. There is no sticky
+daemon-wide runtime pin to survive Task completion, cancellation, or placement
+removal.
+See [Daemon journal migration](getting-started.md#daemon-journal-migration) for
+the on-disk upgrade.
+
+#### Daemon run policy and trust
+
+`workspace.run` accepts only `ci_step`, `hook`, and `environment_setup` from
+server-side Task or Project configuration, using the embedded backend's shell
+semantics and command budgets. The daemon reads `workspace.run.allow` from its
+local `daemon.yaml` beside its credentials; the default is `[ci_step]`. Hooks
+and environment setup require explicit local opt-in. Requests cannot override
+the effective policy loaded at startup. Admission rejects a candidate with `run_purpose_denied` when required
+purposes are disallowed; the daemon also rejects the command with `purpose_denied`,
+which is never retried. See the [configuration example](getting-started.md#daemon-run-policy).
+
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
 
 A write-capable embedded worker turn checks its repository delivery boundary
 before it reports completion. If the final HEAD is unchanged while the
@@ -2194,15 +2499,80 @@ is claimed against the authenticated daemon connection incarnation before
 `execution.start` is dispatched; transport heartbeats renew that same
 owner-bound execution lease independently of log notifications.
 
-When a WebSocket disconnects, its connection-incarnation owner can no longer
-renew or terminalize the execution. The monitor reconciles the expired owner
-lease through the same execution terminal CAS and may publish the
-disconnect-specific `execution.daemon_disconnected`/`reconciliation.event`
-diagnostics. A replacement socket receives a new owner token, and late
-notifications from the old socket are rejected as concurrent outcomes. The
-terminal event, WorkspaceLease disposition, and Task-block cascade happen only
-if that CAS wins. Embedded-server executions use the equivalent in-process
-owner and heartbeat path.
+When a workspace owner or remote execution daemon disconnects, its `ready`
+placements become `disconnected` and their Tasks wait with visible Attention.
+Heartbeat-lease expiry detects the same outage when the daemon is frozen but
+its TCP socket stays open. Suspension rechecks the execution version and expired
+lease together with the placement version in one database CAS; a heartbeat,
+terminal result, or concurrent socket-disconnect handler cannot double-apply it.
+Forge does not
+requeue or rebuild them on another machine. Running leases are suspended:
+heartbeat loss cannot expire them or discard a retained terminal report.
+`max_disconnect` (default 24 hours) ends the wait with
+`owner_disconnected_timeout`; the execution's hard deadline still applies.
+This also applies to server-owned workspaces executed on a remote daemon.
+
+On reconnect, `workspace.describe` supplies workspace state plus active and
+journaled execution IDs. Forge drains retained results first, resumes leases
+for active executions, applies finished reports once, and fails an unknown
+execution with `owner_lost_execution`. It compares HEAD with recorded evidence
+before returning the placement to `ready` and waking dispatch. Forge records
+the HEAD produced by its own rebase and knowledge-capture commit as
+generation-bound evidence in `workspace_expected_head` (`V202610010530`) for
+remote owners/providers. Evidence uses the execution's immutable terminal time,
+so later edits to an old execution cannot supersede a rebase head. A recording
+failure is logged without failing the successful Git operation; reconciliation
+may then require an explicit reset.
+Terminal reports are acknowledged only after their Task cascade commits. A
+report received during suspension stays unacknowledged until reconciliation and
+cascade settlement finish; retained reports can replay after a cascade failure
+or server restart.
+A periodic sweep
+retries reconciliation for disconnected placements whose owner is online, so
+an interrupted reconnect can finish after a server restart. The workspace cleanup
+scheduler is the sole periodic retry owner for `cleaning` placements; it retains
+the cleanup backoff and waits for an owner acknowledgement. A stale, still-open socket waits for a heartbeat or a new connection
+before reconciliation RPCs resume. Server-owned shared mounts use the embedded
+backend to describe HEAD after the remote provider's retained terminal report
+settles. Late terminal CAS losers cannot replace an accepted outcome.
+The heartbeat monitor completes its core liveness pass before placement
+maintenance. Owner reconciliation runs detached from the tick, grouped by
+daemon, with per-placement in-flight guards and at most two concurrent owner
+workers (leaving capacity in the five-connection SQLite pool). Each RPC has its
+own transport deadline. A completion cascade, including review CI, is no longer
+bounded by reconcile deadlines: it runs detached from the owner worker and
+releases that worker's permit and daemon key. Live terminal delivery waits for
+per-Task cascade serialization so every completion is driven, even without a
+dispatcher or monitor tick. Terminal reservations and pending RPC entries are released on drop.
+Readiness, Attention resolution, and dispatch wakes commit in one transaction.
+The ready-placement sweep considers only retained terminal reports and placements
+reconciled in the last minute. It skips a busy Task cascade without waiting and
+ends an owner's batch on its first transport timeout or unavailability. The
+monitor aborts its owner workers on stop. Workspace-operation acknowledgement
+receipts survive a restart; execution-report acknowledgement retries use retained
+in-memory reports, so after a server restart they resume when the daemon replays.
+Ignored execution reports are acknowledged after the execution is terminal,
+carries an owner-failure cause, or has been deleted. A refused workspace receipt
+acknowledgement is logged without starving later receipts; transport failure
+ends that owner's batch. Cleaned placements treat an already retired daemon
+handle as absent, allowing terminal sweeps to remove their managed homes.
+
+Placement and transport failures do not spend the Task retry budget.
+`placement_unavailable` and `prepare_failed` create no Execution;
+`owner_disconnected` suspends work; timeout or a lost execution offers recovery
+on the same owner. `stale_generation` and `wrong_owner` refuse the operation and
+surface an Attention item. Users may wait, retry on the same owner, or cancel;
+cross-machine migration is outside this change. `resume_session` requires the
+owner to be online and advertise `resume` for the snapshot's executor.
+
+Cleanup goes through the placement backend. An offline owner's placement stays
+`cleaning` and visible until the owner acknowledges removal; only then is it
+`cleaned`. Immediate cleanup retries a placement version conflict within its
+existing timeout, so concurrent disconnect or reconciliation does not discard
+the cleanup request. A retry of an already cleaned daemon workspace also drains
+retained journal acknowledgements. With a persisted `cleaning` intent, an owner's
+`invalid_input: unknown workspace_handle` response means cleanup already finished;
+other unknown-handle responses remain errors.
 
 Remote output, reasoning, and tool notifications update semantic progress
 when accepted, but a quiet remote execution remains healthy while its lease is
@@ -2230,10 +2600,9 @@ uses the same service path and also runs a local PTY-backed process; it does
 not use plain stdin/stdout pipes.
 
 Process ownership lives on the daemon side for daemon-owned workspaces and on
-the API server for embedded workspaces. The API treats a task as daemon-owned
-when the task is directly assigned to an agent with `daemon_id`, or when the
-current workflow state's effective role assignment points to an agent with
-`daemon_id`; otherwise it uses embedded server process handling. Both runtimes
+the API server for embedded workspaces. The API routes terminals through the
+workspace's persisted placement, including its selected execution provider,
+rather than the Agent's current daemon pin. Both runtimes
 allocate a PTY, start the shell in the server-authorized worktree, forward input
 and output, apply resizes, and terminate the process. Daemon-side starts
 additionally reject workspace paths that escape the daemon workspace root.
@@ -2257,6 +2626,8 @@ running sessions before removing the worktree. If a daemon disconnects beyond
 the heartbeat cleanup threshold, the daemon kills the terminals it owns and the
 server records the sessions as exited, timed out, orphaned, or cleanup
 terminated when it observes the terminal lifecycle event.
+Embedded terminal watcher cancellation or control-channel closure also kills
+the shell, allowing the blocking PTY reader to exit during runtime shutdown.
 
 ## Task state machine
 
@@ -2275,7 +2646,27 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `backlog → todo → planning → in_progress → review → merging → done` and
 `merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
 
-Project environment pauses do not add Task failure states. A `review_needs_owner`
+Project environment pauses do not add Task failure states. Embedded checks and
+review CI use the workspace backend command path; remote starts perform the same
+preflight before their provider RPC. Environment pauses retain the failed
+workspace ID: scheduled and manual re-checks use the primary checkout for embedded
+work and the recorded ready daemon placement for remote work. Missing or unresolved
+workspaces, non-ready placements, and unreachable owners fall back to the primary
+checkout. An owner run-policy denial
+records `purpose_denied` and suppresses scheduled re-checks until an explicit check
+succeeds after the policy changes.
+
+An admitted Task waiting for an owner keeps its active Project slot even before
+an Execution exists. Owner timeout, workspace reset and review-CI infrastructure
+blockers count as parked through the shared blocking-kind list, used by dispatch,
+SQL slot aggregation and API projection. Per-Project and per-Task scan boundaries
+isolate owner expiry, deferral, upgrade wake and environment errors so later work
+is still scanned. Placement's Agent/capability facts resolve the same effective
+coder as claim and execution, inheriting only the coordination root's coder.
+The root's other workspace roles still constrain placement because their later
+executions use the same shared workspace.
+
+ A `review_needs_owner`
 annotation parks a Task in `review`, freeing its active slot until the owner
 acts; the failed Review remains in history. Retry with guidance re-enters normal
 recovery, while a manual pass or deferred follow-up lets the Task proceed to
@@ -2809,6 +3200,24 @@ do not consume budget. Both `reset_retry_window` and the stronger
 Task reset restores every gate's retry window rather than carrying an exhausted
 merge/review budget back to `todo`.
 
+Review-CI infrastructure retry applies only to a typed unreachable owner or an
+RPC timeout before a CI command was sent. It spends no review rejection budget
+and creates no Review row if CI never ran. Barrier, annotation, persisted
+attempt count, and deferral commit atomically under Task/Project authority.
+Automatic retries back off from five seconds exponentially, stop after five
+connected-owner failures, and park with a blocker and `execution_failed` Attention
+whose details name the cause. Disconnected placements wait on the same owner
+without spending that cap; reconnect re-arms an exhausted barrier atomically
+with readiness and resolves its Attention. Successful
+retry clears the barrier, annotation, and review-CI Attention; reset and cancel
+also resolve that Attention, and re-opening clears acknowledgement and snooze
+state. Command timeout, repository mismatch, and not-ready/failed/cleaned
+workspaces are permanent runner refusals, not infrastructure retries. Unbounded
+daemon CI accepts truncated output while preserving its exit-code verdict;
+output pressure does not make a successful command fail. Reset-required workspaces offer
+`reset_to_initial`. Embedded authority-loss cancellation and user review-entry
+behavior retain their existing routing; genuine CI failures charge a rejection.
+
 When a reviewer execution fails, Forge first schedules the next bounded execution
 retry and keeps the Review running. Once retries are exhausted or disabled it
 records the same durable task blocker and recovery annotation used for worker
@@ -2830,9 +3239,9 @@ attempt and inserts its Running reviewer execution plus owner lease in one
 implementation execution, while the reviewer and auditor children point at
 that same candidate. Task/Project/workflow, role assignment, selected Agent
 identity/version, and the latest Review snapshot are rechecked at that insert
-boundary; reviewer capacity counts only running executions (plus any
-explicitly configured daemon session cap). The candidate must be a completed
-implementation execution at that insert boundary. Failed or cancelled
+boundary; reviewer capacity counts running executions and workspace reservations
+(plus any explicitly configured daemon session cap). The candidate must be a
+completed implementation execution at that insert boundary. Failed or cancelled
 remediation executions do not displace the last completed candidate, but a
 newer running implementation still fences review admission. If Task/Project/workflow
 authority changes after reservation, Forge terminalizes the reviewer execution
@@ -2845,7 +3254,8 @@ row also cannot auto-cascade unless the Task still carries current
 actions; an execution failure does not count as a reviewer verdict rejecting the
 work.
 `resume_session` is exposed only when the stopped execution has a session/config
-snapshot and its agent still owns the exact Task role.
+snapshot and its agent still owns the exact Task role. For a daemon placement,
+the owner must also be online and advertise `resume` for that executor.
 
 ### Crash recovery
 
@@ -2869,10 +3279,11 @@ as its reason. Task-version and queue-ID checks protect newer decisions.
 ownerless or expired running executions left by an earlier process. Migration
 `V089` does not invent ownership for pre-existing rows: a running row without
 verifiable lease ownership is immediately eligible for this recovery pass.
-`HeartbeatMonitor` applies the same owner-lease terminal CAS on its periodic
-scan, while a separate semantic-progress scan emits warnings without
-terminalizing a live owner. Hard deadlines are recovered distinctly from
-ordinary owner-lease expiry.
+Startup suspends placed remote executions before recovering local grants.
+`HeartbeatMonitor` likewise suspends placed remote heartbeat expiry and uses
+the terminal CAS for embedded owner-lease expiry or a reached hard deadline.
+A separate semantic-progress scan emits warnings without terminalizing a live
+owner. Hard deadlines are recovered distinctly from ordinary owner-lease expiry.
 
 Startup crash recovery marks every interrupted implementation execution whose
 terminal CAS it wins with `resume_policy = auto`, regardless of its active
@@ -3202,9 +3613,9 @@ assembly. A model reviewer receives the response instruction and frozen contract
 exactly once, and admission rejects a final prompt above 192 KiB. Shell commands
 receive JSON as safely quoted `FORGE_GOVERNING_CONTEXT` and
 `FORGE_REVIEW_CONTRACT` exports, so context prose is never executed as shell.
-Review admission requires server access to the candidate git objects; an
-inaccessible remote worktree fails admission rather than receiving an unverifiable
-contract.
+Review admission reads candidate Git objects through the placement owner and
+refuses unavailable or unverifiable evidence. The versioned source digest is
+frozen with the contract and recomputed through the same backend at settlement.
 
 Review reruns, the `run_ci_steps` entry hook, and reviewer-completion conformance
 checks call `task_service::workspace::prepare_workspace` before using the Task

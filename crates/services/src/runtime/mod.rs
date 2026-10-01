@@ -252,6 +252,7 @@ pub struct ForgeRuntime {
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
+    pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     pub event_bus: Arc<EventBus>,
     pub shutdown_signal: ShutdownSignal,
     pub auth_service: Arc<AuthService>,
@@ -294,6 +295,7 @@ impl ForgeRuntime {
             config.terminal.clone(),
             self.cleanup_scheduler.workspace_root().to_path_buf(),
             terminal_activity,
+            Arc::clone(&self.workspace_backend_router),
         ));
         let terminal_cleanup_handler: Arc<dyn crate::workspace_cleanup::WorkspaceCleanupObserver> =
             terminal_service.clone();
@@ -506,13 +508,46 @@ impl ForgeRuntimeBuilder {
                 workspace_root.clone(),
             ))
         });
+        let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
+        let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
+        let execution_events = Arc::new(crate::daemon_transport::ServerExecutionEventSink::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.event_bus),
+            workspace_root.clone(),
+        ));
+        let execution_event_handler: Arc<dyn crate::daemon_transport::DaemonExecutionEventHandler> =
+            execution_events.clone();
+        let daemon_connections = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::new(
+            Arc::clone(&self.event_bus),
+            execution_event_handler,
+        ));
+        execution_events.set_connection_registry(Arc::downgrade(&daemon_connections));
+        let workspace_backend_router = Arc::new(
+            crate::workspace_backend::WorkspaceBackendRouter::new(Arc::new(
+                crate::workspace_backend::EmbeddedWorkspaceBackend::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&merge_service),
+                    workspace_root.clone(),
+                )
+                .with_repo_cache_locks(Arc::clone(&repo_cache_locks)),
+            ))
+            .with_daemon(Arc::new(
+                crate::workspace_backend::DaemonWorkspaceBackend::new(
+                    Arc::clone(&self.db),
+                    Arc::clone(&daemon_connections),
+                ),
+            )),
+        );
         let cleanup_scheduler = self.cleanup_scheduler.unwrap_or_else(|| {
-            Arc::new(WorkspaceCleanupScheduler::new(
+            Arc::new(WorkspaceCleanupScheduler::new_with_router(
                 Arc::clone(&self.db),
                 Arc::clone(&self.event_bus),
                 workspace_root.clone(),
+                Arc::clone(&workspace_backend_router),
             ))
         });
+        merge_service.set_workspace_backend_router(Arc::clone(&workspace_backend_router));
+        cleanup_scheduler.set_workspace_backend_router(Arc::clone(&workspace_backend_router));
         let review_runner = self.review_runner.unwrap_or_else(|| {
             Arc::new(review::ReviewRunner::new(
                 Arc::clone(&self.db),
@@ -555,34 +590,21 @@ impl ForgeRuntimeBuilder {
         let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&self.db)));
         let cli_task_executor: Arc<dyn TaskExecutor> =
             Arc::new(FallbackExecutor::new(Arc::clone(&self.adapter_registry)));
-        let embedded_task_executor = Arc::new(crate::EmbeddedTaskExecutor::new(
+        let embedded_task_executor = Arc::new(crate::EmbeddedTaskExecutor::new_with_router(
             Arc::clone(&self.db),
             Arc::clone(&embedded_agent_service),
+            Arc::clone(&workspace_backend_router),
         ));
         let task_executor: Arc<dyn TaskExecutor> = Arc::new(crate::TaskExecutorRouter::new(
             cli_task_executor,
             embedded_task_executor,
         ));
         let review_runner = Arc::new(review_runner.with_task_executor(Arc::clone(&task_executor)));
-        let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
-        let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&self.db)));
         let workflow_template_service = Arc::new(
             crate::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
         );
-        let execution_events = Arc::new(crate::daemon_transport::ServerExecutionEventSink::new(
-            Arc::clone(&self.db),
-            Arc::clone(&self.event_bus),
-            workspace_root.clone(),
-        ));
-        let execution_event_handler: Arc<dyn crate::daemon_transport::DaemonExecutionEventHandler> =
-            execution_events.clone();
-        let daemon_connections = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::new(
-            Arc::clone(&self.event_bus),
-            execution_event_handler,
-        ));
-        execution_events.set_connection_registry(Arc::downgrade(&daemon_connections));
         let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -591,20 +613,30 @@ impl ForgeRuntimeBuilder {
             effective_config.terminal.clone(),
             workspace_root.clone(),
             Arc::clone(&terminal_activity),
+            Arc::clone(&workspace_backend_router),
         ));
         let task_service = Arc::new(
-            TaskService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                .with_merge_service(Arc::clone(&merge_service))
-                .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
-                .with_review_runner(Arc::clone(&review_runner))
-                .with_task_executor(Arc::clone(&task_executor))
-                .with_daemon_connections(Arc::clone(&daemon_connections))
-                .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
-                .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
-                .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
-                .with_memory_service(Arc::clone(&memory_service))
-                .with_provider_credential_env(Arc::clone(&embedded_agent_service))
-                .with_workspace_root(workspace_root.clone()),
+            TaskService::new_with_router(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                Arc::clone(&workspace_backend_router),
+            )
+            .with_placement_adapter_registry(Arc::clone(&self.adapter_registry))
+            .with_merge_service(Arc::clone(&merge_service))
+            .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
+            .with_review_runner(Arc::clone(&review_runner))
+            .with_task_executor(Arc::clone(&task_executor))
+            .with_daemon_connections(Arc::clone(&daemon_connections))
+            .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
+            .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
+            .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
+            .with_memory_service(Arc::clone(&memory_service))
+            .with_provider_credential_env(Arc::clone(&embedded_agent_service))
+            .with_workspace_max_disconnect(Duration::from_secs(
+                effective_config.workspace.max_disconnect_seconds,
+            ))
+            .with_workspace_root(workspace_root.clone())
+            .with_workspace_backend_router(Arc::clone(&workspace_backend_router)),
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
         embedded_agent_service.set_task_service(Arc::clone(&task_service));
@@ -649,8 +681,12 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&notification_service),
         ));
         let operator_status_service = Arc::new(
-            OperatorStatusService::new(Arc::clone(&self.db))
-                .with_consumer_stall_seconds(effective_config.server.event_consumer_stall_seconds),
+            OperatorStatusService::new_with_router(
+                Arc::clone(&self.db),
+                Arc::clone(&workspace_backend_router),
+            )
+            .with_consumer_stall_seconds(effective_config.server.event_consumer_stall_seconds)
+            .with_daemon_connections(Arc::clone(&daemon_connections)),
         );
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::new(Arc::clone(&self.event_bus)));
@@ -682,6 +718,9 @@ impl ForgeRuntimeBuilder {
         ));
         let heartbeat_monitor = Arc::new(
             HeartbeatMonitor::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                .with_max_disconnect(Duration::from_secs(
+                    effective_config.workspace.max_disconnect_seconds,
+                ))
                 .with_task_service(Arc::clone(&task_service))
                 .with_task_executor(Arc::clone(&task_executor))
                 .with_daemon_connections(Arc::clone(&daemon_connections)),
@@ -711,9 +750,10 @@ impl ForgeRuntimeBuilder {
         ));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
-        let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new(
+        let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
             Arc::clone(&self.db),
             plugin_registry,
+            Arc::clone(&workspace_backend_router),
         ));
 
         let runtime = ForgeRuntime {
@@ -759,6 +799,7 @@ impl ForgeRuntimeBuilder {
             lifecycle_emitter,
             workspace_exec_locks,
             repo_cache_locks,
+            workspace_backend_router,
             event_bus: self.event_bus,
             shutdown_signal: self.shutdown_signal,
             auth_service,
@@ -1139,6 +1180,10 @@ mod tests {
     #[tokio::test]
     async fn supervisor_start_is_idempotent_and_shutdown_is_bounded() {
         let (_data_dir, runtime_graph) = runtime().await;
+        assert!(Arc::ptr_eq(
+            &runtime_graph.workspace_backend_router,
+            &runtime_graph.task_service.workspace_backend_router()
+        ));
         let mut supervisor =
             RuntimeSupervisor::new(Arc::clone(&runtime_graph), RuntimeAssemblyMode::Solo);
         assert!(!supervisor.started());
@@ -1146,6 +1191,12 @@ mod tests {
         assert!(supervisor.started());
         assert_eq!(supervisor.workers().len(), 15);
         assert_eq!(supervisor.worker_handle_count(), 14);
+        assert!(supervisor
+            .workers()
+            .contains(&RuntimeWorker::HeartbeatMonitor));
+        assert!(supervisor
+            .workers()
+            .contains(&RuntimeWorker::StorageMaintenance));
         let monitored = runtime_graph
             .operator_status_service
             .compute_status()
@@ -1154,6 +1205,8 @@ mod tests {
         assert_eq!(monitored.event_consumers.len(), 5);
         assert_eq!(supervisor.start().await.expect("second start is no-op"), 0);
         supervisor.shutdown().await.expect("runtime shuts down");
+        assert_eq!(supervisor.worker_handle_count(), 0);
+        assert!(runtime_graph.task_dispatcher.is_stopped());
         supervisor
             .shutdown()
             .await

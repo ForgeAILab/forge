@@ -699,7 +699,7 @@ async fn charter_backed_implementation_task_is_claimable_without_a_baseline() {
     );
 
     attach_approved_charter(&db, &project.id).await;
-    let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let tasks = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     let task = tasks
         .create_task(
             project.id.clone(),
@@ -1394,7 +1394,7 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
         .await
         .expect("unrelated task reloads")
         .expect("unrelated task exists");
-    let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let tasks = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     let blocked_result = tasks
         .claim_task(
             blocked_task.id.clone(),

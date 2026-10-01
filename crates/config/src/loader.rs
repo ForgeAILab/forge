@@ -91,6 +91,9 @@ impl ForgeConfig {
             if let Some(cleanup_delay_seconds) = workspace.cleanup_delay_seconds {
                 self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
             }
+            if let Some(max_disconnect_seconds) = workspace.max_disconnect_seconds {
+                self.workspace.max_disconnect_seconds = max_disconnect_seconds;
+            }
         }
 
         if let Some(agent) = file.agent {
@@ -229,6 +232,10 @@ impl ForgeConfig {
             self.workspace.cleanup_delay_seconds =
                 parse_env_u64("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", &value)?;
         }
+        if let Some(value) = env_value("FORGE_MAX_DISCONNECT_SECONDS") {
+            self.workspace.max_disconnect_seconds =
+                parse_env_u64("FORGE_MAX_DISCONNECT_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =
                 parse_env_u32("FORGE_AGENT_MAX_CONCURRENT_TASKS", &value)?;
@@ -285,6 +292,9 @@ impl ForgeConfig {
         }
         if let Some(cleanup_delay_seconds) = overrides.workspace_cleanup_delay_seconds {
             self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+        }
+        if let Some(max_disconnect_seconds) = overrides.workspace_max_disconnect_seconds {
+            self.workspace.max_disconnect_seconds = max_disconnect_seconds;
         }
         if let Some(max_concurrent_tasks) = overrides.agent_max_concurrent_tasks {
             self.agent.max_concurrent_tasks = max_concurrent_tasks;

@@ -108,6 +108,11 @@ database for historical provenance.
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
 | DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
+| GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
+| POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
+| PATCH  | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin changes the default location with a version check |
+| DELETE | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin removes a location; non-cleaned placements return 409 naming their Task |
+| POST   | `/api/v1/repos/{id}/locations/{location_id}/verify` | Owner/admin re-verifies a location with a version check |
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
@@ -1990,10 +1995,26 @@ The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
 the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
-conflict. The daemon protocol minimum is bumped, so an older daemon is rejected
-before dispatch rather than silently degrading to missing or flattened
-accounting. The server uses the actual reported provider/model and never
-infers it from the executor family.
+conflict. The minimum command protocol revision is 3. A revision-2 daemon
+receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
+from the server's release (protocol revision 3 or newer). Every command RPC is
+refused, including execution, repository verification, `fs.list`, `fs.branches`,
+workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
+`409 daemon_upgrade_required` with `needs_human: true`; placement rejection
+includes that filter code in `rejected_candidates`. An upgrade-only dispatch
+refusal records an actionable blocker and creates no Execution; reservation
+returns the typed error without modifying the Task. The heartbeat sweep clears
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 3.
+Repository locations retain the upgrade reason in `last_error` after a verification
+attempt, without changing their verification status; pinned Agents expose
+`effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
+reports `upgrade_required` with the same instruction. A socket without its
+handshake returns HTTP `503 daemon_not_ready`. Existing ready placements become
+disconnected and fail after `max_disconnect` (default 24 hours) if the owner is
+still unusable. Upgrade the server first, then every daemon. Old binaries log the
+connect instruction via their warning handler; new binaries also print it to
+stderr. The server uses the actual reported provider/model and never infers it
+from the executor family.
 
 This is a public-beta breaking cutover. The old nullable `cost_usd` field,
 flattened execution-usage authority, merged `execution_count` meaning, and
@@ -2004,6 +2025,80 @@ float conversion. `AgentChatMessageResponse` uses typed `usage:
 UsageBreakdown[]` when usage is exposed; the MCP chat timeline uses that same
 typed response. MCP adds no pricing-refresh, binding/override, or
 retrospective mutation tool in this change.
+
+## Repository locations
+
+A repository location records a physical checkout separately from its Repo.
+Every location route requires a Project `owner`/`admin` membership or a server
+administrator. A daemon and its runtime must be visible to the caller, and
+the runtime must belong to that daemon. A location ID from another Repo
+returns 404. Locations on hidden daemons are excluded before pagination and
+counts.
+
+Register a server checkout with `POST /api/v1/repos/{id}/locations`:
+
+```json
+{
+  "owner_kind": "server",
+  "path": "/srv/checkouts/app",
+  "kind": "primary_checkout",
+  "is_default": true
+}
+```
+
+`owner_kind` is `server` or `daemon`; `kind` is `primary_checkout`,
+`managed_clone`, or `shared_mount`. `is_default` is optional and defaults to
+false. A daemon location requires `daemon_id` and `runtime_id`. A
+`shared_mount` is server-owned and also requires both IDs; other server
+locations omit them. Machine-local paths are stored as supplied. Server paths
+must be absolute to pass verification.
+
+Registration returns HTTP 200 with a `RepoLocationResponse`, including `id`,
+`repo_id`, owner/runtime IDs, `path`, `kind`, `is_default`, `status`,
+`last_verified_at`, `last_error`, `version`, `created_at`, and `updated_at`.
+The initial `unverified` row is verified before this response. Verification
+failure is persisted and returned as a location with `invalid` or
+`unavailable` status; it does not remove the registration. Only `ready`
+locations are eligible for workspace placement. For an on-demand server managed
+clone failure, `last_error` is a JSON-encoded string with `cause: "clone_failed"`,
+`attempts`, `retry_at` (RFC3339), and a bounded, redacted `message`; ordinary
+verification errors remain strings. First use can replace a legacy backfilled
+Task worktree path with the repository source and verify that location.
+
+Server verification checks the directory, Git work tree, default-branch
+commit, and the origin remote against the Repo URL. A checkout with no origin
+remote is accepted. Failure codes include `path_not_found`, `not_git_work_tree`,
+`default_branch_not_found`, and `remote_mismatch`. Daemon paths are never read
+on the server. A path lexically outside the runtime's advertised
+`workspace_root` becomes `invalid` with `outside_workspace_root`; final
+filesystem and symlink verification belongs to the owning daemon through
+`repo_location.verify`. An unreachable owner returns `unavailable`; verification
+is retried after reconnect. Shared-mount verification writes a temporary probe
+on the server and requires the daemon to read the same content at the same path.
+A shared mount cannot become ready through the server's local Git check alone.
+
+`GET /api/v1/repos/{id}/locations` returns
+`{ "items": [...], "next_cursor": null, "has_more": false, "total_count": null }`.
+Use `limit`, `cursor`, and `include_total`; cursors are opaque. Supported
+sorts are `created_at`, `updated_at`, and `id`, with `sort_order=asc|desc`.
+
+`PATCH /api/v1/repos/{id}/locations/{location_id}` accepts
+`{ "version": 2, "is_default": true }`. Setting a default clears the previous
+default in the same transaction and increments every changed row's version.
+Setting `is_default` to false clears only that location. Location paths and
+ownership are immutable on this surface; register a new location to replace
+one.
+
+`POST /api/v1/repos/{id}/locations/{location_id}/verify` accepts
+`{ "version": 2 }` and returns the updated location. Both PATCH and verify
+return HTTP 409 `version_conflict` for a stale version. A completed verify
+increments the version and records the verification time and error, clearing
+the error on success.
+
+DELETE returns HTTP 204. While any placement references the location in a
+state other than `cleaned`, it returns HTTP 409 `conflict`; the message names
+the Task title, Task ID, and placement ID. Deletion rechecks this condition
+inside its database write transaction.
 
 ## Projects
 
@@ -2111,13 +2206,13 @@ ten-minute review at a time:
   configuration, not a secret store. Use the executor's credential provider
   for tokens and passwords.
 - `assets` copy a host file or directory (absolute `source`) to a
-  worktree-relative `target` immediately before each local execution and before
+  worktree-relative `target` immediately before each local or daemon execution and before
   Forge re-runs the review checks in the Task worktree. A target that already exists is
   never overwritten, so tracked content and earlier copies are left alone.
   Copies are staged and renamed atomically; symbolic links, overlapping
   targets, and sources inside (or containing) the worktree are refused.
 - `checks` run with `bash -lc` in the worktree, in order, immediately before a
-  local execution whose role is listed in `roles` (empty means every role).
+  local or daemon execution whose role is listed in `roles` (empty means every role).
   `timeout_seconds` defaults to 120 and accepts 1–300 seconds. Invalid values
   are refused with HTTP 400 on write; previously stored values are clamped to
   that range when checks run. The first failing check fails the
@@ -2128,22 +2223,30 @@ ten-minute review at a time:
   pause is never overwritten.
 - `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
   While environment-paused, Forge automatically re-runs the recorded failing
-  checks in the primary checkout, with the Project `env` and without copying
-  assets. Checks run in background jobs, at most one per Project, so dispatcher
+  checks in the primary checkout for embedded workspaces, or through the recorded
+  daemon owner in the ready workspace that failed, with the Project `env` and without
+  copying assets. Checks run in background jobs, at most one per Project, so dispatcher
   ticks and operations refresh do not wait for them. Role-scoped checks that
   triggered the pause are included. Every check
   passing clears only the environment pause; Tasks then re-dispatch in their
-  current states. Another failure updates the output and schedules the next
-  check. Checks that depend on worktree assets may pass here and fail at launch,
-  which pauses the Project again. An asset-copy failure or a pause with no
+  current states. If the recorded workspace is missing or cannot be resolved,
+  or its daemon placement is not ready or its owner is unreachable, re-checks
+  fall back to the primary checkout. Another failure, including a re-check error,
+  updates the output and schedules the next check at the same interval.
+  Checks that depend on worktree assets may pass here and fail at launch,
+  which pauses the Project again. A daemon run-policy denial pauses with a clear
+  `purpose_denied` reason and no automatic re-check. Enable `environment_setup`
+  on that owner and use **Check now**. An asset-copy failure or a pause with no
   re-runnable check stays paused; its output explains that the owner must fix
   the environment and resume, or configure a real check.
 
 `ProjectResponse.environment_pause` is `null` when there is no environment
-pause detail. Its persisted shape is:
+pause detail. `workspace_id` records the workspace used at failure and is nullable
+for checkout-only checks. Its persisted shape is:
 
 ```json
 {
+  "workspace_id": "<workspace-id>",
   "checks": ["disk"],
   "role": "coder",
   "output": "disk: exit 1\nroot free: 7G",
@@ -3141,11 +3244,12 @@ included when the backend has a user-supplied or cleanup reason.
 ### Daemon transport
 
 Terminal daemon transport is internal to Forge. The browser connects to the
-API server; the API server proxies process operations to the daemon over the
-existing daemon transport when the task is directly assigned to an agent with
-`daemon_id`, or when the current workflow state's effective role assignment
-points to an agent with `daemon_id`. Tasks without an agent daemon use the
-embedded server PTY path. See the
+API server; the API server routes process operations through the workspace's
+persisted placement and its selected execution provider. A daemon-owned terminal
+uses the path resolved by that owner for its opaque handle. A server workspace
+can use a daemon only through a verified shared mount; otherwise it uses the
+embedded server PTY. Changing an Agent's daemon pin does not reroute an admitted
+workspace. See the
 [task terminal architecture](architecture.md#task-terminal-sessions) for the
 full design rationale.
 
@@ -3605,6 +3709,124 @@ contains the typed missing requirements and permitted remediation actions;
 clients must not infer readiness from the HTTP status of Project creation or
 from a different setup dimension.
 
+Workspace admission errors use HTTP `409`. `placement_unavailable` includes
+`details.task_id`, `details.repo_id`, and `details.rejected_candidates`: each
+candidate names its repository location, owner, daemon/runtime and `filter_codes`.
+Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
+`location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
+`agent_capacity`, `daemon_capacity`, `work_mode_unsupported`,
+`native_backend_unsupported`, `run_purpose_denied`, and `not_visible`.
+`daemon_upgrade_required` applies only if an otherwise eligible candidate is
+blocked solely by the upgrade (ignoring facts absent from its revision-3
+handshake), with no candidate blocked solely by capacity or transient conditions.
+The dispatch-failure annotation and Task metadata record the refused daemon IDs.
+The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
+daemon reconnects at revision 3, even when a blocking annotation was preserved.
+Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
+`recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
+`before_work_hook_failed`, and `before_work_hook_timeout` annotations.
+No eligible candidate means no fallback and no Execution. `prepare_failed`
+includes `details.placement_id` and `details.failure_cause`; failed or expired
+preparation creates no Execution or lease and does not spend the Task retry budget.
+Preparation fence refusals (`stale_generation` and `wrong_owner`) persist that
+failure cause and open a `workspace_fence_rejected` attention item for inspection.
+A new reservation after `prepare_failed` advances the unprepared placement's
+generation, giving the new prepare attempt a fresh operation ID. Retransmission
+within one attempt keeps its operation ID and replays the owner's retained result.
+Every launch, follow-up, and resume uses reserve → prepare → start admission.
+The start transaction rechecks the prepared placement version and capacity before
+creating the Running Execution and its leases; a stale placement returns 409.
+
+Task responses include `placement` (null before workspace admission), also
+available as `workspace.placement` and on every Workspace response. Subtasks
+sharing a root workspace expose that root's placement. The object includes
+`id`, `workspace_id`, `task_id`, `agent_id`, `owner_kind` (`server` or `daemon`),
+`daemon_id`, `runtime_id`, `repo_location_id`, `execution_daemon_id`,
+`workspace_handle`, `generation`, `state`, `selected_by`, `selection_reason`,
+`reserved_until`, `disconnected_at`, `failure_cause`, `version`, and timestamps.
+The handle is opaque; `worktree_path` is populated only for server placements
+and is empty for daemon placements. Responses expose reserved/preparing and
+disconnected placements even when the owner cannot be reached. Placement version
+conflicts use the ordinary HTTP `409 version_conflict` error.
+A claim on a `cleaning` or prepared `failed` placement returns
+HTTP 409 with `WORKSPACE_RESET_REQUIRED` and `{ task_id, reason }`, rather than a
+generic placement/version conflict. An unprepared `failed(prepare_failed)`
+placement with no handle remains reselectable; capacity refusals still queue.
+
+Recovery annotations expose `blocking_reason` values `owner_disconnected_timeout`
+(the max-disconnect bound expired), `owner_lost_execution` (the owner no longer
+knows the run), and `owner_workspace_reset_required` (HEAD/workspace needs a
+reset). Review CI uses `review_ci_infrastructure` during bounded retry,
+`review_ci_infrastructure_exhausted` at its cap, `review_ci_unavailable` for a
+permanent runner refusal, and `workspace_reset_required` when reset is required.
+Review-CI parks appear as the existing `execution_failed` attention category,
+with the specific cause in details; owner waits appear as `runtime_offline`.
+Disconnected review CI waits without counting attempts until reconnect or
+max-disconnect expiry; reconnect re-arms an exhausted review-CI barrier.
+Execution terminal acknowledgements are retried from retained reports while the
+server runs. After a server restart, acknowledgement resumes when the daemon
+replays its retained report. Workspace operation acknowledgements are retried
+from durable receipts.
+Executor snapshots store `placement_id`; they no longer store `resolved_daemon_id`.
+For daemon placements, `execution.start.workspace_path` comes from the retained
+owner preparation result for that exact handle and generation.
+Task, Workspace, and Execution plan-artifact reads use the same owner router as
+dispatch. A daemon workspace handle is never interpreted as a server path.
+
+### Workspace daemon protocol
+
+Protocol revision 3 negotiates `workspace.v1` and is required for every command
+RPC, including execution, verification, filesystem browsing, and PTY terminals.
+Revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Task admission refusals (as defined above) create no Execution and resume dispatch
+automatically after the daemon upgrade. Existing placements disconnect
+and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
+(`structured_events`, `usage`, `resume`, `cancel_ack`, `terminal_observed`) and
+the daemon's effective `workspace.run` policy; absent facts are unsupported.
+
+| Method | Owner operation |
+| --- | --- |
+| `repo_location.verify` | Verify the checkout and any shared-mount probe |
+| `workspace.prepare` | Prepare a placement and return its opaque handle and base SHA |
+| `workspace.describe` | Report workspace state, active executions, and retained execution results |
+| `workspace.run` | Run configured `ci_step`, `hook`, or `environment_setup` commands |
+| `workspace.diff` | Read diffs and exact reviewer evidence |
+| `workspace.read` | Read bounded artifacts, Git evidence, and owner-local paths |
+| `workspace.merge` | Direct merge into the verified primary checkout |
+| `workspace.reset` | Reset the workspace or perform typed asset, knowledge, and review-checkout operations |
+| `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
+
+Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
+`generation`, and `expected` (a base SHA or version). Existing workspaces also
+carry `workspace_handle`. Duplicate operation IDs replay their journaled result
+until acknowledgement;
+`stale_generation` and `wrong_owner` refuse changes. No method accepts an arbitrary
+shell command outside the three configured run purposes. `purpose_denied` is
+never retried. CI permits unbounded execution time, with output capped at 1 MiB
+per stream. UTF-8-safe tails start with `[Forge: CI log truncated]` and set
+`stdout_truncated`/`stderr_truncated` when size-bounded. Unbounded CI requests
+(`max_output_bytes = u64::MAX`) accept these tails and retain their exit verdict.
+Bounded conformance commands still fail on size overflow. A shell whose
+descendants retain an output pipe returns bytes read before the two-second drain
+limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
+of size truncation. These booleans default to false when absent.
+
+The single daemon journal retains terminal reports with bounded worklog/evidence
+outbox entries, operation results, and cleanup acknowledgements. Revision 3 uses
+`journal.ack { entry_id }`. Retained terminal and cleanup results replay after
+reconnect until the server durably records their result and acknowledges it.
+Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt
+is already gone. The server must not redispatch an acknowledged operation.
+The journal caps all persisted files at 32 MiB, receipts at 1,024, and each receipt
+at 16 MiB. Logs may be shortened to their tail or omitted entirely; run admission reserves
+headroom so completion identity, exit codes, and flags fit even under pressure.
+Cleanup removes a handle and its execution IDs when its receipt is acknowledged.
+Requests store environment names and a digest of the redacted request; incoming
+`_request_digest` is ignored. Redaction is scoped to request commands, stdout,
+stderr, error messages, and terminal output text, preserving IDs and exit codes.
+Undecodable entry files are quarantined as `corrupt-<original name>` with a warning
+and do not stop journal initialization.
+
 When a follow-up, re-execute, or launch collides with an already-running
 execution, REST returns HTTP `409` with code `execution.already_running`.
 `details.scope` is `repository` for a shared Workspace slot or `interactive`
@@ -3705,7 +3927,9 @@ operation. `operation_not_in_scope` is reserved for the canonical catalog.
 They carry `retry.action: none`, `retryable: false`, and `scope: session`;
 pauses apply only while their current cause holds. Other specific refusals
 are turn-scoped and never cached or recorded. A paused target Agent uses
-`target_agent_paused`. A Project pause on `task.recover` is also turn-scoped:
+`target_agent_paused`. Workspace target refusals use `placement_unavailable`,
+`daemon_upgrade_required`, or `workspace_reset_required`; they remain tool results
+with turn scope and never withdraw the caller's operation. A Project pause on `task.recover` is also turn-scoped:
 re-execution may be refused while cancellation remains available. An unknown
 refusal uses `denied_by: unspecified`, `retry.action: none`, and neutral text:
 "Refused for this request. Repeating the identical call will be refused again."

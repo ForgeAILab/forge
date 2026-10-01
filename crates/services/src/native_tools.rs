@@ -858,21 +858,30 @@ impl CoordinationToolProvider {
         // the stored artifact ambiguous about what was actually observed.
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
-                let root = self.task_workspace_root(&task_id).await?;
+                let workspace = self.task_workspace(&task_id).await?;
+                let root = workspace
+                    .embedded_path()
+                    .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
                 let resolved =
                     resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
-                let bytes = read_bounded_regular_file(
-                    &resolved,
-                    &root,
-                    MAX_CAPTURED_EVIDENCE_BYTES as u64,
-                    false,
-                )
-                .map_err(|error| {
-                    AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
-                })?
-                .ok_or_else(|| {
-                    AgentHostError::Runtime("captured artifact does not exist".to_owned())
-                })?;
+                let relative = resolved
+                    .strip_prefix(root.canonicalize().map_err(|error| {
+                        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+                    })?)
+                    .map_err(|error| AgentHostError::Authority(error.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = workspace
+                    .backend
+                    .read(
+                        &workspace.placement,
+                        &relative,
+                        MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                    })?;
                 let name = resolved
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -1266,8 +1275,14 @@ impl CoordinationToolProvider {
         {
             let result = match entry {
                 Ok(entry) => {
-                    self.ingest_outbox_evidence(input, &author_name, &outbox, &position, &entry)
-                        .await
+                    self.ingest_local_outbox_evidence(
+                        input,
+                        &author_name,
+                        &outbox,
+                        &position,
+                        &entry,
+                    )
+                    .await
                 }
                 Err(reason) => Err(reason),
             };
@@ -1344,7 +1359,7 @@ impl CoordinationToolProvider {
             .await
     }
 
-    async fn ingest_outbox_evidence(
+    async fn ingest_local_outbox_evidence(
         &self,
         input: &ExecutionOutboxInput<'_>,
         author_name: &str,
@@ -1429,6 +1444,210 @@ impl CoordinationToolProvider {
         .await
     }
 
+    /// Apply owner-harvested entries without opening any owner-local paths.
+    pub async fn ingest_execution_outbox_entries(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> ExecutionOutboxReport {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxWorklogKind};
+        let mut report = ExecutionOutboxReport::default();
+        let author_name = input.role.unwrap_or("agent");
+        let mut worklog_count = 0;
+        let mut evidence_count = 0;
+        let mut evidence_bytes = 0_u64;
+        for entry in entries {
+            let (file, line_no, result) = match entry {
+                ExecutionOutboxEntry::Worklog {
+                    position,
+                    kind,
+                    summary,
+                } => {
+                    worklog_count += 1;
+                    let kind = match kind {
+                        ExecutionOutboxWorklogKind::Progress => "progress",
+                        ExecutionOutboxWorklogKind::Decision => "decision",
+                        ExecutionOutboxWorklogKind::Validation => "validation",
+                        ExecutionOutboxWorklogKind::Blocker => "blocker",
+                    };
+                    let result = if worklog_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND
+                    {
+                        Err("execution outbox has too many worklog entries".to_owned())
+                    } else if position.is_empty() {
+                        Err("line number must be positive".to_owned())
+                    } else if summary.trim().is_empty() {
+                        Err("summary is required".to_owned())
+                    } else if summary.trim().chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
+                        Err(format!("summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"))
+                    } else {
+                        self.append_outbox_worklog(
+                            input,
+                            author_name,
+                            kind,
+                            summary.trim(),
+                            format!("outbox:{}:worklog:{position}", input.execution_id),
+                        )
+                        .await
+                    };
+                    if result.is_ok() {
+                        report.worklog_entries += 1;
+                    }
+                    (executors::OUTBOX_WORKLOG_FILE, position, result)
+                }
+                ExecutionOutboxEntry::Evidence {
+                    position,
+                    kind,
+                    caption,
+                    path,
+                    content,
+                    artifact,
+                } => {
+                    evidence_count += 1;
+                    let size = artifact
+                        .as_ref()
+                        .map(|artifact| artifact.bytes.len())
+                        .or_else(|| content.as_ref().map(String::len))
+                        .unwrap_or(0) as u64;
+                    evidence_bytes = evidence_bytes.saturating_add(size);
+                    let result =
+                        if evidence_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND {
+                            Err("execution outbox has too many evidence entries".to_owned())
+                        } else if evidence_bytes > api_types::MAX_EXECUTION_OUTBOX_EVIDENCE_BYTES {
+                            Err("execution outbox evidence exceeds size budget".to_owned())
+                        } else {
+                            self.ingest_outbox_evidence(
+                                input,
+                                author_name,
+                                ExecutionOutboxEntry::Evidence {
+                                    position: position.clone(),
+                                    kind,
+                                    caption,
+                                    path,
+                                    content,
+                                    artifact,
+                                },
+                            )
+                            .await
+                        };
+                    if result.is_ok() {
+                        report.evidence_items += 1;
+                    }
+                    (executors::OUTBOX_EVIDENCE_FILE, position, result)
+                }
+            };
+            if let Err(reason) = result {
+                report.rejected.push(format!("{file}:{line_no}: {reason}"));
+            }
+        }
+        report
+    }
+
+    async fn ingest_outbox_evidence(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        author_name: &str,
+        entry: api_types::ExecutionOutboxEntry,
+    ) -> Result<(), String> {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxEvidenceKind};
+        let ExecutionOutboxEntry::Evidence {
+            position: line_no,
+            kind,
+            caption,
+            path,
+            content,
+            artifact,
+        } = entry
+        else {
+            return Err("expected an evidence entry".to_owned());
+        };
+        let kind = match kind {
+            ExecutionOutboxEvidenceKind::Screenshot => "screenshot",
+            ExecutionOutboxEvidenceKind::WalkthroughVideo => "walkthrough_video",
+            ExecutionOutboxEvidenceKind::Log => "log",
+            ExecutionOutboxEvidenceKind::Report => "report",
+            ExecutionOutboxEvidenceKind::Other => "other",
+        };
+        if line_no.is_empty() {
+            return Err("line number must be positive".to_owned());
+        }
+        let caption = caption.trim();
+        if caption.is_empty() {
+            return Err("caption describing the artifact is required".to_owned());
+        }
+        let path = path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content = content.as_deref().filter(|value| !value.trim().is_empty());
+        let (bytes, filename, content_type) = match (path, content, artifact) {
+            (Some(_), None, Some(artifact)) => {
+                if artifact.filename.is_empty()
+                    || artifact.filename.contains('/')
+                    || artifact.filename.contains('\\')
+                {
+                    return Err("captured artifact filename is invalid".to_owned());
+                }
+                (artifact.bytes, artifact.filename, artifact.content_type)
+            }
+            (None, Some(content), None) => (
+                content.as_bytes().to_vec(),
+                format!("{kind}.txt"),
+                "text/plain".to_owned(),
+            ),
+            (Some(_), Some(_), _) => {
+                return Err("supply either path or content, not both".to_owned())
+            }
+            (Some(_), None, None) => {
+                return Err("owner did not supply captured artifact bytes".to_owned())
+            }
+            _ => {
+                return Err(
+                    "evidence requires either a path with captured bytes or inline content"
+                        .to_owned(),
+                )
+            }
+        };
+        if bytes.is_empty() {
+            return Err("captured artifact is empty".to_owned());
+        }
+        if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(format!(
+                "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
+            ));
+        }
+        let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
+        let already_ingested = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task_comment WHERE task_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(input.task_id)
+        .bind(&idempotency_key)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+        if already_ingested {
+            return Ok(());
+        }
+        self.store_task_evidence_with_id(
+            input.agent_id,
+            input.task_id,
+            &filename,
+            content_type,
+            &bytes,
+            outbox_evidence_media_id(input.execution_id, &line_no),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        self.append_outbox_worklog(
+            input,
+            author_name,
+            "validation",
+            &format!("Captured {kind} evidence `{filename}`: {caption}"),
+            idempotency_key,
+        )
+        .await
+    }
+
     async fn outbox_worklog_receipt_exists(
         &self,
         task_id: &str,
@@ -1491,23 +1710,29 @@ impl CoordinationToolProvider {
         }
     }
 
-    async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT worktree_path FROM workspace
-             WHERE task_id = ? AND status != 'cleaned'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(task_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        path.filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
+    async fn task_workspace(
+        &self,
+        task_id: &str,
+    ) -> Result<crate::workspace_backend::ResolvedWorkspace, AgentHostError> {
+        let workspace = db::WorkspaceRepo::get_by_task_id(&*self.db, task_id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+            .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
             .ok_or_else(|| {
                 AgentHostError::Runtime(
                     "this Task has no active workspace to capture an artifact from".to_owned(),
                 )
-            })
+            })?;
+        let router = self
+            .task_service_handle()
+            .map(|service| service.workspace_backend_router())
+            .ok_or_else(|| {
+                AgentHostError::Runtime("workspace router is not configured".to_owned())
+            })?;
+        router
+            .resolve(&self.db, &workspace)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))
     }
 
     /// The Project Agent's own verification workspace root (`forge/` plus the
@@ -5129,16 +5354,40 @@ fn invalid_arguments(message: String) -> AgentHostError {
 }
 
 fn service_error(error: crate::ServiceError) -> AgentHostError {
+    if let crate::ServiceError::TurnFailure { error, .. } = error {
+        return service_error(*error);
+    }
+    let target_refusal = match &error {
+        crate::ServiceError::PlacementUnavailable(error) if error.needs_daemon_upgrade() => {
+            Some(DeniedBy::DaemonUpgradeRequired)
+        }
+        crate::ServiceError::PlacementUnavailable(_) => Some(DeniedBy::PlacementUnavailable),
+        crate::ServiceError::DaemonUpgradeRequired { .. } => Some(DeniedBy::DaemonUpgradeRequired),
+        crate::ServiceError::WorkspaceResetRequired { .. } => {
+            Some(DeniedBy::WorkspaceResetRequired)
+        }
+        _ => None,
+    };
+    if let Some(cause) = target_refusal {
+        return AgentHostError::StructuredOutcome(Box::new(OrchestrationOutcome::terminal_denial(
+            "unknown",
+            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+            "",
+            cause,
+        )));
+    }
     match &error {
         crate::ServiceError::AuthorizationDenied { message } => {
             return AgentHostError::Authority(message.clone());
         }
-        crate::ServiceError::AgentPaused { agent_id } => {
+        crate::ServiceError::AgentPaused { agent_id }
+        | crate::ServiceError::Db(db::DbError::AgentPaused { agent_id }) => {
             return AgentHostError::AgentPaused {
                 agent_id: agent_id.clone(),
             };
         }
-        crate::ServiceError::ProjectPaused { project_id } => {
+        crate::ServiceError::ProjectPaused { project_id }
+        | crate::ServiceError::Db(db::DbError::ProjectPaused { project_id }) => {
             return AgentHostError::ProjectPaused {
                 project_id: project_id.clone(),
             };
@@ -5194,6 +5443,12 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
         crate::ServiceError::NotFound { .. } | crate::ServiceError::Db(db::DbError::NotFound) => (
             OutcomeCode::NotFound,
             "the requested Forge resource is unavailable",
+            None,
+            None,
+        ),
+        crate::ServiceError::Db(db::DbError::TurnNotRetryable | db::DbError::ChatTurnLive) => (
+            OutcomeCode::ValidationError,
+            "Agent Chat turn cannot be retried in its current state",
             None,
             None,
         ),
@@ -5276,7 +5531,9 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
                 Some(retry),
             )
         }
-        crate::ServiceError::DaemonUnavailable { .. }
+        crate::ServiceError::DaemonNotReady { .. }
+        | crate::ServiceError::PrepareFailed { .. }
+        | crate::ServiceError::DaemonUnavailable { .. }
         | crate::ServiceError::DaemonTimeout { .. }
         | crate::ServiceError::TerminalDaemonUnavailable { .. }
         | crate::ServiceError::TerminalSessionLimit { .. } => (
@@ -6395,10 +6652,10 @@ mod tests {
         let (first, replay) = tokio::join!(
             fixture
                 .provider
-                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+                .ingest_local_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
             fixture
                 .provider
-                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+                .ingest_local_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
         );
         first.expect("first evidence capture succeeds");
         replay.expect("concurrent evidence replay succeeds");
@@ -7177,6 +7434,44 @@ mod tests {
             "missing and inaccessible scopes remain indistinguishable"
         );
         assert!(!values[0].to_string().contains("binding"));
+    }
+
+    #[test]
+    fn daemon_target_refusals_are_specific_tool_results_without_withdrawal() {
+        for (error, cause) in [
+            (
+                crate::ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                    task_id: "target".into(),
+                    repo_id: "repo".into(),
+                    rejected_candidates: vec![],
+                }),
+                DeniedBy::PlacementUnavailable,
+            ),
+            (
+                crate::ServiceError::DaemonUpgradeRequired {
+                    daemon_id: "target".into(),
+                },
+                DeniedBy::DaemonUpgradeRequired,
+            ),
+            (
+                crate::ServiceError::WorkspaceResetRequired {
+                    task_id: "target".into(),
+                    reason: "lost".into(),
+                },
+                DeniedBy::WorkspaceResetRequired,
+            ),
+        ] {
+            let AgentHostError::StructuredOutcome(outcome) = service_error(error) else {
+                panic!("tool result expected")
+            };
+            assert_eq!(outcome.denied_by, Some(cause.clone()));
+            assert!(!cause.withdraws_operation());
+            assert_eq!(
+                outcome.retry.unwrap().scope,
+                Some(api_types::RetryScope::Turn)
+            );
+            assert_eq!(cause.to_string().parse::<DeniedBy>().unwrap(), cause);
+        }
     }
 
     #[test]

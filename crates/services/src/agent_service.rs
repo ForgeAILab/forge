@@ -1,4 +1,4 @@
-use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
+use crate::{agent_capacity::has_execution_capacity, Result, ServiceError, TaskService};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
     AgentStatus, CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, PageRequest,
@@ -14,6 +14,7 @@ pub enum EffectiveStatus {
     Deactivated,
     DaemonOffline,
     DaemonUnavailable,
+    DaemonUpgradeRequired,
     ConnectionDegraded,
     ConnectionUnavailable,
     SourceDisabled,
@@ -29,6 +30,7 @@ impl EffectiveStatus {
             Self::Deactivated => "deactivated",
             Self::DaemonOffline => "daemon_offline",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::DaemonUpgradeRequired => api_types::DAEMON_UPGRADE_REQUIRED,
             Self::ConnectionDegraded => "connection_degraded",
             Self::ConnectionUnavailable => "connection_unavailable",
             Self::SourceDisabled => "source_disabled",
@@ -45,8 +47,12 @@ impl fmt::Display for EffectiveStatus {
     }
 }
 
-#[tracing::instrument(skip(db, agent), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
-pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<EffectiveStatus> {
+#[tracing::instrument(skip(db, agent, connections), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
+pub async fn compute_effective_status(
+    db: &SqliteDb,
+    agent: &Agent,
+    connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
+) -> Result<EffectiveStatus> {
     if agent.status == AgentStatus::Error {
         return Ok(EffectiveStatus::Error);
     }
@@ -75,7 +81,7 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
             Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
             _ => return Ok(EffectiveStatus::ConnectionUnavailable),
         }
-        if !has_running_execution_capacity(db, agent).await? {
+        if !has_execution_capacity(db, agent, None).await? {
             return Ok(EffectiveStatus::Busy);
         }
         return Ok(EffectiveStatus::Active);
@@ -85,6 +91,12 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
             return Ok(EffectiveStatus::DaemonOffline);
         };
+        if connections
+            .and_then(|registry| registry.get(daemon_id))
+            .is_some_and(|connection| connection.needs_upgrade())
+        {
+            return Ok(EffectiveStatus::DaemonUpgradeRequired);
+        }
         if daemon.status == DaemonStatus::Offline {
             return Ok(EffectiveStatus::DaemonOffline);
         }
@@ -111,7 +123,7 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         }
     }
 
-    if !has_running_execution_capacity(db, agent).await? {
+    if !has_execution_capacity(db, agent, None).await? {
         return Ok(EffectiveStatus::Busy);
     }
 
@@ -480,7 +492,7 @@ impl AgentService {
 
         let mut available = Vec::new();
         for agent in page.items {
-            if has_running_execution_capacity(&self.db, &agent).await? {
+            if has_execution_capacity(&self.db, &agent, None).await? {
                 available.push(agent);
             }
         }
@@ -492,11 +504,8 @@ impl AgentService {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
-        let task_service = TaskService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let role_events = task_service
-            .on_agent_deleted_in_tx(&mut transaction, &agent_id)
-            .await?;
+        let role_events = TaskService::on_agent_deleted_in_tx(&mut transaction, &agent_id).await?;
         let now = now_rfc3339();
         let result = sqlx::query(
             "UPDATE agent_identity
@@ -513,7 +522,7 @@ impl AgentService {
             return Err(ServiceError::not_found("agent", agent_id));
         }
         transaction.commit().await?;
-        task_service.publish_role_sweep_events(role_events);
+        TaskService::publish_role_sweep_events(&self.event_bus, role_events);
         self.publish(ForgeEvent {
             event_type: "agent.archived".to_owned(),
             entity_id: agent_id,
@@ -908,7 +917,7 @@ mod tests {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Error);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -922,7 +931,7 @@ mod tests {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Idle);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -941,7 +950,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -960,7 +969,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -980,7 +989,7 @@ mod tests {
         .await;
         seed_active_task(&db, &agent.id).await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1000,7 +1009,7 @@ mod tests {
         .await;
         agent.paused = true;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1019,7 +1028,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1065,7 +1074,7 @@ mod tests {
         .expect("CLI runtime disables");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("disabled status computes"),
             EffectiveStatus::SourceDisabled
@@ -1082,7 +1091,7 @@ mod tests {
         .await
         .expect("CLI runtime reenables");
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("reenabled status computes"),
             EffectiveStatus::Active
@@ -1166,7 +1175,7 @@ mod tests {
         .expect("provider Agent creates");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("provider-disabled status computes"),
             EffectiveStatus::SourceDisabled

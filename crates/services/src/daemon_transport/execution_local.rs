@@ -13,6 +13,40 @@ pub struct EmbeddedExecutionProvider {
 }
 
 impl EmbeddedExecutionProvider {
+    /// Facts for the server's built-in execution paths. Admission checks
+    /// installation, authentication, and policy separately from adapter support.
+    pub(crate) fn adapter_capabilities(
+        executor_type: &str,
+    ) -> api_types::ExecutorAdapterCapabilityFacts {
+        use executors::ExecutorKind;
+        let Ok(kind) = executor_type.parse::<ExecutorKind>() else {
+            return Default::default();
+        };
+        let session_executor = matches!(
+            kind,
+            ExecutorKind::Embedded
+                | ExecutorKind::Codex
+                | ExecutorKind::ClaudeCode
+                | ExecutorKind::Cursor
+                | ExecutorKind::Opencode
+                | ExecutorKind::Gemini
+                | ExecutorKind::Smith
+        );
+        api_types::ExecutorAdapterCapabilityFacts {
+            structured_events: session_executor,
+            usage: matches!(
+                kind,
+                ExecutorKind::Embedded
+                    | ExecutorKind::Codex
+                    | ExecutorKind::ClaudeCode
+                    | ExecutorKind::Smith
+            ),
+            resume: session_executor,
+            cancel_ack: true,
+            terminal_observed: true,
+        }
+    }
+
     pub fn new(
         task_service: Arc<TaskService>,
         task_executor: Arc<dyn executors::TaskExecutor>,

@@ -94,6 +94,16 @@ pub(crate) fn is_dispatch_failed_annotation(raw_annotation: Option<&str>) -> boo
         .is_some_and(|kind| kind == DISPATCH_FAILED_ANNOTATION)
 }
 
+fn preserve_dispatch_annotation(raw_annotation: Option<&str>) -> bool {
+    raw_annotation
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value["type"].as_str().map(str::to_owned))
+        .is_some_and(|kind| {
+            kind != DISPATCH_FAILED_ANNOTATION
+                && crate::task_dispatcher::is_blocking_annotation_type(&kind)
+        })
+}
+
 /// Persist a `dispatch_failed` error annotation on the task, retrying version
 /// conflicts. Shared by the engine's dispatch-failure fallback and the task
 /// dispatcher's governance parking.
@@ -104,11 +114,111 @@ pub(crate) async fn annotate_dispatch_failure(
     message: &str,
     authority: Option<&WorkflowAuthority>,
 ) -> db::Result<()> {
-    let annotation = dispatch_failed_annotation_json(state, message);
+    annotate_dispatch_failure_details(db, task_id, state, message, authority, None).await
+}
+
+pub(crate) async fn annotate_upgrade_dispatch_refusal(
+    db: &db::SqliteDb,
+    task_id: &str,
+    state: &str,
+    error: &crate::ServiceError,
+) -> db::Result<()> {
+    let daemon_ids: Vec<&str> = match error {
+        crate::ServiceError::PlacementUnavailable(refusal) if refusal.needs_daemon_upgrade() => {
+            refusal.upgrade_daemon_ids().collect()
+        }
+        crate::ServiceError::DaemonUpgradeRequired { daemon_id } => vec![daemon_id],
+        _ => return Ok(()),
+    };
+    let details =
+        serde_json::json!({"code": api_types::DAEMON_UPGRADE_REQUIRED, "daemon_ids": daemon_ids});
+    let task = TaskRepo::get_by_id(db, task_id, false)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    let expected_annotation = if preserve_dispatch_annotation(task.error_annotation.as_deref()) {
+        serde_json::from_str::<serde_json::Value>(task.error_annotation.as_deref().unwrap())
+            .expect("blocking annotation JSON")
+    } else {
+        let mut annotation: serde_json::Value =
+            serde_json::from_str(&dispatch_failed_annotation_json(state, &error.to_string()))
+                .expect("annotation JSON");
+        annotation
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+        // The annotation writer creates its own timestamp. Fence the refusal's
+        // content, without comparing separately generated detection times.
+        annotation.as_object_mut().unwrap().remove("detected_at");
+        annotation
+    };
+    let metadata: serde_json::Value = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let mut marker = details.clone();
+    marker["error_annotation"] = expected_annotation;
+    marker["dispatch_disposition"] = metadata["dispatch_disposition"].clone();
+    marker["deferred_dispatch"] = metadata["deferred_dispatch"].clone();
+    TaskRepo::mutate_metadata(
+        db,
+        task_id,
+        Some(task.version),
+        vec![
+            db::TaskMetadataMutation::Set {
+                key: "daemon_upgrade_refusal".into(),
+                value: marker,
+            },
+            db::TaskMetadataMutation::Remove {
+                key: "owner_wait".into(),
+            },
+        ],
+        &now_rfc3339(),
+    )
+    .await?;
+    annotate_dispatch_failure_details(db, task_id, state, &error.to_string(), None, Some(details))
+        .await
+}
+
+async fn annotate_dispatch_failure_details(
+    db: &db::SqliteDb,
+    task_id: &str,
+    state: &str,
+    message: &str,
+    authority: Option<&WorkflowAuthority>,
+    details: Option<serde_json::Value>,
+) -> db::Result<()> {
+    let mut annotation: serde_json::Value =
+        serde_json::from_str(&dispatch_failed_annotation_json(state, message))
+            .expect("annotation JSON");
+    if let Some(details) = &details {
+        annotation
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+    }
+    let annotation = annotation.to_string();
     let mut current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
     for attempt in 0..3 {
+        if let Some(raw) = current.error_annotation.as_deref() {
+            if preserve_dispatch_annotation(Some(raw)) {
+                return Ok(());
+            }
+            // The hook retained typed refusal details before the engine's
+            // string-only fallback. Preserve them for reconnection recovery.
+            if details.is_none()
+                && serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .is_some_and(|value| {
+                        value["message"] == message
+                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED
+                    })
+            {
+                return Ok(());
+            }
+        }
         let update = UpdateTask {
             id: current.id.clone(),
             expected_version: current.version,
@@ -157,11 +267,26 @@ pub(crate) async fn clear_dispatch_failure_annotation(
     task_id: &str,
     authority: Option<&WorkflowAuthority>,
 ) -> db::Result<()> {
+    clear_dispatch_failure_matching(db, task_id, authority, |_| true).await
+}
+
+async fn clear_dispatch_failure_matching(
+    db: &db::SqliteDb,
+    task_id: &str,
+    authority: Option<&WorkflowAuthority>,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> db::Result<()> {
     let mut current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
     for attempt in 0..3 {
         if !is_dispatch_failed_annotation(current.error_annotation.as_deref()) {
+            return Ok(());
+        }
+        let annotation: serde_json::Value =
+            serde_json::from_str(current.error_annotation.as_deref().unwrap())
+                .expect("dispatch annotation JSON");
+        if !matches(&annotation) {
             return Ok(());
         }
         let update = UpdateTask {
@@ -204,6 +329,89 @@ pub(crate) async fn clear_dispatch_failure_annotation(
     Ok(())
 }
 
+pub(crate) async fn wake_upgraded_daemon_tasks(
+    db: &db::SqliteDb,
+    daemon_ids: &[String],
+) -> crate::Result<()> {
+    let task_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM task WHERE deleted_at IS NULL AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.daemon_upgrade_refusal.code') END = ?"
+    ).bind(api_types::DAEMON_UPGRADE_REQUIRED).fetch_all(db.pool()).await?;
+    for task_id in task_ids {
+        let matches = |marker: &serde_json::Value| {
+            marker["code"] == api_types::DAEMON_UPGRADE_REQUIRED
+                && marker["daemon_ids"].as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| daemon_ids.iter().any(|daemon| id == daemon))
+                })
+        };
+        let Some(task) = TaskRepo::get_by_id(db, &task_id, false).await? else {
+            continue;
+        };
+        let Some(metadata) = task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        else {
+            continue;
+        };
+        if !matches(&metadata["daemon_upgrade_refusal"]) {
+            continue;
+        }
+        clear_upgrade_dispatch_refusal(db, &task).await?;
+    }
+    Ok(())
+}
+
+async fn clear_upgrade_dispatch_refusal(db: &db::SqliteDb, task: &db::Task) -> crate::Result<bool> {
+    // Clearing and waking are one CAS. A manual action that changes the row
+    // or metadata after the scan must keep its newly recorded deferral.
+    let metadata: serde_json::Value = task
+        .metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let marker = &metadata["daemon_upgrade_refusal"];
+    let mut annotation = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or_default();
+    if annotation["type"] == DISPATCH_FAILED_ANNOTATION {
+        annotation.as_object_mut().unwrap().remove("detected_at");
+    }
+    if marker["code"] != api_types::DAEMON_UPGRADE_REQUIRED
+        || marker["error_annotation"] != annotation
+        || marker["dispatch_disposition"] != metadata["dispatch_disposition"]
+        || marker["deferred_dispatch"] != metadata["deferred_dispatch"]
+    {
+        return Ok(false);
+    }
+    let clear_annotation = annotation["type"] == DISPATCH_FAILED_ANNOTATION
+        && annotation["code"] == api_types::DAEMON_UPGRADE_REQUIRED;
+    let result = sqlx::query(
+        "UPDATE task SET
+            error_annotation = CASE WHEN ? THEN NULL ELSE error_annotation END,
+            metadata_json = NULLIF(json_remove(metadata_json, '$.daemon_upgrade_refusal', '$.dispatch_disposition', '$.deferred_dispatch'), '{}'),
+            version = version + 1, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL AND version = ?
+            AND metadata_json IS ? AND error_annotation IS ?
+            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?"
+    )
+    .bind(clear_annotation)
+    .bind(now_rfc3339())
+    .bind(&task.id)
+    .bind(task.version)
+    .bind(&task.metadata_json)
+    .bind(&task.error_annotation)
+    .bind(api_types::DAEMON_UPGRADE_REQUIRED)
+    .execute(db.pool()).await?;
+    let changed = result.rows_affected() != 0;
+    if changed {
+        tracing::info!(task_id = %task.id, "task dispatch woken after daemon upgrade");
+    }
+    Ok(changed)
+}
+
 pub struct WorkflowEngine {
     pub db: Arc<db::SqliteDb>,
     pub event_bus: Arc<EventBus>,
@@ -219,6 +427,7 @@ pub struct WorkflowEngine {
     pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
     pub workspace_root: PathBuf,
     pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
 }
 
 pub struct TransitionResult {
@@ -323,15 +532,31 @@ impl WorkflowEngine {
         if action != "run_ci_steps" || actor.is_user() {
             return Ok(None);
         }
+        // A typed owner/preflight refusal was settled atomically by the hook.
+        // It may have occurred before any Review row was created.
+        let interrupted = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|barrier| {
+                barrier["status"] == "blocked"
+                    && barrier["interrupted_at"]
+                        .as_str()
+                        .is_some_and(|at| at >= entry_started_at)
+            });
+        if interrupted {
+            return Ok(Some(ReviewEntryFailure {
+                task: task.clone(),
+                cascade: None,
+            }));
+        }
         let Some(review) = latest_review(&self.db, &task.id).await? else {
             return Ok(None);
         };
-        if review.status != db::ReviewStatus::Failed {
-            return Ok(None);
-        }
-        // A configuration/runner failure before attempt creation must not
-        // route a failed Review left over from an earlier state entry.
-        if review.started_at.as_str() < entry_started_at {
+        // Authority-loss cancellations retain the base routing.
+        if review.status != db::ReviewStatus::Failed
+            || review.started_at.as_str() < entry_started_at
+        {
             return Ok(None);
         }
         let task = self
@@ -670,6 +895,7 @@ impl WorkflowEngine {
             "started_at": started_at.as_str(),
             "retry_started_at": retry_started_at.as_str(),
             "retry_reason": reason,
+            "infrastructure_attempts": barrier.get("infrastructure_attempts").cloned().unwrap_or(serde_json::json!(0)),
         })
         .to_string();
         let mut task = TaskRepo::set_entry_barrier_with_workflow_authority(
@@ -725,6 +951,7 @@ impl WorkflowEngine {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             workspace_id,
             agent_id: latest_execution
                 .as_ref()
@@ -1318,6 +1545,7 @@ impl WorkflowEngine {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
                 workspace_id: workspace_id.clone(),
                 agent_id: latest_execution
                     .as_ref()
@@ -1350,6 +1578,7 @@ impl WorkflowEngine {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
                 workspace_id,
                 agent_id: latest_execution
                     .as_ref()

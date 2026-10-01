@@ -47,6 +47,7 @@ pub struct AppState {
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
     pub daemon_service: Arc<DaemonService>,
+    pub repo_location_service: Arc<services::repo_location::RepoLocationService>,
     pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
     pub workflow_template_service:
         Arc<services::workflow::template_service::WorkflowTemplateService>,
@@ -64,6 +65,7 @@ pub struct AppState {
     pub task_dispatcher: Option<Arc<services::TaskDispatcher>>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
+    pub workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     pub event_bus: Arc<EventBus>,
     pub shutdown_signal: ShutdownSignal,
     pub auth_service: Arc<AuthService>,
@@ -108,7 +110,7 @@ impl AppState {
     ) -> Self {
         let workspace_root = default_workspace_root();
         let workflows_dir = test_workflows_dir();
-        let merge_service = Arc::new(MergeService::new(
+        let merge_service = Arc::new(MergeService::new_for_test(
             Arc::clone(&db),
             Arc::clone(&event_bus),
             workspace_root.clone(),
@@ -187,6 +189,7 @@ impl AppState {
             models_dev_client: Arc::clone(&runtime.models_dev_client),
             agent_usage_cache: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
+            workspace_backend_router: Arc::clone(&runtime.workspace_backend_router),
             agent_service: Arc::clone(&runtime.agent_service),
             embedded_agent_service: Arc::clone(&runtime.embedded_agent_service),
             agent_chat_service: Arc::clone(&runtime.agent_chat_service),
@@ -198,6 +201,13 @@ impl AppState {
             agent_inbox_service: Arc::clone(&runtime.agent_inbox_service),
             agent_action_service: Arc::clone(&runtime.agent_action_service),
             daemon_service: Arc::clone(&runtime.daemon_service),
+            repo_location_service: Arc::new(services::repo_location::RepoLocationService::new(
+                Arc::clone(&runtime.db),
+                Arc::new(services::repo_location::RemoteDaemonLocationVerifier::new(
+                    Arc::clone(&runtime.daemon_connections),
+                    runtime.cleanup_scheduler.workspace_root().to_path_buf(),
+                )),
+            )),
             daemon_connections: Arc::clone(&runtime.daemon_connections),
             workflow_template_service: Arc::clone(&runtime.workflow_template_service),
             memory_service: Arc::clone(&runtime.memory_service),
@@ -261,6 +271,7 @@ impl AppState {
             config.terminal.clone(),
             self.cleanup_scheduler.workspace_root().to_path_buf(),
             terminal_activity,
+            Arc::clone(&self.workspace_backend_router),
         ));
         let terminal_cleanup_handler: Arc<
             dyn services::workspace_cleanup::WorkspaceCleanupObserver,

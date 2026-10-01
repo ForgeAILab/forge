@@ -8,7 +8,7 @@ use crate::{
     PlanArtifactDetail, PlanProgressSummary, RecoveryAction, ResumePolicy, StopReason,
     TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
     UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
-    WorkspaceResponse,
+    WorkspacePlacementResponse, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -106,6 +106,7 @@ pub struct TaskResponse {
     pub review_passed_at: Option<String>,
     pub archived_at: Option<String>,
     pub workspace: Option<WorkspaceResponse>,
+    pub placement: Option<WorkspacePlacementResponse>,
     pub plan_progress: Option<PlanProgressSummary>,
     pub plan_artifact: Option<PlanArtifactDetail>,
     pub external_issue_number: Option<i64>,

@@ -27,6 +27,7 @@ mod product_genesis;
 mod project_hooks;
 mod project_orchestration;
 mod provider_auth;
+mod repo_location;
 mod repo_review;
 mod requests;
 mod review_conformance;
@@ -60,6 +61,7 @@ pub use product_genesis::*;
 pub use project_hooks::*;
 pub use project_orchestration::*;
 pub use provider_auth::*;
+pub use repo_location::*;
 pub use repo_review::*;
 pub use requests::*;
 pub use review_conformance::*;
@@ -71,12 +73,17 @@ pub use workflow::*;
 #[test]
 #[ignore = "manual type export for the web client"]
 fn export_typescript() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    export_typescript_to(crate_dir);
+    export_typescript_to(&crate_dir.join("../../web/src/types/generated"));
+}
+
+#[cfg(test)]
+fn export_typescript_to(out_dir: &std::path::Path) {
     use ts_rs::TS;
 
-    let out_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src/types/generated");
-    std::fs::create_dir_all(&out_dir).expect("create types output directory");
-    std::env::set_current_dir(&out_dir).expect("switch to types output directory");
+    std::fs::create_dir_all(out_dir).expect("create types output directory");
+    std::env::set_current_dir(out_dir).expect("switch to types output directory");
 
     TaskType::export().expect("export TaskType");
     ProductMaturity::export().expect("export ProductMaturity");
@@ -93,6 +100,15 @@ fn export_typescript() {
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");
     RepoResponse::export().expect("export RepoResponse");
     RepoSyncResponse::export().expect("export RepoSyncResponse");
+    RepoLocationOwnerKind::export().expect("export RepoLocationOwnerKind");
+    RepoLocationKind::export().expect("export RepoLocationKind");
+    RepoLocationStatus::export().expect("export RepoLocationStatus");
+    RepoLocationResponse::export().expect("export RepoLocationResponse");
+    CreateRepoLocationRequest::export().expect("export CreateRepoLocationRequest");
+    UpdateRepoLocationRequest::export().expect("export UpdateRepoLocationRequest");
+    VerifyRepoLocationRequest::export().expect("export VerifyRepoLocationRequest");
+    WorkspacePlacementResponse::export().expect("export WorkspacePlacementResponse");
+    WorkspaceResponse::export().expect("export WorkspaceResponse");
     FsEntry::export().expect("export FsEntry");
     FsListResponse::export().expect("export FsListResponse");
     BranchListResponse::export().expect("export BranchListResponse");
@@ -645,3 +661,5 @@ fn export_typescript() {
     CostEstimationRunStatus::export().expect("export CostEstimationRunStatus");
     CostEstimationRun::export().expect("export CostEstimationRun");
 }
+
+pub mod execution_outbox;

@@ -74,6 +74,14 @@ impl DaemonMonitor {
     pub async fn check_once(&self) -> Result<u64> {
         let mut offline_count = 0;
         for daemon in self.list_daemons().await? {
+            if daemon.status == DaemonStatus::Offline {
+                crate::recovery::disconnect_daemon_placements(
+                    &self.db,
+                    &self.event_bus,
+                    &daemon.id,
+                )
+                .await?;
+            }
             if daemon.status != DaemonStatus::Online
                 || !daemon_is_stale(&daemon, self.offline_after)
             {
@@ -82,6 +90,8 @@ impl DaemonMonitor {
 
             let updated_at = now_rfc3339();
             let daemon = DaemonRepo::mark_offline(&*self.db, &daemon.id, &updated_at).await?;
+            crate::recovery::disconnect_daemon_placements(&self.db, &self.event_bus, &daemon.id)
+                .await?;
             self.event_bus.publish(ForgeEvent {
                 event_type: "daemon.offline".to_owned(),
                 entity_id: daemon.id.clone(),

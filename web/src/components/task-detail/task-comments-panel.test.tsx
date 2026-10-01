@@ -29,6 +29,7 @@ const task = {
   effective_coder: null,
   effective_coder_source: null,
   remaining_retries: {},
+  placement: null,
   version: 1,
   created_at: now,
   updated_at: now,

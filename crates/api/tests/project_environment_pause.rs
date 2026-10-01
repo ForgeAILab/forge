@@ -45,6 +45,7 @@ async fn pause_environment(harness: &common::Harness, id: &str) {
         .unwrap();
     let now = now_rfc3339();
     let detail = ProjectEnvironmentPause {
+        workspace_id: None,
         checks: vec!["disk".to_owned()],
         role: Some("coder".to_owned()),
         output: "root free: 7G".to_owned(),
@@ -70,6 +71,9 @@ async fn owner_environment_recheck_reports_all_checks_and_resumes() {
     let harness = common::test_app(root.path(), "environment-recheck-api").await;
     let project = environment_project(&harness, &repo).await;
     pause_environment(&harness, &project.id).await;
+    sqlx::query("UPDATE project SET environment_pause_json = json_set(environment_pause_json, '$.workspace_id', 'deleted-workspace') WHERE id = ?")
+        .bind(&project.id)
+        .execute(harness.state.db.pool()).await.unwrap();
     let visible: ProjectResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -80,6 +84,15 @@ async fn owner_environment_recheck_reports_all_checks_and_resumes() {
     assert_eq!(
         visible.environment_pause.as_ref().unwrap().checks,
         vec!["disk"]
+    );
+    assert_eq!(
+        visible
+            .environment_pause
+            .as_ref()
+            .unwrap()
+            .workspace_id
+            .as_deref(),
+        Some("deleted-workspace")
     );
     let list: PaginatedResponse<ProjectResponse> = common::empty_request(
         &harness.app,

@@ -61,7 +61,7 @@ pub async fn get_execution(
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id))?;
     Ok(Json(
-        execution_response_with_plan(&state.db, execution).await?,
+        execution_response_with_plan(&state.db, &state.workspace_backend_router, execution).await?,
     ))
 }
 
@@ -270,9 +270,14 @@ pub async fn follow_up_execution(
 
     Ok(Json(LaunchExecutionResponse {
         data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
+            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
             execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
+            workspace: workspace_response(
+                &state.db,
+                &state.workspace_backend_router,
+                launched.workspace,
+            )
+            .await?,
             execution_behavior,
         },
     }))
@@ -301,9 +306,14 @@ pub async fn re_execute_execution(
 
     Ok(Json(LaunchExecutionResponse {
         data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
+            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
             execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
+            workspace: workspace_response(
+                &state.db,
+                &state.workspace_backend_router,
+                launched.workspace,
+            )
+            .await?,
             execution_behavior,
         },
     }))

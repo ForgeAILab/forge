@@ -38,6 +38,39 @@ impl WorkspaceRepo for SqliteDb {
             .transpose()
     }
 
+    async fn embedded_path_is_owned_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        path: &str,
+    ) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1")
+                .bind(path)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .is_some(),
+        )
+    }
+
+    async fn task_owns_embedded_path(&self, task_id: &str, path: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM workspace
+             LEFT JOIN workspace_placement AS placement
+               ON placement.workspace_id = workspace.id
+             WHERE workspace.task_id = ?
+               AND workspace.status IN ('creating', 'ready', 'error')
+               AND ((placement.owner_kind = 'server' AND placement.workspace_handle = ?)
+                    OR (placement.id IS NULL AND workspace.worktree_path = ?))
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(path)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some())
+    }
+
     async fn set_cleanup_after(
         &self,
         id: &str,

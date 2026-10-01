@@ -10,14 +10,15 @@ use api_types::{
     RetryPressureSummary, TokenTotalsSummary, UsageSummary, WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
-use db::SqliteDb;
+use db::{SqliteDb, WorkspaceRepo};
 use serde_json::Value;
 use sqlx::Row;
 
 use crate::{
     agent_capacity::daemon_session_cap_from_labels,
-    plan_artifact::{read_plan_artifact, to_plan_progress_summary, PlanArtifactError},
+    plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
     usage_projection::{usage_aggregate_for_operations, usage_aggregate_for_source_state},
+    workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
     ServiceError,
 };
 
@@ -30,16 +31,53 @@ pub struct OperatorStatusService {
     log_snapshots: ExecutionLogSnapshots,
     consumer_stall_seconds: u32,
     expected_event_consumers: RwLock<Vec<&'static str>>,
+    daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
 impl OperatorStatusService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         Self {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
-            expected_event_consumers: RwLock::new(Vec::new()),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
+            expected_event_consumers: RwLock::new(Vec::new()),
+            daemon_connections: None,
+            workspace_backend_router,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>) -> Self {
+        Self::new_for_test(db)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<SqliteDb>) -> Self {
+        Self {
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
+            db,
+            log_snapshots: ExecutionLogSnapshots::default(),
+            consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
+            expected_event_consumers: RwLock::new(Vec::new()),
+            daemon_connections: None,
+        }
+    }
+
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self
+    }
+
+    pub fn with_daemon_connections(
+        mut self,
+        registry: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    ) -> Self {
+        self.daemon_connections = Some(registry);
+        self
     }
 
     pub fn with_consumer_stall_seconds(mut self, seconds: u32) -> Self {
@@ -195,9 +233,7 @@ impl OperatorStatusService {
                 e.role,
                 e.agent_id,
                 a.name AS agent_name,
-                a.daemon_id,
                 e.workspace_id,
-                w.worktree_path,
                 e.agent_session_id,
                 e.created_at AS started_at,
                 e.logs_path,
@@ -205,7 +241,6 @@ impl OperatorStatusService {
              FROM execution e
              JOIN task t ON t.id = e.task_id
              LEFT JOIN agent_current a ON a.id = e.agent_id
-             LEFT JOIN workspace w ON w.id = e.workspace_id
              WHERE e.status = 'running'
              ORDER BY e.created_at ASC, e.id ASC",
         )
@@ -215,14 +250,36 @@ impl OperatorStatusService {
         let mut active_executions = Vec::with_capacity(rows.len());
         for row in rows {
             let started_at: String = row.try_get("started_at")?;
-            let workspace_path: Option<String> = row.try_get("worktree_path")?;
+            let workspace_id: Option<String> = row.try_get("workspace_id")?;
+            let resolved = match workspace_id.as_deref() {
+                Some(id) => match WorkspaceRepo::get_by_id(&*self.db, id).await? {
+                    Some(workspace) => Some(
+                        self.workspace_backend_router
+                            .resolve(&self.db, &workspace)
+                            .await?,
+                    ),
+                    None => None,
+                },
+                None => None,
+            };
+            let workspace_path = resolved
+                .as_ref()
+                .map(|workspace| workspace.handle().map(str::to_owned))
+                .transpose()?;
+            let daemon_id = resolved.as_ref().and_then(|workspace| {
+                workspace
+                    .placement
+                    .execution_daemon_id
+                    .clone()
+                    .or_else(|| workspace.placement.daemon_id.clone())
+            });
             let runtime_seconds = seconds_since(&started_at, now);
             let snapshot_json: Option<String> = row.try_get("executor_config_snapshot_json")?;
             let effective_policy =
                 effective_policy(snapshot_json.as_deref(), workspace_path.as_deref());
             let rate_limit_snapshot = rate_limit_snapshot(snapshot_json.as_deref());
-            let plan_progress = match workspace_path.clone() {
-                Some(workspace_path) => plan_progress(workspace_path).await?,
+            let plan_progress = match resolved.as_ref() {
+                Some(workspace) => plan_progress(workspace).await?,
                 None => None,
             };
             let log_snapshot = self
@@ -243,8 +300,8 @@ impl OperatorStatusService {
                 role: row.try_get("role")?,
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
-                daemon_id: row.try_get("daemon_id")?,
-                workspace_id: row.try_get("workspace_id")?,
+                daemon_id,
+                workspace_id,
                 workspace_path,
                 session_id: row.try_get("agent_session_id")?,
                 started_at,
@@ -299,16 +356,24 @@ impl OperatorStatusService {
         let rows = sqlx::query(
             "SELECT id, hostname, status, last_report_at, updated_at
              FROM daemon
-             WHERE status = 'offline'
-                OR status = 'error'
-                OR (last_report_at IS NOT NULL AND last_report_at < ?)
              ORDER BY updated_at DESC, id ASC",
         )
-        .bind(stale_before.to_rfc3339())
         .fetch_all(self.db.pool())
         .await?;
 
         rows.into_iter()
+            .filter(|row| {
+                let id: String = row.get("id");
+                let status: String = row.get("status");
+                let last: Option<String> = row.get("last_report_at");
+                matches!(status.as_str(), "offline" | "error")
+                    || last.is_some_and(|last| last < stale_before.to_rfc3339())
+                    || self
+                        .daemon_connections
+                        .as_ref()
+                        .and_then(|registry| registry.get(&id))
+                        .is_some_and(|connection| connection.needs_upgrade())
+            })
             .map(|row| {
                 let status: String = row.try_get("status")?;
                 let last_report_at: Option<String> = row.try_get("last_report_at")?;
@@ -317,8 +382,22 @@ impl OperatorStatusService {
                     "offline" => ("offline".to_owned(), OperatorSeverity::Attention),
                     _ => ("stale".to_owned(), OperatorSeverity::Attention),
                 };
+                let id: String = row.try_get("id")?;
+                let issue = if self
+                    .daemon_connections
+                    .as_ref()
+                    .and_then(|registry| registry.get(&id))
+                    .is_some_and(|connection| connection.needs_upgrade())
+                {
+                    format!(
+                        "upgrade_required: {}",
+                        api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+                    )
+                } else {
+                    issue
+                };
                 Ok(DaemonIssueSummary {
-                    daemon_id: row.try_get("id")?,
+                    daemon_id: id,
                     hostname: row.try_get("hostname")?,
                     issue,
                     severity,
@@ -345,8 +424,20 @@ impl OperatorStatusService {
                 (
                     SELECT COUNT(*)
                     FROM execution e
-                    JOIN agent_current a ON a.id = e.agent_id
-                    WHERE a.daemon_id = d.id AND e.status = 'running'
+                    LEFT JOIN workspace_placement placement ON placement.workspace_id = e.workspace_id
+                    LEFT JOIN agent_current a ON a.id = e.agent_id
+                    WHERE CASE WHEN e.workspace_id IS NOT NULL
+                        THEN COALESCE(placement.execution_daemon_id, placement.daemon_id)
+                        ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
+                          THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
+                        END = d.id
+                      AND e.status = 'running'
+                ) + (
+                    SELECT COUNT(*) FROM workspace_placement p
+                    WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = d.id
+                      AND p.state IN ('reserved', 'preparing')
+                      AND NOT EXISTS (SELECT 1 FROM execution e
+                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions,
                 (
                     SELECT COUNT(*)
@@ -397,6 +488,11 @@ impl OperatorStatusService {
                     SELECT COUNT(*)
                     FROM execution e
                     WHERE e.agent_id = a.id AND e.status = 'running'
+                ) + (
+                    SELECT COUNT(*) FROM workspace_placement p
+                    WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
+                      AND NOT EXISTS (SELECT 1 FROM execution e
+                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions
              FROM agent_current a
              ORDER BY a.name ASC, a.id ASC",
@@ -435,7 +531,7 @@ impl OperatorStatusService {
         now: DateTime<Utc>,
     ) -> Result<Vec<WorkspaceCleanupSummary>, ServiceError> {
         let rows = sqlx::query(
-            "SELECT id, task_id, worktree_path, cleanup_after
+            "SELECT id, task_id, cleanup_after
              FROM workspace
              WHERE status IN ('ready', 'cleaning')
                AND cleanup_after IS NOT NULL
@@ -446,16 +542,24 @@ impl OperatorStatusService {
         .fetch_all(self.db.pool())
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(WorkspaceCleanupSummary {
-                    workspace_id: row.try_get("id")?,
-                    task_id: row.try_get("task_id")?,
-                    worktree_path: row.try_get("worktree_path")?,
-                    cleanup_after: row.try_get("cleanup_after")?,
-                })
-            })
-            .collect()
+        let mut backlog = Vec::with_capacity(rows.len());
+        for row in rows {
+            let workspace_id: String = row.try_get("id")?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.clone()))?;
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, &workspace)
+                .await?;
+            backlog.push(WorkspaceCleanupSummary {
+                workspace_id,
+                task_id: row.try_get("task_id")?,
+                worktree_path: Some(resolved.handle()?.to_owned()),
+                cleanup_after: row.try_get("cleanup_after")?,
+            });
+        }
+        Ok(backlog)
     }
 
     async fn retry_pressure(&self) -> Result<Vec<RetryPressureSummary>, ServiceError> {
@@ -716,21 +820,11 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
 }
 
 async fn plan_progress(
-    workspace_path: String,
+    workspace: &ResolvedWorkspace,
 ) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    tokio::task::spawn_blocking(move || plan_progress_blocking(&workspace_path))
-        .await
-        .map_err(|error| ServiceError::InvalidOperation {
-            message: format!("plan progress worker failed: {error}"),
-        })?
-}
-
-fn plan_progress_blocking(
-    workspace_path: &str,
-) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    match read_plan_artifact(std::path::Path::new(workspace_path), None) {
-        Ok(artifact) => Ok(Some(to_plan_progress_summary(&artifact))),
-        Err(PlanArtifactError::NotFound) => Ok(None),
+    match read_plan_for_resolved_workspace(workspace).await {
+        Ok(Some((progress, _))) => Ok(Some(progress)),
+        Ok(None) | Err(PlanArtifactError::NotFound) => Ok(None),
         Err(error) => Ok(Some(PlanProgressSummary {
             total: 0,
             completed: 0,
@@ -1008,6 +1102,56 @@ mod tests {
         assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
         assert_eq!(status.blocked_tasks.len(), 1);
         assert_eq!(status.blocked_tasks[0].task_id, task_id);
+    }
+
+    #[tokio::test]
+    async fn revision_two_daemon_waits_for_upgrade_and_operator_sees_action() {
+        let (db, service) = test_service().await;
+        let daemon_id = insert_daemon(&db, "online").await;
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, mut outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.clone());
+        let id = connection.id();
+        registry.register(daemon_id.clone(), connection);
+        registry.dispatch_incoming_for_connection(&daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: serde_json::json!({"protocol_revision":2, "capabilities":["execution.terminal.usage_reports", "execution.terminal.ack"]}),
+        });
+        let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+            panic!("upgrade error expected")
+        };
+        assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert_eq!(error.message, api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE);
+        let result: Result<Value, ServiceError> = registry
+            .send_request(
+                &daemon_id,
+                api_types::METHOD_EXECUTION_START,
+                serde_json::json!({}),
+                1,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::DaemonUpgradeRequired { .. })
+        ));
+        assert!(outbound.try_recv().is_err());
+        let service = service.with_daemon_connections(registry);
+        service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('upgrade-lag', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|issue| issue.entity_type == "event_consumer"));
+        assert!(status.database.incremental_vacuum);
+        let issue = status
+            .daemon_issues
+            .iter()
+            .find(|issue| issue.daemon_id == daemon_id)
+            .unwrap();
+        assert_eq!(issue.issue, format!("upgrade_required: {}", error.message));
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
     }
 
     #[tokio::test]

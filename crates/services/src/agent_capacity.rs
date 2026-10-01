@@ -1,4 +1,4 @@
-use db::{Agent, DaemonRepo};
+use db::{Agent, WorkspacePlacementRepo};
 use serde_json::Value;
 
 use crate::Result;
@@ -16,56 +16,60 @@ pub(crate) async fn count_running_executions(db: &db::SqliteDb, agent_id: &str) 
     .await?)
 }
 
-pub(crate) async fn has_running_execution_capacity(
+pub(crate) async fn count_occupied_agent_slots(db: &db::SqliteDb, agent_id: &str) -> Result<i64> {
+    let mut transaction = db.pool().begin().await?;
+    Ok(
+        crate::placement::capacity::count_agent_capacity(&mut transaction, agent_id)
+            .await?
+            .occupied_slots(),
+    )
+}
+
+pub(crate) async fn has_execution_capacity(
     db: &db::SqliteDb,
     agent: &Agent,
+    workspace_id: Option<&str>,
 ) -> Result<bool> {
-    let running_count = count_running_executions(db, &agent.id).await?;
-    if running_count >= agent.max_concurrent_tasks {
+    let mut transaction = db.pool().begin().await?;
+    if !crate::placement::capacity::count_agent_capacity(&mut transaction, &agent.id)
+        .await?
+        .has_capacity(agent.max_concurrent_tasks)
+    {
         return Ok(false);
     }
-
-    let Some(daemon_id) = agent.daemon_id.as_deref() else {
+    let placement = match workspace_id {
+        Some(id) => {
+            WorkspacePlacementRepo::get_by_workspace_id_in_tx(db, &mut transaction, id).await?
+        }
+        None => None,
+    };
+    let daemon_id = if workspace_id.is_some() {
+        placement.as_ref().and_then(|placement| {
+            placement
+                .execution_daemon_id
+                .as_deref()
+                .or(placement.daemon_id.as_deref())
+        })
+    } else {
+        agent.daemon_id.as_deref()
+    };
+    let Some(daemon_id) = daemon_id else {
         return Ok(true);
     };
-    let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
-        return Ok(true);
-    };
-    let Some(max_sessions) = daemon_session_cap_from_labels(&daemon.labels_json) else {
-        return Ok(true);
-    };
-    let running_count = count_running_executions_for_daemon(db, daemon_id).await?;
-    let chat_count = count_active_chat_turns_for_daemon(db, daemon_id).await?;
-    Ok(running_count.saturating_add(chat_count) < max_sessions)
-}
-
-pub(crate) async fn count_running_executions_for_daemon(
-    db: &db::SqliteDb,
-    daemon_id: &str,
-) -> Result<i64> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)
-         FROM execution
-         JOIN agent_current AS agent ON agent.id = execution.agent_id
-         WHERE agent.daemon_id = ? AND execution.status = 'running'",
+    let labels = sqlx::query_scalar::<_, String>("SELECT labels_json FROM daemon WHERE id = ?")
+        .bind(daemon_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let max_sessions = labels.as_deref().and_then(daemon_session_cap_from_labels);
+    Ok(
+        crate::placement::capacity::count_daemon_capacity(
+            &mut transaction,
+            daemon_id,
+            max_sessions,
+        )
+        .await?
+        .has_capacity(),
     )
-    .bind(daemon_id)
-    .fetch_one(db.pool())
-    .await?)
-}
-
-async fn count_active_chat_turns_for_daemon(db: &db::SqliteDb, daemon_id: &str) -> Result<i64> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)
-         FROM agent_chat_turn_job
-         JOIN agent_current AS agent
-           ON agent.id = agent_chat_turn_job.responder_identity_id
-         WHERE agent.daemon_id = ?
-           AND agent_chat_turn_job.status IN ('leased', 'running')",
-    )
-    .bind(daemon_id)
-    .fetch_one(db.pool())
-    .await?)
 }
 
 pub(crate) fn daemon_session_cap_from_labels(labels_json: &str) -> Option<i64> {

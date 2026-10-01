@@ -5121,3 +5121,56 @@ async fn timestamp_migration_merged_after_a_newer_one_still_runs() {
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn daemon_migrations_arriving_after_integration_preserve_existing_workspaces() {
+    let dir = unique_temp_path("daemon-late-migrations");
+    fs::create_dir_all(&dir).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if matches!(
+            migration_version(filename),
+            Some(202_610_010_400 | 202_610_010_530)
+        ) {
+            continue;
+        }
+        fs::copy(&path, dir.join(filename)).unwrap();
+    }
+    let (pool, db_path) = migration_test_pool("daemon-late-db").await;
+    run_migrations_from(&pool, &dir).await.unwrap();
+    sqlx::raw_sql("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('late-project', 'keep', '{}', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO repo (id, project_id, name, local_path, work_mode, default_branch, created_at, updated_at) VALUES ('late-repo', 'late-project', 'repo', '/existing/checkout', 'direct_merge', 'main', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('late-task', 'late-project', 'keep task', 'task', 'in_progress', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES ('late-workspace', 'late-task', 'late-repo', '/existing/worktree', 'task/keep', 'ready', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');")
+        .execute(&pool).await.unwrap();
+    for filename in [
+        "V202610010400__daemon_owned_workspaces.sql",
+        "V202610010530__workspace_expected_head.sql",
+    ] {
+        fs::copy(source.join(filename), dir.join(filename)).unwrap();
+    }
+    run_migrations_from(&pool, &dir).await.unwrap();
+    let preserved: (String, String, String) = sqlx::query_as("SELECT t.title, p.workspace_handle, l.path FROM task t JOIN workspace_placement p ON p.task_id = t.id JOIN repo_location l ON l.id = p.repo_location_id WHERE t.id = 'late-task'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        preserved,
+        (
+            "keep task".into(),
+            "/existing/worktree".into(),
+            "/existing/checkout".into()
+        )
+    );
+    assert!(table_exists(&pool, "workspace_expected_head").await);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version IN (202610010400,202610010410,202610010500,202610010530,202610010550,202610010600)").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 6);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(dir);
+}

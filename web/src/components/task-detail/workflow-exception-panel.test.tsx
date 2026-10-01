@@ -55,6 +55,7 @@ const task = {
   effective_coder: null,
   effective_coder_source: null,
   remaining_retries: {},
+  placement: null,
   workflow_exception: {
     type: 'review_blocked',
     message: 'The reviewer could not access the provider.',

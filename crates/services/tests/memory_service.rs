@@ -276,7 +276,7 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
         .await
         .expect("memory table drops");
 
-    let service = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     service
         .approve_review(task_id.clone())
         .await

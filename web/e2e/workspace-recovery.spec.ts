@@ -1,4 +1,5 @@
 import { expect, test, type Page } from './fixtures'
+import { serverPlacement } from '../src/test-utils/placement'
 
 const MOCK_PROJECT_ID = 'proj-test-ws'
 const MOCK_TASK_ID = 'task-test-ws'
@@ -16,6 +17,7 @@ function mockTask(overrides: Record<string, unknown> = {}) {
     parent_task_id: null,
     role_assignments: [],
     remaining_retries: {},
+    placement: null,
     error_annotation: null,
     task_state_config: null,
     review_passed_at: null,
@@ -197,6 +199,11 @@ test.describe('workspace recovery banner (mocked)', () => {
           id: 'ws-new',
           task_id: MOCK_TASK_ID,
           worktree_path: '/tmp/worktrees/new',
+          placement: serverPlacement({
+            workspace_id: 'ws-new',
+            task_id: MOCK_TASK_ID,
+            workspace_handle: '/tmp/worktrees/new',
+          }),
           branch: 'main',
           status: 'ready',
         },

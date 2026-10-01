@@ -6067,6 +6067,26 @@ mod tests {
     }
 
     #[test]
+    fn daemon_tool_refusals_do_not_classify_chat_turns_as_configuration_failures() {
+        for error in [
+            ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                task_id: "task".into(),
+                repo_id: "repo".into(),
+                rejected_candidates: vec![],
+            }),
+            ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+            ServiceError::WorkspaceResetRequired {
+                task_id: "task".into(),
+                reason: "lost".into(),
+            },
+        ] {
+            assert_eq!(TurnRunError::from(error).failure, TurnFailure::Unclassified);
+        }
+    }
+
+    #[test]
     fn load_turn_errors_preserve_typed_authority_and_configuration() {
         for error in [
             ServiceError::AgentPaused {

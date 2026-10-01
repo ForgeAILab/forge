@@ -221,6 +221,7 @@ impl TaskExecutor for PendingExecutor {
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
     let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     WorkflowEngine {
+        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
         db,
         event_bus,
         review_runner: None,
@@ -1307,7 +1308,7 @@ async fn entry_barrier_stays_running_through_inline_role_dispatch() {
         &*db,
         UpsertDaemon {
             id: daemon_id.to_owned(),
-            machine_id: "machine-entry-barrier-inline-dispatch".to_owned(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -1432,6 +1433,7 @@ async fn entry_barrier_stays_running_through_inline_role_dispatch() {
         .clone()
         .with_task_executor(Arc::new(PendingExecutor))
         .with_workspace_root(workspace_root.clone());
+    eng.workspace_backend_router = eng.task_service.workspace_backend_router();
     eng.workspace_root = workspace_root;
     let result = eng
         .transition(
@@ -2279,12 +2281,19 @@ async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixtur
         &task,
         &task.id,
         None,
+        &crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            workspace_root.path().to_path_buf(),
+            None,
+        ),
     )
     .await
     .unwrap();
-    let sha = git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
-        .await
-        .unwrap();
+    let sha = git::get_current_sha(std::path::Path::new(
+        &workspace.embedded_worktree_path_for_backend(),
+    ))
+    .await
+    .unwrap();
     let now = now_rfc3339();
     db::ExecutionRepo::create(
         &*db,
@@ -2353,7 +2362,7 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             .execute(fixture.db.pool())
             .await
             .unwrap();
-        std::fs::remove_dir_all(&fixture.workspace.worktree_path).unwrap();
+        std::fs::remove_dir_all(fixture.workspace.embedded_worktree_path_for_backend()).unwrap();
         let result = fixture
             .engine
             .transition_with_authority(
@@ -2396,7 +2405,9 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
             1
         );
-        assert!(std::path::Path::new(&fixture.workspace.worktree_path).exists());
+        assert!(
+            std::path::Path::new(&fixture.workspace.embedded_worktree_path_for_backend()).exists()
+        );
     }
 }
 
@@ -3560,4 +3571,745 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
             "subtask merge override must fail via ServiceError, not panic: {error:?}"
         ),
     }
+}
+
+#[tokio::test]
+async fn system_review_ci_placement_error_retries_without_review_rejection() {
+    use crate::workspace_backend as ws;
+    struct UnreachableOnce(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for UnreachableOnce {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            unreachable!()
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(ws::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "review-owner".into(),
+                })
+            } else {
+                Ok(ws::RunResult {
+                    exit_code: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    duration_ms: 1,
+                })
+            }
+        }
+        async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
+            unreachable!()
+        }
+        async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn merge(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::MergeSpec,
+        ) -> ws::Result<ws::MergeOutcome> {
+            unreachable!()
+        }
+        async fn reset(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::ResetSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn cleanup(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::CleanupAck> {
+            unreachable!()
+        }
+        async fn harvest_outbox(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &str,
+        ) -> ws::Result<ws::OutboxHarvest> {
+            unreachable!()
+        }
+        async fn consume_outbox(&self, _: &db::WorkspacePlacement, _: &str) -> ws::Result<()> {
+            unreachable!()
+        }
+    }
+    // Budget 1 would immediately block if this outage were a CI rejection.
+    let mut fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    fixture
+        .workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&fixture.workflow).unwrap())
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture.engine.workspace_backend_router = Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(
+        UnreachableOnce(std::sync::atomic::AtomicBool::new(true)),
+    )));
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "worker completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "review");
+    assert!(result.review.is_none());
+    let annotation: serde_json::Value =
+        serde_json::from_str(result.task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
+    assert!(annotation["message"]
+        .as_str()
+        .unwrap()
+        .contains("owner_unreachable"));
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        0
+    );
+    let retried = fixture
+        .engine
+        .retry_entry_barrier_with_authority(
+            &fixture.task.id,
+            result.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "owner reconnected",
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    assert!(retried.task.error_annotation.is_none());
+    assert!(retried.task.entry_barrier_json.is_none());
+    assert_eq!(
+        retried.review.unwrap().status,
+        db::ReviewStatus::AwaitingHuman
+    );
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_attempts() {
+    use crate::workspace_backend as ws;
+    struct ReviewCiFault {
+        db: Arc<db::SqliteDb>,
+        task_id: String,
+        authority_loss: bool,
+    }
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for ReviewCiFault {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            unreachable!()
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            if self.authority_loss {
+                sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+                    .bind(&self.task_id)
+                    .execute(self.db.pool())
+                    .await
+                    .unwrap();
+                Ok(ws::RunResult {
+                    exit_code: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    duration_ms: 1,
+                })
+            } else {
+                sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.concurrent_ci_note', 'retained') WHERE id = ?")
+                    .bind(&self.task_id).execute(self.db.pool()).await.unwrap();
+                Err(ws::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "review-owner".into(),
+                })
+            }
+        }
+
+        async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
+            unreachable!()
+        }
+        async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn merge(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::MergeSpec,
+        ) -> ws::Result<ws::MergeOutcome> {
+            unreachable!()
+        }
+        async fn reset(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::ResetSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn cleanup(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::CleanupAck> {
+            unreachable!()
+        }
+        async fn harvest_outbox(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &str,
+        ) -> ws::Result<ws::OutboxHarvest> {
+            unreachable!()
+        }
+        async fn consume_outbox(&self, _: &db::WorkspacePlacement, _: &str) -> ws::Result<()> {
+            unreachable!()
+        }
+    }
+
+    let mut fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    fixture.engine.workspace_backend_router =
+        Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(ReviewCiFault {
+            db: fixture.db.clone(),
+            task_id: fixture.task.id.clone(),
+            authority_loss: false,
+        })));
+    let mut result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "worker completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let placement = db::WorkspacePlacementRepo::get_for_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE workspace_placement SET state = 'disconnected' WHERE id = ?")
+        .bind(&placement.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        result = fixture
+            .engine
+            .retry_entry_barrier_with_authority(
+                &fixture.task.id,
+                result.task.version,
+                &fixture.workflow,
+                &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+                "same owner remains offline",
+                fixture.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.task.blocked_json.is_none(),
+            "an owner outage waits for max_disconnect"
+        );
+        let barrier: serde_json::Value =
+            serde_json::from_str(result.task.entry_barrier_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            barrier["infrastructure_attempts"], 1,
+            "disconnected attempts do not spend the infrastructure cap"
+        );
+    }
+    sqlx::query("UPDATE workspace_placement SET state = 'ready' WHERE id = ?")
+        .bind(&placement.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    for attempt in 1..=5 {
+        let barrier: serde_json::Value =
+            serde_json::from_str(result.task.entry_barrier_json.as_deref().unwrap()).unwrap();
+        assert_eq!(barrier["infrastructure_attempts"], attempt);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM review WHERE task_id = ?")
+            .bind(&fixture.task.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "an unreachable owner never ran CI");
+        if attempt == 5 {
+            break;
+        }
+        let deferred = crate::deferred_dispatch::pending_until(&result.task).unwrap();
+        let delay = chrono::DateTime::parse_from_rfc3339(&deferred.not_before)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            - chrono::Utc::now();
+        assert!(delay.num_milliseconds() > (5 * (1_i64 << (attempt - 1)) - 1) * 1000);
+        result = fixture
+            .engine
+            .retry_entry_barrier_with_authority(
+                &fixture.task.id,
+                result.task.version,
+                &fixture.workflow,
+                &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+                "retry owner",
+                fixture.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+    }
+    let annotation: serde_json::Value =
+        serde_json::from_str(result.task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        annotation["blocking_reason"],
+        "review_ci_infrastructure_exhausted"
+    );
+    let blocked: api_types::InterruptionMetadata =
+        serde_json::from_str(result.task.blocked_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        blocked.kind,
+        Some(api_types::FailureKind::BeforeWorkHookFailed)
+    );
+    assert!(!blocked.reason.is_empty());
+    assert!(!blocked.created_at.is_empty());
+    assert!(crate::deferred_dispatch::pending_until(&result.task).is_none());
+    let metadata: serde_json::Value =
+        serde_json::from_str(result.task.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["concurrent_ci_note"], "retained");
+    let feed = crate::AttentionService::new(fixture.db.clone())
+        .mission_control_home("test-user", None, 50)
+        .await
+        .unwrap();
+    let item = feed
+        .needs_attention
+        .iter()
+        .find(|item| item.dedupe_key == format!("review-ci:{}", fixture.task.id))
+        .expect("review CI park is visible in Mission Control");
+    assert_eq!(item.category, api_types::AttentionCategory::ExecutionFailed);
+    assert!(item.details["cause"]
+        .as_str()
+        .unwrap()
+        .contains("review_ci_infrastructure_exhausted"));
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
+    use crate::workspace_backend as ws;
+    struct ReviewCiFault {
+        db: Arc<db::SqliteDb>,
+        task_id: String,
+        authority_loss: bool,
+    }
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for ReviewCiFault {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            unreachable!()
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            if self.authority_loss {
+                sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+                    .bind(&self.task_id)
+                    .execute(self.db.pool())
+                    .await
+                    .unwrap();
+                Ok(ws::RunResult {
+                    exit_code: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    duration_ms: 1,
+                })
+            } else {
+                Err(ws::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "review-owner".into(),
+                })
+            }
+        }
+
+        async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
+            unreachable!()
+        }
+        async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn merge(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::MergeSpec,
+        ) -> ws::Result<ws::MergeOutcome> {
+            unreachable!()
+        }
+        async fn reset(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::ResetSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn cleanup(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::CleanupAck> {
+            unreachable!()
+        }
+        async fn harvest_outbox(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &str,
+        ) -> ws::Result<ws::OutboxHarvest> {
+            unreachable!()
+        }
+        async fn consume_outbox(&self, _: &db::WorkspacePlacement, _: &str) -> ws::Result<()> {
+            unreachable!()
+        }
+    }
+
+    let mut fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    fixture.engine.workspace_backend_router =
+        Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(ReviewCiFault {
+            db: fixture.db.clone(),
+            task_id: fixture.task.id.clone(),
+            authority_loss: true,
+        })));
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "worker completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await;
+    let result = result.unwrap();
+    assert_eq!(result.task.status, "in_progress");
+    assert!(result.task.entry_barrier_json.is_none());
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!task
+        .error_annotation
+        .as_deref()
+        .is_some_and(|raw| raw.contains("review_ci_")));
+    assert!(crate::deferred_dispatch::pending_until(&task).is_none());
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1",
+    )
+    .bind(&fixture.task.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "cancelled");
+}
+
+#[tokio::test]
+async fn dispatch_failure_preserves_other_annotations_and_wakes_only_its_upgrade_owner() {
+    let db = sqlite_db().await;
+    for kind in [
+        "manual_stop",
+        "workspace_error",
+        "agent_timeout",
+        "recovery_required",
+        "workspace_reset_required",
+        "max_turns_exceeded",
+        "before_work_hook_failed",
+        "before_work_hook_timeout",
+    ] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        let original = json!({"type":kind,"message":"keep"}).to_string();
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        super::annotate_dispatch_failure(&db, &task_id, "in_progress", "upgrade", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            TaskRepo::get_by_id(&db, &task_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .error_annotation
+                .as_deref(),
+            Some(original.as_str())
+        );
+    }
+    let task_id = new_uuid_v4();
+    seed_project_repo_and_task(&db, &task_id, "todo").await;
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(
+            json!({"owner_wait":{"daemon_id":"owner","started_at":"1970-01-01T00:00:00Z"}})
+                .to_string(),
+        )
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let error = ServiceError::DaemonUpgradeRequired {
+        daemon_id: "owner".into(),
+    };
+    super::annotate_upgrade_dispatch_refusal(&db, &task_id, "in_progress", &error)
+        .await
+        .unwrap();
+    super::annotate_dispatch_failure(&db, &task_id, "in_progress", &error.to_string(), None)
+        .await
+        .unwrap();
+    let observed = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(observed.metadata_json.as_deref().unwrap()).unwrap();
+    assert!(metadata.get("owner_wait").is_none());
+    super::wake_upgraded_daemon_tasks(&db, &["other-owner".into()])
+        .await
+        .unwrap();
+    assert!(TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .error_annotation
+        .is_some());
+    super::wake_upgraded_daemon_tasks(&db, &["owner".into()])
+        .await
+        .unwrap();
+    assert!(TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .error_annotation
+        .is_none());
+}
+
+#[tokio::test]
+async fn dispatch_failure_overwrites_nonblocking_and_malformed_annotations() {
+    let db = sqlite_db().await;
+    for original in [
+        r#"{"type":"old_notice"}"#,
+        r#"{"message":"old"}"#,
+        "{broken",
+    ] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        super::annotate_dispatch_failure(&db, &task_id, "in_progress", "new failure", None)
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: serde_json::Value =
+            serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["type"], "dispatch_failed");
+        assert_eq!(annotation["message"], "new failure");
+    }
+}
+
+#[tokio::test]
+async fn dispatch_failure_upgrade_metadata_wakes_with_blocking_annotation_and_skips_deleted_tasks()
+{
+    let db = sqlite_db().await;
+    for deleted in [false, true] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        let original = json!({"type":"manual_stop","message":"keep"}).to_string();
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::deferred_dispatch::record_dispatch_disposition(&db, &task, "coder", "upgrade")
+            .await
+            .unwrap();
+        super::annotate_upgrade_dispatch_refusal(
+            &db,
+            &task_id,
+            "in_progress",
+            &ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+        )
+        .await
+        .unwrap();
+        if deleted {
+            sqlx::query("UPDATE task SET deleted_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(&task_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        super::wake_upgraded_daemon_tasks(&db, &["owner".into(), "other-owner".into()])
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.error_annotation.as_deref(), Some(original.as_str()));
+        let metadata: serde_json::Value = task
+            .metadata_json
+            .as_deref()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .unwrap_or(json!({}));
+        assert_eq!(metadata.get("daemon_upgrade_refusal").is_some(), deleted);
+        assert_eq!(metadata.get("dispatch_disposition").is_some(), deleted);
+    }
+}
+
+#[tokio::test]
+async fn dispatch_failure_upgrade_wake_preserves_a_concurrent_manual_deferral() {
+    let db = sqlite_db().await;
+    let task_id = new_uuid_v4();
+    seed_project_repo_and_task(&db, &task_id, "todo").await;
+    super::annotate_upgrade_dispatch_refusal(
+        &db,
+        &task_id,
+        "in_progress",
+        &ServiceError::DaemonUpgradeRequired {
+            daemon_id: "owner".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let observed = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    // Metadata writes need not bump Task.version. The wake fences those too.
+    crate::deferred_dispatch::set(
+        &db,
+        &observed,
+        "in_progress",
+        "2099-01-01T00:00:00Z",
+        "manual action",
+    )
+    .await
+    .unwrap();
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &observed)
+        .await
+        .unwrap());
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::deferred_dispatch::pending_until(&current)
+            .unwrap()
+            .reason,
+        "manual action"
+    );
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    super::wake_upgraded_daemon_tasks(&db, &["owner".into()])
+        .await
+        .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(crate::deferred_dispatch::pending_until(&current).is_some());
+    crate::deferred_dispatch::clear(&db, &current)
+        .await
+        .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    let cleared = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    crate::deferred_dispatch::set(
+        &db,
+        &cleared,
+        "in_progress",
+        "2099-01-01T00:00:00Z",
+        "new manual action",
+    )
+    .await
+    .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    assert!(crate::deferred_dispatch::pending_until(
+        &TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+    )
+    .is_some());
 }

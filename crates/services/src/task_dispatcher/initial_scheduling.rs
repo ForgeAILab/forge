@@ -86,6 +86,13 @@ impl TaskDispatcher {
                     &error.to_string(),
                 )
                 .await?;
+                crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                    &self.db,
+                    &task.id,
+                    &task.status,
+                    &error,
+                )
+                .await?;
                 tracing::warn!(
                     task_id = %task.id,
                     %error,
@@ -144,155 +151,169 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
-            if deferred_dispatch::queued_recovery(&task).is_some() {
-                continue;
-            }
-            if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
-                continue;
-            }
-            if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
-                // The Project Agent coordinates this root through its child
-                // records. Only children receive implementation dispatches.
-                let sequence_complete = crate::task_hierarchy::coordination_root_sequence_complete(
-                    &self.db, &task, workflow,
-                )
-                .await?;
-                let needs_recovery_advance = sequence_complete
-                    && workflow.canonical_phase_for_state(&task.status)
-                        != api_types::CanonicalPhase::Review
-                    && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
-                if crate::task_service::coordination_review_pending(&task) || needs_recovery_advance
-                {
-                    dispatched += self.advance_coordination_root_once(&task).await?;
+            let task_id = task.id.clone();
+            let result: Result<()> = async {
+                if deferred_dispatch::queued_recovery(&task).is_some() {
+                    return Ok(());
                 }
-                continue;
-            }
-            let task_workflow = WorkflowEngine::resolve_workflow_for_task(
-                &task,
-                &project.workflow_definition,
-                &Actor::system(SystemComponent::TaskDispatcher),
-            );
-            if task_workflow.state_kind(&task.status) != Some(StateKind::Initial) {
-                continue;
-            }
-            if helpers::has_blocking_annotation(&task) {
-                continue;
-            }
-            // Creation gives a Task the Project's default assignees, so a Task
-            // with neither stored assignments nor an inherited root coder was
-            // proposed before those defaults existed in Project settings
-            // (e.g. while the Project was still paused for having no
-            // repository). Apply them now rather than skipping the Task on
-            // every scan with nothing in the log. An inherited coder must not
-            // be materialized as a child assignment here.
-            if TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
-                .await?
-                .is_empty()
-                && crate::task_hierarchy::effective_coder_assignment(&self.db, &task)
-                    .await?
-                    .is_none()
-            {
-                if let Err(error) = self.task_service.assign_project_default_roles(&task).await {
-                    tracing::warn!(task_id = %task.id, %error, "Task has no role assignments and the Project defaults could not be applied");
+                if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
+                    return Ok(());
                 }
-            }
-            let Some(target) = self
-                .resolve_initial_schedule_target(&task_workflow, &task)
-                .await?
-            else {
-                continue;
-            };
-            if deferred_dispatch::dispatch_disposition_is_current(&task, &target.role) {
-                // An unchanged deterministic blocker was already observed for
-                // this exact Task version and capability. Skip the attempt —
-                // and its warning — entirely rather than re-deriving and
-                // re-logging the identical denial every scan (F11). Nothing
-                // schedules this Task again until its version changes or an
-                // explicit `wake_task_dispatch` clears the disposition.
-                continue;
-            }
-            // Only an actual admission candidate needs the capacity query.
-            // Blocked Tasks, coordination containers, and empty queues skip it.
-            if project_slots.is_none() {
-                project_slots = Some(super::slots::load_project_slots(&self.db, project).await?);
-            }
-            let slots = project_slots.as_mut().expect("admission slot projection");
-            let waiting_message = if slots.limit == 0 {
-                None
-            } else if slots.active >= slots.limit {
-                Some(format!(
-                    "project_at_capacity: waiting for a slot ({}/{} active)",
-                    slots.active, slots.limit
-                ))
-            } else if slots.parked >= 2 * slots.limit {
-                Some(format!(
-                    "project_waiting_on_owner: {} parked tasks waiting on the owner",
-                    slots.parked
-                ))
-            } else {
-                None
-            };
-            if let Some(message) = waiting_message {
-                // Capacity can change without changing this Task's version.
-                // Keep it outside the sticky role capability and re-check on
-                // every tick, writing only when the reason actually changes.
-                if deferred_dispatch::record_dispatch_disposition(
-                    &self.db,
-                    &task,
-                    "project_capacity",
-                    &message,
-                )
-                .await?
-                {
-                    self.publish_capacity_disposition_change(&task);
-                }
-                continue;
-            }
-            match self.dispatch_initial_task(&task, &target).await {
-                Ok(true) => {
-                    self.clear_dispatch_disposition(&task).await?;
-                    slots.active += 1;
-                    dispatched += 1;
-                }
-                Ok(false) => {}
-                Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        to_state = %target.transition_to,
-                        target_role = %target.role,
-                        "task dispatcher initial transition lost version race"
-                    );
-                }
-                Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
-                    deferred_dispatch::record_dispatch_disposition(
-                        &self.db,
-                        &task,
-                        &target.role,
-                        &error.to_string(),
+                if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
+                    // The Project Agent coordinates this root through its child
+                    // records. Only children receive implementation dispatches.
+                    let sequence_complete = crate::task_hierarchy::coordination_root_sequence_complete(
+                        &self.db, &task, workflow,
                     )
                     .await?;
-                    tracing::warn!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        to_state = %target.transition_to,
-                        target_role = %target.role,
-                        %error,
-                        "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
-                    );
+                    let needs_recovery_advance = sequence_complete
+                        && workflow.canonical_phase_for_state(&task.status)
+                            != api_types::CanonicalPhase::Review
+                        && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
+                    if crate::task_service::coordination_review_pending(&task) || needs_recovery_advance
+                    {
+                        dispatched += self.advance_coordination_root_once(&task).await?;
+                    }
+                    return Ok(());
                 }
-                Err(error) => {
-                    // Potentially transient: no disposition, so the next scan
-                    // retries instead of stalling on a momentary failure.
-                    tracing::warn!(
-                        task_id = %task.id,
-                        from_state = %task.status,
-                        to_state = %target.transition_to,
-                        target_role = %target.role,
-                        %error,
-                        "task dispatcher initial dispatch failed"
-                    );
+                let task_workflow = WorkflowEngine::resolve_workflow_for_task(
+                    &task,
+                    &project.workflow_definition,
+                    &Actor::system(SystemComponent::TaskDispatcher),
+                );
+                if task_workflow.state_kind(&task.status) != Some(StateKind::Initial) {
+                    return Ok(());
                 }
+                if helpers::has_blocking_annotation(&task) {
+                    return Ok(());
+                }
+                // Creation gives a Task the Project's default assignees, so a Task
+                // with neither stored assignments nor an inherited root coder was
+                // proposed before those defaults existed in Project settings
+                // (e.g. while the Project was still paused for having no
+                // repository). Apply them now rather than skipping the Task on
+                // every scan with nothing in the log. An inherited coder must not
+                // be materialized as a child assignment here.
+                if TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
+                    .await?
+                    .is_empty()
+                    && crate::task_hierarchy::effective_coder_assignment(&self.db, &task)
+                        .await?
+                        .is_none()
+                {
+                    if let Err(error) = self.task_service.assign_project_default_roles(&task).await {
+                        tracing::warn!(task_id = %task.id, %error, "Task has no role assignments and the Project defaults could not be applied");
+                    }
+                }
+                let Some(target) = self
+                    .resolve_initial_schedule_target(&task_workflow, &task)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                if deferred_dispatch::dispatch_disposition_is_current(&task, &target.role) {
+                    // An unchanged deterministic blocker was already observed for
+                    // this exact Task version and capability. Skip the attempt —
+                    // and its warning — entirely rather than re-deriving and
+                    // re-logging the identical denial every scan (F11). Nothing
+                    // schedules this Task again until its version changes or an
+                    // explicit `wake_task_dispatch` clears the disposition.
+                    return Ok(());
+                }
+                // Only an actual admission candidate needs the capacity query.
+                // Blocked Tasks, coordination containers, and empty queues skip it.
+                if project_slots.is_none() {
+                    project_slots = Some(super::slots::load_project_slots(&self.db, project).await?);
+                }
+                let slots = project_slots.as_mut().expect("admission slot projection");
+                let waiting_message = if slots.limit == 0 {
+                    None
+                } else if slots.active >= slots.limit {
+                    Some(format!(
+                        "project_at_capacity: waiting for a slot ({}/{} active)",
+                        slots.active, slots.limit
+                    ))
+                } else if slots.parked >= 2 * slots.limit {
+                    Some(format!(
+                        "project_waiting_on_owner: {} parked tasks waiting on the owner",
+                        slots.parked
+                    ))
+                } else {
+                    None
+                };
+                if let Some(message) = waiting_message {
+                    // Capacity can change without changing this Task's version.
+                    // Keep it outside the sticky role capability and re-check on
+                    // every tick, writing only when the reason actually changes.
+                    if deferred_dispatch::record_dispatch_disposition(
+                        &self.db,
+                        &task,
+                        "project_capacity",
+                        &message,
+                    )
+                    .await?
+                    {
+                        self.publish_capacity_disposition_change(&task);
+                    }
+                    return Ok(());
+                }
+                match self.dispatch_initial_task(&task, &target).await {
+                    Ok(true) => {
+                        self.clear_dispatch_disposition(&task).await?;
+                        slots.active += 1;
+                        dispatched += 1;
+                    }
+                    Ok(false) => {}
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(
+                            task_id = %task.id,
+                            from_state = %task.status,
+                            to_state = %target.transition_to,
+                            target_role = %target.role,
+                            "task dispatcher initial transition lost version race"
+                        );
+                    }
+                    Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                        deferred_dispatch::record_dispatch_disposition(
+                            &self.db,
+                            &task,
+                            &target.role,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                            &self.db,
+                            &task.id,
+                            &task.status,
+                            &error,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            from_state = %task.status,
+                            to_state = %target.transition_to,
+                            target_role = %target.role,
+                            %error,
+                            "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
+                        );
+                    }
+                    Err(error) => {
+                        // Potentially transient: no disposition, so the next scan
+                        // retries instead of stalling on a momentary failure.
+                        tracing::warn!(
+                            task_id = %task.id,
+                            from_state = %task.status,
+                            to_state = %target.transition_to,
+                            target_role = %target.role,
+                            %error,
+                            "task dispatcher initial dispatch failed"
+                        );
+                    }
+                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%task_id, %error, "Task scan failed; continuing with the next Task");
             }
         }
         Ok(dispatched)
@@ -304,6 +325,17 @@ impl TaskDispatcher {
         target: &InitialScheduleTarget,
     ) -> Result<bool> {
         if self.is_stopped() {
+            return Ok(false);
+        }
+        if db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|placement| {
+                matches!(
+                    placement.state,
+                    db::PlacementState::Disconnected | db::PlacementState::Cleaning
+                )
+            })
+        {
             return Ok(false);
         }
         if helpers::has_blocking_annotation(task) {
@@ -321,7 +353,7 @@ impl TaskDispatcher {
         let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
-        if compute_effective_status(&self.db, &agent).await? != EffectiveStatus::Active {
+        if compute_effective_status(&self.db, &agent, None).await? != EffectiveStatus::Active {
             return Ok(false);
         }
         crate::ensure_execution_role_principal(

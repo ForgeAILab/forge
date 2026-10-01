@@ -161,7 +161,7 @@ async fn fixture() -> Fixture {
     .expect("pending Task creates");
 
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
-    provider.set_task_service(Arc::new(TaskService::new(
+    provider.set_task_service(Arc::new(TaskService::new_for_test(
         Arc::clone(&db),
         Arc::new(events::EventBus::new(16)),
     )));
