@@ -174,6 +174,10 @@ impl DaemonLink {
             .collect()
     }
 
+    fn last_request(&self) -> Option<(String, Value)> {
+        self.requests.lock().unwrap().last().cloned()
+    }
+
     fn stop_heartbeats(&self) {
         self.tasks[2].abort();
     }
@@ -677,13 +681,18 @@ impl Fixture {
     async fn wait_until_journal_empty(&self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if self.runtime.journal().pending().unwrap().is_empty() {
+            let pending = self.runtime.journal().pending().unwrap();
+            if pending.is_empty() {
                 return;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "owner journal acknowledgement arrives"
-            );
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "owner journal acknowledgement arrives: pending_count={}, pending_entry_ids={:?}, last_server_frame={:?}",
+                    pending.len(),
+                    pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+                    self.link.as_ref().and_then(DaemonLink::last_request),
+                );
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -999,26 +1008,39 @@ async fn assert_outage_order(socket_first: bool) {
     fixture.reconnect().await;
     loop {
         monitor.check_once().await.unwrap();
-        if WorkspacePlacementRepo::get_by_id(&*database, &placement.id)
+        let observed_placement = WorkspacePlacementRepo::get_by_id(&*database, &placement.id)
             .await
             .unwrap()
+            .unwrap();
+        let observed_task = TaskRepo::get_by_id(&*database, &placement.task_id, false)
+            .await
             .unwrap()
-            .state
-            == PlacementState::Ready
-            && TaskRepo::get_by_id(&*database, &placement.task_id, false)
-                .await
-                .unwrap()
-                .unwrap()
-                .status
-                == "review"
-            && fixture.runtime.journal().pending().unwrap().is_empty()
+            .unwrap();
+        let observed_execution = ExecutionRepo::get_by_id(&*database, &execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = fixture.runtime.journal().pending().unwrap();
+        if observed_placement.state == PlacementState::Ready
+            && observed_task.status == "review"
+            && pending.is_empty()
         {
             break;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "retained terminal reconciles and advances the Task to Review"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "retained terminal reconciles and advances the Task to Review: placement_state={:?}, placement_version={}, task_status={}, task_version={}, execution_status={:?}, execution_version={}, pending_journal_count={}, pending_entry_ids={:?}, last_server_frame={:?}",
+                observed_placement.state,
+                observed_placement.version,
+                observed_task.status,
+                observed_task.version,
+                observed_execution.status,
+                observed_execution.execution_version,
+                pending.len(),
+                pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+                fixture.link.as_ref().and_then(DaemonLink::last_request),
+            );
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let finished = ExecutionRepo::get_by_id(&*database, &execution_id)
@@ -1563,13 +1585,27 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
     assert_eq!(placement.state, PlacementState::Cleaning);
     assert_eq!(workspace.status, WorkspaceStatus::Cleaning);
     fixture.reconnect().await;
-    fixture
+    let cleanup_result = fixture
         .harness
         .state
         .cleanup_scheduler
         .cleanup_now(&placement.workspace_id)
-        .await
-        .unwrap();
+        .await;
+    if let Err(error) = cleanup_result {
+        let observed_placement =
+            WorkspacePlacementRepo::get_by_id(&*fixture.harness.state.db, &placement.id)
+                .await
+                .unwrap();
+        let observed_workspace =
+            WorkspaceRepo::get_by_id(&*fixture.harness.state.db, &placement.workspace_id)
+                .await
+                .unwrap();
+        panic!(
+            "owner cleanup acknowledgement commits: error={error:?}, placement={observed_placement:?}, workspace={observed_workspace:?}, pending_journal_count={}, last_server_frame={:?}",
+            fixture.runtime.journal().pending().unwrap().len(),
+            fixture.link.as_ref().and_then(DaemonLink::last_request),
+        );
+    }
     let placement = WorkspacePlacementRepo::get_by_id(&*fixture.harness.state.db, &placement.id)
         .await
         .unwrap()

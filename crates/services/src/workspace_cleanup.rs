@@ -642,31 +642,57 @@ impl WorkspaceCleanupScheduler {
         placement: &WorkspacePlacement,
         _ack: &crate::workspace_backend::CleanupAck,
     ) -> Result<db::Workspace> {
-        let now = now_rfc3339();
-        let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        if placement.state != PlacementState::Cleaned {
-            WorkspacePlacementRepo::update_in_tx(
-                &*self.db,
-                &mut transaction,
-                cleanup_state_update(placement, PlacementState::Cleaned, &now),
+        let mut current = placement.clone();
+        for _ in 0..3 {
+            if current.generation != placement.generation
+                || current.workspace_handle != placement.workspace_handle
+                || !matches!(
+                    current.state,
+                    PlacementState::Cleaning | PlacementState::Cleaned
+                )
+            {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let now = now_rfc3339();
+            let mut transaction = db::begin_immediate(self.db.pool()).await?;
+            if current.state != PlacementState::Cleaned {
+                match WorkspacePlacementRepo::update_in_tx(
+                    &*self.db,
+                    &mut transaction,
+                    cleanup_state_update(&current, PlacementState::Cleaned, &now),
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(db::DbError::VersionConflict) => {
+                        transaction.rollback().await?;
+                        current = WorkspacePlacementRepo::get_by_id(&*self.db, &current.id)
+                            .await?
+                            .ok_or_else(|| {
+                                ServiceError::not_found("placement", current.id.clone())
+                            })?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            sqlx::query(
+                "UPDATE workspace
+                         SET status = 'cleaned', cleanup_after = NULL,
+                             cleanup_attempts = 0, last_cleanup_error = NULL,
+                             error = NULL, updated_at = ?
+                         WHERE id = ?",
             )
+            .bind(&now)
+            .bind(&current.workspace_id)
+            .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
+            return WorkspaceRepo::get_by_id(&*self.db, &current.workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", current.workspace_id));
         }
-        sqlx::query(
-            "UPDATE workspace
-                     SET status = 'cleaned', cleanup_after = NULL,
-                         cleanup_attempts = 0, last_cleanup_error = NULL,
-                         error = NULL, updated_at = ?
-                     WHERE id = ?",
-        )
-        .bind(&now)
-        .bind(&placement.workspace_id)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        WorkspaceRepo::get_by_id(&*self.db, &placement.workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", placement.workspace_id.clone()))
+        Err(db::DbError::VersionConflict.into())
     }
 }
 
@@ -719,6 +745,70 @@ mod tests {
         assert_eq!(cleanup_backoff(1), Duration::from_secs(120));
         assert_eq!(cleanup_backoff(6), Duration::from_secs(3600));
         assert_eq!(cleanup_backoff(7), Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn cleanup_accepts_owner_notification_winning_the_cleaned_state_cas() {
+        let db = sqlite_db().await;
+        let (_, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'cancelled' WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let cleaning = WorkspacePlacementRepo::update(
+            &*db,
+            cleanup_state_update(&placement, PlacementState::Cleaning, &now_rfc3339()),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workspace SET status = 'cleaning' WHERE id = ?")
+            .bind(&cleaning.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let notification: api_types::WorkspaceCleanupResult =
+            serde_json::from_value(serde_json::json!({
+                "entry_id": "cleanup-entry",
+                "operation_id": "cleanup-operation",
+                "workspace_handle": cleaning.workspace_handle,
+                "generation": cleaning.generation,
+                "cleaned": true,
+            }))
+            .unwrap();
+        assert_eq!(
+            crate::recovery::apply_owner_cleanup(
+                &db,
+                cleaning.daemon_id.as_deref().unwrap(),
+                &notification,
+            )
+            .await
+            .unwrap(),
+            crate::daemon_transport::DaemonTerminalDisposition::Acknowledge
+        );
+
+        let temp = TempDir::new().unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            db.clone(),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        let workspace = scheduler
+            .acknowledge_cleanup(
+                &cleaning,
+                &crate::workspace_backend::CleanupAck { removed: true },
+            )
+            .await
+            .expect("the already committed owner acknowledgement is idempotent");
+        assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+        assert_eq!(
+            WorkspacePlacementRepo::get_by_id(&*db, &cleaning.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlacementState::Cleaned
+        );
     }
 
     async fn seed_workspace(

@@ -835,14 +835,23 @@ impl DaemonConnectionRegistry {
             api_types::METHOD_EXECUTION_TERMINAL => {
                 match serde_json::from_value::<api_types::ExecutionTerminalNotification>(params) {
                     Ok(notification) => {
-                        lock(&self.inner.journal_terminals).insert(
-                            (
-                                daemon_id.to_owned(),
-                                connection_id,
-                                notification.execution_id.clone(),
-                            ),
-                            notification.clone(),
+                        let key = (
+                            daemon_id.to_owned(),
+                            connection_id,
+                            notification.execution_id.clone(),
                         );
+                        let should_apply = {
+                            let mut terminals = lock(&self.inner.journal_terminals);
+                            if terminals.get(&key) == Some(&notification) {
+                                false
+                            } else {
+                                terminals.insert(key, notification.clone());
+                                true
+                            }
+                        };
+                        if !should_apply {
+                            return;
+                        }
                         let registry = self.clone();
                         let daemon_id = daemon_id.to_owned();
                         tokio::spawn(async move {
