@@ -185,7 +185,7 @@ pub struct TestLifecycleHookRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CreateRepoRequest {
-    pub remote_url: String,
+    pub remote_url: Option<String>,
     pub local_path: Option<String>,
     pub name: Option<String>,
     pub default_branch: Option<String>,
@@ -199,8 +199,14 @@ pub struct CreateRepoRequest {
 pub struct UpdateRepoRequest {
     #[ts(optional = nullable)]
     pub name: Option<String>,
-    #[ts(optional = nullable)]
-    pub remote_url: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_update_field",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(type = "string | null")]
+    #[ts(optional)]
+    pub remote_url: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_update_field")]
     #[ts(type = "string | null")]
     #[ts(optional)]

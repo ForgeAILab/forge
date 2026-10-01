@@ -126,7 +126,7 @@ async fn repo_with_local_path(db: &SqliteDb, project_id: &str, local_path: Optio
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
             name: "setup-repo".to_owned(),
-            remote_url: "https://example.invalid/setup-repo".to_owned(),
+            remote_url: Some("https://example.invalid/setup-repo".to_owned()),
             local_path: local_path.map(str::to_owned),
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

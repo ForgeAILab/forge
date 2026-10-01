@@ -1650,7 +1650,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "heartbeat-test".to_owned(),
-                remote_url: "https://example.invalid/heartbeat.git".to_owned(),
+                remote_url: Some("https://example.invalid/heartbeat.git".to_owned()),
                 local_path: None,
                 work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),

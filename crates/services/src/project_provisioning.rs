@@ -112,7 +112,7 @@ pub(crate) async fn reconcile_project_setup_metadata(
                     "filesystem_verified": true,
                 }),
             )
-        } else if !repo.remote_url.trim().is_empty() {
+        } else if repo.remote_url.is_some() {
             // A remote-only binding has no local filesystem to inspect. Record
             // that it was explicitly verified as a remote binding rather than
             // pretending a local Git checkpoint completed.
@@ -1029,7 +1029,7 @@ async fn ready_operation_is_verified(
         if git::get_current_sha(path).await?.trim().is_empty() {
             return Ok(false);
         }
-    } else if repo.remote_url.trim().is_empty() {
+    } else if repo.remote_url.is_none() {
         // A remote-only repository has no local filesystem checkpoint to
         // inspect, but its durable remote binding must still be non-empty.
         return Ok(false);
@@ -1881,7 +1881,8 @@ async fn find_or_register_repository(
     let matching = repos
         .into_iter()
         .filter(|repo| {
-            repo.local_path.as_deref() == Some(local_path.as_str()) || repo.remote_url == local_path
+            repo.local_path.as_deref() == Some(local_path.as_str())
+                || repo.remote_url.as_deref() == Some(local_path.as_str())
         })
         .collect::<Vec<_>>();
     if matching.len() > 1 {
@@ -1898,7 +1899,7 @@ async fn find_or_register_repository(
         project_id: project.id.clone(),
         name: repo_directory_name(&project.name, &project.id),
         local_path: Some(local_path.clone()),
-        remote_url: local_path.clone(),
+        remote_url: Some(local_path.clone()),
         work_mode: WorkMode::DirectMerge,
         default_branch: DEFAULT_BRANCH.to_owned(),
         created_at: now.clone(),
@@ -1926,7 +1927,7 @@ async fn find_or_register_repository(
             .await?;
             let matching = repos.items.into_iter().filter(|repo| {
                 repo.local_path.as_deref() == Some(local_path.as_str())
-                    || repo.remote_url == local_path
+                    || repo.remote_url.as_deref() == Some(local_path.as_str())
             });
             let mut matches = matching.collect::<Vec<_>>();
             if matches.len() == 1 {

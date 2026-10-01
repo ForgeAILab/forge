@@ -19,6 +19,132 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn create_local_repo_normalizes_blank_remote_url() {
+    let (app, db) = test_app_with_db().await;
+    let local_path = env::current_dir().expect("current directory");
+    for remote_url in [Value::Null, json!(""), json!(" \t\r\n"), json!("\u{2003}")] {
+        let project: ProjectResponse = json_request(
+            &app,
+            Method::POST,
+            "/api/v1/projects",
+            json!({"name": "local-only"}),
+            StatusCode::OK,
+        )
+        .await;
+        let repo: RepoResponse = json_request(
+            &app,
+            Method::POST,
+            &format!("/api/v1/projects/{}/repos", project.id),
+            json!({"name": "local-only", "local_path": local_path, "remote_url": remote_url}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(repo.remote_url, None);
+        let stored: Option<String> = sqlx::query_scalar("SELECT remote_url FROM repo WHERE id = ?")
+            .bind(&repo.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("stored remote loads");
+        assert_eq!(stored, None);
+        let reloaded: RepoResponse = json_request(
+            &app,
+            Method::GET,
+            &format!("/api/v1/repos/{}", repo.id),
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(reloaded.remote_url, None);
+    }
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "local-only-omitted"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({"local_path": local_path}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(repo.remote_url, None);
+    assert!(!repo.name.is_empty());
+}
+
+#[test]
+fn remote_url_update_serialization_preserves_omission() {
+    let omitted: api_types::UpdateRepoRequest =
+        serde_json::from_value(json!({})).expect("omitted update decodes");
+    assert_eq!(omitted.remote_url, None);
+    assert!(serde_json::to_value(&omitted)
+        .expect("update serializes")
+        .get("remote_url")
+        .is_none());
+    let clear: api_types::UpdateRepoRequest =
+        serde_json::from_value(json!({"remote_url": null})).expect("clear update decodes");
+    assert_eq!(clear.remote_url, Some(None));
+    assert_eq!(
+        serde_json::to_value(clear).expect("clear serializes")["remote_url"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn update_repo_normalizes_blank_remote_url_and_preserves_omission() {
+    let app = test_app().await;
+    let project: ProjectResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "remote-update"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({"remote_url": "https://example.com/repo.git"}),
+        StatusCode::OK,
+    )
+    .await;
+    let uri = format!("/api/v1/repos/{}", repo.id);
+    let updated: RepoResponse = json_request(
+        &app,
+        Method::PATCH,
+        &uri,
+        json!({"name": "renamed"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(updated.remote_url, repo.remote_url);
+    for remote_url in [Value::Null, json!(""), json!(" \t\r\n")] {
+        let _: RepoResponse = json_request(
+            &app,
+            Method::PATCH,
+            &uri,
+            json!({"remote_url": "https://example.com/repo.git"}),
+            StatusCode::OK,
+        )
+        .await;
+        let updated: RepoResponse = json_request(
+            &app,
+            Method::PATCH,
+            &uri,
+            json!({"remote_url": remote_url}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(updated.remote_url, None);
+    }
+}
+
+#[tokio::test]
 async fn create_local_repo_normalizes_relative_path() {
     let app = test_app().await;
     let project: ProjectResponse = json_request(
@@ -159,7 +285,10 @@ async fn update_repo_clears_local_path_for_remote_clone_mode() {
     .await;
 
     assert_eq!(updated.local_path, None);
-    assert_eq!(updated.remote_url, "https://example.com/acme/clone-me.git");
+    assert_eq!(
+        updated.remote_url.as_deref(),
+        Some("https://example.com/acme/clone-me.git")
+    );
 }
 
 #[tokio::test]

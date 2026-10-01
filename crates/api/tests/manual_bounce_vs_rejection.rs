@@ -138,7 +138,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             name: "repo".to_owned(),
             local_path: None,
             work_mode: db::WorkMode::DirectMerge,
-            remote_url: "https://example.com/repo.git".to_owned(),
+            remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

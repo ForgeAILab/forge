@@ -158,7 +158,7 @@ pub struct RepoResponse {
     pub project_id: String,
     pub name: String,
     pub local_path: Option<String>,
-    pub remote_url: String,
+    pub remote_url: Option<String>,
     pub default_branch: String,
     pub work_mode: WorkMode,
     pub pr_provider: Option<String>,

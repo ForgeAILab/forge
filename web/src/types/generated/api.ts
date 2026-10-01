@@ -786,7 +786,7 @@ export interface Repo {
   project_id: string
   name: string
   local_path: string | null
-  remote_url: string
+  remote_url: string | null
   default_branch: string
   work_mode: WorkMode
   pr_provider?: string | null
@@ -1088,7 +1088,7 @@ export interface UpdateProjectRequest {
 }
 
 export interface CreateRepoRequest {
-  remote_url: string
+  remote_url?: string | null
   local_path?: string | null
   name?: string | null
   default_branch?: string | null
@@ -1104,7 +1104,7 @@ export interface CreateRepoRequest {
 export interface UpdateRepoRequest {
   name?: string | null
   local_path?: string | null
-  remote_url?: string
+  remote_url?: string | null
   default_branch?: string | null
   work_mode?: WorkMode
   pr_provider?: string | null

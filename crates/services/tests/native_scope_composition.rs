@@ -349,7 +349,7 @@ async fn seed_project(db: &SqliteDb) {
             id: REPO_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
             name: "Scope composition repository".to_owned(),
-            remote_url: "file:///tmp/scope-composition-repo".to_owned(),
+            remote_url: Some("file:///tmp/scope-composition-repo".to_owned()),
             local_path: None,
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

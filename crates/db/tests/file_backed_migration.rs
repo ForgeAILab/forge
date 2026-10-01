@@ -102,6 +102,157 @@ async fn file_backed_migrations_apply_cleanly() {
 }
 
 #[tokio::test]
+async fn repo_remote_url_migration_normalizes_blanks_and_preserves_references() {
+    let migration_dir = unique_temp_path("repo-remote-migrations");
+    fs::create_dir_all(&migration_dir).expect("migration directory creates");
+    copy_migrations_up_to(149, &migration_dir);
+    let db_path = unique_temp_path("repo-remote-db").with_extension("db");
+    let pool = create_sqlite_pool(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("pre-V150 migrations apply");
+    let now = "2026-09-30T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at)
+         VALUES ('project-remote-migration', 'Local Project', '{}', '{}', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("project inserts");
+    let remotes = [
+        ("repo-empty", ""),
+        ("repo-spaces", "   "),
+        ("repo-whitespace", " \t\r\n"),
+        ("repo-unicode", "\u{2003}\u{a0}"),
+        ("repo-remote", " https://example.com/repo.git "),
+    ];
+    for (id, remote) in remotes {
+        sqlx::query(
+            "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode,
+                               default_branch, created_at, updated_at)
+             VALUES (?, 'project-remote-migration', 'Local Repo', ?, '/tmp/local-repo',
+                     'direct_merge', 'main', ?, ?)",
+        )
+        .bind(id)
+        .bind(remote)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("repo inserts");
+    }
+    sqlx::query(
+        "UPDATE project SET primary_repo_id = 'repo-empty' WHERE id = 'project-remote-migration'",
+    )
+    .execute(&pool)
+    .await
+    .expect("primary repo selects");
+    sqlx::query(
+        "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+         VALUES ('task-remote-migration', 'project-remote-migration', 'Local Task', 'task', 'done', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("task inserts");
+    sqlx::query(
+        "INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at)
+         VALUES ('workspace-remote-migration', 'task-remote-migration', 'repo-empty',
+                 '/tmp/local-worktree', 'forge/task-remote-migration', 'ready', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("workspace inserts");
+    sqlx::query(
+        "INSERT INTO pr_provider_config (id, repo_id, provider_type, created_at, updated_at)
+         VALUES ('provider-remote-migration', 'repo-remote', 'github', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("provider configuration inserts");
+
+    run_migrations(&pool).await.expect("V150 applies");
+    run_migrations(&pool)
+        .await
+        .expect("migration restart succeeds");
+    for (id, remote) in remotes {
+        let row = sqlx::query("SELECT * FROM repo WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("repo survives");
+        let stored: Option<String> = row.try_get("remote_url").expect("remote loads");
+        assert_eq!(
+            stored.as_deref(),
+            if id == "repo-remote" {
+                Some(remote)
+            } else {
+                None
+            }
+        );
+        assert_eq!(
+            row.try_get::<String, _>("project_id").unwrap(),
+            "project-remote-migration"
+        );
+        assert_eq!(row.try_get::<String, _>("name").unwrap(), "Local Repo");
+        assert_eq!(
+            row.try_get::<String, _>("local_path").unwrap(),
+            "/tmp/local-repo"
+        );
+        assert_eq!(
+            row.try_get::<String, _>("work_mode").unwrap(),
+            "direct_merge"
+        );
+        assert_eq!(row.try_get::<String, _>("default_branch").unwrap(), "main");
+        assert_eq!(row.try_get::<String, _>("created_at").unwrap(), now);
+        assert_eq!(row.try_get::<String, _>("updated_at").unwrap(), now);
+    }
+    let references: (String, String, String) = sqlx::query_as(
+        "SELECT p.primary_repo_id, w.repo_id, config.repo_id
+         FROM project p, workspace w, pr_provider_config config
+         WHERE p.id = 'project-remote-migration' AND w.id = 'workspace-remote-migration'
+           AND config.id = 'provider-remote-migration'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("repository references survive");
+    assert_eq!(
+        references,
+        (
+            "repo-empty".to_owned(),
+            "repo-empty".to_owned(),
+            "repo-remote".to_owned()
+        )
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .expect("foreign keys check")
+        .is_empty());
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .expect("foreign key setting loads");
+    assert_eq!(foreign_keys, 1);
+    sqlx::query("UPDATE repo SET remote_url = NULL WHERE id = 'repo-remote'")
+        .execute(&pool)
+        .await
+        .expect("remote column accepts NULL");
+    pool.close().await;
+    fs::remove_file(db_path).expect("database removes");
+    fs::remove_dir_all(migration_dir).expect("migration directory removes");
+}
+
+#[tokio::test]
 async fn solo_ready_permission_migration_repairs_only_the_exact_legacy_ceiling() {
     const LEGACY: &str = r#"{"permissions":["read_project","read_agent_chat","read_memory","propose_message","propose_project"]}"#;
     const READY: &str = r#"{"permissions":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;

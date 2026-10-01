@@ -1008,7 +1008,12 @@ requirement carrying the same stable ID; a passing result never substitutes
 for proof.
 
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
-It records the exact input manifest, source versions, evidence attachment
+Repository/build context permits an absent remote URL for local-only
+repositories; blank remote URLs normalize to `NULL`/`None` at repository writes
+and context reads. Repository identity, name, work mode, default branch, Task
+version, and observed timestamp remain required immutable metadata.
+
+Each snapshot records the exact input manifest, source versions, evidence attachment
 IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
 `stale`), and readiness digest. A ready snapshot moves an unreleased active
 milestone to `ready_for_release`; non-ready results leave it active with typed

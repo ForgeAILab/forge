@@ -205,7 +205,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "forge".to_owned(),
-                remote_url: "https://example.com/forge.git".to_owned(),
+                remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),

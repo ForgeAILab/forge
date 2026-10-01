@@ -136,7 +136,7 @@ export function repoFormFromRepo(repo: Repo): RepoFormState {
     source_mode: repo.local_path ? 'local' : 'remote',
     name: repo.name,
     local_path: repo.local_path ?? '',
-    remote_url: repo.remote_url,
+    remote_url: repo.remote_url ?? '',
     default_branch: repo.default_branch || 'main',
     work_mode: repo.work_mode,
     pr_provider: repo.pr_provider_status?.provider_type ?? repo.pr_provider ?? 'github',
@@ -147,7 +147,7 @@ export function repoFormFromRepo(repo: Repo): RepoFormState {
 }
 
 export function repoSource(repo: Repo): string {
-  return repo.remote_url
+  return repo.remote_url ?? repo.local_path ?? ''
 }
 
 export function formatDuration(ms: number | null): string {

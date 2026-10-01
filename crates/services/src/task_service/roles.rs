@@ -987,7 +987,10 @@ impl TaskService {
             let repo_url = repo
                 .local_path
                 .filter(|path| !path.trim().is_empty())
-                .unwrap_or(repo.remote_url);
+                .or(repo.remote_url)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("repository has no local path or remote URL")
+                })?;
             let repo_name = reassignment_repo_name(&repo_url);
             let workspace_root = self
                 .cleanup_scheduler

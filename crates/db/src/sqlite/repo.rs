@@ -4,11 +4,12 @@ use crate::now_rfc3339;
 #[async_trait]
 impl RepoRepo for SqliteDb {
     async fn create(&self, input: CreateRepo) -> Result<Repo> {
+        let remote_url = normalize_repo_remote_url(input.remote_url);
         sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
-            .bind(&input.remote_url)
+            .bind(&remote_url)
             .bind(&input.local_path)
             .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
@@ -38,6 +39,7 @@ impl RepoRepo for SqliteDb {
             ));
         }
 
+        let remote_url = normalize_repo_remote_url(input.remote_url);
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let project_row = sqlx::query("SELECT version, primary_repo_id FROM project WHERE id = ?")
             .bind(&input.project_id)
@@ -54,7 +56,7 @@ impl RepoRepo for SqliteDb {
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
-            .bind(&input.remote_url)
+            .bind(&remote_url)
             .bind(&input.local_path)
             .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
@@ -157,7 +159,7 @@ impl RepoRepo for SqliteDb {
             repo.local_path = local_path;
         }
         if let Some(remote_url) = input.remote_url {
-            repo.remote_url = remote_url;
+            repo.remote_url = normalize_repo_remote_url(remote_url);
         }
         if let Some(work_mode) = input.work_mode {
             repo.work_mode = work_mode;
