@@ -7261,26 +7261,38 @@ async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_actio
 }
 
 #[tokio::test]
-async fn malformed_owner_task_and_project_do_not_abort_the_dispatcher_scan() {
+async fn worker_robustness_dispatcher_isolates_projects_and_tasks() {
     let db = Arc::new(sqlite_db().await);
     let repo = TempDir::new().unwrap();
     let workspace = TempDir::new().unwrap();
-    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
-    let bad = seed_task(&db, &project_id, "bad metadata", "in_progress", 0).await;
-    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
-        .bind(r#"{"owner_wait":{"daemon_id":"owner","started_at":"2000-01-01T00:00:00Z"},"plan_publication_claim":42}"#)
-        .bind(&bad.id).execute(db.pool()).await.unwrap();
-    let broken_repo = TempDir::new().unwrap();
-    let (broken, _) = seed_project_repo(&db, broken_repo.path()).await;
-    sqlx::query("UPDATE project SET settings = 'invalid' WHERE id = ?")
+    let (broken, _) = seed_project_repo(&db, repo.path()).await;
+    sqlx::query("UPDATE project SET settings = 'invalid', created_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z")
         .bind(&broken)
         .execute(db.pool())
         .await
         .unwrap();
+    let healthy_repo = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, healthy_repo.path()).await;
+    sqlx::query("UPDATE project SET created_at = ? WHERE id = ?")
+        .bind("2001-01-01T00:00:00Z")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let bad = seed_task(&db, &project_id, "bad metadata", "in_progress", 0).await;
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(r#"{"owner_wait":{"daemon_id":"owner","started_at":"2000-01-01T00:00:00Z"},"plan_publication_claim":42}"#)
+        .bind(&bad.id).execute(db.pool()).await.unwrap();
     let agent = seed_agent(&db, 2, DaemonStatus::Online, AgentStatus::Idle).await;
     let healthy = seed_task(&db, &project_id, "healthy", "todo", 0).await;
     assign_role(&db, &healthy.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(db, workspace.path()).await;
     assert_eq!(dispatcher.check_once().await.unwrap(), 1);
     assert_eq!(rx.recv().await.unwrap().task_id, healthy.id);
+
+    let healthy_again = seed_task(&dispatcher.db, &project_id, "healthy again", "todo", 0).await;
+    assign_role(&dispatcher.db, &healthy_again.id, "coder", &agent).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(rx.recv().await.unwrap().task_id, healthy_again.id);
 }

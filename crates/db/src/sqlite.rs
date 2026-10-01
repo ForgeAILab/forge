@@ -428,6 +428,8 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         before_sha: row.try_get("before_sha")?,
         cleanup_after: row.try_get("cleanup_after")?,
+        cleanup_attempts: row.try_get("cleanup_attempts")?,
+        last_cleanup_error: row.try_get("last_cleanup_error")?,
         error: row.try_get("error")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

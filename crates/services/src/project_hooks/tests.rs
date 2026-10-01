@@ -417,12 +417,18 @@ async fn all_work_completed_matches_when_all_visible_tasks_are_cancelled() {
 }
 
 async fn test_service() -> (Arc<SqliteDb>, ProjectHookService) {
+    test_service_with_event_capacity(128).await
+}
+
+async fn test_service_with_event_capacity(
+    event_capacity: usize,
+) -> (Arc<SqliteDb>, ProjectHookService) {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
-    let event_bus = Arc::new(EventBus::new(128));
+    let event_bus = Arc::new(EventBus::new(event_capacity));
     let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
     let notification_service = Arc::new(NotificationService::new(
         Arc::clone(&db),
@@ -654,4 +660,57 @@ async fn start_with_shutdown_stops_and_releases_the_parent_receiver() {
         .expect("project hook worker stops promptly")
         .expect("project hook worker joins");
     assert_eq!(event_bus.receiver_count(), 0);
+}
+
+#[tokio::test]
+async fn worker_robustness_project_hook_receiver_continues_after_lag() {
+    let (db, service) = test_service_with_event_capacity(1).await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let rules = serde_json::to_string(&vec![create_task_rule(
+        "after-lag",
+        "Created after lag",
+        None,
+        1,
+    )])
+    .unwrap();
+    ProjectRepo::set_project_hooks_json(&*db, &project.id, &rules, &now_rfc3339())
+        .await
+        .unwrap();
+    let event_bus = Arc::clone(&service.event_bus);
+    let receiver = event_bus.subscribe();
+    for entity_id in ["first", "second"] {
+        event_bus.publish(events::ForgeEvent {
+            event_type: "test.event".to_owned(),
+            entity_id: entity_id.to_owned(),
+            timestamp: events::event_timestamp(),
+            context: events::EventContext::Empty {},
+        });
+    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(Arc::new(service).run(receiver, Some(shutdown_rx)));
+
+    event_bus.publish(events::ForgeEvent {
+        event_type: "task.status_changed".to_owned(),
+        entity_id: task.id,
+        timestamp: events::event_timestamp(),
+        context: events::EventContext::TaskStatusChanged {
+            project_id: project.id.clone(),
+            old_status: "review".to_owned(),
+            new_status: "done".to_owned(),
+        },
+    });
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if task_count_by_title(&db, &project.id, "Created after lag").await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-lag event is delivered");
+    shutdown_tx.send(true).unwrap();
+    handle.await.unwrap();
 }

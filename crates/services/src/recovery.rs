@@ -483,102 +483,121 @@ impl HeartbeatMonitor {
         // Heartbeat staleness can precede the socket's close/timeout. Persist
         // owner suspension before Agent or WorkspaceLease recovery sees it.
         let now = now_rfc3339();
-        for execution in ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await? {
-            if !is_unclaimed_dispatch_marker(&execution, &now) {
-                if let Err(error) =
-                    suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await
-                {
-                    tracing::warn!(execution_id = %execution.id, %error, "owner suspension remains pending");
+        let owner_suspension = async {
+            for execution in ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await? {
+                if !is_unclaimed_dispatch_marker(&execution, &now) {
+                    if let Err(error) =
+                        suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await
+                    {
+                        tracing::warn!(execution_id = %execution.id, %error, "owner suspension remains pending");
+                    }
                 }
             }
+            Ok::<(), ServiceError>(())
+        }
+        .await;
+        if let Err(error) = owner_suspension {
+            tracing::warn!(%error, "expired owner suspension pass failed");
         }
         if let Err(error) = self.suspend_unreachable_placements().await {
             tracing::warn!(%error, "placement suspension remains pending");
         }
-        let agents = self.list_busy_agents().await?;
-        let mut timed_out = 0;
+        let timed_out = match async {
+            let agents = self.list_busy_agents().await?;
+            let mut timed_out = 0;
 
-        for agent in agents {
-            if !agent_timed_out(&agent) {
-                continue;
-            }
-            let mut suspended_owner = false;
-            for execution in ExecutionRepo::list_running(&*self.db).await? {
-                if execution.agent_id.as_deref() == Some(agent.id.as_str())
-                    && execution_lease_is_suspended(&self.db, &execution).await?
-                {
-                    suspended_owner = true;
-                    break;
+            for agent in agents {
+                if !agent_timed_out(&agent) {
+                    continue;
                 }
-            }
-            if suspended_owner {
-                continue;
-            }
+                let mut suspended_owner = false;
+                for execution in ExecutionRepo::list_running(&*self.db).await? {
+                    if execution.agent_id.as_deref() == Some(agent.id.as_str())
+                        && execution_lease_is_suspended(&self.db, &execution).await?
+                    {
+                        suspended_owner = true;
+                        break;
+                    }
+                }
+                if suspended_owner {
+                    continue;
+                }
 
-            let last_heartbeat = agent
-                .last_heartbeat_at
-                .clone()
-                .unwrap_or_else(|| "never".to_owned());
+                let last_heartbeat = agent
+                    .last_heartbeat_at
+                    .clone()
+                    .unwrap_or_else(|| "never".to_owned());
 
-            AgentRepo::update(
-                &*self.db,
-                UpdateAgent {
-                    id: agent.id.clone(),
-                    expected_version: agent.version,
-                    name: None,
-                    description: None,
-                    max_concurrent_tasks: None,
-                    heartbeat_interval_seconds: None,
-                    max_missed_heartbeats: None,
-                    status: Some(AgentStatus::Error),
-                    last_heartbeat_at: None,
-                    model: None,
-                    reasoning_effort: None,
-                    permission_policy: None,
-                    capabilities_json: None,
-                    config_json: None,
-                    daemon_id: None,
-                    is_default: None,
-                    paused: None,
-                    prompt_template: None,
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await?;
-            self.publish(ForgeEvent {
-                event_type: "agent.timeout".to_owned(),
-                entity_id: agent.id.clone(),
-                timestamp: event_timestamp(),
-                context: EventContext::AgentTimeout {
-                    last_heartbeat: last_heartbeat.clone(),
-                },
-            });
-
-            for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
-                let outcome = recover_task(
-                    &self.db,
-                    task,
-                    StopReason::AgentTimeout,
-                    &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
+                AgentRepo::update(
+                    &*self.db,
+                    UpdateAgent {
+                        id: agent.id.clone(),
+                        expected_version: agent.version,
+                        name: None,
+                        description: None,
+                        max_concurrent_tasks: None,
+                        heartbeat_interval_seconds: None,
+                        max_missed_heartbeats: None,
+                        status: Some(AgentStatus::Error),
+                        last_heartbeat_at: None,
+                        model: None,
+                        reasoning_effort: None,
+                        permission_policy: None,
+                        capabilities_json: None,
+                        config_json: None,
+                        daemon_id: None,
+                        is_default: None,
+                        paused: None,
+                        prompt_template: None,
+                        updated_at: now_rfc3339(),
+                    },
                 )
                 .await?;
+                self.publish(ForgeEvent {
+                    event_type: "agent.timeout".to_owned(),
+                    entity_id: agent.id.clone(),
+                    timestamp: event_timestamp(),
+                    context: EventContext::AgentTimeout {
+                        last_heartbeat: last_heartbeat.clone(),
+                    },
+                });
 
-                if outcome.annotated {
-                    publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
-                    self.publish(ForgeEvent {
-                        event_type: "task.recovered".to_owned(),
-                        entity_id: outcome.task.id.clone(),
-                        timestamp: event_timestamp(),
-                        context: EventContext::TaskRecovered {
-                            project_id: outcome.task.project_id,
-                            reason: "agent_timeout".to_owned(),
-                        },
-                    });
+                for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
+                    let outcome = recover_task(
+                        &self.db,
+                        task,
+                        StopReason::AgentTimeout,
+                        &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor),
+                    )
+                    .await?;
+
+                    if outcome.annotated {
+                        publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
+                        self.publish(ForgeEvent {
+                            event_type: "task.recovered".to_owned(),
+                            entity_id: outcome.task.id.clone(),
+                            timestamp: event_timestamp(),
+                            context: EventContext::TaskRecovered {
+                                project_id: outcome.task.project_id,
+                                reason: "agent_timeout".to_owned(),
+                            },
+                        });
+                    }
                 }
+
+                timed_out += 1;
             }
 
-            timed_out += 1;
+            Ok::<u64, ServiceError>(timed_out)
         }
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "agent heartbeat timeout pass failed");
+                0
+            }
+        };
 
         if timed_out > 0 {
             tracing::info!(
@@ -586,17 +605,38 @@ impl HeartbeatMonitor {
                 "heartbeat monitor detected timed out agents"
             );
         }
-        renew_workspace_leases(&self.db).await?;
-        let progress_warnings = self.check_stale_progress().await?;
-        let stalled = self.check_stalled_executions().await?;
-        let expired = expire_workspace_leases(
+        if let Err(error) = renew_workspace_leases(&self.db).await {
+            tracing::warn!(%error, "workspace lease renewal pass failed");
+        }
+        let progress_warnings = match self.check_stale_progress().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "execution progress warning pass failed");
+                0
+            }
+        };
+        let stalled = match self.check_stalled_executions().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "execution owner lease expiry pass failed");
+                0
+            }
+        };
+        let expired = match expire_workspace_leases(
             &self.db,
             &self.event_bus,
             self.task_executor.as_deref(),
             self.task_service.as_deref(),
             true,
         )
-        .await?;
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "workspace lease expiry pass failed");
+                0
+            }
+        };
         // Owner RPCs run after the core liveness pass. A bad placement cannot
         // abort heartbeat recovery, and each owner gets a bounded attempt.
         let reservations =
@@ -5783,6 +5823,67 @@ pub(crate) mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn worker_robustness_heartbeat_runs_lease_expiry_after_early_failure() {
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::new(32));
+        let (task, placement, execution) = daemon_owned_fixture(&db).await;
+        let ready = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let db::ExecutionLeaseMutation::Updated(execution) = ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: execution.lease_owner.clone().unwrap(),
+                lease_expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                hard_deadline_at: execution.hard_deadline_at.clone(),
+                now: now.to_rfc3339(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("execution lease updates");
+        };
+        let grant = expired_owner_grant(&db, &task, &ready, &execution).await;
+        sqlx::query(
+            "UPDATE agent_identity
+             SET status = 'busy', heartbeat_interval_seconds = 'invalid'
+             WHERE id = ?",
+        )
+        .bind(execution.agent_id.as_deref().unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        HeartbeatMonitor::new(db.clone(), bus)
+            .check_once()
+            .await
+            .expect("later heartbeat passes still run");
+
+        assert_eq!(
+            WorkspaceLeaseRepo::get_by_id(&*db, &grant.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed
+        );
     }
 
     #[tokio::test]

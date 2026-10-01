@@ -94,7 +94,10 @@ impl WorkspaceRepo for SqliteDb {
 
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace> {
         let result = sqlx::query(
-            "UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE workspace
+             SET status = 'cleaned', cleanup_after = NULL, cleanup_attempts = 0,
+                 last_cleanup_error = NULL, error = NULL, updated_at = ?
+             WHERE id = ?",
         )
         .bind(updated_at)
         .bind(id)

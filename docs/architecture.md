@@ -118,6 +118,18 @@ MCP endpoint, OAuth callback listener, remote-daemon connection lifecycle,
 external sync, and task-terminal transport. Solo therefore opens no TCP
 listener and does not silently start a hidden `forge` server.
 
+Periodic correctness workers isolate recoverable work within a tick. The Task
+dispatcher logs a failing Project and continues with later Projects, while its
+per-Task scans likewise continue after one malformed or failing Task. The
+heartbeat monitor runs its owner suspension, placement suspension, Agent
+timeout, lease renewal, progress warning, execution expiry, WorkspaceLease
+expiry, reservation, and placement passes in that order; a failed pass is
+logged and does not suppress later passes. Notification and Project-hook
+broadcast consumers treat receiver lag as a warned delivery gap and continue
+receiving subsequent events; they exit only when their bus closes or runtime
+shutdown is requested. Durable replay remains the responsibility of the
+durable-event consumers rather than these broadcast loops.
+
 Codex Agent Chat uses app-server stdio dynamic-tool callbacks to invoke the
 same `ScopeToolComposition` and shared `CoordinationToolProvider` as native
 turns. The host resolves the persisted CLI session, verifies the admitted
@@ -2781,10 +2793,14 @@ Task branches and execution logs are retained; only
 directory. Cleanup is deferred while any execution or WorkspaceLease is active.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs; failed
-workspace cleanup is also retried with backoff by the deadline worker. The sweep
-honors cleanup deadlines and grace periods, and ineligible scheduled rows have
-their deadlines cleared so they cannot starve later cleanup. Cleanup failures
-are logged by the worker and never reported as transition effect failures.
+workspace cleanup is also retried by the deadline worker with persisted
+exponential backoff from one minute up to one hour. A failure records its
+attempt count and last error, moves `cleanup_after` to the next retry, and does
+not stop later due workspaces in the same tick. The sweep honors cleanup
+deadlines and grace periods, and ineligible scheduled rows have their deadlines
+and retry state cleared so they cannot starve later cleanup. Successful cleanup
+also clears retry state. Cleanup failures are logged by the worker and never
+reported as transition effect failures.
 
 Operators must not delete worktrees based on execution status. A completed or
 failed execution can belong to a Task still in `review` or `merge_failed`, whose
