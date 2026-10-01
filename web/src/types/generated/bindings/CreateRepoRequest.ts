@@ -2,4 +2,4 @@
 import type { PrProviderConfigRequest } from "./PrProviderConfigRequest";
 import type { WorkMode } from "./WorkMode";
 
-export type CreateRepoRequest = { remote_url: string, local_path: string | null, name: string | null, default_branch: string | null, work_mode: WorkMode | null, pr_provider: string | null, pr_provider_config: PrProviderConfigRequest | null, };
+export type CreateRepoRequest = { remote_url: string | null, local_path: string | null, name: string | null, default_branch: string | null, work_mode: WorkMode | null, pr_provider: string | null, pr_provider_config: PrProviderConfigRequest | null, };

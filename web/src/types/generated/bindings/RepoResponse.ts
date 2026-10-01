@@ -2,4 +2,4 @@
 import type { PrProviderStatus } from "./PrProviderStatus";
 import type { WorkMode } from "./WorkMode";
 
-export type RepoResponse = { id: string, project_id: string, name: string, local_path: string | null, remote_url: string, default_branch: string, work_mode: WorkMode, pr_provider: string | null, pr_provider_status: PrProviderStatus | null, created_at: string, updated_at: string, };
+export type RepoResponse = { id: string, project_id: string, name: string, local_path: string | null, remote_url: string | null, default_branch: string, work_mode: WorkMode, pr_provider: string | null, pr_provider_status: PrProviderStatus | null, created_at: string, updated_at: string, };
