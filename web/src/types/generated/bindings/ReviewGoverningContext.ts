@@ -13,4 +13,7 @@ requirements: Array<ReviewRequirement>, deferred_requirement_count: number, defe
  * Commands used to prepare the detached clean checkout before required
  * conformance checks execute.
  */
-setup_steps: Array<string>, required_checks: Array<ConformanceCheck>, source_digest: string, };
+setup_steps: Array<string>, required_checks: Array<ConformanceCheck>, /**
+ * Source fingerprint algorithm. Missing means v1 for contracts at rest.
+ */
+source_digest_version?: number, source_digest: string, };

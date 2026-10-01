@@ -4103,6 +4103,80 @@ async fn merge_again_from_review(ctx: &mut HookContext) -> HookResult {
 }
 
 #[tokio::test]
+async fn review_digest_completion_uses_the_frozen_fingerprint_version() {
+    for (version, change, expected) in [
+        (2, "settings", api_types::ConformanceStatus::Passed),
+        (2, "description", api_types::ConformanceStatus::Unverified),
+        (1, "unchanged", api_types::ConformanceStatus::Passed),
+        (1, "settings", api_types::ConformanceStatus::Unverified),
+    ] {
+        let (harness, scenario) =
+            build_carry_scenario("task-digest-completion", "agent-digest-completion", false).await;
+        let ctx = &harness.ctx;
+        let execution_id = new_uuid_v4();
+        create_carry_execution(ctx, &execution_id, "reviewer", &scenario.workspace_id, true).await;
+        let source = ctx
+            .db
+            .review_source(&ctx.task_id, Some(&execution_id))
+            .await
+            .unwrap();
+        let mut context = ::review::contract::context_from_source(&source).unwrap();
+        assert_eq!(
+            context.source_digest_version,
+            Some(2),
+            "new admissions use v2"
+        );
+        if version == 1 {
+            // Simulate an in-flight pre-upgrade contract, without a version field.
+            context.source_digest_version = None;
+            context.source_digest = api_types::canonical_digest(&source).unwrap();
+        }
+        let mut contract = api_types::ReviewContract {
+            execution_id: execution_id.clone(),
+            policy: api_types::REVIEW_CONFORMANCE_POLICY.into(),
+            commit_sha: scenario.commit_sha.clone(),
+            base_sha: run_git(&scenario.worktree, &["rev-parse", "HEAD~1"]),
+            candidate_changed_paths: scenario.changed_paths.clone(),
+            context,
+            check_results: Vec::new(),
+            digest: String::new(),
+        };
+        contract.digest = api_types::canonical_digest(&contract).unwrap();
+        ctx.db.create_review_contract(&contract).await.unwrap();
+        match change {
+            "settings" => {
+                sqlx::query("UPDATE project SET settings = json_set(settings, '$.max_active_tasks', 7, '$.recheck_interval_seconds', 30) WHERE id = ?")
+                    .bind(&ctx.project_id).execute(ctx.db.pool()).await.unwrap();
+            }
+            "description" => {
+                sqlx::query(
+                    "UPDATE task SET description = 'Changed acceptance criteria' WHERE id = ?",
+                )
+                .bind(&ctx.task_id)
+                .execute(ctx.db.pool())
+                .await
+                .unwrap();
+            }
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        let conformance = ::review::contract::evaluate(
+            &ctx.db,
+            &execution_id,
+            &scenario.worktree,
+            r#"{"result":"pass","reason":"verified candidate"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conformance.status, expected,
+            "v{version} {change}: {:?}",
+            conformance.reason
+        );
+    }
+}
+
+#[tokio::test]
 async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-clean", "agent-carry-clean", false).await;

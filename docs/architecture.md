@@ -2881,13 +2881,38 @@ inputs make conformance unverified while retaining the parsed review.
 Natural-language Charter text never becomes an executable command;
 product-specific deterministic checks must be configured explicitly.
 
-The frozen Task source includes bounded worklog comments and active attached
+The frozen prompt context includes bounded worklog comments and active attached
 media metadata, giving read-only discovery Tasks a reviewable deliverable sink.
 Such Tasks own no implementation requirement IDs. Execution setup counts an
 implementation commit only when a non-reviewer execution changes `before_sha` to
 a different `after_sha`; the repository's unchanged base commit is not evidence
 of implementation.
 
+New contracts store `context.source_digest_version: 2` in their existing JSON.
+The v2 source digest fingerprints only review authority: the Charter revision ID
+and content digest plus the Task's Charter reference; Task title, description
+(including acceptance criteria), and plan; effective requirement IDs and
+allocations; linked Document revision IDs and content digests; effective
+`setup_steps`, `ci_steps`, `check_timeout_seconds` (30 minutes when unset), and
+requirement-linked `conformance_checks`; the review state's workflow config and
+Task overrides; and the Task's read-only review mode. The plan is authority
+because the resolver includes it in the universal `task:acceptance` requirement.
+Project environment variables are injected into review commands, so their names
+are fingerprinted, never their values. Whole Project settings/workflow blobs,
+reviewer assignments, worklog/media evidence, and other audit metadata do not
+enter the v2 digest. Changing unrelated settings or other workflow states does
+not revoke a v2 approval.
+
+A missing `source_digest_version` means v1. Such contracts still verify with
+`legacy_v1_source_digest`, the exact whole-source algorithm used when they were
+frozen, including its settings, workflow, assignment, and evidence inputs. The
+missing version stays omitted when serializing v1, preserving contract digests and
+immutable assessment equality. No migration or review is required merely by
+upgrading; changing a v1 input still requires fresh review. Fingerprint versions
+are independent of the conformance policy version.
+
+Acceptance and reviewer completion recheck the source digest using the version
+frozen in the contract; completion also validates current governing material.
 Acceptance rechecks source provenance inside the SQLite write transaction.
 Direct integration holds the authority write lock during the local git operation,
 compares source and target commits, fast-forwards only the immutable reviewed
@@ -2919,8 +2944,8 @@ usual:
   every one with exit code 0 (with no checks, nothing verified the new tree);
 - the Review attempt immediately before this entry passed and is still current
   authority under the same checks integration makes: passed conformance, current
-  policy, an unchanged governing-context digest (Charter, Task scope, workflow,
-  reviewer assignment) and a matching frozen assessment;
+  policy, an unchanged source digest under the contract's frozen fingerprint
+  version and a matching frozen assessment;
 - every path `HEAD` changes relative to the target tip is in the approved
   contract's `candidate_changed_paths`, `HEAD` descends from the current target
   tip, the worktree is clean and no handed-off file adds conflict markers;
@@ -2940,7 +2965,8 @@ current passed contract's, else the contract's own `commit_sha`/`base_sha`.
 Integration and PR publication compare `HEAD` and the target tip with that
 candidate, so a newer real review (a different contract execution) supersedes
 all earlier carries automatically. A stored workflow change (such as migration
-`V148`) alters the governing context and therefore also forces one fresh review.
+`V148`) forces a fresh v1 review; for v2, only a change to review authority
+invalidates the source digest.
 
 The manual review-rerun endpoint consumes the same result categories as automatic
 review completion. Passed reruns cascade into merging, failed reruns use the
