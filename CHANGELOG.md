@@ -27,6 +27,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and operations outside the orchestration contract return the same structured
   outcome where they used to return an error string.
 
+- Retrying an Agent Chat turn now requires `expected_version` and
+  `idempotency_key`. A refused retry returns 409 `turn_not_retryable` or
+  `another_turn_live`, and a turn that is waiting for input now blocks a
+  retry. Retry is offered only for the newest failed or cancelled turn of a
+  message, and only while no later message exists in the chat.
+- Agent Chat turn responses, the `agent_chat.turn.failed` event and the MCP
+  turn response add `failure_class`, `retry_decision`,
+  `pre_provider_failure_count` and `retry_action`. Failure codes
+  `credential_unavailable`, `provider_unavailable`,
+  `usage_admission_authority_failed`, `usage_admission_failed`,
+  `awaiting_input_commit_failed`, `response_commit_failed` and
+  `turn_postcondition_check_failed` are gone; `provider_rejected`,
+  `context_overflow`, `transient`, `turn_limit` and `pre_provider_admission`
+  are new.
+- A failed chat turn raises an attention item only for a configuration error,
+  an authority refusal or a provider rejection that cannot be retried. It used
+  to raise one for every turn that failed terminally. The item recommends
+  `retry_turn`.
+
 ### Changed
 
 - Agents now get guidance that keeps a Project easy to merge. Charter
@@ -76,6 +95,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   recover or re-execute a Task only when the operation is offered and the
   earlier cause is addressed, and to treat a final refusal as final. Turns
   admitted before the upgrade keep revision 17.
+- A failed Agent Chat turn is retried according to what failed, where it used
+  to be retried three times regardless. A configuration error, an authority
+  refusal, a non-retryable provider rejection and a context overflow fail on
+  the first attempt. A network, timeout or server error backs off within the
+  attempt budget and honours the provider's retry hint. A usage limit waits
+  for the provider's reset time without spending an attempt, with growing
+  waits when the reset time is unknown, and gives up after 24 deferrals or 24
+  hours. A failure before any provider call retries on its own budget of
+  three.
+- Manual retry writes the new `agent_chat.turn.retried` event with
+  `source_turn_job_id`. The web "Retry turn" button calls the retry endpoint
+  where it used to resend the message as a new one. Solo offers retry for a
+  cancelled turn. CLI chat executors defer on usage exhaustion. A server
+  shutdown re-queues a leased turn without spending an attempt.
 
 ### Added
 
@@ -99,6 +132,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the upgrade moves the Project Agent to a newer operating-skill revision. The
   turn runs with the revision it was admitted under, and its context manifest
   records that revision.
+- Retrying a chat turn after editing the Agent no longer returns the earlier
+  retry's turn; it admits a new turn with the Agent's current model,
+  credential and policy.
 - An invalid artifact path or `project.summary` id now returns
   `validation_error` with the reason, and a failure to load
   `project.current_state` returns `internal_failure`; both used to be reported
