@@ -5075,6 +5075,377 @@ async fn review_source_accepts_direct_child_execution_for_coordination_root() {
     assert_eq!(implicit["repo_id"], repo_id);
 }
 
+// Freeze both contract and passed assessment so these tests exercise the same
+// verification paths as acceptance, integration, and authority carry.
+async fn seed_review_digest_contract(
+    version: u32,
+) -> (SqliteDb, String, String, api_types::ReviewContract) {
+    use api_types::{canonical_digest, review_source_digest, ReviewConformance, ReviewContract};
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "review".into(), "Digest scope").await;
+    let now = now_rfc3339();
+    TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "reviewer".into(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project SET settings = ?, workflow_definition = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "default_review_config": {"ci_steps": ["true"]},
+                "environment": {"env": {"TOKEN": "original"}},
+            })
+            .to_string(),
+        )
+        .bind(
+            serde_json::json!({"states": [
+                {"name": "review", "role": "reviewer", "config": {}},
+                {"name": "working", "role": "coder", "config": {}},
+            ]})
+            .to_string(),
+        )
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            role: "reviewer".into(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let source = db
+        .review_source(&task_id, Some(&execution_id))
+        .await
+        .unwrap();
+    let mut context_json = serde_json::json!({
+        "project_id": project_id, "task_id": task_id, "repo_id": repo_id,
+        "charter_revision_id": null, "charter_digest": null, "charter": null,
+        "task_scope": source["task_scope"], "linked_documents": [],
+        "requirements": [], "setup_steps": [], "required_checks": [],
+        "source_digest": if version == 1 {
+            // Independently reproduce the pre-change algorithm.
+            canonical_digest(&source).unwrap()
+        } else {
+            review_source_digest(&source, version).unwrap()
+        },
+    });
+    if version != 1 {
+        context_json["source_digest_version"] = serde_json::json!(version);
+    }
+    let mut contract = ReviewContract {
+        execution_id: execution_id.clone(),
+        policy: api_types::REVIEW_CONFORMANCE_POLICY.into(),
+        commit_sha: "candidate".into(),
+        base_sha: "base".into(),
+        candidate_changed_paths: vec!["file.rs".into()],
+        context: serde_json::from_value(context_json).unwrap(),
+        check_results: Vec::new(),
+        digest: String::new(),
+    };
+    contract.digest = canonical_digest(&contract).unwrap();
+    db.create_review_contract(&contract).await.unwrap();
+    let conformance = ReviewConformance {
+        status: api_types::ConformanceStatus::Passed,
+        contract: Some(contract.clone()),
+        assessment: Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Pass,
+            reason: "checked".into(),
+            report: String::new(),
+        }),
+        checks: Vec::new(),
+        reason: None,
+    };
+    db.record_review_conformance(&conformance).await.unwrap();
+    ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id,
+            attempt_number: 1,
+            status: ReviewStatus::Passed,
+            step_results_json: serde_json::json!({"conformance": conformance}).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    TaskRepo::set_review_passed_at(&db, &task_id, Some(now.clone()), &now)
+        .await
+        .unwrap();
+    (db, project_id, task_id, contract)
+}
+
+async fn assert_review_digest_integrates(db: &SqliteDb, task_id: &str) {
+    let guard = db.lock_review_integration(task_id).await.unwrap();
+    assert!(guard.contract.is_some(), "must check automated authority");
+    guard.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
+    let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_at_version(
+        &db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(
+                serde_json::json!({
+                    "max_active_tasks": 7, "recheck_interval_seconds": 30,
+                    "default_review_config": {"ci_steps": ["true"]},
+                    "environment": {"env": {"TOKEN": "rotated-secret"}},
+                })
+                .to_string(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
+    // Non-review workflow configuration and Task state config are not authority.
+    sqlx::query("UPDATE project SET workflow_definition = json_set(workflow_definition, '$.states[1].config', json('{\"unrelated\":true}')) WHERE id = ?")
+        .bind(&project_id).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config = '{\"working\":{\"unrelated\":true}}', priority = 10 WHERE id = ?")
+        .bind(&task_id).execute(db.pool()).await.unwrap();
+    db.record_review_conformance(
+        &db.review_conformance(&contract.execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_review_digest_integrates(&db, &task_id).await;
+    // The same passed-contract verifier also authorizes carry.
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: contract.execution_id.clone(),
+            attempt_number: 2,
+            status: ReviewStatus::Running,
+            step_results_json: "{}".into(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.review_carry_base(&task_id).await.unwrap().contract,
+        contract
+    );
+}
+
+#[tokio::test]
+async fn review_digest_governing_edits_invalidate_passed_contract() {
+    for change in [
+        "ci_steps",
+        "description",
+        "plan",
+        "requirement_ids",
+        "review_state",
+        "env_name",
+    ] {
+        let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+        let (sql, id) = match change {
+            "ci_steps" => ("UPDATE project SET settings = json_set(settings, '$.default_review_config.ci_steps', json('[\"false\"]')) WHERE id = ?", &project_id),
+            "review_state" => ("UPDATE project SET workflow_definition = json_set(workflow_definition, '$.states[0].config.review_prompt', 'Changed acceptance instruction') WHERE id = ?", &project_id),
+            "env_name" => ("UPDATE project SET settings = json_set(settings, '$.environment.env.NEW_TOKEN', 'secret') WHERE id = ?", &project_id),
+            "description" => ("UPDATE task SET description = 'Changed acceptance criteria' WHERE id = ?", &task_id),
+            "plan" => ("UPDATE task SET plan = 'Changed required plan' WHERE id = ?", &task_id),
+            "requirement_ids" => ("UPDATE task SET task_state_config = '{\"review\":{\"requirement_ids\":[\"new-requirement\"]}}' WHERE id = ?", &task_id),
+            _ => unreachable!(),
+        };
+        sqlx::query(sql).bind(id).execute(db.pool()).await.unwrap();
+        assert!(
+            matches!(
+                db.lock_review_integration(&task_id).await,
+                Err(DbError::Check(_))
+            ),
+            "{change}"
+        );
+        let conformance = db
+            .review_conformance(&contract.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                db.record_review_conformance(&conformance).await,
+                Err(DbError::Check(_))
+            ),
+            "{change}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_digest_unversioned_contract_preserves_v1_verification() {
+    let (db, project_id, task_id, contract) = seed_review_digest_contract(1).await;
+    let raw: String = sqlx::query_scalar(
+        "SELECT contract_json FROM execution_review_contract WHERE execution_id = ?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!raw.contains("source_digest_version"));
+    let restored = db
+        .review_contract(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.context.source_digest_version, None);
+    assert_eq!(serde_json::to_string(&restored).unwrap(), raw);
+    let mut digest_input = serde_json::from_str::<serde_json::Value>(&raw).unwrap();
+    digest_input["digest"] = serde_json::json!("");
+    assert_eq!(
+        api_types::canonical_digest(&digest_input).unwrap(),
+        restored.digest
+    );
+    assert_review_digest_integrates(&db, &task_id).await;
+    sqlx::query(
+        "UPDATE project SET settings = json_set(settings, '$.max_active_tasks', 7) WHERE id = ?",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.lock_review_integration(&task_id).await,
+        Err(DbError::Check(_))
+    ));
+    let conformance = db
+        .review_conformance(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.record_review_conformance(&conformance).await,
+        Err(DbError::Check(_))
+    ));
+}
+
+#[test]
+fn review_digest_scopes_authority_and_rejects_unknown_versions() {
+    let source = serde_json::json!({
+        "charter": {"id": "r1", "content_digest": "charter-digest"},
+        "task_charter_revision_id": "r1",
+        "task_scope": {"title": "Task", "description": "Acceptance", "plan": "Plan", "config": {}, "allocations": {}},
+        "documents": [{"id": "doc-r1", "content_digest": "document-digest"}],
+        "workflow": {"states": [{"name": "review", "role": "reviewer", "config": {}}]},
+        "project_settings": {"default_review_config": {
+            "setup_steps": [], "ci_steps": [], "check_timeout_seconds": 1800,
+            "conformance_checks": [], "requirement_ids": [], "requirement_allocations": {},
+        }},
+    });
+    let digest = api_types::review_source_digest(&source, 2).unwrap();
+    for (pointer, value) in [
+        ("/charter/id", serde_json::json!("r2")),
+        (
+            "/charter/content_digest",
+            serde_json::json!("new requirement digest"),
+        ),
+        (
+            "/documents/0/content_digest",
+            serde_json::json!("new acceptance digest"),
+        ),
+        (
+            "/task_scope/allocations",
+            serde_json::json!({"req": {"task_id": "other-task"}}),
+        ),
+        ("/task_scope/title", serde_json::json!("New title")),
+        (
+            "/project_settings/default_review_config/setup_steps",
+            serde_json::json!(["install"]),
+        ),
+        (
+            "/project_settings/default_review_config/check_timeout_seconds",
+            serde_json::json!(60),
+        ),
+        (
+            "/project_settings/default_review_config/conformance_checks",
+            serde_json::json!([{"id": "check", "command": "test", "requirement_ids": ["req"]}]),
+        ),
+    ] {
+        let mut changed = source.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert_ne!(
+            api_types::review_source_digest(&changed, 2).unwrap(),
+            digest,
+            "{pointer}"
+        );
+    }
+    let mut audit = source.clone();
+    audit["reviewer_assignment"] = serde_json::json!({"id": "new-reviewer"});
+    audit["task_scope"]["evidence"] =
+        serde_json::json!({"worklog": ["new report"], "media": ["new attachment"]});
+    audit["task_scope"]["merge_config"] = serde_json::json!("changed target");
+    assert_eq!(api_types::review_source_digest(&audit, 2).unwrap(), digest);
+    // Fingerprint effective commands: overridden Project defaults have no effect.
+    let mut overridden = source.clone();
+    overridden["task_scope"]["config"]["review"] = serde_json::json!({"ci_steps": ["true"]});
+    let override_digest = api_types::review_source_digest(&overridden, 2).unwrap();
+    overridden["project_settings"]["default_review_config"]["ci_steps"] =
+        serde_json::json!(["false"]);
+    assert_eq!(
+        api_types::review_source_digest(&overridden, 2).unwrap(),
+        override_digest
+    );
+    assert!(api_types::review_source_digest(&source, 99).is_err());
+}
+
 #[tokio::test]
 async fn review_authority_rejects_stale_candidate_when_newer_running_candidate_exists() {
     let db = sqlite_db().await;

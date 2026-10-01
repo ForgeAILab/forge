@@ -18,4 +18,8 @@ setup_steps: Array<string>, required_checks: Array<ConformanceCheck>,
  * Per-command limit for the setup steps and required checks. Absent
  * (the default) keeps contracts frozen before the field existed equal.
  */
-check_timeout_seconds?: number, source_digest: string, };
+check_timeout_seconds?: number, 
+/**
+ * Source fingerprint algorithm. Missing means v1 for contracts at rest.
+ */
+source_digest_version?: number, source_digest: string, };

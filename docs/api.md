@@ -3819,13 +3819,19 @@ execution-retry path and eventually exposes a durable recovery blocker; it
 neither dispatches a coder nor grants acceptance. Embedded reviewers get up to
 two follow-up turns to supply a missing result block before that happens.
 
-Policy `forge.review-conformance/3` is the only current contract policy; v1
-and v2 contracts remain historical and require a fresh review before their
+Policy `forge.review-conformance/3` is the only current contract policy; policy
+versions 1 and 2 remain historical and require a fresh review before their
 result can authorize current integration. Assessments stored before this
 response format (with `contract_digest`, `verdict`, `requirements`, and
 `findings`) were migrated in place: their verdict became the `result`, their
 recorded conformance reason the `reason`, and the original JSON is kept as a
 fenced block in `report`.
+
+Contracts expose `context.source_digest_version`, independent of the policy
+version. New contracts use fingerprint version 2, scoped to review authority
+(see [Architecture](architecture.md#charter-conformance-at-review)). A missing
+field means fingerprint version 1 and verifies against the original whole-source
+algorithm, without rewriting stored contracts or forcing a review on upgrade.
 
 `default_review_config` on Project settings and Task review state configuration
 accepts `requirement_ids` and `conformance_checks`. `requirement_ids` names the

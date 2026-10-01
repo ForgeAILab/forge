@@ -235,7 +235,7 @@ impl ReviewRunner {
         // with "pre-review result for required check ci:0 is unavailable".
         // The effective config already drops ci_steps for read-only Tasks.
         let state_config =
-            crate::contract::effective_review_config(&review_source).map_err(|message| {
+            api_types::effective_review_config(&review_source).map_err(|message| {
                 ReviewError::from(serde_json::Error::io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     message,

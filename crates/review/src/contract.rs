@@ -331,7 +331,8 @@ pub fn context_from_source(source: &Value) -> Result<ReviewGoverningContext, Str
         setup_steps,
         required_checks: checks,
         check_timeout_seconds,
-        source_digest: canonical_digest(source).map_err(|e| e.to_string())?,
+        source_digest_version: Some(REVIEW_SOURCE_DIGEST_VERSION),
+        source_digest: review_source_digest(source, REVIEW_SOURCE_DIGEST_VERSION)?,
     };
     if serde_json::to_vec(&context)
         .map_err(|e| e.to_string())?
@@ -584,80 +585,6 @@ async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, Stri
         .map_err(|e| e.to_string())
 }
 
-pub fn effective_review_config(source: &Value) -> Result<Value, String> {
-    let state = source
-        .pointer("/workflow/states")
-        .and_then(Value::as_array)
-        .and_then(|states| {
-            states
-                .iter()
-                .find(|state| state["role"] == "reviewer" || state["name"] == "review")
-        });
-    let state_name = state
-        .and_then(|state| state["name"].as_str())
-        .unwrap_or("review");
-    let mut merged = serde_json::Map::new();
-    if let Some(config) = state.and_then(|state| state.get("config")) {
-        if !config.is_null() {
-            let config = config
-                .as_object()
-                .ok_or("review workflow state config must be an object")?;
-            merged.extend(config.clone());
-        }
-    }
-    if let Some(defaults) = source.pointer("/project_settings/default_review_config") {
-        if !defaults.is_null() {
-            let defaults = defaults
-                .as_object()
-                .ok_or("project default review config must be an object")?;
-            for (key, value) in defaults {
-                merged.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
-    }
-    if let Some(task_config) = source.pointer("/task_scope/config") {
-        if !task_config.is_null() {
-            let task_config = task_config
-                .as_object()
-                .ok_or("Task review config must be an object")?;
-            if let Some(overrides) = task_config.get(state_name) {
-                if !overrides.is_null() {
-                    let overrides = overrides
-                        .as_object()
-                        .ok_or("Task review state config must be an object")?;
-                    for (key, value) in overrides {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
-    }
-    if task_scope_is_read_only(source) {
-        merged.remove("ci_steps");
-        merged.remove("setup_steps");
-    }
-    Ok(Value::Object(merged))
-}
-
-/// Whether the server-owned Task kind or capability forbids repository writes.
-/// Review contracts use the same persisted inputs as execution admission so a
-/// Project's implementation CI defaults do not become requirements for a
-/// discovery or planning Task.
-#[must_use]
-pub fn task_scope_is_read_only(source: &Value) -> bool {
-    matches!(
-        source
-            .pointer("/task_scope/task_type")
-            .and_then(Value::as_str),
-        Some("planning_task" | "discovery")
-    ) || matches!(
-        source
-            .pointer("/task_scope/capability_class")
-            .and_then(Value::as_str),
-        Some("repository_read" | "read_only" | "discovery_read" | "planning_read")
-    )
-}
-
 /// Resolve the review base commit: the point the reviewed branch actually
 /// forked from, not the target branch's current tip. If the reviewer is
 /// handed the tip instead, every file merged into the target branch after
@@ -721,7 +648,8 @@ pub async fn admit(
         .map_err(|e| e.to_string())?
     {
         if existing.policy != REVIEW_CONFORMANCE_POLICY
-            || existing.context != context
+            || existing.context.task_id != task_id
+            || verify_contract_context(db, &existing).await.is_err()
             || existing.commit_sha != commit_sha
             || existing.check_results != check_results
         {
@@ -1327,6 +1255,22 @@ pub async fn project_environment(
         .map_err(|error| format!("invalid Project environment settings: {error}"))
 }
 
+/// Compare review authority using the algorithm frozen in this contract;
+/// prompt/audit context may change without changing review authority.
+async fn verify_contract_context(db: &SqliteDb, contract: &ReviewContract) -> Result<(), String> {
+    let source = db
+        .review_source(&contract.context.task_id, Some(&contract.execution_id))
+        .await
+        .map_err(|error| error.to_string())?;
+    context_from_source(&source)?;
+    if review_source_digest(&source, contract.context.source_digest_version.unwrap_or(1))?
+        != contract.context.source_digest
+    {
+        return Err("review context changed; fresh review required".into());
+    }
+    Ok(())
+}
+
 async fn evaluate_inner(
     db: &SqliteDb,
     path: &Path,
@@ -1338,10 +1282,8 @@ async fn evaluate_inner(
     // Keep the review even when the checks below fail: its Markdown is what
     // the coder or the owner reads next.
     result.assessment = Some(report.clone());
-    if load_context(db, &contract.context.task_id, Some(&contract.execution_id)).await?
-        != contract.context
-        || git_read(path, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha
-    {
+    verify_contract_context(db, contract).await?;
+    if git_read(path, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha {
         return Err("review context or commit changed; fresh review required".into());
     }
     if !git_read(path, &["diff", "--name-only", "HEAD"])
