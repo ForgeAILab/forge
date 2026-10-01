@@ -341,7 +341,7 @@ impl HookAction for ScheduleWorkspaceCleanup {
                 api_types::CleanupPolicy::Immediate => None,
                 api_types::CleanupPolicy::Delayed { seconds } => Some(Duration::from_secs(seconds)),
             })
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
+            .unwrap_or(Duration::ZERO);
         if let Err(error) = cleanup_scheduler.schedule(&workspace_id, delay).await {
             return HookResult::Failed {
                 reason: error.to_string(),

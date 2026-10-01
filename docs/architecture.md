@@ -2106,11 +2106,24 @@ review before retrying integration. A failed or
 blocked child stops the sequence at that child so the Project Agent can inspect
 evidence, reassign it, or otherwise coordinate recovery.
 
-Child terminal/reassignment cleanup never owns the shared root workspace. A
-root cancellation terminalizes active child executions before scheduling root
-cleanup; a scheduled cleanup is deferred while any execution still holds the
-workspace, and a newly admitted sibling clears an older terminal cleanup
-deadline before reusing the branch.
+Forge owns Task workspace cleanup. Entering a terminal workflow state (`done`
+or `cancelled` in the built-in workflows) removes the Task's worktree through
+`git worktree remove --force`, removes its build output, and prunes missing Git
+worktree registrations. Task branches and execution logs are retained; only
+`.codex-managed-home` (including task scratch) is removed from the Task's logs
+directory. Cleanup is deferred while any execution or WorkspaceLease is active.
+A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
+including missing worktrees and managed homes left by older installs; failed
+workspace cleanup is also retried by the deadline worker.
+
+Operators must not delete worktrees based on execution status. A completed or
+failed execution can belong to a Task still in `review` or `merge_failed`, whose
+workspace remains live until the Task itself reaches a terminal workflow state.
+Child terminal/reassignment cleanup never owns the shared root workspace; a
+terminal child releases only its own managed Codex home. A root cancellation
+terminalizes active child executions before root cleanup, and root cleanup also
+waits for every child to become terminal. Reopening a terminal Task waits for
+physical cleanup before its workspace can be rebuilt from the retained branch.
 
 Dependency IDs are separate directed prerequisite-DAG edges. `depends_on_ids`
 on the direct MCP task-creation API (and `depends_on_task_ids` on the native

@@ -185,7 +185,7 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
             state.cleanup = Some(CleanupPolicy::Immediate);
         }
         if state.name == CANCELLED {
-            state.cleanup = Some(CleanupPolicy::Delayed { seconds: 86_400 });
+            state.cleanup = Some(CleanupPolicy::Immediate);
         }
         if state.name == WORKING {
             // A normal first entry has no terminal worker execution to resume, so the
@@ -514,10 +514,7 @@ mod tests {
             .iter()
             .find(|state| state.name == CANCELLED)
             .expect("cancelled state");
-        assert_eq!(
-            cancelled.cleanup,
-            Some(CleanupPolicy::Delayed { seconds: 86_400 })
-        );
+        assert_eq!(cancelled.cleanup, Some(CleanupPolicy::Immediate));
         assert_eq!(
             cancelled
                 .hooks

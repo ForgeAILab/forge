@@ -200,7 +200,7 @@ pub fn default_workflow() -> WorkflowDefinition {
             state.cleanup = Some(CleanupPolicy::Immediate);
         }
         if state.name == default_states::CANCELLED {
-            state.cleanup = Some(CleanupPolicy::Delayed { seconds: 86_400 });
+            state.cleanup = Some(CleanupPolicy::Immediate);
         }
         if state.name == default_states::PLANNING {
             state.dispatch = Some(WorkflowDispatch {
