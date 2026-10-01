@@ -871,11 +871,16 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
     Ok(())
 }
 
+pub(super) struct CiStepFailure {
+    pub error: crate::workspace_backend::WorkspaceBackendError,
+    pub completed_steps: usize,
+}
+
 pub(super) async fn run_ci_steps_in_worktree(
-    workspace: &(impl ::review::ReviewWorkspace + ?Sized),
+    workspace: &crate::workspace_backend::ResolvedWorkspace,
     ci_steps: &[String],
     env: &std::collections::BTreeMap<String, String>,
-) -> Result<(Vec<Value>, Option<usize>), String> {
+) -> Result<(Vec<Value>, Option<usize>), CiStepFailure> {
     let mut results = Vec::with_capacity(ci_steps.len());
 
     for (index, step) in ci_steps.iter().enumerate() {
@@ -884,12 +889,25 @@ pub(super) async fn run_ci_steps_in_worktree(
         // that knows when a step actually ran.
         let started_at = now_rfc3339();
         let output = workspace
-            .run(step, env, None)
+            .backend
+            .run(
+                &workspace.placement,
+                &crate::workspace_backend::RunSpec {
+                    purpose: api_types::WorkspaceRunPurpose::CiStep,
+                    command: step.clone(),
+                    env: env.clone(),
+                    timeout_secs: 0,
+                    max_output_bytes: usize::MAX,
+                },
+            )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CiStepFailure {
+                error,
+                completed_steps: index,
+            })?;
         let finished_at = now_rfc3339();
-        let stderr = executors::environment::redact_environment_values(&output.stderr, env);
-        let stdout = executors::environment::redact_environment_values(&output.stdout, env);
+        let stderr = executors::environment::redact_environment_values(&output.stderr_tail, env);
+        let stdout = executors::environment::redact_environment_values(&output.stdout_tail, env);
         let output_tail = if stdout.is_empty() {
             stderr.clone()
         } else if stderr.is_empty() {
@@ -897,7 +915,11 @@ pub(super) async fn run_ci_steps_in_worktree(
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let exit_code = output.exit_code.unwrap_or(1);
+        let exit_code = if output.exit_code < 0 {
+            1
+        } else {
+            output.exit_code
+        };
         results.push(json!({
             "index": index,
             "command": step,

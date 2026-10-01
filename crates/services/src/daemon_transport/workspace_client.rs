@@ -514,7 +514,6 @@ impl DaemonWorkspaceClient {
         let value = serde_json::json!({"entry_id": entry_id, "operation_id": params["operation_id"], "error": error});
         self.retain_receipt(daemon_id, method, params, &value, "error")
             .await?;
-        self.acknowledge_recorded(daemon_id, &value).await;
         Ok(())
     }
 
@@ -675,28 +674,27 @@ impl DaemonWorkspaceClient {
         Ok(())
     }
 
-    pub(crate) async fn acknowledge_recorded(&self, daemon_id: &str, value: &Value) {
+    async fn acknowledge_receipt(&self, daemon_id: &str, value: &Value) -> Result<()> {
         if self.db.is_none() {
-            return;
+            return Ok(());
         }
-        let Some(entry_id) = value["entry_id"].as_str() else {
-            return;
-        };
-        // A lost acknowledgement is retried from the durable receipt on reconnect.
-        match self.acknowledge(daemon_id, entry_id.to_owned()).await {
-            Ok(result) if result.entry_id == entry_id && result.acknowledged => {
-                if let Err(error) = self.record_acknowledgement(daemon_id, entry_id).await {
-                    tracing::warn!(daemon_id, entry_id, %error, "workspace acknowledgement receipt remains pending");
-                }
-            }
-            Ok(_) => tracing::warn!(
-                daemon_id,
-                entry_id,
-                "owner did not acknowledge the workspace journal entry"
-            ),
-            Err(error) => {
-                tracing::warn!(daemon_id, entry_id, %error, "workspace journal acknowledgement remains pending")
-            }
+        let entry_id = value["entry_id"].as_str().ok_or_else(|| {
+            ServiceError::invalid_operation("workspace receipt has no journal entry")
+        })?;
+        let ack = self.acknowledge(daemon_id, entry_id.to_owned()).await?;
+        if ack.entry_id != entry_id || !ack.acknowledged {
+            return Err(ServiceError::invalid_operation(
+                "owner did not acknowledge workspace journal entry",
+            )
+            .into());
+        }
+        self.record_acknowledgement(daemon_id, entry_id).await
+    }
+
+    pub(crate) async fn acknowledge_recorded(&self, daemon_id: &str, value: &Value) {
+        // An acknowledgement failure never fails a successful owner operation.
+        if let Err(error) = self.acknowledge_receipt(daemon_id, value).await {
+            tracing::warn!(daemon_id, entry_id = ?value["entry_id"], %error, "workspace acknowledgement remains pending");
         }
     }
 
@@ -719,8 +717,8 @@ impl DaemonWorkspaceClient {
         for result in results {
             let result: Value = serde_json::from_str(&result)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            self.acknowledge_recorded(daemon_id, &result["owner_result"])
-                .await;
+            self.acknowledge_receipt(daemon_id, &result["owner_result"])
+                .await?;
         }
         Ok(())
     }
@@ -752,6 +750,7 @@ impl DaemonWorkspaceClient {
                 Ok(value) => value,
                 Err(WorkspaceClientError::Daemon(error)) => {
                     self.retain_error(daemon_id, method, params, &error).await?;
+                    self.retry_acknowledgements(daemon_id).await?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -806,7 +805,7 @@ impl DaemonWorkspaceClient {
                 }
                 _ => unreachable!("query selects only run and merge intents"),
             }
-            self.acknowledge_recorded(daemon_id, &value).await;
+            self.acknowledge_receipt(daemon_id, &value).await?;
         }
         Ok(())
     }
@@ -1027,9 +1026,9 @@ pub(crate) fn validate_merge_result(params: &Value, result: &WorkspaceMergeResul
 }
 
 // Cancellation, queue-send failures, and timeouts must all remove the pending sender.
-struct PendingRequest {
-    connection: DaemonConnection,
-    request_id: String,
+pub(super) struct PendingRequest {
+    pub(super) connection: DaemonConnection,
+    pub(super) request_id: String,
 }
 
 impl Drop for PendingRequest {
@@ -1088,6 +1087,7 @@ pub(crate) mod tests {
         Prepare,
         Describe,
         Run,
+        RunLimits { timed_out: bool, truncated: bool },
         Verify { mismatch: bool },
     }
 
@@ -1166,6 +1166,14 @@ pub(crate) mod tests {
                             "entry_id": "run-entry", "operation_id": params["operation_id"], "exit_code": 0,
                             "stdout": "ok", "stderr": "", "duration_ms": 1, "timed_out": false,
                             "stdout_truncated": false, "stderr_truncated": false,
+                        }),
+                        Reply::RunLimits {
+                            timed_out,
+                            truncated,
+                        } => json!({
+                            "entry_id": "run-entry", "operation_id": params["operation_id"], "exit_code": 0,
+                            "stdout": "", "stderr": "", "duration_ms": 1, "timed_out": timed_out,
+                            "stdout_truncated": truncated, "stderr_truncated": false,
                         }),
                         Reply::Verify { mismatch } => {
                             let probe_content = if let Some(probe) = params.get("probe") {

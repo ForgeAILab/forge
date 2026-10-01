@@ -418,9 +418,7 @@ impl HookAction for DispatchRoleAgent {
                         Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                             reason: "project paused".to_string(),
                         },
-                        Err(error) => HookResult::Failed {
-                            reason: error.to_string(),
-                        },
+                        Err(error) => dispatch_refusal(ctx, error).await,
                     };
                 }
 
@@ -466,9 +464,7 @@ impl HookAction for DispatchRoleAgent {
                     Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                         reason: "project paused".to_string(),
                     },
-                    Err(error) => HookResult::Failed {
-                        reason: error.to_string(),
-                    },
+                    Err(error) => dispatch_refusal(ctx, error).await,
                 }
             }
             Some(assignment)
@@ -648,5 +644,26 @@ impl HookAction for NotifyRoleHolder {
                 reason: "role not assigned".to_string(),
             },
         }
+    }
+}
+
+/// Leave an admitted Task on the scheduler's retry path during owner outages.
+async fn dispatch_refusal(ctx: &HookContext, error: crate::ServiceError) -> HookResult {
+    let reason = error.to_string();
+    let result = async {
+        let task = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("task", &ctx.task_id))?;
+        ctx.task_service
+            .defer_placement_refusal(&task, &error)
+            .await
+    }
+    .await;
+    match result {
+        Ok(true) => HookResult::Skipped { reason },
+        Ok(false) => HookResult::Failed { reason },
+        Err(error) => HookResult::Failed {
+            reason: error.to_string(),
+        },
     }
 }

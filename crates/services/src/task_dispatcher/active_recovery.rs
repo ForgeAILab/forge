@@ -66,6 +66,43 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            if self.task_service.expire_owner_wait(&task).await? {
+                continue;
+            }
+            if task.entry_barrier_json.is_some()
+                && task
+                    .error_annotation
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .is_some_and(|annotation| {
+                        annotation["blocking_reason"] == "review_ci_infrastructure"
+                    })
+            {
+                if db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+                    .await?
+                    .is_some_and(|placement| placement.state == db::PlacementState::Disconnected)
+                {
+                    continue;
+                }
+                if !deferred_dispatch::is_pending(&task, chrono::Utc::now()) {
+                    match self
+                        .task_service
+                        .recover_task(
+                            task.id.clone(),
+                            api_types::RecoveryAction::RetryHook,
+                            Some("retry review CI infrastructure".into()),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(_) => dispatched += 1,
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, %error, "review CI retry remains pending")
+                        }
+                    }
+                }
+                continue;
+            }
             if deferred_dispatch::queued_recovery(&task).is_some() {
                 continue;
             }
@@ -316,6 +353,19 @@ impl TaskDispatcher {
                     {
                         tracing::warn!(task_id = %task.id, %block_error, "failed to block task for workspace reset");
                     }
+                }
+                Err(error)
+                    if crate::placement::admission_refusal_is_retryable(
+                        &self.db, &task.id, &error,
+                    )
+                    .await? =>
+                {
+                    let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                    self.task_service
+                        .defer_placement_refusal(&current, &error)
+                        .await?;
                 }
                 Err(error) if helpers::is_io_or_workspace_error(&error) => {
                     tracing::error!(task_id = %task.id, %error, "task dispatcher recovery blocked task due to workspace error");

@@ -7,6 +7,57 @@ use api_types::*;
 use std::{collections::BTreeMap, path::PathBuf};
 
 impl ResolvedWorkspace {
+    /// A Forge-driven rebase is authoritative HEAD evidence, independent of
+    /// the worker's earlier terminal SHA. Fence it to this physical workspace.
+    pub(crate) async fn record_rebase_head(&self, db: &db::SqliteDb) -> Result<()> {
+        if self.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let Some(daemon_id) = self.placement.execution_daemon_id.as_deref() else {
+                return Ok(());
+            };
+            if db::DaemonRepo::get_by_id(db, daemon_id)
+                .await?
+                .is_none_or(|daemon| {
+                    crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+                })
+            {
+                return Ok(());
+            }
+        }
+        let head = self
+            .backend
+            .describe(&self.placement)
+            .await?
+            .head_sha
+            .ok_or_else(|| ServiceError::invalid_operation("rebased workspace has no HEAD"))?;
+        let changed = sqlx::query(
+            "INSERT INTO workspace_expected_head (placement_id, generation, head_sha, recorded_at)
+             SELECT id, generation, ?, ? FROM workspace_placement
+             WHERE id = ? AND generation = ? AND version = ?
+             ON CONFLICT(placement_id) DO UPDATE SET generation = excluded.generation,
+                 head_sha = excluded.head_sha, recorded_at = excluded.recorded_at",
+        )
+        .bind(head)
+        .bind(db::now_rfc3339())
+        .bind(&self.placement.id)
+        .bind(self.placement.generation)
+        .bind(self.placement.version)
+        .execute(db.pool())
+        .await
+        .map_err(ServiceError::from)?;
+        if changed.rows_affected() != 1 {
+            return Err(db::DbError::VersionConflict.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_head_best_effort(&self, db: &db::SqliteDb) {
+        if let Err(error) = self.record_rebase_head(db).await {
+            tracing::warn!(placement_id = %self.placement.id,
+                daemon_id = ?self.placement.daemon_id.as_ref().or(self.placement.execution_daemon_id.as_ref()),
+                %error, "could not record Forge-established workspace HEAD");
+        }
+    }
+
     pub(crate) fn owner_client(&self) -> Result<&DaemonWorkspaceClient> {
         self.backend
             .daemon_client()

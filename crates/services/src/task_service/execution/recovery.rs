@@ -189,7 +189,10 @@ impl TaskService {
             context: context.clone(),
         };
         match Box::pin(self.apply_recovery_action(task.clone(), action, reason, context)).await {
-            Err(error) if crate::placement::is_capacity_refusal(&error) => {
+            Err(error)
+                if crate::placement::admission_refusal_is_retryable(&self.db, &task.id, &error)
+                    .await? =>
+            {
                 self.queue_recovery_for_capacity(&task, QueuedRecoveryRequest::Recover(request))
                     .await
             }
@@ -252,22 +255,27 @@ impl TaskService {
                     }
                     api_types::RecoveryAction::Reexecute => {
                         if timed_out {
-                            let online = match placement.daemon_id.as_deref() {
-                                Some(daemon_id) => {
-                                    DaemonRepo::get_by_id(&*self.db, daemon_id)
-                                        .await?
-                                        .is_some_and(|daemon| {
-                                            daemon.status == db::DaemonStatus::Online
-                                        })
-                                        && self
-                                            .daemon_connections
-                                            .as_ref()
-                                            .and_then(|registry| registry.get(daemon_id))
-                                            .and_then(|connection| connection.snapshot())
-                                            .is_some_and(|facts| !facts.workspace_incapable)
-                                }
-                                None => false,
-                            };
+                            let online =
+                                match crate::recovery::placement_execution_daemon_id(&placement) {
+                                    Some(daemon_id) => {
+                                        DaemonRepo::get_by_id(&*self.db, daemon_id)
+                                            .await?
+                                            .is_some_and(|daemon| {
+                                                daemon.status == db::DaemonStatus::Online
+                                            })
+                                            && self
+                                                .daemon_connections
+                                                .as_ref()
+                                                .and_then(|registry| registry.get(daemon_id))
+                                                .and_then(|connection| connection.snapshot())
+                                                .is_some_and(|facts| {
+                                                    placement.owner_kind
+                                                        == db::PlacementOwnerKind::Server
+                                                        || !facts.workspace_incapable
+                                                })
+                                    }
+                                    None => false,
+                                };
                             if !online {
                                 return Ok(task);
                             }
@@ -466,7 +474,7 @@ impl TaskService {
                     key: "deferred_dispatch".to_owned(),
                     value: json!({
                         "not_before": now,
-                        "reason": "recovery queued: agent at capacity",
+                        "reason": "recovery queued: waiting for execution capacity or workspace owner",
                         "target_state": task.status,
                     }),
                 },
@@ -480,11 +488,19 @@ impl TaskService {
             context: EventContext::TaskRecovered {
                 project_id: updated.project_id.clone(),
                 reason: match queued.request {
-                    QueuedRecoveryRequest::Recover(request) => request
-                        .reason
-                        .unwrap_or_else(|| format!("{} queued: agent at capacity", request.action)),
+                    QueuedRecoveryRequest::Recover(request) => {
+                        request.reason.unwrap_or_else(|| {
+                            format!(
+                                "{} queued: waiting for execution capacity or workspace owner",
+                                request.action
+                            )
+                        })
+                    }
                     QueuedRecoveryRequest::Resume { resume_reason, .. } => resume_reason
-                        .unwrap_or_else(|| "resume queued: agent at capacity".to_owned()),
+                        .unwrap_or_else(|| {
+                            "resume queued: waiting for execution capacity or workspace owner"
+                                .to_owned()
+                        }),
                 },
             },
         });
@@ -612,15 +628,23 @@ impl TaskService {
         };
         let result = self.dispatch_queued_recovery_inner(task, &queued).await;
         if let Err(error) = &result {
-            if !crate::placement::is_capacity_refusal(error)
-                && !matches!(
-                    error,
-                    ServiceError::Db(
-                        db::DbError::AgentAtCapacity
-                            | db::DbError::VersionConflict
-                            | db::DbError::TaskVersionConflict { .. }
-                    )
+            let claim_race = matches!(
+                error,
+                ServiceError::Db(
+                    db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. }
                 )
+            ) && !db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+                .await?
+                .is_some_and(|placement| {
+                    matches!(
+                        placement.state,
+                        db::PlacementState::Failed
+                            | db::PlacementState::Cleaning
+                            | db::PlacementState::Cleaned
+                    )
+                });
+            if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await?
+                && !claim_race
             {
                 self.restore_failed_queued_recovery(task, &queued, error)
                     .await?;
@@ -814,7 +838,7 @@ impl TaskService {
                 key: "deferred_dispatch".to_owned(),
                 value: json!({
                     "not_before": (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
-                    "reason": "recovery queued: agent at capacity",
+                    "reason": "recovery queued: waiting for execution capacity or workspace owner",
                     "target_state": queued.target_state,
                 }),
             }],
@@ -856,7 +880,9 @@ impl TaskService {
             })
             .await;
         if let Err(error) = &result {
-            if !crate::placement::is_capacity_refusal(error) {
+            if !crate::placement::admission_refusal_is_retryable(&self.db, &claimed.id, error)
+                .await?
+            {
                 // An admission CAS refusal during our own replay can be
                 // permanent. Only a competing scan's claim CAS is retried.
                 self.restore_failed_queued_recovery(&claimed, queued, error)
@@ -2815,10 +2841,15 @@ impl TaskService {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            let actor = if annotation.blocking_reason == "review_ci_infrastructure" {
+                api_types::Actor::system(api_types::SystemComponent::TaskDispatcher)
+            } else {
+                api_types::Actor::user(api_types::UserActionSource::RetryHook)
+            };
             let workflow = WorkflowEngine::resolve_workflow_for_task(
                 &task,
                 &project.workflow_definition,
-                &api_types::Actor::user(api_types::UserActionSource::RetryHook),
+                &actor,
             );
             let engine = WorkflowEngine {
                 db: Arc::clone(&self.db),
@@ -2839,7 +2870,7 @@ impl TaskService {
                     &task.id,
                     task.version,
                     &workflow,
-                    &api_types::Actor::user(api_types::UserActionSource::RetryHook),
+                    &actor,
                     reason.as_deref().unwrap_or("retry_hook"),
                     crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
@@ -3095,6 +3126,7 @@ impl TaskService {
 
         match resolved.rebase_target(&target_branch, false).await? {
             api_types::WorkspaceOwnerOperationOutcome::Rebased => {
+                resolved.record_head_best_effort(&self.db).await;
                 tracing::info!(
                     task_id = %task.id,
                     workspace_id = %workspace.id,

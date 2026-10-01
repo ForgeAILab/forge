@@ -344,8 +344,11 @@ Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
 
 `workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
-placement waits for its owner to reconnect. It defaults to `86400` (24 hours)
-and must be positive. `FORGE_MAX_DISCONNECT_SECONDS` overrides the file value.
+placement, or a server-owned workspace executed on a remote daemon, waits for
+that daemon to reconnect. Both freeze heartbeat leases to prevent a second
+execution from writing to a live worktree on a shared mount. The same bound
+covers a Task queued on an offline owner before its first placement exists.
+It defaults to `86400` (24 hours) and must be positive. `FORGE_MAX_DISCONNECT_SECONDS` overrides the file value.
 After the bound elapses, the placement and running execution fail with
 `owner_disconnected_timeout`; execution hard deadlines still apply during the wait.
 

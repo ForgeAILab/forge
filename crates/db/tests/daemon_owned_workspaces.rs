@@ -270,7 +270,10 @@ async fn migration_backfills_locations_and_non_cleaned_workspaces_without_data_l
         assert_eq!(placement.state, state);
         assert_eq!(placement.version, 1);
         assert_eq!(placement.generation, 1);
-        assert_eq!(placement.reserved_until, None);
+        assert_eq!(
+            placement.reserved_until.is_some(),
+            workspace_id == "creating"
+        );
         assert_eq!(placement.disconnected_at, None);
         assert_eq!(placement.created_at, NOW);
         assert_eq!(placement.updated_at, NOW);
@@ -604,4 +607,21 @@ async fn location_pages_filter_before_pagination_and_counts() {
         RepoLocationRepo::list_by_repo(&db, "repo", page(Some("invalid".to_owned()))).await,
         Err(DbError::InvalidCursor)
     ));
+}
+
+#[tokio::test]
+async fn migration_preparing_placement_has_bounded_reservation() {
+    let db = legacy_database().await;
+    seed_repo(&db, "repo", Some("/checkout/repo")).await;
+    seed_workspace(&db, "creating", "repo", "creating").await;
+    sqlx::raw_sql(MIGRATION).execute(db.pool()).await.unwrap();
+    let placement = WorkspacePlacementRepo::get_by_workspace_id(&db, "creating")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement.state, PlacementState::Preparing);
+    let expiry =
+        chrono::DateTime::parse_from_rfc3339(placement.reserved_until.as_deref().unwrap()).unwrap();
+    let remaining = expiry.signed_duration_since(chrono::Utc::now());
+    assert!(remaining.num_seconds() > 0 && remaining.num_seconds() <= 600);
 }

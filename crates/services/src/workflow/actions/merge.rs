@@ -489,6 +489,7 @@ pub(super) async fn target_moved_result(
         };
     match resolved.rebase_target(target_branch, handoff_conflicts).await {
         Ok(api_types::WorkspaceOwnerOperationOutcome::Rebased) => {
+            resolved.record_head_best_effort(&ctx.db).await;
             if let Err(error) = create_system_comment(ctx,
                 format!("Rebased onto {target_branch} after it advanced during review: {reason}"))
                 .await
@@ -504,6 +505,7 @@ pub(super) async fn target_moved_result(
             format!("{reason}; worktree has uncommitted changes and cannot be rebased"), api_types::FailureKind::DirtyWorktree).await,
         Ok(api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths }) => {
             if handoff_conflicts && !conflict_paths.is_empty() {
+                resolved.record_head_best_effort(&ctx.db).await;
                 conflict_handoff_result(ctx, task, target_branch, &conflict_paths).await
             } else {
                 merge_failure_result(ctx, task, format!("rebase onto {target_branch} conflicted: {details}"), api_types::FailureKind::MergeConflict).await

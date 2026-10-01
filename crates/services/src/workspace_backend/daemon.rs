@@ -169,9 +169,9 @@ impl DaemonWorkspaceBackend {
     ) -> WorkspaceBackendError {
         let daemon_id = placement.daemon_id.clone().unwrap_or_default();
         match error {
-            WorkspaceClientError::Transport(
-                ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. },
-            ) => WorkspaceBackendError::OwnerUnreachable { daemon_id },
+            WorkspaceClientError::Transport(ServiceError::DaemonUnavailable { .. }) => {
+                WorkspaceBackendError::OwnerUnreachable { daemon_id }
+            }
             WorkspaceClientError::Transport(error) => error.into(),
             WorkspaceClientError::Daemon(error) => match error.code.as_str() {
                 api_types::STALE_GENERATION => WorkspaceBackendError::StaleGeneration {
@@ -187,10 +187,14 @@ impl DaemonWorkspaceBackend {
                         purpose: purpose.expect("run purpose checked"),
                     }
                 }
-                api_types::DAEMON_UNAVAILABLE
-                | api_types::DAEMON_TIMEOUT
-                | "disconnected"
-                | "timeout" => WorkspaceBackendError::OwnerUnreachable { daemon_id },
+                api_types::DAEMON_UNAVAILABLE | "disconnected"
+                    if !error
+                        .details
+                        .as_ref()
+                        .is_some_and(|details| details["interrupted"] == true) =>
+                {
+                    WorkspaceBackendError::OwnerUnreachable { daemon_id }
+                }
                 "version_conflict" => db::DbError::VersionConflict.into(),
                 // The shared backend error contract represents path refusals as InvalidOperation.
                 _ => ServiceError::invalid_operation(format!("{}: {}", error.code, error.message))
@@ -244,8 +248,20 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
     ) -> Result<PreparedWorkspace> {
         let workspace = self.workspace(placement).await?;
         // Initial owner-local version is stable across placement lifecycle CAS updates.
-        let expected = WorkspaceOperationExpected::Version { version: 0 };
-        let operation_id = operation_id(placement, api_types::METHOD_WORKSPACE_PREPARE);
+        let recovering = placement.state == db::PlacementState::Ready;
+        let expected = if recovering {
+            WorkspaceOperationExpected::BaseSha {
+                sha: base.base_ref.clone(),
+            }
+        } else {
+            WorkspaceOperationExpected::Version { version: 0 }
+        };
+        let operation_id = if recovering {
+            // A prior preparation receipt must not hide a deleted directory.
+            db::new_uuid_v4()
+        } else {
+            operation_id(placement, api_types::METHOD_WORKSPACE_PREPARE)
+        };
         let result = self
             .client
             .prepare(
@@ -260,7 +276,22 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
                 },
             )
             .await
-            .map_err(|error| Self::error(placement, None, error))?;
+            .map_err(|error| match &error {
+                WorkspaceClientError::Daemon(error)
+                    if recovering
+                        && matches!(
+                            error.code.as_str(),
+                            api_types::INVALID_INPUT | "version_conflict"
+                        ) =>
+                {
+                    ServiceError::WorkspaceResetRequired {
+                        task_id: placement.task_id.clone(),
+                        reason: error.message.clone(),
+                    }
+                    .into()
+                }
+                _ => Self::error(placement, None, error),
+            })?;
         self.check_operation(&operation_id, &result.operation_id)?;
         self.prepared(placement, result.workspace)
     }
@@ -302,7 +333,20 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             )
             .into());
         }
-        let expected = self.current_expected(placement).await?;
+        let expected = self
+            .current_expected(placement)
+            .await
+            .map_err(|error| match error {
+                WorkspaceBackendError::Other(ref service)
+                    if matches!(**service, ServiceError::DaemonTimeout { .. }) =>
+                {
+                    WorkspaceBackendError::RpcTimeoutBeforeStart {
+                        daemon_id: placement.daemon_id.clone().unwrap_or_default(),
+                        method: api_types::METHOD_WORKSPACE_DESCRIBE.to_owned(),
+                    }
+                }
+                error => error,
+            })?;
         let operation_id = db::new_uuid_v4();
         let result = self
             .client
@@ -658,7 +702,19 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
     }
 
     async fn cleanup(&self, placement: &WorkspacePlacement) -> Result<CleanupAck> {
-        let state = self.describe(placement).await?;
+        // Cleaning is the durable cleanup intent. A replayed, acknowledged
+        // cleanup may already have retired the owner's handle.
+        let unknown_handle = |error: &WorkspaceBackendError| {
+            placement.state == db::PlacementState::Cleaning
+                && matches!(error, WorkspaceBackendError::Other(error)
+                if matches!(&**error, ServiceError::InvalidOperation { message }
+                    if message == "invalid_input: unknown workspace_handle"))
+        };
+        let state = match self.describe(placement).await {
+            Ok(state) => state,
+            Err(error) if unknown_handle(&error) => return Ok(CleanupAck { removed: false }),
+            Err(error) => return Err(error),
+        };
         let sha = match state.head_sha {
             Some(sha) => Some(sha),
             None => self.workspace(placement).await?.before_sha,
@@ -670,7 +726,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             },
         };
         let operation_id = db::new_uuid_v4();
-        let result = self
+        let result = match self
             .client
             .cleanup(
                 self.owner(placement)?.0,
@@ -680,7 +736,12 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
                 },
             )
             .await
-            .map_err(|error| Self::error(placement, None, error))?;
+            .map_err(|error| Self::error(placement, None, error))
+        {
+            Ok(result) => result,
+            Err(error) if unknown_handle(&error) => return Ok(CleanupAck { removed: false }),
+            Err(error) => return Err(error),
+        };
         self.check_generation(placement, result.generation)?;
         if result.workspace_handle != workspace_handle(placement)? {
             return Err(WorkspaceBackendError::WrongOwner {
@@ -984,6 +1045,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_acknowledged_handle_is_already_cleaned_only_with_intent() {
+        for cleaning in [true, false] {
+            let daemon = ScriptedDaemon::new(vec![rejection(
+                "invalid_input",
+                "unknown workspace_handle",
+                None,
+            )]);
+            let backend = backend(&daemon).await;
+            let mut placement = placement();
+            placement.state = if cleaning {
+                db::PlacementState::Cleaning
+            } else {
+                db::PlacementState::Ready
+            };
+            let result = backend.cleanup(&placement).await;
+            if cleaning {
+                assert!(!result.unwrap().removed);
+            } else {
+                assert!(result.is_err());
+            }
+            daemon.finish().await;
+        }
+    }
+
+    #[tokio::test]
     async fn successive_runs_get_fresh_fenced_operation_ids() {
         let daemon = ScriptedDaemon::new(vec![
             Reply::Describe,
@@ -1041,5 +1127,50 @@ mod tests {
         assert_eq!(state.active_execution_ids, vec!["active"]);
         assert_eq!(state.journaled_execution_ids, vec!["finished"]);
         daemon.finish().await;
+    }
+    #[tokio::test]
+    async fn daemon_transport_review_command_limits_are_permanent_failures() {
+        for (timed_out, truncated, expected) in [
+            (true, false, "review command timed out"),
+            (false, true, "review command output exceeds size budget"),
+        ] {
+            let daemon = ScriptedDaemon::new(vec![
+                Reply::Describe,
+                Reply::RunLimits {
+                    timed_out,
+                    truncated,
+                },
+            ]);
+            let spec = RunSpec {
+                purpose: WorkspaceRunPurpose::CiStep,
+                command: "ci".into(),
+                env: BTreeMap::new(),
+                timeout_secs: 1,
+                max_output_bytes: 1024,
+            };
+            let error = backend(&daemon)
+                .await
+                .run(&placement(), &spec)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WorkspaceBackendError::Other(ref service)
+                if matches!(**service, ServiceError::InvalidOperation { ref message } if message == expected)));
+            assert_eq!(daemon.requests().len(), 2);
+            daemon.finish().await;
+        }
+    }
+
+    #[test]
+    fn daemon_transport_review_interrupted_command_is_not_owner_unreachable() {
+        let error = DaemonWorkspaceBackend::error(
+            &placement(),
+            Some(WorkspaceRunPurpose::CiStep),
+            WorkspaceClientError::Daemon(api_types::DaemonErrorPayload {
+                code: api_types::DAEMON_UNAVAILABLE.into(),
+                message: "command interrupted".into(),
+                details: Some(json!({"interrupted": true})),
+            }),
+        );
+        assert!(matches!(error, WorkspaceBackendError::Other(_)));
     }
 }

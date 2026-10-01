@@ -3845,6 +3845,144 @@ async fn seed_admitted_review_with(
     (db, service, task, execution, repo_dir)
 }
 
+#[tokio::test]
+async fn daemon_placement_reviewer_completion_evaluates_through_owner() {
+    use crate::workspace_backend::DaemonWorkspaceBackend;
+    let (db, service, task, execution, repo_dir) = seed_admitted_review().await;
+    let (_, owner, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    let workspace_id = execution.workspace_id.as_deref().unwrap();
+    let repo_id: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id = ?")
+        .bind(workspace_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let location = db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Daemon,
+            daemon_id: owner.daemon_id.clone(),
+            runtime_id: owner.runtime_id.clone(),
+            path: "/owner-only/repo".into(),
+            kind: db::RepoLocationKind::PrimaryCheckout,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::WorkspacePlacementRepo::create(
+        &*db,
+        db::CreateWorkspacePlacement {
+            id: new_uuid_v4(),
+            workspace_id: workspace_id.into(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            owner_kind: db::PlacementOwnerKind::Daemon,
+            daemon_id: owner.daemon_id.clone(),
+            runtime_id: owner.runtime_id,
+            repo_location_id: location.id,
+            execution_daemon_id: owner.daemon_id.clone(),
+            workspace_handle: Some("opaque-review-owner".into()),
+            generation: 1,
+            state: db::PlacementState::Ready,
+            selected_by: db::PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".into(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let daemon_id = owner.daemon_id.unwrap();
+    let (connection_id, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    let sha = git::get_current_sha(repo_dir.path()).await.unwrap();
+    let evidence_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder = {
+        let registry = registry.clone();
+        let evidence_reads = evidence_reads.clone();
+        tokio::spawn(async move {
+            while let Some(api_types::DaemonFrame::Request { id, method, params }) =
+                outbound.recv().await
+            {
+                assert_eq!(params["workspace_handle"], "opaque-review-owner");
+                let result = match method.as_str() {
+                    api_types::METHOD_WORKSPACE_DESCRIBE => {
+                        json!({"workspace_handle": "opaque-review-owner", "generation": 1,
+                        "exists": true, "head_sha": sha, "dirty": false, "branch": "review-candidate", "locked": false,
+                        "active_execution_ids": [], "journaled_execution_ids": []})
+                    }
+                    api_types::METHOD_WORKSPACE_READ => {
+                        evidence_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        match params["query"]["kind"].as_str().unwrap() {
+                            "head" | "resolve_ref" | "merge_base" => {
+                                json!({"kind": "git", "output": format!("{sha}\n")})
+                            }
+                            "tracked_changes" | "candidate_paths" => {
+                                json!({"kind": "git", "output": ""})
+                            }
+                            query => panic!("unexpected conformance query: {query}"),
+                        }
+                    }
+                    method => panic!("unexpected reviewer owner operation: {method}"),
+                };
+                registry.dispatch_incoming_for_connection(
+                    &daemon_id,
+                    connection_id,
+                    api_types::DaemonFrame::Response { id, result },
+                );
+            }
+        })
+    };
+    let router = (*service.workspace_backend_router())
+        .clone()
+        .with_daemon(Arc::new(DaemonWorkspaceBackend::new(db.clone(), registry)));
+    let service = service.with_workspace_backend_router(Arc::new(router));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        complete_review_with(
+            &db,
+            &service,
+            &execution,
+            r#"{"result":"pass","reason":"acceptance satisfied"}"#,
+        ),
+    )
+    .await
+    .unwrap();
+    responder.abort();
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(review.status, ReviewStatus::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert!(evidence_reads.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "merging"
+    );
+}
+
 /// Complete the reviewer execution with `reply` and run the review cascade.
 async fn complete_review_with(
     db: &SqliteDb,

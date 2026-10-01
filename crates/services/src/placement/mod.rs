@@ -11,8 +11,8 @@ pub use selection::{
     SelectionOutcome, SelectionReason, SelectionRule, ServerFacts, WorktreeAgent,
 };
 
-/// Recovery queues a refusal only when an otherwise compatible owner is full.
-pub(crate) fn is_capacity_refusal(error: &crate::ServiceError) -> bool {
+/// Classify selection filters; transport errors also require placement state.
+pub(crate) fn is_retryable_admission_refusal(error: &crate::ServiceError) -> bool {
     match error {
         crate::ServiceError::Db(db::DbError::AgentAtCapacity) => true,
         crate::ServiceError::PlacementUnavailable(refusal) => {
@@ -23,7 +23,15 @@ pub(crate) fn is_capacity_refusal(error: &crate::ServiceError) -> bool {
                             code,
                             PlacementFilterCode::AgentCapacity
                                 | PlacementFilterCode::DaemonCapacity
-                        )
+                                | PlacementFilterCode::OwnerUnreachable
+                        ) || (candidate
+                            .filter_codes
+                            .contains(&PlacementFilterCode::OwnerUnreachable)
+                            && matches!(
+                                code,
+                                PlacementFilterCode::WorkspaceProtocolMissing
+                                    | PlacementFilterCode::ExecutorUnavailable
+                            ))
                     })
             })
         }
@@ -31,11 +39,62 @@ pub(crate) fn is_capacity_refusal(error: &crate::ServiceError) -> bool {
     }
 }
 
+pub(crate) async fn admission_refusal_is_retryable(
+    db: &db::SqliteDb,
+    task_id: &str,
+    error: &crate::ServiceError,
+) -> crate::Result<bool> {
+    let placement = db::WorkspacePlacementRepo::get_for_task(db, task_id).await?;
+    if matches!(
+        error,
+        crate::ServiceError::DaemonUnavailable { .. }
+            | crate::ServiceError::DaemonTimeout { .. }
+            | crate::ServiceError::Db(db::DbError::VersionConflict)
+    ) && placement.as_ref().is_some_and(|placement| {
+        matches!(
+            placement.state,
+            db::PlacementState::Cleaning | db::PlacementState::Cleaned | db::PlacementState::Failed
+        )
+    }) {
+        return Ok(false);
+    }
+    Ok(match error {
+        crate::ServiceError::DaemonUnavailable { daemon_id } => {
+            placement.as_ref().is_none_or(|placement| {
+                placement
+                    .daemon_id
+                    .as_deref()
+                    .or(placement.execution_daemon_id.as_deref())
+                    == Some(daemon_id.as_str())
+                    && matches!(
+                        placement.state,
+                        db::PlacementState::Ready | db::PlacementState::Disconnected
+                    )
+            })
+        }
+        crate::ServiceError::DaemonTimeout { daemon_id, method } => {
+            method != api_types::METHOD_WORKSPACE_RUN
+                && placement.as_ref().is_some_and(|placement| {
+                    placement
+                        .daemon_id
+                        .as_deref()
+                        .or(placement.execution_daemon_id.as_deref())
+                        == Some(daemon_id.as_str())
+                        && matches!(
+                            placement.state,
+                            db::PlacementState::Ready | db::PlacementState::Disconnected
+                        )
+                })
+        }
+        _ => is_retryable_admission_refusal(error),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn placement_recovery_queues_only_capacity_refusals() {
+    fn placement_recovery_queues_transient_owner_and_capacity_refusals() {
         let error = |codes| {
             crate::ServiceError::PlacementUnavailable(PlacementUnavailable {
                 task_id: "task".into(),
@@ -49,16 +108,82 @@ mod tests {
                 }],
             })
         };
-        assert!(is_capacity_refusal(&error(vec![
+        assert!(is_retryable_admission_refusal(&error(vec![
             PlacementFilterCode::AgentCapacity
         ])));
-        assert!(is_capacity_refusal(&error(vec![
+        assert!(is_retryable_admission_refusal(&error(vec![
             PlacementFilterCode::DaemonCapacity
         ])));
-        assert!(!is_capacity_refusal(&error(vec![
+        assert!(!is_retryable_admission_refusal(&error(vec![
             PlacementFilterCode::AgentCapacity,
             PlacementFilterCode::ExecutorUnavailable
         ])));
-        assert!(!is_capacity_refusal(&error(vec![])));
+        assert!(!is_retryable_admission_refusal(&error(vec![])));
+        assert!(is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::OwnerUnreachable
+        ])));
+        assert!(is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::OwnerUnreachable,
+            PlacementFilterCode::WorkspaceProtocolMissing,
+            PlacementFilterCode::ExecutorUnavailable
+        ])));
+        assert!(!is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::LocationNotReady
+        ])));
+        assert!(!is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::OwnerUnreachable,
+            PlacementFilterCode::PinMismatch
+        ])));
+    }
+    #[tokio::test]
+    async fn placement_terminal_owner_states_are_permanent_admission_refusals() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        let (task, mut placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let unavailable = crate::ServiceError::DaemonUnavailable {
+            daemon_id: placement.daemon_id.clone().unwrap(),
+        };
+        assert!(admission_refusal_is_retryable(&db, &task.id, &unavailable)
+            .await
+            .unwrap());
+        for state in [
+            db::PlacementState::Failed,
+            db::PlacementState::Cleaning,
+            db::PlacementState::Cleaned,
+        ] {
+            let mut update = admission::placement_update(&placement);
+            update.state = Some(state);
+            placement = db::WorkspacePlacementRepo::update(&db, update)
+                .await
+                .unwrap();
+            assert!(!admission_refusal_is_retryable(&db, &task.id, &unavailable)
+                .await
+                .unwrap());
+            assert!(!admission_refusal_is_retryable(
+                &db,
+                &task.id,
+                &crate::ServiceError::DaemonTimeout {
+                    daemon_id: placement.daemon_id.clone().unwrap(),
+                    method: api_types::METHOD_WORKSPACE_DESCRIBE.into(),
+                }
+            )
+            .await
+            .unwrap());
+            assert!(admission_refusal_is_retryable(
+                &db,
+                &task.id,
+                &crate::ServiceError::Db(db::DbError::AgentAtCapacity)
+            )
+            .await
+            .unwrap());
+            assert!(!admission_refusal_is_retryable(
+                &db,
+                &task.id,
+                &crate::ServiceError::Db(db::DbError::VersionConflict)
+            )
+            .await
+            .unwrap());
+        }
     }
 }

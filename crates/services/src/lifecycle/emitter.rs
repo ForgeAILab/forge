@@ -372,6 +372,11 @@ impl LifecycleEventEmitter {
                 LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await
             }
         }
+        if hooks.iter().any(|hook| matches!(hook, api_types::LifecycleHookDef::Plugin { name, enabled: true, .. } if name == "knowledge-capture")) {
+            if let Some(resolved) = resolved.as_ref() {
+                resolved.record_head_best_effort(&self.db).await;
+            }
+        }
         Ok(())
     }
 

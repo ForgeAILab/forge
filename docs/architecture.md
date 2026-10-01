@@ -1993,6 +1993,10 @@ Claim admission runs **reserve → prepare → start**:
 3. A claim transaction checks the ready placement's version and capacity, then
    creates the Task claim, Running Execution, and lease together.
 
+Backfilled `preparing` reservations expire after ten minutes. The reservation
+sweep also reclaims crash-orphaned `reserved` or `preparing` rows without an
+explicit expiry after ten minutes from their last update.
+
 Candidates must pass reachability and visibility, executor availability and
 adapter capability facts, daemon `workspace.v1` support, run policy, Agent pin,
 capacity, and the daemon placement limits. Missing adapter facts mean unsupported.
@@ -2005,11 +2009,31 @@ default location → server-owned → `(created_at, id)`. The selection reason r
 the winning rule and rejected candidates with filter codes. If no owner is
 eligible, claim returns structured `placement_unavailable`; there is no silent
 fallback.
+Automatic dispatch keeps transient owner-unreachable or capacity refusals queued
+on the same owner. Before the first placement exists, an offline owner creates
+Task-scoped `runtime_offline` Attention and a durable wait bounded by
+`workspace.max_disconnect_seconds`; expiry blocks the Task visibly. Explicit
+recovery preserves the offline-Agent refusal even at capacity. Capacity recovery
+uses `queued_recovery`; permanent replay refusals restore its original blocker.
+The active scan retries structural placement refusals, because location,
+executor, handshake, and run-policy changes can fix them without editing a Task.
+On state entry, a structural refusal still rolls the transition back with
+`dispatch_failed`; only retryable owner/capacity refusals defer dispatch.
+Stable governance refusals use `metadata.dispatch_disposition` with the safe
+reason, and remain parked until their authority changes or dispatch is woken.
 
 After preparation, placement is sticky through retries, re-review, and recovery.
 A subtask sharing its root workspace inherits the same placement; an incompatible
-Agent fails admission. Reclaim describes the existing ready workspace rather than
-preparing another. States progress from `reserved` to `preparing` to `ready`,
+Agent fails admission. Reclaim describes the existing ready workspace. If its
+directory was deleted or its Git metadata is damaged, claim, resume, recovery
+launch, and review-CI preparation
+recreate the worktree from its surviving Task branch through the recorded owner;
+daemon owners receive a fenced
+`workspace.prepare` request with the recorded base SHA. Missing branches or
+incompatible history require an explicit workspace reset. A child preserves its
+root's shared workspace row when its branch is missing. Merge, target-moved
+rebase, and other gate reads retain their existing reset/readiness behavior.
+States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
 Cleanup moves through `cleaning` to `cleaned`; failures use `failed`.
 Updates use optimistic `version`
@@ -2025,7 +2049,12 @@ generation again.
 `V202610010400__daemon_owned_workspaces.sql` preserves existing data: server primary
 locations are backfilled from `Repo.local_path`, and non-cleaned workspaces gain
 server placements with `selected_by = backfill` and their existing worktree path
-as the handle. Managed clones acquire a location when first used. Server paths
+as the handle. Remote-only repositories gain an `unverified` managed-clone
+location. The first embedded admission clones or verifies it outside the
+admission transaction and marks it ready before selecting it. Verification uses
+the same physical-path lock as clone/worktree writers, checks that a managed
+clone is a checkout with the repository's matching remote, retries location CAS
+conflicts, and persists clone errors with exponential retry backoff. Server paths
 remain embedded backend details, not remote workspace addresses.
 
 ### Daemon command transport
@@ -2156,12 +2185,24 @@ requeue or rebuild them on another machine. Running leases are suspended:
 heartbeat loss cannot expire them or discard a retained terminal report.
 `max_disconnect` (default 24 hours) ends the wait with
 `owner_disconnected_timeout`; the execution's hard deadline still applies.
+This also applies to server-owned workspaces executed on a remote daemon.
 
 On reconnect, `workspace.describe` supplies workspace state plus active and
 journaled execution IDs. Forge drains retained results first, resumes leases
 for active executions, applies finished reports once, and fails an unknown
 execution with `owner_lost_execution`. It compares HEAD with recorded evidence
-before returning the placement to `ready` and waking dispatch. A periodic sweep
+before returning the placement to `ready` and waking dispatch. Forge records
+the HEAD produced by its own rebase and knowledge-capture commit as
+generation-bound evidence in `workspace_expected_head` (`V202610010530`) for
+remote owners/providers. Evidence uses the execution's immutable terminal time,
+so later edits to an old execution cannot supersede a rebase head. A recording
+failure is logged without failing the successful Git operation; reconciliation
+may then require an explicit reset.
+Terminal reports are acknowledged only after their Task cascade commits. A
+report received during suspension stays unacknowledged until reconciliation and
+cascade settlement finish; retained reports can replay after a cascade failure
+or server restart.
+A periodic sweep
 retries reconciliation for disconnected placements whose owner is online, so
 an interrupted reconnect can finish after a server restart. The workspace cleanup
 scheduler is the sole periodic retry owner for `cleaning` placements; it retains
@@ -2169,6 +2210,21 @@ the cleanup backoff and waits for an owner acknowledgement. A stale, still-open 
 before reconciliation RPCs resume. Server-owned shared mounts use the embedded
 backend to describe HEAD after the remote provider's retained terminal report
 settles. Late terminal CAS losers cannot replace an accepted outcome.
+The heartbeat monitor completes its core liveness pass before placement
+maintenance. Owner reconciliation runs detached from the tick, grouped by
+daemon, with per-placement in-flight guards and at most two concurrent owner
+workers (leaving capacity in the five-connection SQLite pool). Each RPC has its
+own transport deadline; the aggregate reconcile/cascade has no cancelling
+timeout. Terminal reservations and pending RPC entries are released on drop.
+Readiness, Attention resolution, and dispatch wakes commit in one transaction.
+The ready-placement sweep considers only retained terminal reports and placements
+reconciled in the last minute. It skips a busy Task cascade without waiting and
+ends an owner's batch on its first transport timeout or unavailability. The
+monitor aborts its owner workers on stop. Workspace-operation acknowledgement
+receipts survive a restart; execution-report acknowledgement retries use retained
+in-memory reports, so after a server restart they resume when the daemon replays.
+Ignored execution reports are acknowledged only after the execution is terminal
+or carries an owner-failure cause.
 
 Placement and transport failures do not spend the Task retry budget.
 `placement_unavailable` and `prepare_failed` create no Execution;
@@ -2183,7 +2239,9 @@ Cleanup goes through the placement backend. An offline owner's placement stays
 `cleaned`. Immediate cleanup retries a placement version conflict within its
 existing timeout, so concurrent disconnect or reconciliation does not discard
 the cleanup request. A retry of an already cleaned daemon workspace also drains
-retained journal acknowledgements.
+retained journal acknowledgements. With a persisted `cleaning` intent, an owner's
+`invalid_input: unknown workspace_handle` response means cleanup already finished;
+other unknown-handle responses remain errors.
 
 Remote output, reasoning, and tool notifications update semantic progress
 when accepted, but a quiet remote execution remains healthy while its lease is
@@ -2734,6 +2792,21 @@ do not consume budget. Both `reset_retry_window` and the stronger
 `reset_to_initial` recovery action establish a new audit boundary, so a full
 Task reset restores every gate's retry window rather than carrying an exhausted
 merge/review budget back to `todo`.
+
+Review-CI infrastructure retry applies only to a typed unreachable owner or an
+RPC timeout before a CI command was sent. It spends no review rejection budget
+and creates no Review row if CI never ran. Barrier, annotation, persisted
+attempt count, and deferral commit atomically under Task/Project authority.
+Automatic retries back off from five seconds exponentially, stop after five
+connected-owner failures, and park with a blocker and `execution_failed` Attention
+whose details name the cause. Disconnected placements wait on the same owner
+without spending that cap; reconnect re-arms an exhausted barrier atomically
+with readiness and resolves its Attention. Successful
+retry clears the barrier and annotation. Command timeout, output-size refusal,
+repository mismatch, and not-ready/failed/cleaned workspaces are permanent
+runner refusals, not infrastructure retries. Reset-required workspaces offer
+`reset_to_initial`. Embedded authority-loss cancellation and user review-entry
+behavior retain their existing routing; genuine CI failures charge a rejection.
 
 When a reviewer execution fails, Forge first schedules the next bounded execution
 retry and keeps the Review running. Once retries are exhausted or disabled it

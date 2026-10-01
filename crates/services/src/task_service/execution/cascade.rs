@@ -72,6 +72,18 @@ impl TaskService {
         }
     }
 
+    /// A sweep must never wait behind another Task cascade while holding an owner permit.
+    pub(crate) async fn try_cascade_executor_completion(&self, execution_id: &str) -> Result<bool> {
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(true);
+        };
+        let Some(_slot) = self.claim_completion_cascade(&execution.task_id) else {
+            return Ok(false);
+        };
+        self.cascade_executor_completion(execution_id).await?;
+        Ok(true)
+    }
+
     pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
         self.completion_cascades
             .lock()

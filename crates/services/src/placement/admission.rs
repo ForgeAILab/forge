@@ -44,8 +44,8 @@ pub(crate) async fn sweep_expired_reservations_in_tx(
 ) -> Result<u64> {
     let rows = sqlx::query(
         "SELECT id, version FROM workspace_placement
-         WHERE state IN ('reserved', 'preparing') AND reserved_until IS NOT NULL
-           AND julianday(reserved_until) <= julianday(?)",
+         WHERE state IN ('reserved', 'preparing')
+           AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?)",
     )
     .bind(now)
     .fetch_all(&mut **transaction)
@@ -56,7 +56,7 @@ pub(crate) async fn sweep_expired_reservations_in_tx(
         let version: i64 = row.try_get("version")?;
         let result = sqlx::query(
             "UPDATE workspace_placement SET state = 'failed', failure_cause = 'prepare_failed',
-                 reserved_until = NULL, version = version + 1, updated_at = ?
+                 reserved_until = NULL, workspace_handle = NULL, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND state IN ('reserved', 'preparing')",
         )
         .bind(now)
@@ -156,5 +156,48 @@ pub(crate) async fn record_fence_rejection(
         },
     )
     .await?;
+    Ok(())
+}
+
+pub(crate) async fn record_wait_attention_in_tx(
+    db: &SqliteDb,
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &db::Task,
+    kind: &str,
+    reason: &str,
+    dedupe_key: &str,
+) -> Result<()> {
+    let now = db::now_rfc3339();
+    let event = DomainEventRepo::append_event_in_tx(
+        db,
+        tx,
+        &db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: format!("task.{kind}"),
+            entity_type: "task".into(),
+            entity_id: task.id.clone(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: task.project_id.clone(),
+            correlation_id: task.id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("{dedupe_key}:{}", task.version)),
+            payload_json: json!({"task_id": task.id, "cause": reason}).to_string(),
+            created_at: now.clone(),
+        },
+    )
+    .await?;
+    sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id,
+        source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at,
+        updated_at, recommended_action, source_sequence)
+        VALUES (?, ?, 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'recover_task', ?)
+        ON CONFLICT(dedupe_key) DO UPDATE SET summary = excluded.summary, details_json = excluded.details_json,
+        source_event_id = excluded.source_event_id, status = 'open', resolved_at = NULL,
+        updated_at = excluded.updated_at, version = attention_projection.version + 1")
+        .bind(db::new_uuid_v4()).bind(kind).bind(&task.project_id).bind(&event.id)
+        .bind(reason).bind(json!({"task": {"id": task.id, "title": task.title}, "cause": reason}).to_string())
+        .bind(dedupe_key).bind(&now).bind(&now).bind(event.sequence).execute(&mut **tx).await?;
     Ok(())
 }

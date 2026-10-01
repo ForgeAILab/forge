@@ -326,6 +326,9 @@ fn filter_candidate(
 
     let mut filters = BTreeSet::new();
     let daemon_owned = candidate.location.owner_kind == RepoLocationOwnerKind::Daemon;
+    // An offline owner's missing handshake is unknown capability/policy
+    // evidence, not a permanent refusal. Admission still fails closed below.
+    let owner_facts_known = candidate.embedded_execution || candidate.negotiated_revision.is_some();
     if !candidate.connected
         || !candidate.runtime_ready
         || (daemon_owned
@@ -362,13 +365,14 @@ fn filter_candidate(
     if let Some(binding) = context.binding() {
         if !matches_placement(candidate, binding) {
             filters.insert(PinMismatch);
-        } else if matches!(
-            binding.state,
-            PlacementState::Disconnected | PlacementState::Cleaning
-        ) {
+        } else if matches!(binding.state, PlacementState::Disconnected) {
             // Reconnection must reconcile the durable placement before a new
             // execution can start, even if its command socket is already up.
             filters.insert(OwnerUnreachable);
+        } else if binding.state == PlacementState::Cleaning
+            || binding.state == PlacementState::Failed
+        {
+            filters.insert(LocationNotReady);
         }
     }
     for role in context.agents() {
@@ -385,7 +389,7 @@ fn filter_candidate(
             continue;
         }
         match candidate.executors.get(&role.agent.id) {
-            Some(facts) if facts.available() => {
+            Some(facts) if facts.available() && owner_facts_known => {
                 if !facts.covers(&role.required_capabilities) {
                     filters.insert(CapabilityMissing);
                 }
@@ -411,10 +415,11 @@ fn filter_candidate(
     if daemon_owned && context.repo.work_mode != WorkMode::DirectMerge {
         filters.insert(WorkModeUnsupported);
     }
-    if context
-        .needed_run_purposes
-        .iter()
-        .any(|purpose| !candidate.allowed_run_purposes.contains(purpose))
+    if (!daemon_owned || owner_facts_known)
+        && context
+            .needed_run_purposes
+            .iter()
+            .any(|purpose| !candidate.allowed_run_purposes.contains(purpose))
     {
         filters.insert(RunPurposeDenied);
     }
@@ -1172,6 +1177,34 @@ mod tests {
             .unwrap()
             .capabilities = ExecutorAdapterCapabilityFacts::default();
         rejected(&context, PlacementFilterCode::CapabilityMissing);
+    }
+
+    #[test]
+    fn offline_owner_missing_handshake_is_a_retryable_placement_refusal() {
+        let mut context = context();
+        let owner = &mut context.candidates[0];
+        owner.connected = false;
+        owner.negotiated_revision = None;
+        owner.workspace_v1 = false;
+        owner.allowed_run_purposes.clear();
+        for facts in owner.executors.values_mut() {
+            facts.capabilities = ExecutorAdapterCapabilityFacts::default();
+        }
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(super::super::is_retryable_admission_refusal(
+            &crate::ServiceError::PlacementUnavailable(refusal)
+        ));
+
+        // Once the handshake arrives, an actual capability/policy refusal
+        // requires intervention and must not stay queued indefinitely.
+        let owner = &mut context.candidates[0];
+        owner.connected = true;
+        owner.negotiated_revision = Some(3);
+        owner.workspace_v1 = true;
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(!super::super::is_retryable_admission_refusal(
+            &crate::ServiceError::PlacementUnavailable(refusal)
+        ));
     }
 
     #[test]

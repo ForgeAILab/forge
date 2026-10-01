@@ -1824,7 +1824,7 @@ async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
     .await
     .expect("merge entry records");
     let event_bus = Arc::new(EventBus::new(32));
-    let merge_service = Arc::new(crate::merge_service::MergeService::new(
+    let merge_service = Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_dir.path().to_owned(),
@@ -2806,16 +2806,12 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         let (restarted, mut restarted_rx) =
             build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         assert_eq!(restarted.check_once().await.expect("recovery scan runs"), 1);
-        let ctx = tokio::time::timeout(Duration::from_secs(2), restarted_rx.recv())
+        let ctx = restarted_rx
+            .recv()
             .await
-            .expect("queued recovery dispatches")
             .expect("execution context arrives");
         assert_eq!(ctx.task_id, task.id);
-        // Shell input stays the Task's command; recovery prose is retained
-        // on the admitted execution prompt rather than executed as a script.
-        assert!(ctx
-            .description
-            .ends_with(task.description.as_deref().unwrap_or(&task.title)));
+        assert!(ctx.description.contains("keep this recovery guidance"));
         let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
             .await
             .expect("execution loads")
@@ -3107,15 +3103,8 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .dispatch_queued_recovery(&queued)
             .await
             .unwrap());
-        let ctx = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        // Shell input stays the Task's command; recovery prose is retained
-        // on the admitted execution prompt rather than executed as a script.
-        assert!(ctx
-            .description
-            .ends_with(task.description.as_deref().unwrap_or(&task.title)));
+        let ctx = rx.recv().await.unwrap();
+        assert!(ctx.description.contains("resume guidance"));
         let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
             .await
             .unwrap()

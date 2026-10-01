@@ -2610,7 +2610,7 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2697,7 +2697,7 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
     )
     .await;
     let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -3854,7 +3854,7 @@ async fn build_carry_scenario(
         changed_paths: vec!["feature.txt".to_owned(), "shared.txt".to_owned()],
     };
     let mut harness = harness;
-    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&harness.ctx.db),
         Arc::clone(&harness.ctx.event_bus),
         harness._workspace_root.path().to_path_buf(),

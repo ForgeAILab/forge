@@ -1980,7 +1980,11 @@ Registration returns HTTP 200 with a `RepoLocationResponse`, including `id`,
 The initial `unverified` row is verified before this response. Verification
 failure is persisted and returned as a location with `invalid` or
 `unavailable` status; it does not remove the registration. Only `ready`
-locations are eligible for workspace placement.
+locations are eligible for workspace placement. For an on-demand server managed
+clone failure, `last_error` is a JSON-encoded string with `cause: "clone_failed"`,
+`attempts`, `retry_at` (RFC3339), and a bounded, redacted `message`; ordinary
+verification errors remain strings. First use can replace a legacy backfilled
+Task worktree path with the repository source and verify that location.
 
 Server verification checks the directory, Git work tree, default-branch
 commit, and the origin remote against the Repo URL. A checkout with no origin
@@ -3510,6 +3514,25 @@ The handle is opaque; `worktree_path` is populated only for server placements
 and is empty for daemon placements. Responses expose reserved/preparing and
 disconnected placements even when the owner cannot be reached. Placement version
 conflicts use the ordinary HTTP `409 version_conflict` error.
+A claim on a `cleaning` or prepared `failed` placement returns
+HTTP 409 with `WORKSPACE_RESET_REQUIRED` and `{ task_id, reason }`, rather than a
+generic placement/version conflict. An unprepared `failed(prepare_failed)`
+placement with no handle remains reselectable; capacity refusals still queue.
+
+Recovery annotations expose `blocking_reason` values `owner_disconnected_timeout`
+(the max-disconnect bound expired), `owner_lost_execution` (the owner no longer
+knows the run), and `owner_workspace_reset_required` (HEAD/workspace needs a
+reset). Review CI uses `review_ci_infrastructure` during bounded retry,
+`review_ci_infrastructure_exhausted` at its cap, `review_ci_unavailable` for a
+permanent runner refusal, and `workspace_reset_required` when reset is required.
+Review-CI parks appear as the existing `execution_failed` attention category,
+with the specific cause in details; owner waits appear as `runtime_offline`.
+Disconnected review CI waits without counting attempts until reconnect or
+max-disconnect expiry; reconnect re-arms an exhausted review-CI barrier.
+Execution terminal acknowledgements are retried from retained reports while the
+server runs. After a server restart, acknowledgement resumes when the daemon
+replays its retained report. Workspace operation acknowledgements are retried
+from durable receipts.
 Executor snapshots store `placement_id`; they no longer store `resolved_daemon_id`.
 For daemon placements, `execution.start.workspace_path` comes from the retained
 owner preparation result for that exact handle and generation.

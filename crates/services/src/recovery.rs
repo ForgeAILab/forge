@@ -20,12 +20,12 @@ use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::Instrument;
 
@@ -319,9 +319,10 @@ pub struct HeartbeatMonitor {
     daemon_connections: Option<Arc<DaemonConnectionRegistry>>,
     check_interval: Duration,
     execution_stall_timeout: Duration,
-    daemon_disconnect_grace: Duration,
     max_disconnect: Duration,
-    disconnect_observed: Mutex<HashMap<String, Instant>>,
+    placement_in_flight: Arc<Mutex<HashSet<String>>>,
+    placement_workers: Arc<tokio::sync::Semaphore>,
+    placement_worker_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     stopped: AtomicBool,
     stop_notify: tokio::sync::Notify,
 }
@@ -364,7 +365,6 @@ fn is_unclaimed_dispatch_marker(execution: &Execution, now: &str) -> bool {
 impl HeartbeatMonitor {
     const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
     const DEFAULT_EXECUTION_STALL_TIMEOUT: Duration = Duration::from_secs(300);
-    const DEFAULT_DAEMON_DISCONNECT_GRACE: Duration = Duration::from_secs(120);
 
     pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         Self::with_check_interval(db, event_bus, Self::DEFAULT_CHECK_INTERVAL)
@@ -383,9 +383,10 @@ impl HeartbeatMonitor {
             daemon_connections: None,
             check_interval,
             execution_stall_timeout: Self::DEFAULT_EXECUTION_STALL_TIMEOUT,
-            daemon_disconnect_grace: Self::DEFAULT_DAEMON_DISCONNECT_GRACE,
             max_disconnect: Duration::from_secs(config::DEFAULT_MAX_DISCONNECT_SECONDS),
-            disconnect_observed: Mutex::new(HashMap::new()),
+            placement_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            placement_workers: Arc::new(tokio::sync::Semaphore::new(2)),
+            placement_worker_handles: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             stop_notify: tokio::sync::Notify::new(),
         }
@@ -411,11 +412,6 @@ impl HeartbeatMonitor {
 
     pub fn with_execution_stall_timeout(mut self, execution_stall_timeout: Duration) -> Self {
         self.execution_stall_timeout = execution_stall_timeout;
-        self
-    }
-
-    pub fn with_daemon_disconnect_grace(mut self, daemon_disconnect_grace: Duration) -> Self {
-        self.daemon_disconnect_grace = daemon_disconnect_grace;
         self
     }
 
@@ -456,6 +452,26 @@ impl HeartbeatMonitor {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
         self.stop_notify.notify_one();
+        let mut handles = self
+            .placement_worker_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for handle in handles.drain(..) {
+            handle.abort();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn finish_placement_workers(&self) {
+        let handles = std::mem::take(
+            &mut *self
+                .placement_worker_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for handle in handles {
+            handle.await.expect("placement worker completes");
+        }
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -469,13 +485,16 @@ impl HeartbeatMonitor {
         let now = now_rfc3339();
         for execution in ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await? {
             if !is_unclaimed_dispatch_marker(&execution, &now) {
-                suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await?;
+                if let Err(error) =
+                    suspend_expired_remote_execution(&self.db, &self.event_bus, &execution).await
+                {
+                    tracing::warn!(execution_id = %execution.id, %error, "owner suspension remains pending");
+                }
             }
         }
-        let reservations =
-            crate::placement::admission::sweep_expired_reservations(&self.db, &now_rfc3339())
-                .await?;
-        let placements = self.check_workspace_placements().await?;
+        if let Err(error) = self.suspend_unreachable_placements().await {
+            tracing::warn!(%error, "placement suspension remains pending");
+        }
         let agents = self.list_busy_agents().await?;
         let mut timed_out = 0;
 
@@ -570,7 +589,6 @@ impl HeartbeatMonitor {
         renew_workspace_leases(&self.db).await?;
         let progress_warnings = self.check_stale_progress().await?;
         let stalled = self.check_stalled_executions().await?;
-        let disconnected = self.check_disconnected_daemon_executions().await?;
         let expired = expire_workspace_leases(
             &self.db,
             &self.event_bus,
@@ -579,13 +597,24 @@ impl HeartbeatMonitor {
             true,
         )
         .await?;
-        Ok(reservations
-            + placements
-            + timed_out
-            + progress_warnings
-            + stalled
-            + disconnected
-            + expired)
+        // Owner RPCs run after the core liveness pass. A bad placement cannot
+        // abort heartbeat recovery, and each owner gets a bounded attempt.
+        let reservations =
+            match crate::placement::admission::sweep_expired_reservations(&self.db, &now).await {
+                Ok(count) => count,
+                Err(error) => {
+                    tracing::warn!(%error, "reservation sweep remains pending");
+                    0
+                }
+            };
+        let placements = match self.check_workspace_placements().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "placement sweep remains pending");
+                0
+            }
+        };
+        Ok(reservations + placements + timed_out + progress_warnings + stalled + expired)
     }
 
     #[tracing::instrument(skip(self))]
@@ -840,95 +869,6 @@ impl HeartbeatMonitor {
         }
 
         Ok(warned)
-    }
-
-    async fn check_disconnected_daemon_executions(&self) -> Result<u64> {
-        let Some(daemon_connections) = self.daemon_connections.as_ref() else {
-            return Ok(0);
-        };
-
-        let running = ExecutionRepo::list_running(&*self.db).await?;
-        let mut running_ids = HashMap::new();
-        for execution in &running {
-            running_ids.insert(execution.id.clone(), ());
-        }
-
-        {
-            let mut observed = self
-                .disconnect_observed
-                .lock()
-                .expect("disconnect observation lock");
-            observed.retain(|execution_id, _| running_ids.contains_key(execution_id));
-        }
-
-        let mut disconnected = 0_u64;
-        let now = Instant::now();
-
-        for execution in running {
-            if execution_lease_is_suspended(&self.db, &execution).await? {
-                continue;
-            }
-            let Some((daemon_id, daemon)) = resolve_execution_daemon(&self.db, &execution).await?
-            else {
-                continue;
-            };
-            if is_embedded_daemon_machine(&daemon.machine_id) {
-                continue;
-            }
-            if daemon_connections.is_connected(&daemon_id) {
-                self.disconnect_observed
-                    .lock()
-                    .expect("disconnect observation lock")
-                    .remove(&execution.id);
-                continue;
-            }
-
-            let first_observed = {
-                let mut observed = self
-                    .disconnect_observed
-                    .lock()
-                    .expect("disconnect observation lock");
-                observed
-                    .entry(execution.id.clone())
-                    .or_insert_with(|| now)
-                    .to_owned()
-            };
-            if now.duration_since(first_observed) < self.daemon_disconnect_grace {
-                continue;
-            }
-
-            let updated = fail_execution_daemon_disconnected(
-                &self.db,
-                &self.event_bus,
-                self.task_service.as_deref(),
-                FailDaemonDisconnectedExecution {
-                    execution: &execution,
-                    daemon_id: &daemon_id,
-                    error_message: format!("Remote daemon {daemon_id} disconnected"),
-                    stopped_by: &api_types::Actor::system(
-                        api_types::SystemComponent::HeartbeatMonitor,
-                    )
-                    .display(),
-                    reconciliation_reason: "daemon_disconnected",
-                },
-            )
-            .await?;
-            self.disconnect_observed
-                .lock()
-                .expect("disconnect observation lock")
-                .remove(&execution.id);
-            if updated.is_some() {
-                disconnected += 1;
-            }
-        }
-
-        if disconnected > 0 {
-            tracing::info!(
-                disconnected_executions = disconnected,
-                "heartbeat monitor interrupted executions on disconnected daemons"
-            );
-        }
-        Ok(disconnected)
     }
 
     fn publish(&self, event: ForgeEvent) {
@@ -2021,142 +1961,253 @@ async fn record_disconnected_attention(
     Ok(())
 }
 
+// An attempt owns its daemon and each placement until completion or cancellation.
+struct PlacementAttemptGuard {
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    keys: Vec<String>,
+}
+impl Drop for PlacementAttemptGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            in_flight.remove(key);
+        }
+    }
+}
+
 impl HeartbeatMonitor {
-    async fn check_workspace_placements(&self) -> Result<u64> {
-        let mut settled = 0;
-        if let Some(registry) = self.daemon_connections.as_ref() {
-            let running = ExecutionRepo::list_running(&*self.db).await?;
-            for placement in
-                WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Ready).await?
+    async fn suspend_unreachable_placements(&self) -> Result<()> {
+        let Some(registry) = &self.daemon_connections else {
+            return Ok(());
+        };
+        let running = ExecutionRepo::list_running(&*self.db).await?;
+        let mut owners = HashSet::new();
+        for placement in
+            WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Ready).await?
+        {
+            let Some(daemon_id) = placement_execution_daemon_id(&placement) else {
+                continue;
+            };
+            let Some(daemon) = DaemonRepo::get_by_id(&*self.db, daemon_id).await? else {
+                continue;
+            };
+            if placement.owner_kind == PlacementOwnerKind::Server
+                && is_embedded_daemon_machine(&daemon.machine_id)
             {
-                if let Some(daemon_id) = placement_execution_daemon_id(&placement) {
-                    if placement.owner_kind == PlacementOwnerKind::Daemon
-                        || DaemonRepo::get_by_id(&*self.db, daemon_id)
-                            .await?
-                            .is_some_and(|daemon| !is_embedded_daemon_machine(&daemon.machine_id))
-                    {
-                        // A new connection must describe work owned by the old
-                        // incarnation even if the offline monitor missed it.
-                        let owner_changed = running
-                            .iter()
-                            .filter(|execution| {
-                                execution.workspace_id.as_deref()
-                                    == Some(placement.workspace_id.as_str())
-                            })
-                            .any(|execution| {
-                                registry.get(daemon_id).is_some_and(|connection| {
-                                    execution.lease_owner.as_deref()
-                                        != Some(
-                                            crate::daemon_transport::execution_lease_owner(
-                                                daemon_id,
-                                                connection.id(),
-                                            )
-                                            .as_str(),
-                                        )
-                                })
-                            });
-                        let owner_online = DaemonRepo::get_by_id(&*self.db, daemon_id)
-                            .await?
-                            .is_some_and(|daemon| daemon.status == db::DaemonStatus::Online);
-                        if !owner_online || !registry.is_connected(daemon_id) || owner_changed {
-                            settled +=
-                                disconnect_daemon_placements(&self.db, &self.event_bus, daemon_id)
-                                    .await?;
-                        }
-                    }
-                }
+                continue;
             }
-            // Receipts outlive placement cleanup. Sweep every capable online
-            // owner so a committed result with a lost ACK is retried as well.
-            for (daemon_id, facts) in registry.connection_snapshots() {
-                if facts.workspace_incapable
-                    || !DaemonRepo::get_by_id(&*self.db, &daemon_id)
-                        .await?
-                        .is_some_and(|daemon| daemon.status == db::DaemonStatus::Online)
-                {
-                    continue;
-                }
-                if let Err(error) = reconcile_owner_receipts(&self.db, registry, &daemon_id).await {
-                    tracing::warn!(%daemon_id, %error, "owner operation receipts remain pending");
-                }
+            let owner_changed = registry.get(daemon_id).is_some_and(|connection| {
+                let owner =
+                    crate::daemon_transport::execution_lease_owner(daemon_id, connection.id());
+                running.iter().any(|execution| {
+                    execution.workspace_id.as_deref() == Some(&placement.workspace_id)
+                        && execution.lease_owner.as_deref() != Some(owner.as_str())
+                })
+            });
+            if daemon.status != db::DaemonStatus::Online
+                || !registry.is_connected(daemon_id)
+                || owner_changed
+            {
+                owners.insert(daemon_id.to_owned());
             }
         }
-        for placement in
-            WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Disconnected).await?
-        {
-            record_disconnected_attention(&self.db, &placement).await?;
-            repair_owner_recovery(&self.db, &placement).await?;
-            let expired = placement
-                .disconnected_at
-                .as_deref()
-                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                .and_then(|at| Utc::now().signed_duration_since(at).to_std().ok())
-                .is_some_and(|elapsed| elapsed >= self.max_disconnect);
-            if expired {
-                match WorkspacePlacementRepo::update(
-                    &*self.db,
-                    placement_update(
-                        &placement,
-                        PlacementState::Failed,
-                        Some(PlacementFailureCause::OwnerDisconnectedTimeout),
-                    ),
-                )
-                .await
-                {
-                    Ok(failed) => {
-                        settled += fail_placement_executions(
+        for daemon_id in owners {
+            if let Err(error) =
+                disconnect_daemon_placements(&self.db, &self.event_bus, &daemon_id).await
+            {
+                tracing::warn!(%daemon_id, %error, "owner suspension remains pending");
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_workspace_placements(&self) -> Result<u64> {
+        let mut settled = 0;
+        // Expiry/repair is local and bounded by rows, never by an owner RPC.
+        for state in [PlacementState::Disconnected, PlacementState::Failed] {
+            for placement in WorkspacePlacementRepo::list_by_state(&*self.db, state).await? {
+                let attempt = async {
+                    if placement.state == PlacementState::Disconnected {
+                        record_disconnected_attention(&self.db, &placement).await?;
+                        repair_owner_recovery(&self.db, &placement).await?;
+                        let expired = placement
+                            .disconnected_at
+                            .as_deref()
+                            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                            .and_then(|at| Utc::now().signed_duration_since(at).to_std().ok())
+                            .is_some_and(|elapsed| elapsed >= self.max_disconnect);
+                        if !expired {
+                            return Ok(0);
+                        }
+                        let failed = WorkspacePlacementRepo::update(
+                            &*self.db,
+                            placement_update(
+                                &placement,
+                                PlacementState::Failed,
+                                Some(PlacementFailureCause::OwnerDisconnectedTimeout),
+                            ),
+                        )
+                        .await?;
+                        return fail_placement_executions(
                             &self.db,
                             &self.event_bus,
                             &failed,
                             PlacementFailureCause::OwnerDisconnectedTimeout,
                         )
-                        .await?;
+                        .await;
                     }
-                    Err(db::DbError::VersionConflict) => {}
-                    Err(error) => return Err(error.into()),
+                    if placement.failure_cause
+                        == Some(PlacementFailureCause::OwnerDisconnectedTimeout)
+                    {
+                        let count = fail_placement_executions(
+                            &self.db,
+                            &self.event_bus,
+                            &placement,
+                            PlacementFailureCause::OwnerDisconnectedTimeout,
+                        )
+                        .await?;
+                        repair_owner_recovery(&self.db, &placement).await?;
+                        return Ok(count);
+                    }
+                    Ok::<u64, ServiceError>(0)
                 }
-                continue;
-            }
-            let Some(registry) = self.daemon_connections.as_ref() else {
-                continue;
-            };
-            if let Err(error) = reconcile_workspace_placement(
-                &self.db,
-                &self.event_bus,
-                registry,
-                self.task_service.as_deref(),
-                &placement,
-            )
-            .await
-            {
-                if matches!(error, ServiceError::WorkspaceResetRequired { .. }) {
-                    // Already surfaced on the Task as `workspace_reset_required`
-                    // with operator recovery actions; avoid a warning every tick.
-                    tracing::debug!(placement_id = %placement.id, %error, "workspace reconciliation awaits operator reset");
-                } else {
-                    tracing::warn!(placement_id = %placement.id, %error, "workspace reconciliation remains pending");
+                .await;
+                match attempt {
+                    Ok(count) => settled += count,
+                    Err(ServiceError::Db(db::DbError::VersionConflict)) => {}
+                    Err(error) => tracing::warn!(placement_id = %placement.id,
+                        daemon_id = ?placement_execution_daemon_id(&placement), %error, "placement maintenance remains pending"),
                 }
-            } else if WorkspacePlacementRepo::get_by_id(&*self.db, &placement.id)
-                .await?
-                .is_some_and(|current| current.state == PlacementState::Ready)
-            {
-                settled += 1;
             }
         }
-        // Repair the timeout -> execution-terminal crash window as well.
-        for placement in
-            WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Failed).await?
-        {
-            if placement.failure_cause == Some(PlacementFailureCause::OwnerDisconnectedTimeout) {
-                settled += fail_placement_executions(
-                    &self.db,
-                    &self.event_bus,
-                    &placement,
-                    PlacementFailureCause::OwnerDisconnectedTimeout,
-                )
-                .await?;
-                repair_owner_recovery(&self.db, &placement).await?;
+        let Some(registry) = &self.daemon_connections else {
+            return Ok(settled);
+        };
+        let retained = serde_json::to_string(&registry.retained_terminal_execution_ids())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let recent = (Utc::now() - ChronoDuration::seconds(60)).to_rfc3339();
+        let ready_to_retry: HashSet<String> = sqlx::query_scalar(
+            "SELECT p.id FROM workspace_placement p WHERE p.state = 'ready' AND (
+                EXISTS (SELECT 1 FROM execution e JOIN json_each(?) report ON e.id = report.value WHERE e.workspace_id = p.workspace_id)
+                OR EXISTS (SELECT 1 FROM domain_event ev WHERE ev.entity_id = p.id
+                    AND ev.event_type = 'workspace.owner_reconciled' AND ev.created_at >= ?))")
+            .bind(retained).bind(recent).fetch_all(self.db.pool()).await?.into_iter().collect();
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for state in [PlacementState::Disconnected, PlacementState::Ready] {
+            for placement in WorkspacePlacementRepo::list_by_state(&*self.db, state).await? {
+                if placement.state == PlacementState::Ready
+                    && !ready_to_retry.contains(&placement.id)
+                {
+                    continue;
+                }
+                if let Some(daemon_id) = placement_execution_daemon_id(&placement) {
+                    groups
+                        .entry(daemon_id.to_owned())
+                        .or_default()
+                        .push(placement.id);
+                }
             }
+        }
+        for (daemon_id, facts) in registry.connection_snapshots() {
+            if !facts.workspace_incapable {
+                groups.entry(daemon_id).or_default();
+            }
+        }
+        for (daemon_id, ids) in groups {
+            if !registry.is_connected(&daemon_id) {
+                continue;
+            }
+            let mut keys = vec![format!("daemon:{daemon_id}")];
+            keys.extend(ids.iter().map(|id| format!("placement:{id}")));
+            {
+                let mut in_flight = self
+                    .placement_in_flight
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if keys.iter().any(|key| in_flight.contains(key)) {
+                    continue;
+                }
+                in_flight.extend(keys.iter().cloned());
+            }
+            let guard = PlacementAttemptGuard {
+                in_flight: Arc::clone(&self.placement_in_flight),
+                keys,
+            };
+            let workers = Arc::clone(&self.placement_workers);
+            let db = Arc::clone(&self.db);
+            let event_bus = Arc::clone(&self.event_bus);
+            let registry = Arc::clone(registry);
+            let task_service = self.task_service.clone();
+            let mut handles = self
+                .placement_worker_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            handles.retain(|handle| !handle.is_finished());
+            if self.is_stopped() {
+                continue;
+            }
+            handles.push(tokio::spawn(async move {
+                let _guard = guard;
+                let Ok(_permit) = workers.acquire_owned().await else {
+                    return;
+                };
+                // Every RPC has its own transport deadline. No cancelling
+                // aggregate timeout surrounds database/terminal/cascade work.
+                if let Err(error) = reconcile_owner_receipts(&db, &registry, &daemon_id).await {
+                    tracing::warn!(%daemon_id, placement_ids = ?ids, %error, "owner receipts remain pending");
+                    if matches!(error, ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }) { return; }
+                }
+                for id in &ids {
+                    let attempt = async {
+                        let Some(placement) = WorkspacePlacementRepo::get_by_id(&*db, id).await?
+                        else {
+                            return Ok(());
+                        };
+                        let reconciled = if placement.state == PlacementState::Disconnected {
+                            reconcile_workspace_placement(
+                                &db,
+                                &event_bus,
+                                &registry,
+                                task_service.as_deref(),
+                                &placement,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                        if !reconciled {
+                            if let Some(ready) = WorkspacePlacementRepo::get_by_id(&*db, id)
+                                .await?
+                                .filter(|placement| placement.state == PlacementState::Ready)
+                            {
+                                finish_reconciled_cascades(
+                                    &db,
+                                    &registry,
+                                    task_service.as_deref(),
+                                    &ready,
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok::<(), ServiceError>(())
+                    }
+                    .await;
+                    if let Err(error) = attempt {
+                        if matches!(error, ServiceError::WorkspaceResetRequired { .. }) {
+                            tracing::debug!(placement_id = %id, %daemon_id, %error, "workspace reset remains pending");
+                        } else {
+                            tracing::warn!(placement_id = %id, %daemon_id, %error, "workspace reconciliation remains pending");
+                        }
+                        if matches!(error, ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }) { return; }
+                    }
+                }
+                if let Err(error) = registry.retry_retained_terminals(&daemon_id).await {
+                    tracing::warn!(%daemon_id, placement_ids = ?ids, %error, "terminal acknowledgement remains pending");
+                }
+            }));
         }
         Ok(settled)
     }
@@ -2409,6 +2460,7 @@ async fn annotate_owner_workspace_reset(
         },
     )
     .await?;
+    tracing::warn!(placement_id = %placement.id, daemon_id = ?placement_execution_daemon_id(placement), message, "workspace owner reset required");
     Ok(())
 }
 
@@ -2576,7 +2628,6 @@ pub(crate) async fn reconcile_workspace_placement(
         )
         .await;
     }
-    reconcile_owner_receipts(db, registry, daemon_id).await?;
     if !registry.is_current(daemon_id, facts.connection_id) {
         return Ok(false);
     }
@@ -2833,15 +2884,21 @@ async fn complete_workspace_reconciliation(
         return Ok(false);
     };
     let recorded_head = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT e.after_sha FROM execution e WHERE e.workspace_id = ? AND e.after_sha IS NOT NULL
+        "SELECT head_sha FROM (
+         SELECT head_sha, recorded_at AS evidence_at, placement_id AS evidence_id FROM workspace_expected_head
+         WHERE placement_id = ? AND generation = ?
+         UNION ALL
+         SELECT e.after_sha AS head_sha, (COALESCE(e.stopped_at, (SELECT MIN(receipt.created_at) FROM execution_terminal_receipt receipt WHERE receipt.execution_id = e.id), e.created_at)) AS evidence_at, e.id AS evidence_id FROM execution e WHERE e.workspace_id = ? AND e.after_sha IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM command_receipt reset
              WHERE reset.operation = 'daemon.workspace.reset'
                AND json_extract(reset.outcome_json, '$.metadata.placement_id') = ?
                AND json_extract(reset.outcome_json, '$.metadata.generation') = ?
                AND json_extract(reset.outcome_json, '$.metadata.status') = 'result'
                AND julianday(reset.committed_at) > julianday(e.created_at))
-         ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+         ) ORDER BY julianday(evidence_at) DESC, evidence_id DESC LIMIT 1",
     )
+    .bind(&placement.id)
+    .bind(placement.generation)
     .bind(&placement.workspace_id)
     .bind(&placement.id)
     .bind(placement.generation)
@@ -2878,8 +2935,9 @@ async fn complete_workspace_reconciliation(
     let mut update = placement_update(placement, PlacementState::Ready, cause);
     update.disconnected_at = Some(None);
     update.workspace_handle = Some(Some(state.workspace_handle.clone()));
-    let ready = WorkspacePlacementRepo::update(db, update).await?;
-    let event = db::DomainEventRepo::append_event(db, db::CreateDomainEvent {
+    let mut transaction = db::begin_immediate(db.pool()).await?;
+    let ready = WorkspacePlacementRepo::update_in_tx(db, &mut transaction, update).await?;
+    let event = db::DomainEventRepo::append_event_in_tx(db, &mut transaction, &db::CreateDomainEvent {
         id: db::new_uuid_v4(), event_type: "workspace.owner_reconciled".to_owned(),
         entity_type: "workspace_placement".to_owned(), entity_id: ready.id.clone(),
         actor_type: "system".to_owned(), actor_id: None, scope_type: "task".to_owned(),
@@ -2888,37 +2946,54 @@ async fn complete_workspace_reconciliation(
         payload_json: json!({"task_id": ready.task_id, "placement_id": ready.id, "head_sha": state.head_sha}).to_string(),
         created_at: now_rfc3339(),
     }).await?;
-    db::AttentionRepo::resolve_attention_by_dedupe(
-        db,
-        &format!("workspace-owner:{}", ready.id),
-        &event.id,
-        &now_rfc3339(),
+    sqlx::query(
+        "UPDATE attention_projection SET status = 'resolved', resolved_at = ?,
+        snoozed_until = NULL, source_event_id = ?, updated_at = ?, version = version + 1
+        WHERE dedupe_key = ? AND status <> 'resolved'",
     )
+    .bind(now_rfc3339())
+    .bind(&event.id)
+    .bind(now_rfc3339())
+    .bind(format!("workspace-owner:{}", ready.id))
+    .execute(&mut *transaction)
     .await?;
-    crate::deferred_dispatch::wake_task_dispatch(db, &ready.task_id, "workspace owner reconciled")
-        .await?;
-    for task in TaskRepo::list_subtasks_ordered(db, &ready.task_id).await? {
-        crate::deferred_dispatch::wake_task_dispatch(
-            db,
-            &task.id,
-            "inherited workspace owner reconciled",
-        )
-        .await?;
-    }
+    sqlx::query(
+        "UPDATE task SET metadata_json = json_remove(COALESCE(metadata_json, '{}'),
+        '$.dispatch_disposition', '$.deferred_dispatch', '$.owner_wait'), version = version + 1, updated_at = ?
+        WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
+        AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+             OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
+             OR json_type(metadata_json, '$.owner_wait') IS NOT NULL)",
+    )
+    .bind(now_rfc3339())
+    .bind(&ready.task_id)
+    .bind(&ready.task_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("UPDATE task SET blocked_json = NULL,
+        entry_barrier_json = json_set(entry_barrier_json, '$.infrastructure_attempts', 0),
+        error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
+        version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
+        AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
+        .bind(now_rfc3339()).bind(&ready.task_id).bind(&ready.task_id).execute(&mut *transaction).await?;
+    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
+        WHERE status <> 'resolved' AND dedupe_key IN (?, ?)")
+        .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("review-ci:{}", ready.task_id))
+        .bind(format!("task-owner-wait:{}", ready.task_id)).execute(&mut *transaction).await?;
+    transaction.commit().await?;
     if let Some(task_service) = task_service {
-        for execution_id in sqlx::query_scalar::<_, String>(
-            "SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status != 'running'
-             AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
-                 AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
-                     = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
-                 AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))
-             ORDER BY e.created_at DESC, e.id DESC")
-            .bind(&ready.workspace_id).fetch_all(db.pool()).await? {
-            let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else { continue; };
-            if owner_execution_failure_cause(&execution).is_some() {
-                continue;
+        // The detached owner worker keeps its permit/in-flight guard through
+        // cascade and ACK. A ready-placement sweep can redrive a crash here.
+        if let Err(error) =
+            finish_reconciled_cascades(db, registry, Some(task_service), &ready).await
+        {
+            if matches!(
+                error,
+                ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }
+            ) {
+                return Err(error);
             }
-            task_service.maybe_cascade_executor_completion(&execution_id).await?;
+            tracing::warn!(placement_id = %ready.id, %daemon_id, %error, "reconciled cascade remains pending");
         }
     }
     event_bus.publish(ForgeEvent {
@@ -2932,6 +3007,35 @@ async fn complete_workspace_reconciliation(
         },
     });
     Ok(true)
+}
+
+async fn finish_reconciled_cascades(
+    db: &SqliteDb,
+    registry: &DaemonConnectionRegistry,
+    task_service: Option<&TaskService>,
+    placement: &WorkspacePlacement,
+) -> Result<()> {
+    let Some(task_service) = task_service else {
+        return Ok(());
+    };
+    for execution_id in sqlx::query_scalar::<_, String>(
+        "SELECT e.id FROM execution e WHERE e.workspace_id = ? AND e.status != 'running'
+         AND NOT EXISTS (SELECT 1 FROM execution newer WHERE newer.task_id = e.task_id
+             AND CASE newer.role WHEN 'executor' THEN 'coder' ELSE newer.role END
+                 = CASE e.role WHEN 'executor' THEN 'coder' ELSE e.role END
+             AND (newer.created_at > e.created_at OR (newer.created_at = e.created_at AND newer.id > e.id)))
+         ORDER BY e.created_at DESC, e.id DESC")
+        .bind(&placement.workspace_id).fetch_all(db.pool()).await? {
+        let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else { continue; };
+        if owner_execution_failure_cause(&execution).is_none()
+            && !task_service.try_cascade_executor_completion(&execution_id).await? {
+            return Ok(());
+        }
+    }
+    if let Some(daemon_id) = placement_execution_daemon_id(placement) {
+        registry.retry_retained_terminals(daemon_id).await?;
+    }
+    Ok(())
 }
 
 pub(crate) const DAEMON_REPORT_RECONCILE_MIN_AGE: Duration = Duration::from_secs(60);
@@ -3083,7 +3187,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
-        daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
+        daemon_transport::DaemonConnectionRegistry,
         workflow::{default_roles, default_states},
         TaskService,
     };
@@ -4867,106 +4971,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_monitor_fails_remote_execution_when_daemon_stays_disconnected() {
-        let db = Arc::new(sqlite_db().await);
-        let event_bus = Arc::new(EventBus::new(16));
-        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, _repo_id) = seed_project_repo(&db).await;
-        let (agent_id, _) =
-            seed_agent_with_daemon(&db, "remote-machine-a", AgentStatus::Idle).await;
-        let task = seed_task(
-            &db,
-            project_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
-
-        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .with_daemon_connections(Arc::clone(&registry))
-            .with_daemon_disconnect_grace(Duration::from_millis(1));
-
-        monitor.check_once().await.expect("first check");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let interrupted = monitor.check_once().await.expect("second check");
-        assert_eq!(interrupted, 1);
-
-        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        assert_eq!(updated.status, ExecutionStatus::Failed);
-        assert_eq!(updated.stop_reason, Some(StopReason::DaemonDisconnected));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_monitor_leaves_remote_execution_alone_within_disconnect_grace() {
-        let db = Arc::new(sqlite_db().await);
-        let event_bus = Arc::new(EventBus::new(16));
-        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, _repo_id) = seed_project_repo(&db).await;
-        let (agent_id, _) =
-            seed_agent_with_daemon(&db, "remote-machine-b", AgentStatus::Idle).await;
-        let task = seed_task(
-            &db,
-            project_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
-
-        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .with_daemon_connections(Arc::clone(&registry))
-            .with_daemon_disconnect_grace(Duration::from_secs(120));
-
-        let interrupted = monitor.check_once().await.expect("monitor checks");
-        assert_eq!(interrupted, 0);
-
-        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        assert_eq!(updated.status, ExecutionStatus::Running);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_monitor_clears_disconnect_tracking_when_daemon_reconnects() {
-        let db = Arc::new(sqlite_db().await);
-        let event_bus = Arc::new(EventBus::new(16));
-        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, _repo_id) = seed_project_repo(&db).await;
-        let (agent_id, agent) =
-            seed_agent_with_daemon(&db, "remote-machine-c", AgentStatus::Idle).await;
-        let daemon_id = agent.daemon_id.clone().expect("daemon id");
-        let task = seed_task(
-            &db,
-            project_id,
-            "in_progress".to_owned(),
-            Some(agent_id.clone()),
-        )
-        .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
-
-        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .with_daemon_connections(Arc::clone(&registry))
-            .with_daemon_disconnect_grace(Duration::from_secs(120));
-
-        monitor.check_once().await.expect("first check");
-        let (connection, _rx) = DaemonConnection::new(daemon_id.clone());
-        registry.register(daemon_id, connection);
-        let interrupted = monitor.check_once().await.expect("second check");
-        assert_eq!(interrupted, 0);
-
-        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        assert_eq!(updated.status, ExecutionStatus::Running);
-    }
-
-    #[tokio::test]
     async fn heartbeat_monitor_skips_embedded_daemon_executions_for_disconnect_check() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
@@ -4988,8 +4992,7 @@ pub(crate) mod tests {
         let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
 
         let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .with_daemon_connections(Arc::clone(&registry))
-            .with_daemon_disconnect_grace(Duration::from_millis(1));
+            .with_daemon_connections(Arc::clone(&registry));
 
         monitor.check_once().await.expect("first check");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5693,7 +5696,7 @@ pub(crate) mod tests {
         (task, placement, execution)
     }
 
-    fn owner_connection(
+    pub(crate) fn owner_connection(
         registry: &DaemonConnectionRegistry,
         daemon_id: &str,
         resume: bool,
@@ -5875,7 +5878,7 @@ pub(crate) mod tests {
                 sink.handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
                     .await
                     .unwrap(),
-                DaemonTerminalDisposition::Acknowledge
+                DaemonTerminalDisposition::AwaitingCascade
             );
         }
         let responder = {
@@ -5901,6 +5904,12 @@ pub(crate) mod tests {
                 .unwrap()
         );
         responder.await.unwrap();
+        assert_eq!(
+            sink.handle_terminal_with_ack(daemon_id, connection_id, notification)
+                .await
+                .unwrap(),
+            DaemonTerminalDisposition::Acknowledge
+        );
         let finished = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
             .unwrap()
@@ -6021,7 +6030,7 @@ pub(crate) mod tests {
             sink.handle_terminal_with_ack(ready.daemon_id.as_deref().unwrap(), 1, notification)
                 .await
                 .unwrap(),
-            DaemonTerminalDisposition::Acknowledge
+            DaemonTerminalDisposition::AwaitingCascade
         );
         let disconnected = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
             .await
@@ -6179,7 +6188,7 @@ pub(crate) mod tests {
             serde_json::from_value(json!({
                 "terminal_report_id": new_uuid_v4(), "execution_id": execution.id, "exit_code": 0,
                 "ts": now_rfc3339(), "status": "completed", "after_sha": "owner-head", "usage_reports": [],
-            })).unwrap()).await.unwrap(), DaemonTerminalDisposition::Acknowledge);
+            })).unwrap()).await.unwrap(), DaemonTerminalDisposition::AwaitingCascade);
         assert_eq!(
             ExecutionRepo::get_by_id(&*db, &execution.id)
                 .await
@@ -6431,6 +6440,10 @@ pub(crate) mod tests {
         let (_, placement, execution) = daemon_owned_fixture(&db).await;
         // The terminal/drain committed before the server stopped; readiness
         // did not. The new monitor receives no reconnect event.
+        sqlx::query("UPDATE task SET status = 'review', entry_barrier_json = ?, error_annotation = ?, blocked_json = ? WHERE id = ?")
+            .bind(json!({"state": "review", "status": "blocked", "infrastructure_attempts": 5}).to_string())
+            .bind(json!({"type": "before_work_hook_failed", "blocking_reason": "review_ci_infrastructure_exhausted", "recovery_actions": ["retry_hook"]}).to_string())
+            .bind("{}").bind(&placement.task_id).execute(db.pool()).await.unwrap();
         sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'owner-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
             .bind(&execution.id).execute(db.pool()).await.unwrap();
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
@@ -6459,6 +6472,22 @@ pub(crate) mod tests {
             .with_daemon_connections(registry);
         monitor.check_once().await.unwrap();
         responder.await.unwrap();
+        monitor.finish_placement_workers().await;
+        let task = TaskRepo::get_by_id(&*db, &placement.task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.blocked_json.is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(task.error_annotation.as_deref().unwrap())
+                .unwrap()["blocking_reason"],
+            "review_ci_infrastructure"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(task.entry_barrier_json.as_deref().unwrap())
+                .unwrap()["infrastructure_attempts"],
+            0
+        );
         assert_eq!(
             WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
                 .await
@@ -6492,19 +6521,23 @@ pub(crate) mod tests {
         ));
         let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
         sink.set_connection_registry(Arc::downgrade(&registry));
-        let service = Arc::new(
-            TaskService::new(db.clone(), bus)
-                .with_daemon_connections(registry.clone())
-                .with_provider_credential_env(Arc::new(
-                    crate::embedded_agent_service::EmbeddedAgentService::new(
-                        db.clone(),
-                        b"owner-outbox-test-key",
-                    ),
-                )),
-        );
+        let service = TaskService::new(db.clone(), bus)
+            .with_daemon_connections(registry.clone())
+            .with_provider_credential_env(Arc::new(
+                crate::embedded_agent_service::EmbeddedAgentService::new(
+                    db.clone(),
+                    b"owner-outbox-test-key",
+                ),
+            ));
+        let router = (*service.workspace_backend_router())
+            .clone()
+            .with_daemon(Arc::new(
+                crate::workspace_backend::DaemonWorkspaceBackend::new(db.clone(), registry.clone()),
+            ));
+        let service = Arc::new(service.with_workspace_backend_router(Arc::new(router)));
         sink.set_task_service(Arc::downgrade(&service));
         let daemon_id = placement.daemon_id.as_deref().unwrap();
-        let (connection_id, _outbound) = owner_connection(&registry, daemon_id, false);
+        let (connection_id, mut outbound) = owner_connection(&registry, daemon_id, false);
         let notification: api_types::ExecutionTerminalNotification = serde_json::from_value(json!({
             "terminal_report_id": new_uuid_v4(), "execution_id": execution.id, "exit_code": 0,
             "ts": now_rfc3339(), "status": "completed", "after_sha": "owner-head", "usage_reports": [],
@@ -6514,28 +6547,33 @@ pub(crate) mod tests {
             sink.handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
                 .await
                 .unwrap(),
-            DaemonTerminalDisposition::Acknowledge
+            DaemonTerminalDisposition::AwaitingCascade
         );
         assert_eq!(
             sink.handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
                 .await
                 .unwrap(),
-            DaemonTerminalDisposition::Acknowledge
+            DaemonTerminalDisposition::AwaitingCascade
         );
         // A fresh sink proves the receipt/outbox path also survives restart.
-        let restarted = ServerExecutionEventSink::new(
+        let restarted = Arc::new(ServerExecutionEventSink::new(
             db.clone(),
             Arc::new(EventBus::new(16)),
             root.path().to_path_buf(),
-        );
+        ));
+        let restarted_registry = Arc::new(DaemonConnectionRegistry::new(
+            Arc::new(EventBus::new(16)),
+            restarted.clone(),
+        ));
+        restarted_registry.register(daemon_id.to_owned(), registry.get(daemon_id).unwrap());
         restarted.set_task_service(Arc::downgrade(&service));
-        restarted.set_connection_registry(Arc::downgrade(&registry));
+        restarted.set_connection_registry(Arc::downgrade(&restarted_registry));
         assert_eq!(
             restarted
-                .handle_terminal_with_ack(daemon_id, connection_id, notification)
+                .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
                 .await
                 .unwrap(),
-            DaemonTerminalDisposition::Acknowledge
+            DaemonTerminalDisposition::AwaitingCascade
         );
         let finished = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
@@ -6560,6 +6598,86 @@ pub(crate) mod tests {
                 .state,
             PlacementState::Disconnected
         );
+        // The restarted registry retains the replay until reconciliation
+        // commits its cascade, then actively ACKs it without another delivery.
+        restarted_registry.dispatch_incoming_for_connection(
+            daemon_id,
+            connection_id,
+            api_types::DaemonFrame::Notification {
+                method: api_types::METHOD_EXECUTION_TERMINAL.to_owned(),
+                params: serde_json::to_value(notification).unwrap(),
+            },
+        );
+        let responder = {
+            let registry = restarted_registry.clone();
+            let daemon_id = daemon_id.to_owned();
+            let execution_id = execution.id.clone();
+            tokio::spawn(async move {
+                while let Some(api_types::DaemonFrame::Request { id, method, params }) =
+                    outbound.recv().await
+                {
+                    let result = match method.as_str() {
+                        api_types::METHOD_WORKSPACE_DESCRIBE => json!({
+                            "workspace_handle": params["workspace_handle"], "generation": 1,
+                            "exists": true, "head_sha": "owner-head", "dirty": false, "branch": "task/remote",
+                            "locked": false, "active_execution_ids": [], "journaled_execution_ids": [execution_id],
+                        }),
+                        api_types::METHOD_WORKSPACE_READ => match params["operation"].as_str() {
+                            Some("git") => {
+                                json!({"kind": "git", "output": match params["query"]["kind"].as_str() {
+                                    Some("head" | "resolve_ref" | "merge_base" | "target_head") => "owner-head\n",
+                                    _ => "",
+                                }})
+                            }
+                            Some("paths") => {
+                                json!({"kind": "paths", "workspace_path": "/owner-only/workspace", "repo_path": "/owner-only/repo"})
+                            }
+                            Some("files") => json!({"kind": "files", "files": []}),
+                            _ => json!({"path": params["path"], "bytes": [], "truncated": false}),
+                        },
+                        api_types::METHOD_JOURNAL_ACK => {
+                            json!({"entry_id": params["entry_id"], "acknowledged": true})
+                        }
+                        _ => panic!("unexpected owner RPC {method}"),
+                    };
+                    registry.dispatch_incoming_for_connection(
+                        &daemon_id,
+                        connection_id,
+                        api_types::DaemonFrame::Response { id, result },
+                    );
+                    if method == api_types::METHOD_JOURNAL_ACK {
+                        return;
+                    }
+                }
+                panic!("journal ACK was not sent");
+            })
+        };
+        let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
+            .with_daemon_connections(restarted_registry)
+            .with_task_service(service);
+        monitor.check_once().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), responder)
+            .await
+            .unwrap()
+            .unwrap();
+        monitor.finish_placement_workers().await;
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM execution_terminal_receipt WHERE execution_id = ?",
+        )
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 1);
+        let comments: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM task_comment WHERE task_id = ? AND idempotency_key = ?",
+        )
+        .bind(&execution.task_id)
+        .bind(format!("outbox:{}:worklog:1", execution.id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(comments, 1);
     }
 
     #[tokio::test]
@@ -6755,12 +6873,11 @@ pub(crate) mod tests {
                 });
             })
         };
-        HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
-            .with_daemon_connections(registry)
-            .check_once()
-            .await
-            .unwrap();
+        let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
+            .with_daemon_connections(registry);
+        monitor.check_once().await.unwrap();
         responder.await.unwrap();
+        monitor.finish_placement_workers().await;
         let failed = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
             .unwrap()
@@ -7063,6 +7180,365 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn placement_busy_cascade_does_not_block_another_reconciliation() {
+        let db = Arc::new(sqlite_db().await);
+        let (busy_task, busy, busy_execution) = daemon_owned_fixture(&db).await;
+        let (_, other, other_execution) = daemon_owned_fixture(&db).await;
+        let daemon_id = busy.daemon_id.clone().unwrap();
+        sqlx::query("UPDATE workspace_placement SET daemon_id = ?, runtime_id = ? WHERE id = ?")
+            .bind(&daemon_id)
+            .bind(&busy.runtime_id)
+            .bind(&other.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for execution in [&busy_execution, &other_execution] {
+            sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'base-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+                .bind(&execution.id).execute(db.pool()).await.unwrap();
+        }
+        let bus = Arc::new(EventBus::default());
+        let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
+        let _cascade = service.claim_completion_cascade(&busy_task.id).unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (connection_id, mut outbound) = owner_connection(&registry, &daemon_id, false);
+        let responder = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let api_types::DaemonFrame::Request { id, method, params } =
+                        outbound.recv().await.unwrap()
+                    else {
+                        panic!("describe request");
+                    };
+                    assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+                    registry.dispatch_incoming_for_connection(&daemon_id, connection_id,
+                        api_types::DaemonFrame::Response { id, result: json!({
+                            "workspace_handle": params["workspace_handle"], "generation": 1,
+                            "exists": true, "head_sha": "base-head", "dirty": false, "branch": "task/remote",
+                            "locked": false, "active_execution_ids": [], "journaled_execution_ids": []}) });
+                }
+            })
+        };
+        let monitor = HeartbeatMonitor::new(db.clone(), bus)
+            .with_daemon_connections(registry)
+            .with_task_service(service);
+        monitor.check_once().await.unwrap();
+        monitor.finish_placement_workers().await;
+        responder.await.unwrap();
+        for placement in [&busy, &other] {
+            assert_eq!(
+                WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                PlacementState::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_monitor_stop_aborts_workers_and_releases_guards() {
+        let db = Arc::new(sqlite_db().await);
+        let monitor = HeartbeatMonitor::new(db, Arc::new(EventBus::default()));
+        let keys = vec!["daemon:stopped-owner".to_owned()];
+        monitor
+            .placement_in_flight
+            .lock()
+            .unwrap()
+            .extend(keys.clone());
+        let guard = PlacementAttemptGuard {
+            in_flight: monitor.placement_in_flight.clone(),
+            keys,
+        };
+        let workers = monitor.placement_workers.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            let _finished = finished_tx;
+            let _guard = guard;
+            let _permit = workers.acquire_owned().await.unwrap();
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        monitor
+            .placement_worker_handles
+            .lock()
+            .unwrap()
+            .push(worker);
+        started_rx.await.unwrap();
+        monitor.stop();
+        assert!(finished_rx.await.is_err(), "stop aborts the owner worker");
+        assert!(monitor.placement_in_flight.lock().unwrap().is_empty());
+        assert_eq!(monitor.placement_workers.available_permits(), 2);
+    }
+
+    #[test]
+    fn placement_attempt_guard_recovers_a_poisoned_mutex() {
+        let in_flight = Arc::new(Mutex::new(HashSet::from(["placement:poisoned".into()])));
+        let poisoned = in_flight.clone();
+        assert!(std::panic::catch_unwind(move || {
+            let _lock = poisoned.lock().unwrap();
+            panic!("poison fixture");
+        })
+        .is_err());
+        drop(PlacementAttemptGuard {
+            in_flight: in_flight.clone(),
+            keys: vec!["placement:poisoned".into()],
+        });
+        assert!(in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn placement_sweep_skips_ready_workspaces_without_terminal_or_recent_reconcile() {
+        let db = Arc::new(sqlite_db().await);
+        let (_, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (_, mut outbound) =
+            owner_connection(&registry, placement.daemon_id.as_deref().unwrap(), false);
+        let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry);
+        monitor.check_once().await.unwrap();
+        monitor.finish_placement_workers().await;
+        assert!(
+            outbound.try_recv().is_err(),
+            "no workspace RPC for an unrelated ready placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_placement_timeout_does_not_delay_liveness_or_next_owner() {
+        let db = Arc::new(sqlite_db().await);
+        let (_, bad, bad_execution) = daemon_owned_fixture(&db).await;
+        let (_, good, good_execution) = daemon_owned_fixture(&db).await;
+        for execution in [&bad_execution, &good_execution] {
+            sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'base-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+                .bind(&execution.id).execute(db.pool()).await.unwrap();
+        }
+        let stale = seed_agent(&db, AgentStatus::Busy, Some("1970-01-01T00:00:00Z".into())).await;
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let (_, mut silent) = owner_connection(&registry, bad.daemon_id.as_deref().unwrap(), false);
+        let daemon_id = good.daemon_id.clone().unwrap();
+        let (connection_id, mut responsive) = owner_connection(&registry, &daemon_id, false);
+        let responder = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let api_types::DaemonFrame::Request { id, method, params } =
+                    responsive.recv().await.unwrap()
+                else {
+                    panic!("describe request")
+                };
+                assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+                registry.dispatch_incoming_for_connection(&daemon_id, connection_id,
+                    api_types::DaemonFrame::Response { id, result: json!({"workspace_handle": params["workspace_handle"],
+                        "generation": 1, "exists": true, "head_sha": "base-head", "dirty": false,
+                        "branch": "task/remote", "locked": false, "active_execution_ids": [], "journaled_execution_ids": []}) });
+            })
+        };
+        let bus = Arc::new(EventBus::new(32));
+        let mut events = bus.subscribe();
+        let monitor =
+            Arc::new(HeartbeatMonitor::new(db.clone(), bus).with_daemon_connections(registry));
+        let tick = {
+            let monitor = monitor.clone();
+            tokio::spawn(async move { monitor.check_once().await })
+        };
+        silent.recv().await.unwrap();
+        assert_eq!(
+            AgentRepo::get_by_id(&*db, &stale.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Error,
+            "core liveness must finish before a silent owner RPC starts"
+        );
+        tick.await.unwrap().unwrap();
+        responder.await.unwrap();
+        // Wait for the responsive owner's committed reconciliation before
+        // pausing time; SQLite work must not race Tokio's auto-advance.
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.event_type == "reconciliation.event" && event.entity_id == good.task_id {
+                break;
+            }
+        }
+        // Only the silent owner's RPC deadline remains.
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(
+            api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+        ))
+        .await;
+        monitor.finish_placement_workers().await;
+        assert_eq!(
+            WorkspacePlacementRepo::get_by_id(&*db, &good.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlacementState::Ready
+        );
+        assert_eq!(
+            WorkspacePlacementRepo::get_by_id(&*db, &bad.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlacementState::Disconnected
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_reconcile_accepts_forge_rebase_head() {
+        let db = Arc::new(sqlite_db().await);
+        let (_, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'old-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        let placement = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let (connection_id, mut outbound) = owner_connection(&registry, &daemon_id, false);
+        let responder = {
+            let registry = registry.clone();
+            let daemon_id = daemon_id.clone();
+            tokio::spawn(async move {
+                for step in 0..4 {
+                    let api_types::DaemonFrame::Request { id, method, params } =
+                        outbound.recv().await.unwrap()
+                    else {
+                        panic!("owner rebase request")
+                    };
+                    let result = match step {
+                        0 | 3 => {
+                            assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+                            json!({"workspace_handle": params["workspace_handle"], "generation": 1, "exists": true,
+                                "head_sha": if step == 0 { "old-head" } else { "rebased-head" }, "dirty": false,
+                                "branch": "task/remote", "locked": false, "active_execution_ids": [], "journaled_execution_ids": []})
+                        }
+                        1 => {
+                            assert_eq!(method, api_types::METHOD_WORKSPACE_RESET);
+                            json!({"entry_id": "rebase-entry", "operation_id": params["operation_id"], "outcome": {"kind": "rebased"}})
+                        }
+                        _ => {
+                            assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+                            json!({"entry_id": params["entry_id"], "acknowledged": true})
+                        }
+                    };
+                    registry.dispatch_incoming_for_connection(
+                        &daemon_id,
+                        connection_id,
+                        api_types::DaemonFrame::Response { id, result },
+                    );
+                }
+            })
+        };
+        let resolved = crate::workspace_backend::ResolvedWorkspace {
+            placement: placement.clone(),
+            backend: Arc::new(crate::workspace_backend::DaemonWorkspaceBackend::new(
+                db.clone(),
+                registry.clone(),
+            )),
+        };
+        assert!(matches!(
+            resolved.rebase_target("main", false).await.unwrap(),
+            api_types::WorkspaceOwnerOperationOutcome::Rebased
+        ));
+        resolved.record_rebase_head(&db).await.unwrap();
+        sqlx::query("UPDATE execution SET updated_at = ? WHERE id = ?")
+            .bind((Utc::now() + ChronoDuration::minutes(1)).to_rfc3339())
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        let placement = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Disconnected, None),
+        )
+        .await
+        .unwrap();
+        let state = serde_json::from_value(json!({"workspace_handle": placement.workspace_handle, "generation": 1,
+            "exists": true, "head_sha": "rebased-head", "dirty": false, "branch": "task/remote", "locked": false,
+            "active_execution_ids": [], "journaled_execution_ids": []})).unwrap();
+        assert!(complete_workspace_reconciliation(
+            &db,
+            &EventBus::new(32),
+            &registry,
+            None,
+            &placement,
+            state,
+            false,
+            connection_id
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlacementState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_crash_orphaned_preparing_without_expiry_releases_capacity() {
+        let db = Arc::new(sqlite_db().await);
+        let (_, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_placement SET state = 'preparing', reserved_until = NULL, updated_at = ? WHERE id = ?")
+            .bind((Utc::now() - ChronoDuration::minutes(11)).to_rfc3339())
+            .bind(&placement.id).execute(db.pool()).await.unwrap();
+        assert_eq!(
+            crate::placement::admission::sweep_expired_reservations(&db, &now_rfc3339())
+                .await
+                .unwrap(),
+            1
+        );
+        let expired = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.state, PlacementState::Failed);
+        assert!(expired.workspace_handle.is_none());
+        assert_eq!(
+            expired.failure_cause,
+            Some(PlacementFailureCause::PrepareFailed)
+        );
+        assert_eq!(
+            crate::agent_capacity::count_occupied_agent_slots(
+                &db,
+                placement.agent_id.as_deref().unwrap()
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_owned_workspace_reservation_expiry_runs_without_active_dispatch() {
         let db = Arc::new(sqlite_db().await);
         let (task, placement, execution) = daemon_owned_fixture(&db).await;
@@ -7190,6 +7666,7 @@ pub(crate) mod tests {
         monitor.check_once().await.unwrap();
         responder.await.unwrap();
         monitor.check_once().await.unwrap();
+        monitor.finish_placement_workers().await;
         let acknowledgements: i64 = sqlx::query_scalar("SELECT count(*) FROM command_receipt WHERE operation IN ('daemon.workspace.run.ack', 'daemon.workspace.cleanup.ack')")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(acknowledgements, 2);
@@ -7201,6 +7678,127 @@ pub(crate) mod tests {
                 .state,
             PlacementState::Cleaned
         );
+    }
+
+    #[tokio::test]
+    async fn placement_launch_recreates_deleted_daemon_worktree() {
+        assert_daemon_launch_recreates_worktree(false).await;
+    }
+
+    #[tokio::test]
+    async fn placement_launch_recreates_damaged_daemon_worktree() {
+        assert_daemon_launch_recreates_worktree(true).await;
+    }
+
+    async fn assert_daemon_launch_recreates_worktree(damaged: bool) {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'owner-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        let ready = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let daemon_id = ready.daemon_id.clone().unwrap();
+        let (connection_id, mut outbound) = owner_connection(&registry, &daemon_id, false);
+        let responder = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                for step in 0..4 {
+                    let api_types::DaemonFrame::Request { id, method, params } =
+                        outbound.recv().await.unwrap()
+                    else {
+                        panic!("owner launch request")
+                    };
+                    if step == 0 && damaged {
+                        assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+                        registry.dispatch_incoming_for_connection(
+                            &daemon_id,
+                            connection_id,
+                            api_types::DaemonFrame::Error {
+                                id: Some(id),
+                                error: api_types::DaemonErrorPayload {
+                                    code: "workspace_error".into(),
+                                    message: "git: not a git repository".into(),
+                                    details: None,
+                                },
+                            },
+                        );
+                        continue;
+                    }
+                    let result = match step {
+                        0 | 3 => {
+                            assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+                            json!({"workspace_handle": params["workspace_handle"], "generation": 1, "exists": step == 3,
+                                "head_sha": if step == 3 { Some("owner-head") } else { None }, "dirty": false,
+                                "branch": "task/remote", "locked": false, "active_execution_ids": [], "journaled_execution_ids": []})
+                        }
+                        1 => {
+                            assert_eq!(method, api_types::METHOD_WORKSPACE_PREPARE);
+                            assert_eq!(params["expected"]["sha"], "base-head");
+                            assert_eq!(params["branch"], "task/remote");
+                            json!({"entry_id": "launch-recover-entry", "operation_id": params["operation_id"],
+                                "workspace_handle": "opaque-owner-handle", "workspace_path": "/owner-only/rebuilt", "generation": 1,
+                                "base_sha": "base-head", "branch": "task/remote"})
+                        }
+                        _ => {
+                            assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+                            json!({"entry_id": params["entry_id"], "acknowledged": true})
+                        }
+                    };
+                    registry.dispatch_incoming_for_connection(
+                        &daemon_id,
+                        connection_id,
+                        api_types::DaemonFrame::Response { id, result },
+                    );
+                }
+            })
+        };
+        let root = tempfile::TempDir::new().unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)))
+            .with_workspace_root(root.path().to_path_buf());
+        let router = (*service.workspace_backend_router())
+            .clone()
+            .with_daemon(Arc::new(
+                crate::workspace_backend::DaemonWorkspaceBackend::new(db.clone(), registry),
+            ));
+        let workspace = crate::task_service::workspace::prepare_workspace(
+            &db,
+            root.path(),
+            &task,
+            &task.id,
+            None,
+            &router,
+        )
+        .await
+        .unwrap();
+        let reused = crate::task_service::workspace::prepare_workspace(
+            &db,
+            root.path(),
+            &task,
+            &task.id,
+            None,
+            &router,
+        )
+        .await
+        .unwrap();
+        responder.await.unwrap();
+        assert_eq!(workspace.id, ready.workspace_id);
+        assert_eq!(reused.id, workspace.id);
+        assert_eq!(reused.branch, "task/remote");
+        let stored = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.daemon_id, ready.daemon_id);
+        assert_eq!(
+            stored.workspace_handle.as_deref(),
+            Some("opaque-owner-handle")
+        );
+        assert_eq!(ExecutionRepo::list_running(&*db).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -7249,12 +7847,11 @@ pub(crate) mod tests {
                 }
             })
         };
-        HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
-            .with_daemon_connections(registry)
-            .check_once()
-            .await
-            .unwrap();
+        let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
+            .with_daemon_connections(registry);
+        monitor.check_once().await.unwrap();
         responder.await.unwrap();
+        monitor.finish_placement_workers().await;
         let ready = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
             .await
             .unwrap()
@@ -7350,7 +7947,7 @@ pub(crate) mod tests {
                             assert_eq!(params["expected"]["sha"], "candidate-head");
                             assert_eq!(params["base_ref"], "base-head");
                             json!({"entry_id": "reset-entry", "operation_id": params["operation_id"],
-                                "workspace_handle": "rebuilt-owner-handle", "workspace_path": "/owner-only/rebuilt",
+                                "workspace_handle": "opaque-owner-handle", "workspace_path": "/owner-only/rebuilt",
                                 "generation": 2, "base_sha": "base-head", "branch": "task/remote"})
                         }
                         _ => {
@@ -7392,7 +7989,7 @@ pub(crate) mod tests {
         assert_eq!(ready.version, placement.version + 1);
         assert_eq!(
             ready.workspace_handle.as_deref(),
-            Some("rebuilt-owner-handle")
+            Some("opaque-owner-handle")
         );
         assert_eq!(ready.owner_kind, placement.owner_kind);
         assert_eq!(ready.daemon_id, placement.daemon_id);
@@ -7469,7 +8066,7 @@ pub(crate) mod tests {
                             )
                             .await
                             .unwrap();
-                            json!({"entry_id": "reset-entry", "operation_id": params["operation_id"], "workspace_handle": "rebuilt-owner-handle",
+                            json!({"entry_id": "reset-entry", "operation_id": params["operation_id"], "workspace_handle": "opaque-owner-handle",
                                 "workspace_path": "/owner-only/rebuilt", "generation": 2, "base_sha": "base-head", "branch": "task/remote"})
                         }
                         _ => {
@@ -7522,10 +8119,69 @@ pub(crate) mod tests {
         assert_eq!(ready.generation, 2);
         assert_eq!(
             ready.workspace_handle.as_deref(),
-            Some("rebuilt-owner-handle")
+            Some("opaque-owner-handle")
         );
         assert_eq!(ready.daemon_id, placement.daemon_id);
         assert_eq!(ready.state, PlacementState::Ready);
+    }
+
+    #[tokio::test]
+    async fn placement_recovery_refuses_offline_agent_and_preserves_blocker() {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE execution SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        let ready = WorkspacePlacementRepo::update(
+            &*db,
+            placement_update(&placement, PlacementState::Ready, None),
+        )
+        .await
+        .unwrap();
+        db::TaskRoleAssignmentRepo::assign(
+            &*db,
+            db::CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: "coder".into(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: placement.agent_id.clone(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(json!({"type":"manual_stop", "blocking_reason":"manual_stop", "blocked_by":"user",
+                "blocked_at":now_rfc3339(), "blocked_execution_id":execution.id, "message":"retry on same owner",
+                "recovery_actions":["reexecute", "cancel_task"]}).to_string())
+            .bind(&task.id).execute(db.pool()).await.unwrap();
+        DaemonRepo::mark_offline(&*db, ready.daemon_id.as_deref().unwrap(), &now_rfc3339())
+            .await
+            .unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)));
+        let before = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = service
+            .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+            .await
+            .expect_err("explicit recovery preserves the base offline-agent refusal");
+        assert!(
+            matches!(error, ServiceError::InvalidOperation { ref message } if message.contains("offline")),
+            "{error:?}"
+        );
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.error_annotation, before.error_annotation);
+        assert!(crate::deferred_dispatch::queued_recovery(&current).is_none());
+        assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

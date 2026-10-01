@@ -709,7 +709,10 @@ fn within_runtime_root(path: &str, root: &str) -> bool {
     }
 }
 
-async fn verify_server_location(repo: &Repo, location_path: &str) -> LocationVerification {
+pub(crate) async fn verify_server_location(
+    repo: &Repo,
+    location_path: &str,
+) -> LocationVerification {
     let path = Path::new(location_path);
     if !path.is_absolute() {
         return LocationVerification::invalid("path_not_absolute");
@@ -749,6 +752,32 @@ async fn verify_server_location(repo: &Repo, location_path: &str) -> LocationVer
         }
     }
     LocationVerification::ready()
+}
+
+pub(crate) async fn verify_managed_clone(repo: &Repo, path: &str) -> LocationVerification {
+    let verified = verify_server_location(repo, path).await;
+    if verified.status != RepoLocationStatus::Ready {
+        return verified;
+    }
+    // A task worktree (including a migration's non-standard path) is not a
+    // managed clone. Its origin may be inherited from an unrelated common dir.
+    if !Path::new(path).join(".git").is_dir() {
+        return LocationVerification::invalid("managed_clone_is_worktree");
+    }
+    match git::list_branches(Path::new(path)).await {
+        Ok(branches)
+            if branches
+                .origin_url
+                .as_deref()
+                .zip(repo.remote_url.as_deref())
+                .is_some_and(|(actual, expected)| {
+                    git::normalize_remote_url(actual) == git::normalize_remote_url(expected)
+                }) =>
+        {
+            verified
+        }
+        _ => LocationVerification::invalid("managed_clone_remote_mismatch"),
+    }
 }
 
 async fn local_git(path: &Path, args: &[&str]) -> std::result::Result<String, String> {
@@ -791,6 +820,59 @@ mod tests {
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn placement_managed_clone_verification_rejects_worktrees_and_absent_remotes() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("clone");
+        std::fs::create_dir_all(&checkout).unwrap();
+        git::init(&checkout).await.unwrap();
+        std::fs::write(checkout.join("README.md"), "base").unwrap();
+        git::commit_all(&checkout, "base").await.unwrap();
+        let repo = repo();
+        assert_eq!(
+            verify_managed_clone(&repo, checkout.to_str().unwrap())
+                .await
+                .status,
+            RepoLocationStatus::Invalid
+        );
+        local_git(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                repo.remote_url.as_deref().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verify_managed_clone(&repo, checkout.to_str().unwrap())
+                .await
+                .status,
+            RepoLocationStatus::Ready
+        );
+        let worktree = root.path().join("worktree");
+        local_git(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .await
+        .unwrap();
+        let verified = verify_managed_clone(&repo, worktree.to_str().unwrap()).await;
+        assert_eq!(verified.status, RepoLocationStatus::Invalid);
+        assert_eq!(
+            verified.last_error.as_deref(),
+            Some("managed_clone_is_worktree")
+        );
     }
 
     #[tokio::test]

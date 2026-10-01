@@ -104,7 +104,7 @@ FROM legacy_sources;
 INSERT INTO workspace_placement (
     id, workspace_id, task_id, agent_id, owner_kind, repo_location_id,
     workspace_handle, generation, state, selected_by, selection_reason,
-    failure_cause, created_at, updated_at
+    failure_cause, reserved_until, created_at, updated_at
 )
 SELECT
     lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
@@ -124,6 +124,7 @@ SELECT
     'backfill', json_object('rule', 'backfill', 'rejected_candidates', json('[]'),
                             'workspace_status', w.status),
     CASE WHEN w.status = 'error' THEN 'prepare_failed' END,
+    CASE WHEN w.status = 'creating' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+10 minutes') END,
     w.created_at, w.updated_at
 FROM workspace w
 JOIN repo_location l ON l.repo_id = w.repo_id AND (

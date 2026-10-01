@@ -418,6 +418,7 @@ pub struct TaskService {
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
     test_workspace_backend: bool,
     workspace_root: PathBuf,
+    workspace_max_disconnect: Duration,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Task IDs whose completion cascade is running right now. Shared by
@@ -510,6 +511,7 @@ impl TaskService {
             workspace_backend_router,
             test_workspace_backend: false,
             workspace_root,
+            workspace_max_disconnect: Duration::from_secs(::config::DEFAULT_MAX_DISCONNECT_SECONDS),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
@@ -630,6 +632,11 @@ impl TaskService {
             cleanup_scheduler.set_repo_cache_locks(Arc::clone(locks));
         }
         self.cleanup_scheduler = Some(cleanup_scheduler);
+        self
+    }
+
+    pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {
+        self.workspace_max_disconnect = timeout;
         self
     }
 

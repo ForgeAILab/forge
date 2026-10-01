@@ -82,9 +82,42 @@ impl DaemonExecutionEventHandler for ConflictHandler {
     }
 }
 
+struct IgnoreHandler;
+
+#[async_trait]
+impl DaemonExecutionEventHandler for IgnoreHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(DaemonTerminalDisposition::Ignore)
+    }
+}
+
 #[derive(Default)]
 struct JournalReadinessHandler {
     ready: std::sync::atomic::AtomicBool,
+    committed: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -115,6 +148,8 @@ impl DaemonExecutionEventHandler for JournalReadinessHandler {
     ) -> Result<DaemonTerminalDisposition, ServiceError> {
         Ok(if self.ready.load(std::sync::atomic::Ordering::Acquire) {
             DaemonTerminalDisposition::Acknowledge
+        } else if self.committed.load(std::sync::atomic::Ordering::Acquire) {
+            DaemonTerminalDisposition::AwaitingCascade
         } else {
             DaemonTerminalDisposition::Pending
         })
@@ -991,6 +1026,23 @@ async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
         .await
         .unwrap());
     assert!(outbound.try_recv().is_err());
+    // Durable terminal settlement allows reconciliation to continue, while
+    // the owner retains its report until the cascade can commit.
+    handler
+        .committed
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(registry
+        .drain_execution_journal("journal-owner", connection_id, &execution_ids)
+        .await
+        .unwrap());
+    assert!(outbound.try_recv().is_err());
+    assert!(
+        super::lock(&registry.inner.journal_terminals).contains_key(&(
+            "journal-owner".to_owned(),
+            connection_id,
+            "execution-journal".to_owned()
+        ))
+    );
     handler
         .ready
         .store(true, std::sync::atomic::Ordering::Release);
@@ -1019,4 +1071,88 @@ async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
         .await
         .unwrap());
     responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_transport_request_removes_pending_sender_for_each_request_path() {
+    for pinned in [false, true] {
+        let registry = make_registry();
+        let (connection, mut outbound) = DaemonConnection::new("cancelled-owner".to_owned());
+        let connection_id = connection.id();
+        registry.register("cancelled-owner".to_owned(), connection.clone());
+        accept_protocol_handshake(&registry, "cancelled-owner", connection_id);
+        let request = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                if pinned {
+                    registry
+                        .send_request_for_connection::<_, TestResponse>(
+                            "cancelled-owner",
+                            connection_id,
+                            "test.echo",
+                            json!({}),
+                            30,
+                        )
+                        .await
+                } else {
+                    registry
+                        .send_request::<_, TestResponse>(
+                            "cancelled-owner",
+                            "test.echo",
+                            json!({}),
+                            30,
+                        )
+                        .await
+                }
+            })
+        };
+        outbound.recv().await.unwrap();
+        assert_eq!(super::lock(&connection.pending).len(), 1);
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(super::lock(&connection.pending).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn daemon_transport_ignored_terminal_is_acknowledged() {
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::new(EventBus::new(16)),
+        Arc::new(IgnoreHandler),
+    ));
+    let daemon_id = "ignored-owner";
+    let (connection, mut outbound) = DaemonConnection::new(daemon_id.into());
+    let connection_id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    accept_protocol_handshake(&registry, daemon_id, connection_id);
+    let notification = serde_json::from_value(json!({"terminal_report_id": "ignored-report",
+        "execution_id": "late-execution", "exit_code": 0, "status": "completed", "ts": now_rfc3339(), "usage_reports": []})).unwrap();
+    let attempt = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .apply_journal_terminal(daemon_id, connection_id, notification)
+                .await
+                .unwrap()
+        })
+    };
+    let api_types::DaemonFrame::Request { id, method, params } =
+        tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected acknowledgement");
+    };
+    assert_eq!(method, api_types::METHOD_JOURNAL_ACK);
+    assert_eq!(params["entry_id"], "ignored-report");
+    registry.dispatch_incoming_for_connection(
+        daemon_id,
+        connection_id,
+        api_types::DaemonFrame::Response {
+            id,
+            result: json!({"entry_id": "ignored-report", "acknowledged": true}),
+        },
+    );
+    assert_eq!(attempt.await.unwrap(), DaemonTerminalDisposition::Ignore);
 }

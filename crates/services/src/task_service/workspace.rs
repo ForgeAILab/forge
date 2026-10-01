@@ -41,6 +41,7 @@ const PLACEMENT_RESERVATION_SECONDS: i64 = 600;
 
 pub(super) struct WorkspaceAdmission {
     pub workspace: Workspace,
+    claiming_task: Task,
     pub placement: db::WorkspacePlacement,
     selection_context: Option<crate::placement::SelectionContext>,
     server_facts: crate::placement::ServerFacts,
@@ -77,6 +78,123 @@ impl TaskService {
             return Err(DbError::VersionConflict.into());
         }
         Ok(())
+    }
+
+    pub(crate) async fn defer_placement_refusal(
+        &self,
+        task: &Task,
+        error: &ServiceError,
+    ) -> Result<bool> {
+        if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await? {
+            return Ok(false);
+        }
+        let daemon_id = match error {
+            ServiceError::DaemonUnavailable { daemon_id }
+            | ServiceError::DaemonTimeout { daemon_id, .. } => Some(daemon_id.clone()),
+            ServiceError::PlacementUnavailable(refusal) => refusal
+                .rejected_candidates
+                .iter()
+                .find(|candidate| {
+                    candidate
+                        .filter_codes
+                        .contains(&crate::placement::PlacementFilterCode::OwnerUnreachable)
+                })
+                .and_then(|candidate| candidate.daemon_id.clone()),
+            _ => None,
+        };
+        let reason = error.to_string();
+        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let now = Utc::now();
+        let started_at = metadata
+            .extra
+            .get("owner_wait")
+            .and_then(|wait| wait["started_at"].as_str())
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or(now);
+        let expired = daemon_id.is_some()
+            && (now - started_at)
+                .to_std()
+                .is_ok_and(|elapsed| elapsed >= self.workspace_max_disconnect);
+        let owner_wait = daemon_id.as_ref().map(|daemon_id| {
+            json!({
+                "started_at": started_at.to_rfc3339(), "daemon_id": daemon_id,
+            })
+            .to_string()
+        });
+        let deferral = (!expired).then(|| {
+            json!({
+                "target_state": task.status, "reason": reason,
+                "not_before": (now + chrono::Duration::seconds(30)).to_rfc3339(),
+            })
+            .to_string()
+        });
+        let annotation = expired.then(|| {
+            json!({"type": "recovery_required", "blocking_reason": "owner_disconnected_timeout",
+            "message": reason, "blocked_at": now.to_rfc3339(), "blocked_by": "system:workflow",
+            "recovery_actions": ["reexecute", "cancel_task"]})
+            .to_string()
+        });
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let result = sqlx::query("UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            error_annotation = COALESCE(?, error_annotation),
+            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
+            .bind(&deferral).bind(&deferral).bind(&annotation).bind(&annotation).bind(now.to_rfc3339())
+            .bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::VersionConflict.into());
+        }
+        if let Some(owner_wait) = owner_wait {
+            sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ?")
+                .bind(owner_wait).bind(&task.id).execute(&mut *tx).await?;
+        }
+        if daemon_id.is_some() {
+            crate::placement::admission::record_wait_attention_in_tx(
+                &self.db,
+                &mut tx,
+                task,
+                "runtime_offline",
+                &if expired {
+                    format!("Workspace owner wait expired: {reason}")
+                } else {
+                    format!("Waiting for workspace owner: {reason}")
+                },
+                &format!("task-owner-wait:{}", task.id),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(!expired)
+    }
+
+    pub(crate) async fn expire_owner_wait(&self, task: &Task) -> Result<bool> {
+        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let Some(wait) = metadata.extra.get("owner_wait") else {
+            return Ok(false);
+        };
+        let Some(daemon_id) = wait["daemon_id"].as_str() else {
+            return Ok(false);
+        };
+        let expired = wait["started_at"]
+            .as_str()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .and_then(|at| (Utc::now() - at.with_timezone(&Utc)).to_std().ok())
+            .is_some_and(|elapsed| elapsed >= self.workspace_max_disconnect);
+        if !expired || task.blocked_json.is_some() {
+            return Ok(false);
+        }
+        self.defer_placement_refusal(
+            task,
+            &ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.into(),
+            },
+        )
+        .await?;
+        Ok(true)
     }
 
     pub(super) async fn reserve_claim_workspace(
@@ -147,13 +265,133 @@ impl TaskService {
             claiming_agent.iter().chain(worktree_agents.iter()),
         )
         .await?;
+        let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+        // Verify an upgraded managed clone only when this admission can use
+        // the embedded owner. An existing daemon placement stays on its owner.
+        if claiming_agent
+            .iter()
+            .chain(worktree_agents.iter())
+            .all(|role| {
+                role.agent.daemon_id.is_none()
+                    || role.agent.daemon_id == server_facts.execution_daemon_id
+            })
+        {
+            let bound_location = sqlx::query_scalar::<_, String>(
+                "SELECT p.repo_location_id FROM workspace_placement p
+                 JOIN workspace w ON w.id = p.workspace_id WHERE w.task_id = ?
+                 AND (p.state IN ('reserved', 'preparing', 'ready', 'disconnected', 'cleaning')
+                      OR (p.state = 'failed' AND p.workspace_handle IS NOT NULL))",
+            )
+            .bind(workspace_task_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let lock_key = repo
+                .local_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && Path::new(path).exists())
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    self.workspace_root
+                        .join(".repos")
+                        .join(&repo.id)
+                        .to_string_lossy()
+                        .into_owned()
+                });
+            let locks = self.repo_cache_locks.clone().unwrap_or_default();
+            // Use the same physical-source key as every clone/worktree writer.
+            let locations: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+                "SELECT id, path, version, last_error FROM repo_location WHERE repo_id = ?
+                 AND owner_kind = 'server' AND daemon_id IS NULL AND runtime_id IS NULL
+                 AND kind = 'managed_clone' AND (status = 'unverified' OR (status = 'unavailable' AND last_error LIKE '{%')
+                      OR (status = 'invalid' AND last_error = 'managed_clone_is_worktree'))
+                 AND (? IS NULL OR id = ?)")
+                .bind(&repo.id).bind(&bound_location).bind(&bound_location).fetch_all(self.db.pool()).await?;
+            for (id, path, version, last_error) in locations {
+                let original_path = path.clone();
+                let retry: Value = last_error
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or(Value::Null);
+                if retry["retry_at"]
+                    .as_str()
+                    .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| at > Utc::now())
+                {
+                    continue;
+                }
+                let _guard = locks.acquire(&lock_key).await;
+                let source = if Path::new(&path).join(".git").is_file() {
+                    resolve_repo_source(repo, &self.workspace_root).await
+                } else if Path::new(&path).exists() {
+                    Ok(path)
+                } else {
+                    resolve_repo_source(repo, &self.workspace_root).await
+                };
+                let (source, verification) = match source {
+                    Ok(source) => {
+                        let verification =
+                            crate::repo_location::verify_managed_clone(repo, &source).await;
+                        (source, verification)
+                    }
+                    Err(error) => {
+                        let attempts = retry["attempts"].as_u64().unwrap_or(0) + 1;
+                        let retry_at = (Utc::now()
+                            + chrono::Duration::seconds(
+                                30 * (1_i64 << attempts.saturating_sub(1).min(7)),
+                            ))
+                        .to_rfc3339();
+                        (lock_key.clone(), crate::repo_location::LocationVerification::unavailable(json!({
+                            "cause": "clone_failed", "attempts": attempts, "retry_at": retry_at,
+                            "message": bounded_redacted_remote_diagnostic(&error.to_string()),
+                        }).to_string()))
+                    }
+                };
+                let mut expected_version = version;
+                for _ in 0..3 {
+                    let result = db::RepoLocationRepo::update(
+                        &*self.db,
+                        db::UpdateRepoLocation {
+                            id: id.clone(),
+                            expected_version,
+                            path: Some(source.clone()),
+                            kind: None,
+                            is_default: None,
+                            status: Some(verification.status.clone()),
+                            last_verified_at: Some(Some(now_rfc3339())),
+                            last_error: Some(verification.last_error.clone()),
+                            updated_at: now_rfc3339(),
+                        },
+                    )
+                    .await;
+                    match result {
+                        Ok(_) => break,
+                        Err(DbError::VersionConflict) => {
+                            let Some(current) =
+                                db::RepoLocationRepo::get_by_id(&*self.db, &id).await?
+                            else {
+                                break;
+                            };
+                            // PATCH may have replaced the location, not just its default flag.
+                            if (current.path != original_path && current.path != source)
+                                || current.kind != RepoLocationKind::ManagedClone
+                            {
+                                break;
+                            }
+                            expected_version = current.version;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+
         let empty_registry = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
         let registry = self
             .daemon_connections
             .as_deref()
             .unwrap_or(&empty_registry);
         let handshakes = connection_handshakes(registry);
-        let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         crate::placement::admission::sweep_expired_reservations_in_tx(
             &mut transaction,
@@ -219,6 +457,19 @@ impl TaskService {
             return Err(ServiceError::conflict(
                 "workspace preparation is already reserved",
             ));
+        }
+        if let Some(placement) = existing.as_ref().filter(|placement| {
+            placement.state == PlacementState::Cleaning
+                || (placement.state == PlacementState::Failed
+                    && placement.workspace_handle.is_some())
+        }) {
+            return Err(ServiceError::WorkspaceResetRequired {
+                task_id: task.id.clone(),
+                reason: format!(
+                    "workspace placement is {}: {:?}",
+                    placement.state, placement.failure_cause
+                ),
+            });
         }
         let location_count =
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repo_location WHERE repo_id = ?")
@@ -368,7 +619,19 @@ impl TaskService {
             let prepared =
                 placement.workspace_handle.is_some() && placement.state != PlacementState::Cleaned;
             if prepared && placement.state != PlacementState::Ready {
-                return Err(DbError::VersionConflict.into());
+                if placement.state == PlacementState::Disconnected {
+                    return Err(ServiceError::DaemonUnavailable {
+                        daemon_id: placement
+                            .daemon_id
+                            .clone()
+                            .or(placement.execution_daemon_id.clone())
+                            .unwrap_or_default(),
+                    });
+                }
+                return Err(ServiceError::WorkspaceResetRequired {
+                    task_id: task.id.clone(),
+                    reason: format!("workspace placement is {}", placement.state),
+                });
             }
             let mut update = crate::placement::admission::placement_update(&placement);
             update.agent_id = Some(agent.map(|agent| agent.id.clone()));
@@ -458,6 +721,7 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
         Ok(WorkspaceAdmission {
+            claiming_task: task.clone(),
             workspace,
             placement,
             selection_context: context,
@@ -473,7 +737,7 @@ impl TaskService {
         mut admission: WorkspaceAdmission,
     ) -> Result<WorkspaceAdmission> {
         if admission.placement.state == PlacementState::Ready {
-            let state = match async {
+            let needs_recreation = match async {
                 let backend = self
                     .workspace_backend_router
                     .for_placement(&admission.placement)?;
@@ -481,7 +745,8 @@ impl TaskService {
             }
             .await
             {
-                Ok(state) => state,
+                Ok(state) => !state.exists,
+                Err(error) if worktree_describe_needs_recreation(&error) => true,
                 Err(error) => {
                     let cause = match &error {
                         crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
@@ -513,11 +778,20 @@ impl TaskService {
                     return Err(error.into());
                 }
             };
-            if !state.exists {
-                return Err(ServiceError::WorkspaceResetRequired {
-                    task_id: admission.workspace.task_id.clone(),
-                    reason: "prepared workspace is missing on its owner".to_owned(),
-                });
+            if needs_recreation {
+                admission.workspace = prepare_workspace(
+                    &self.db,
+                    &self.workspace_root,
+                    &admission.claiming_task,
+                    &admission.claiming_task.id,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                )
+                .await?;
+                admission.placement =
+                    WorkspacePlacementRepo::get_by_id(&*self.db, &admission.placement.id)
+                        .await?
+                        .ok_or(DbError::NotFound)?;
             }
             admission.workspace =
                 clear_workspace_cleanup_after(&self.db, admission.workspace).await?;
@@ -710,6 +984,17 @@ impl TaskService {
             .await?;
             crate::placement::select_placement(&context).into_result()?;
         }
+        sqlx::query(
+            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait')
+            WHERE id = ? AND json_type(metadata_json, '$.owner_wait') IS NOT NULL",
+        )
+        .bind(&task.id)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
+            WHERE dedupe_key = ? AND status <> 'resolved'")
+            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
+            .execute(&mut **transaction).await?;
         Ok(())
     }
 }
@@ -824,6 +1109,15 @@ pub(crate) async fn prepare_workspace(
     )
 }
 
+fn worktree_describe_needs_recreation(
+    error: &crate::workspace_backend::WorkspaceBackendError,
+) -> bool {
+    matches!(error, crate::workspace_backend::WorkspaceBackendError::Other(error)
+        if matches!(&**error, ServiceError::Git(_))
+            || matches!(&**error, ServiceError::InvalidOperation { message }
+                if message.starts_with("workspace_error:")))
+}
+
 /// Prepare a workspace and report whether this call won creation ownership.
 /// The ownership bit is consumed by admission-failure cleanup; callers must
 /// never infer it from a racy preflight existence query.
@@ -850,17 +1144,50 @@ pub(crate) async fn prepare_workspace_owned(
                     owner_task_id,
                 )
                 .await?;
-                if placement.state != PlacementState::Ready {
-                    return Err(ServiceError::DaemonUnavailable {
-                        daemon_id: placement.daemon_id.unwrap_or_default(),
-                    });
+                match placement.state {
+                    PlacementState::Ready => {}
+                    PlacementState::Disconnected => {
+                        return Err(ServiceError::DaemonUnavailable {
+                            daemon_id: placement.daemon_id.unwrap_or_default(),
+                        })
+                    }
+                    _ => {
+                        return Err(ServiceError::WorkspaceResetRequired {
+                            task_id: task.id.clone(),
+                            reason: format!("workspace placement is {}", placement.state),
+                        })
+                    }
                 }
                 let resolved = router.resolve(db, &workspace).await?;
-                if !resolved.backend.describe(&resolved.placement).await?.exists {
-                    return Err(ServiceError::WorkspaceResetRequired {
-                        task_id: owner_task_id.to_owned(),
-                        reason: "prepared workspace is missing on its owner".to_owned(),
-                    });
+                let needs_recreation = match resolved.backend.describe(&resolved.placement).await {
+                    Ok(state) => !state.exists,
+                    Err(error) if worktree_describe_needs_recreation(&error) => true,
+                    Err(error) => return Err(error.into()),
+                };
+                if needs_recreation {
+                    if sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')")
+                        .bind(&workspace.id).fetch_one(db.pool()).await? {
+                        return Err(ServiceError::conflict("workspace still has a running execution"));
+                    }
+                    let recovered = resolved
+                        .backend
+                        .prepare(
+                            &resolved.placement,
+                            &crate::workspace_backend::PrepareSpec {
+                                base_ref: workspace.before_sha.clone().ok_or_else(|| {
+                                    ServiceError::WorkspaceResetRequired {
+                                        task_id: owner_task_id.to_owned(),
+                                        reason: "workspace has no recorded recovery base"
+                                            .to_owned(),
+                                    }
+                                })?,
+                            },
+                        )
+                        .await?;
+                    let mut update =
+                        crate::placement::admission::placement_update(&resolved.placement);
+                    update.workspace_handle = Some(Some(recovered.handle));
+                    WorkspacePlacementRepo::update(db, update).await?;
                 }
                 return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
             }
@@ -895,7 +1222,7 @@ pub(crate) async fn prepare_workspace_owned(
             let resolved =
                 resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
             let worktree_path = resolved.embedded_path()?;
-            match worktree_readiness(&worktree_path).await {
+            match worktree_readiness(&worktree_path, workspace.before_sha.as_deref()).await {
                 WorktreeReadiness::Ready => {
                     info!(
                         task_id = task_id,
@@ -985,7 +1312,7 @@ pub(crate) async fn prepare_workspace_owned(
             let resolved =
                 resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
             let worktree_path = resolved.embedded_path()?;
-            match worktree_readiness(&worktree_path).await {
+            match worktree_readiness(&worktree_path, workspace.before_sha.as_deref()).await {
                 WorktreeReadiness::Ready => {
                     info!(
                         task_id = task_id,
@@ -1071,7 +1398,7 @@ async fn recover_missing_worktree(
 ) -> Result<Workspace> {
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let existing_path = resolved.embedded_path()?;
-    let readiness = worktree_readiness(&existing_path).await;
+    let readiness = worktree_readiness(&existing_path, workspace.before_sha.as_deref()).await;
     warn!(
         task_id = task_id,
         workspace_id = %workspace.id,
@@ -1171,15 +1498,22 @@ enum WorktreeReadiness {
     Invalid,
 }
 
-async fn worktree_readiness(worktree_path: &Path) -> WorktreeReadiness {
+async fn worktree_readiness(
+    worktree_path: &Path,
+    recorded_head: Option<&str>,
+) -> WorktreeReadiness {
     if !worktree_path.exists() {
         return WorktreeReadiness::Missing;
     }
     if !worktree_path.join(".git").exists() {
-        // Some unit tests seed lightweight workspace rows with plain directories.
-        // Real Forge-created worktrees always have .git metadata, so only verify
-        // git health when metadata is present.
-        return WorktreeReadiness::Ready;
+        // A recorded Git HEAD proves this was a real worktree: missing
+        // metadata is damage, even though the directory itself still exists.
+        // Lightweight rows without Git evidence retain their existing behavior.
+        return if recorded_head.is_some() {
+            WorktreeReadiness::Invalid
+        } else {
+            WorktreeReadiness::Ready
+        };
     }
     match git::get_current_sha(worktree_path).await {
         Ok(_) => WorktreeReadiness::Ready,
@@ -2121,6 +2455,312 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn placement_migrated_remote_only_repo_first_claim_verifies_clone() {
+        assert_migrated_clone_claim(false).await;
+    }
+
+    #[tokio::test]
+    async fn placement_migrated_worktree_location_replaces_invalid_path_on_claim() {
+        assert_migrated_clone_claim(true).await;
+    }
+
+    async fn assert_migrated_clone_claim(nonstandard: bool) {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("../db/migrations");
+        let mut historical = std::fs::read_dir(migrations)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                let version: i64 = name.strip_prefix('V')?.split_once("__")?.0.parse().ok()?;
+                (version < 202610010400).then_some((version, path))
+            })
+            .collect::<Vec<_>>();
+        historical.sort_by_key(|(version, _)| *version);
+        for (_, path) in historical {
+            sqlx::raw_sql(&std::fs::read_to_string(path).unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let db = Arc::new(SqliteDb::new(pool));
+        let remote = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, repo_id) = seed_project_with_real_repo(&db, remote.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let daemon = db::DaemonRepo::upsert_by_machine_id(
+            &*db,
+            db::UpsertDaemon {
+                id: new_uuid_v4(),
+                machine_id: crate::embedded_daemon::embedded_machine_id(),
+                hostname: "server".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                agent_version: None,
+                labels_json: "{}".into(),
+                status: db::DaemonStatus::Online,
+                registration_token_hash: None,
+                owner_id: None,
+                visibility: "global".into(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        db::DaemonRepo::update_report(
+            &*db,
+            db::UpdateDaemonReport {
+                id: daemon.id,
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.into(),
+                labels_json: None,
+                status: db::DaemonStatus::Online,
+                last_report_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let base = git::get_current_sha(remote.path()).await.unwrap();
+        // Legacy remote-only repository and a ready task worktree. Its clone
+        // cache has disappeared, so first use must clone before selection.
+        sqlx::query("UPDATE repo SET local_path = NULL WHERE id = ?")
+            .bind(&repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let path = if nonstandard {
+            let path = root.path().join("legacy-worktree");
+            git::create_worktree(
+                remote.path(),
+                &::workspace::task_branch_name(&task.id),
+                &path,
+            )
+            .await
+            .unwrap();
+            path
+        } else {
+            ::workspace::WorkspaceManager::new(root.path().to_path_buf())
+                .create_worktree_named(remote.path().to_str().unwrap(), &task.id, "repo", "main")
+                .await
+                .unwrap()
+        };
+        WorkspaceRepo::create(
+            &*db,
+            CreateWorkspace {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                repo_id: repo_id.clone(),
+                worktree_path: path.to_string_lossy().into_owned(),
+                branch: ::workspace::task_branch_name(&task.id),
+                status: WorkspaceStatus::Ready,
+                before_sha: Some(base),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610010400__daemon_owned_workspaces.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM repo_location WHERE repo_id = ?")
+                .bind(&repo_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "unverified");
+        if nonstandard {
+            sqlx::query("UPDATE repo_location SET status = 'invalid', last_error = 'managed_clone_is_worktree' WHERE repo_id = ?")
+                .bind(&repo_id).execute(db.pool()).await.unwrap();
+        }
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let claimed = service
+            .claim_task(&task.id, Assignee::Agent(agent.id), None)
+            .await
+            .unwrap();
+        assert_eq!(claimed.task.status, "in_progress");
+        let location_path: String =
+            sqlx::query_scalar("SELECT path FROM repo_location WHERE repo_id = ?")
+                .bind(&repo_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            location_path,
+            root.path().join(".repos").join(&repo_id).to_string_lossy()
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM repo_location WHERE repo_id = ?")
+                .bind(&repo_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "ready");
+        assert!(root.path().join(".repos").join(repo_id).is_dir());
+        assert!(path.is_dir());
+    }
+
+    #[tokio::test]
+    async fn placement_remote_clone_failure_is_recorded_and_backed_off() {
+        let db = Arc::new(sqlite_db().await);
+        let remote = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, repo_id) = seed_project_with_real_repo(&db, remote.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let missing = root.path().join("missing-remote");
+        sqlx::query("UPDATE repo SET local_path = NULL, remote_url = ? WHERE id = ?")
+            .bind(missing.to_str().unwrap())
+            .bind(&repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let location = db::RepoLocationRepo::create(
+            &*db,
+            db::CreateRepoLocation {
+                id: new_uuid_v4(),
+                repo_id: repo_id.clone(),
+                owner_kind: db::RepoLocationOwnerKind::Server,
+                daemon_id: None,
+                runtime_id: None,
+                path: root
+                    .path()
+                    .join(".repos")
+                    .join(&repo_id)
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: RepoLocationKind::ManagedClone,
+                is_default: true,
+                status: db::RepoLocationStatus::Unverified,
+                last_verified_at: None,
+                last_error: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let locks = Arc::new(RepoCacheLockManager::new());
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf())
+            .with_repo_cache_locks(locks.clone());
+        assert!(service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .is_err());
+        let failed = db::RepoLocationRepo::get_by_id(&*db, &location.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, db::RepoLocationStatus::Unavailable);
+        let error: Value = serde_json::from_str(failed.last_error.as_deref().unwrap()).unwrap();
+        assert_eq!(error["cause"], "clone_failed");
+        assert_eq!(error["attempts"], 1);
+        assert!(
+            DateTime::parse_from_rfc3339(error["retry_at"].as_str().unwrap()).unwrap() > Utc::now()
+        );
+        let _source_lock = locks.acquire(&location.path).await;
+        assert!(service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .is_err());
+        let deferred = db::RepoLocationRepo::get_by_id(&*db, &location.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            deferred.version, failed.version,
+            "backoff must not retry the clone on every scan"
+        );
+        assert_eq!(deferred.last_error, failed.last_error);
+    }
+
+    #[tokio::test]
+    async fn placement_claim_recreates_deleted_ready_worktree() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        let original = prepared.placement.clone();
+        let sha = git::get_current_sha(Path::new(original.workspace_handle.as_deref().unwrap()))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(original.workspace_handle.as_deref().unwrap()).unwrap();
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let recovered = service.prepare_claim_workspace(admission).await.unwrap();
+        assert_eq!(recovered.workspace.id, prepared.workspace.id);
+        assert_eq!(recovered.workspace.branch, prepared.workspace.branch);
+        assert_eq!(recovered.placement.generation, original.generation + 1);
+        assert_eq!(
+            git::get_current_sha(Path::new(
+                recovered.placement.workspace_handle.as_deref().unwrap()
+            ))
+            .await
+            .unwrap(),
+            sha
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_claim_recreates_invalid_ready_worktree() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        let original = prepared.placement.clone();
+        let sha = git::get_current_sha(Path::new(original.workspace_handle.as_deref().unwrap()))
+            .await
+            .unwrap();
+        std::fs::remove_file(Path::new(original.workspace_handle.as_deref().unwrap()).join(".git"))
+            .unwrap();
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let recovered = service.prepare_claim_workspace(admission).await.unwrap();
+        assert_eq!(recovered.workspace.id, prepared.workspace.id);
+        assert_eq!(recovered.workspace.branch, prepared.workspace.branch);
+        assert_eq!(recovered.placement.generation, original.generation + 1);
+        assert_eq!(
+            git::get_current_sha(Path::new(
+                recovered.placement.workspace_handle.as_deref().unwrap()
+            ))
+            .await
+            .unwrap(),
+            sha
+        );
     }
 
     #[tokio::test]
@@ -3242,5 +3882,152 @@ mod tests {
             matches!(&result, Err(ServiceError::InvalidOperation { message }) if message.contains("does not exist")),
             "expected InvalidOperation about missing repo, got: {result:?}"
         );
+    }
+    #[tokio::test]
+    async fn missing_worktree_child_claim_missing_branch_preserves_parent_row() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let parent = seed_task(&db, &project_id, None).await;
+        let child = seed_task(&db, &project_id, Some(parent.id.clone())).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let admission = service
+            .reserve_claim_workspace(&parent, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        std::fs::remove_dir_all(prepared.placement.workspace_handle.as_deref().unwrap()).unwrap();
+        let output = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .args(["branch", "-D", &prepared.workspace.branch])
+            .current_dir(repo.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let admission = service
+            .reserve_claim_workspace(&child, Some(&agent), "coder")
+            .await
+            .unwrap();
+        assert!(service.prepare_claim_workspace(admission).await.is_err());
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&*db, &prepared.workspace.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .task_id,
+            parent.id
+        );
+        assert!(
+            WorkspacePlacementRepo::get_by_id(&*db, &prepared.placement.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_ready_embedded_claim_describes_without_source_lock_or_prepare() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let locks = Arc::new(RepoCacheLockManager::new());
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf())
+            .with_repo_cache_locks(locks.clone());
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        // Ready reclaims don't rerun history validation or clone/worktree creation.
+        sqlx::query("UPDATE workspace SET before_sha = 'obsolete-base-object' WHERE id = ?")
+            .bind(&prepared.workspace.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let _source_lock = locks.acquire(repo.path().to_str().unwrap()).await;
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let admitted_version = admission.placement.version;
+        let reclaimed = service.prepare_claim_workspace(admission).await.unwrap();
+        assert_eq!(
+            reclaimed.placement.workspace_handle,
+            prepared.placement.workspace_handle
+        );
+        assert_eq!(reclaimed.placement.version, admitted_version);
+        assert_eq!(
+            reclaimed.workspace.before_sha.as_deref(),
+            Some("obsolete-base-object")
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_first_offline_owner_wait_creates_attention_and_expires_without_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let mut task = seed_task(&db, &project_id, None).await;
+        sqlx::query("UPDATE task SET status = 'in_progress' WHERE id = ?")
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        task.status = "in_progress".into();
+        sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.concurrent_note', 'retained') WHERE id = ?")
+            .bind(&task.id).execute(db.pool()).await.unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_max_disconnect(Duration::from_secs(1));
+        let refusal = ServiceError::DaemonUnavailable {
+            daemon_id: "offline-owner".into(),
+        };
+        assert!(service
+            .defer_placement_refusal(&task, &refusal)
+            .await
+            .unwrap());
+        let attention: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM attention_projection WHERE dedupe_key = ? AND status = 'open'",
+        )
+        .bind(format!("task-owner-wait:{}", task.id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attention, 1);
+        sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.owner_wait.started_at', ?) WHERE id = ?")
+            .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()).bind(&task.id).execute(db.pool()).await.unwrap();
+        let dispatcher = crate::task_dispatcher::TaskDispatcher::new(
+            db.clone(),
+            Arc::new(EventBus::default()),
+            Arc::new(service),
+        );
+        dispatcher.check_once().await.unwrap();
+        let task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.blocked_json.is_some());
+        let metadata: Value = serde_json::from_str(task.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["concurrent_note"], "retained");
+        assert!(task
+            .error_annotation
+            .as_deref()
+            .unwrap()
+            .contains("owner_disconnected_timeout"));
+        assert!(crate::deferred_dispatch::pending_until(&task).is_none());
+        assert_eq!(execution_count(&db, &task.id).await, 0);
     }
 }

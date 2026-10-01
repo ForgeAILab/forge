@@ -128,6 +128,8 @@ pub enum WorkspaceBackendError {
     PurposeDenied { purpose: WorkspaceRunPurpose },
     #[error("owner_unreachable: daemon {daemon_id}")]
     OwnerUnreachable { daemon_id: String },
+    #[error("owner_rpc_timed_out_before_start: daemon {daemon_id}, method {method}")]
+    RpcTimeoutBeforeStart { daemon_id: String, method: String },
     #[error("owner_unsupported: workspace owner {owner_kind}")]
     OwnerUnsupported { owner_kind: PlacementOwnerKind },
     #[error(transparent)]
@@ -183,6 +185,9 @@ impl From<WorkspaceBackendError> for ServiceError {
             | WorkspaceBackendError::PurposeDenied { .. }) => Self::AuthorizationDenied {
                 message: error.to_string(),
             },
+            WorkspaceBackendError::RpcTimeoutBeforeStart { daemon_id, method } => {
+                Self::DaemonTimeout { daemon_id, method }
+            }
             error @ WorkspaceBackendError::OwnerUnsupported { .. } => {
                 Self::invalid_operation(error.to_string())
             }

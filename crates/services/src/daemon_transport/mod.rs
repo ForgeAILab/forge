@@ -70,6 +70,8 @@ pub type PendingRequests = HashMap<String, PendingResponse>;
 pub enum DaemonTerminalDisposition {
     Acknowledge,
     Pending,
+    /// The report committed, but reconciliation must finish before cascade/ACK.
+    AwaitingCascade,
     Conflict,
     Ignore,
 }
@@ -522,6 +524,10 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
+        let _pending = workspace_client::PendingRequest {
+            connection: connection.clone(),
+            request_id: request_id.clone(),
+        };
 
         if !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
@@ -536,14 +542,21 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        if connection.outbound.send(frame).await.is_err() {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        let sent = tokio::time::timeout_at(deadline, connection.outbound.send(frame))
+            .await
+            .map_err(|_| ServiceError::DaemonTimeout {
+                daemon_id: daemon_id.to_owned(),
+                method: method.to_owned(),
+            })?;
+        if sent.is_err() {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
 
-        let result = match tokio::time::timeout(timeout_duration, receiver).await {
+        let result = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(error))) => {
                 return Err(remote::daemon_error_to_service_error(
@@ -594,6 +607,10 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
+        let _pending = workspace_client::PendingRequest {
+            connection: connection.clone(),
+            request_id: request_id.clone(),
+        };
 
         // The connection can be replaced after the lookup above.  Do not
         // leave a request registered on a stale incarnation, and never route
@@ -616,14 +633,21 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        if connection.outbound.send(frame).await.is_err() {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        let sent = tokio::time::timeout_at(deadline, connection.outbound.send(frame))
+            .await
+            .map_err(|_| ServiceError::DaemonTimeout {
+                daemon_id: daemon_id.to_owned(),
+                method: method.to_owned(),
+            })?;
+        if sent.is_err() {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
 
-        let result = match tokio::time::timeout(timeout_duration, receiver).await {
+        let result = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(error))) => {
                 return Err(remote::daemon_error_to_service_error(
@@ -942,7 +966,10 @@ impl DaemonConnectionRegistry {
         let disposition = handler
             .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
             .await?;
-        if disposition == DaemonTerminalDisposition::Acknowledge {
+        if matches!(
+            disposition,
+            DaemonTerminalDisposition::Acknowledge | DaemonTerminalDisposition::Ignore
+        ) {
             let revision = self
                 .get(daemon_id)
                 .filter(|connection| connection.id() == connection_id)
@@ -984,6 +1011,48 @@ impl DaemonConnectionRegistry {
             ));
         }
         Ok(disposition)
+    }
+
+    pub(crate) fn retained_terminal_execution_ids(&self) -> Vec<String> {
+        lock(&self.inner.journal_terminals)
+            .iter()
+            .filter(|((daemon_id, connection_id, _), _)| self.is_current(daemon_id, *connection_id))
+            .map(|((_, _, execution_id), _)| execution_id.clone())
+            .collect()
+    }
+
+    pub(crate) async fn retry_retained_terminals(
+        &self,
+        daemon_id: &str,
+    ) -> Result<(), ServiceError> {
+        let Some(connection) = self.get(daemon_id) else {
+            return Ok(());
+        };
+        let notifications: Vec<_> = lock(&self.inner.journal_terminals)
+            .iter()
+            .filter(|((owner, incarnation, _), _)| {
+                owner == daemon_id && *incarnation == connection.id()
+            })
+            .map(|(_, notification)| notification.clone())
+            .collect();
+        let mut first_error = None;
+        for notification in notifications {
+            if let Err(error) = self
+                .apply_journal_terminal(daemon_id, connection.id(), notification)
+                .await
+            {
+                // A failed cascade/ACK must not starve another placement on
+                // the same daemon. The worker logs its placement/owner context.
+                if matches!(
+                    error,
+                    ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }
+                ) {
+                    return Err(error);
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Describe replays the journal before its response. Drain the retained

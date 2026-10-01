@@ -3,6 +3,93 @@ use ::review::ReviewWorkspace;
 use api_types::{Actor, UserActionSource};
 
 impl TaskService {
+    pub(crate) async fn annotate_review_ci_interruption(
+        &self,
+        task: &Task,
+        ctx: &crate::workflow::HookContext,
+        reason: &str,
+        retry: bool,
+        reset: bool,
+    ) -> Result<Task> {
+        let now = now_rfc3339();
+        let mut barrier: Value = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        let disconnected = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|placement| placement.state == db::PlacementState::Disconnected);
+        let attempts = barrier["infrastructure_attempts"].as_u64().unwrap_or(0)
+            + u64::from(retry && !disconnected);
+        let exhausted = retry && !disconnected && attempts >= 5;
+        let retry = retry && !exhausted;
+        let kind = if reset {
+            "workspace_reset_required"
+        } else if retry {
+            "review_ci_infrastructure"
+        } else if exhausted {
+            "review_ci_infrastructure_exhausted"
+        } else {
+            "review_ci_unavailable"
+        };
+        barrier["state"] = json!(task.status);
+        barrier["status"] = json!("blocked");
+        barrier["updated_at"] = json!(now);
+        barrier["interrupted_at"] = json!(now);
+        barrier["infrastructure_attempts"] = json!(attempts);
+        barrier["blocking_reason"] = json!(reason);
+        let actions = if reset {
+            json!(["reset_to_initial", "cancel_task"])
+        } else {
+            json!(["retry_hook", "cancel_task"])
+        };
+        let annotation = json!({"type": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed },
+            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason,
+            "recovery_actions": actions});
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if let Some(version) = ctx.project_version {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
+                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
+                .fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        let deferral = retry.then(|| json!({
+            "target_state": task.status, "reason": reason,
+            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).min(4)))).to_rfc3339(),
+        }).to_string());
+        let changed = sqlx::query("UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
+            blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL")
+            .bind(barrier.to_string()).bind(annotation.to_string())
+            .bind((!retry).then(|| json!({"kind": kind, "reason": reason, "blocked_by": "system:workflow", "blocked_at": now}).to_string()))
+            .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
+            .execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(DbError::VersionConflict.into());
+        }
+        if !retry {
+            crate::placement::admission::record_wait_attention_in_tx(
+                &self.db,
+                &mut tx,
+                task,
+                "execution_failed",
+                &format!("Review CI [{kind}] could not run: {reason}"),
+                &format!("review-ci:{}", task.id),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    }
+
     pub(crate) async fn review_workspace_io(
         &self,
         workspace: &Workspace,

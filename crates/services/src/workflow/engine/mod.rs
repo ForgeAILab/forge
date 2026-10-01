@@ -324,15 +324,31 @@ impl WorkflowEngine {
         if action != "run_ci_steps" || actor.is_user() {
             return Ok(None);
         }
+        // A typed owner/preflight refusal was settled atomically by the hook.
+        // It may have occurred before any Review row was created.
+        let interrupted = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|barrier| {
+                barrier["status"] == "blocked"
+                    && barrier["interrupted_at"]
+                        .as_str()
+                        .is_some_and(|at| at >= entry_started_at)
+            });
+        if interrupted {
+            return Ok(Some(ReviewEntryFailure {
+                task: task.clone(),
+                cascade: None,
+            }));
+        }
         let Some(review) = latest_review(&self.db, &task.id).await? else {
             return Ok(None);
         };
-        if review.status != db::ReviewStatus::Failed {
-            return Ok(None);
-        }
-        // A configuration/runner failure before attempt creation must not
-        // route a failed Review left over from an earlier state entry.
-        if review.started_at.as_str() < entry_started_at {
+        // Authority-loss cancellations retain the base routing.
+        if review.status != db::ReviewStatus::Failed
+            || review.started_at.as_str() < entry_started_at
+        {
             return Ok(None);
         }
         let task = self
@@ -671,6 +687,7 @@ impl WorkflowEngine {
             "started_at": started_at.as_str(),
             "retry_started_at": retry_started_at.as_str(),
             "retry_reason": reason,
+            "infrastructure_attempts": barrier.get("infrastructure_attempts").cloned().unwrap_or(serde_json::json!(0)),
         })
         .to_string();
         let mut task = TaskRepo::set_entry_barrier_with_workflow_authority(

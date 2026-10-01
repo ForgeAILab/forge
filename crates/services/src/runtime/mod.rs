@@ -612,6 +612,9 @@ impl ForgeRuntimeBuilder {
             .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
             .with_memory_service(Arc::clone(&memory_service))
             .with_provider_credential_env(Arc::clone(&embedded_agent_service))
+            .with_workspace_max_disconnect(Duration::from_secs(
+                effective_config.workspace.max_disconnect_seconds,
+            ))
             .with_workspace_root(workspace_root.clone())
             .with_workspace_backend_router(Arc::clone(&workspace_backend_router)),
         );
