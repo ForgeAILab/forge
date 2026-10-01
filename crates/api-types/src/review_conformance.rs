@@ -18,7 +18,11 @@ pub fn review_source_digest(source: &Value, version: u32) -> Result<String, Stri
     match version {
         1 => return legacy_v1_source_digest(source),
         REVIEW_SOURCE_DIGEST_VERSION => {}
-        _ => return Err(format!("unsupported review source digest version: {version}")),
+        _ => {
+            return Err(format!(
+                "unsupported review source digest version: {version}"
+            ))
+        }
     }
     let config = effective_review_config(source)?;
     let state = review_state(source);
