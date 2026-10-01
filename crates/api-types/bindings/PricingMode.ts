@@ -3,4 +3,4 @@
 /**
  * How an owner's price differs from the models.dev list price.
  */
-export type PricingMode = 'list' | 'discount' | 'fixed'
+export type PricingMode = "list" | "discount" | "fixed";

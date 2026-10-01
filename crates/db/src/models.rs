@@ -416,6 +416,45 @@ pub enum WorkMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocationOwnerKind {
+    Server,
+    Daemon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocationKind {
+    PrimaryCheckout,
+    ManagedClone,
+    SharedMount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocationStatus {
+    Unverified,
+    Ready,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLocation {
+    pub id: String,
+    pub repo_id: String,
+    pub owner_kind: RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub path: String,
+    pub kind: RepoLocationKind,
+    pub is_default: bool,
+    pub status: RepoLocationStatus,
+    pub last_verified_at: Option<String>,
+    pub last_error: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrProviderConfig {
     pub id: String,
     pub repo_id: String,
@@ -1035,7 +1074,7 @@ pub struct Workspace {
     pub id: String,
     pub task_id: String,
     pub repo_id: String,
-    pub worktree_path: String,
+    pub(crate) worktree_path: String,
     pub branch: String,
     pub status: WorkspaceStatus,
     pub before_sha: Option<String>,
@@ -1045,6 +1084,14 @@ pub struct Workspace {
     pub updated_at: String,
 }
 
+impl Workspace {
+    /// Backend-only access to the legacy server path. Consumers must resolve
+    /// the placement through `WorkspaceBackendRouter` instead.
+    pub fn embedded_worktree_path_for_backend(&self) -> &str {
+        &self.worktree_path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceStatus {
     Creating,
@@ -1052,6 +1099,66 @@ pub enum WorkspaceStatus {
     Error,
     Cleaning,
     Cleaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementOwnerKind {
+    Server,
+    Daemon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementState {
+    Reserved,
+    Preparing,
+    Ready,
+    Disconnected,
+    Cleaning,
+    Cleaned,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementSelectedBy {
+    Scheduler,
+    Pin,
+    Inherited,
+    Backfill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementFailureCause {
+    PlacementUnavailable,
+    PrepareFailed,
+    OwnerDisconnected,
+    OwnerDisconnectedTimeout,
+    OwnerLostExecution,
+    StaleGeneration,
+    WrongOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePlacement {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: PlacementOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: PlacementState,
+    pub selected_by: PlacementSelectedBy,
+    pub selection_reason: String,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<PlacementFailureCause>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Scheduler-issued authority for one assigned Task/repository operation.
@@ -2414,6 +2521,56 @@ macro_rules! enum_strings {
 enum_strings!(WorkMode {
     DirectMerge => "direct_merge",
     PullRequest => "pull_request",
+});
+
+enum_strings!(RepoLocationOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(RepoLocationKind {
+    PrimaryCheckout => "primary_checkout",
+    ManagedClone => "managed_clone",
+    SharedMount => "shared_mount",
+});
+
+enum_strings!(RepoLocationStatus {
+    Unverified => "unverified",
+    Ready => "ready",
+    Unavailable => "unavailable",
+    Invalid => "invalid",
+});
+
+enum_strings!(PlacementOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(PlacementState {
+    Reserved => "reserved",
+    Preparing => "preparing",
+    Ready => "ready",
+    Disconnected => "disconnected",
+    Cleaning => "cleaning",
+    Cleaned => "cleaned",
+    Failed => "failed",
+});
+
+enum_strings!(PlacementSelectedBy {
+    Scheduler => "scheduler",
+    Pin => "pin",
+    Inherited => "inherited",
+    Backfill => "backfill",
+});
+
+enum_strings!(PlacementFailureCause {
+    PlacementUnavailable => "placement_unavailable",
+    PrepareFailed => "prepare_failed",
+    OwnerDisconnected => "owner_disconnected",
+    OwnerDisconnectedTimeout => "owner_disconnected_timeout",
+    OwnerLostExecution => "owner_lost_execution",
+    StaleGeneration => "stale_generation",
+    WrongOwner => "wrong_owner",
 });
 
 enum_strings!(IntegrationPlatform {

@@ -5,7 +5,7 @@ use db::ReviewStatus;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
-    agent_capacity::has_running_execution_capacity,
+    agent_capacity::has_execution_capacity,
     task_service::TaskService,
     workflow::{
         dispatch::{
@@ -303,7 +303,7 @@ impl HookAction for DispatchRoleAgent {
                         reason: "agent paused".to_string(),
                     };
                 }
-                match has_running_execution_capacity(&ctx.db, &agent).await {
+                match has_execution_capacity(&ctx.db, &agent, ctx.workspace_id.as_deref()).await {
                     Ok(true) => {}
                     Ok(false) => {
                         return HookResult::Skipped {
@@ -388,9 +388,12 @@ impl HookAction for DispatchRoleAgent {
                     };
                     // Follow-up executions continue the workflow lifecycle, so the
                     // service used by the spawned run must keep the hook dependencies.
-                    let mut service =
-                        TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
-                            .with_task_executor(task_executor);
+                    let mut service = TaskService::new_with_router(
+                        Arc::clone(&ctx.db),
+                        Arc::clone(&ctx.event_bus),
+                        Arc::clone(&ctx.workspace_backend_router),
+                    )
+                    .with_task_executor(task_executor);
                     if let Some(review_runner) = ctx.review_runner.as_ref().cloned() {
                         service = service.with_review_runner(review_runner);
                     }
@@ -413,6 +416,8 @@ impl HookAction for DispatchRoleAgent {
                     if let Some(terminal_activity) = ctx.terminal_activity.as_ref().cloned() {
                         service = service.with_terminal_activity_tracker(terminal_activity);
                     }
+                    service = service
+                        .with_workspace_backend_router(Arc::clone(&ctx.workspace_backend_router));
                     let trigger = follow_up_trigger(ctx);
                     let follow_up_result = if let Some(admission) = reviewer_admission.clone() {
                         service
@@ -460,9 +465,13 @@ impl HookAction for DispatchRoleAgent {
                             .to_string(),
                     };
                 };
-                let mut service = TaskService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus))
-                    .with_task_executor(task_executor)
-                    .with_workspace_root(ctx.workspace_root.clone());
+                let mut service = TaskService::new_with_router(
+                    Arc::clone(&ctx.db),
+                    Arc::clone(&ctx.event_bus),
+                    Arc::clone(&ctx.workspace_backend_router),
+                )
+                .with_task_executor(task_executor)
+                .with_workspace_root(ctx.workspace_root.clone());
                 if let Some(review_runner) = ctx.review_runner.as_ref().cloned() {
                     service = service.with_review_runner(review_runner);
                 }
@@ -485,6 +494,8 @@ impl HookAction for DispatchRoleAgent {
                     service = service.with_terminal_activity_tracker(terminal_activity);
                 }
 
+                service = service
+                    .with_workspace_backend_router(Arc::clone(&ctx.workspace_backend_router));
                 let dispatch_result = match reviewer_admission {
                     Some(admission) => {
                         service

@@ -1,4 +1,11 @@
 import type { ReviewConformance } from './bindings/ReviewConformance'
+export type { RepoLocationOwnerKind } from './bindings/RepoLocationOwnerKind'
+export type { RepoLocationKind } from './bindings/RepoLocationKind'
+export type { RepoLocationStatus } from './bindings/RepoLocationStatus'
+export type { RepoLocationResponse } from './bindings/RepoLocationResponse'
+export type { CreateRepoLocationRequest } from './bindings/CreateRepoLocationRequest'
+export type { UpdateRepoLocationRequest } from './bindings/UpdateRepoLocationRequest'
+export type { VerifyRepoLocationRequest } from './bindings/VerifyRepoLocationRequest'
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
@@ -596,6 +603,7 @@ export interface Task {
   review_passed_at?: string | null
   archived_at?: string | null
   workspace?: Workspace | null
+  placement: WorkspacePlacementResponse | null
   execution_observability?: TaskExecutionObservability
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
@@ -1146,11 +1154,35 @@ export interface AgentAvailability {
   reason?: string | null
 }
 
+export interface WorkspacePlacementResponse {
+  id: string
+  workspace_id: string
+  task_id: string
+  agent_id: string | null
+  owner_kind: string
+  daemon_id: string | null
+  runtime_id: string | null
+  repo_location_id: string
+  execution_daemon_id: string | null
+  workspace_handle: string | null
+  generation: number
+  state: string
+  selected_by: string
+  selection_reason: Record<string, unknown>
+  reserved_until: string | null
+  disconnected_at: string | null
+  failure_cause: string | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
 export interface Workspace {
   id: string
   task_id: string
   repo_id: string
   worktree_path: string
+  placement: WorkspacePlacementResponse
   branch: string
   status: string
   before_sha?: string | null

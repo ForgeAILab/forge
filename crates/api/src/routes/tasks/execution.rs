@@ -17,7 +17,9 @@ pub async fn claim_task(
         .await?;
     let execution_id = claimed.execution.id.clone();
     state.task_service.start_execution(execution_id).await?;
-    Ok(Json(task_response(&state.db, claimed.task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, claimed.task).await?,
+    ))
 }
 
 pub async fn launch_task(
@@ -49,9 +51,14 @@ pub async fn launch_task(
 
     Ok(Json(LaunchExecutionResponse {
         data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
+            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
             execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
+            workspace: workspace_response(
+                &state.db,
+                &state.workspace_backend_router,
+                launched.workspace,
+            )
+            .await?,
             execution_behavior,
         },
     }))

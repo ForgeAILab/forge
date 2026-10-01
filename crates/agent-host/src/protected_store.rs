@@ -237,7 +237,7 @@ impl SqliteProtectedRuntimeStore {
 
     /// Loads the server-issued identity/scope binding for one runtime session.
     ///
-    /// The optional Task workspace is joined by the exact host-supplied path;
+    /// The optional Task workspace is authorized by the exact host-supplied path;
     /// a path that is not the current persisted workspace is therefore
     /// rejected before RuntimeBuilder receives a filesystem-capable tool.
     pub(crate) async fn runtime_scope_binding(
@@ -311,8 +311,7 @@ impl SqliteProtectedRuntimeStore {
                     chat.project_id AS agent_chat_project_id,
                     binding.permission_ceiling_json AS binding_permission_ceiling,
                     bound_project.charter_setup_required AS project_charter_setup_required,
-                    COALESCE(workspace.worktree_path, scope.workspace_path)
-                        AS worktree_path
+                    scope.workspace_path
              FROM agent_session AS session
              JOIN agent_identity AS identity
                ON identity.id = session.identity_id
@@ -335,16 +334,11 @@ impl SqliteProtectedRuntimeStore {
                     WHEN scope.scope_type = 'agent_chat' THEN chat.project_id
                     ELSE scope.project_id
                   END
-             LEFT JOIN workspace
-               ON workspace.task_id = scope.scope_id
-              AND workspace.status IN ('creating', 'ready', 'error')
-              AND workspace.worktree_path = ?
              WHERE session.id = ?
                AND session.runtime_session_id IS ?
                AND (? IS NOT NULL OR (session.backend_kind = 'cli' AND profile.backend_kind = 'cli'))
              LIMIT 1",
         )
-        .bind(workspace_path)
         .bind(forge_session_id)
         .bind(runtime_session_id)
         .bind(runtime_session_id)
@@ -389,8 +383,8 @@ impl SqliteProtectedRuntimeStore {
         let workspace_access: String = row
             .try_get("workspace_access")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let persisted_workspace_path: Option<String> = row
-            .try_get("worktree_path")
+        let mut persisted_workspace_path: Option<String> = row
+            .try_get("workspace_path")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let binding_permission_ceiling: Option<String> = row
             .try_get("binding_permission_ceiling")
@@ -462,12 +456,21 @@ impl SqliteProtectedRuntimeStore {
             } else {
                 None
             };
-        if matches!(scope.scope_type, crate::CanonicalScopeType::Task)
-            && persisted_workspace_path.is_none()
-        {
-            return Err(crate::AgentHostError::Authority(
-                "Task session has no active persisted workspace".to_owned(),
-            ));
+        if matches!(scope.scope_type, crate::CanonicalScopeType::Task) {
+            let mut authorized_path = None;
+            if let Some(path) = workspace_path {
+                if db::WorkspaceRepo::task_owns_embedded_path(&*self.db, &scope.scope_id, path)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                {
+                    authorized_path = Some(path.to_owned());
+                }
+            }
+            persisted_workspace_path = Some(authorized_path.ok_or_else(|| {
+                crate::AgentHostError::Authority(
+                    "Task session has no active persisted workspace".to_owned(),
+                )
+            })?);
         }
         // A Project Agent Chat owns its verification checkout and a Main Agent
         // Chat (or an inquiry sub-agent under the account scope) owns its

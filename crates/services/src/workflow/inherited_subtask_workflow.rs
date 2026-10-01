@@ -276,6 +276,7 @@ mod tests {
         let subtask = seed_root_and_subtask(&db, default_states::IN_PROGRESS).await;
         let workflow = inherited_subtask_workflow();
         let engine = WorkflowEngine {
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus: Arc::new(EventBus::new(16)),
             review_runner: None,

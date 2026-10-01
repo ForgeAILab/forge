@@ -1,7 +1,22 @@
 use super::*;
+use ::review::ReviewWorkspace;
 use api_types::{Actor, UserActionSource};
 
 impl TaskService {
+    pub(crate) async fn review_workspace_io(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Arc<dyn ReviewWorkspace>> {
+        let workspace = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        Ok(Arc::new(workspace))
+    }
+
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
         let task_id = task_id.to_string();
         validate_required("task_id", &task_id)?;
@@ -237,6 +252,7 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let workspace_io = self.review_workspace_io(&workspace).await?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
@@ -299,10 +315,11 @@ impl TaskService {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
         let result = review_runner
+            .with_workspace_io(workspace_io)
             .run(ReviewRequest {
                 task_id,
                 executor_execution_id,
-                workspace_path: workspace.worktree_path.into(),
+                workspace_path: PathBuf::new(),
                 ci_steps: review_config.ci_steps,
                 logs_path,
                 auditor_agent_id,

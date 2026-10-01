@@ -16,7 +16,7 @@ pub(crate) mod ledger;
 mod recovery;
 mod runner;
 
-pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
+pub(super) use runner::rfc3339_after;
 
 pub(super) use cascade::should_block_task_for_failed_execution;
 pub(crate) use cascade::{

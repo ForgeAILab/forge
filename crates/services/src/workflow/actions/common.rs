@@ -7,7 +7,6 @@ use db::{
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
-use tokio::process::Command;
 
 use crate::workflow::{
     default_states,
@@ -103,6 +102,27 @@ pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
         .map(|workspace| workspace.id)
 }
 
+pub(super) fn workspace_backend_router(
+    ctx: &HookContext,
+) -> Arc<crate::workspace_backend::WorkspaceBackendRouter> {
+    Arc::clone(&ctx.workspace_backend_router)
+}
+
+pub(super) async fn resolve_workspace_backend(
+    ctx: &HookContext,
+    workspace: &db::Workspace,
+) -> crate::Result<crate::workspace_backend::ResolvedWorkspace> {
+    Ok(
+        crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &workspace_backend_router(ctx),
+            &ctx.db,
+            workspace,
+            &ctx.workspace_root,
+        )
+        .await?,
+    )
+}
+
 pub(super) async fn cancel_subtask_with_effective_workflow(
     ctx: &HookContext,
     subtask: db::Task,
@@ -164,6 +184,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         terminal_activity: ctx.terminal_activity.clone(),
         workspace_root: ctx.workspace_root.clone(),
         repo_cache_locks: ctx.repo_cache_locks.clone(),
+        workspace_backend_router: Arc::clone(&ctx.workspace_backend_router),
     };
     engine
         .transition_with_authority(
@@ -847,7 +868,7 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
 }
 
 pub(super) async fn run_ci_steps_in_worktree(
-    worktree_path: &str,
+    workspace: &(impl ::review::ReviewWorkspace + ?Sized),
     ci_steps: &[String],
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Vec<Value>, Option<usize>), String> {
@@ -858,23 +879,13 @@ pub(super) async fn run_ci_steps_in_worktree(
         // API publishes them, so stamp each step here — this is the only place
         // that knows when a step actually ran.
         let started_at = now_rfc3339();
-        let output = Command::new("bash")
-            .arg("-lc")
-            .arg(step)
-            .envs(env)
-            .current_dir(worktree_path)
-            .output()
+        let output = workspace
+            .run(step, env, None)
             .await
             .map_err(|error| error.to_string())?;
         let finished_at = now_rfc3339();
-        let stderr = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stderr),
-            env,
-        );
-        let stdout = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stdout),
-            env,
-        );
+        let stderr = executors::environment::redact_environment_values(&output.stderr, env);
+        let stdout = executors::environment::redact_environment_values(&output.stdout, env);
         let output_tail = if stdout.is_empty() {
             stderr.clone()
         } else if stderr.is_empty() {
@@ -882,7 +893,7 @@ pub(super) async fn run_ci_steps_in_worktree(
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let exit_code = output.status.code().unwrap_or(1);
+        let exit_code = output.exit_code.unwrap_or(1);
         results.push(json!({
             "index": index,
             "command": step,

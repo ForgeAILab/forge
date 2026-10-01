@@ -233,6 +233,17 @@ impl TaskDispatcher {
         if self.is_stopped() {
             return Ok(false);
         }
+        if db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|placement| {
+                matches!(
+                    placement.state,
+                    db::PlacementState::Disconnected | db::PlacementState::Cleaning
+                )
+            })
+        {
+            return Ok(false);
+        }
         if helpers::has_blocking_annotation(task) {
             return Ok(false);
         }

@@ -520,7 +520,7 @@ async fn reassign_coder_with_workspace_allows_reset_workspace() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let workspace_root = TempDir::new().expect("workspace root creates");
-    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new(
+    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.path().to_path_buf(),
@@ -576,7 +576,7 @@ async fn reassign_coder_with_workspace_allows_both_reset_flags() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let workspace_root = TempDir::new().expect("workspace root creates");
-    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new(
+    let cleanup_scheduler = Arc::new(WorkspaceCleanupScheduler::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.path().to_path_buf(),

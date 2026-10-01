@@ -1073,3 +1073,156 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
         "expected invalid_operation, got {error:?}"
     );
 }
+
+#[tokio::test]
+async fn server_owned_workspace_resume_uses_embedded_provider_facts() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        None,
+        crate::workflow::default_roles::CODER,
+        ExecutionStatus::Failed,
+        Some("local-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let now = now_rfc3339();
+    let workspace = WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id,
+            worktree_path: repo_dir.path().to_string_lossy().into_owned(),
+            branch: "task/local".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: Some("base-head".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let placement =
+        crate::workspace_backend::EmbeddedWorkspaceBackend::ensure_recorded_server_placement(
+            &db, &workspace,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE execution SET workspace_id = ? WHERE id = ?")
+        .bind(&workspace.id)
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "local execution stopped".to_owned(),
+        blocked_by: Some("system".to_owned()),
+        blocked_at: Some(now.clone()),
+        blocked_execution_id: Some(execution.id.clone()),
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![
+            api_types::RecoveryAction::ResumeSession,
+            api_types::RecoveryAction::Reexecute,
+        ],
+    });
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(serde_json::to_string(&annotation).unwrap())),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(16)))
+        .with_daemon_connections(registry.clone());
+    for executor in [
+        "codex",
+        "claude_code",
+        "cursor",
+        "opencode",
+        "gemini",
+        "smith",
+        "embedded",
+        "shell",
+        "unknown",
+    ] {
+        sqlx::query("UPDATE execution SET executor_config_snapshot_json = ? WHERE id = ?")
+            .bind(json!({"executor_type": executor, "config": {}}).to_string())
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .available_recovery_actions(&task.id)
+                .await
+                .unwrap()
+                .contains(&api_types::RecoveryAction::ResumeSession),
+            !matches!(executor, "shell" | "unknown"),
+            "resume facts for {executor}"
+        );
+    }
+    let daemon_id = new_uuid_v4();
+    db::DaemonRepo::upsert_by_machine_id(
+        &*db,
+        db::UpsertDaemon {
+            id: daemon_id.clone(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
+            hostname: "server-host".to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: db::DaemonStatus::Online,
+            registration_token_hash: None,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut update = crate::placement::admission::placement_update(&placement);
+    update.execution_daemon_id = Some(Some(daemon_id.clone()));
+    db::WorkspacePlacementRepo::update(&*db, update)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE execution SET executor_config_snapshot_json = ? WHERE id = ?")
+        .bind(json!({"executor_type": "codex", "config": {}}).to_string())
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(!registry.is_connected(&daemon_id));
+    assert!(service
+        .available_recovery_actions(&task.id)
+        .await
+        .unwrap()
+        .contains(&api_types::RecoveryAction::ResumeSession));
+}

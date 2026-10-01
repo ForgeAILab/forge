@@ -1,4 +1,5 @@
 use super::*;
+use db::DaemonRepo;
 
 impl TaskService {
     pub async fn available_recovery_actions(
@@ -15,10 +16,117 @@ impl TaskService {
                 api_types::RecoveryAction::CancelTask,
             ]);
         }
-        Ok(self
+        if let Some(placement) =
+            db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        {
+            let timed_out = placement.state == db::PlacementState::Failed
+                && placement.failure_cause
+                    == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout);
+            if placement.state == db::PlacementState::Disconnected || timed_out {
+                if let Some(annotation) = self.parse_blocking_annotation(&task) {
+                    if annotation.annotation_type == api_types::FailureKind::WorkspaceResetRequired
+                    {
+                        return Ok(annotation.recovery_actions);
+                    }
+                }
+                return Ok(vec![
+                    api_types::RecoveryAction::Reexecute,
+                    api_types::RecoveryAction::CancelTask,
+                ]);
+            }
+        }
+        let mut actions = self
             .recovery_annotation(&task)
             .map(|annotation| annotation.recovery_actions)
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if !self.task_owner_supports_resume(&task).await? {
+            actions.retain(|action| *action != api_types::RecoveryAction::ResumeSession);
+        }
+        Ok(actions)
+    }
+
+    async fn task_owner_supports_resume(&self, task: &Task) -> Result<bool> {
+        let Some(placement) = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        else {
+            return Ok(true);
+        };
+        let Some(execution_id) = self
+            .recovery_annotation(task)
+            .ok()
+            .and_then(|annotation| annotation.blocked_execution_id)
+        else {
+            return Ok(false);
+        };
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, &execution_id).await? else {
+            return Ok(false);
+        };
+        if execution.agent_session_id.is_none() || execution.task_id != task.id {
+            return Ok(false);
+        }
+        let executor = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
+            .and_then(|snapshot| {
+                snapshot
+                    .get("executor_type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let Some(executor) = executor else {
+            return Ok(false);
+        };
+        let daemon_workspace = placement.owner_kind == db::PlacementOwnerKind::Daemon;
+        let daemon_id = match placement.owner_kind {
+            db::PlacementOwnerKind::Daemon => placement.daemon_id.as_deref(),
+            db::PlacementOwnerKind::Server => placement.execution_daemon_id.as_deref(),
+        };
+        let Some(daemon_id) = daemon_id else {
+            return Ok(!daemon_workspace
+                && crate::daemon_transport::EmbeddedExecutionProvider::adapter_capabilities(
+                    &executor,
+                )
+                .resume);
+        };
+        let Some(daemon) = DaemonRepo::get_by_id(&*self.db, daemon_id).await? else {
+            return Ok(false);
+        };
+        if daemon.status != db::DaemonStatus::Online {
+            return Ok(false);
+        }
+        let connection = self
+            .daemon_connections
+            .as_ref()
+            .and_then(|registry| registry.get(daemon_id));
+        if !daemon_workspace
+            && connection
+                .as_ref()
+                .is_none_or(|connection| connection.is_stale())
+            && crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+        {
+            return Ok(
+                crate::daemon_transport::EmbeddedExecutionProvider::adapter_capabilities(&executor)
+                    .resume,
+            );
+        }
+        Ok(connection
+            .and_then(|connection| connection.snapshot())
+            .filter(|facts| !daemon_workspace || !facts.workspace_incapable)
+            .and_then(|facts| {
+                facts
+                    .handshake
+                    .executor_capabilities
+                    .get(&executor)
+                    .cloned()
+            })
+            .is_some_and(|capabilities| capabilities.resume))
+    }
+
+    pub(crate) async fn retry_placement_cleanup(&self, workspace_id: &str) -> Result<()> {
+        if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+            scheduler.cleanup_now(workspace_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn recover_task(
@@ -92,6 +200,99 @@ impl TaskService {
                 "cannot recover task {} in terminal status {}",
                 task.id, task.status
             )));
+        }
+        if let Some(mut placement) =
+            db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        {
+            let timed_out = placement.state == db::PlacementState::Failed
+                && placement.failure_cause
+                    == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout);
+            if placement.state == db::PlacementState::Disconnected || timed_out {
+                match action {
+                    api_types::RecoveryAction::CancelTask => {
+                        return self.recover_cancel_task(task, reason).await
+                    }
+                    api_types::RecoveryAction::Reexecute => {
+                        if timed_out {
+                            let online = match placement.daemon_id.as_deref() {
+                                Some(daemon_id) => {
+                                    DaemonRepo::get_by_id(&*self.db, daemon_id)
+                                        .await?
+                                        .is_some_and(|daemon| {
+                                            daemon.status == db::DaemonStatus::Online
+                                        })
+                                        && self
+                                            .daemon_connections
+                                            .as_ref()
+                                            .and_then(|registry| registry.get(daemon_id))
+                                            .and_then(|connection| connection.snapshot())
+                                            .is_some_and(|facts| !facts.workspace_incapable)
+                                }
+                                None => false,
+                            };
+                            if !online {
+                                return Ok(task);
+                            }
+                            let mut update =
+                                crate::placement::admission::placement_update(&placement);
+                            update.state = Some(db::PlacementState::Disconnected);
+                            update.disconnected_at = Some(Some(now_rfc3339()));
+                            placement =
+                                db::WorkspacePlacementRepo::update(&*self.db, update).await?;
+                        }
+                        let reconciled = if let Some(registry) = self.daemon_connections.as_ref() {
+                            registry.reconciliation_notify().notify_one();
+                            crate::recovery::reconcile_workspace_placement(
+                                &self.db,
+                                &self.event_bus,
+                                registry,
+                                Some(self),
+                                &placement,
+                            )
+                            .await?
+                        } else {
+                            false
+                        };
+                        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                            .await?
+                            .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                        if reconciled {
+                            if let Some(annotation) = self.parse_blocking_annotation(&current) {
+                                if matches!(
+                                    annotation.blocking_reason.as_str(),
+                                    "owner_lost_execution" | "owner_disconnected_timeout"
+                                ) && ExecutionRepo::list_running_by_task(&*self.db, &current.id)
+                                    .await?
+                                    .is_empty()
+                                {
+                                    return self
+                                        .recover_reexecute(current, &annotation, reason, context)
+                                        .await;
+                                }
+                            }
+                        }
+                        self.publish_recovery_applied(
+                            &current,
+                            "reexecute",
+                            Some(&current.status),
+                            None,
+                        );
+                        return Ok(current);
+                    }
+                    api_types::RecoveryAction::ResetToInitial
+                        if self
+                            .parse_blocking_annotation(&task)
+                            .is_some_and(|annotation| {
+                                annotation.annotation_type
+                                    == api_types::FailureKind::WorkspaceResetRequired
+                            }) => {}
+                    _ => {
+                        return Err(ServiceError::invalid_operation(
+                            "workspace owner is disconnected; retry on the same owner or cancel",
+                        ))
+                    }
+                }
+            }
         }
         let annotation = self.recovery_annotation(&task);
         if let Ok(explicit) = &annotation {
@@ -552,6 +753,11 @@ impl TaskService {
         context: Option<String>,
     ) -> Result<Task> {
         let original_task = task.clone();
+        if !self.task_owner_supports_resume(&task).await? {
+            return Err(ServiceError::invalid_operation(
+                "resume_session requires an online workspace owner advertising resume for this executor",
+            ));
+        }
         let blocked_execution_id = annotation.blocked_execution_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("resume_session requires blocked_execution_id")
         })?;
@@ -648,6 +854,7 @@ impl TaskService {
                 &task,
                 &task.id,
                 self.repo_cache_locks.clone(),
+                &self.workspace_backend_router,
             )
             .await?;
         let updated_task = self
@@ -908,6 +1115,7 @@ impl TaskService {
                 &task,
                 &task.id,
                 self.repo_cache_locks.clone(),
+                &self.workspace_backend_router,
             )
             .await?;
         let executor_config_snapshot_json =
@@ -1462,6 +1670,7 @@ impl TaskService {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             };
             let recovered = engine
                 .manual_override_transition_with_authority(
@@ -1778,6 +1987,7 @@ impl TaskService {
             )),
         );
         let initial_state = workflow_initial_state(&workflow)?;
+        self.reset_daemon_owner_workspace(&task).await?;
         let assignee_id = if should_clear_assignments_for_reset(annotation) {
             Some(None)
         } else {
@@ -1872,6 +2082,30 @@ impl TaskService {
             },
         });
         Ok(recovered)
+    }
+
+    async fn reset_daemon_owner_workspace(&self, task: &Task) -> Result<()> {
+        let Some(placement) = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+        else {
+            return Ok(());
+        };
+        if placement.owner_kind != db::PlacementOwnerKind::Daemon {
+            return Ok(());
+        }
+        if placement.task_id != task.id {
+            return Err(ServiceError::invalid_operation(
+                "reset the root's shared workspace instead",
+            ));
+        }
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, &placement.workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", &placement.workspace_id))?;
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        super::super::workspace::reset_daemon_workspace(&self.db, &workspace, &resolved).await?;
+        Ok(())
     }
 
     async fn recover_cancel_task(&self, task: Task, reason: Option<String>) -> Result<Task> {
@@ -2031,6 +2265,7 @@ impl TaskService {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             };
             let recovered = engine
                 .retry_entry_barrier_with_authority(
@@ -2097,6 +2332,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let recovered = engine
             .manual_override_transition_with_authority(
@@ -2259,29 +2495,36 @@ impl TaskService {
         annotation: &api_types::TaskBlockingAnnotation,
         reason: Option<String>,
     ) -> Result<Task> {
-        let workspace = prepare_workspace(
+        let workspace = super::super::workspace::prepare_workspace(
             &self.db,
             &self.workspace_root,
             &task,
             &task.id,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await?;
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let target_branch = default_target_branch(&repo.default_branch);
-        let worktree_path = std::path::Path::new(&workspace.worktree_path);
-
-        if !git::is_worktree_clean(worktree_path).await? {
-            let files = git::status_porcelain(worktree_path).await?.join(", ");
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        let status = resolved
+            .git_query(api_types::WorkspaceGitQuery::StatusPorcelain, false)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("owner returned no workspace status"))?;
+        if !status.trim().is_empty() {
+            let files = status.lines().collect::<Vec<_>>().join(", ");
             return Err(ServiceError::invalid_operation(format!(
                 "cannot update workspace before retrying hook because the worktree is dirty: {files}"
             )));
         }
 
-        match git::rebase(worktree_path, &target_branch).await {
-            Ok(()) => {
+        match resolved.rebase_target(&target_branch, false).await? {
+            api_types::WorkspaceOwnerOperationOutcome::Rebased => {
                 tracing::info!(
                     task_id = %task.id,
                     workspace_id = %workspace.id,
@@ -2289,13 +2532,23 @@ impl TaskService {
                     "workspace updated before retrying hook"
                 );
             }
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
-                let _ = git::abort_rebase(worktree_path).await;
+            api_types::WorkspaceOwnerOperationOutcome::Conflict { details, .. }
+            | api_types::WorkspaceOwnerOperationOutcome::UnsupportedConflict { details } => {
                 return Err(ServiceError::invalid_operation(format!(
-                    "cannot update workspace before retrying hook because rebase onto {target_branch} conflicted: {stderr}"
+                    "cannot update workspace before retrying hook because rebase onto {target_branch} conflicted: {details}"
                 )));
             }
-            Err(error) => return Err(error.into()),
+            api_types::WorkspaceOwnerOperationOutcome::Dirty { files } => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "cannot update workspace before retrying hook because the worktree is dirty: {}",
+                    files.join(", ")
+                )));
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "owner returned an invalid rebase result",
+                ))
+            }
         }
 
         self.recover_retry_hook(
@@ -2387,6 +2640,7 @@ impl TaskService {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             };
             let recovered = engine
                 .retry_entry_barrier_with_authority(

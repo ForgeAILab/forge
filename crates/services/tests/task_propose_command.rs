@@ -342,7 +342,7 @@ async fn fixture() -> Fixture {
     )
     .await;
     Fixture {
-        task_service: TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32))),
+        task_service: TaskService::new_for_test(Arc::clone(&db), Arc::new(EventBus::new(32))),
         action_service: AgentActionService::new(Arc::clone(&db)),
         db,
     }
@@ -1417,7 +1417,10 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
         .expect("mutate live action-backed Task");
     let restarted_fixture = Fixture {
         db: Arc::clone(&fixture.db),
-        task_service: TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32))),
+        task_service: TaskService::new_for_test(
+            Arc::clone(&fixture.db),
+            Arc::new(EventBus::new(32)),
+        ),
         action_service: fixture.action_service.clone(),
     };
     let replay = propose(
@@ -1917,7 +1920,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
         .await
         .expect("mutate live direct Task");
     let restarted_task_service =
-        TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
+        TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(32)));
     let replay = restarted_task_service
         .execute_task_proposal_direct(input)
         .await

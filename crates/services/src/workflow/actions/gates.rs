@@ -240,12 +240,22 @@ impl HookAction for RequirePlanChecklistComplete {
             }
         };
 
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
+        let resolved = match super::review::resolve_workspace(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: format!("plan checklist unreadable: {error}"),
+                };
+            }
+        };
+        let bytes = match resolved
+            .backend
+            .read(&resolved.placement, "../plan.md", 1_048_576)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(&*error, crate::ServiceError::InvalidOperation { message } if message == "plan artifact not found") =>
+            {
                 return HookResult::Skipped {
                     reason: "no plan checklist".to_string(),
                 };
@@ -256,6 +266,15 @@ impl HookAction for RequirePlanChecklistComplete {
                 };
             }
         };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                return HookResult::Failed {
+                    reason: "plan checklist unreadable: failed to read plan artifact: stream did not contain valid UTF-8".to_owned(),
+                };
+            }
+        };
+        let artifact = crate::plan_artifact::parse_plan_markdown(&content);
         let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
         if summary.total == 0 || summary.remaining == 0 {
             return HookResult::Ok;

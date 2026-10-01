@@ -12,7 +12,7 @@ use crate::{
     workflow::{effective_role, HookAction, HookContext, HookResult},
 };
 
-use super::common::{task, workspace_id};
+use super::common::{resolve_workspace_backend, task, workspace_id};
 
 pub struct RunBeforeWorkHooks;
 
@@ -90,6 +90,7 @@ impl HookAction for RunBeforeWorkHooks {
                 &task,
                 &task.id,
                 ctx.repo_cache_locks.clone(),
+                &ctx.workspace_backend_router,
             )
             .await
             {
@@ -102,10 +103,8 @@ impl HookAction for RunBeforeWorkHooks {
             },
         };
 
-        let repo_path = match RepoRepo::get_by_id(&*ctx.db, &workspace.repo_id).await {
-            Ok(Some(repo)) if repo.project_id == project.id => repo
-                .local_path
-                .unwrap_or_else(|| workspace.worktree_path.clone()),
+        match RepoRepo::get_by_id(&*ctx.db, &workspace.repo_id).await {
+            Ok(Some(repo)) if repo.project_id == project.id => {}
             Ok(_) => {
                 return HookResult::Failed {
                     reason: format!(
@@ -119,7 +118,24 @@ impl HookAction for RunBeforeWorkHooks {
                     reason: error.to_string(),
                 };
             }
+        }
+        let resolved = match resolve_workspace_backend(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
         };
+        let (repo_path, worktree_path) =
+            match crate::lifecycle::context::workspace_context_paths(&ctx.db, &resolved).await {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            };
         let assigned_agent_id = target_role_agent_id(ctx).await;
         let log_dir = std::env::temp_dir()
             .join("forge")
@@ -136,14 +152,14 @@ impl HookAction for RunBeforeWorkHooks {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
             repo_path,
-            worktree_path: Some(workspace.worktree_path.clone()),
+            worktree_path: Some(worktree_path),
             agent_id: assigned_agent_id,
             execution_id: ctx.execution_id.clone(),
             log_dir: Some(log_dir),
         };
 
-        match LifecycleHookRunner::run_blocking_before_work_hooks(hook_ctx, &hooks).await {
-            Some(failure) => {
+        match LifecycleHookRunner::run_blocking_workspace_hooks(hook_ctx, &hooks, &resolved).await {
+            Ok(Some(failure)) => {
                 if let Err(error) = annotate_before_work_hook_block(ctx, &task, &failure).await {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -159,7 +175,10 @@ impl HookAction for RunBeforeWorkHooks {
                     ),
                 }
             }
-            None => HookResult::Ok,
+            Ok(None) => HookResult::Ok,
+            Err(error) => HookResult::Failed {
+                reason: error.to_string(),
+            },
         }
     }
 }

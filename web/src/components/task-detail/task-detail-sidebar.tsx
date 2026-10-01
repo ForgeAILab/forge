@@ -18,6 +18,7 @@ import {
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
+import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { productTerm } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
@@ -310,6 +311,12 @@ export function TaskDetailSidebar({
               />
             </SidebarField>
 
+            {task.placement ?? task.workspace?.placement ? (
+              <div className="pb-4">
+                <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
+              </div>
+            ) : null}
+
             {task.workspace ? (
               <>
                 <SidebarField label="Branch">
@@ -325,7 +332,8 @@ export function TaskDetailSidebar({
               </>
             ) : null}
 
-            {task.status === 'done' ? (
+            {task.status === 'done' &&
+            (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
               <p className="mt-4 text-xs text-muted-foreground">Workspace cleaned after merge.</p>
             ) : null}
 

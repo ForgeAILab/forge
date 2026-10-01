@@ -42,6 +42,7 @@ pub struct HookContext {
     pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
     pub workspace_root: PathBuf,
     pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     pub workspace_id: Option<String>,
     pub agent_id: Option<String>,
     pub execution_id: Option<String>,

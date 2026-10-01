@@ -3,4 +3,4 @@
 /**
  * Which adjustment an agent's price uses.
  */
-export type PricingAdjustmentSource = 'agent' | 'provider' | 'default'
+export type PricingAdjustmentSource = "agent" | "provider" | "default";

@@ -7,14 +7,15 @@ use api_types::{
     UsageSummary, WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
-use db::SqliteDb;
+use db::{SqliteDb, WorkspaceRepo};
 use serde_json::Value;
 use sqlx::Row;
 
 use crate::{
     agent_capacity::daemon_session_cap_from_labels,
-    plan_artifact::{read_plan_artifact, to_plan_progress_summary, PlanArtifactError},
+    plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
     usage_projection::{usage_aggregate_for_operations, usage_aggregate_for_source_state},
+    workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
     ServiceError,
 };
 
@@ -25,14 +26,38 @@ use log_snapshot::ExecutionLogSnapshots;
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
     log_snapshots: ExecutionLogSnapshots,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
 impl OperatorStatusService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         Self {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
+            workspace_backend_router,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>) -> Self {
+        Self::new_for_test(db)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<SqliteDb>) -> Self {
+        Self {
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
+            db,
+            log_snapshots: ExecutionLogSnapshots::default(),
+        }
+    }
+
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self
     }
 
     pub async fn compute_status(&self) -> Result<OperatorStatusResponse, ServiceError> {
@@ -108,9 +133,7 @@ impl OperatorStatusService {
                 e.role,
                 e.agent_id,
                 a.name AS agent_name,
-                a.daemon_id,
                 e.workspace_id,
-                w.worktree_path,
                 e.agent_session_id,
                 e.created_at AS started_at,
                 e.logs_path,
@@ -118,7 +141,6 @@ impl OperatorStatusService {
              FROM execution e
              JOIN task t ON t.id = e.task_id
              LEFT JOIN agent_current a ON a.id = e.agent_id
-             LEFT JOIN workspace w ON w.id = e.workspace_id
              WHERE e.status = 'running'
              ORDER BY e.created_at ASC, e.id ASC",
         )
@@ -128,14 +150,36 @@ impl OperatorStatusService {
         let mut active_executions = Vec::with_capacity(rows.len());
         for row in rows {
             let started_at: String = row.try_get("started_at")?;
-            let workspace_path: Option<String> = row.try_get("worktree_path")?;
+            let workspace_id: Option<String> = row.try_get("workspace_id")?;
+            let resolved = match workspace_id.as_deref() {
+                Some(id) => match WorkspaceRepo::get_by_id(&*self.db, id).await? {
+                    Some(workspace) => Some(
+                        self.workspace_backend_router
+                            .resolve(&self.db, &workspace)
+                            .await?,
+                    ),
+                    None => None,
+                },
+                None => None,
+            };
+            let workspace_path = resolved
+                .as_ref()
+                .map(|workspace| workspace.handle().map(str::to_owned))
+                .transpose()?;
+            let daemon_id = resolved.as_ref().and_then(|workspace| {
+                workspace
+                    .placement
+                    .execution_daemon_id
+                    .clone()
+                    .or_else(|| workspace.placement.daemon_id.clone())
+            });
             let runtime_seconds = seconds_since(&started_at, now);
             let snapshot_json: Option<String> = row.try_get("executor_config_snapshot_json")?;
             let effective_policy =
                 effective_policy(snapshot_json.as_deref(), workspace_path.as_deref());
             let rate_limit_snapshot = rate_limit_snapshot(snapshot_json.as_deref());
-            let plan_progress = match workspace_path.clone() {
-                Some(workspace_path) => plan_progress(workspace_path).await?,
+            let plan_progress = match resolved.as_ref() {
+                Some(workspace) => plan_progress(workspace).await?,
                 None => None,
             };
             let log_snapshot = self
@@ -156,8 +200,8 @@ impl OperatorStatusService {
                 role: row.try_get("role")?,
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
-                daemon_id: row.try_get("daemon_id")?,
-                workspace_id: row.try_get("workspace_id")?,
+                daemon_id,
+                workspace_id,
                 workspace_path,
                 session_id: row.try_get("agent_session_id")?,
                 started_at,
@@ -258,8 +302,20 @@ impl OperatorStatusService {
                 (
                     SELECT COUNT(*)
                     FROM execution e
-                    JOIN agent_current a ON a.id = e.agent_id
-                    WHERE a.daemon_id = d.id AND e.status = 'running'
+                    LEFT JOIN workspace_placement placement ON placement.workspace_id = e.workspace_id
+                    LEFT JOIN agent_current a ON a.id = e.agent_id
+                    WHERE CASE WHEN e.workspace_id IS NOT NULL
+                        THEN COALESCE(placement.execution_daemon_id, placement.daemon_id)
+                        ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
+                          THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
+                        END = d.id
+                      AND e.status = 'running'
+                ) + (
+                    SELECT COUNT(*) FROM workspace_placement p
+                    WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = d.id
+                      AND p.state IN ('reserved', 'preparing')
+                      AND NOT EXISTS (SELECT 1 FROM execution e
+                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions,
                 (
                     SELECT COUNT(*)
@@ -310,6 +366,11 @@ impl OperatorStatusService {
                     SELECT COUNT(*)
                     FROM execution e
                     WHERE e.agent_id = a.id AND e.status = 'running'
+                ) + (
+                    SELECT COUNT(*) FROM workspace_placement p
+                    WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
+                      AND NOT EXISTS (SELECT 1 FROM execution e
+                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions
              FROM agent_current a
              ORDER BY a.name ASC, a.id ASC",
@@ -348,7 +409,7 @@ impl OperatorStatusService {
         now: DateTime<Utc>,
     ) -> Result<Vec<WorkspaceCleanupSummary>, ServiceError> {
         let rows = sqlx::query(
-            "SELECT id, task_id, worktree_path, cleanup_after
+            "SELECT id, task_id, cleanup_after
              FROM workspace
              WHERE status IN ('ready', 'cleaning')
                AND cleanup_after IS NOT NULL
@@ -359,16 +420,24 @@ impl OperatorStatusService {
         .fetch_all(self.db.pool())
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(WorkspaceCleanupSummary {
-                    workspace_id: row.try_get("id")?,
-                    task_id: row.try_get("task_id")?,
-                    worktree_path: row.try_get("worktree_path")?,
-                    cleanup_after: row.try_get("cleanup_after")?,
-                })
-            })
-            .collect()
+        let mut backlog = Vec::with_capacity(rows.len());
+        for row in rows {
+            let workspace_id: String = row.try_get("id")?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.clone()))?;
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, &workspace)
+                .await?;
+            backlog.push(WorkspaceCleanupSummary {
+                workspace_id,
+                task_id: row.try_get("task_id")?,
+                worktree_path: Some(resolved.handle()?.to_owned()),
+                cleanup_after: row.try_get("cleanup_after")?,
+            });
+        }
+        Ok(backlog)
     }
 
     async fn retry_pressure(&self) -> Result<Vec<RetryPressureSummary>, ServiceError> {
@@ -629,21 +698,11 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
 }
 
 async fn plan_progress(
-    workspace_path: String,
+    workspace: &ResolvedWorkspace,
 ) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    tokio::task::spawn_blocking(move || plan_progress_blocking(&workspace_path))
-        .await
-        .map_err(|error| ServiceError::InvalidOperation {
-            message: format!("plan progress worker failed: {error}"),
-        })?
-}
-
-fn plan_progress_blocking(
-    workspace_path: &str,
-) -> Result<Option<PlanProgressSummary>, ServiceError> {
-    match read_plan_artifact(std::path::Path::new(workspace_path), None) {
-        Ok(artifact) => Ok(Some(to_plan_progress_summary(&artifact))),
-        Err(PlanArtifactError::NotFound) => Ok(None),
+    match read_plan_for_resolved_workspace(workspace).await {
+        Ok(Some((progress, _))) => Ok(Some(progress)),
+        Ok(None) | Err(PlanArtifactError::NotFound) => Ok(None),
         Err(error) => Ok(Some(PlanProgressSummary {
             total: 0,
             completed: 0,

@@ -8,6 +8,7 @@ use crate::{
         default_states,
         engine::{WorkflowAuthority, WorkflowEngine},
     },
+    workspace_backend::{EmbeddedWorkspaceBackend, WorkspaceBackendRouter},
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
@@ -401,6 +402,8 @@ pub struct TaskService {
     workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    test_workspace_backend: bool,
     workspace_root: PathBuf,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -469,8 +472,14 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+    /// Production services receive the runtime's shared owner router.
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    ) -> Self {
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
+        let workspace_root = default_workspace_root();
         Self {
             db,
             event_bus,
@@ -482,7 +491,9 @@ impl TaskService {
             workspace_exec_locks: None,
             terminal_activity: None,
             repo_cache_locks: None,
-            workspace_root: default_workspace_root(),
+            workspace_backend_router,
+            test_workspace_backend: false,
+            workspace_root,
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
@@ -490,9 +501,60 @@ impl TaskService {
         }
     }
 
+    /// Embedded-only fixture constructor for tests outside this crate.
+    pub fn new_for_test(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        let router = crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            default_workspace_root(),
+            None,
+        );
+        let mut service = Self::new_with_router(db, event_bus, router);
+        service.test_workspace_backend = true;
+        service
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
+        Self::new_for_test(db, event_bus)
+    }
+
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {
         self.merge_service = Some(merge_service);
+        self.configure_workspace_backend();
         self
+    }
+
+    /// Inject the graph's shared router after configuring workspace dependencies.
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self.test_workspace_backend = false;
+        self
+    }
+
+    pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
+        Arc::clone(&self.workspace_backend_router)
+    }
+
+    fn configure_workspace_backend(&mut self) {
+        if !self.test_workspace_backend {
+            return;
+        }
+        let merge_service = self.merge_service.clone().unwrap_or_else(|| {
+            Arc::new(MergeService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                self.workspace_root.clone(),
+            ))
+        });
+        let mut embedded = EmbeddedWorkspaceBackend::new(
+            Arc::clone(&self.db),
+            merge_service,
+            self.workspace_root.clone(),
+        );
+        if let Some(locks) = &self.repo_cache_locks {
+            embedded = embedded.with_repo_cache_locks(Arc::clone(locks));
+        }
+        self.workspace_backend_router = Arc::new(WorkspaceBackendRouter::new(Arc::new(embedded)));
     }
 
     pub(crate) async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
@@ -536,6 +598,7 @@ impl TaskService {
 
     pub fn with_repo_cache_locks(mut self, locks: Arc<RepoCacheLockManager>) -> Self {
         self.repo_cache_locks = Some(locks);
+        self.configure_workspace_backend();
         self
     }
 
@@ -549,6 +612,7 @@ impl TaskService {
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = workspace_root;
+        self.configure_workspace_backend();
         self
     }
 
@@ -639,68 +703,6 @@ impl TaskService {
             }
         }
         Ok(())
-    }
-
-    /// Prepare the scheduler-owned lease installed with a newly-created
-    /// running execution.  A currently authenticated daemon connection owns
-    /// the attempt from the first row write; all other dispatches receive an
-    /// already-expired pending marker which recovery can reclaim.
-    pub(crate) async fn initial_execution_lease(
-        &self,
-        input: &CreateExecution,
-    ) -> Result<ClaimExecutionLease> {
-        if input.status != ExecutionStatus::Running {
-            return Err(ServiceError::invalid_operation(
-                "initial execution leases require a running execution",
-            ));
-        }
-        let snapshot = serde_json::from_str::<Value>(
-            input
-                .executor_config_snapshot_json
-                .as_deref()
-                .unwrap_or("{}"),
-        )
-        .unwrap_or(Value::Null);
-        let hard_deadline_at = execution::rfc3339_after(
-            &input.updated_at,
-            i64::try_from(execution::execution_deadline_seconds(&snapshot)).unwrap_or(i64::MAX),
-        );
-        let remote_owner = if let Some(agent_id) = input.agent_id.as_deref() {
-            AgentRepo::get_by_id(&*self.db, agent_id)
-                .await?
-                .and_then(|agent| {
-                    agent.daemon_id.as_deref().and_then(|daemon_id| {
-                        self.daemon_connections.as_ref().and_then(|registry| {
-                            registry.get(daemon_id).map(|connection| {
-                                crate::daemon_transport::execution_lease_owner(
-                                    daemon_id,
-                                    connection.id(),
-                                )
-                            })
-                        })
-                    })
-                })
-        } else {
-            None
-        };
-        let (owner, lease_expires_at) = match remote_owner {
-            Some(owner) => (
-                owner,
-                execution::bounded_lease_expiry(&input.updated_at, &hard_deadline_at),
-            ),
-            None => (
-                format!("dispatch-pending:{}", input.id),
-                input.updated_at.clone(),
-            ),
-        };
-        Ok(ClaimExecutionLease {
-            execution_id: input.id.clone(),
-            expected_version: 1,
-            owner,
-            lease_expires_at,
-            hard_deadline_at,
-            now: input.updated_at.clone(),
-        })
     }
 
     /// Create a running execution and remove a freshly prepared workspace if
@@ -847,15 +849,21 @@ impl TaskService {
                 admission.expected_auditor_execution_id = auditor_execution_id;
             }
         }
-        self.create_running_execution_with_admission(input, workspace_created_by_attempt, admission)
-            .await
+        self.create_running_execution_with_admission(
+            input,
+            workspace_created_by_attempt,
+            admission,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn create_running_execution_with_admission(
+    async fn create_running_execution_with_admission(
         &self,
         input: CreateExecution,
         workspace_created_by_attempt: bool,
         admission: Option<ExecutionAdmission>,
+        workspace_admission: Option<&workspace::WorkspaceAdmission>,
     ) -> Result<Execution> {
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
@@ -871,18 +879,62 @@ impl TaskService {
             ));
         };
 
-        let create_result = if input.status == ExecutionStatus::Running {
-            let lease = self.initial_execution_lease(&input).await?;
-            ExecutionRepo::create_with_lease_and_admission(
-                &*self.db,
-                input.clone(),
-                lease,
-                admission,
-            )
-            .await
-        } else {
-            ExecutionRepo::create(&*self.db, input.clone()).await
-        };
+        let create_result: Result<Execution> = async {
+            if input.status == ExecutionStatus::Running {
+                let (task, workspace) = repository_context
+                    .as_ref()
+                    .expect("repository context loaded");
+                let prepared_admission;
+                let workspace_admission = match workspace_admission {
+                    Some(admission) => admission,
+                    None => {
+                        let agent = match input.agent_id.as_deref() {
+                            Some(id) => {
+                                Some(AgentRepo::get_by_id(&*self.db, id).await?.ok_or_else(
+                                    || ServiceError::not_found("agent", id.to_owned()),
+                                )?)
+                            }
+                            None => None,
+                        };
+                        let reservation = self
+                            .reserve_claim_workspace(task, agent.as_ref(), &input.role)
+                            .await?;
+                        prepared_admission = self.prepare_claim_workspace(reservation).await?;
+                        &prepared_admission
+                    }
+                };
+                if workspace.id != workspace_admission.workspace.id {
+                    return Err(DbError::VersionConflict.into());
+                }
+                let lease = self.initial_execution_lease(&input).await?;
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                self.check_claim_placement_in_tx(&mut transaction, task, workspace_admission)
+                    .await?;
+                self.check_placement_lease_owner(&workspace_admission.placement, &lease)?;
+                let execution = ExecutionRepo::create_with_lease_and_admission_in_tx(
+                    &*self.db,
+                    &mut transaction,
+                    input.clone(),
+                    lease,
+                    admission,
+                )
+                .await?;
+                self.issue_workspace_lease_in_tx(
+                    &mut transaction,
+                    task,
+                    &workspace_admission.workspace,
+                    &input.role,
+                    input.agent_id.as_deref(),
+                    &input.id,
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(execution)
+            } else {
+                Ok(ExecutionRepo::create(&*self.db, input.clone()).await?)
+            }
+        }
+        .await;
         let execution = match create_result {
             Ok(execution) => execution,
             Err(error) => {
@@ -893,47 +945,10 @@ impl TaskService {
                     )
                     .await;
                 }
-                return Err(error.into());
-            }
-        };
-        if let Some((task, workspace)) = repository_context.as_ref() {
-            if let Err(error) = self
-                .issue_workspace_lease(
-                    task,
-                    workspace,
-                    &input.role,
-                    input.agent_id.as_deref(),
-                    &input.id,
-                )
-                .await
-            {
-                if let Err(mark_error) = self
-                    .fail_execution_before_dispatch(&execution.id, error.to_string())
-                    .await
-                {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %mark_error,
-                        "failed to terminalize execution after WorkspaceLease rejection"
-                    );
-                }
-                if workspace_created_by_attempt {
-                    self.cleanup_fresh_execution_workspace(task, workspace)
-                        .await;
-                }
                 return Err(error);
             }
-        }
+        };
         Ok(execution)
-    }
-
-    pub(crate) async fn cleanup_fresh_execution_workspace(
-        &self,
-        task: &Task,
-        workspace: &Workspace,
-    ) {
-        self.cleanup_fresh_execution_workspace_by_id(&task.id, Some(&workspace.id))
-            .await;
     }
 
     async fn cleanup_fresh_execution_workspace_by_id(

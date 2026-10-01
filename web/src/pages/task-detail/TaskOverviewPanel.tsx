@@ -839,7 +839,9 @@ export function TaskOverviewPanel({
                   <p className="break-all font-mono">{task.workspace.worktree_path}</p>
                 </div>
               ) : null}
-              {task.status === 'done' ? <p>Workspace cleaned after merge.</p> : null}
+              {task.status === 'done' && (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
+                <p>Workspace cleaned after merge.</p>
+              ) : null}
             </div>
           </>
         ) : (

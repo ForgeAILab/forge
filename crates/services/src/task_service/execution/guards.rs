@@ -132,7 +132,30 @@ impl TaskService {
             let agent = AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-            let status = compute_effective_status(&self.db, &agent).await?;
+            let placed = match current_execution.workspace_id.as_deref() {
+                Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id)
+                    .await?
+                    .is_some(),
+                None => false,
+            };
+            let status = if placed && agent.backend_kind == "cli" {
+                // Admission already chose the executor owner. Availability
+                // display resolves Agent pins and must not change that route.
+                if agent.paused {
+                    EffectiveStatus::Paused
+                } else if agent.status == db::AgentStatus::Error {
+                    EffectiveStatus::Error
+                } else if crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id)
+                    .await?
+                    >= agent.max_concurrent_tasks
+                {
+                    EffectiveStatus::Busy
+                } else {
+                    EffectiveStatus::Active
+                }
+            } else {
+                compute_effective_status(&self.db, &agent).await?
+            };
             if status == EffectiveStatus::Active
                 || self
                     .busy_only_because_current_execution(&status, &agent, execution)
@@ -176,7 +199,9 @@ impl TaskService {
             return Ok(false);
         }
         let running_count = count_running_executions(&self.db, &agent.id).await?;
-        if running_count <= agent.max_concurrent_tasks {
+        let occupied_slots =
+            crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id).await?;
+        if running_count > 0 && occupied_slots <= agent.max_concurrent_tasks {
             return Ok(true);
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
@@ -196,7 +221,7 @@ impl TaskService {
         ) {
             return Ok(false);
         }
-        Ok(running_count <= agent.max_concurrent_tasks)
+        Ok(running_count > 0 && occupied_slots <= agent.max_concurrent_tasks)
     }
 
     pub(super) async fn ensure_no_running_interactive_execution(

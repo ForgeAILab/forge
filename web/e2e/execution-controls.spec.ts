@@ -52,6 +52,7 @@ function mockTask(overrides: Record<string, unknown> = {}) {
     task_state_config: null,
     review_passed_at: null,
     workspace: null,
+    placement: null,
     version: 1,
     created_at: '2026-04-25T00:00:00Z',
     updated_at: '2026-04-25T00:00:00Z',

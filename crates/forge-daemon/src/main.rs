@@ -77,6 +77,8 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| credentials::default_path(&cli.server));
     let owner_token = resolve_owner_token(cli.token.as_deref());
+    let run_policy =
+        forge_client::daemon_config::DaemonConfig::load(&credentials_path)?.run_policy();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -117,6 +119,7 @@ async fn main() -> Result<()> {
         workspace_root.clone(),
         active_executions,
         shutdown_rx.clone(),
+        run_policy,
     ));
 
     wait_for_shutdown(shutdown_rx.clone()).await;

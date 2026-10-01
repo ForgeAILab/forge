@@ -407,6 +407,8 @@ pub fn outcome_for_service_error_with_correction(
             )
         }
         ServiceError::DaemonUnavailable { .. }
+        | ServiceError::PlacementUnavailable(_)
+        | ServiceError::PrepareFailed { .. }
         | ServiceError::DaemonTimeout { .. }
         | ServiceError::TerminalDaemonUnavailable { .. }
         | ServiceError::TerminalActiveExecution { .. }

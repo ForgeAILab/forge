@@ -188,6 +188,11 @@ impl Fixture {
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus: Arc::new(events::EventBus::new(16)),
+            workspace_backend_router: services::TaskService::new_for_test(
+                Arc::clone(&self.db),
+                Arc::new(events::EventBus::new(16)),
+            )
+            .workspace_backend_router(),
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,

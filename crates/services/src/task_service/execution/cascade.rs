@@ -1071,13 +1071,21 @@ impl TaskService {
                 let workspace = WorkspaceRepo::get_by_id(&*self.db, id)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("workspace", id.to_owned()))?;
-                ::review::contract::evaluate(
-                    &self.db,
-                    &execution.id,
-                    std::path::Path::new(&workspace.worktree_path),
-                    &final_message,
-                )
-                .await
+                let resolved =
+                    crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+                        &self.workspace_backend_router,
+                        &self.db,
+                        &workspace,
+                        &self.workspace_root,
+                    )
+                    .await?;
+                match resolved.embedded_path() {
+                    Ok(path) => {
+                        ::review::contract::evaluate(&self.db, &execution.id, &path, &final_message)
+                            .await
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
             }
             None => Err("review execution has no workspace evidence".to_owned()),
         };

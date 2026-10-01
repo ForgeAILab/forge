@@ -1059,6 +1059,17 @@ pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
+    /// Cleanup ownership guard for the legacy embedded path, under the same
+    /// writer lock as the caller's filesystem quarantine operation.
+    async fn embedded_path_is_owned_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        path: &str,
+    ) -> Result<bool>;
+    /// Authorize an embedded runtime path without exposing the legacy column.
+    /// A recorded placement is authoritative; unplaced rows retain their
+    /// exact-path guard until the backend records their server placement.
+    async fn task_owns_embedded_path(&self, task_id: &str, path: &str) -> Result<bool>;
     async fn set_cleanup_after(
         &self,
         id: &str,
@@ -1075,6 +1086,62 @@ pub trait WorkspaceRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<Workspace>;
     async fn delete(&self, id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait WorkspacePlacementRepo: Send + Sync {
+    async fn create(&self, input: CreateWorkspacePlacement) -> Result<WorkspacePlacement>;
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateWorkspacePlacement,
+    ) -> Result<WorkspacePlacement>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_workspace_id(&self, workspace_id: &str) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_workspace_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    async fn update(&self, input: UpdateWorkspacePlacement) -> Result<WorkspacePlacement>;
+    async fn update_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateWorkspacePlacement,
+    ) -> Result<WorkspacePlacement>;
+    async fn list_by_daemon_and_state(
+        &self,
+        daemon_id: &str,
+        state: PlacementState,
+    ) -> Result<Vec<WorkspacePlacement>>;
+    async fn list_by_state(&self, state: PlacementState) -> Result<Vec<WorkspacePlacement>>;
+    async fn get_for_task(&self, task_id: &str) -> Result<Option<WorkspacePlacement>>;
+    /// Suspend a ready placement only while the observed execution version
+    /// still has an expired heartbeat lease and a live hard deadline.
+    async fn suspend_expired_execution_lease(
+        &self,
+        placement: &WorkspacePlacement,
+        execution: &Execution,
+        now: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    /// Rebind a suspended attempt to a new authenticated incarnation of its
+    /// existing owner. Both the placement and execution versions are fenced.
+    async fn resume_disconnected_execution_lease(
+        &self,
+        placement: &WorkspacePlacement,
+        execution: &Execution,
+        input: RenewExecutionLease,
+    ) -> Result<ExecutionLeaseMutation>;
+    async fn expire_unsuspended_workspace_leases(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceLease>>;
 }
 
 /// Internal scheduler authority for a Task workspace.  A lease is deliberately
@@ -1172,6 +1239,14 @@ pub trait ExecutionRepo: Send + Sync {
     /// versioned Task decision; service dispatch paths should always supply it.
     async fn create_with_lease_and_admission(
         &self,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<Execution>;
+    /// Share the caller's writer transaction with placement start fencing.
+    async fn create_with_lease_and_admission_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         input: CreateExecution,
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
@@ -2197,6 +2272,18 @@ pub trait RepoRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait RepoLocationRepo: Send + Sync {
+    async fn create(&self, input: CreateRepoLocation) -> Result<RepoLocation>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<RepoLocation>>;
+    async fn list_by_repo(&self, repo_id: &str, page: PageRequest) -> Result<Page<RepoLocation>>;
+    async fn update(&self, input: UpdateRepoLocation) -> Result<RepoLocation>;
+    /// Returns VersionConflict while a non-cleaned placement references the location.
+    async fn delete(&self, id: &str) -> Result<()>;
+    /// Supplies the Task identity for the delete-in-use response.
+    async fn get_blocking_placement(&self, id: &str) -> Result<Option<WorkspacePlacement>>;
+}
+
+#[async_trait]
 pub trait PrProviderConfigRepo: Send + Sync {
     async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig>;
     async fn get_by_repo_id(&self, repo_id: &str) -> Result<Option<PrProviderConfig>>;
@@ -2364,6 +2451,36 @@ pub struct UpdateRepo {
     pub remote_url: Option<String>,
     pub work_mode: Option<WorkMode>,
     pub default_branch: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRepoLocation {
+    pub id: String,
+    pub repo_id: String,
+    pub owner_kind: RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub path: String,
+    pub kind: RepoLocationKind,
+    pub is_default: bool,
+    pub status: RepoLocationStatus,
+    pub last_verified_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRepoLocation {
+    pub id: String,
+    pub expected_version: i64,
+    pub path: Option<String>,
+    pub kind: Option<RepoLocationKind>,
+    pub is_default: Option<bool>,
+    pub status: Option<RepoLocationStatus>,
+    pub last_verified_at: Option<Option<String>>,
+    pub last_error: Option<Option<String>>,
     pub updated_at: String,
 }
 
@@ -2589,6 +2706,50 @@ pub struct CreateWorkspace {
     pub status: WorkspaceStatus,
     pub before_sha: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkspacePlacement {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: PlacementOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: PlacementState,
+    pub selected_by: PlacementSelectedBy,
+    pub selection_reason: String,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<PlacementFailureCause>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWorkspacePlacement {
+    pub id: String,
+    pub expected_version: i64,
+    pub agent_id: Option<Option<String>>,
+    pub owner_kind: Option<PlacementOwnerKind>,
+    pub daemon_id: Option<Option<String>>,
+    pub runtime_id: Option<Option<String>>,
+    pub repo_location_id: Option<String>,
+    pub execution_daemon_id: Option<Option<String>>,
+    pub workspace_handle: Option<Option<String>>,
+    pub generation: Option<i64>,
+    pub state: Option<PlacementState>,
+    pub selected_by: Option<PlacementSelectedBy>,
+    pub selection_reason: Option<String>,
+    pub reserved_until: Option<Option<String>>,
+    pub disconnected_at: Option<Option<String>>,
+    pub failure_cause: Option<Option<PlacementFailureCause>>,
     pub updated_at: String,
 }
 

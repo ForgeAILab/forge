@@ -7,6 +7,21 @@ pub trait LifecyclePlugin: Send + Sync {
     fn name(&self) -> &str;
     fn supported_events(&self) -> &[api_types::LifecycleEvent];
     async fn execute(&self, ctx: &LifecycleHookContext) -> Result<PluginResult, PluginError>;
+
+    async fn execute_in_workspace(
+        &self,
+        ctx: &LifecycleHookContext,
+        workspace: &crate::workspace_backend::ResolvedWorkspace,
+    ) -> Result<PluginResult, PluginError> {
+        // The built-in knowledge plugins use host filesystem APIs. Their
+        // local entry point must never interpret a daemon handle as a path.
+        let path = workspace.embedded_path().map_err(|error| PluginError {
+            message: error.to_string(),
+        })?;
+        let mut ctx = ctx.clone();
+        ctx.worktree_path = Some(path.to_string_lossy().into_owned());
+        self.execute(&ctx).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

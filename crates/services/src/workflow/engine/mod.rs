@@ -207,6 +207,7 @@ pub struct WorkflowEngine {
     pub terminal_activity: Option<Arc<TerminalActivityTracker>>,
     pub workspace_root: PathBuf,
     pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
 }
 
 pub struct TransitionResult {
@@ -659,6 +660,7 @@ impl WorkflowEngine {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
             workspace_id,
             agent_id: latest_execution
                 .as_ref()
@@ -1232,6 +1234,7 @@ impl WorkflowEngine {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
                 workspace_id: workspace_id.clone(),
                 agent_id: latest_execution
                     .as_ref()
@@ -1264,6 +1267,7 @@ impl WorkflowEngine {
                 terminal_activity: self.terminal_activity.clone(),
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
+                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
                 workspace_id,
                 agent_id: latest_execution
                     .as_ref()

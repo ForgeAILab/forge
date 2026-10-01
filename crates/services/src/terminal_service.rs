@@ -23,8 +23,8 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use config::TerminalConfig;
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, AssigneeKind, CreateTerminalSession, ProjectRepo,
-    SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, TerminalSession, TerminalSessionRepo,
+    new_uuid_v4, now_rfc3339, CreateTerminalSession, PlacementOwnerKind, PlacementState,
+    ProjectRepo, SqliteDb, Task, TaskRepo, TerminalSession, TerminalSessionRepo,
     TerminalSessionStatus as DbTerminalSessionStatus, UpdateTerminalSessionStatus, Workspace,
     WorkspaceRepo, WorkspaceStatus,
 };
@@ -38,7 +38,8 @@ use tokio::{
 
 use crate::{
     daemon_transport::{DaemonConnectionRegistry, DaemonTerminalEventHandler},
-    workflow::{effective_role, engine::WorkflowEngine},
+    workflow::engine::WorkflowEngine,
+    workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
     workspace_cleanup::WorkspaceCleanupObserver,
     ServiceError, WorkspaceExecutionLockManager,
 };
@@ -72,6 +73,18 @@ enum EmbeddedTerminalCommand {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
     Terminate { reason: Option<String> },
+}
+
+struct EmbeddedTerminalCancellation {
+    command_tx: mpsc::UnboundedSender<EmbeddedTerminalCommand>,
+}
+
+impl Drop for EmbeddedTerminalCancellation {
+    fn drop(&mut self) {
+        let _ = self
+            .command_tx
+            .send(EmbeddedTerminalCommand::Terminate { reason: None });
+    }
 }
 
 #[derive(Default)]
@@ -136,10 +149,11 @@ pub struct TerminalService {
     workspace_root: PathBuf,
     state: Arc<Mutex<TerminalState>>,
     terminal_activity: Arc<TerminalActivityTracker>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
 impl TerminalService {
-    pub fn new(
+    pub fn new_for_test(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
         daemon_connections: Arc<DaemonConnectionRegistry>,
@@ -147,6 +161,11 @@ impl TerminalService {
         terminal_config: TerminalConfig,
         workspace_root: PathBuf,
     ) -> Self {
+        let router = crate::lifecycle::context::embedded_workspace_router_for_test(
+            Arc::clone(&db),
+            workspace_root.clone(),
+            None,
+        );
         Self::new_with_activity_tracker(
             db,
             event_bus,
@@ -155,9 +174,11 @@ impl TerminalService {
             terminal_config,
             workspace_root,
             Arc::new(TerminalActivityTracker::default()),
+            router,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_activity_tracker(
         db: Arc<SqliteDb>,
         event_bus: Arc<EventBus>,
@@ -166,6 +187,7 @@ impl TerminalService {
         terminal_config: TerminalConfig,
         workspace_root: PathBuf,
         terminal_activity: Arc<TerminalActivityTracker>,
+        workspace_backend_router: Arc<WorkspaceBackendRouter>,
     ) -> Self {
         Self {
             db,
@@ -176,7 +198,13 @@ impl TerminalService {
             workspace_root,
             state: Arc::new(Mutex::new(TerminalState::default())),
             terminal_activity,
+            workspace_backend_router,
         }
+    }
+
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self
     }
 
     pub fn activity_tracker(&self) -> Arc<TerminalActivityTracker> {
@@ -227,10 +255,15 @@ impl TerminalService {
             return Ok(availability);
         }
 
-        let daemon_id = self.resolve_terminal_daemon_id(&task, &workspace).await?;
-        availability.daemon_reachable = daemon_id
-            .as_deref()
-            .is_none_or(|daemon_id| self.daemon_connections.is_connected(daemon_id));
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        let daemon_id = terminal_daemon_id(&resolved)?;
+        availability.daemon_reachable = resolved.placement.state != PlacementState::Disconnected
+            && daemon_id
+                .as_deref()
+                .is_none_or(|daemon_id| self.daemon_connections.is_connected(daemon_id));
         if !availability.daemon_reachable {
             availability.reason = Some(api_types::TERMINAL_DAEMON_UNAVAILABLE.to_owned());
             return Ok(availability);
@@ -275,7 +308,7 @@ impl TerminalService {
         let cols = cols.unwrap_or(DEFAULT_COLS);
         validate_terminal_size(rows, cols)?;
 
-        let (task, workspace) = self.require_terminal_workspace(task_id).await?;
+        let (_task, workspace) = self.require_terminal_workspace(task_id).await?;
 
         let task_sessions =
             TerminalSessionRepo::list_running_terminal_sessions_for_task(&*self.db, task_id)
@@ -301,11 +334,20 @@ impl TerminalService {
             });
         }
 
-        self.validate_workspace_path(&workspace.worktree_path)
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
             .await?;
-        let daemon_id = self.resolve_terminal_daemon_id(&task, &workspace).await?;
+        let workspace_path = resolved.handle()?.to_owned();
+        if resolved.placement.owner_kind == PlacementOwnerKind::Server {
+            self.validate_workspace_path(&resolved.embedded_path()?)
+                .await?;
+        }
+        let daemon_id = terminal_daemon_id(&resolved)?;
         if let Some(daemon_id) = daemon_id.as_deref() {
-            if !self.daemon_connections.is_connected(daemon_id) {
+            if resolved.placement.state == PlacementState::Disconnected
+                || !self.daemon_connections.is_connected(daemon_id)
+            {
                 return Err(ServiceError::TerminalDaemonUnavailable {
                     daemon_id: daemon_id.to_owned(),
                 });
@@ -356,7 +398,7 @@ impl TerminalService {
             .await;
 
         let start_result = self
-            .start_terminal_process(&created, &workspace.worktree_path, rows, cols)
+            .start_terminal_process(&created, &workspace_path, rows, cols)
             .await;
         let start_result = match start_result {
             Ok(start_result) => start_result,
@@ -760,7 +802,20 @@ impl TerminalService {
         task: &Task,
         workspace: &Workspace,
     ) -> Result<bool, ServiceError> {
-        if workspace.status != WorkspaceStatus::Ready || workspace.worktree_path.trim().is_empty() {
+        if workspace.status != WorkspaceStatus::Ready {
+            return Ok(false);
+        }
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, workspace)
+            .await?;
+        if !matches!(
+            resolved.placement.state,
+            PlacementState::Ready | PlacementState::Disconnected
+        ) || resolved
+            .handle()
+            .map_or(true, |handle| handle.trim().is_empty())
+        {
             return Ok(false);
         }
 
@@ -786,8 +841,7 @@ impl TerminalService {
         ))
     }
 
-    async fn validate_workspace_path(&self, worktree_path: &str) -> Result<(), ServiceError> {
-        let worktree_path = Path::new(worktree_path);
+    async fn validate_workspace_path(&self, worktree_path: &Path) -> Result<(), ServiceError> {
         let workspace_root = tokio::fs::canonicalize(&self.workspace_root)
             .await
             .map_err(|_| ServiceError::TerminalPathGuardrail)?;
@@ -798,57 +852,6 @@ impl TerminalService {
             return Err(ServiceError::TerminalPathGuardrail);
         }
         Ok(())
-    }
-
-    async fn resolve_terminal_daemon_id(
-        &self,
-        task: &Task,
-        _workspace: &Workspace,
-    ) -> Result<Option<String>, ServiceError> {
-        if task.assignee_type.as_deref() == Some("agent") {
-            return self.agent_daemon_id(task.assignee_id.as_deref()).await;
-        }
-
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::General),
-        );
-        let Some(role_name) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(effective_role)
-        else {
-            return Ok(None);
-        };
-        let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name).await?
-        else {
-            return Ok(None);
-        };
-        if assignment.assignee_type != Some(AssigneeKind::Agent) {
-            return Ok(None);
-        }
-
-        self.agent_daemon_id(assignment.assignee_id.as_deref())
-            .await
-    }
-
-    async fn agent_daemon_id(
-        &self,
-        agent_id: Option<&str>,
-    ) -> Result<Option<String>, ServiceError> {
-        let Some(agent_id) = agent_id else {
-            return Ok(None);
-        };
-        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        Ok(agent.daemon_id)
     }
 
     async fn start_terminal_process(
@@ -966,7 +969,13 @@ impl TerminalService {
         let wait_session_id = session_id.clone();
         let wait_child = Arc::clone(&child);
         let wait_reason = Arc::clone(&terminate_reason);
+        let cancellation = EmbeddedTerminalCancellation {
+            command_tx: command_tx.clone(),
+        };
         tokio::spawn(async move {
+            // The service or watchdog may still retain a command sender when
+            // shutdown cancels this watcher. Explicitly stop its blocking workers.
+            let _cancellation = cancellation;
             wait_for_embedded_child_exit(
                 db,
                 event_bus,
@@ -1128,7 +1137,7 @@ fn spawn_embedded_control(
                 EmbeddedTerminalCommand::Input(bytes) => {
                     if let Err(error) = writer.write_all(&bytes) {
                         tracing::warn!(%error, session_id = %session_id, "embedded terminal input write failed");
-                        return;
+                        break;
                     }
                     last_activity.store(unix_timestamp_secs(), Ordering::Relaxed);
                 }
@@ -1143,18 +1152,22 @@ fn spawn_embedded_control(
                     if let Ok(mut stored_reason) = terminate_reason.lock() {
                         *stored_reason = reason;
                     }
-                    match child.lock() {
-                        Ok(mut child) => {
-                            if let Err(error) = child.kill() {
-                                tracing::warn!(%error, session_id = %session_id, "failed to kill embedded terminal child");
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, session_id = %session_id, "embedded terminal child lock poisoned during termination");
-                        }
-                    }
-                    return;
+                    break;
                 }
+            }
+        }
+        // Runtime shutdown drops the command senders too. Kill the shell so
+        // the blocking PTY reader observes EOF instead of holding shutdown.
+        match child.lock() {
+            Ok(mut child) => {
+                if !matches!(child.try_wait(), Ok(Some(_))) {
+                    if let Err(error) = child.kill() {
+                        tracing::warn!(%error, session_id = %session_id, "failed to kill embedded terminal child");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, session_id = %session_id, "embedded terminal child lock poisoned during termination");
             }
         }
     });
@@ -1561,6 +1574,24 @@ fn hash_attach_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+fn terminal_daemon_id(resolved: &ResolvedWorkspace) -> Result<Option<String>, ServiceError> {
+    match resolved.placement.owner_kind {
+        PlacementOwnerKind::Server => Ok(resolved.placement.execution_daemon_id.clone()),
+        PlacementOwnerKind::Daemon => {
+            resolved
+                .placement
+                .daemon_id
+                .clone()
+                .map(Some)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "daemon workspace placement has no owner daemon",
+                    )
+                })
+        }
+    }
+}
+
 fn map_terminal_daemon_error(error: ServiceError, daemon_id: &str) -> ServiceError {
     match error {
         ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. } => {
@@ -1627,7 +1658,7 @@ mod tests {
             Arc::new(NoopExecutionHandler),
         ));
         let workspace_root = TempDir::new().expect("workspace root");
-        let service = TerminalService::new(
+        let service = TerminalService::new_for_test(
             Arc::clone(&db),
             event_bus,
             daemon_connections,
@@ -1779,6 +1810,89 @@ mod tests {
             enabled: true,
             ..TerminalConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn embedded_terminal_command_channel_close_kills_the_child() {
+        let pair = native_pty_system().openpty(pty_size(24, 80)).unwrap();
+        // A reader keeps the master open during shutdown, as the blocking
+        // output reader does in the service. Dropping control alone is insufficient.
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let child: SharedChild =
+            Arc::new(StdMutex::new(pair.slave.spawn_command(command).unwrap()));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        spawn_embedded_control(
+            "shutdown-test".to_owned(),
+            pair.master,
+            writer,
+            receiver,
+            Arc::clone(&child),
+            Arc::new(AtomicU64::new(unix_timestamp_secs())),
+            Arc::new(StdMutex::new(None)),
+        );
+        drop(sender);
+        let exit = tokio_time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if let Some(status) = child.lock().unwrap().try_wait().unwrap() {
+                    return status;
+                }
+                tokio_time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if exit.is_err() {
+            child.lock().unwrap().kill().unwrap();
+        }
+        drop(reader);
+        assert!(exit.is_ok(), "closing terminal control must stop the child");
+    }
+
+    #[tokio::test]
+    async fn embedded_terminal_watcher_cancellation_kills_the_child_with_live_senders() {
+        let pair = native_pty_system().openpty(pty_size(24, 80)).unwrap();
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        let child: SharedChild =
+            Arc::new(StdMutex::new(pair.slave.spawn_command(command).unwrap()));
+        let (sender, receiver) = mpsc::unbounded_channel();
+        spawn_embedded_control(
+            "watcher-cancellation-test".to_owned(),
+            pair.master,
+            writer,
+            receiver,
+            Arc::clone(&child),
+            Arc::new(AtomicU64::new(unix_timestamp_secs())),
+            Arc::new(StdMutex::new(None)),
+        );
+        let cancellation = EmbeddedTerminalCancellation {
+            command_tx: sender.clone(),
+        };
+        let watcher = tokio::spawn(async move {
+            let _cancellation = cancellation;
+            std::future::pending::<()>().await;
+        });
+        watcher.abort();
+        assert!(watcher.await.unwrap_err().is_cancelled());
+        let exit = tokio_time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                if let Some(status) = child.lock().unwrap().try_wait().unwrap() {
+                    return status;
+                }
+                tokio_time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if exit.is_err() {
+            child.lock().unwrap().kill().unwrap();
+        }
+        drop(sender);
+        drop(reader);
+        assert!(exit.is_ok(), "cancelling the watcher must stop the child");
     }
 
     #[tokio::test]

@@ -189,6 +189,11 @@ async fn assign_role(db: &SqliteDb, task_id: &str, role_name: &str) {
 
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
     WorkflowEngine {
+        workspace_backend_router: services::TaskService::new_for_test(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        )
+        .workspace_backend_router(),
         db,
         event_bus,
         review_runner: None,

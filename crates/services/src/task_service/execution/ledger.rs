@@ -202,19 +202,26 @@ fn candidates_from_snapshot(snapshot: &Value) -> Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
-fn subject_ref(
+async fn subject_ref(
+    db: &SqliteDb,
+    tx: &mut Transaction<'_, Sqlite>,
     candidate: &Candidate,
     snapshot: &Value,
     agent: &db::Agent,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>)> {
     let provider_entry = nonempty(candidate.config.get("credential_ref"))
         .or_else(|| nonempty(candidate.config.get("provider_entry_id")))
         .or_else(|| nonempty(snapshot.get("credential_ref")))
         .or_else(|| agent.credential_ref.clone());
-    let daemon_id = nonempty(candidate.config.get("daemon_id"))
-        .or_else(|| nonempty(snapshot.get("resolved_daemon_id")))
-        .or_else(|| agent.daemon_id.clone());
-    (provider_entry, daemon_id)
+    let daemon_id = if let Some(placement_id) = nonempty(snapshot.get("placement_id")) {
+        let placement = db::WorkspacePlacementRepo::get_by_id_in_tx(db, tx, &placement_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace placement", placement_id))?;
+        placement.execution_daemon_id.or(placement.daemon_id)
+    } else {
+        nonempty(snapshot.get("daemon_id")).or_else(|| agent.daemon_id.clone())
+    };
+    Ok((provider_entry, daemon_id))
 }
 
 async fn resolve_price_identity(
@@ -233,7 +240,7 @@ async fn resolve_price_identity(
             ..Default::default()
         });
     };
-    let (provider_entry, daemon_id) = subject_ref(candidate, snapshot, agent);
+    let (provider_entry, daemon_id) = subject_ref(db, tx, candidate, snapshot, agent).await?;
     let executor_type = candidate.executor_type.to_string();
     // Provision the subject and materialize the binding this agent resolves:
     // the models.dev row for the runtime model under the effective
@@ -452,6 +459,16 @@ pub(crate) async fn admit_task_execution_in_tx_with_db(
     {
         return Ok(());
     }
+    let mut placement_snapshot = snapshot.clone();
+    if let Some(workspace_id) = execution.workspace_id.as_deref() {
+        let placement = db::WorkspacePlacementRepo::get_by_workspace_id_in_tx(db, tx, workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("workspace placement", workspace_id.to_owned())
+            })?;
+        placement_snapshot["placement_id"] = serde_json::json!(placement.id);
+    }
+    let snapshot = &placement_snapshot;
     let admitted_at = db::now_rfc3339();
     for candidate in candidates_from_snapshot(snapshot)? {
         let identity = resolve_price_identity(

@@ -3,4 +3,4 @@
 /**
  * Remove a pricing adjustment, falling back to its parent.
  */
-export type DeletePricingSettingsQuery = { version: number }
+export type DeletePricingSettingsQuery = { version: number, };

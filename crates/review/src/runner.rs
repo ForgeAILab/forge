@@ -14,7 +14,7 @@ use executors::{
     ExecutionOverrides, LogEntry, LogKind, LogStream, LogWriter, TaskExecutor,
 };
 use serde_json::{json, Value};
-use std::{future::Future, path::PathBuf, process::ExitStatus, sync::Arc};
+use std::{future::Future, path::PathBuf, sync::Arc};
 use thiserror::Error;
 use tokio::{process::Command, sync::oneshot, task::JoinHandle};
 use uuid::Uuid;
@@ -28,6 +28,7 @@ pub struct ReviewRunner {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     executor: Arc<dyn TaskExecutor>,
+    workspace_io: Option<Arc<dyn crate::ReviewWorkspace>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,15 @@ pub struct ReviewRequest {
 
 #[derive(Debug, Error)]
 pub enum ReviewError {
+    #[error("workspace owner unavailable: daemon {daemon_id}")]
+    OwnerUnavailable { daemon_id: String },
+
+    #[error("{0}")]
+    WorkspaceInfrastructure(String),
+
+    #[error("{0}")]
+    Workspace(String),
+
     #[error("review assessment unavailable: {reason}")]
     Conformance {
         execution_id: String,
@@ -120,6 +130,7 @@ impl ReviewRunner {
             db,
             event_bus,
             executor: Arc::new(AdapterExecutor::new(adapter_registry)),
+            workspace_io: None,
         }
     }
 
@@ -137,6 +148,17 @@ impl ReviewRunner {
             db: Arc::clone(&self.db),
             event_bus: Arc::clone(&self.event_bus),
             executor,
+            workspace_io: self.workspace_io.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_workspace_io(&self, workspace: Arc<dyn crate::ReviewWorkspace>) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            event_bus: Arc::clone(&self.event_bus),
+            executor: Arc::clone(&self.executor),
+            workspace_io: Some(workspace),
         }
     }
 
@@ -151,10 +173,13 @@ impl ReviewRunner {
             db,
             event_bus,
             executor,
+            workspace_io: None,
         }
     }
 
     pub async fn run(&self, req: ReviewRequest) -> Result<(Review, ReviewOutcome), ReviewError> {
+        let local_workspace = req.workspace_path.clone();
+        let workspace_io = self.workspace_io.as_deref().unwrap_or(&local_workspace);
         let task_id = req.task_id.to_string();
         let executor_execution_id = req.executor_execution_id.to_string();
         let executor_execution = ExecutionRepo::get_by_id(&*self.db, &executor_execution_id)
@@ -290,7 +315,7 @@ impl ReviewRunner {
                 .and_then(|result| result)
         } else {
             reviewer_lease
-                .run(self.run_steps(&req, &reviewer_execution, &ci_steps))
+                .run(self.run_steps(&req, workspace_io, &reviewer_execution, &ci_steps))
                 .await
                 .and_then(|result| result)
         };
@@ -341,6 +366,13 @@ impl ReviewRunner {
                     );
                     false
                 });
+                if matches!(
+                    error,
+                    ReviewError::OwnerUnavailable { .. } | ReviewError::WorkspaceInfrastructure(_)
+                ) {
+                    cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                    return Err(error);
+                }
                 let cleanup_now = now_rfc3339();
                 let cleanup = update_review_with_authority(
                     &self.db,
@@ -407,6 +439,7 @@ impl ReviewRunner {
             let audit = self
                 .run_auditor(
                     &req,
+                    workspace_io,
                     &executor_execution,
                     &task,
                     &project,
@@ -420,6 +453,14 @@ impl ReviewRunner {
             let audit = match audit {
                 Ok(result) => result,
                 Err(error) => {
+                    if matches!(
+                        error,
+                        ReviewError::OwnerUnavailable { .. }
+                            | ReviewError::WorkspaceInfrastructure(_)
+                    ) {
+                        cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                        return Err(error);
+                    }
                     let conformance = if let ReviewError::Conformance { execution_id, .. } = &error
                     {
                         match db::ReviewConformanceRepo::review_conformance(&*self.db, execution_id)
@@ -636,6 +677,7 @@ impl ReviewRunner {
     async fn run_steps(
         &self,
         req: &ReviewRequest,
+        workspace: &dyn crate::ReviewWorkspace,
         reviewer_execution: &Execution,
         ci_steps: &[String],
     ) -> Result<(ReviewStatus, ReviewOutcome, Vec<StepResult>, Option<usize>), ReviewError> {
@@ -651,25 +693,15 @@ impl ReviewRunner {
 
         for (index, step) in ci_steps.iter().enumerate() {
             let started_at = now_rfc3339();
-            let output = Command::new("bash")
-                .arg("-lc")
-                .arg(step)
-                .envs(&environment.env)
-                .current_dir(&req.workspace_path)
-                .output()
-                .await?;
+            let output = workspace.run(step, &environment.env, None).await?;
             let finished_at = now_rfc3339();
 
-            let stdout = executors::environment::redact_environment_values(
-                &String::from_utf8_lossy(&output.stdout),
-                &environment.env,
-            );
-            let stderr = executors::environment::redact_environment_values(
-                &String::from_utf8_lossy(&output.stderr),
-                &environment.env,
-            );
+            let stdout =
+                executors::environment::redact_environment_values(&output.stdout, &environment.env);
+            let stderr =
+                executors::environment::redact_environment_values(&output.stderr, &environment.env);
             let combined_output = combined_output(&stdout, &stderr);
-            let exit_code = exit_code(output.status);
+            let exit_code = output.exit_code.unwrap_or(1);
             let result = StepResult {
                 index,
                 command: step.clone(),
@@ -719,6 +751,7 @@ impl ReviewRunner {
     async fn run_auditor(
         &self,
         req: &ReviewRequest,
+        workspace_io: &dyn crate::ReviewWorkspace,
         executor_execution: &Execution,
         task: &Task,
         project: &Project,
@@ -744,7 +777,12 @@ impl ReviewRunner {
             return Ok(Some(AuditorRunResult::failed("auditor_agent_unavailable")));
         };
 
-        let diff_text = read_git_diff(&req.workspace_path, &repo.default_branch).await?;
+        let auditor_workspace_path = workspace_io.execution_path().await.map_err(|reason| {
+            workspace_io
+                .infrastructure_error(&reason)
+                .unwrap_or(ReviewError::Workspace(reason))
+        })?;
+        let diff_text = workspace_io.diff(&repo.default_branch).await?;
         let mut prompt = auditor::render_auditor_prompt(
             &task.title,
             task.description.as_deref(),
@@ -752,7 +790,15 @@ impl ReviewRunner {
             review_prompt,
         );
         let auditor_execution_id = new_uuid_v4();
-        let auditor_before_sha = git::get_current_sha(&req.workspace_path).await?;
+        let auditor_before_sha = crate::contract::git_read(workspace_io, &["rev-parse", "HEAD"])
+            .await
+            .map_err(|reason| {
+                workspace_io
+                    .infrastructure_error(&reason)
+                    .unwrap_or(ReviewError::Workspace(reason))
+            })?
+            .trim()
+            .to_owned();
         let auditor_logs_path = auditor_logs_path(&req.logs_path, &auditor_execution_id);
         let executor_type = executor_type_for_execution(&self.db, executor_execution).await?;
         let extra_config = auditor_resume_thread_extra_config(
@@ -761,6 +807,13 @@ impl ReviewRunner {
             auditor_agent,
         );
         let snapshot = build_auditor_config_snapshot(auditor_agent, extra_config).await?;
+        let snapshot = if let Some(placement_id) = workspace_io.placement_id() {
+            let mut snapshot: Value = serde_json::from_str(&snapshot)?;
+            snapshot["placement_id"] = json!(placement_id);
+            snapshot.to_string()
+        } else {
+            snapshot
+        };
         let lease_claim = ReviewExecutionLease::new_claim(&auditor_execution_id.to_string());
         let now = lease_claim.claim.now.clone();
         let admission = review_execution_admission(
@@ -809,7 +862,7 @@ impl ReviewRunner {
             &self.db,
             &auditor_execution.id,
             &task_id,
-            &req.workspace_path,
+            workspace_io,
             true,
             auditor_agent.executor_type == "shell",
             prompt,
@@ -818,6 +871,12 @@ impl ReviewRunner {
         {
             Ok(prompt) => prompt,
             Err(reason) => {
+                let error = workspace_io.infrastructure_error(&reason).unwrap_or(
+                    ReviewError::Conformance {
+                        execution_id: auditor_execution.id.clone(),
+                        reason: reason.clone(),
+                    },
+                );
                 terminalize_review_execution(
                     &self.db,
                     &auditor_execution,
@@ -825,13 +884,10 @@ impl ReviewRunner {
                     ExecutionStatus::Failed,
                     None,
                     Some(reason.clone()),
-                    ReviewTerminalPolicy::default(),
+                    review_terminal_policy(&error),
                 )
                 .await?;
-                return Err(ReviewError::Conformance {
-                    execution_id: auditor_execution.id.clone(),
-                    reason,
-                });
+                return Err(error);
             }
         };
 
@@ -845,7 +901,7 @@ impl ReviewRunner {
             .run(self.executor.execute(ExecutionContext {
                 task_id,
                 execution_id: auditor_execution.id.clone(),
-                worktree_path: req.workspace_path.display().to_string(),
+                worktree_path: auditor_workspace_path,
                 description: prompt,
                 agent_config: serde_json::from_str(&snapshot)?,
                 logs_path: auditor_logs_path.clone(),
@@ -861,13 +917,16 @@ impl ReviewRunner {
                 Some(error),
             ),
         };
-        let restore_result = git::restore_worktree(&req.workspace_path, &auditor_before_sha)
-            .await
-            .map_err(|error| {
-                executors::ExecutorError::Other(format!(
-                    "failed to restore auditor worktree state: {error}"
-                ))
-            });
+        let restore_result = workspace_io.restore(&auditor_before_sha).await;
+        let restore_infrastructure = restore_result
+            .as_ref()
+            .err()
+            .and_then(|reason| workspace_io.infrastructure_error(reason));
+        let restore_result = restore_result.map_err(|error| {
+            executors::ExecutorError::Other(format!(
+                "failed to restore auditor worktree state: {error}"
+            ))
+        });
         let execution_result = match (execution_result, restore_result) {
             (_, Err(error)) => Err(error),
             (Ok(mut result), Ok(())) => {
@@ -877,7 +936,7 @@ impl ReviewRunner {
             (Err(error), Ok(())) => Err(error),
         };
 
-        if let Some(error) = lease_error {
+        if let Some(error) = lease_error.or(restore_infrastructure) {
             let terminalized = terminalize_review_execution(
                 &self.db,
                 &auditor_execution,
@@ -956,13 +1015,17 @@ impl ReviewRunner {
         let conformance = crate::contract::evaluate(
             &self.db,
             &auditor_execution.id,
-            &req.workspace_path,
+            workspace_io,
             &final_message,
         )
         .await
-        .map_err(|reason| ReviewError::Conformance {
-            execution_id: auditor_execution.id.clone(),
-            reason,
+        .map_err(|reason| {
+            workspace_io
+                .infrastructure_error(&reason)
+                .unwrap_or(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason,
+                })
         })?;
         // Neither an unusable reply nor an environment the reviewer could not
         // work in is the coder's to fix; both take the reviewer failure path.
@@ -1473,7 +1536,13 @@ struct ReviewTerminalPolicy {
 }
 
 fn review_terminal_policy(error: &ReviewError) -> ReviewTerminalPolicy {
-    if matches!(error, ReviewError::ExecutionHardDeadline { .. }) {
+    if matches!(error, ReviewError::OwnerUnavailable { .. }) {
+        ReviewTerminalPolicy {
+            stop_reason: Some(db::StopReason::DaemonDisconnected),
+            stopped_by: Some("system:workspace-owner".to_owned()),
+            resume_policy: Some(db::ResumePolicy::Manual),
+        }
+    } else if matches!(error, ReviewError::ExecutionHardDeadline { .. }) {
         ReviewTerminalPolicy {
             stop_reason: Some(db::StopReason::AgentTimeout),
             stopped_by: Some("system:heartbeat_monitor".to_owned()),
@@ -1614,7 +1683,7 @@ impl AuditorRunResult {
     }
 }
 
-async fn read_git_diff(
+pub async fn read_git_diff(
     workspace_path: &std::path::Path,
     default_branch: &str,
 ) -> Result<String, ReviewError> {
@@ -1846,10 +1915,6 @@ fn combined_output(stdout: &str, stderr: &str) -> String {
     output.push_str(stdout);
     output.push_str(stderr);
     output
-}
-
-fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
 }
 
 fn review_details_json(

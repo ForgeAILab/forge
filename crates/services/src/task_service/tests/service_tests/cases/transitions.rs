@@ -299,7 +299,14 @@ async fn transition_to_review_runs_configured_review_runner() {
             .await
             .expect("workspace loads")
             .expect("workspace exists");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("temp worktree creates");
+    std::fs::create_dir_all(
+        service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("temp worktree creates");
     // Review reviews a finished attempt: the claimed execution is the
     // candidate, and it has to be terminal before the Task can enter review.
     sqlx::query("UPDATE execution SET status = 'completed', stopped_at = ? WHERE id = ?")

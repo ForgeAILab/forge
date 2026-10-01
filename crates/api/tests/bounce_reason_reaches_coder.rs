@@ -22,7 +22,7 @@ use services::{
 async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let service = TaskService::new_for_test(Arc::clone(&db), event_bus);
     let task_id = seed_project_repo_and_task(&db, default_states::IN_PROGRESS).await;
     assign_human_reviewer(&db, &task_id).await;
 

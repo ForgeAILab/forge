@@ -27,6 +27,7 @@ const task = {
   board_position: 0,
   role_assignments: [],
   remaining_retries: {},
+  placement: null,
   version: 1,
   created_at: now,
   updated_at: now,

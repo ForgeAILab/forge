@@ -66,9 +66,10 @@ describe('parent task candidate pagination', () => {
         title: 'Prepare launch',
         description: 'Release notes',
         parent_task_id: null,
+        placement: null,
       },
-      { id: 'child', title: 'Release notes child', parent_task_id: 'parent' },
-      { id: 'current', title: 'Release notes task', parent_task_id: null },
+      { id: 'child', title: 'Release notes child', parent_task_id: 'parent', placement: null },
+      { id: 'current', title: 'Release notes task', parent_task_id: null, placement: null },
     ] as Task[]
 
     expect(filterParentTaskCandidates(candidates, 'current').map((task) => task.id)).toEqual([

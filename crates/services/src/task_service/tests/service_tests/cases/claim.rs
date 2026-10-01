@@ -182,7 +182,14 @@ async fn claim_recovers_task_branch_and_uses_project_primary_repository() {
         .expect("Workspace lease lookup")
         .expect("Agent claim creates a Workspace lease");
     assert_eq!(lease.repository_binding_id, workspace.repo_id);
-    assert!(std::path::Path::new(&workspace.worktree_path).exists());
+    assert!(std::path::Path::new(
+        &service
+            .workspace_backend_router()
+            .embedded_path(&db, &workspace)
+            .await
+            .expect("workspace path resolves")
+    )
+    .exists());
     assert_eq!(claimed.task.status, "in_progress");
 }
 

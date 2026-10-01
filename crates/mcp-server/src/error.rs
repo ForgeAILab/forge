@@ -344,6 +344,21 @@ impl From<ServiceError> for McpToolError {
     fn from(error: ServiceError) -> Self {
         let protected_cause = error.to_string();
         let mapped = match error {
+            ServiceError::PlacementUnavailable(error) => {
+                Self::new(-32029, "workspace placement unavailable").with_data(json!({
+                    "code": "placement_unavailable",
+                    "task_id": error.task_id,
+                    "repo_id": error.repo_id,
+                    "rejected_candidates": error.rejected_candidates,
+                }))
+            }
+            ServiceError::PrepareFailed { placement_id, .. } => {
+                Self::new(-32029, "workspace preparation failed").with_data(json!({
+                    "code": "prepare_failed",
+                    "placement_id": placement_id,
+                    "failure_cause": "prepare_failed",
+                }))
+            }
             ServiceError::ExecutionSetupRequired {
                 message,
                 requirements,

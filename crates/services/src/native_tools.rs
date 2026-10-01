@@ -757,11 +757,29 @@ impl CoordinationToolProvider {
         // the stored artifact ambiguous about what was actually observed.
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
-                let root = self.task_workspace_root(&task_id).await?;
+                let workspace = self.task_workspace(&task_id).await?;
+                let root = workspace
+                    .embedded_path()
+                    .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
                 let resolved = resolve_workspace_artifact(&root, path)?;
-                let bytes = std::fs::read(&resolved).map_err(|error| {
-                    AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
-                })?;
+                let relative = resolved
+                    .strip_prefix(root.canonicalize().map_err(|error| {
+                        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+                    })?)
+                    .map_err(|error| AgentHostError::Authority(error.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = workspace
+                    .backend
+                    .read(
+                        &workspace.placement,
+                        &relative,
+                        MAX_CAPTURED_EVIDENCE_BYTES as u64,
+                    )
+                    .await
+                    .map_err(|error| {
+                        AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                    })?;
                 let name = resolved
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -902,46 +920,18 @@ impl CoordinationToolProvider {
         &self,
         input: &ExecutionOutboxInput<'_>,
     ) -> ExecutionOutboxReport {
-        let mut report = ExecutionOutboxReport::default();
-        let worktree = Path::new(input.worktree_path);
-        let Some(outbox) = executors::execution_outbox_path(worktree, input.execution_id) else {
-            return report;
-        };
-        if !outbox.is_dir() {
-            return report;
-        }
-
-        let author_name = input.role.unwrap_or("agent").to_owned();
-        for (line_no, line) in
-            read_outbox_lines(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut report)
-        {
-            match self
-                .ingest_outbox_worklog(input, &author_name, line_no, &line)
-                .await
-            {
-                Ok(()) => report.worklog_entries += 1,
-                Err(reason) => report.rejected.push(format!(
-                    "{}:{line_no}: {reason}",
-                    executors::OUTBOX_WORKLOG_FILE
-                )),
-            }
-        }
-        for (line_no, line) in
-            read_outbox_lines(&outbox, executors::OUTBOX_EVIDENCE_FILE, &mut report)
-        {
-            match self
-                .ingest_outbox_evidence(input, &author_name, &outbox, line_no, &line)
-                .await
-            {
-                Ok(()) => report.evidence_items += 1,
-                Err(reason) => report.rejected.push(format!(
-                    "{}:{line_no}: {reason}",
-                    executors::OUTBOX_EVIDENCE_FILE
-                )),
-            }
-        }
-
-        if let Err(error) = std::fs::remove_dir_all(&outbox) {
+        let harvest = crate::workspace_backend::harvest_embedded_execution_outbox(
+            input.worktree_path,
+            input.execution_id,
+        );
+        let mut report = self
+            .ingest_execution_outbox_entries(input, harvest.entries)
+            .await;
+        report.rejected.splice(0..0, harvest.rejected);
+        if let Err(error) = crate::workspace_backend::consume_embedded_execution_outbox(
+            input.worktree_path,
+            input.execution_id,
+        ) {
             report.rejected.push(format!(
                 "outbox could not be removed after ingestion: {error}"
             ));
@@ -949,96 +939,167 @@ impl CoordinationToolProvider {
         report
     }
 
-    async fn ingest_outbox_worklog(
+    /// Apply owner-harvested entries without opening any owner-local paths.
+    pub async fn ingest_execution_outbox_entries(
         &self,
         input: &ExecutionOutboxInput<'_>,
-        author_name: &str,
-        line_no: usize,
-        line: &str,
-    ) -> Result<(), String> {
-        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-        let kind = entry
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "progress" | "decision" | "validation" | "blocker"))
-            .ok_or("kind must be progress, decision, validation, or blocker")?;
-        let summary = entry
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or("summary is required")?;
-        if summary.chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
-            return Err(format!(
-                "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
-            ));
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> ExecutionOutboxReport {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxWorklogKind};
+        let mut report = ExecutionOutboxReport::default();
+        let author_name = input.role.unwrap_or("agent");
+        let mut worklog_count = 0;
+        let mut evidence_count = 0;
+        let mut evidence_bytes = 0_u64;
+        for entry in entries {
+            let (file, line_no, result) = match entry {
+                ExecutionOutboxEntry::Worklog {
+                    line_number,
+                    kind,
+                    summary,
+                } => {
+                    worklog_count += 1;
+                    let kind = match kind {
+                        ExecutionOutboxWorklogKind::Progress => "progress",
+                        ExecutionOutboxWorklogKind::Decision => "decision",
+                        ExecutionOutboxWorklogKind::Validation => "validation",
+                        ExecutionOutboxWorklogKind::Blocker => "blocker",
+                    };
+                    let result = if worklog_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND
+                    {
+                        Err("execution outbox has too many worklog entries".to_owned())
+                    } else if line_number == 0 {
+                        Err("line number must be positive".to_owned())
+                    } else if summary.trim().is_empty() {
+                        Err("summary is required".to_owned())
+                    } else if summary.trim().chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
+                        Err(format!("summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"))
+                    } else {
+                        self.append_outbox_worklog(
+                            input,
+                            author_name,
+                            kind,
+                            summary.trim(),
+                            format!("outbox:{}:worklog:{line_number}", input.execution_id),
+                        )
+                        .await
+                    };
+                    if result.is_ok() {
+                        report.worklog_entries += 1;
+                    }
+                    (executors::OUTBOX_WORKLOG_FILE, line_number, result)
+                }
+                ExecutionOutboxEntry::Evidence {
+                    line_number,
+                    kind,
+                    caption,
+                    path,
+                    content,
+                    artifact,
+                } => {
+                    evidence_count += 1;
+                    let size = artifact
+                        .as_ref()
+                        .map(|artifact| artifact.bytes.len())
+                        .or_else(|| content.as_ref().map(String::len))
+                        .unwrap_or(0) as u64;
+                    evidence_bytes = evidence_bytes.saturating_add(size);
+                    let result =
+                        if evidence_count > api_types::MAX_EXECUTION_OUTBOX_ENTRIES_PER_KIND {
+                            Err("execution outbox has too many evidence entries".to_owned())
+                        } else if evidence_bytes > api_types::MAX_EXECUTION_OUTBOX_EVIDENCE_BYTES {
+                            Err("execution outbox evidence exceeds size budget".to_owned())
+                        } else {
+                            self.ingest_outbox_evidence(
+                                input,
+                                author_name,
+                                ExecutionOutboxEntry::Evidence {
+                                    line_number,
+                                    kind,
+                                    caption,
+                                    path,
+                                    content,
+                                    artifact,
+                                },
+                            )
+                            .await
+                        };
+                    if result.is_ok() {
+                        report.evidence_items += 1;
+                    }
+                    (executors::OUTBOX_EVIDENCE_FILE, line_number, result)
+                }
+            };
+            if let Err(reason) = result {
+                report.rejected.push(format!("{file}:{line_no}: {reason}"));
+            }
         }
-        self.append_outbox_worklog(
-            input,
-            author_name,
-            kind,
-            summary,
-            format!("outbox:{}:worklog:{line_no}", input.execution_id),
-        )
-        .await
+        report
     }
 
     async fn ingest_outbox_evidence(
         &self,
         input: &ExecutionOutboxInput<'_>,
         author_name: &str,
-        outbox: &Path,
-        line_no: usize,
-        line: &str,
+        entry: api_types::ExecutionOutboxEntry,
     ) -> Result<(), String> {
-        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-        let kind = entry
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                matches!(
-                    *value,
-                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
-                )
-            })
-            .ok_or("kind must be screenshot, walkthrough_video, log, report, or other")?;
-        let caption = entry
-            .get("caption")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or("caption describing the artifact is required")?;
-        let path = entry
-            .get("path")
-            .and_then(Value::as_str)
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxEvidenceKind};
+        let ExecutionOutboxEntry::Evidence {
+            line_number: line_no,
+            kind,
+            caption,
+            path,
+            content,
+            artifact,
+        } = entry
+        else {
+            return Err("expected an evidence entry".to_owned());
+        };
+        let kind = match kind {
+            ExecutionOutboxEvidenceKind::Screenshot => "screenshot",
+            ExecutionOutboxEvidenceKind::WalkthroughVideo => "walkthrough_video",
+            ExecutionOutboxEvidenceKind::Log => "log",
+            ExecutionOutboxEvidenceKind::Report => "report",
+            ExecutionOutboxEvidenceKind::Other => "other",
+        };
+        if line_no == 0 {
+            return Err("line number must be positive".to_owned());
+        }
+        let caption = caption.trim();
+        if caption.is_empty() {
+            return Err("caption describing the artifact is required".to_owned());
+        }
+        let path = path
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let content = entry
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        let (bytes, filename, content_type) = match (path, content) {
-            (Some(path), None) => {
-                let resolved =
-                    resolve_outbox_artifact(Path::new(input.worktree_path), outbox, path)?;
-                let bytes = std::fs::read(&resolved)
-                    .map_err(|error| format!("captured artifact is unreadable: {error}"))?;
-                let name = resolved
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("artifact")
-                    .to_owned();
-                let content_type = content_type_for(&name, kind);
-                (bytes, name, content_type)
+        let content = content.as_deref().filter(|value| !value.trim().is_empty());
+        let (bytes, filename, content_type) = match (path, content, artifact) {
+            (Some(_), None, Some(artifact)) => {
+                if artifact.filename.is_empty()
+                    || artifact.filename.contains('/')
+                    || artifact.filename.contains('\\')
+                {
+                    return Err("captured artifact filename is invalid".to_owned());
+                }
+                (artifact.bytes, artifact.filename, artifact.content_type)
             }
-            (None, Some(content)) => (
+            (None, Some(content), None) => (
                 content.as_bytes().to_vec(),
                 format!("{kind}.txt"),
                 "text/plain".to_owned(),
             ),
-            (Some(_), Some(_)) => return Err("supply either path or content, not both".to_owned()),
-            (None, None) => {
-                return Err("evidence requires either a path or inline content".to_owned());
+            (Some(_), Some(_), _) => {
+                return Err("supply either path or content, not both".to_owned())
+            }
+            (Some(_), None, None) => {
+                return Err("owner did not supply captured artifact bytes".to_owned())
+            }
+            _ => {
+                return Err(
+                    "evidence requires either a path with captured bytes or inline content"
+                        .to_owned(),
+                )
             }
         };
         if bytes.is_empty() {
@@ -1049,6 +1110,19 @@ impl CoordinationToolProvider {
                 "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
             ));
         }
+        let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
+        let already_ingested = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM task_comment WHERE task_id = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(input.task_id)
+        .bind(&idempotency_key)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+        if already_ingested {
+            return Ok(());
+        }
         self.store_task_evidence(
             input.agent_id,
             input.task_id,
@@ -1058,14 +1132,12 @@ impl CoordinationToolProvider {
         )
         .await
         .map_err(|error| error.to_string())?;
-        // The file has no response channel to report the stored asset back
-        // through, so the caption becomes the worklog line naming it.
         self.append_outbox_worklog(
             input,
             author_name,
             "validation",
             &format!("Captured {kind} evidence `{filename}`: {caption}"),
-            format!("outbox:{}:evidence:{line_no}", input.execution_id),
+            idempotency_key,
         )
         .await
     }
@@ -1101,23 +1173,29 @@ impl CoordinationToolProvider {
         .map_err(|error| error.to_string())
     }
 
-    async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT worktree_path FROM workspace
-             WHERE task_id = ? AND status != 'cleaned'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(task_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        path.filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
+    async fn task_workspace(
+        &self,
+        task_id: &str,
+    ) -> Result<crate::workspace_backend::ResolvedWorkspace, AgentHostError> {
+        let workspace = db::WorkspaceRepo::get_by_task_id(&*self.db, task_id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+            .filter(|workspace| workspace.status != db::WorkspaceStatus::Cleaned)
             .ok_or_else(|| {
                 AgentHostError::Runtime(
                     "this Task has no active workspace to capture an artifact from".to_owned(),
                 )
-            })
+            })?;
+        let router = self
+            .task_service_handle()
+            .map(|service| service.workspace_backend_router())
+            .ok_or_else(|| {
+                AgentHostError::Runtime("workspace router is not configured".to_owned())
+            })?;
+        router
+            .resolve(&self.db, &workspace)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))
     }
 
     /// The Project Agent's own verification workspace root (`forge/` plus the
@@ -4638,78 +4716,6 @@ pub struct ExecutionOutboxReport {
     pub evidence_items: usize,
     /// One human-readable reason per entry that was not ingested.
     pub rejected: Vec<String>,
-}
-
-/// At most this many bytes of one outbox file are read.
-const MAX_OUTBOX_FILE_BYTES: u64 = 1024 * 1024;
-/// At most this many entries of one outbox file are ingested.
-const MAX_OUTBOX_ENTRIES: usize = 200;
-
-/// Non-empty lines of one outbox file, numbered from 1, within the size and
-/// entry bounds. Bounds violations are reported, not silently truncated.
-fn read_outbox_lines(
-    outbox: &Path,
-    file: &str,
-    report: &mut ExecutionOutboxReport,
-) -> Vec<(usize, String)> {
-    let path = outbox.join(file);
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-        return Vec::new();
-    };
-    if !metadata.is_file() {
-        report.rejected.push(format!("{file}: not a regular file"));
-        return Vec::new();
-    }
-    if metadata.len() > MAX_OUTBOX_FILE_BYTES {
-        report.rejected.push(format!(
-            "{file}: exceeds the {MAX_OUTBOX_FILE_BYTES} byte outbox limit"
-        ));
-        return Vec::new();
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) => {
-            report.rejected.push(format!("{file}: unreadable: {error}"));
-            return Vec::new();
-        }
-    };
-    let lines = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| (index + 1, line.to_owned()))
-        .collect::<Vec<_>>();
-    if lines.len() > MAX_OUTBOX_ENTRIES {
-        report.rejected.push(format!(
-            "{file}: only the first {MAX_OUTBOX_ENTRIES} of {} entries were ingested",
-            lines.len()
-        ));
-    }
-    lines.into_iter().take(MAX_OUTBOX_ENTRIES).collect()
-}
-
-/// Resolve an outbox evidence path: worktree-relative, or absolute inside the
-/// outbox (where a read-only role saves what it captured).
-fn resolve_outbox_artifact(worktree: &Path, outbox: &Path, path: &str) -> Result<PathBuf, String> {
-    if !Path::new(path).is_absolute() {
-        return resolve_workspace_artifact(worktree, path).map_err(|error| error.to_string());
-    }
-    let canonical_outbox = outbox
-        .canonicalize()
-        .map_err(|error| format!("outbox is unavailable: {error}"))?;
-    let canonical = Path::new(path)
-        .canonicalize()
-        .map_err(|error| format!("captured artifact does not exist: {error}"))?;
-    if !canonical.starts_with(&canonical_outbox) {
-        return Err(
-            "an absolute evidence path must point inside the outbox; use a worktree-relative path otherwise"
-                .to_owned(),
-        );
-    }
-    if !canonical.is_file() {
-        return Err("captured artifact is not a file".to_owned());
-    }
-    Ok(canonical)
 }
 
 const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;

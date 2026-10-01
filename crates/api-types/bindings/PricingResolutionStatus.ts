@@ -3,9 +3,4 @@
 /**
  * Whether Forge can price an agent's next run.
  */
-export type PricingResolutionStatus =
-  | 'priced'
-  | 'no_model'
-  | 'catalog_absent'
-  | 'not_in_catalog'
-  | 'ambiguous'
+export type PricingResolutionStatus = "priced" | "no_model" | "catalog_absent" | "not_in_catalog" | "ambiguous";

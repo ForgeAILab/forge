@@ -1,6 +1,12 @@
-use crate::{Result, ServiceError};
+use crate::{
+    workspace_backend::{EmbeddedWorkspaceBackend, ResolvedWorkspace, WorkspaceBackendRouter},
+    MergeService, Result, ServiceError,
+};
 use async_trait::async_trait;
-use db::{now_rfc3339, SqliteDb, WorkspaceRepo};
+use db::{
+    now_rfc3339, PlacementState, SqliteDb, UpdateWorkspacePlacement, WorkspacePlacement,
+    WorkspacePlacementRepo, WorkspaceRepo, WorkspaceStatus,
+};
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use std::{
     path::{Path, PathBuf},
@@ -13,7 +19,6 @@ use tokio::{
     time::{interval, timeout},
 };
 use tracing::info;
-use workspace::{WorkspaceError, WorkspaceManager};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
@@ -21,6 +26,7 @@ const ACTIVE_EXECUTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
+    workspace_backend_router: RwLock<Arc<WorkspaceBackendRouter>>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
     terminal_cleanup: RwLock<Option<Arc<dyn WorkspaceCleanupObserver>>>,
@@ -32,13 +38,53 @@ pub trait WorkspaceCleanupObserver: Send + Sync {
 }
 
 impl WorkspaceCleanupScheduler {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>, workspace_root: PathBuf) -> Self {
+    pub fn new_for_test(
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        workspace_root: PathBuf,
+    ) -> Self {
+        let merge_service = Arc::new(MergeService::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            workspace_root.clone(),
+        ));
+        let router = Arc::new(WorkspaceBackendRouter::new(Arc::new(
+            EmbeddedWorkspaceBackend::new(Arc::clone(&db), merge_service, workspace_root.clone()),
+        )));
+        Self::new_with_router(db, event_bus, workspace_root, router)
+    }
+
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        event_bus: Arc<EventBus>,
+        workspace_root: PathBuf,
+        router: Arc<WorkspaceBackendRouter>,
+    ) -> Self {
         Self {
             db,
+            workspace_backend_router: RwLock::new(router),
             event_bus,
             workspace_root,
             terminal_cleanup: RwLock::new(None),
         }
+    }
+
+    pub fn set_workspace_backend_router(&self, router: Arc<WorkspaceBackendRouter>) {
+        match self.workspace_backend_router.write() {
+            Ok(mut current) => *current = router,
+            Err(error) => tracing::warn!(%error, "cleanup workspace backend router lock poisoned"),
+        }
+    }
+
+    fn workspace_backend_router(&self) -> Result<Arc<WorkspaceBackendRouter>> {
+        self.workspace_backend_router
+            .read()
+            .map(|router| Arc::clone(&router))
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "cleanup workspace backend router lock poisoned: {error}"
+                ))
+            })
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -79,7 +125,17 @@ impl WorkspaceCleanupScheduler {
 
     pub async fn cleanup_now(&self, workspace_id: impl Into<String>) -> Result<()> {
         let workspace_id = workspace_id.into();
-        match timeout(CLEANUP_TIMEOUT, self.cleanup_workspace(&workspace_id, true)).await {
+        let cleanup = async {
+            loop {
+                match self.cleanup_workspace(&workspace_id, true).await {
+                    // Disconnect or reconciliation may advance the placement
+                    // between its read and cleanup CAS. Resolve it again.
+                    Err(ServiceError::Db(db::DbError::VersionConflict)) => continue,
+                    result => return result,
+                }
+            }
+        };
+        match timeout(CLEANUP_TIMEOUT, cleanup).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 tracing::warn!(%workspace_id, %error, "workspace cleanup failed");
@@ -117,11 +173,19 @@ impl WorkspaceCleanupScheduler {
     pub(crate) async fn tick(&self) -> Result<()> {
         let now = now_rfc3339();
         let workspaces = WorkspaceRepo::list_pending_cleanup(&*self.db, &now).await?;
-        for pending in workspaces {
-            let Some(workspace) = WorkspaceRepo::get_by_id(&*self.db, &pending.id).await? else {
-                continue;
-            };
-            self.cleanup_workspace(&workspace.id, false).await?;
+        let mut pending_ids = workspaces
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for placement in
+            WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Cleaning).await?
+        {
+            pending_ids.insert(placement.workspace_id);
+        }
+        for workspace_id in pending_ids {
+            if let Err(error) = self.cleanup_workspace(&workspace_id, false).await {
+                tracing::warn!(%workspace_id, %error, "workspace cleanup remains pending");
+            }
         }
         Ok(())
     }
@@ -130,7 +194,27 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        if !force {
+        let placement = EmbeddedWorkspaceBackend::ensure_server_placement(
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        if placement.state == PlacementState::Cleaned
+            && workspace.status == WorkspaceStatus::Cleaned
+        {
+            if placement.owner_kind == db::PlacementOwnerKind::Daemon {
+                // Reconciliation may have committed cleanup while its journal
+                // acknowledgement is still in flight.
+                let resolved = self
+                    .workspace_backend_router()?
+                    .resolve(&self.db, &workspace)
+                    .await?;
+                Self::acknowledge_cleanup_receipts(&resolved).await?;
+            }
+            return Ok(());
+        }
+        if !force && placement.state != PlacementState::Cleaning {
             let Some(cleanup_after) = workspace.cleanup_after.as_deref() else {
                 // A pending-row snapshot may race with a child reusing this
                 // workspace. Reuse clears the stale deadline; never let the
@@ -179,10 +263,12 @@ impl WorkspaceCleanupScheduler {
             return Ok(());
         }
 
+        let placement = self.begin_cleanup(&placement).await?;
         info!(
             workspace_id,
             task_id = %workspace.task_id,
-            worktree_path = %workspace.worktree_path,
+            placement_id = %placement.id,
+            owner_kind = %placement.owner_kind,
             workspace_root = %self.workspace_root.display(),
             "cleaning up workspace"
         );
@@ -200,22 +286,16 @@ impl WorkspaceCleanupScheduler {
                 .cleanup_workspace_terminals(workspace_id)
                 .await?;
         }
-        let manager = WorkspaceManager::new(self.workspace_root.clone());
-        match manager.cleanup_worktree(&workspace.task_id).await {
-            Ok(()) => {}
-            Err(WorkspaceError::NotFound) => {
-                info!(
-                    workspace_id,
-                    task_id = %workspace.task_id,
-                    "workspace worktree already absent"
-                );
-            }
-            Err(error) => {
-                return Err(crate::ServiceError::invalid_operation(error.to_string()));
-            }
+        let router = self.workspace_backend_router()?;
+        let resolved = router.resolve(&self.db, &workspace).await?;
+        let ack = resolved.backend.cleanup(&resolved.placement).await?;
+        if !ack.removed {
+            info!(workspace_id, task_id = %workspace.task_id, "workspace worktree already absent");
         }
-        let now = now_rfc3339();
-        let workspace = WorkspaceRepo::mark_cleaned(&*self.db, workspace_id, &now).await?;
+        let workspace = self.acknowledge_cleanup(&resolved.placement, &ack).await?;
+        // The state CAS is committed before the owner's durable removal
+        // receipt is acknowledged. Reconnect sweeps retry a lost ack.
+        Self::acknowledge_cleanup_receipts(&resolved).await?;
         info!(
             workspace_id = %workspace.id,
             "workspace cleaned"
@@ -231,6 +311,92 @@ impl WorkspaceCleanupScheduler {
             },
         });
         Ok(())
+    }
+
+    async fn acknowledge_cleanup_receipts(resolved: &ResolvedWorkspace) -> Result<()> {
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            let daemon_id = resolved.placement.daemon_id.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("cleanup placement has no daemon")
+            })?;
+            resolved
+                .owner_client()?
+                .retry_acknowledgements(daemon_id)
+                .await
+                .map_err(|error| ServiceError::from(resolved.owner_error(error)))?;
+        }
+        Ok(())
+    }
+
+    async fn begin_cleanup(&self, placement: &WorkspacePlacement) -> Result<WorkspacePlacement> {
+        if matches!(
+            placement.state,
+            PlacementState::Cleaning | PlacementState::Cleaned
+        ) {
+            return Ok(placement.clone());
+        }
+        let now = now_rfc3339();
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let updated = WorkspacePlacementRepo::update_in_tx(
+            &*self.db,
+            &mut transaction,
+            cleanup_state_update(placement, PlacementState::Cleaning, &now),
+        )
+        .await?;
+        sqlx::query("UPDATE workspace SET status = 'cleaning', cleanup_after = COALESCE(cleanup_after, ?), updated_at = ? WHERE id = ?")
+            .bind(&now).bind(&now).bind(&placement.workspace_id)
+            .execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        Ok(updated)
+    }
+
+    async fn acknowledge_cleanup(
+        &self,
+        placement: &WorkspacePlacement,
+        _ack: &crate::workspace_backend::CleanupAck,
+    ) -> Result<db::Workspace> {
+        let now = now_rfc3339();
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        if placement.state != PlacementState::Cleaned {
+            WorkspacePlacementRepo::update_in_tx(
+                &*self.db,
+                &mut transaction,
+                cleanup_state_update(placement, PlacementState::Cleaned, &now),
+            )
+            .await?;
+        }
+        sqlx::query("UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?")
+            .bind(&now).bind(&placement.workspace_id)
+            .execute(&mut *transaction).await?;
+        transaction.commit().await?;
+        WorkspaceRepo::get_by_id(&*self.db, &placement.workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", placement.workspace_id.clone()))
+    }
+}
+
+fn cleanup_state_update(
+    placement: &WorkspacePlacement,
+    state: PlacementState,
+    now: &str,
+) -> UpdateWorkspacePlacement {
+    UpdateWorkspacePlacement {
+        id: placement.id.clone(),
+        expected_version: placement.version,
+        agent_id: None,
+        owner_kind: None,
+        daemon_id: None,
+        runtime_id: None,
+        repo_location_id: None,
+        execution_daemon_id: None,
+        workspace_handle: None,
+        generation: None,
+        state: Some(state),
+        selected_by: None,
+        selection_reason: None,
+        reserved_until: Some(None),
+        disconnected_at: None,
+        failure_cause: None,
+        updated_at: now.to_owned(),
     }
 }
 
@@ -366,8 +532,11 @@ mod tests {
         let temp = TempDir::new().expect("temp dir creates");
         let (workspace_id, worktree_path) =
             seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
-        let scheduler =
-            WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let scheduler = WorkspaceCleanupScheduler::new_for_test(
+            Arc::clone(&db),
+            event_bus,
+            temp.path().to_path_buf(),
+        );
 
         scheduler
             .cleanup_now(workspace_id.clone())
@@ -391,8 +560,11 @@ mod tests {
             seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
         std::fs::remove_dir_all(worktree_path.parent().expect("task root exists"))
             .expect("worktree removes");
-        let scheduler =
-            WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let scheduler = WorkspaceCleanupScheduler::new_for_test(
+            Arc::clone(&db),
+            event_bus,
+            temp.path().to_path_buf(),
+        );
 
         scheduler
             .cleanup_now(workspace_id.clone())
@@ -413,8 +585,11 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let temp = TempDir::new().expect("temp dir creates");
         let (workspace_id, _) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
-        let scheduler =
-            WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let scheduler = WorkspaceCleanupScheduler::new_for_test(
+            Arc::clone(&db),
+            event_bus,
+            temp.path().to_path_buf(),
+        );
 
         scheduler
             .schedule(&workspace_id, Duration::from_secs(60))
@@ -438,8 +613,11 @@ mod tests {
         WorkspaceRepo::set_cleanup_after(&*db, &workspace_id, Some(cleanup_after), &now_rfc3339())
             .await
             .expect("cleanup deadline sets");
-        let scheduler =
-            WorkspaceCleanupScheduler::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let scheduler = WorkspaceCleanupScheduler::new_for_test(
+            Arc::clone(&db),
+            event_bus,
+            temp.path().to_path_buf(),
+        );
 
         scheduler.tick().await.expect("tick succeeds");
 
@@ -448,5 +626,79 @@ mod tests {
             .expect("workspace loads")
             .expect("workspace exists");
         assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn cleanup_backend_failure_keeps_cleaning_until_retry_is_acknowledged() {
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let temp = TempDir::new().expect("temp dir creates");
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task_root = worktree_path.parent().expect("task root exists");
+        std::fs::remove_dir_all(task_root).expect("worktree removes");
+        std::fs::write(task_root, "cleanup cannot remove a file as a directory")
+            .expect("cleanup obstruction writes");
+        let scheduler = WorkspaceCleanupScheduler::new_for_test(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            temp.path().to_path_buf(),
+        );
+
+        scheduler
+            .cleanup_now(&workspace_id)
+            .await
+            .expect("cleanup is best effort");
+
+        let pending = WorkspacePlacementRepo::get_by_workspace_id(&*db, &workspace_id)
+            .await
+            .expect("placement loads")
+            .expect("placement exists");
+        assert_eq!(pending.state, PlacementState::Cleaning);
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .expect("workspace loads")
+            .expect("workspace exists");
+        assert_eq!(workspace.status, WorkspaceStatus::Cleaning);
+        assert!(events.try_recv().is_err());
+
+        std::fs::remove_file(task_root).expect("cleanup obstruction removes");
+        std::fs::create_dir_all(&worktree_path).expect("worktree recreates");
+        WorkspaceRepo::set_cleanup_after(&*db, &workspace_id, None, &now_rfc3339())
+            .await
+            .expect("deadline clears");
+        scheduler
+            .tick()
+            .await
+            .expect("pending placement cleanup retries");
+
+        let cleaned = WorkspacePlacementRepo::get_by_workspace_id(&*db, &workspace_id)
+            .await
+            .expect("placement loads")
+            .expect("placement exists");
+        assert_eq!(cleaned.id, pending.id);
+        assert_eq!(cleaned.generation, pending.generation);
+        assert_eq!(cleaned.state, PlacementState::Cleaned);
+        assert_eq!(cleaned.version, pending.version + 1);
+        assert!(!worktree_path.exists());
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .expect("workspace loads")
+            .expect("workspace exists");
+        assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+        assert!(workspace.cleanup_after.is_none());
+        assert_eq!(
+            events
+                .try_recv()
+                .expect("cleanup event publishes")
+                .event_type,
+            "workspace.cleaned"
+        );
+        scheduler
+            .cleanup_now(&workspace_id)
+            .await
+            .expect("ack replay is harmless");
+        assert!(events.try_recv().is_err());
     }
 }

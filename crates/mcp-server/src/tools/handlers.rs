@@ -594,9 +594,12 @@ pub(super) async fn forge_get_task_diff(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let diff = DiffService::new(std::sync::Arc::clone(&state.db))
-        .task_diff(&params.task_id)
-        .await?;
+    let diff = DiffService::new_with_router(
+        std::sync::Arc::clone(&state.db),
+        std::sync::Arc::clone(&state.workspace_backend_router),
+    )
+    .task_diff(&params.task_id)
+    .await?;
     serde_json::to_value(diff)
         .map_err(|error| McpToolError::new(-32603, format!("failed to serialize diff: {error}")))
 }
@@ -886,6 +889,16 @@ pub(super) async fn forge_follow_up_execution(
         .follow_up_interactive_execution(execution_id, message, agent_id, overrides)
         .await?;
 
+    let workspace = state
+        .workspace_backend_router
+        .resolve(&state.db, &launched.workspace)
+        .await
+        .map_err(services::ServiceError::from)?;
+    let workspace_handle = workspace
+        .handle()
+        .map_err(services::ServiceError::from)?
+        .to_owned();
+
     Ok(json!({
         "task": task_value(launched.task),
         "execution": execution_value(launched.execution),
@@ -893,7 +906,7 @@ pub(super) async fn forge_follow_up_execution(
             "id": launched.workspace.id,
             "task_id": launched.workspace.task_id,
             "repo_id": launched.workspace.repo_id,
-            "worktree_path": launched.workspace.worktree_path,
+            "worktree_path": workspace_handle,
             "branch": launched.workspace.branch,
             "status": launched.workspace.status.to_string(),
             "before_sha": launched.workspace.before_sha,

@@ -414,95 +414,57 @@ pub(super) async fn target_moved_result(
             };
         }
     };
-    let worktree_path = std::path::Path::new(&workspace.worktree_path);
-
-    match git::is_worktree_clean(worktree_path).await {
-        Ok(true) => {}
-        Ok(false) => {
-            // Uncommitted work in the worktree is the Worker's to resolve; a
-            // rebase would refuse anyway.
-            return merge_failure_result(
-                ctx,
-                task,
-                format!("{reason}; worktree has uncommitted changes and cannot be rebased"),
-                api_types::FailureKind::DirtyWorktree,
-            )
-            .await;
-        }
+    let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+        &ctx.workspace_backend_router,
+        &ctx.db,
+        &workspace,
+        &ctx.workspace_root,
+    )
+    .await
+    .map_err(crate::ServiceError::from);
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
         Err(error) => {
             return HookResult::Failed {
                 reason: error.to_string(),
-            };
+            }
         }
-    }
-
-    match git::rebase(worktree_path, target_branch).await {
-        Ok(()) => {
-            if let Err(error) = create_system_comment(
-                ctx,
-                format!("Rebased onto {target_branch} after it advanced during review: {reason}"),
-            )
-            .await
-            {
+    };
+    let handoff_conflicts =
+        match crate::task_service::coordination_root_has_subtasks(&ctx.db, task).await {
+            Ok(coordination_root) => !coordination_root,
+            Err(error) => {
                 return HookResult::Failed {
                     reason: error.to_string(),
-                };
+                }
+            }
+        };
+    match resolved.rebase_target(target_branch, handoff_conflicts).await {
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Rebased) => {
+            if let Err(error) = create_system_comment(ctx,
+                format!("Rebased onto {target_branch} after it advanced during review: {reason}"))
+                .await
+            {
+                return HookResult::Failed { reason: error.to_string() };
             }
             HookResult::Cascade {
                 to: default_states::MERGE_FAILED.to_string(),
                 reason: format!("{REVIEW_REFRESH_MARKER} {TARGET_MOVED_MARKER} {reason}; rebased onto {target_branch}, re-review required"),
             }
         }
-        Err(git::GitError::MergeConflict { stderr, .. }) => {
-            // Coordination roots aggregate subtask branches and keep the
-            // manual-repair path; everything else goes back to its Worker.
-            match crate::task_service::coordination_root_has_subtasks(&ctx.db, task).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} conflicted: {stderr}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            }
-            match git::continue_rebase_keeping_conflicts(worktree_path).await {
-                Ok(paths) => conflict_handoff_result(ctx, task, target_branch, &paths).await,
-                // The helper aborted the rebase, so the branch is as it was.
-                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!(
-                            "rebase onto {target_branch} conflicted: {stderr}; committing the conflict for the Worker failed: {error}"
-                        ),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Dirty { .. }) => merge_failure_result(ctx, task,
+            format!("{reason}; worktree has uncommitted changes and cannot be rebased"), api_types::FailureKind::DirtyWorktree).await,
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths }) => {
+            if handoff_conflicts && !conflict_paths.is_empty() {
+                conflict_handoff_result(ctx, task, target_branch, &conflict_paths).await
+            } else {
+                merge_failure_result(ctx, task, format!("rebase onto {target_branch} conflicted: {details}"), api_types::FailureKind::MergeConflict).await
             }
         }
-        Err(error) => HookResult::Failed {
-            reason: error.to_string(),
-        },
+        Ok(api_types::WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }) => merge_failure_result(ctx, task,
+            format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"), api_types::FailureKind::MergeConflict).await,
+        Ok(_) => HookResult::Failed { reason: "workspace owner returned an invalid rebase outcome".into() },
+        Err(error) => HookResult::Failed { reason: error.to_string() },
     }
 }
 

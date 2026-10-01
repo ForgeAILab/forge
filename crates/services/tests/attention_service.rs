@@ -184,7 +184,8 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
     let project_id = configured_project(&db, &identity_id, "intentional-stops").await;
-    let tasks = services::TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::default()));
+    let tasks =
+        services::TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::default()));
     let attention = AttentionService::new(Arc::clone(&db));
 
     for pause in [true, false] {

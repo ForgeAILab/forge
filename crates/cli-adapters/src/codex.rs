@@ -879,6 +879,7 @@ impl CodexAdapter {
                     .chain(dirs::home_dir().map_or_else(Vec::new, |home| {
                         package_cache_roots(&home, |key| std::env::var_os(key))
                     }))
+                    .map(|root| resolve_symlinked_root(&root))
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -1226,6 +1227,29 @@ fn ambient_codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs_path("codex"))
+}
+
+/// Codex rejects writable roots with a symlink component (for example a
+/// relocated `~/.npm` or macOS `/tmp`). Resolve the deepest existing ancestor
+/// and keep any not-yet-created remainder as is.
+fn resolve_symlinked_root(root: &Path) -> PathBuf {
+    let mut existing = root;
+    let mut remainder = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return remainder
+                .iter()
+                .rev()
+                .fold(resolved, |path, component| path.join(component));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                remainder.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return root.to_path_buf(),
+        }
+    }
 }
 
 /// Package-manager cache directories a managed Task may write so dependency
@@ -1730,6 +1754,27 @@ mod tests {
                 Some(AskForApproval::Never)
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_roots_resolve_symlinked_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let target = base.join("relocated-npm");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join(".npm");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(resolve_symlinked_root(&link), target);
+        assert_eq!(
+            resolve_symlinked_root(&link.join("missing/child")),
+            target.join("missing/child")
+        );
+        assert_eq!(
+            resolve_symlinked_root(&base.join("absent")),
+            base.join("absent")
+        );
     }
 
     #[test]

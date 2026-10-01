@@ -5,11 +5,14 @@ pub mod analytics;
 pub mod auth;
 pub mod client;
 pub mod daemon;
+pub mod daemon_config;
 #[doc(hidden)]
 pub mod daemon_fs;
 pub mod daemon_link;
+mod daemon_outbox;
 pub mod daemon_persistence;
 pub mod daemon_runtime;
+pub mod daemon_workspace;
 pub mod embedded;
 pub mod mcp;
 pub mod memory;

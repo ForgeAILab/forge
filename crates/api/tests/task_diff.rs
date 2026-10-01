@@ -50,7 +50,12 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
         .launch_execution(task.id.clone(), agent_id, None, None)
         .await
         .expect("launch succeeds");
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace_path = app
+        .state
+        .workspace_backend_router
+        .embedded_path(&app.state.db, &launched.workspace)
+        .await
+        .expect("workspace path resolves");
     std::fs::write(workspace_path.join("README.md"), "# Task diff\nupdated\n")
         .expect("workspace file writes");
 
@@ -117,7 +122,12 @@ async fn task_diff_uses_merge_base_when_default_branch_advances() {
     run_git(&repo_dir, &["add", "-A"]);
     run_git(&repo_dir, &["commit", "-m", "advance default branch"]);
 
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace_path = app
+        .state
+        .workspace_backend_router
+        .embedded_path(&app.state.db, &launched.workspace)
+        .await
+        .expect("workspace path resolves");
     std::fs::write(
         workspace_path.join("README.md"),
         "# Task diff\nworkspace update\n",

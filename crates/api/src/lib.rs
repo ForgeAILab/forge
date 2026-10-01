@@ -534,6 +534,20 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::repos::delete_repo),
         )
         .route("/api/v1/repos/{id}/sync", post(routes::repos::sync_repo))
+        .route(
+            "/api/v1/repos/{id}/locations",
+            get(routes::repo_locations::list_locations)
+                .post(routes::repo_locations::register_location),
+        )
+        .route(
+            "/api/v1/repos/{id}/locations/{location_id}",
+            patch(routes::repo_locations::update_location)
+                .delete(routes::repo_locations::remove_location),
+        )
+        .route(
+            "/api/v1/repos/{id}/locations/{location_id}/verify",
+            post(routes::repo_locations::verify_location),
+        )
         .route("/api/v1/fs/list", get(routes::fs::list_entries))
         .route("/api/v1/fs/branches", get(routes::fs::list_branches))
         .route(

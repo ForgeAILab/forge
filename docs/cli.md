@@ -189,7 +189,7 @@ idempotency key.
 | `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects |
 | `analytics` | Inspect account-wide usage, cost coverage, and pricing provenance |
-| `repo`    | Add / list repos under a project |
+| `repo`    | Add / list repos and manage their machine-local locations |
 | `memory`  | Search and retrieve project-scoped memory |
 | `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
 | `agent`   | Register / list / show agents |
@@ -256,6 +256,49 @@ forge-ctl task cancel <TASK_ID>
 to preview the prompt for a transition target instead of the task's current
 state.
 
+### Repository locations
+
+Use `repo location` to manage physical checkouts of a Repo. Every command
+requires `--repo-id` and Project owner/admin access (or a server administrator).
+Registration verifies the location and prints its persisted status and error.
+
+```bash
+forge-ctl repo location list --repo-id <REPO_ID> --include-total
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner server --path /srv/checkouts/app --default
+forge-ctl repo location add --repo-id <REPO_ID> \
+  --owner daemon --daemon-id <DAEMON_ID> --runtime-id <RUNTIME_ID> \
+  --path /Volumes/Data/codes/app --kind primary_checkout
+forge-ctl repo location verify --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location set-default --repo-id <REPO_ID> <LOCATION_ID> --version <VERSION>
+forge-ctl repo location remove --repo-id <REPO_ID> <LOCATION_ID>
+```
+
+`add` defaults to `--owner server` and `--kind primary_checkout`. Other kinds
+are `managed_clone` and `shared_mount`; a shared mount uses `--owner server`
+with both daemon/runtime IDs. Daemon/runtime IDs must be visible and belong
+together. Configure the daemon's `--workspace-root` to include the checkout
+path supplied to `add`; a daemon path must lie within that runtime's advertised
+root, and the server never opens it. Verification uses `repo_location.verify`
+over the daemon command stream; an offline daemon reports `unavailable` with
+`daemon_unavailable`. Shared mounts also require the daemon to read back a
+server-written probe under the server's worktree root at the same path.
+Verification is retried after an accepted daemon handshake, including for
+previously ready locations. A root escape reports `invalid` with
+`outside_workspace_root`.
+
+Table output includes full location, daemon, and runtime IDs, the path, kind,
+default flag, status, version, and last error. Use `--output json` for the full
+response and verification timestamps. `list` accepts `--limit`, `--cursor`,
+and `--include-total`; pass the returned next cursor unchanged. A successful
+request can return an `invalid` or `unavailable` location: inspect its status
+to determine whether verification succeeded.
+
+Pass the current version shown by `list` to `verify` and `set-default`.
+A stale version returns 409. Setting a new default clears the old default
+atomically, which also changes that old location's version. `remove` returns
+409 naming the Task while any non-cleaned placement still uses the location.
+
 ### Usage and cost analytics
 
 Project and account analytics preserve provider-reported and Forge-estimated
@@ -316,11 +359,12 @@ stream heartbeats to keep the daemon's last-seen timestamp fresh while it is
 connected. When the Forge server starts, external daemons are considered
 offline until their command stream reconnects.
 
-Execution dispatch requires the task worktree path created by the server to
-exist at the same absolute path on the daemon host. Use a local daemon or mount
-the server workspace root into the daemon host/container at the same path. A
-daemon on an unrelated filesystem can browse its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+Repository locations identify a checkout on the server or a particular daemon
+runtime. Register daemon checkouts through `repo location add` and verify them
+before placement. A daemon may execute a server-owned workspace only through
+a verified `shared_mount` location; matching absolute paths alone are
+insufficient. Daemon-owned placement requires a direct-merge repository and
+CLI Agents for every role that touches its worktree.
 
 ### Installing MCP client config
 

@@ -705,35 +705,6 @@ impl TaskService {
         }
     }
 
-    /// Issue the scheduler's short-lived internal repository authority only
-    /// after the same admission gate used by claim/launch/recovery.  The
-    /// opaque lease is persisted by `WorkspaceLeaseRepo`; no route or chat
-    /// context receives the row, its capability JSON, or a filesystem path.
-    ///
-    /// The database-side lease scope guard repeats the current-Charter and
-    /// capability predicates, so a Charter supersession racing this call
-    /// cannot turn a stale preflight into repository authority.
-    pub(super) async fn issue_workspace_lease(
-        &self,
-        task: &db::Task,
-        workspace: &db::Workspace,
-        role: &str,
-        principal_id: Option<&str>,
-        execution_id: &str,
-    ) -> Result<Option<db::WorkspaceLease>> {
-        self.issue_workspace_lease_with_operation_key(
-            task,
-            workspace,
-            role,
-            principal_id,
-            execution_id,
-            execution_id,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// The issuance body with an explicit idempotency key.  Normal issuance
     /// keys on the execution id; a stale-lease reissue must use the
     /// version-derived key because `operation_idempotency_key` is globally

@@ -152,12 +152,11 @@ async fn seed_agent(
     agent_status: AgentStatus,
 ) -> String {
     let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
-    DaemonRepo::upsert_by_machine_id(
+    let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -172,7 +171,8 @@ async fn seed_agent(
         },
     )
     .await
-    .expect("daemon creates");
+    .expect("daemon creates")
+    .id;
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
@@ -3219,4 +3219,52 @@ fn a_running_execution_slot_is_not_a_deterministic_dispatch_refusal() {
             reason: "task has 1 unsatisfied dependency".to_owned(),
         }
     ));
+}
+
+#[tokio::test]
+async fn disconnected_owner_is_skipped_before_dispatch_and_never_falls_back() {
+    let db = Arc::new(sqlite_db().await);
+    let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    let bus = Arc::new(events::EventBus::new(16));
+    let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
+    let dispatcher = TaskDispatcher::new(db.clone(), bus, service);
+    assert!(dispatcher
+        .list_tasks(&task.project_id, vec![task.status.clone()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!dispatcher
+        .dispatch_initial_task(
+            &task,
+            &super::initial_scheduling::InitialScheduleTarget {
+                transition_to: "in_progress".to_owned(),
+                role: "coder".to_owned(),
+                agent_id: execution.agent_id.clone().unwrap(),
+            }
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        db::WorkspacePlacementRepo::get_for_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        placement.id
+    );
+    assert_eq!(
+        ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
 }

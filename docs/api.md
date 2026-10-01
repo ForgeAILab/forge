@@ -104,6 +104,11 @@ database for historical provenance.
 | GET    | `/api/v1/repos/{id}` | Get repo |
 | PATCH  | `/api/v1/repos/{id}` | Update repo |
 | DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
+| GET    | `/api/v1/repos/{id}/locations` | Owner/admin lists visible repository locations with opaque cursor pagination |
+| POST   | `/api/v1/repos/{id}/locations` | Owner/admin registers and verifies a machine-local checkout |
+| PATCH  | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin changes the default location with a version check |
+| DELETE | `/api/v1/repos/{id}/locations/{location_id}` | Owner/admin removes a location; non-cleaned placements return 409 naming their Task |
+| POST   | `/api/v1/repos/{id}/locations/{location_id}/verify` | Owner/admin re-verifies a location with a version check |
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
@@ -1849,9 +1854,9 @@ The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
 the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
-conflict. The daemon protocol minimum is bumped, so an older daemon is rejected
-before dispatch rather than silently degrading to missing or flattened
-accounting. The server uses the actual reported provider/model and never
+conflict. The minimum daemon protocol revision is 2; revision 3 adds workspace
+ownership. A revision-2 daemon retains execution and filesystem features on
+server-owned placements and cannot own a workspace. The server uses the actual reported provider/model and never
 infers it from the executor family.
 
 This is a public-beta breaking cutover. The old nullable `cost_usd` field,
@@ -1863,6 +1868,76 @@ float conversion. `AgentChatMessageResponse` uses typed `usage:
 UsageBreakdown[]` when usage is exposed; the MCP chat timeline uses that same
 typed response. MCP adds no pricing-refresh, binding/override, or
 retrospective mutation tool in this change.
+
+## Repository locations
+
+A repository location records a physical checkout separately from its Repo.
+Every location route requires a Project `owner`/`admin` membership or a server
+administrator. A daemon and its runtime must be visible to the caller, and
+the runtime must belong to that daemon. A location ID from another Repo
+returns 404. Locations on hidden daemons are excluded before pagination and
+counts.
+
+Register a server checkout with `POST /api/v1/repos/{id}/locations`:
+
+```json
+{
+  "owner_kind": "server",
+  "path": "/srv/checkouts/app",
+  "kind": "primary_checkout",
+  "is_default": true
+}
+```
+
+`owner_kind` is `server` or `daemon`; `kind` is `primary_checkout`,
+`managed_clone`, or `shared_mount`. `is_default` is optional and defaults to
+false. A daemon location requires `daemon_id` and `runtime_id`. A
+`shared_mount` is server-owned and also requires both IDs; other server
+locations omit them. Machine-local paths are stored as supplied. Server paths
+must be absolute to pass verification.
+
+Registration returns HTTP 200 with a `RepoLocationResponse`, including `id`,
+`repo_id`, owner/runtime IDs, `path`, `kind`, `is_default`, `status`,
+`last_verified_at`, `last_error`, `version`, `created_at`, and `updated_at`.
+The initial `unverified` row is verified before this response. Verification
+failure is persisted and returned as a location with `invalid` or
+`unavailable` status; it does not remove the registration. Only `ready`
+locations are eligible for workspace placement.
+
+Server verification checks the directory, Git work tree, default-branch
+commit, and the origin remote against the Repo URL. A checkout with no origin
+remote is accepted. Failure codes include `path_not_found`, `not_git_work_tree`,
+`default_branch_not_found`, and `remote_mismatch`. Daemon paths are never read
+on the server. A path lexically outside the runtime's advertised
+`workspace_root` becomes `invalid` with `outside_workspace_root`; final
+filesystem and symlink verification belongs to the owning daemon through
+`repo_location.verify`. An unreachable owner returns `unavailable`; verification
+is retried after reconnect. Shared-mount verification writes a temporary probe
+on the server and requires the daemon to read the same content at the same path.
+A shared mount cannot become ready through the server's local Git check alone.
+
+`GET /api/v1/repos/{id}/locations` returns
+`{ "items": [...], "next_cursor": null, "has_more": false, "total_count": null }`.
+Use `limit`, `cursor`, and `include_total`; cursors are opaque. Supported
+sorts are `created_at`, `updated_at`, and `id`, with `sort_order=asc|desc`.
+
+`PATCH /api/v1/repos/{id}/locations/{location_id}` accepts
+`{ "version": 2, "is_default": true }`. Setting a default clears the previous
+default in the same transaction and increments every changed row's version.
+Setting `is_default` to false clears only that location. Location paths and
+ownership are immutable on this surface; register a new location to replace
+one.
+
+`POST /api/v1/repos/{id}/locations/{location_id}/verify` accepts
+`{ "version": 2 }` and returns the updated location. Both PATCH and verify
+return HTTP 409 `version_conflict` for a stale version. A completed verify
+increments the version and records the verification time and error, clearing
+the error on success.
+
+DELETE returns HTTP 204. While any placement references the location in a
+state other than `cleaned`, it returns HTTP 409 `conflict`; the message names
+the Task title, Task ID, and placement ID. Deletion rechecks this condition
+inside its database write transaction.
 
 ## Projects
 
@@ -2756,11 +2831,12 @@ included when the backend has a user-supplied or cleanup reason.
 ### Daemon transport
 
 Terminal daemon transport is internal to Forge. The browser connects to the
-API server; the API server proxies process operations to the daemon over the
-existing daemon transport when the task is directly assigned to an agent with
-`daemon_id`, or when the current workflow state's effective role assignment
-points to an agent with `daemon_id`. Tasks without an agent daemon use the
-embedded server PTY path. See the
+API server; the API server routes process operations through the workspace's
+persisted placement and its selected execution provider. A daemon-owned terminal
+uses the path resolved by that owner for its opaque handle. A server workspace
+can use a daemon only through a verified shared mount; otherwise it uses the
+embedded server PTY. Changing an Agent's daemon pin does not reroute an admitted
+workspace. See the
 [task terminal architecture](architecture.md#task-terminal-sessions) for the
 full design rationale.
 
@@ -3219,6 +3295,76 @@ repository, or other prerequisite is missing return HTTP `409` with code
 contains the typed missing requirements and permitted remediation actions;
 clients must not infer readiness from the HTTP status of Project creation or
 from a different setup dimension.
+
+Workspace admission errors use HTTP `409`. `placement_unavailable` includes
+`details.task_id`, `details.repo_id`, and `details.rejected_candidates`: each
+candidate names its repository location, owner, daemon/runtime and `filter_codes`.
+Codes include `owner_unreachable`, `workspace_protocol_missing`,
+`location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
+`agent_capacity`, `daemon_capacity`, `work_mode_unsupported`,
+`native_backend_unsupported`, `run_purpose_denied`, and `not_visible`.
+No eligible candidate means no fallback and no Execution. `prepare_failed`
+includes `details.placement_id` and `details.failure_cause`; failed or expired
+preparation creates no Execution or lease and does not spend the Task retry budget.
+Preparation fence refusals (`stale_generation` and `wrong_owner`) persist that
+failure cause and open a `workspace_fence_rejected` attention item for inspection.
+A new reservation after `prepare_failed` advances the unprepared placement's
+generation, giving the new prepare attempt a fresh operation ID. Retransmission
+within one attempt keeps its operation ID and replays the owner's retained result.
+Every launch, follow-up, and resume uses reserve → prepare → start admission.
+The start transaction rechecks the prepared placement version and capacity before
+creating the Running Execution and its leases; a stale placement returns 409.
+
+Task responses include `placement` (null before workspace admission), also
+available as `workspace.placement` and on every Workspace response. Subtasks
+sharing a root workspace expose that root's placement. The object includes
+`id`, `workspace_id`, `task_id`, `agent_id`, `owner_kind` (`server` or `daemon`),
+`daemon_id`, `runtime_id`, `repo_location_id`, `execution_daemon_id`,
+`workspace_handle`, `generation`, `state`, `selected_by`, `selection_reason`,
+`reserved_until`, `disconnected_at`, `failure_cause`, `version`, and timestamps.
+The handle is opaque; `worktree_path` is populated only for server placements
+and is empty for daemon placements. Responses expose reserved/preparing and
+disconnected placements even when the owner cannot be reached. Placement version
+conflicts use the ordinary HTTP `409 version_conflict` error.
+Executor snapshots store `placement_id`; they no longer store `resolved_daemon_id`.
+For daemon placements, `execution.start.workspace_path` comes from the retained
+owner preparation result for that exact handle and generation.
+Task, Workspace, and Execution plan-artifact reads use the same owner router as
+dispatch. A daemon workspace handle is never interpreted as a server path.
+
+### Workspace daemon protocol
+
+Protocol revision 3 negotiates `workspace.v1`. Revision 2 remains accepted for
+server-owned execution and filesystem browsing and is `workspace_incapable` for
+placement admission. The handshake includes per-executor adapter facts
+(`structured_events`, `usage`, `resume`, `cancel_ack`, `terminal_observed`) and
+the daemon's effective `workspace.run` policy; absent facts are unsupported.
+
+| Method | Owner operation |
+| --- | --- |
+| `repo_location.verify` | Verify the checkout and any shared-mount probe |
+| `workspace.prepare` | Prepare a placement and return its opaque handle and base SHA |
+| `workspace.describe` | Report workspace state, active executions, and retained execution results |
+| `workspace.run` | Run configured `ci_step`, `hook`, or `environment_setup` commands |
+| `workspace.diff` | Read diffs and exact reviewer evidence |
+| `workspace.read` | Read bounded artifacts, Git evidence, and owner-local paths |
+| `workspace.merge` | Direct merge into the verified primary checkout |
+| `workspace.reset` | Reset the workspace or perform typed asset, knowledge, and review-checkout operations |
+| `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
+
+Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
+`generation`, and `expected` (a base SHA or version). Existing workspaces also
+carry `workspace_handle`. Duplicate operation IDs replay their journaled result;
+`stale_generation` and `wrong_owner` refuse changes. No method accepts an arbitrary
+shell command outside the three configured run purposes. `purpose_denied` is
+never retried. CI preserves unbounded command execution/output semantics;
+conformance commands retain their configured time and output budgets.
+
+The single daemon journal retains terminal reports with bounded worklog/evidence
+outbox entries, operation results, and cleanup acknowledgements. Revision 3 uses
+`journal.ack { entry_id }`; revision 2 uses `execution.terminal.ack`. Retained
+terminal and cleanup results replay after reconnect, and acknowledged mutation
+receipts remain available for idempotent retries.
 
 When a follow-up, re-execute, or launch collides with an already-running
 execution, REST returns HTTP `409` with code `execution.already_running`.
