@@ -237,9 +237,16 @@ pub async fn next_daemon_request(
                         let verification: api_types::RepoLocationVerifyParams =
                             serde_json::from_value(params.clone()).expect("verification params");
                         let (outbound, _unused) = tokio::sync::mpsc::unbounded_channel();
+                        // The fixtures advertise the directory that holds the
+                        // repository as the daemon root; the server's probe
+                        // lives beside the repository, not inside it.
+                        let daemon_root = std::path::Path::new(&verification.path)
+                            .parent()
+                            .expect("location path has a parent")
+                            .to_path_buf();
                         let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
                             outbound,
-                            std::path::PathBuf::from(&verification.path),
+                            daemon_root,
                             Default::default(),
                             verification.daemon_id,
                             Default::default(),
