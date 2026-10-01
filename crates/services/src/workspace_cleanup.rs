@@ -184,7 +184,9 @@ impl WorkspaceCleanupScheduler {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
-        let result = self.cleanup_task(&workspace.task_id, false).await;
+        // Immediate cleanup is still terminal-only: a non-terminal Task's
+        // worktree and build output are never removed.
+        let result = self.cleanup_task(&workspace.task_id, true).await;
         if let Err(cleanup_error) = &result {
             if let Err(error) = self
                 .record_cleanup_failure(&workspace.task_id, cleanup_error)

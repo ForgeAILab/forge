@@ -112,7 +112,6 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
         &format!("/api/v1/projects/{}/repos", project.id),
         json!({
             "name": "repo",
-            "kind": "remote",
             "remote_url": "https://example.com/repo.git",
             "default_branch": "main"
         }),
