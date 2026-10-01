@@ -189,6 +189,7 @@ pub(crate) async fn execution_admission_for_task(
         )
     };
     Ok(ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: Some(expected_project_version),
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -869,8 +870,18 @@ impl TaskService {
         &self,
         mut input: CreateExecution,
         workspace_created_by_attempt: bool,
-        admission: Option<ExecutionAdmission>,
+        mut admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
+        // Replay authority follows this call chain only; spawned execution
+        // runners and unrelated API requests do not inherit the task-local.
+        if let Ok((task_id, recovery_id)) = execution::REPLAYING_RECOVERY.try_with(Clone::clone) {
+            if task_id == input.task_id {
+                let admission = admission.as_mut().ok_or_else(|| {
+                    ServiceError::invalid_operation("queued replay requires execution admission")
+                })?;
+                admission.expected_queued_recovery_id = Some(recovery_id);
+            }
+        }
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
                 .await?

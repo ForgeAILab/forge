@@ -3522,6 +3522,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(competing.clone()),
         make_lease(competing.clone()),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -3593,6 +3594,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(stale.clone()),
         make_lease(stale),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -3781,6 +3783,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
         now: now.clone(),
     };
     let make_admission = || ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: Some(project.version),
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -3993,7 +3996,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
     let mutations = vec![
         crate::TaskMetadataMutation::Set {
             key: "queued_recovery".to_owned(),
-            value: serde_json::json!({ "action": "reexecute" }),
+            value: serde_json::json!({ "id": "queued-intent", "action": "reexecute" }),
         },
         crate::TaskMetadataMutation::Set {
             key: "deferred_dispatch".to_owned(),
@@ -4042,35 +4045,120 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
     .await;
     assert!(matches!(stale, Err(DbError::VersionConflict)));
     let now = now_rfc3339();
-    ExecutionRepo::create(
+    let make_execution = || CreateExecution {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        agent_id: None,
+        role: "interactive".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let unrelated = ExecutionRepo::create(&db, make_execution())
+        .await
+        .expect("unrelated execution admits");
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
+    assert_eq!(current.version, queued.version);
+    for (expected_version, queued_recovery_id) in [
+        (queued.version - 1, "queued-intent"),
+        (queued.version, "newer-intent"),
+    ] {
+        let result = TaskRepo::restore_queued_recovery(
+            &db,
+            crate::RestoreQueuedRecovery {
+                task_id: task_id.clone(),
+                expected_version,
+                queued_recovery_id: queued_recovery_id.to_owned(),
+                error_annotation: Some("stale blocker".to_owned()),
+                blocked_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DbError::VersionConflict)));
+    }
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
+    assert!(current.error_annotation.is_none());
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+        .bind(&unrelated.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let make_admission = |id: &str| ExecutionAdmission {
+        expected_queued_recovery_id: Some(id.to_owned()),
+        expected_project_version: None,
+        expected_task_version: queued.version,
+        expected_task_status: queued.status.clone(),
+        expected_effective_role: None,
+        expected_agent_version: None,
+        expected_agent_max_concurrent_tasks: None,
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: None,
+        expected_assignment_updated_at: None,
+        expected_workflow_definition: None,
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:queued-recovery".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: None,
+        now: now.clone(),
+    };
+    let stale_execution = make_execution();
+    let stale_id = stale_execution.id.clone();
+    let result = ExecutionRepo::create_with_lease_and_admission(
         &db,
-        CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            agent_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
+        stale_execution,
+        make_lease(stale_id.clone()),
+        Some(make_admission("wrong-intent")),
+    )
+    .await;
+    assert!(matches!(result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &stale_id)
+        .await
+        .unwrap()
+        .is_none());
+    let execution = make_execution();
+    let lease = make_lease(execution.id.clone());
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        execution,
+        lease,
+        Some(make_admission("queued-intent")),
     )
     .await
-    .expect("execution admits and consumes queue");
+    .expect("own replay admits and consumes queue");
     let admitted = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task loads")
@@ -4186,6 +4274,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status,
@@ -4415,6 +4504,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         root_execution_input,
         make_lease(root_execution_id, "embedded:custom-root"),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: root.version,
             expected_task_status: root.status.clone(),
@@ -4449,6 +4539,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         ),
         make_lease(child_execution_id, "embedded:inherited-child"),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: child.version,
             expected_task_status: child.status.clone(),
@@ -4561,6 +4652,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
     .await
     .expect("first review creates");
     let make_admission = |parent_execution_id: Option<String>| ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5414,6 +5506,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5481,6 +5574,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         make_execution(dependency_id.clone()),
         make_lease(dependency_id),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -5511,6 +5605,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         interactive_execution,
         make_lease(interactive_id),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -5615,6 +5710,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5767,6 +5863,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: first_task.version,
         expected_task_status: first_task.status.clone(),
@@ -5786,6 +5883,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_workflow_definition: Some("{}".to_owned()),
     };
     let second_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: second_task.version,
         expected_task_status: second_task.status.clone(),

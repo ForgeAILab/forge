@@ -104,6 +104,9 @@ pub trait TaskRepo: Send + Sync {
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
     ) -> Result<Task>;
+    /// Restore a queued recovery's interruption and remove its intent in one
+    /// versioned write, including when an unrelated execution superseded it.
+    async fn restore_queued_recovery(&self, input: RestoreQueuedRecovery) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
     async fn set_review_passed_at(
@@ -2910,6 +2913,8 @@ pub struct CreateExecution {
 /// between the dispatcher's final read and admission fails closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionAdmission {
+    /// Only the replay owning this exact intent may consume it at admission.
+    pub expected_queued_recovery_id: Option<String>,
     /// Project revision selected with the Task/workflow snapshot. Project
     /// settings, repository, pause, and workflow edits all advance this
     /// revision; role launches must not admit a stale prepared execution even
@@ -2959,6 +2964,16 @@ pub struct ExecutionAdmission {
     /// the task is governed by the built-in inherited subtask workflow. This
     /// lets the transaction detect a workflow edit that did not bump Task.
     pub expected_workflow_definition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreQueuedRecovery {
+    pub task_id: String,
+    pub expected_version: i64,
+    pub queued_recovery_id: String,
+    pub error_annotation: Option<String>,
+    pub blocked_json: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -26,10 +26,20 @@ pub(crate) struct DeferredDispatch {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct QueuedRecovery {
     pub id: String,
-    pub request: api_types::RecoverTaskRequest,
+    pub request: QueuedRecoveryRequest,
     pub target_state: String,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum QueuedRecoveryRequest {
+    Recover(api_types::RecoverTaskRequest),
+    Resume {
+        resume_reason: Option<String>,
+        agent_id: String,
+    },
 }
 
 pub(crate) fn queued_recovery(task: &Task) -> Option<QueuedRecovery> {

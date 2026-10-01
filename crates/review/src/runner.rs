@@ -1107,6 +1107,7 @@ fn review_execution_admission(
         );
     let expected_effective_role = effective_review_role(task, project);
     ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: Some(project.version),
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),

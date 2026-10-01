@@ -20,6 +20,7 @@ const PLAN_PUBLICATION_CLAIM_KEY: &str = "plan_publication_claim";
 const PLAN_PUBLICATION_CLEANUP_KEY: &str = "plan_publication_cleanup";
 const TERMINAL_EXECUTION_SETTLEMENT_KEY: &str = "terminal_execution_settlement";
 
+pub(super) use recovery::REPLAYING_RECOVERY;
 pub(crate) use runner::discard_execution_plan_stage;
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 

@@ -2415,7 +2415,15 @@ for the dispatcher to apply when a slot becomes available. Its
 `workflow_health.kind` is `waiting_for_agent` with label `Retry Queued`.
 Session resumes keep their session lineage; re-execution keeps the supplied
 guidance. The dispatcher rechecks admission before launching queued recovery.
-Other refusals retain their existing errors and do not queue the action.
+Repeating the same recovery while it is queued returns the queued Task with
+`200` and preserves the original intent. Resume fallback launches use this
+same capacity queue and retain their session lineage and guidance. Only the
+queued replay's own execution admission consumes the intent; an unrelated
+execution preserves it for reconciliation. A permanent replay refusal restores
+the saved blocker with the refusal as its reason and removes the queue entry.
+Paused or offline Agents are refused rather than shown as waiting for capacity,
+including when availability changes while recovery is queued. Other refusals
+retain their existing errors and do not queue the action.
 
 Task `workflow_health` also represents active non-agent work. A running
 interactive execution reports `kind: "running"`, label `Interactive`. A

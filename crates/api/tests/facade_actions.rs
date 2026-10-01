@@ -410,6 +410,21 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
     assert_eq!(response.status, "in_progress");
     assert!(response.error_annotation.is_none());
     assert!(response.blocked.is_none());
+    let queued = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let repeated: TaskResponse = common::json_request(
+        &harness.app, Method::POST, &url,
+        json!({ "action": "reexecute", "reason": "operator retry", "context": "recovery guidance" }),
+        StatusCode::OK,
+    ).await;
+    assert_eq!(repeated.version, response.version);
+    let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
     let health = response.workflow_health.expect("queued health returns");
     assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
     assert_eq!(health.label, "Retry Queued");

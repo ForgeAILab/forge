@@ -958,16 +958,21 @@ impl SqliteDb {
         .execute(&mut **transaction)
         .await?;
 
-        if input.status == ExecutionStatus::Running {
+        if let Some(recovery_id) = admission
+            .filter(|_| input.status == ExecutionStatus::Running)
+            .and_then(|admission| admission.expected_queued_recovery_id.as_deref())
+        {
             // Consume accepted recovery intent with admission, so a crash
-            // after INSERT cannot replay it into a second execution.
+            // after INSERT cannot replay it into a second execution. Ordinary
+            // interactive/role launches carry no replay authority.
             sqlx::query(
                 "UPDATE task
                  SET metadata_json = NULLIF(json_remove(metadata_json, '$.queued_recovery', '$.deferred_dispatch'), '{}')
                  WHERE id = ? AND json_valid(metadata_json)
-                   AND json_type(metadata_json, '$.queued_recovery') IS NOT NULL",
+                   AND json_extract(metadata_json, '$.queued_recovery.id') = ?",
             )
             .bind(&input.task_id)
+            .bind(recovery_id)
             .execute(&mut **transaction)
             .await?;
         }
@@ -1059,6 +1064,17 @@ impl SqliteDb {
         let metadata_json: Option<String> = row.try_get("metadata_json")?;
         let metadata = TaskMetadata::parse(metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if let Some(expected) = admission.expected_queued_recovery_id.as_deref() {
+            if metadata
+                .extra
+                .get("queued_recovery")
+                .and_then(|queued| queued.get("id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(expected)
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
         if let Some(claim) = metadata.extra.get("plan_publication_claim") {
             let claim_state = claim
                 .get("state")

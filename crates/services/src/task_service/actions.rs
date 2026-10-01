@@ -551,7 +551,7 @@ impl TaskService {
             .task)
     }
 
-    async fn resume_task_execution(
+    pub(crate) async fn resume_task_execution(
         &self,
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
@@ -566,6 +566,11 @@ impl TaskService {
                 expected: expected_version,
                 actual: current.version,
             }));
+        }
+        if !Self::is_replaying_recovery(&task.id)
+            && crate::deferred_dispatch::queued_recovery(&current).is_some()
+        {
+            return Ok(current);
         }
         if current.failed_json.is_some() {
             return Err(ServiceError::TaskActionUnavailable {
@@ -661,6 +666,15 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
+                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                        return self
+                            .queue_resume_for_capacity(
+                                &current,
+                                execution.agent_id.as_deref(),
+                                context.clone(),
+                            )
+                            .await;
+                    }
                     return Err(error);
                 }
             };
@@ -697,6 +711,29 @@ impl TaskService {
                 Err(error) => {
                     self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
                         .await;
+                    if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                        let role = if execution.role == "executor" {
+                            crate::workflow::default_roles::CODER
+                        } else {
+                            &execution.role
+                        };
+                        let assigned_agent = TaskRoleAssignmentRepo::get_by_task_and_role(
+                            &*self.db,
+                            &current.id,
+                            role,
+                        )
+                        .await?
+                        .filter(|assignment| assignment.assignee_type == Some(AssigneeKind::Agent))
+                        .and_then(|assignment| assignment.assignee_id)
+                        .or_else(|| execution.agent_id.clone());
+                        return self
+                            .queue_resume_for_capacity(
+                                &current,
+                                assigned_agent.as_deref(),
+                                context.clone(),
+                            )
+                            .await;
+                    }
                     return Err(error);
                 }
             };
@@ -719,7 +756,9 @@ impl TaskService {
                 &task.id,
                 &agent_id,
                 role,
-                context.unwrap_or_else(|| "Resume task work.".to_owned()),
+                context
+                    .clone()
+                    .unwrap_or_else(|| "Resume task work.".to_owned()),
             )
             .await
         {
@@ -727,6 +766,11 @@ impl TaskService {
             Err(error) => {
                 self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), role)
                     .await;
+                if matches!(error, ServiceError::Db(db::DbError::AgentAtCapacity)) {
+                    return self
+                        .queue_resume_for_capacity(&current, Some(&agent_id), context)
+                        .await;
+                }
                 return Err(error);
             }
         };
@@ -735,6 +779,24 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
         self.clear_resume_retry_metadata(&resumed_task).await;
         Ok(resumed_task)
+    }
+
+    async fn queue_resume_for_capacity(
+        &self,
+        task: &Task,
+        agent_id: Option<&str>,
+        resume_reason: Option<String>,
+    ) -> Result<Task> {
+        let agent_id =
+            agent_id.ok_or_else(|| ServiceError::invalid_operation("resume requires an agent"))?;
+        self.queue_recovery_for_capacity(
+            task,
+            crate::deferred_dispatch::QueuedRecoveryRequest::Resume {
+                resume_reason,
+                agent_id: agent_id.to_owned(),
+            },
+        )
+        .await
     }
 
     async fn prepare_manual_stop_resume_clear(

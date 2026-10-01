@@ -2484,9 +2484,16 @@ the durable dispatch queue. Clearing its interruption and recording its action,
 reason, and context share a Task-version CAS and a no-running-execution check.
 The dispatcher retries that intent before ordinary scheduling once capacity
 is available, revalidating the current workflow and execution admission. The
+replay carries its queue ID through execution admission, and only its own
 Running execution INSERT consumes the queued intent in the same transaction,
 so restart cannot replay an already admitted recovery. While queued, the Task
 reports `Retry Queued` through the existing deferred-dispatch health projection.
+Repeated recovery requests return that queued Task without replacing the
+intent. Resume fallback launches share this queue and replay the Resume path.
+Only capacity refusals remain queued: permanent pre-claim/replay failures,
+including paused/offline Agents or an unrelated execution taking the slot,
+atomically remove the intent and restore its saved interruption with the error
+as its reason. Task-version and queue-ID checks protect newer decisions.
 
 `CrashRecovery` runs at server and Solo startup and deterministically reconciles
 ownerless or expired running executions left by an earlier process. Migration
