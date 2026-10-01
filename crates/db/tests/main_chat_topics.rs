@@ -87,6 +87,13 @@ async fn apply_v103(db: &SqliteDb, migration_dir: &Path) {
         .expect("V103 migration applies");
 }
 
+async fn apply_migrations_after_v103(db: &SqliteDb, migration_dir: &Path) {
+    copy_migrations_in_range(103, i64::MAX, migration_dir);
+    run_migrations_from(db.pool(), migration_dir)
+        .await
+        .expect("post-V103 migrations apply");
+}
+
 async fn create_user(db: &SqliteDb, id: &str, now: &str) {
     UserRepo::create_user(
         db,
@@ -207,6 +214,9 @@ async fn database_with_ready_main_chat(name: &str) -> (SqliteDb, String) {
     let account_id = format!("{name}-account");
     create_user(&db, &account_id, &now).await;
     apply_v103(&db, &migration_dir).await;
+    // The fixture observes V103 separately, then advances to the current
+    // schema before calling current repository code and its row mappers.
+    apply_migrations_after_v103(&db, &migration_dir).await;
     let chat = AgentChatRepo::get_main_chat(&db, &account_id)
         .await
         .expect("main chat lookup")

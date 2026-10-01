@@ -804,7 +804,8 @@ async fn retry_exhausted_agent_chat_is_suppressed_before_binding_setup() {
             causation_id: None,
             causation_depth: 0,
             dedupe_key: Some("retry-suppression-source".to_owned()),
-            payload_json: r#"{"status":"failed"}"#.to_owned(),
+            payload_json: r#"{"status":"failed","failure_class":{"kind":"configuration"}}"#
+                .to_owned(),
             created_at: now,
         },
     )
