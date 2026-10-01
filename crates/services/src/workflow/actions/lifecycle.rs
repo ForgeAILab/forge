@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use api_types::ProjectSettings;
 use async_trait::async_trait;
-use db::{now_rfc3339, RepoRepo, WorkspaceRepo};
+use db::{now_rfc3339, RepoRepo, WorkspacePlacementRepo, WorkspaceRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::json;
 
@@ -72,7 +72,55 @@ impl HookAction for RunBeforeWorkHooks {
         };
         let workspace = match workspace_id(ctx).await {
             Some(workspace_id) => match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-                Ok(Some(workspace)) => workspace,
+                Ok(Some(workspace)) => {
+                    let daemon_owned =
+                        match WorkspacePlacementRepo::get_by_workspace_id(&*ctx.db, &workspace.id)
+                            .await
+                        {
+                            Ok(placement) => placement.is_some_and(|placement| {
+                                placement.owner_kind == db::PlacementOwnerKind::Daemon
+                            }),
+                            Err(error) => {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                        };
+                    if daemon_owned {
+                        workspace
+                    } else {
+                        match crate::task_service::workspace::ensure_valid(
+                            &ctx.db,
+                            &ctx.workspace_root,
+                            &task,
+                            workspace,
+                            ctx.repo_cache_locks.clone(),
+                            false,
+                            &ctx.workspace_backend_router,
+                        )
+                        .await
+                        {
+                            Ok(workspace) => workspace,
+                            Err(error @ crate::ServiceError::WorkspaceResetRequired { .. }) => {
+                                if let Err(annotation_error) =
+                                    annotate_before_work_workspace_reset(ctx, &task, &error).await
+                                {
+                                    return HookResult::Failed {
+                                        reason: annotation_error.to_string(),
+                                    };
+                                }
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                            Err(error) => {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
                 Ok(None) => {
                     return HookResult::Failed {
                         reason: format!("workspace not found: {workspace_id}"),
@@ -240,6 +288,31 @@ async fn annotate_before_work_hook_block(
         "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
     });
 
+    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+}
+
+async fn annotate_before_work_workspace_reset(
+    ctx: &HookContext,
+    task: &db::Task,
+    error: &crate::ServiceError,
+) -> db::Result<()> {
+    let annotation = json!({
+        "type": api_types::FailureKind::WorkspaceResetRequired,
+        "blocking_reason": "workspace_reset_required",
+        "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
+        "blocked_at": now_rfc3339(),
+        "blocked_execution_id": ctx.execution_id,
+        "message": error.to_string(),
+        "recovery_actions": ["reset_to_initial", "cancel_task"],
+    });
+    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+}
+
+async fn persist_before_work_annotation(
+    ctx: &HookContext,
+    task: &db::Task,
+    annotation: String,
+) -> db::Result<()> {
     // `before_enter` owns the Task version used by the surrounding workflow
     // transition, so this annotation deliberately retains that historical
     // version behavior. The recovery event still commits atomically with the
@@ -249,7 +322,7 @@ async fn annotate_before_work_hook_block(
     let update = sqlx::query(
         "UPDATE task SET error_annotation = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(annotation.to_string())
+    .bind(&annotation)
     .bind(&updated_at)
     .bind(&task.id)
     .execute(&mut *transaction)
@@ -258,7 +331,7 @@ async fn annotate_before_work_hook_block(
         return Err(db::DbError::NotFound);
     }
     let mut interruption_snapshot = task.clone();
-    interruption_snapshot.error_annotation = Some(annotation.to_string());
+    interruption_snapshot.error_annotation = Some(annotation);
     interruption_snapshot.updated_at = updated_at;
     let mut interruption_event =
         db::CreateDomainEvent::task_interruption_changed(&interruption_snapshot);

@@ -4,7 +4,7 @@ use crate::{
 };
 use db::{
     now_rfc3339, ExecutionRepo, RepoRepo, ReviewConformanceRepo, SqliteDb, TaskRepo, WorkMode,
-    WorkspaceRepo,
+    WorkspacePlacementRepo, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -187,6 +187,15 @@ impl MergeService {
             &self.workspace_root,
         )
         .await?;
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let worktree_path = resolved.embedded_path()?;
+            if !matches!(
+                crate::task_service::workspace::worktree_readiness(&worktree_path).await?,
+                crate::task_service::workspace::WorktreeReadiness::Ready
+            ) {
+                return Ok(Vec::new());
+            }
+        }
         let transitions = db::TransitionLogRepo::list_by_task(&*self.db, task_id).await?;
         let handed_off = crate::workflow::handed_off_conflict_paths(&transitions);
         let markers = resolved
@@ -246,6 +255,15 @@ impl MergeService {
             &self.workspace_root,
         )
         .await?;
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let worktree_path = resolved.embedded_path()?;
+            if !matches!(
+                crate::task_service::workspace::worktree_readiness(&worktree_path).await?,
+                crate::task_service::workspace::WorktreeReadiness::Ready
+            ) {
+                return Ok(unavailable("workspace is unavailable"));
+            }
+        }
         let worktree_path = &resolved;
         if resolved.backend.describe(&resolved.placement).await?.dirty {
             return Ok(unavailable("worktree has uncommitted changes"));
@@ -338,6 +356,45 @@ impl MergeService {
         ))))
     }
 
+    async fn ensure_delivery_workspace(
+        &self,
+        task: &db::Task,
+        execution: &db::Execution,
+    ) -> Result<(db::Workspace, crate::workspace_backend::ResolvedWorkspace)> {
+        let expected = resolve_delivery_workspace(&self.db, execution).await?;
+        let router = self.workspace_backend_router()?;
+        let daemon_owned = WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &expected.id)
+            .await?
+            .is_some_and(|placement| placement.owner_kind == db::PlacementOwnerKind::Daemon);
+        let workspace = if daemon_owned {
+            expected.clone()
+        } else {
+            crate::task_service::workspace::ensure_valid(
+                &self.db,
+                &self.workspace_root,
+                task,
+                expected.clone(),
+                Some(Arc::clone(&self.integration_locks)),
+                false,
+                &router,
+            )
+            .await?
+        };
+        if workspace.id != expected.id {
+            return Err(ServiceError::conflict(
+                "validated workspace differs from the implementation execution workspace",
+            ));
+        }
+        let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
+            &router,
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        Ok((workspace, resolved))
+    }
+
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
         let task_id = task_id.into();
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -353,19 +410,11 @@ impl MergeService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
             })?;
-        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
+        let (workspace, resolved) = self.ensure_delivery_workspace(&task, &execution).await?;
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
-        let router = self.workspace_backend_router()?;
-        let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
-            &router,
-            &self.db,
-            &workspace,
-            &self.workspace_root,
-        )
-        .await?;
         let transitions = db::TransitionLogRepo::list_by_task(&*self.db, &task_id).await?;
         let target_branch = target_branch(&task.merge_config, &repo.default_branch)?;
         let expected_target_sha = if resolved.placement.owner_kind == db::PlacementOwnerKind::Server
@@ -668,15 +717,7 @@ impl MergeService {
             .ok_or_else(|| {
                 ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
             })?;
-        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
-        let router = self.workspace_backend_router()?;
-        let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
-            &router,
-            &self.db,
-            &workspace,
-            &self.workspace_root,
-        )
-        .await?;
+        let (_workspace, resolved) = self.ensure_delivery_workspace(&task, &execution).await?;
         let path = resolved.embedded_path()?;
         self.publish_workspace_pr(&task_id, &path).await
     }
@@ -1221,6 +1262,116 @@ mod tests {
             .expect("execution exists");
         assert_eq!(execution.before_sha, Some(worktree_sha.clone()));
         assert_eq!(execution.after_sha, Some(worktree_sha));
+    }
+
+    #[tokio::test]
+    async fn merge_recovers_deleted_ready_worktree_from_task_branch() {
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let temp = TempDir::new().expect("temp creates");
+        let repo_path = setup_repo(&temp).await;
+        let task_id = new_uuid_v4();
+        let worktree_path = temp.path().join(&task_id).join("repo");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&task_id),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree creates");
+        std::fs::write(worktree_path.join("feature.txt"), "recovered merge\n")
+            .expect("feature writes");
+        let worktree_sha = git::commit_all(&worktree_path, "feature")
+            .await
+            .expect("feature commits");
+        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        std::fs::remove_dir_all(&worktree_path).expect("worktree directory removes");
+        run_git(&repo_path, &["worktree", "prune"]).await;
+
+        let service =
+            MergeService::new_for_test(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let outcome = service.merge(&task_id).await.expect("merge recovers");
+
+        assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
+        assert!(worktree_path.exists());
+        assert_eq!(
+            git::get_current_sha(&worktree_path)
+                .await
+                .expect("recovered worktree HEAD reads"),
+            worktree_sha
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_checks_do_not_repair_unavailable_workspace() {
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let temp = TempDir::new().expect("temp creates");
+        let repo_path = setup_repo(&temp).await;
+        let task_id = new_uuid_v4();
+        let worktree_path = temp.path().join(&task_id).join("repo");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&task_id),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree creates");
+        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        let workspace = WorkspaceRepo::get_by_task_id(&*db, &task_id)
+            .await
+            .expect("workspace loads")
+            .expect("workspace exists");
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        std::fs::remove_dir_all(&worktree_path).expect("worktree directory removes");
+        run_git(&repo_path, &["worktree", "prune"]).await;
+        let service =
+            MergeService::new_for_test(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+
+        assert!(service
+            .unresolved_handoff_markers(&task_id)
+            .await
+            .expect("marker check treats a missing workspace as unavailable")
+            .is_empty());
+        assert!(matches!(
+            service
+                .review_carry_facts(&task_id)
+                .await
+                .expect("review carry treats a missing workspace as unavailable"),
+            ReviewCarryFacts::Unavailable { .. }
+        ));
+        assert!(
+            !worktree_path.exists(),
+            "read-only checks must not recreate"
+        );
+
+        sqlx::query("UPDATE project SET primary_repo_id = NULL WHERE id = ?")
+            .bind(&task.project_id)
+            .execute(db.pool())
+            .await
+            .expect("project primary repo clears");
+        sqlx::query("DELETE FROM repo WHERE id = ?")
+            .bind(&workspace.repo_id)
+            .execute(db.pool())
+            .await
+            .expect("repo deletes while workspace provenance remains");
+        assert!(service
+            .unresolved_handoff_markers(&task_id)
+            .await
+            .expect("missing repo keeps the empty marker result")
+            .is_empty());
+        assert_eq!(
+            service
+                .review_carry_facts(&task_id)
+                .await
+                .expect("missing repo keeps the unavailable review result"),
+            ReviewCarryFacts::Unavailable {
+                reason: "repository not found".to_owned()
+            }
+        );
     }
 
     #[tokio::test]

@@ -2308,12 +2308,20 @@ Agent fails admission. Reclaim describes the existing ready workspace. If its
 directory was deleted, claim, resume, recovery launch, and review-CI preparation
 recreate the worktree from its surviving Task branch through the recorded owner;
 daemon owners receive a fenced `workspace.prepare` request with the recorded base
-SHA. Embedded owners also repair damaged Git metadata. A damaged worktree on a
-daemon owner requires a reset; other describe failures remain transient errors
-and do not trigger preparation. Missing branches or
-incompatible history require an explicit workspace reset. A child preserves its
-root's shared workspace row when its branch is missing. Merge, target-moved
-rebase, and other gate reads retain their existing reset/readiness behavior.
+SHA. Server-owned Task launch and mutating delivery paths use the same validity
+accessor before Git I/O, including review entry and reviewer evaluation, merge,
+target-moved rebase, and reset-to-initial. An existing directory is invalid only
+when its `.git` entry is absent or Git reports that it is not a repository; Git
+spawn and I/O failures remain transient errors and never trigger recovery.
+Missing or damaged worktrees are repaired or recreated from the surviving Task
+branch. Launch may discard a root Workspace row when both are gone, while
+delivery, hook, rebase, and reassignment checks preserve the row and return the
+typed reset-required error. Read-only review-carry and conflict-marker checks
+only validate a server worktree and never repair it or clear cleanup state. A
+child always preserves its root's shared Workspace, including reassignment with
+`reset_worktree`. Daemon-owned delivery calls retain their prior owner-local
+path; damaged daemon worktrees require a reset, and daemon describe failures
+remain transient errors without triggering metadata repair.
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
 Cleanup moves through `cleaning` to `cleaned`; failures use `failed`.

@@ -346,9 +346,15 @@ impl HookAction for RunMerge {
                     reason: "project paused; integration deferred".to_owned(),
                 }
             }
-            Err(error) => HookResult::Failed {
-                reason: error.to_string(),
-            },
+            Err(error) => {
+                merge_failure_result(
+                    ctx,
+                    &task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await
+            }
         }
     }
 }
@@ -460,6 +466,42 @@ pub(super) async fn target_moved_result(
             return HookResult::Failed {
                 reason: error.to_string(),
             };
+        }
+    };
+    let daemon_owned =
+        match db::WorkspacePlacementRepo::get_by_workspace_id(&*ctx.db, &workspace.id).await {
+            Ok(placement) => placement
+                .is_some_and(|placement| placement.owner_kind == db::PlacementOwnerKind::Daemon),
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+    let workspace = if daemon_owned {
+        workspace
+    } else {
+        match crate::task_service::workspace::ensure_valid(
+            &ctx.db,
+            &ctx.workspace_root,
+            task,
+            workspace,
+            ctx.repo_cache_locks.clone(),
+            false,
+            &ctx.workspace_backend_router,
+        )
+        .await
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return merge_failure_result(
+                    ctx,
+                    task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await;
+            }
         }
     };
     let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(

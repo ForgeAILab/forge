@@ -9,7 +9,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     CreateAgent, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo,
     DaemonStatus, ProjectRepo, RepoRepo, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon,
+    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
@@ -2338,6 +2338,80 @@ async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixtur
         _repo_dir: repo_dir,
         _workspace_root: workspace_root,
     }
+}
+
+#[tokio::test]
+async fn before_work_workspace_reset_required_keeps_typed_recovery_annotation() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(
+            json!({
+                "lifecycle_hooks": {
+                    "before_work": [{
+                        "type": "script",
+                        "command": "true",
+                        "timeout_seconds": 5,
+                        "blocking": true
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .bind(&fixture.task.project_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("blocking before-work hook config writes");
+    let worktree_path =
+        std::path::PathBuf::from(fixture.workspace.embedded_worktree_path_for_backend());
+    std::fs::remove_dir_all(&worktree_path).expect("worktree directory removes");
+    run_git(fixture._repo_dir.path(), &["worktree", "prune"]);
+    run_git(
+        fixture._repo_dir.path(),
+        &["branch", "-D", &fixture.workspace.branch],
+    );
+
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "worker completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .expect("typed workspace blocker settles the transition");
+
+    assert_eq!(result.task.status, "in_progress");
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let annotation: serde_json::Value = serde_json::from_str(
+        task.error_annotation
+            .as_deref()
+            .expect("workspace reset annotation exists"),
+    )
+    .expect("workspace reset annotation is JSON");
+    assert_eq!(annotation["type"], "workspace_reset_required");
+    assert!(annotation["message"]
+        .as_str()
+        .expect("annotation message is text")
+        .contains("workspace reset required"));
+    assert_eq!(
+        annotation["recovery_actions"],
+        json!(["reset_to_initial", "cancel_task"])
+    );
+    assert!(
+        WorkspaceRepo::get_by_id(&*fixture.db, &fixture.workspace.id)
+            .await
+            .expect("workspace reloads")
+            .is_some()
+    );
+    assert!(!worktree_path.exists());
 }
 
 #[tokio::test]

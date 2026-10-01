@@ -206,6 +206,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `domain_event.committed`. Polling is a 15 s foreground fallback, plus 1.5 s
   for live activity while a turn or inquiry is running; it stops while the tab
   is hidden and reconciles at once when the tab becomes visible again.
+- Reassigning a role with `reset_worktree` when the server-owned worktree is
+  missing now recreates it from the Task branch, or returns
+  `409 WORKSPACE_RESET_REQUIRED` when the branch is gone; it used to fail with
+  a not-found error. Reassigning a subtask leaves the shared root worktree
+  unchanged.
 
 ### Added
 
@@ -275,6 +280,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   owner keeps the fixed one-minute retry.
 - The notification and Project-hook services keep delivering after they fall
   behind on the event bus; they used to stop until the server restarted.
+- A server-owned Task worktree that was deleted or left without git metadata
+  no longer fails review entry, merge, target-moved rebase, review carry or
+  reset with `not a git repository`: it is recreated from the Task branch
+  first, as launch already did. A transient failure to run git is returned as
+  an error and never treated as a damaged worktree.
 
 ### Known issues
 
