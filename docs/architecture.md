@@ -2151,12 +2151,6 @@ therefore cannot be inferred from response differences. MCP responses retain
 the context-not-instructions guardrail; repository/memory text cannot grant
 tools, permissions, approvals, or a broader scope.
 
-`ForgeMemorySource` is constructed with immutable identity and canonical-scope
-bindings and returns already-authorized, ranked, bounded Agent Runtime memory
-records. It suppresses raw chat-derived memories already represented in the
-active LCM/recent history. LCM summaries remain derived episodic continuity,
-not verified semantic facts.
-
 ### Commitments, Attention, and Mission Control
 
 Inbox items, commitments, and typed action/proposal envelopes are durable
@@ -2391,8 +2385,8 @@ verified primary checkout and refuses a dirty target.
 file-tree reads. Git evidence preserves the complete output, including NUL
 path separators. Review's `workspace.diff` variant uses the same three-dot diff,
 fallback, and UTF-8 truncation marker as server review. Same-generation owner
-operations use `workspace.reset` for assets, knowledge files, candidate restore,
-and rebase. Conformance checks run in the prepared Task checkout through its
+operations use `workspace.reset` for assets, candidate restore, and rebase.
+Conformance checks run in the prepared Task checkout through its
 owner, preserving ignored dependency caches. Candidate restoration resets tracked
 files after each check and refuses changes to HEAD or tracked content.
 
@@ -2549,8 +2543,8 @@ journaled execution IDs. Forge drains retained results first, resumes leases
 for active executions, applies finished reports once, and fails an unknown
 execution with `owner_lost_execution`. It compares HEAD with recorded evidence
 before returning the placement to `ready` and waking dispatch. Forge records
-the HEAD produced by its own rebase and knowledge-capture commit as
-generation-bound evidence in `workspace_expected_head` (`V202610010530`) for
+the HEAD produced by its own rebase as generation-bound evidence in
+`workspace_expected_head` (`V202610010530`) for
 remote owners/providers. Evidence uses the execution's immutable terminal time,
 so later edits to an old execution cannot supersede a rebase head. A recording
 failure is logged without failing the successful Git operation; reconciliation
@@ -3161,8 +3155,9 @@ content guards still run and may block; `on_enter`/`after_enter` hooks run
 normally; `task.status_changed` is published unconditionally; agent dispatch fires
 only when a role/agent is assigned. Override transitions are audited as
 `triggered_by = "user:override:<source>"` (e.g. `user:override:api`). This is
-separate from `manual_override_transition`, a system-triggered primitive with
-`skip_before_exit=true` used by `TaskService::advance_to_next_state`.
+separate from `manual_override_transition_with_authority`, a system-triggered
+primitive with `skip_before_exit=true` used by
+`TaskService::advance_to_next_state`.
 An authenticated Project Agent cancellation is narrower: `task.cancel` may
 cross a system-triggered edge only when the destination is the workflow's
 declared cancellation state. It receives no general routing override.

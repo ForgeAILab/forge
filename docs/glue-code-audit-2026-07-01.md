@@ -33,11 +33,11 @@ let auth_service = Arc::new(AuthService::new(
 
 **Fix:** consume `config.server.jwt_secret`, falling back to generating and persisting a per-install secret at `jwt_secret_path()`; take bcrypt cost from config with a sane default. Small change, closes the hole.
 
-### B2 — High: the knowledge-inject plugin writes to a file nothing reads
+### B2 — Resolved: removed the unused knowledge lifecycle plugins
 
-`KnowledgeInjectPlugin` (registered in production, `forge-cli/main.rs:186-191`) scores `docs/knowledge/*.md` against the task title and writes `.forge/knowledge-context.md` into the worktree (`services/src/lifecycle/knowledge_inject.rs:68-75`). A repo-wide search for `knowledge-context` finds **zero readers**: no prompt builder, no executor, no doc, no test outside the plugin's own. The paired `KnowledgeCapturePlugin` commits `docs/knowledge/` files directly with `git commit` inside the workspace (`knowledge_capture.rs:416-466`), outside the task's normal merge flow.
-
-The entire capture/inject feature is also absent from `docs/`, `CHANGELOG.md`, and `docs/spec/` — it shipped undocumented and unconnected. Either wire the context file into the dispatch prompt (one line telling the agent to read it) or remove the plugin pair until the memory Phase 3 work lands.
+The knowledge inject/capture pair was removed after confirming that nothing
+consumed `.forge/knowledge-context.md` or the capture commit. Lifecycle hooks
+now contain only configured plugins supplied by an embedding runtime.
 
 ### B3 — High: `max_turns` is only enforced for embedded executions
 
@@ -135,7 +135,6 @@ The 9-call `TaskService::new(...).with_*(...)` chain appears twice **inside one 
 - `docs/architecture.md:168` and `CLAUDE.md:102` still describe the "legacy `TaskStatus`/`transition_allowed` path" as live. It isn't (actor review F3, still unfixed) — and it misdirected this audit too until verified.
 - `docs/api.md` mentions ~37 of **131** registered `/api/v1` route paths (94 undocumented, including whole features: conversations, admin, notifications, workflow-templates, daemons). Reverse direction is clean: 0 documented-but-missing routes.
 - MCP: 24 tools implemented, **10 documented** (14 missing, including `forge_transition_task` — the tool the actor review centers on).
-- The knowledge capture/inject feature (B2) is entirely undocumented.
 
 ### G9 — Dev-loop glue: `forge-cli/build.rs` builds the frontend on every cargo invocation
 

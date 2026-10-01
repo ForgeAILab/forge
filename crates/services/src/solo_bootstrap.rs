@@ -524,27 +524,6 @@ impl SoloBootstrapService {
         Ok(result)
     }
 
-    /// List current candidate state for a scoped owner without materializing
-    /// a Project.  This is useful for a retryable first-run picker.
-    pub async fn list_candidates(
-        &self,
-        owner_id: &str,
-        observed: &[SoloAgentCandidateInput],
-    ) -> Result<Vec<SoloAgentCandidate>> {
-        let owner_id = required("owner_id", owner_id)?;
-        let inputs = if observed.is_empty() {
-            self.discovered_candidate_inputs(owner_id).await?
-        } else {
-            observed.to_vec()
-        };
-        Ok(self
-            .evaluate_candidate_inputs(owner_id, inputs)
-            .await?
-            .into_iter()
-            .map(|evaluation| evaluation.candidate)
-            .collect())
-    }
-
     /// Create or resume an owner-scoped local CLI Agent from a positive,
     /// structured harness discovery result. This is the convergent bridge for
     /// a new isolated store, where no Agent row exists yet. It deliberately

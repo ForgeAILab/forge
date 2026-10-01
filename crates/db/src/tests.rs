@@ -3633,6 +3633,60 @@ async fn migration_runner_is_idempotent() {
 }
 
 #[tokio::test]
+async fn remove_knowledge_lifecycle_hooks_migration_cleans_only_retired_plugins() {
+    let pool = create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    run_migrations(&pool).await.expect("migrations run");
+
+    let changed = r#"{ "max_active_tasks" : 7, "lifecycle_hooks": {"before_work": [ {"type":"script","command":"make setup"}, {"type":"plugin","name":"knowledge-inject","enabled":true}, {"type":"plugin","name":"other","config":{"keep":1}}, {"type":"plugin","name":"knowledge-capture"} ], "on_task_done": [{"type":"plugin","name":"knowledge-capture"},{"type":"script","command":"finish"}]}, "tail" : [1.00, "\u0061"] }"#;
+    let unchanged = r#" { "lifecycle_hooks" : { "before_work" : [ { "type" : "plugin", "name" : "other" } ] }, "untouched" : true } "#;
+    let invalid = "{not json";
+    for (id, settings) in [
+        ("changed", changed),
+        ("unchanged", unchanged),
+        ("invalid", invalid),
+    ] {
+        sqlx::query(
+            "INSERT INTO project (id, name, settings, created_at, updated_at)
+             VALUES (?, ?, ?, '2026-10-01T21:20:00Z', '2026-10-01T21:20:00Z')",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(settings)
+        .execute(&pool)
+        .await
+        .expect("legacy Project inserts");
+    }
+
+    sqlx::query("DELETE FROM _migration WHERE version = 202610012120")
+        .execute(&pool)
+        .await
+        .expect("knowledge hook migration marker clears");
+    run_migrations(&pool)
+        .await
+        .expect("knowledge hook migration re-applies");
+
+    let load_settings = |id: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("Project settings load")
+        }
+    };
+
+    assert_eq!(
+        load_settings("changed").await,
+        r#"{"max_active_tasks":7,"lifecycle_hooks":{"before_work":[{"type":"script","command":"make setup"},{"type":"plugin","name":"other","config":{"keep":1}}],"on_task_done":[{"type":"script","command":"finish"}]},"tail":[1.00,"\u0061"]}"#
+    );
+    assert_eq!(load_settings("unchanged").await, unchanged);
+    assert_eq!(load_settings("invalid").await, invalid);
+}
+
+#[tokio::test]
 async fn execution_liveness_migration_preserves_history_and_does_not_fabricate_owner() {
     let migration_root =
         std::env::temp_dir().join(format!("forge-db-migrations-{}", new_uuid_v4()));

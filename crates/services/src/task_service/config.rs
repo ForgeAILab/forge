@@ -195,26 +195,6 @@ pub(super) fn executor_snapshot_with_sticky_resume(
     }
 }
 
-#[allow(dead_code)]
-pub(super) fn executor_snapshot_without_resume_thread(snapshot_json: &str) -> Result<String> {
-    let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
-    if let Some(config) = snapshot.get_mut("config").and_then(Value::as_object_mut) {
-        config.remove(RESUME_THREAD_ID_CONFIG_KEY);
-        config.remove("resume_thread_in_place");
-        config.remove("resume_fallback_prompt");
-        config.remove("resume_session_id");
-    }
-    if let Some(obj) = snapshot.as_object_mut() {
-        obj.remove("dispatch_metadata");
-        if let Some(dispatch_obj) = obj.get_mut("dispatch").and_then(Value::as_object_mut) {
-            dispatch_obj.remove("execution_policy");
-        }
-    }
-    serde_json::to_string(&snapshot).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
-    })
-}
-
 pub(super) fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= max_bytes {

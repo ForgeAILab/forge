@@ -9,8 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{task::JoinHandle, time::sleep};
-use tracing::Instrument;
+use tokio::time::sleep;
 
 const SHUTDOWN_ERROR_TYPE: &str = "shutdown";
 
@@ -112,19 +111,6 @@ impl GracefulShutdown {
         }
         Ok(())
     }
-}
-
-pub fn install_signal_handler(shutdown: Arc<GracefulShutdown>) -> JoinHandle<()> {
-    tokio::spawn(
-        async move {
-            tracing::info!("shutdown signal handler installed");
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("shutdown signal received");
-                let _ = shutdown.shutdown().await;
-            }
-        }
-        .instrument(tracing::info_span!("shutdown.signal_handler")),
-    )
 }
 
 #[cfg(not(test))]

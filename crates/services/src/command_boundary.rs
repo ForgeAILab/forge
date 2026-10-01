@@ -86,14 +86,6 @@ impl CommandScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandOperationMetadata {
-    pub operation: String,
-    pub classification: OperationClassification,
-    pub required_permission: Option<String>,
-    pub allowed_scopes: Vec<CommandScopeType>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ExpectedCommandState {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -279,15 +271,6 @@ impl CommandOutcomeContext {
             scope: scope.into(),
             correlation_id: correlation_id.into(),
         }
-    }
-
-    #[must_use]
-    pub fn from_command_context(context: &CommandContext) -> Self {
-        Self::new(
-            context.operation().to_owned(),
-            CanonicalScopeRef::from(&context.canonical_scope),
-            context.correlation_id().to_owned(),
-        )
     }
 }
 

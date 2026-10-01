@@ -252,20 +252,6 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
     })
 }
 
-pub fn register_prompt_builder(builder: Arc<dyn PromptBuilder>) {
-    let mut builders = registry()
-        .write()
-        .expect("prompt builder registry lock poisoned");
-    builders.insert(builder.id().to_string(), builder);
-}
-
-pub fn register_default_role_builder(role: &str, builder_id: &str) {
-    let mut role_defaults = default_role_builders()
-        .write()
-        .expect("default role builder mapping lock poisoned");
-    role_defaults.insert(role.to_string(), builder_id.to_string());
-}
-
 pub fn resolve_prompt_builder(builder_id: &str) -> Arc<dyn PromptBuilder> {
     if let Some(builder) = registry()
         .read()
@@ -357,26 +343,6 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             description: "Fallback prompt for custom roles without a specialized builder.",
         },
     ]
-}
-
-pub fn dispatch_intent_from_config(value: &Value) -> DispatchIntent {
-    let dispatch = value.get("dispatch").unwrap_or(value);
-    let prompt_config = dispatch
-        .get("prompt")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-
-    DispatchIntent {
-        builder_id: dispatch
-            .get("builder")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        execution_policy: dispatch
-            .get("execution_policy")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        prompt_config,
-    }
 }
 
 pub fn dispatch_intent_from_workflow_dispatch(

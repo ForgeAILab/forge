@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo, CommentAuthorType,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateReview, CreateTask, CreateTaskComment,
-    CreateTransitionLog, DomainEventRepo, ExecutionRepo, ExecutionStatus, MemoryConfidence,
-    MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskCommentRepo,
-    TaskRepo, TransitionLogRepo,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo, CreateDomainEvent,
+    CreateExecution, CreateProject, CreateReview, CreateTask, DomainEventRepo, ExecutionRepo,
+    ExecutionStatus, MemoryConfidence, MemoryKind, MemorySourceType, ProjectRepo, ReviewRepo,
+    ReviewStatus, SqliteDb, TaskRepo,
 };
 use serde_json::json;
 use services::{AgentChatMemoryConsumer, MemoryItemInput, MemoryService, TaskService};
@@ -287,114 +286,6 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
         .expect("review loads")
         .expect("review exists");
     assert_eq!(review.status, ReviewStatus::Passed);
-}
-
-#[tokio::test]
-async fn memory_backfill_all_is_idempotent() {
-    let db = sqlite_db().await;
-    let (project_id, task_id) = seed_project_and_task(&db, "in_progress").await;
-    let now = now_rfc3339();
-    let execution_id = new_uuid_v4();
-    ExecutionRepo::create(
-        &*db,
-        CreateExecution {
-            id: execution_id.clone(),
-            task_id: task_id.clone(),
-            agent_id: None,
-            role: "coder".to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("execution summary".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("execution creates");
-    ReviewRepo::create(
-        &*db,
-        CreateReview {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            execution_id: execution_id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::Failed,
-            step_results_json: json!({ "auditor": { "verdict": "fail", "reason": "bug" } })
-                .to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("review creates");
-    TaskCommentRepo::create_comment(
-        &*db,
-        CreateTaskComment {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            author_type: CommentAuthorType::System,
-            author_id: None,
-            author_name: "Forge".to_owned(),
-            content: "comment content".to_owned(),
-            execution_id: None,
-            role: None,
-            worklog_kind: None,
-            idempotency_key: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("comment creates");
-    TransitionLogRepo::insert(
-        &*db,
-        CreateTransitionLog {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            from_state: "review".to_owned(),
-            to_state: "merge_failed".to_owned(),
-            trigger_name: Some("review_failed".to_owned()),
-            triggered_by: "system".to_owned(),
-            trigger_reason: "review failed".to_owned(),
-            hook_results_json: None,
-            rejection: true,
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect("transition creates");
-    let first = MemoryService::backfill_all(Arc::clone(&db))
-        .await
-        .expect("first backfill succeeds");
-    let second = MemoryService::backfill_all(Arc::clone(&db))
-        .await
-        .expect("second backfill succeeds");
-
-    assert_eq!(first.indexed, 4);
-    assert_eq!(first.skipped, 0);
-    assert_eq!(second.indexed, 0);
-    assert_eq!(second.skipped, 4);
-    let count =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memory_item WHERE project_id = ?")
-            .bind(project_id.to_string())
-            .fetch_one(db.pool())
-            .await
-            .expect("memory count loads");
-    assert_eq!(count, 4);
 }
 
 #[tokio::test]

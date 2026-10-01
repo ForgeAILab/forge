@@ -40,7 +40,6 @@ pub mod main_genesis_commands;
 pub mod main_orchestration_actions;
 pub mod main_orchestration_queries;
 pub mod memory;
-pub mod memory_source;
 pub mod merge_service;
 pub mod milestone_orchestration;
 pub mod milestone_runtime;
@@ -211,10 +210,6 @@ pub use memory::{
     BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
     MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
     MemoryService,
-};
-pub use memory_source::{
-    ForgeMemoryQuery, ForgeMemoryRecord, ForgeMemorySearch, ForgeMemorySource,
-    MemorySourceBindingInput,
 };
 pub use merge_service::{MergeOutcome, MergeService, ReviewCarryFacts};
 pub use milestone_orchestration::{

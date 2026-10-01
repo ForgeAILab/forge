@@ -40,18 +40,8 @@ impl SharedMediaCleanupScheduler {
         }
     }
 
-    pub fn with_batch_size(mut self, batch_size: i64) -> Self {
-        self.batch_size = batch_size.clamp(1, 500);
-        self
-    }
-
     pub fn with_lease_owner(mut self, lease_owner: impl Into<String>) -> Self {
         self.lease_owner = lease_owner.into();
-        self
-    }
-
-    pub fn with_lease_seconds(mut self, lease_seconds: i64) -> Self {
-        self.lease_seconds = lease_seconds.max(1);
         self
     }
 

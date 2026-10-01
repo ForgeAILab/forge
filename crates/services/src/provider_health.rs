@@ -14,7 +14,7 @@
 //! timed backoff lapses is the trial: success clears it, failure waits longer.
 
 use chrono::{DateTime, Duration, Utc};
-use db::{AgentRepo, CredentialHandleRepo, ProviderEntryHealth, SqliteDb};
+use db::{CredentialHandleRepo, ProviderEntryHealth, SqliteDb};
 
 use crate::Result;
 
@@ -386,22 +386,6 @@ pub async fn record_chat_outcome(
         }
     }
     Ok(())
-}
-
-/// Records one provider call's outcome for the entry an agent runs through.
-/// Agents without a provider entry (CLI runtimes) are ignored.
-pub async fn record_agent_outcome(
-    db: &SqliteDb,
-    agent_id: &str,
-    outcome: std::result::Result<(), &str>,
-) -> Result<()> {
-    let Some(agent) = AgentRepo::get_by_id(db, agent_id).await? else {
-        return Ok(());
-    };
-    let Some(credential_id) = agent.credential_ref.as_deref() else {
-        return Ok(());
-    };
-    record_entry_outcome(db, credential_id, outcome).await
 }
 
 /// Whether an agent's provider entry currently blocks new work.

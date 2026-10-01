@@ -119,6 +119,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - The upgrade clears stored pull-request provider tokens. The stored work
     mode of existing repositories is kept unchanged because it is part of
     release and evidence digests.
+- The `knowledge-inject` and `knowledge-capture` lifecycle plugins are
+  removed. Forge no longer writes `.forge/knowledge-context.md` (nothing read
+  it) or commits `docs/knowledge` into the workspace after each Task. The
+  upgrade removes those two hook entries from Project settings and keeps
+  every other hook.
 
 ### Changed
 

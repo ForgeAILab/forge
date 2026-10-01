@@ -13,8 +13,6 @@ pub trait LifecyclePlugin: Send + Sync {
         ctx: &LifecycleHookContext,
         workspace: &crate::workspace_backend::ResolvedWorkspace,
     ) -> Result<PluginResult, PluginError> {
-        // The built-in knowledge plugins use host filesystem APIs. Their
-        // local entry point must never interpret a daemon handle as a path.
         let path = workspace.embedded_path().map_err(|error| PluginError {
             message: error.to_string(),
         })?;

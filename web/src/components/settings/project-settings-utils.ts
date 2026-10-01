@@ -54,20 +54,7 @@ export const BUILTIN_PLUGINS: Array<{
   label: string
   description: string
   supportedEvents: LifecycleEvent[]
-}> = [
-  {
-    name: 'knowledge-inject',
-    label: 'Knowledge Inject',
-    description: 'Injects relevant knowledge base entries into agent context',
-    supportedEvents: ['before_work'],
-  },
-  {
-    name: 'knowledge-capture',
-    label: 'Knowledge Capture',
-    description: 'Captures knowledge from completed tasks',
-    supportedEvents: ['on_task_done'],
-  },
-]
+}> = []
 
 export function lifecycleHooksFromSettings(
   settings: Record<string, unknown> | null | undefined,

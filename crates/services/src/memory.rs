@@ -659,10 +659,6 @@ impl<R> MemoryService<R>
 where
     R: MemoryBackfillRepository + Send + Sync,
 {
-    pub async fn backfill_all(db: Arc<R>) -> Result<BackfillSummary> {
-        Self::new(db).backfill_sources().await
-    }
-
     pub async fn backfill_sources(&self) -> Result<BackfillSummary> {
         let mut results = backfill_results_by_type();
         for source in self.db.list_memory_backfill_sources().await? {

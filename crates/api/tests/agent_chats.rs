@@ -1179,17 +1179,12 @@ async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
                         token_usage_json: None,
                         duration_ms: None,
                     };
-                    if ledger {
-                        service
-                            .append_success_with_usage(&job, "reader", response, vec![])
-                            .await
-                            .unwrap();
-                    } else {
-                        service
-                            .append_success(&job, "reader", response)
-                            .await
-                            .unwrap();
-                    }
+                    // Success has one service path; it settles usage even
+                    // when there is none to settle.
+                    service
+                        .append_success_with_usage(&job, "reader", response, vec![])
+                        .await
+                        .unwrap();
                     "agent_chat.response.completed"
                 }
                 "failed" => {

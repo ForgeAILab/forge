@@ -3874,7 +3874,7 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.diff` | Read diffs and exact reviewer evidence |
 | `workspace.read` | Read bounded artifacts, Git evidence, and owner-local paths |
 | `workspace.merge` | Direct merge into the verified primary checkout |
-| `workspace.reset` | Reset the workspace or perform typed asset, knowledge, and review-checkout operations |
+| `workspace.reset` | Reset the workspace or perform typed asset and review-checkout operations |
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,

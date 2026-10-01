@@ -1,8 +1,7 @@
 use crate::{agent_capacity::has_execution_capacity, Result, ServiceError, TaskService};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
-    AgentStatus, CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, PageRequest,
-    SortBy, SortOrder, SqliteDb, UpdateAgent,
+    new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentRepo, AgentStatus,
+    CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde_json::Value;
@@ -430,76 +429,6 @@ impl AgentService {
     }
 
     #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
-    pub async fn update_heartbeat(&self, agent_id: impl Into<String>) -> Result<()> {
-        let agent_id = agent_id.into();
-        tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
-        validate_required("agent_id", &agent_id)?;
-        let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        AgentRepo::update(
-            &*self.db,
-            UpdateAgent {
-                id: agent_id,
-                expected_version: agent.version,
-                name: None,
-                description: None,
-                max_concurrent_tasks: None,
-                heartbeat_interval_seconds: None,
-                max_missed_heartbeats: None,
-                status: None,
-                last_heartbeat_at: Some(Some(now_rfc3339())),
-                model: None,
-                reasoning_effort: None,
-                permission_policy: None,
-                capabilities_json: None,
-                config_json: None,
-                daemon_id: None,
-                is_default: None,
-                paused: None,
-                prompt_template: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
-
-    #[tracing::instrument(
-        skip(self, capabilities_filter),
-        fields(capabilities_count = capabilities_filter.as_ref().map(Vec::len).unwrap_or_default())
-    )]
-    pub async fn list_available(
-        &self,
-        capabilities_filter: Option<Vec<String>>,
-    ) -> Result<Vec<Agent>> {
-        let page = AgentRepo::list(
-            &*self.db,
-            AgentListQuery {
-                status: Some(AgentStatus::Idle),
-                executor_type: None,
-                capabilities: capabilities_filter.unwrap_or_default(),
-                page: PageRequest {
-                    cursor: None,
-                    limit: 500,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Asc,
-                },
-            },
-        )
-        .await?;
-
-        let mut available = Vec::new();
-        for agent in page.items {
-            if has_execution_capacity(&self.db, &agent, None).await? {
-                available.push(agent);
-            }
-        }
-        Ok(available)
-    }
-
-    #[tracing::instrument(skip(self, agent_id), fields(agent_id = tracing::field::Empty))]
     pub async fn archive(&self, agent_id: impl Into<String>) -> Result<()> {
         let agent_id = agent_id.into();
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
@@ -810,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_update_heartbeat_list_and_archive_agent() {
+    async fn register_update_and_archive_agent() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let service = AgentService::new(Arc::clone(&db), Arc::clone(&event_bus));
@@ -850,32 +779,10 @@ mod tests {
         assert_eq!(updated.status, AgentStatus::Busy);
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.status_changed");
 
-        service
-            .update_heartbeat(updated.id.clone())
-            .await
-            .expect("heartbeat updates");
-        let reloaded = AgentRepo::get_by_id(&*db, &updated.id)
-            .await
-            .expect("agent loads")
-            .expect("agent exists");
-        assert!(reloaded.last_heartbeat_at.is_some());
-
-        let available = service
-            .list_available(Some(vec!["rust".to_owned()]))
-            .await
-            .expect("available agents list");
-        assert!(available.is_empty());
-
         let idle = service
-            .update_status(reloaded.id.clone(), AgentStatus::Idle, reloaded.version)
+            .update_status(updated.id.clone(), AgentStatus::Idle, updated.version)
             .await
             .expect("agent returns idle");
-        let available = service
-            .list_available(Some(vec!["rust".to_owned()]))
-            .await
-            .expect("available agents list");
-        assert_eq!(available, vec![idle.clone()]);
-
         service.archive(idle.id).await.expect("agent archives");
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.status_changed");
         assert_eq!(rx.recv().await.unwrap().event_type, "agent.archived");

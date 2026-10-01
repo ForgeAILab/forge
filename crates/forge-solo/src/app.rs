@@ -186,10 +186,6 @@ impl ProjectReadiness {
     pub fn allows_chat(&self) -> bool {
         matches!(self, Self::Ready | Self::AwaitingAdoption)
     }
-
-    pub fn allows_mutating_tasks(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,13 +259,6 @@ impl SetupState {
                 ..
             } => candidates.get(*selected),
             _ => None,
-        }
-    }
-
-    pub fn selected_index(&self) -> usize {
-        match self {
-            Self::AgentPicker { selected, .. } => *selected,
-            _ => 0,
         }
     }
 
@@ -760,14 +749,6 @@ impl TaskSummary {
             version: 0,
             selected: false,
         }
-    }
-
-    pub fn checks_passed(&self) -> bool {
-        !self.checks.is_empty()
-            && self
-                .checks
-                .iter()
-                .all(|check| check.state == CheckState::Passed)
     }
 }
 
@@ -1278,9 +1259,6 @@ pub struct AppState {
     retryable_send: Option<Command>,
 }
 
-/// Alias used by callers that prefer the product-level name.
-pub type SoloApp = AppState;
-
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -1322,11 +1300,6 @@ impl AppState {
 
     pub fn with_limits(mut self, limits: AppLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    pub fn with_idempotency_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.idempotency_prefix = prefix.into();
         self
     }
 

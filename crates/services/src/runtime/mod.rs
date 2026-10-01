@@ -1087,14 +1087,7 @@ fn remaining_until(deadline: Instant) -> Option<Duration> {
 }
 
 fn lifecycle_plugin_registry() -> Arc<crate::lifecycle::PluginRegistry> {
-    let mut registry = crate::lifecycle::PluginRegistry::new();
-    registry.register(Arc::new(
-        crate::lifecycle::knowledge_inject::KnowledgeInjectPlugin,
-    ));
-    registry.register(Arc::new(
-        crate::lifecycle::knowledge_capture::KnowledgeCapturePlugin,
-    ));
-    Arc::new(registry)
+    Arc::new(crate::lifecycle::PluginRegistry::new())
 }
 
 fn agent_chat_turn_log_root(config: &ForgeConfig) -> PathBuf {

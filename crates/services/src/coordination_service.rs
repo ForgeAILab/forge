@@ -288,19 +288,6 @@ impl CommitmentService {
         .await
     }
 
-    pub async fn add_evidence(
-        &self,
-        input: CommitmentEvidenceInput,
-    ) -> Result<AgentCommitmentEvidence> {
-        validate_evidence(&input)?;
-        db::AgentCommitmentRepo::add_commitment_evidence(
-            &*self.db,
-            to_db_evidence(input, now_rfc3339()),
-        )
-        .await
-        .map_err(Into::into)
-    }
-
     pub async fn evidence(&self, commitment_id: &str) -> Result<Vec<AgentCommitmentEvidence>> {
         db::AgentCommitmentRepo::list_commitment_evidence(&*self.db, commitment_id)
             .await
