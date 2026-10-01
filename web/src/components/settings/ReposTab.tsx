@@ -162,8 +162,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       toast.error('Remote URL is required')
       return null
     }
-    const remoteUrl =
-      nextForm.source_mode === 'local' ? remoteUrlInput || localPath : remoteUrlInput
+    const remoteUrl = remoteUrlInput || null
     const defaultBranch = nextForm.default_branch.trim() || 'main'
     const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
     const pollingInterval = Number(pollingIntervalInput)
@@ -204,8 +203,7 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
       toast.error('Remote URL is required')
       return null
     }
-    const remoteUrl =
-      nextForm.source_mode === 'local' ? remoteUrlInput || localPath : remoteUrlInput
+    const remoteUrl = remoteUrlInput || null
     const defaultBranch = nextForm.default_branch.trim() || 'main'
     const pollingIntervalInput = nextForm.pr_polling_interval_seconds.trim()
     const pollingInterval = Number(pollingIntervalInput)
@@ -489,7 +487,11 @@ export function ReposTab({ project, projectId }: { project?: Project; projectId:
               </div>
             ) : null}
           </div>
-          <IntegrationsTab embedded projectId={projectId} repoRemoteUrl={primaryRepo.remote_url} />
+          <IntegrationsTab
+            embedded
+            projectId={projectId}
+            repoRemoteUrl={primaryRepo.remote_url ?? undefined}
+          />
         </>
       ) : (
         <div className="rounded-lg border border-dashed p-8 text-center">

@@ -1,0 +1,6 @@
+[env]
+TS_RS_EXPORT_DIR = { value = "web/src/types/generated/bindings", relative = true }
+# Test threads get the same stack as the server's runtime threads
+# (RUNTIME_THREAD_STACK_SIZE in crates/forge-cli/src/main.rs). The default
+# 2 MiB test-thread stack overflows on deep dispatch futures in debug builds.
+RUST_MIN_STACK = "16777216"

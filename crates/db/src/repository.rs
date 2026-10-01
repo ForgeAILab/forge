@@ -86,13 +86,13 @@ pub trait TaskRepo: Send + Sync {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
     ) -> Result<Task>;
-    /// Restore interruption metadata only when no newer running execution for
-    /// the same Task (in any workspace) or the same workspace (including a
+    /// Update interruption and dispatch metadata only when no newer running
+    /// execution for the same Task (in any workspace) or the same workspace (including a
     /// shared-root sibling Task) is present. Recovery failure paths use this
     /// boundary so they cannot resurrect a manual-stop annotation over a live
     /// cross-role replacement admitted after the clear.
     #[allow(clippy::too_many_arguments)]
-    async fn restore_recovery_metadata_if_no_running_execution(
+    async fn update_recovery_metadata_if_no_running_execution(
         &self,
         id: &str,
         expected_version: i64,
@@ -102,7 +102,11 @@ pub trait TaskRepo: Send + Sync {
         updated_at: &str,
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
+        metadata_mutations: Vec<TaskMetadataMutation>,
     ) -> Result<Task>;
+    /// Restore a queued recovery's interruption and remove its intent in one
+    /// versioned write, including when an unrelated execution superseded it.
+    async fn restore_queued_recovery(&self, input: RestoreQueuedRecovery) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
     async fn set_review_passed_at(
@@ -1244,6 +1248,13 @@ pub trait RuntimeRepo: Send + Sync {
     async fn list(&self, query: RuntimeListQuery) -> Result<Page<Runtime>>;
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskExecutionProjectionQuery {
+    pub task_id: String,
+    pub current_role: Option<String>,
+    pub blocked_execution_id: Option<String>,
+}
+
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
@@ -1274,6 +1285,11 @@ pub trait ExecutionRepo: Send + Sync {
     /// concurrent insert cannot shift an older running row to another page.
     async fn list_running_by_task(&self, task_id: &str) -> Result<Vec<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;
+    /// Latest history, running occupancy, and bounded action authority for a page.
+    async fn list_task_projection_executions(
+        &self,
+        tasks: &[TaskExecutionProjectionQuery],
+    ) -> Result<Vec<Execution>>;
     async fn list_by_task_and_role(
         &self,
         task_id: &str,
@@ -2344,6 +2360,8 @@ pub trait ExternalLinkRepo: Send + Sync {
     async fn get_by_global_id(&self, global_id: &str) -> Result<Option<TaskExternalLink>>;
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<TaskExternalLink>>;
     async fn list_by_task_id(&self, task_id: &str) -> Result<Vec<TaskExternalLink>>;
+    async fn list_latest_links_for_tasks(&self, task_ids: &[&str])
+        -> Result<Vec<TaskExternalLink>>;
     async fn list_by_integration(&self, integration_id: &str) -> Result<Vec<TaskExternalLink>>;
     async fn delete_link(&self, id: &str) -> Result<()>;
 }
@@ -2451,7 +2469,7 @@ pub struct CreateRepo {
     pub id: String,
     pub project_id: String,
     pub name: String,
-    pub remote_url: String,
+    pub remote_url: Option<String>,
     pub local_path: Option<String>,
     pub work_mode: WorkMode,
     pub default_branch: String,
@@ -2464,7 +2482,7 @@ pub struct UpdateRepo {
     pub id: String,
     pub name: Option<String>,
     pub local_path: Option<Option<String>>,
-    pub remote_url: Option<String>,
+    pub remote_url: Option<Option<String>>,
     pub work_mode: Option<WorkMode>,
     pub default_branch: Option<String>,
     pub updated_at: String,
@@ -2909,6 +2927,8 @@ pub struct CreateExecution {
 /// between the dispatcher's final read and admission fails closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionAdmission {
+    /// Only the replay owning this exact intent may consume it at admission.
+    pub expected_queued_recovery_id: Option<String>,
     /// Project revision selected with the Task/workflow snapshot. Project
     /// settings, repository, pause, and workflow edits all advance this
     /// revision; role launches must not admit a stale prepared execution even
@@ -2958,6 +2978,16 @@ pub struct ExecutionAdmission {
     /// the task is governed by the built-in inherited subtask workflow. This
     /// lets the transaction detect a workflow edit that did not bump Task.
     pub expected_workflow_definition: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestoreQueuedRecovery {
+    pub task_id: String,
+    pub expected_version: i64,
+    pub queued_recovery_id: String,
+    pub error_annotation: Option<String>,
+    pub blocked_json: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3401,6 +3431,7 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
         &self,
         task_id: &str,
     ) -> std::result::Result<Vec<TaskRoleAssignment>, crate::DbError>;
+    async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TaskRoleAssignment>>;
     async fn remove(
         &self,
         task_id: &str,
@@ -3448,6 +3479,7 @@ pub trait TransitionLogRepo: Send + Sync {
         &self,
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, crate::DbError>;
+    async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>>;
     async fn count_gate_rejections(
         &self,
         task_id: &str,

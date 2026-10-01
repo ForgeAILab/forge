@@ -2,11 +2,11 @@
 import type { AgentStatus } from "./AgentStatus";
 import type { UsageAggregate } from "./UsageAggregate";
 
-export type AgentResponse = { id: string, name: string, description: string | null, profile_id: string, backend_kind: string, executor_type: string, provider: string | null, model: string | null, reasoning_effort: string | null, permission_policy: string | null, prompt_template: string | null, capabilities: Array<string>, config_json: Record<string, unknown>, credential_handle_id: string | null, daemon_id: string | null, max_concurrent_tasks: bigint, status: AgentStatus,
+export type AgentResponse = { id: string, name: string, description: string | null, profile_id: string, backend_kind: string, executor_type: string, provider: string | null, model: string | null, reasoning_effort: string | null, permission_policy: string | null, prompt_template: string | null, capabilities: Array<string>, config_json: Record<string, unknown>, credential_handle_id: string | null, daemon_id: string | null, max_concurrent_tasks: bigint, status: AgentStatus, 
 /**
  * Assigned workload; see `Agent::active_assigned_task_count`.
  */
-active_assigned_task_count: bigint | null,
+active_assigned_task_count: bigint | null, 
 /**
  * Live concurrency; this is what `max_concurrent_tasks` gates.
  */

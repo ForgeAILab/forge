@@ -7,11 +7,11 @@
  * currency is fixed to USD for this revision, even though it is represented
  * as a string so that the JSON contract remains straightforward for clients.
  */
-export type MoneyAmount = {
+export type MoneyAmount = { 
 /**
  * Always `USD` in this API revision.
  */
-currency: "USD",
+currency: "USD", 
 /**
  * Canonical non-negative decimal text; never an exponent.
  */

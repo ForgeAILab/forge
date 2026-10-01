@@ -722,30 +722,7 @@ impl CoordinationToolProvider {
             ));
         }
         let task_id = scope.scope_id.clone();
-        let kind = payload
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                matches!(
-                    *value,
-                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
-                )
-            })
-            .ok_or_else(|| {
-                invalid_arguments(
-                    "kind must be screenshot, walkthrough_video, log, report, or other".to_owned(),
-                )
-            })?
-            .to_owned();
-        let caption = payload
-            .get("caption")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                invalid_arguments("caption describing the artifact is required".to_owned())
-            })?
-            .to_owned();
+        let (kind, caption) = evidence_kind_and_caption(payload).map_err(invalid_arguments)?;
         let path = payload
             .get("path")
             .and_then(Value::as_str)
@@ -778,7 +755,7 @@ impl CoordinationToolProvider {
                     .and_then(|value| value.to_str())
                     .unwrap_or("artifact")
                     .to_owned();
-                let content_type = content_type_for(&name, &kind);
+                let content_type = content_type_for(&name, kind);
                 (bytes, name, content_type)
             }
             (None, Some(content)) => (
@@ -812,6 +789,12 @@ impl CoordinationToolProvider {
             .map(str::trim)
             .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
             .map_or(default_name, str::to_owned);
+        let filename = match payload.get("kind").and_then(Value::as_str) {
+            Some(original_kind) if original_kind != kind => {
+                format!("[{}] {filename}", original_kind.replace(['/', '\\'], "_"))
+            }
+            _ => filename,
+        };
 
         let stored = self
             .store_task_evidence(actor_identity_id, &task_id, &filename, content_type, &bytes)
@@ -960,8 +943,8 @@ impl CoordinationToolProvider {
 
     /// Store Task evidence under a caller-selected durable identity.
     ///
-    /// CLI outbox ingestion derives this identity from the execution and JSONL
-    /// line. If the process stops after the media row commits but before its
+    /// CLI outbox ingestion derives this identity from the execution and record
+    /// position. If the process stops after the media row commits but before its
     /// caption comment is appended, replay resolves the same media instead of
     /// creating another asset.
     async fn store_task_evidence_with_id(
@@ -1137,30 +1120,38 @@ impl CoordinationToolProvider {
         };
 
         let author_name = input.role.unwrap_or("agent").to_owned();
-        for (line_no, line) in
-            read_outbox_lines(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut report)
+        for (position, entry) in
+            read_outbox_entries(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut report)
         {
-            match self
-                .ingest_outbox_worklog(input, &author_name, line_no, &line)
-                .await
-            {
+            let result = match entry {
+                Ok(entry) => {
+                    self.ingest_outbox_worklog(input, &author_name, &position, &entry)
+                        .await
+                }
+                Err(reason) => Err(reason),
+            };
+            match result {
                 Ok(()) => report.worklog_entries += 1,
                 Err(reason) => report.rejected.push(format!(
-                    "{}:{line_no}: {reason}",
+                    "{}:{position}: {reason}",
                     executors::OUTBOX_WORKLOG_FILE
                 )),
             }
         }
-        for (line_no, line) in
-            read_outbox_lines(&outbox, executors::OUTBOX_EVIDENCE_FILE, &mut report)
+        for (position, entry) in
+            read_outbox_entries(&outbox, executors::OUTBOX_EVIDENCE_FILE, &mut report)
         {
-            match self
-                .ingest_outbox_evidence(input, &author_name, &outbox, line_no, &line)
-                .await
-            {
+            let result = match entry {
+                Ok(entry) => {
+                    self.ingest_outbox_evidence(input, &author_name, &outbox, &position, &entry)
+                        .await
+                }
+                Err(reason) => Err(reason),
+            };
+            match result {
                 Ok(()) => report.evidence_items += 1,
                 Err(reason) => report.rejected.push(format!(
-                    "{}:{line_no}: {reason}",
+                    "{}:{position}: {reason}",
                     executors::OUTBOX_EVIDENCE_FILE
                 )),
             }
@@ -1200,10 +1191,16 @@ impl CoordinationToolProvider {
         &self,
         input: &ExecutionOutboxInput<'_>,
         author_name: &str,
-        line_no: usize,
-        line: &str,
+        position: &str,
+        entry: &Value,
     ) -> Result<(), String> {
-        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+        let idempotency_key = format!("outbox:{}:worklog:{position}", input.execution_id);
+        if self
+            .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
+            .await?
+        {
+            return Ok(());
+        }
         let kind = entry
             .get("kind")
             .and_then(Value::as_str)
@@ -1220,14 +1217,8 @@ impl CoordinationToolProvider {
                 "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
             ));
         }
-        self.append_outbox_worklog(
-            input,
-            author_name,
-            kind,
-            summary,
-            format!("outbox:{}:worklog:{line_no}", input.execution_id),
-        )
-        .await
+        self.append_outbox_worklog(input, author_name, kind, summary, idempotency_key)
+            .await
     }
 
     async fn ingest_outbox_evidence(
@@ -1235,10 +1226,10 @@ impl CoordinationToolProvider {
         input: &ExecutionOutboxInput<'_>,
         author_name: &str,
         outbox: &Path,
-        line_no: usize,
-        line: &str,
+        position: &str,
+        entry: &Value,
     ) -> Result<(), String> {
-        let idempotency_key = format!("outbox:{}:evidence:{line_no}", input.execution_id);
+        let idempotency_key = format!("outbox:{}:evidence:{position}", input.execution_id);
         if self
             .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
             .await?
@@ -1246,23 +1237,7 @@ impl CoordinationToolProvider {
             return Ok(());
         }
 
-        let entry: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
-        let kind = entry
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                matches!(
-                    *value,
-                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
-                )
-            })
-            .ok_or("kind must be screenshot, walkthrough_video, log, report, or other")?;
-        let caption = entry
-            .get("caption")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or("caption describing the artifact is required")?;
+        let (kind, caption) = evidence_kind_and_caption(entry)?;
         let path = entry
             .get("path")
             .and_then(Value::as_str)
@@ -1315,36 +1290,20 @@ impl CoordinationToolProvider {
             &filename,
             content_type,
             &bytes,
-            outbox_evidence_media_id(input.execution_id, line_no),
+            outbox_evidence_media_id(input.execution_id, position),
         )
         .await
         .map_err(|error| error.to_string())?;
         // The file has no response channel to report the stored asset back
         // through, so the caption becomes the worklog line naming it.
-        let appended = self
-            .append_outbox_worklog(
-                input,
-                author_name,
-                "validation",
-                &format!("Captured {kind} evidence `{filename}`: {caption}"),
-                idempotency_key.clone(),
-            )
-            .await;
-        match appended {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if self
-                    .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
-                    .await?
-                {
-                    // Concurrent ingestion may lose the unique idempotency-key
-                    // insert after storing the same deterministic media receipt.
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            }
-        }
+        self.append_outbox_worklog(
+            input,
+            author_name,
+            "validation",
+            &format!("Captured {kind} evidence `{filename}`: {caption}"),
+            idempotency_key,
+        )
+        .await
     }
 
     async fn outbox_worklog_receipt_exists(
@@ -1374,7 +1333,7 @@ impl CoordinationToolProvider {
         idempotency_key: String,
     ) -> Result<(), String> {
         let now = db::now_rfc3339();
-        db::TaskCommentRepo::create_comment(
+        let result = db::TaskCommentRepo::create_comment(
             &*self.db,
             db::CreateTaskComment {
                 id: db::new_uuid_v4(),
@@ -1386,14 +1345,27 @@ impl CoordinationToolProvider {
                 execution_id: Some(input.execution_id.to_owned()),
                 role: input.role.map(str::to_owned),
                 worklog_kind: Some(kind.to_owned()),
-                idempotency_key: Some(idempotency_key),
+                idempotency_key: Some(idempotency_key.clone()),
                 created_at: now.clone(),
                 updated_at: now,
             },
         )
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A concurrent replay can win the insert after the repository's
+                // lookup. Its durable receipt makes this append successful too.
+                if self
+                    .outbox_worklog_receipt_exists(input.task_id, &idempotency_key)
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    Err(error.to_string())
+                }
+            }
+        }
     }
 
     async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
@@ -1462,21 +1434,7 @@ impl CoordinationToolProvider {
             .project_orchestration_target(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let kind = payload
-            .get("kind")
-            .and_then(Value::as_str)
-            .filter(|value| {
-                matches!(
-                    *value,
-                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
-                )
-            })
-            .ok_or_else(|| {
-                invalid_arguments(
-                    "kind must be screenshot, walkthrough_video, log, report, or other".to_owned(),
-                )
-            })?
-            .to_owned();
+        let (kind, caption) = evidence_kind_and_caption(&payload).map_err(invalid_arguments)?;
         if payload
             .get("asset_id")
             .is_some_and(|value| !value.is_null())
@@ -1526,7 +1484,7 @@ impl CoordinationToolProvider {
                 // The Project media store accepts a closed content-type set;
                 // structured-text and unknown captures are stored as plain
                 // text rather than refused after the bytes were read.
-                let content_type = match content_type_for(&name, &kind).as_str() {
+                let content_type = match content_type_for(&name, kind).as_str() {
                     "application/json" | "application/octet-stream" => "text/plain".to_owned(),
                     other => other.to_owned(),
                 };
@@ -1649,6 +1607,8 @@ impl CoordinationToolProvider {
         .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         let mut object = payload.as_object().cloned().unwrap_or_default();
         object.insert("action".to_owned(), json!("attach"));
+        object.insert("kind".to_owned(), json!(kind));
+        object.insert("caption".to_owned(), json!(caption));
         object.insert("asset_id".to_owned(), json!(created.id));
         object.insert("checksum".to_owned(), json!(checksum));
         object.remove("content");
@@ -4996,21 +4956,41 @@ const MAX_OUTBOX_FILE_BYTES: u64 = 1024 * 1024;
 /// At most this many entries of one outbox file are ingested.
 const MAX_OUTBOX_ENTRIES: usize = 200;
 
-fn outbox_evidence_media_id(execution_id: &str, line_no: usize) -> String {
+fn evidence_kind_and_caption(payload: &Value) -> Result<(&str, String), String> {
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("kind must be a non-empty string")?;
+    let caption = payload
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("caption describing the artifact is required")?;
+    match kind {
+        "screenshot" | "walkthrough_video" | "log" | "report" | "other" => {
+            Ok((kind, caption.to_owned()))
+        }
+        _ => Ok(("other", format!("[{kind}] {caption}"))),
+    }
+}
+
+fn outbox_evidence_media_id(execution_id: &str, position: &str) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
-        format!("forge:execution:{execution_id}:outbox-evidence:{line_no}").as_bytes(),
+        format!("forge:execution:{execution_id}:outbox-evidence:{position}").as_bytes(),
     )
     .to_string()
 }
 
-/// Non-empty lines of one outbox file, numbered from 1, within the size and
-/// entry bounds. Bounds violations are reported, not silently truncated.
-fn read_outbox_lines(
+/// JSON objects from a bounded file, including pretty-printed and concatenated
+/// objects. Malformed content is reported before resuming at the next line.
+fn read_outbox_entries(
     outbox: &Path,
     file: &str,
     report: &mut ExecutionOutboxReport,
-) -> Vec<(usize, String)> {
+) -> Vec<(String, Result<Value, String>)> {
     let path = outbox.join(file);
     let bytes = match read_bounded_regular_file(&path, outbox, MAX_OUTBOX_FILE_BYTES, true) {
         Ok(Some(bytes)) => bytes,
@@ -5029,19 +5009,60 @@ fn read_outbox_lines(
             return Vec::new();
         }
     };
-    let lines = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| (index + 1, line.to_owned()))
+    let line_starts = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
         .collect::<Vec<_>>();
-    if lines.len() > MAX_OUTBOX_ENTRIES {
-        report.rejected.push(format!(
-            "{file}: only the first {MAX_OUTBOX_ENTRIES} of {} entries were ingested",
-            lines.len()
-        ));
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    let mut previous_line = 0;
+    while offset < text.len() {
+        offset += text.as_bytes()[offset..]
+            .iter()
+            .take_while(|byte| matches!(**byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        if offset == text.len() {
+            break;
+        }
+        if entries.len() == MAX_OUTBOX_ENTRIES {
+            report.rejected.push(format!(
+                "{file}: only the first {MAX_OUTBOX_ENTRIES} entries were ingested"
+            ));
+            break;
+        }
+        let line_no = line_starts.partition_point(|start| *start <= offset);
+        // Preserve existing JSONL receipt keys; a second object on the same
+        // physical line also needs its byte column to remain distinct.
+        let position = if line_no == previous_line {
+            format!("{line_no}:{}", offset - line_starts[line_no - 1] + 1)
+        } else {
+            line_no.to_string()
+        };
+        previous_line = line_no;
+        let mut stream = serde_json::Deserializer::from_str(&text[offset..]).into_iter::<Value>();
+        let Some(entry) = stream.next() else {
+            break;
+        };
+        match entry {
+            Ok(value) => {
+                offset += stream.byte_offset();
+                entries.push((
+                    position,
+                    if value.is_object() {
+                        Ok(value)
+                    } else {
+                        Err("entry must be a JSON object".to_owned())
+                    },
+                ));
+            }
+            Err(error) => {
+                entries.push((position, Err(error.to_string())));
+                offset += text[offset..]
+                    .find('\n')
+                    .map_or(text.len() - offset, |index| index + 1);
+            }
+        }
     }
-    lines.into_iter().take(MAX_OUTBOX_ENTRIES).collect()
+    entries
 }
 
 /// Resolve an outbox evidence path: worktree-relative, or absolute inside the
@@ -5301,7 +5322,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "repo".to_owned(),
-                remote_url: "https://example.invalid/repo.git".to_owned(),
+                remote_url: Some("https://example.invalid/repo.git".to_owned()),
                 local_path: None,
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
@@ -5644,7 +5665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_invalid_plan_outbox_replays_evidence_exactly_once() {
+    async fn retained_invalid_plan_outbox_replays_worklog_and_evidence_exactly_once() {
         let fixture = native_plan_fixture("planner", "planner").await;
         let media_root = fixture._temp.path().join("media");
         fixture.provider.set_media_root(media_root.clone());
@@ -5653,6 +5674,11 @@ mod tests {
         std::fs::create_dir_all(&outbox).expect("outbox creates");
         std::fs::write(outbox.join("plan.md"), "# Plan without checklist\n")
             .expect("invalid plan writes");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_WORKLOG_FILE),
+            "{\"kind\":\"validation\",\"summary\":\"focused tests passed\"}\n",
+        )
+        .expect("worklog writes");
         std::fs::write(
             outbox.join(executors::OUTBOX_EVIDENCE_FILE),
             concat!(
@@ -5664,7 +5690,7 @@ mod tests {
 
         // Reproduce a stop after the media commit but before the caption
         // comment. The next ingestion must resolve this durable identity.
-        let media_id = outbox_evidence_media_id(&fixture.execution_id, 1);
+        let media_id = outbox_evidence_media_id(&fixture.execution_id, "1");
         fixture
             .provider
             .store_task_evidence_with_id(
@@ -5687,13 +5713,18 @@ mod tests {
             worktree_path: &worktree_path,
         };
         let first = fixture.provider.ingest_execution_outbox(&input).await;
+        assert_eq!(first.worklog_entries, 1, "{first:?}");
         assert_eq!(first.evidence_items, 1, "{first:?}");
         assert!(first.plan_rejected, "{first:?}");
+        assert_eq!(first.rejected.len(), 1, "{first:?}");
+        assert!(first.rejected[0].starts_with("plan.md:"));
         assert!(outbox.exists(), "the rejected plan retains its outbox");
 
         let replay = fixture.provider.ingest_execution_outbox(&input).await;
+        assert_eq!(replay.worklog_entries, 1, "{replay:?}");
         assert_eq!(replay.evidence_items, 1, "{replay:?}");
         assert!(replay.plan_rejected, "{replay:?}");
+        assert_eq!(replay.rejected, first.rejected);
         assert!(outbox.exists(), "the rejected plan remains diagnosable");
 
         let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
@@ -5727,12 +5758,234 @@ mod tests {
         .await
         .expect("comments list")
         .items;
-        assert_eq!(comments.len(), 1, "replay must not append another caption");
-        let receipt_key = format!("outbox:{}:evidence:1", fixture.execution_id);
+        assert_eq!(comments.len(), 2, "replay must not append another entry");
+        let worklog_key = format!("outbox:{}:worklog:1", fixture.execution_id);
         assert_eq!(
             comments[0].idempotency_key.as_deref(),
+            Some(worklog_key.as_str())
+        );
+        let receipt_key = format!("outbox:{}:evidence:1", fixture.execution_id);
+        assert_eq!(
+            comments[1].idempotency_key.as_deref(),
             Some(receipt_key.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn execution_outbox_normalizes_unknown_evidence_kinds() {
+        let fixture = native_plan_fixture("worker", "worker").await;
+        fixture
+            .provider
+            .set_media_root(fixture._temp.path().join("media"));
+        let outbox = executors::prepare_execution_outbox(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox creates");
+        std::fs::write(fixture.worktree.join("benchmark.log"), "120 ops/s\n")
+            .expect("benchmark writes");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_EVIDENCE_FILE),
+            concat!(
+                r#"{"kind":"test","caption":"focused tests","content":"20 tests OK"}"#,
+                "\n",
+                r#"{"kind":"benchmark","caption":"throughput","path":"benchmark.log"}"#,
+                "\n",
+                r#"{"kind":"log","caption":"standard kind","content":"OK"}"#,
+                "\n",
+                r#"{"caption":"missing kind","content":"OK"}"#,
+                "\n",
+                r#"{"kind":7,"caption":"invalid kind","content":"OK"}"#,
+                "\n",
+            ),
+        )
+        .expect("evidence writes");
+        let worktree_path = fixture.worktree.to_string_lossy().into_owned();
+        let report = fixture
+            .provider
+            .ingest_execution_outbox(&ExecutionOutboxInput {
+                task_id: &fixture.task_id,
+                execution_id: &fixture.execution_id,
+                agent_id: &fixture.agent_id,
+                role: Some("worker"),
+                worktree_path: &worktree_path,
+            })
+            .await;
+
+        assert_eq!(report.evidence_items, 3, "{report:?}");
+        assert_eq!(report.rejected.len(), 2, "{report:?}");
+        assert!(report
+            .rejected
+            .iter()
+            .all(|reason| reason.contains("kind must be a non-empty string")));
+        let comments: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM task_comment WHERE task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_all(fixture.db.pool())
+                .await
+                .expect("comments list");
+        assert!(comments
+            .contains(&"Captured other evidence `other.txt`: [test] focused tests".to_owned()));
+        assert!(comments.contains(
+            &"Captured other evidence `benchmark.log`: [benchmark] throughput".to_owned()
+        ));
+        assert!(comments.contains(&"Captured log evidence `log.txt`: standard kind".to_owned()));
+        let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("media lists");
+        assert_eq!(media.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn native_task_evidence_preserves_unknown_kind_in_stored_filename() {
+        let fixture = native_plan_fixture("worker", "worker").await;
+        fixture
+            .provider
+            .set_media_root(fixture._temp.path().join("media"));
+        let result = fixture
+            .provider
+            .execute_task_evidence_capture(
+                &fixture.agent_id,
+                &fixture.scope,
+                &json!({"kind": "test", "caption": "focused tests", "content": "OK"}),
+            )
+            .await
+            .expect("unknown kind captures");
+
+        assert_eq!(result["kind"], "other");
+        assert_eq!(result["caption"], "[test] focused tests");
+        let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("media lists");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].display_filename, "[test] other.txt");
+    }
+
+    #[tokio::test]
+    async fn execution_outbox_ingests_pretty_printed_and_concatenated_objects() {
+        let fixture = native_plan_fixture("worker", "worker").await;
+        fixture
+            .provider
+            .set_media_root(fixture._temp.path().join("media"));
+        let outbox = executors::prepare_execution_outbox(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox creates");
+        std::fs::write(outbox.join("plan.md"), "# Missing checklist\n")
+            .expect("invalid plan writes");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_WORKLOG_FILE),
+            format!(
+                "{}\n\n{}{}\n",
+                serde_json::to_string_pretty(&json!({"kind": "progress", "summary": "approach"}))
+                    .expect("pretty worklog serializes"),
+                json!({"kind": "decision", "summary": "implementation"}),
+                json!({"kind": "validation", "summary": "verification"}),
+            ),
+        )
+        .expect("worklog writes");
+        std::fs::write(
+            outbox.join(executors::OUTBOX_EVIDENCE_FILE),
+            format!(
+                "{}\n{}{}\n",
+                serde_json::to_string_pretty(
+                    &json!({"kind": "log", "caption": "first", "content": "one"})
+                )
+                .expect("pretty evidence serializes"),
+                json!({"kind": "log", "caption": "second", "content": "two"}),
+                json!({"kind": "log", "caption": "third", "content": "three"}),
+            ),
+        )
+        .expect("evidence writes");
+        let worktree_path = fixture.worktree.to_string_lossy().into_owned();
+        let input = ExecutionOutboxInput {
+            task_id: &fixture.task_id,
+            execution_id: &fixture.execution_id,
+            agent_id: &fixture.agent_id,
+            role: Some("worker"),
+            worktree_path: &worktree_path,
+        };
+        for _ in 0..2 {
+            let report = fixture.provider.ingest_execution_outbox(&input).await;
+            assert_eq!(report.worklog_entries, 3, "{report:?}");
+            assert_eq!(report.evidence_items, 3, "{report:?}");
+            assert_eq!(report.rejected.len(), 1, "{report:?}");
+            assert!(report.rejected[0].starts_with("plan.md:"));
+        }
+        let comments: Vec<(String, String)> =
+            sqlx::query_as("SELECT idempotency_key, content FROM task_comment WHERE task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_all(fixture.db.pool())
+                .await
+                .expect("comments list");
+        assert_eq!(
+            comments.len(),
+            6,
+            "each streamed object has a distinct receipt"
+        );
+        for summary in ["approach", "implementation", "verification"] {
+            assert!(comments.iter().any(|(_, content)| content == summary));
+        }
+        assert!(comments
+            .iter()
+            .any(|(key, _)| key == &format!("outbox:{}:worklog:1", fixture.execution_id)));
+        let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("media lists");
+        assert_eq!(
+            media.len(),
+            3,
+            "replay does not duplicate concatenated artifacts"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_outbox_worklog_and_evidence_replays_are_already_ingested() {
+        let fixture = native_plan_fixture("worker", "worker").await;
+        fixture
+            .provider
+            .set_media_root(fixture._temp.path().join("media"));
+        let outbox = executors::prepare_execution_outbox(&fixture.worktree, &fixture.execution_id)
+            .expect("outbox creates");
+        let worktree_path = fixture.worktree.to_string_lossy().into_owned();
+        let input = ExecutionOutboxInput {
+            task_id: &fixture.task_id,
+            execution_id: &fixture.execution_id,
+            agent_id: &fixture.agent_id,
+            role: Some("worker"),
+            worktree_path: &worktree_path,
+        };
+        let key = format!("outbox:{}:worklog:1", fixture.execution_id);
+        let (first, replay) = tokio::join!(
+            fixture.provider.append_outbox_worklog(
+                &input,
+                "worker",
+                "validation",
+                "OK",
+                key.clone()
+            ),
+            fixture
+                .provider
+                .append_outbox_worklog(&input, "worker", "validation", "OK", key),
+        );
+        first.expect("first append succeeds");
+        replay.expect("concurrent replay succeeds");
+        let evidence = json!({"kind": "log", "caption": "focused tests", "content": "OK"});
+        let (first, replay) = tokio::join!(
+            fixture
+                .provider
+                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+            fixture
+                .provider
+                .ingest_outbox_evidence(&input, "worker", &outbox, "1", &evidence),
+        );
+        first.expect("first evidence capture succeeds");
+        replay.expect("concurrent evidence replay succeeds");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id = ?")
+            .bind(&fixture.task_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("comments count");
+        assert_eq!(count, 2, "one worklog entry and one evidence caption");
+        let media = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .expect("media lists");
+        assert_eq!(media.len(), 1);
     }
 
     #[tokio::test]
@@ -5829,6 +6082,8 @@ mod tests {
                 "\n\n",
                 r#"{"kind":"chatter","summary":"not a kind"}"#,
                 "\nnot json\n",
+                r#"{"kind":"progress","summary":"valid entry after malformed content"}"#,
+                "\n",
             ),
         )
         .expect("worklog");
@@ -5860,7 +6115,7 @@ mod tests {
             })
             .await;
 
-        assert_eq!(report.worklog_entries, 1, "{report:?}");
+        assert_eq!(report.worklog_entries, 2, "{report:?}");
         assert_eq!(report.evidence_items, 3, "{report:?}");
         assert_eq!(report.rejected.len(), 3, "{report:?}");
         assert!(report.rejected[0].starts_with("worklog.jsonl:3: kind must be"));
@@ -5890,7 +6145,7 @@ mod tests {
         .await
         .expect("comments list")
         .items;
-        assert_eq!(comments.len(), 4);
+        assert_eq!(comments.len(), 5);
         assert!(comments.iter().all(|comment| {
             comment.execution_id.as_deref() == Some("exec-1")
                 && comment.role.as_deref() == Some("reviewer")
@@ -5898,6 +6153,10 @@ mod tests {
         }));
         assert_eq!(comments[0].worklog_kind.as_deref(), Some("validation"));
         assert_eq!(comments[0].content, "unittest: 20 OK");
+        assert!(comments.iter().any(|comment| {
+            comment.content == "valid entry after malformed content"
+                && comment.worklog_kind.as_deref() == Some("progress")
+        }));
         assert!(comments
             .iter()
             .any(|comment| comment.content.contains("`shot.png`: saved in the outbox")));
@@ -6284,9 +6543,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn outbox_entry_reader_reports_malformed_and_non_object_content() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            temp.path().join(executors::OUTBOX_WORKLOG_FILE),
+            concat!(
+                "not json\n",
+                "{\n\"kind\":\"progress\",\n\"summary\":\"valid\"\n}\n",
+                "[]\n",
+                "{\"kind\":\"validation\",\"summary\":",
+            ),
+        )
+        .expect("worklog writes");
+        let mut report = ExecutionOutboxReport::default();
+        let entries = read_outbox_entries(temp.path(), executors::OUTBOX_WORKLOG_FILE, &mut report);
+        assert!(
+            report.rejected.is_empty(),
+            "entry errors stay in file order"
+        );
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].0, "1");
+        assert!(entries[0].1.is_err());
+        assert_eq!(entries[1].0, "2");
+        assert_eq!(
+            entries[1].1.as_ref().expect("pretty object parses")["summary"],
+            "valid"
+        );
+        assert_eq!(entries[2].0, "6");
+        assert_eq!(
+            entries[2].1.as_ref().expect_err("array is not an entry"),
+            "entry must be a JSON object"
+        );
+        assert_eq!(entries[3].0, "7");
+        assert!(entries[3]
+            .1
+            .as_ref()
+            .expect_err("truncated object is malformed")
+            .contains("EOF"));
+    }
+
+    #[test]
+    fn outbox_entry_reader_limits_objects_rather_than_pretty_printed_lines() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let entry = json!({
+            "kind": "progress",
+            "summary": "large pretty object",
+            "details": vec![0; MAX_OUTBOX_ENTRIES + 1],
+        });
+        let pretty = serde_json::to_string_pretty(&entry).expect("pretty object serializes");
+        assert!(pretty.lines().count() > MAX_OUTBOX_ENTRIES);
+        let path = temp.path().join(executors::OUTBOX_WORKLOG_FILE);
+        std::fs::write(&path, &pretty).expect("pretty object writes");
+        let mut report = ExecutionOutboxReport::default();
+        let entries = read_outbox_entries(temp.path(), executors::OUTBOX_WORKLOG_FILE, &mut report);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.as_ref().expect("pretty object parses"), &entry);
+        assert!(report.rejected.is_empty());
+
+        std::fs::write(&path, "{}".repeat(MAX_OUTBOX_ENTRIES + 1)).expect("object stream writes");
+        let entries = read_outbox_entries(temp.path(), executors::OUTBOX_WORKLOG_FILE, &mut report);
+        assert_eq!(entries.len(), MAX_OUTBOX_ENTRIES);
+        assert_eq!(report.rejected.len(), 1);
+        assert!(report.rejected[0].contains("only the first 200 entries"));
+        let positions: BTreeSet<_> = entries.iter().map(|(position, _)| position).collect();
+        assert_eq!(positions.len(), MAX_OUTBOX_ENTRIES);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn outbox_line_reader_rejects_symlinks_and_hard_links() {
+    fn outbox_entry_reader_rejects_symlinks_and_hard_links() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -6304,7 +6630,7 @@ mod tests {
             .expect("log symlink creates");
         let mut symlink_report = ExecutionOutboxReport::default();
         assert!(
-            read_outbox_lines(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut symlink_report)
+            read_outbox_entries(&outbox, executors::OUTBOX_WORKLOG_FILE, &mut symlink_report)
                 .is_empty()
         );
         assert!(symlink_report
@@ -6316,7 +6642,7 @@ mod tests {
         fs::hard_link(&outside_log, outbox.join(executors::OUTBOX_WORKLOG_FILE))
             .expect("log hard link creates");
         let mut hard_link_report = ExecutionOutboxReport::default();
-        assert!(read_outbox_lines(
+        assert!(read_outbox_entries(
             &outbox,
             executors::OUTBOX_WORKLOG_FILE,
             &mut hard_link_report

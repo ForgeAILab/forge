@@ -32,6 +32,7 @@ enum ReviewerReconciliation {
 
 impl TaskDispatcher {
     const MERGE_RECOVERY_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+    const FAILED_REVIEW_RECOVERY_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 
     pub(super) async fn recover_active_tasks(
         &self,
@@ -62,6 +63,9 @@ impl TaskDispatcher {
         for mut task in tasks {
             if self.is_stopped() {
                 break;
+            }
+            if deferred_dispatch::queued_recovery(&task).is_some() {
+                continue;
             }
             task = match crate::task_service::execution::clear_stale_plan_publication_claim(
                 &self.db, &task,
@@ -168,6 +172,23 @@ impl TaskDispatcher {
             else {
                 continue;
             };
+            if effective_role(state) == Some(crate::workflow::default_roles::REVIEWER) {
+                match self.recover_failed_review(&task).await {
+                    Ok(true) => {
+                        dispatched += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(task_id = %task.id, "failed review recovery lost version race");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(task_id = %task.id, %error, "failed review recovery failed");
+                        continue;
+                    }
+                }
+            }
             if state.kind == StateKind::Gate
                 && state
                     .hooks
@@ -332,6 +353,120 @@ impl TaskDispatcher {
             }
         }
         Ok(dispatched)
+    }
+
+    pub(super) async fn recover_failed_review(&self, task: &Task) -> Result<bool> {
+        if helpers::has_blocking_annotation(task)
+            || task.error_annotation.is_some()
+            || helpers::awaiting_human(task)
+            || (task.entry_barrier_json.is_some() && !task.entry_barrier_is_running())
+            || !ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+                .await?
+                .is_empty()
+        {
+            return Ok(false);
+        }
+        let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
+        let Some(review) = reviews
+            .into_iter()
+            .max_by_key(|review| review.attempt_number)
+        else {
+            return Ok(false);
+        };
+        if review.status != db::ReviewStatus::Failed {
+            return Ok(false);
+        }
+        let transitions = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let Some(entry) = transitions
+            .last()
+            .filter(|entry| entry.to_state == task.status)
+        else {
+            return Ok(false);
+        };
+        // User routing is a deliberate management action. Never reinterpret
+        // a parked human review, or a verdict from a previous state entry.
+        if entry.triggered_by.starts_with("user:") {
+            return Ok(false);
+        }
+        let (Ok(entered_at), Ok(started_at), Ok(failed_at)) = (
+            chrono::DateTime::parse_from_rfc3339(&entry.created_at),
+            chrono::DateTime::parse_from_rfc3339(&review.started_at),
+            chrono::DateTime::parse_from_rfc3339(&review.updated_at),
+        ) else {
+            return Ok(false);
+        };
+        if started_at < entered_at
+            || chrono::Utc::now().signed_duration_since(failed_at)
+                < Self::FAILED_REVIEW_RECOVERY_GRACE
+        {
+            return Ok(false);
+        }
+        if let Some(raw_barrier) = task.entry_barrier_json.as_deref() {
+            let barrier: serde_json::Value = serde_json::from_str(raw_barrier)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let Some(barrier_started_at) = barrier
+                .get("retry_started_at")
+                .or_else(|| barrier.get("started_at"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            else {
+                return Ok(false);
+            };
+            if barrier_started_at > started_at {
+                // A newer entry retry has not produced its own verdict yet.
+                return Ok(false);
+            }
+        }
+        let Some(_cascade_slot) = self.task_service.claim_completion_cascade(&task.id) else {
+            return Ok(false);
+        };
+        // Claim this exact Task snapshot before routing or installing the
+        // exhausted-budget annotation. Concurrent recovery loses this CAS.
+        let task = TaskRepo::set_entry_barrier(
+            &*self.db,
+            &task.id,
+            task.version,
+            None,
+            &db::now_rfc3339(),
+        )
+        .await?;
+        let latest = ReviewRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .max_by_key(|review| review.attempt_number);
+        if latest.is_none_or(|latest| {
+            latest.id != review.id
+                || latest.status != db::ReviewStatus::Failed
+                || latest.updated_at != review.updated_at
+        }) || !ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let task = if task.review_passed_at.is_some() {
+            TaskRepo::set_review_passed_at_cas(
+                &*self.db,
+                &task.id,
+                task.version,
+                None,
+                &db::now_rfc3339(),
+            )
+            .await?
+        } else {
+            task
+        };
+        tracing::info!(task_id = %task.id, review_id = %review.id, "routing stranded failed review");
+        let (task, target, reason) = self
+            .task_service
+            .review_failure_target(&task, Some(&review.execution_id))
+            .await?;
+        if let Some(target) = target {
+            self.task_service
+                .cascade_completed_review_task(&task, &target, &reason, true)
+                .await?;
+        }
+        Ok(true)
     }
 
     async fn recover_merge_gate(

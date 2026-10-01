@@ -84,10 +84,27 @@ impl JsonRpcPeer {
             Ok(Ok(value)) => serde_json::from_value(value).map_err(|error| {
                 ExecutorError::Other(format!("failed to decode {method} response: {error}"))
             }),
-            Ok(Err(error)) => Err(ExecutorError::Other(format!(
-                "{method} failed: {} ({})",
-                error.message, error.code
-            ))),
+            Ok(Err(error)) => {
+                let mut capacity = crate::capacity::CapacitySignal::default();
+                capacity.observe(
+                    &serde_json::json!({
+                        "code": error.code,
+                        "message": error.message,
+                        "data": error.data,
+                    })
+                    .to_string(),
+                );
+                if let Some(retry_after) = capacity.retry_after {
+                    return Err(ExecutorError::UsageExhausted {
+                        retry_after,
+                        usage_reports: Vec::new(),
+                    });
+                }
+                Err(ExecutorError::Other(format!(
+                    "{method} failed: {} ({})",
+                    error.message, error.code
+                )))
+            }
             Err(_) => Err(ExecutorError::Other(format!(
                 "{method} response channel closed"
             ))),

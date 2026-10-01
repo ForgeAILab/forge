@@ -1,17 +1,18 @@
 use crate::ExecutionAdmission;
 use crate::{
-    canonical_attention_incident_digest, new_uuid_v4, AccountMainAgentBinding,
-    AccountMainAgentBindingRepo, AdmitAgentChatTurn, AdmitAgentHandoff, AdmittedAgentChatTurn,
-    AdmittedAgentHandoff, Agent, AgentAction, AgentActionApproval, AgentActionExecution,
-    AgentActionListQuery, AgentActionRepo, AgentChat, AgentChatInstructionRevision,
-    AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery, AgentChatMessageRepo,
-    AgentChatRepo, AgentChatSourceRef, AgentChatTransactionRepo, AgentChatTurnJob,
-    AgentChatTurnJobRepo, AgentChatTurnState, AgentCommitment, AgentCommitmentEvidence,
-    AgentCommitmentLifecycle, AgentCommitmentListQuery, AgentCommitmentRepo, AgentCommitmentStatus,
-    AgentCommitmentTransfer, AgentHandoff, AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery,
-    AgentInboxRepo, AgentInquiry, AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo,
-    AgentQuestion, AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery,
-    AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
+    canonical_attention_incident_digest, new_uuid_v4, normalize_repo_remote_url,
+    AccountMainAgentBinding, AccountMainAgentBindingRepo, AdmitAgentChatTurn, AdmitAgentHandoff,
+    AdmittedAgentChatTurn, AdmittedAgentHandoff, Agent, AgentAction, AgentActionApproval,
+    AgentActionExecution, AgentActionListQuery, AgentActionRepo, AgentChat,
+    AgentChatInstructionRevision, AgentChatMessage, AgentChatMessageAuthorType,
+    AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatRepo, AgentChatSourceRef,
+    AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState,
+    AgentCommitment, AgentCommitmentEvidence, AgentCommitmentLifecycle, AgentCommitmentListQuery,
+    AgentCommitmentRepo, AgentCommitmentStatus, AgentCommitmentTransfer, AgentHandoff,
+    AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery, AgentInboxRepo, AgentInquiry,
+    AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion,
+    AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery, AgentWakeDisposition,
+    AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
     AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
     AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
     CancelAgentChatTurn, CancelAgentChatTurnWithUsage, CancelAgentInquiryWithUsage, CiStepStats,
@@ -319,7 +320,7 @@ fn map_repo(row: SqliteRow) -> Result<Repo> {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
         name: row.try_get("name")?,
-        remote_url: row.try_get("remote_url")?,
+        remote_url: normalize_repo_remote_url(row.try_get("remote_url")?),
         local_path: row.try_get("local_path")?,
         work_mode: parse_enum(row.try_get::<String, _>("work_mode")?)?,
         default_branch: row.try_get("default_branch")?,
@@ -958,6 +959,25 @@ impl SqliteDb {
         .execute(&mut **transaction)
         .await?;
 
+        if let Some(recovery_id) = admission
+            .filter(|_| input.status == ExecutionStatus::Running)
+            .and_then(|admission| admission.expected_queued_recovery_id.as_deref())
+        {
+            // Consume accepted recovery intent with admission, so a crash
+            // after INSERT cannot replay it into a second execution. Ordinary
+            // interactive/role launches carry no replay authority.
+            sqlx::query(
+                "UPDATE task
+                 SET metadata_json = NULLIF(json_remove(metadata_json, '$.queued_recovery', '$.deferred_dispatch'), '{}')
+                 WHERE id = ? AND json_valid(metadata_json)
+                   AND json_extract(metadata_json, '$.queued_recovery.id') = ?",
+            )
+            .bind(&input.task_id)
+            .bind(recovery_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut **transaction)
@@ -1045,6 +1065,17 @@ impl SqliteDb {
         let metadata_json: Option<String> = row.try_get("metadata_json")?;
         let metadata = TaskMetadata::parse(metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if let Some(expected) = admission.expected_queued_recovery_id.as_deref() {
+            if metadata
+                .extra
+                .get("queued_recovery")
+                .and_then(|queued| queued.get("id"))
+                .and_then(serde_json::Value::as_str)
+                != Some(expected)
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
         if let Some(claim) = metadata.extra.get("plan_publication_claim") {
             let claim_state = claim
                 .get("state")

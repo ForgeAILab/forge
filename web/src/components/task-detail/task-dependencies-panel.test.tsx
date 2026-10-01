@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TaskDependenciesPanel } from './task-dependencies-panel'
 import { TaskSubtasksPanel } from './task-subtasks-panel'
 import { useAuthStore } from '@/stores/auth'
-import type { Execution, Task } from '@/types/generated'
+import type { Execution, Task, TasksResponse } from '@/types/generated'
+import { taskListItem } from '@/test-utils/task-list-item'
 
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
 
@@ -23,11 +24,10 @@ const task: Task = {
   updated_at: '2026-01-01T00:00:00Z',
 }
 
-const candidate: Task = {
-  ...task,
+const candidate = taskListItem({
   id: 'task-2',
   title: 'Fix request retries',
-}
+})
 
 function renderPanels() {
   const queryClient = new QueryClient({
@@ -72,14 +72,15 @@ describe('task relationship panels', () => {
       }
 
       if (url.pathname === '/api/v1/projects/project-1/tasks') {
+        const page: TasksResponse = {
+          items: [candidate],
+          next_cursor: null,
+          has_more: false,
+          total_count: null,
+          board_revision: 1,
+        }
         return new Response(
-          JSON.stringify({
-            items: [candidate],
-            next_cursor: null,
-            has_more: false,
-            total_count: null,
-            board_revision: 1,
-          }),
+          JSON.stringify(page),
           { status: 200, headers: { 'content-type': 'application/json' } },
         )
       }

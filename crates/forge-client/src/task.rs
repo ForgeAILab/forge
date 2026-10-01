@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use api_types::{
     ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, PaginatedResponse,
-    PromptPreviewResponse, TaskMediaResponse, TaskResponse, TransitionTaskRequest,
-    TransitionTaskResponse,
+    PromptPreviewResponse, TaskListItemResponse, TaskMediaResponse, TaskResponse,
+    TransitionTaskRequest, TransitionTaskResponse,
 };
 use clap::Subcommand;
 use reqwest::multipart::Form;
@@ -126,7 +126,7 @@ impl TaskArgs {
                 status,
                 limit,
             } => {
-                let response: PaginatedResponse<TaskResponse> = client
+                let response: PaginatedResponse<TaskListItemResponse> = client
                     .get(&task_list_path(project_id, status.as_deref(), *limit))
                     .await?;
                 match output {
@@ -274,7 +274,7 @@ fn print_task(output: &OutputFormat, task: &TaskResponse) -> Result<()> {
     match output {
         OutputFormat::Json => print_json(task),
         OutputFormat::Table => {
-            print_table_tasks(std::slice::from_ref(task));
+            print_table_tasks(&[task.clone().into()]);
             Ok(())
         }
     }

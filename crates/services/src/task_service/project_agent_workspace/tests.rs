@@ -36,6 +36,84 @@ async fn sqlite_db() -> SqliteDb {
 }
 
 #[tokio::test]
+async fn local_repository_without_remote_keeps_workspace_authority_and_source() {
+    let db = sqlite_db().await;
+    let root = TempDir::new().expect("workspace root creates");
+    let local_path = root.path().to_string_lossy().into_owned();
+    let now = now_rfc3339();
+    let project = ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: new_uuid_v4(),
+            name: "Local Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    let repo = RepoRepo::create_primary_for_project(
+        &db,
+        CreateRepo {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            name: "Local Repo".to_owned(),
+            remote_url: Some(" \t\r\n".to_owned()),
+            local_path: Some(local_path.clone()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        None,
+        project.version,
+        now,
+    )
+    .await
+    .expect("primary repo creates");
+    let authority = query_project_agent_workspace_authority(db.pool(), &project.id)
+        .await
+        .expect("authority loads")
+        .expect("authority exists");
+    assert_eq!(
+        authority.repository_identity,
+        Some((
+            repo.id.clone(),
+            None,
+            Some(local_path.clone()),
+            "main".to_owned()
+        ))
+    );
+    assert_eq!(
+        resolve_repo_source(&repo, root.path())
+            .await
+            .expect("local source resolves"),
+        local_path
+    );
+    sqlx::query("UPDATE repo SET remote_url = ' ' WHERE id = ?")
+        .bind(&repo.id)
+        .execute(db.pool())
+        .await
+        .expect("raw blank remote seeds");
+    let blank_authority = query_project_agent_workspace_authority(db.pool(), &project.id)
+        .await
+        .expect("authority loads")
+        .expect("authority exists");
+    assert!(authority.same_repository(&blank_authority));
+    let mut unavailable = repo;
+    unavailable.local_path = None;
+    assert!(matches!(
+        resolve_repo_source(&unavailable, root.path()).await,
+        Err(ServiceError::InvalidOperation { .. })
+    ));
+    assert!(!root.path().join(".repos").exists());
+}
+
+#[tokio::test]
 async fn project_agent_generation_reuse_quarantines_old_workspace_without_touching_replacement() {
     let db = sqlite_db().await;
     let root = TempDir::new().expect("workspace root creates");
@@ -450,7 +528,7 @@ async fn project_agent_version_and_repo_changes_preserve_notes_but_replace_check
             id: repo_one_id.clone(),
             project_id: project_id.clone(),
             name: "first repository".to_owned(),
-            remote_url: "https://example.invalid/first.git".to_owned(),
+            remote_url: Some("https://example.invalid/first.git".to_owned()),
             local_path: None,
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -566,7 +644,7 @@ async fn project_agent_version_and_repo_changes_preserve_notes_but_replace_check
             id: repo_two_id.clone(),
             project_id: project_id.clone(),
             name: "second repository".to_owned(),
-            remote_url: "https://example.invalid/second.git".to_owned(),
+            remote_url: Some("https://example.invalid/second.git".to_owned()),
             local_path: None,
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

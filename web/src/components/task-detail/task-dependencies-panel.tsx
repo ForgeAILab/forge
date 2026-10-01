@@ -10,7 +10,7 @@ import { TaskStatusBadge } from '@/components/task-controls'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type { PaginatedResponse, Task } from '@/types/generated'
+import type { Task, TasksResponse } from '@/types/generated'
 
 const CANDIDATE_TASK_LIMIT = 30
 const TASK_SEARCH_DEBOUNCE_MS = 250
@@ -28,7 +28,7 @@ function useDependencyCandidatesQuery(projectId: string, search: string, enabled
       CANDIDATE_TASK_LIMIT,
     ],
     queryFn: ({ signal }) =>
-      apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
+      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
         search: {
           q: search || undefined,
           limit: CANDIDATE_TASK_LIMIT,

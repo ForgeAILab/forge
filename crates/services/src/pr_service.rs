@@ -159,6 +159,13 @@ impl PrService {
         source_branch: &str,
         target_branch: &str,
     ) -> Result<PublishedPr> {
+        let remote_url = repo
+            .remote_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("pull requests require a repository remote URL")
+            })?;
         let config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
             .await?
             .ok_or_else(|| ServiceError::PrProviderMissing {
@@ -181,7 +188,7 @@ impl PrService {
             } else {
                 provider
                     .create_pr(PrCreateRequest {
-                        repo_remote_url: repo.remote_url.clone(),
+                        repo_remote_url: remote_url.to_owned(),
                         source_branch: source_branch.to_owned(),
                         target_branch: target_branch.to_owned(),
                         title: task.title.clone(),
@@ -192,7 +199,7 @@ impl PrService {
         } else {
             provider
                 .create_pr(PrCreateRequest {
-                    repo_remote_url: repo.remote_url.clone(),
+                    repo_remote_url: remote_url.to_owned(),
                     source_branch: source_branch.to_owned(),
                     target_branch: target_branch.to_owned(),
                     title: task.title.clone(),

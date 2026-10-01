@@ -538,8 +538,7 @@ function ProjectMcpTab({ projectId }: { projectId: string }) {
       toast.error('Remote URL is required')
       return
     }
-    const remoteUrl =
-      nextForm.source_mode === 'local' ? remoteUrlInput || localPath : remoteUrlInput
+    const remoteUrl = remoteUrlInput || null
     createRepo.mutate(
       {
         remote_url: remoteUrl,

@@ -1,4 +1,6 @@
-use api_types::{AgentResponse, DaemonResponse, ProjectResponse, RepoResponse, TaskResponse};
+use api_types::{
+    AgentResponse, DaemonResponse, ProjectResponse, RepoResponse, TaskListItemResponse,
+};
 use serde::Serialize;
 use tabled::Table;
 
@@ -7,7 +9,7 @@ pub fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_table_tasks(items: &[TaskResponse]) {
+pub fn print_table_tasks(items: &[TaskListItemResponse]) {
     let rows = items
         .iter()
         .map(|value| {
@@ -106,7 +108,11 @@ fn repo_source(value: &RepoResponse) -> String {
     format!(
         "[{}] {}",
         serialized_label(&value.work_mode),
-        value.remote_url
+        value
+            .remote_url
+            .as_deref()
+            .or(value.local_path.as_deref())
+            .unwrap_or("—")
     )
 }
 

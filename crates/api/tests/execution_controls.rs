@@ -269,6 +269,7 @@ async fn task_health_uses_active_execution_when_newer_terminal_row_exists() {
         response["workflow_health"]["execution_id"],
         json!(running_id)
     );
+    assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
 
 #[tokio::test]
@@ -395,6 +396,7 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
         open_interactive["disabled_reason"],
         json!("An interactive execution is already running")
     );
+    assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
 
 #[tokio::test]
@@ -544,6 +546,7 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
         json!(coder_execution_id),
         "Open Interactive must target the current-role resumable session"
     );
+    assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
 
 #[tokio::test]
@@ -661,6 +664,7 @@ async fn running_interactive_session_outranks_newer_open_interactive_lease_in_he
         response["workflow_health"]["execution_id"],
         json!(running_session_id)
     );
+    assert_task_list_diagnostics_match(&harness, &project_id, &response).await;
 }
 
 #[tokio::test]
@@ -805,6 +809,7 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
             .is_some_and(|reason| reason.contains("Retry budget exhausted")),
         "expected retry budget disabled reason: {action:?}"
     );
+    assert_task_list_diagnostics_match(&harness, &project_id, &task).await;
 }
 
 #[tokio::test]
@@ -1054,5 +1059,37 @@ fn assert_action_enabled(actions: &[Value], action_name: &str, expected_enabled:
         action.get("enabled").and_then(Value::as_bool),
         Some(expected_enabled),
         "unexpected enabled state for {action_name}: {action:?}"
+    );
+}
+
+async fn assert_task_list_diagnostics_match(
+    harness: &common::Harness,
+    project_id: &str,
+    task: &Value,
+) {
+    let page: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        StatusCode::OK,
+    )
+    .await;
+    let listed = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == task["id"])
+        .unwrap();
+    for field in [
+        "workflow_health",
+        "workflow_exception",
+        "remaining_retries",
+        "role_assignments",
+    ] {
+        assert_eq!(listed[field], task[field], "list/detail agree on {field}");
+    }
+    assert_eq!(
+        listed["execution_observability"]["latest_execution_id"],
+        task["execution_observability"]["latest_execution_id"]
     );
 }

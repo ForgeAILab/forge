@@ -5,7 +5,7 @@ import type { RateBuckets } from "./RateBuckets";
 /**
  * Create or replace a pricing adjustment.
  */
-export type UpdatePricingSettingsRequest = { mode: PricingMode, discount_percent: string | null, fixed_rates: RateBuckets | null, catalog_provider_id: string | null, catalog_model_id: string | null,
+export type UpdatePricingSettingsRequest = { mode: PricingMode, discount_percent: string | null, fixed_rates: RateBuckets | null, catalog_provider_id: string | null, catalog_model_id: string | null, 
 /**
  * `0` when no adjustment exists yet, else the current `version`.
  */

@@ -361,7 +361,7 @@ struct ProjectAgentWorkspaceAuthority {
     primary_repo_id: Option<String>,
     /// `(id, remote_url, local_path, default_branch)` for the exact primary
     /// repository snapshot used to build the checkout.
-    repository_identity: Option<(String, String, Option<String>, String)>,
+    repository_identity: Option<(String, Option<String>, Option<String>, String)>,
 }
 
 impl ProjectAgentWorkspaceAuthority {
@@ -433,7 +433,8 @@ where
     let row = sqlx::query_as::<_, ProjectAgentWorkspaceAuthorityRow>(
         "SELECT p.id, p.created_at, p.primary_repo_id,
                 operation.id,
-                repo.id, repo.remote_url, repo.local_path, repo.default_branch
+                repo.id, CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END,
+                repo.local_path, repo.default_branch
          FROM project p
          LEFT JOIN project_provisioning_operation operation
            ON operation.project_id = p.id
@@ -460,9 +461,14 @@ where
             project_created_at,
             provisioning_operation_id,
             primary_repo_id,
-            repository_identity: repository_id.zip(remote_url).zip(default_branch).map(
-                |((repository_id, remote_url), default_branch)| {
-                    (repository_id, remote_url, local_path, default_branch)
+            repository_identity: repository_id.zip(default_branch).map(
+                |(repository_id, default_branch)| {
+                    (
+                        repository_id,
+                        db::normalize_repo_remote_url(remote_url),
+                        local_path,
+                        default_branch,
+                    )
                 },
             ),
         },
@@ -1094,7 +1100,16 @@ pub(super) async fn resolve_repo_source(
         // error, which callers classify as potentially transient and retry on
         // every scan -- but a source directory that is gone is not coming
         // back on its own, and the Task should park saying exactly that.
-        if let Some(missing) = missing_local_repo_source(&repo.remote_url) {
+        let remote_url = repo
+            .remote_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "repository has no available local path or remote URL",
+                )
+            })?;
+        if let Some(missing) = missing_local_repo_source(remote_url) {
             return Err(ServiceError::invalid_operation(format!(
                 "repo source path does not exist: {missing}"
             )));
@@ -1107,7 +1122,7 @@ pub(super) async fn resolve_repo_source(
         .await
         .map_err(|error| ServiceError::Git(git::GitError::Io(error)))?;
         let output = Command::new("git")
-            .args(["clone", &repo.remote_url, &clone_path.to_string_lossy()])
+            .args(["clone", remote_url, &clone_path.to_string_lossy()])
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
@@ -1116,7 +1131,7 @@ pub(super) async fn resolve_repo_source(
             .map_err(|error| ServiceError::Git(git::GitError::Io(error)))?;
         if !output.status.success() {
             return Err(ServiceError::Git(git::GitError::CommandFailed {
-                command: format!("git clone {} {}", repo.remote_url, clone_path.display()),
+                command: format!("git clone {} {}", remote_url, clone_path.display()),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             }));

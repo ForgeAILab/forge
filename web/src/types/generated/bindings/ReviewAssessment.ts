@@ -11,7 +11,7 @@ import type { ReviewResult } from "./ReviewResult";
  * comes from the required checks Forge runs itself, not from the reviewer's
  * citations.
  */
-export type ReviewAssessment = { result: ReviewResult, reason: string,
+export type ReviewAssessment = { result: ReviewResult, reason: string, 
 /**
  * The reviewer's Markdown review, without the result block.
  */

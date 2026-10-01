@@ -29,12 +29,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 hex = "0.4"
+ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "time", "process", "net", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
 url = "2"
+zstd = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", default-features = false, features = ["signal"] }

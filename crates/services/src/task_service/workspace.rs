@@ -483,7 +483,14 @@ async fn create_fresh_workspace(
     let worktree_path = match worktree_result.map_err(map_workspace_error) {
         Ok(worktree_path) => worktree_path,
         Err(error) => {
-            if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+            if let Err(cleanup_error) = manager
+                .cleanup_worktree(
+                    task_id,
+                    Path::new(&worktree_source),
+                    &workspace_root.join(task_id).join(&repo.name),
+                )
+                .await
+            {
                 tracing::error!(
                     task_id,
                     error = %cleanup_error,
@@ -530,7 +537,14 @@ async fn create_fresh_workspace(
                 .flatten()
                 .is_none()
             {
-                if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+                if let Err(cleanup_error) = manager
+                    .cleanup_worktree(
+                        task_id,
+                        Path::new(&worktree_source),
+                        &workspace_root.join(task_id).join(&repo.name),
+                    )
+                    .await
+                {
                     tracing::error!(
                         task_id,
                         error = %cleanup_error,
@@ -597,7 +611,9 @@ pub(super) async fn reset_workspace(
             if let Some(ref locks) = repo_cache_locks {
                 manager = manager.with_repo_cache_locks(Arc::clone(locks));
             }
-            let _ = manager.cleanup_worktree(&task.id).await;
+            let _ = manager
+                .cleanup_worktree(&task.id, Path::new(&repo_source), worktree_path)
+                .await;
         }
         // Prune stale git worktree references
         let _ = tokio::process::Command::new("git")
@@ -781,7 +797,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "repo".to_owned(),
-                remote_url: "/tmp/repo".to_owned(),
+                remote_url: Some("/tmp/repo".to_owned()),
                 local_path: Some("/tmp/repo".to_owned()),
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
@@ -910,7 +926,7 @@ mod tests {
                 id: replacement_repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "replacement".to_owned(),
-                remote_url: "/tmp/replacement-repo".to_owned(),
+                remote_url: Some("/tmp/replacement-repo".to_owned()),
                 local_path: Some("/tmp/replacement-repo".to_owned()),
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
@@ -1090,7 +1106,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "repo".to_owned(),
-                remote_url: repo_path.to_string_lossy().into_owned(),
+                remote_url: Some(repo_path.to_string_lossy().into_owned()),
                 local_path: Some(repo_path.to_string_lossy().into_owned()),
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
@@ -1163,7 +1179,7 @@ mod tests {
         // What a reassignment reset does: the cleanup scheduler removes the
         // worktree and marks the row cleaned, but the task branch survives.
         ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
-            .cleanup_worktree(&task.id)
+            .cleanup_worktree(&task.id, repo_dir.path(), Path::new(&fresh.worktree_path))
             .await
             .expect("worktree cleans");
         WorkspaceRepo::mark_cleaned(&db, &fresh.id, &now_rfc3339())
@@ -1191,7 +1207,7 @@ mod tests {
             .await
             .expect("first workspace creates");
         ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
-            .cleanup_worktree(&task.id)
+            .cleanup_worktree(&task.id, repo_dir.path(), Path::new(&fresh.worktree_path))
             .await
             .expect("worktree cleans");
         WorkspaceRepo::mark_cleaned(&db, &fresh.id, &now_rfc3339())

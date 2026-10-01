@@ -180,6 +180,113 @@ async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {
 }
 
 #[tokio::test]
+async fn project_task_list_omits_detail_content_and_preserves_page_diagnostics() {
+    let workspace_root = common::TestDir::new("task-list-projection");
+    let harness = common::test_app(workspace_root.path(), "task-list-projection").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Task list projection" }),
+        StatusCode::OK,
+    )
+    .await;
+    let description = "full task description ".repeat(400);
+    let config = json!({ "review": { "ci_steps": [] }, "private_detail": "x".repeat(6000) });
+    for index in 0..3 {
+        let task: TaskResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/projects/{}/tasks", project.id),
+            json!({ "title": format!("Task {index}"), "description": description }),
+            StatusCode::OK,
+        )
+        .await;
+        sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+            .bind(config.to_string())
+            .bind(&task.id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        create_completed_execution(&harness.state.db, &task.id, "2026-09-29T00:00:00Z").await;
+    }
+    let page: serde_json::Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/tasks?limit=2&include_total=true",
+            project.id
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let typed: api_types::TasksResponse = serde_json::from_value(page.clone()).unwrap();
+    assert_eq!(typed.items.len(), 2);
+    assert_eq!(typed.total_count, Some(3));
+    assert!(typed.has_more);
+    for item in page["items"].as_array().unwrap() {
+        for field in [
+            "description",
+            "task_state_config",
+            "workspace",
+            "plan_progress",
+            "plan_artifact",
+            "execution_actions",
+            "execution_evidence",
+            "execution_blocker",
+        ] {
+            assert!(item.get(field).is_none(), "list must omit {field}");
+        }
+        assert_eq!(
+            item["execution_observability"].as_object().unwrap().len(),
+            1
+        );
+        let detail: TaskDetailResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}/detail", item["id"].as_str().unwrap()),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            detail.task.description.as_deref(),
+            Some(description.as_str())
+        );
+        assert_eq!(detail.task.task_state_config.as_ref(), Some(&config));
+        let full = serde_json::to_value(detail.task).unwrap();
+        for field in [
+            "id",
+            "version",
+            "role_assignments",
+            "remaining_retries",
+            "workflow_health",
+            "workflow_exception",
+        ] {
+            assert_eq!(item[field], full[field], "list/detail agree on {field}");
+        }
+        assert_eq!(
+            item["execution_observability"]["latest_execution_id"],
+            full["execution_observability"]["latest_execution_id"]
+        );
+    }
+    let second: api_types::TasksResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/tasks?limit=2&cursor={}",
+            project.id,
+            typed.next_cursor.unwrap()
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(second.items.len(), 1);
+    assert!(!second.has_more);
+    assert_eq!(second.board_revision, typed.board_revision);
+    assert!(typed.items.iter().all(|item| item.id != second.items[0].id));
+}
+
+#[tokio::test]
 async fn task_relations_returns_direct_rows_in_order_including_cancelled_targets() {
     let workspace_root = common::TestDir::new("task-relations");
     let harness = common::test_app(workspace_root.path(), "task-relations").await;

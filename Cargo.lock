@@ -234,7 +234,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "api-types"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -695,15 +695,17 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 
 [[package]]
 name = "cli-adapters"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
+ "chrono",
  "command-group",
  "dirs",
  "executors",
  "futures-util",
  "git",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -788,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "rand 0.8.6",
  "serde",
@@ -985,7 +987,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "db"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
@@ -1182,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "events"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "chrono",
@@ -1193,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "executors"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
@@ -1286,7 +1288,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-agent-host"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "agent-runtime",
  "api-types",
@@ -1299,6 +1301,7 @@ dependencies = [
  "nix 0.28.0",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1309,11 +1312,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "zstd",
 ]
 
 [[package]]
 name = "forge-cli"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api",
  "clap",
@@ -1331,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "forge-client"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "anyhow",
  "api",
@@ -1363,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "forge-daemon"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "anyhow",
  "api-types",
@@ -1387,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "forge-solo"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "clap",
@@ -1582,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "git"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "serde",
  "tempfile",
@@ -2194,7 +2198,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-server"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "axum",
@@ -2932,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "review"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
@@ -3232,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "services"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "agent-runtime",
  "api-types",
@@ -4799,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "workspace"
-version = "0.13.11"
+version = "0.13.12"
 dependencies = [
  "git",
  "tempfile",

@@ -751,7 +751,7 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -2340,6 +2340,265 @@ async fn seed_ordered_task(
 }
 
 #[tokio::test]
+async fn task_page_projection_batches_roles_and_retry_history() {
+    let db = sqlite_db().await;
+    let (project_id, _, agent_id) = seed_project_repo_agent(&db).await;
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let task_id = seed_task(
+            &db,
+            &project_id,
+            Some(&agent_id),
+            "todo".to_owned(),
+            &format!("Task {index}"),
+        )
+        .await;
+        for (role, to_state, rejection) in
+            [("reviewer", "review", true), ("auditor", "todo", false)]
+        {
+            TaskRoleAssignmentRepo::assign(
+                &db,
+                CreateTaskRoleAssignment {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    role_name: role.to_owned(),
+                    assignee_type: None,
+                    assignee_id: None,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            TransitionLogRepo::insert(
+                &db,
+                CreateTransitionLog {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    from_state: "review".to_owned(),
+                    to_state: to_state.to_owned(),
+                    trigger_name: Some("reject".to_owned()),
+                    triggered_by: "system".to_owned(),
+                    trigger_reason: "test".to_owned(),
+                    hook_results_json: Some("{}".to_owned()),
+                    rejection,
+                    created_at: "2026-09-30T00:00:00Z".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        task_ids.push(task_id);
+    }
+    let ids = task_ids[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    let roles = TaskRoleAssignmentRepo::list_by_tasks(&db, &ids)
+        .await
+        .unwrap();
+    let transitions = TransitionLogRepo::list_by_tasks(&db, &ids).await.unwrap();
+    assert_eq!(roles.len(), 6);
+    assert_eq!(transitions.len(), 4);
+    for task_id in ids {
+        let actual_roles = roles
+            .iter()
+            .filter(|row| row.task_id == task_id)
+            .collect::<Vec<_>>();
+        let expected_roles = TaskRoleAssignmentRepo::list_by_task(&db, task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual_roles).unwrap(),
+            serde_json::to_value(expected_roles).unwrap()
+        );
+        let actual_transitions = transitions
+            .iter()
+            .filter(|row| row.task_id == task_id)
+            .collect::<Vec<_>>();
+        let expected_transitions = TransitionLogRepo::list_by_task(&db, task_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual_transitions).unwrap(),
+            serde_json::to_value(expected_transitions).unwrap()
+        );
+    }
+    assert!(TaskRoleAssignmentRepo::list_by_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(TransitionLogRepo::list_by_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn task_page_projection_executions_preserve_authority_with_bounded_history() {
+    let db = sqlite_db().await;
+    let (project_id, _, agent_id) = seed_project_repo_agent(&db).await;
+    let first = seed_task(&db, &project_id, None, "todo".to_owned(), "First").await;
+    let second = seed_task(&db, &project_id, None, "todo".to_owned(), "Second").await;
+    let hidden = seed_task(&db, &project_id, None, "todo".to_owned(), "Not on page").await;
+    for task_id in [&first, &second, &hidden] {
+        // The older coder alias session and explicit blocked row must survive
+        // more than 100 newer unrelated terminal rows.
+        for (id, role, status, session, agent, created_at) in [
+            (
+                format!("{task_id}-blocked"),
+                "auditor",
+                "completed",
+                None,
+                None,
+                "2026-09-01T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-resume"),
+                "executor",
+                "completed",
+                Some("coder-session"),
+                Some(agent_id.as_str()),
+                "2026-09-02T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-interactive"),
+                "interactive",
+                "running",
+                Some("live-session"),
+                None,
+                "2026-09-03T00:00:00Z",
+            ),
+            (
+                format!("{task_id}-lease"),
+                "interactive",
+                "running",
+                None,
+                None,
+                "2026-09-04T00:00:00Z",
+            ),
+        ] {
+            sqlx::query("INSERT INTO execution (id, task_id, role, status, agent_session_id, agent_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(id).bind(task_id).bind(role).bind(status).bind(session).bind(agent)
+                .bind(created_at).bind(created_at).execute(db.pool()).await.unwrap();
+        }
+        for index in 0..105 {
+            sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES (?, ?, 'reviewer', 'completed', ?, ?)")
+                .bind(format!("{task_id}-history-{index:03}")).bind(task_id)
+                .bind("2026-09-05T00:00:00Z").bind("2026-09-05T00:00:00Z")
+                .execute(db.pool()).await.unwrap();
+        }
+    }
+    let queries = [&first, &second]
+        .into_iter()
+        .map(|task_id| crate::TaskExecutionProjectionQuery {
+            task_id: task_id.clone(),
+            current_role: Some("coder".to_owned()),
+            blocked_execution_id: Some(format!("{task_id}-blocked")),
+        })
+        .collect::<Vec<_>>();
+    let rows = ExecutionRepo::list_task_projection_executions(&db, &queries)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        10,
+        "five representatives per Task, not all history"
+    );
+    for task_id in [&first, &second] {
+        let ids = rows
+            .iter()
+            .filter(|row| &row.task_id == task_id)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        for suffix in ["blocked", "resume", "interactive", "lease", "history-104"] {
+            assert!(ids.contains(&format!("{task_id}-{suffix}").as_str()));
+        }
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    assert!(rows.iter().all(|row| row.task_id != hidden));
+    assert!(ExecutionRepo::list_task_projection_executions(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn task_page_projection_links_select_latest_per_task() {
+    use crate::{
+        CreateProjectIntegration, CreateTaskExternalLink, ExternalLinkRepo, IntegrationPlatform,
+        IntegrationRepo,
+    };
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Links", None).await;
+    let integration_id = new_uuid_v4();
+    let now = now_rfc3339();
+    IntegrationRepo::create_integration(
+        &db,
+        CreateProjectIntegration {
+            id: integration_id.clone(),
+            project_id: project_id.clone(),
+            platform: IntegrationPlatform::Github,
+            base_url: "https://api.github.com".to_owned(),
+            owner: "owner".to_owned(),
+            repo: "repo".to_owned(),
+            token_secret_ref: "test".to_owned(),
+            poll_interval_secs: 60,
+            sync_filter: "{}".to_owned(),
+            default_task_state: None,
+            default_assignee_type: None,
+            default_assignee_id: None,
+            enabled: false,
+            last_polled_at: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut task_ids = Vec::new();
+    for index in 0..3 {
+        let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Links").await;
+        for issue in 1..=2 {
+            ExternalLinkRepo::create_link(
+                &db,
+                CreateTaskExternalLink {
+                    id: format!("{task_id}-link-{issue}"),
+                    task_id: task_id.clone(),
+                    integration_id: integration_id.clone(),
+                    platform: "github".to_owned(),
+                    remote_owner: "owner".to_owned(),
+                    remote_repo: "repo".to_owned(),
+                    remote_issue_number: index * 2 + issue,
+                    remote_url: format!("https://example.com/{index}/{issue}"),
+                    global_id: format!("link-{index}-{issue}"),
+                    synced_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        task_ids.push(task_id);
+    }
+    let ids = task_ids[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    let links = ExternalLinkRepo::list_latest_links_for_tasks(&db, &ids)
+        .await
+        .unwrap();
+    assert_eq!(links.len(), 2);
+    for task_id in ids {
+        let latest = ExternalLinkRepo::get_by_task_id(&db, task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            links.iter().find(|link| link.task_id == task_id),
+            Some(&latest)
+        );
+    }
+    assert!(ExternalLinkRepo::list_latest_links_for_tasks(&db, &[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn task_list_hides_cancelled_and_archived_by_default() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
@@ -3030,7 +3289,7 @@ async fn sqlite_repo_create_round_trips_local_path() {
             id: repo_id,
             project_id,
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -3043,7 +3302,10 @@ async fn sqlite_repo_create_round_trips_local_path() {
 
     assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, Some("/tmp/forge-test-repo".to_owned()));
-    assert_eq!(repo.remote_url, "https://example.com/forge.git");
+    assert_eq!(
+        repo.remote_url.as_deref(),
+        Some("https://example.com/forge.git")
+    );
 }
 
 #[tokio::test]
@@ -3075,7 +3337,7 @@ async fn sqlite_repo_create_round_trips_remote_url() {
             id: repo_id,
             project_id,
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -3088,11 +3350,14 @@ async fn sqlite_repo_create_round_trips_remote_url() {
 
     assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, None);
-    assert_eq!(repo.remote_url, "https://example.com/forge.git");
+    assert_eq!(
+        repo.remote_url.as_deref(),
+        Some("https://example.com/forge.git")
+    );
 }
 
 #[tokio::test]
-async fn sqlite_repo_create_rejects_missing_remote_url() {
+async fn sqlite_repo_create_accepts_missing_remote_url() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
@@ -3127,7 +3392,119 @@ async fn sqlite_repo_create_rejects_missing_remote_url() {
         .await
         .map_err(crate::DbError::from);
 
-    assert!(matches!(result, Err(DbError::Sqlx(_))));
+    result.expect("local-only repository accepts a NULL remote URL");
+}
+
+#[tokio::test]
+async fn sqlite_repo_create_normalizes_blank_remote_url() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    for remote_url in [None, Some(""), Some(" \t\r\n"), Some("\u{2003}")] {
+        let project = ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: new_uuid_v4(),
+                name: "Local Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        for primary in [false, true] {
+            let input = CreateRepo {
+                id: new_uuid_v4(),
+                project_id: project.id.clone(),
+                name: "Local Repo".to_owned(),
+                remote_url: remote_url.map(str::to_owned),
+                local_path: Some("/tmp/local-repo".to_owned()),
+                work_mode: WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            let repo = if primary {
+                RepoRepo::create_primary_for_project(&db, input, None, project.version, now.clone())
+                    .await
+            } else {
+                RepoRepo::create(&db, input).await
+            }
+            .expect("local repo creates");
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT remote_url FROM repo WHERE id = ?")
+                    .bind(&repo.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("stored remote loads");
+            assert_eq!(stored, None);
+            assert_eq!(repo.remote_url, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_repo_update_and_read_normalize_blank_remote_url() {
+    let db = sqlite_db().await;
+    let (_, repo_id, _) = seed_project_repo_agent(&db).await;
+    let original = Some("https://example.com/forge.git".to_owned());
+    for (input, expected) in [
+        (None, original.clone()),
+        (Some(None), None),
+        (Some(Some(String::new())), None),
+        (Some(Some(" \t\r\n".to_owned())), None),
+        (Some(original.clone()), original.clone()),
+    ] {
+        sqlx::query("UPDATE repo SET remote_url = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&repo_id)
+            .execute(db.pool())
+            .await
+            .expect("remote resets");
+        let repo = RepoRepo::update(
+            &db,
+            UpdateRepo {
+                id: repo_id.clone(),
+                name: None,
+                local_path: None,
+                remote_url: input,
+                work_mode: None,
+                default_branch: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("remote updates");
+        let stored: Option<String> = sqlx::query_scalar("SELECT remote_url FROM repo WHERE id = ?")
+            .bind(&repo_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("stored remote loads");
+        assert_eq!(stored, expected);
+        assert_eq!(repo.remote_url, expected);
+    }
+
+    sqlx::query("UPDATE repo SET remote_url = '  ' WHERE id = ?")
+        .bind(&repo_id)
+        .execute(db.pool())
+        .await
+        .expect("unnormalized remote seeds");
+    let repo = RepoRepo::get_by_id(&db, &repo_id)
+        .await
+        .expect("repo loads")
+        .expect("repo exists");
+    assert_eq!(repo.remote_url, None);
+    assert_eq!(
+        RepoRepo::list_by_project(&db, &repo.project_id, page(10))
+            .await
+            .expect("repos list")
+            .items[0]
+            .remote_url,
+        None
+    );
 }
 
 #[tokio::test]
@@ -3522,6 +3899,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(competing.clone()),
         make_lease(competing.clone()),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -3593,6 +3971,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(stale.clone()),
         make_lease(stale),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -3781,6 +4160,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
         now: now.clone(),
     };
     let make_admission = || ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: Some(project.version),
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -3895,7 +4275,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         .await
         .expect("repository task loads")
         .expect("repository task exists");
-    let repository_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let repository_result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &db,
         &repository_task.id,
         repository_task.version,
@@ -3904,6 +4284,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         &now,
         None,
+        Vec::new(),
         Vec::new(),
     )
     .await;
@@ -3932,7 +4313,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         .await
         .expect("interactive task loads")
         .expect("interactive task exists");
-    let interactive_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let interactive_result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &db,
         &interactive_task.id,
         interactive_task.version,
@@ -3941,6 +4322,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         &now,
         None,
+        Vec::new(),
         Vec::new(),
     )
     .await;
@@ -3951,6 +4333,223 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
             execution_id,
         }) if scope == "interactive" && execution_id == interactive_execution_id
     ));
+}
+
+#[tokio::test]
+async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admission() {
+    let db = sqlite_db().await;
+    let project_id = seed_project(&db, "Queued recovery", None).await;
+    let task_id = seed_task(&db, &project_id, None, "in_progress".to_owned(), "Recover").await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let task = TaskRepo::update(
+        &db,
+        UpdateTask {
+            id: task_id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::json!({
+                    "type": "recovery_required", "blocking_reason": "crash_recovery",
+                    "recovery_actions": ["reexecute"],
+                })
+                .to_string(),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("interruption persists");
+    let mutations = vec![
+        crate::TaskMetadataMutation::Set {
+            key: "queued_recovery".to_owned(),
+            value: serde_json::json!({ "id": "queued-intent", "action": "reexecute" }),
+        },
+        crate::TaskMetadataMutation::Set {
+            key: "deferred_dispatch".to_owned(),
+            value: serde_json::json!({ "target_state": "in_progress" }),
+        },
+        crate::TaskMetadataMutation::Set {
+            key: "unrelated".to_owned(),
+            value: serde_json::json!("preserved"),
+        },
+    ];
+    let queued = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        &db,
+        &task_id,
+        task.version,
+        None,
+        None,
+        None,
+        &now_rfc3339(),
+        None,
+        Vec::new(),
+        mutations,
+    )
+    .await
+    .expect("clear and queue commit together");
+    assert_eq!(queued.version, task.version + 1);
+    assert!(queued.error_annotation.is_none());
+    let metadata: serde_json::Value =
+        serde_json::from_str(queued.metadata_json.as_deref().expect("queue metadata"))
+            .expect("metadata parses");
+    assert!(metadata.get("queued_recovery").is_some());
+    assert!(metadata.get("deferred_dispatch").is_some());
+    let stale = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        &db,
+        &task_id,
+        task.version,
+        task.error_annotation,
+        None,
+        None,
+        &now_rfc3339(),
+        None,
+        Vec::new(),
+        vec![crate::TaskMetadataMutation::Remove {
+            key: "queued_recovery".to_owned(),
+        }],
+    )
+    .await;
+    assert!(matches!(stale, Err(DbError::VersionConflict)));
+    let now = now_rfc3339();
+    let make_execution = || CreateExecution {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        agent_id: None,
+        role: "interactive".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let unrelated = ExecutionRepo::create(&db, make_execution())
+        .await
+        .expect("unrelated execution admits");
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
+    assert_eq!(current.version, queued.version);
+    for (expected_version, queued_recovery_id) in [
+        (queued.version - 1, "queued-intent"),
+        (queued.version, "newer-intent"),
+    ] {
+        let result = TaskRepo::restore_queued_recovery(
+            &db,
+            crate::RestoreQueuedRecovery {
+                task_id: task_id.clone(),
+                expected_version,
+                queued_recovery_id: queued_recovery_id.to_owned(),
+                error_annotation: Some("stale blocker".to_owned()),
+                blocked_json: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(DbError::VersionConflict)));
+    }
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
+    assert!(current.error_annotation.is_none());
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+        .bind(&unrelated.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let make_admission = |id: &str| ExecutionAdmission {
+        expected_queued_recovery_id: Some(id.to_owned()),
+        expected_project_version: None,
+        expected_task_version: queued.version,
+        expected_task_status: queued.status.clone(),
+        expected_effective_role: None,
+        expected_agent_version: None,
+        expected_agent_max_concurrent_tasks: None,
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: None,
+        expected_assignment_updated_at: None,
+        expected_workflow_definition: None,
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:queued-recovery".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: None,
+        now: now.clone(),
+    };
+    let stale_execution = make_execution();
+    let stale_id = stale_execution.id.clone();
+    let result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        stale_execution,
+        make_lease(stale_id.clone()),
+        Some(make_admission("wrong-intent")),
+    )
+    .await;
+    assert!(matches!(result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &stale_id)
+        .await
+        .unwrap()
+        .is_none());
+    let execution = make_execution();
+    let lease = make_lease(execution.id.clone());
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        execution,
+        lease,
+        Some(make_admission("queued-intent")),
+    )
+    .await
+    .expect("own replay admits and consumes queue");
+    let admitted = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata: serde_json::Value = serde_json::from_str(
+        admitted
+            .metadata_json
+            .as_deref()
+            .expect("remaining metadata"),
+    )
+    .expect("metadata parses");
+    assert!(metadata.get("queued_recovery").is_none());
+    assert!(metadata.get("deferred_dispatch").is_none());
+    assert_eq!(metadata["unrelated"], "preserved");
 }
 
 #[tokio::test]
@@ -4052,6 +4651,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status,
@@ -4281,6 +4881,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         root_execution_input,
         make_lease(root_execution_id, "embedded:custom-root"),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: root.version,
             expected_task_status: root.status.clone(),
@@ -4315,6 +4916,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         ),
         make_lease(child_execution_id, "embedded:inherited-child"),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: child.version,
             expected_task_status: child.status.clone(),
@@ -4427,6 +5029,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
     .await
     .expect("first review creates");
     let make_admission = |parent_execution_id: Option<String>| ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5075,6 +5678,377 @@ async fn review_source_accepts_direct_child_execution_for_coordination_root() {
     assert_eq!(implicit["repo_id"], repo_id);
 }
 
+// Freeze both contract and passed assessment so these tests exercise the same
+// verification paths as acceptance, integration, and authority carry.
+async fn seed_review_digest_contract(
+    version: u32,
+) -> (SqliteDb, String, String, api_types::ReviewContract) {
+    use api_types::{canonical_digest, review_source_digest, ReviewConformance, ReviewContract};
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "review".into(), "Digest scope").await;
+    let now = now_rfc3339();
+    TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "reviewer".into(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project SET settings = ?, workflow_definition = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "default_review_config": {"ci_steps": ["true"]},
+                "environment": {"env": {"TOKEN": "original"}},
+            })
+            .to_string(),
+        )
+        .bind(
+            serde_json::json!({"states": [
+                {"name": "review", "role": "reviewer", "config": {}},
+                {"name": "working", "role": "coder", "config": {}},
+            ]})
+            .to_string(),
+        )
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            role: "reviewer".into(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let source = db
+        .review_source(&task_id, Some(&execution_id))
+        .await
+        .unwrap();
+    let mut context_json = serde_json::json!({
+        "project_id": project_id, "task_id": task_id, "repo_id": repo_id,
+        "charter_revision_id": null, "charter_digest": null, "charter": null,
+        "task_scope": source["task_scope"], "linked_documents": [],
+        "requirements": [], "setup_steps": [], "required_checks": [],
+        "source_digest": if version == 1 {
+            // Independently reproduce the pre-change algorithm.
+            canonical_digest(&source).unwrap()
+        } else {
+            review_source_digest(&source, version).unwrap()
+        },
+    });
+    if version != 1 {
+        context_json["source_digest_version"] = serde_json::json!(version);
+    }
+    let mut contract = ReviewContract {
+        execution_id: execution_id.clone(),
+        policy: api_types::REVIEW_CONFORMANCE_POLICY.into(),
+        commit_sha: "candidate".into(),
+        base_sha: "base".into(),
+        candidate_changed_paths: vec!["file.rs".into()],
+        context: serde_json::from_value(context_json).unwrap(),
+        check_results: Vec::new(),
+        digest: String::new(),
+    };
+    contract.digest = canonical_digest(&contract).unwrap();
+    db.create_review_contract(&contract).await.unwrap();
+    let conformance = ReviewConformance {
+        status: api_types::ConformanceStatus::Passed,
+        contract: Some(contract.clone()),
+        assessment: Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Pass,
+            reason: "checked".into(),
+            report: String::new(),
+        }),
+        checks: Vec::new(),
+        reason: None,
+    };
+    db.record_review_conformance(&conformance).await.unwrap();
+    ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id,
+            attempt_number: 1,
+            status: ReviewStatus::Passed,
+            step_results_json: serde_json::json!({"conformance": conformance}).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    TaskRepo::set_review_passed_at(&db, &task_id, Some(now.clone()), &now)
+        .await
+        .unwrap();
+    (db, project_id, task_id, contract)
+}
+
+async fn assert_review_digest_integrates(db: &SqliteDb, task_id: &str) {
+    let guard = db.lock_review_integration(task_id).await.unwrap();
+    assert!(guard.contract.is_some(), "must check automated authority");
+    guard.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_digest_settings_and_audit_edits_preserve_passed_contract() {
+    let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_at_version(
+        &db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(
+                serde_json::json!({
+                    "max_active_tasks": 7, "recheck_interval_seconds": 30,
+                    "default_review_config": {"ci_steps": ["true"]},
+                    "environment": {"env": {"TOKEN": "rotated-secret"}},
+                })
+                .to_string(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
+    // Non-review workflow configuration and Task state config are not authority.
+    sqlx::query("UPDATE project SET workflow_definition = json_set(workflow_definition, '$.states[1].config', json('{\"unrelated\":true}')) WHERE id = ?")
+        .bind(&project_id).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config = '{\"working\":{\"unrelated\":true}}', priority = 10 WHERE id = ?")
+        .bind(&task_id).execute(db.pool()).await.unwrap();
+    db.record_review_conformance(
+        &db.review_conformance(&contract.execution_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_review_digest_integrates(&db, &task_id).await;
+    // The same passed-contract verifier also authorizes carry.
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: contract.execution_id.clone(),
+            attempt_number: 2,
+            status: ReviewStatus::Running,
+            step_results_json: "{}".into(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.review_carry_base(&task_id).await.unwrap().contract,
+        contract
+    );
+}
+
+#[tokio::test]
+async fn review_digest_governing_edits_invalidate_passed_contract() {
+    for change in [
+        "ci_steps",
+        "description",
+        "plan",
+        "requirement_ids",
+        "review_state",
+        "env_name",
+    ] {
+        let (db, project_id, task_id, contract) = seed_review_digest_contract(2).await;
+        let (sql, id) = match change {
+            "ci_steps" => ("UPDATE project SET settings = json_set(settings, '$.default_review_config.ci_steps', json('[\"false\"]')) WHERE id = ?", &project_id),
+            "review_state" => ("UPDATE project SET workflow_definition = json_set(workflow_definition, '$.states[0].config.review_prompt', 'Changed acceptance instruction') WHERE id = ?", &project_id),
+            "env_name" => ("UPDATE project SET settings = json_set(settings, '$.environment.env.NEW_TOKEN', 'secret') WHERE id = ?", &project_id),
+            "description" => ("UPDATE task SET description = 'Changed acceptance criteria' WHERE id = ?", &task_id),
+            "plan" => ("UPDATE task SET plan = 'Changed required plan' WHERE id = ?", &task_id),
+            "requirement_ids" => ("UPDATE task SET task_state_config = '{\"review\":{\"requirement_ids\":[\"new-requirement\"]}}' WHERE id = ?", &task_id),
+            _ => unreachable!(),
+        };
+        sqlx::query(sql).bind(id).execute(db.pool()).await.unwrap();
+        assert!(
+            matches!(
+                db.lock_review_integration(&task_id).await,
+                Err(DbError::Check(_))
+            ),
+            "{change}"
+        );
+        let conformance = db
+            .review_conformance(&contract.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                db.record_review_conformance(&conformance).await,
+                Err(DbError::Check(_))
+            ),
+            "{change}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_digest_unversioned_contract_preserves_v1_verification() {
+    let (db, project_id, task_id, contract) = seed_review_digest_contract(1).await;
+    let raw: String = sqlx::query_scalar(
+        "SELECT contract_json FROM execution_review_contract WHERE execution_id = ?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!raw.contains("source_digest_version"));
+    let restored = db
+        .review_contract(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.context.source_digest_version, None);
+    assert_eq!(serde_json::to_string(&restored).unwrap(), raw);
+    let mut digest_input = serde_json::from_str::<serde_json::Value>(&raw).unwrap();
+    digest_input["digest"] = serde_json::json!("");
+    assert_eq!(
+        api_types::canonical_digest(&digest_input).unwrap(),
+        restored.digest
+    );
+    assert_review_digest_integrates(&db, &task_id).await;
+    sqlx::query(
+        "UPDATE project SET settings = json_set(settings, '$.max_active_tasks', 7) WHERE id = ?",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.lock_review_integration(&task_id).await,
+        Err(DbError::Check(_))
+    ));
+    let conformance = db
+        .review_conformance(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        db.record_review_conformance(&conformance).await,
+        Err(DbError::Check(_))
+    ));
+}
+
+#[test]
+fn review_digest_scopes_authority_and_rejects_unknown_versions() {
+    let source = serde_json::json!({
+        "charter": {"id": "r1", "content_digest": "charter-digest"},
+        "task_charter_revision_id": "r1",
+        "task_scope": {"title": "Task", "description": "Acceptance", "plan": "Plan", "config": {}, "allocations": {}},
+        "documents": [{"id": "doc-r1", "content_digest": "document-digest"}],
+        "workflow": {"states": [{"name": "review", "role": "reviewer", "config": {}}]},
+        "project_settings": {"default_review_config": {
+            "setup_steps": [], "ci_steps": [], "check_timeout_seconds": 1800,
+            "conformance_checks": [], "requirement_ids": [], "requirement_allocations": {},
+        }},
+    });
+    let digest = api_types::review_source_digest(&source, 2).unwrap();
+    for (pointer, value) in [
+        ("/charter/id", serde_json::json!("r2")),
+        (
+            "/charter/content_digest",
+            serde_json::json!("new requirement digest"),
+        ),
+        (
+            "/documents/0/content_digest",
+            serde_json::json!("new acceptance digest"),
+        ),
+        (
+            "/task_scope/allocations",
+            serde_json::json!({"req": {"task_id": "other-task"}}),
+        ),
+        ("/task_scope/title", serde_json::json!("New title")),
+        (
+            "/project_settings/default_review_config/setup_steps",
+            serde_json::json!(["install"]),
+        ),
+        (
+            "/project_settings/default_review_config/check_timeout_seconds",
+            serde_json::json!(60),
+        ),
+        (
+            "/project_settings/default_review_config/conformance_checks",
+            serde_json::json!([{"id": "check", "command": "test", "requirement_ids": ["req"]}]),
+        ),
+    ] {
+        let mut changed = source.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert_ne!(
+            api_types::review_source_digest(&changed, 2).unwrap(),
+            digest,
+            "{pointer}"
+        );
+    }
+    let mut audit = source.clone();
+    audit["reviewer_assignment"] = serde_json::json!({"id": "new-reviewer"});
+    audit["task_scope"]["evidence"] =
+        serde_json::json!({"worklog": ["new report"], "media": ["new attachment"]});
+    audit["task_scope"]["merge_config"] = serde_json::json!("changed target");
+    assert_eq!(api_types::review_source_digest(&audit, 2).unwrap(), digest);
+    // Fingerprint effective commands: overridden Project defaults have no effect.
+    let mut overridden = source.clone();
+    overridden["task_scope"]["config"]["review"] = serde_json::json!({"ci_steps": ["true"]});
+    let override_digest = api_types::review_source_digest(&overridden, 2).unwrap();
+    overridden["project_settings"]["default_review_config"]["ci_steps"] =
+        serde_json::json!(["false"]);
+    assert_eq!(
+        api_types::review_source_digest(&overridden, 2).unwrap(),
+        override_digest
+    );
+    assert!(api_types::review_source_digest(&source, 99).is_err());
+}
+
 #[tokio::test]
 async fn review_authority_rejects_stale_candidate_when_newer_running_candidate_exists() {
     let db = sqlite_db().await;
@@ -5280,6 +6254,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5347,6 +6322,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         make_execution(dependency_id.clone()),
         make_lease(dependency_id),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -5377,6 +6353,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         interactive_execution,
         make_lease(interactive_id),
         Some(ExecutionAdmission {
+            expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
             expected_task_status: task.status.clone(),
@@ -5481,6 +6458,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
         expected_task_status: task.status.clone(),
@@ -5633,6 +6611,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: first_task.version,
         expected_task_status: first_task.status.clone(),
@@ -5652,6 +6631,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_workflow_definition: Some("{}".to_owned()),
     };
     let second_admission = ExecutionAdmission {
+        expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: second_task.version,
         expected_task_status: second_task.status.clone(),

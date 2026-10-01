@@ -1,4 +1,5 @@
-import type { MoveTaskRequest, Task, TasksResponse } from '@/types/generated'
+import type { TaskListItem as Task, TasksResponse } from '@/types/generated'
+import type { MoveTaskRequest } from '@/types/generated'
 
 export type BoardSnapshot = {
   tasks: Task[]

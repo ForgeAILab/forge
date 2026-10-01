@@ -1160,9 +1160,12 @@ pub async fn serve_with_listener<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, build_router(state, web_dist_dir))
-        .with_graceful_shutdown(shutdown_signal)
-        .await
+    axum::serve(
+        listener,
+        build_router(state, web_dist_dir).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await
 }
 
 async fn healthz() -> impl IntoResponse {

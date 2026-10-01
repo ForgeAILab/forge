@@ -1,7 +1,8 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
-import type { MoveTaskRequest, MoveTaskResponse, TasksResponse } from '@/types/generated'
+import type { MoveTaskRequest, MoveTaskResponse } from '@/types/generated'
+import type { TasksResponse } from '@/types/generated'
 
 export type BoardTaskSearch = {
   q?: string

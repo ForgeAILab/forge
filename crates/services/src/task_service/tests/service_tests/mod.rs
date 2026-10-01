@@ -301,7 +301,7 @@ async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "forge".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch,

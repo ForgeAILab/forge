@@ -1,7 +1,7 @@
 {
   "name": "web",
   "private": true,
-  "version": "0.13.11",
+  "version": "0.13.12",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -20,7 +20,7 @@
     "typecheck": "tsc -b",
     "test:typecheck-regression": "node scripts/typecheck-regression.mjs",
     "format": "prettier --write .",
-    "generate:types": "cargo test -p api-types -- --ignored export_typescript"
+    "generate:types": "make -C .. types"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.2",

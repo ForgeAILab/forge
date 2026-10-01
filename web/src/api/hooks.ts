@@ -113,6 +113,7 @@ import type {
   Workspace,
   AgentInquiryResponse,
 } from '@/types/generated'
+import type { TasksResponse } from '@/types/generated'
 import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
 import type { MilestoneDefinitionRevision } from '@/types/generated/bindings/MilestoneDefinitionRevision'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
@@ -502,7 +503,7 @@ export function useTasksQuery(
   return useInfiniteQuery({
     queryKey: qk.tasks(projectId, filterKey(search)),
     queryFn: ({ pageParam, signal }) =>
-      apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
+      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
         search: { ...search, cursor: pageParam as string | undefined },
         signal,
       }),

@@ -401,12 +401,16 @@ pub struct Repo {
     pub id: String,
     pub project_id: String,
     pub name: String,
-    pub remote_url: String,
+    pub remote_url: Option<String>,
     pub local_path: Option<String>,
     pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+pub fn normalize_repo_remote_url(remote_url: Option<String>) -> Option<String> {
+    remote_url.filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -88,4 +88,24 @@ pub enum DbError {
         path: PathBuf,
         source: std::num::ParseIntError,
     },
+
+    #[error(
+        "migrations `{first}` and `{second}` both claim version {version}; give the newer one a \
+         timestamp version (VYYYYMMDDHHMM__name.sql)"
+    )]
+    DuplicateMigrationVersion {
+        version: i64,
+        first: String,
+        second: String,
+    },
+
+    #[error(
+        "the database applied migration {version} as `{applied}`, but this build ships \
+         `{bundled}` under that version, so `{bundled}` would never run; refusing to migrate"
+    )]
+    AppliedMigrationMismatch {
+        version: i64,
+        applied: String,
+        bundled: String,
+    },
 }

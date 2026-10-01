@@ -1008,7 +1008,12 @@ requirement carrying the same stable ID; a passing result never substitutes
 for proof.
 
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
-It records the exact input manifest, source versions, evidence attachment
+Repository/build context permits an absent remote URL for local-only
+repositories; blank remote URLs normalize to `NULL`/`None` at repository writes
+and context reads. Repository identity, name, work mode, default branch, Task
+version, and observed timestamp remain required immutable metadata.
+
+Each snapshot records the exact input manifest, source versions, evidence attachment
 IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
 `stale`), and readiness digest. A ready snapshot moves an unreleased active
 milestone to `ready_for_release`; non-ready results leave it active with typed
@@ -1502,6 +1507,25 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
+Protected session/checkpoint payloads use a versioned zstd envelope inside
+authenticated encryption; earlier encrypted JSON rows remain readable and are
+converted on their next state change. Snapshot digests use domain-separated
+HMAC-SHA256 with the protected store key and exclude the save timestamp, so
+unchanged saves do no encryption or database write. Checkpoints
+are idempotent by session, turn, revision, and operation fingerprint, and retain
+the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
+also serves as the session snapshot (NULL standalone snapshot columns reference
+it); only independent canonical state changes need a separate snapshot. Writes
+use the protected row's revision CAS. A competing snapshot save supersedes the
+losing save; a checkpoint save reloads and retries once if it can still advance
+the winning turn. Newer turns/revisions, conflicting fingerprints, and any
+remaining CAS conflict supersede the losing save. The store handles these races
+for every runtime caller without failing the turn. Snapshot/checkpoint LCM policy markers are tracked
+separately so a standalone save cannot relabel an older checkpoint. A checkpoint
+decode failure returns an error naming the runtime session; it cannot safely
+fall back to fresh state because that would discard provider/tool recovery
+barriers.
+
 Forge does not configure Agent Runtime's tool-step or turn-time limits; their
 defaults are `None`. Task workflow `max_turns` is also optional and has no
 default. CLI Task execution, including Smith, receives no max-turn value unless
@@ -1515,7 +1539,7 @@ the Task workflow's optional `max_turns` policy and optional execution hard
 deadline. Exhausted provider attempts on a native Task are classified as
 `ExecutorUnavailable`, use the ordinary provider cooldown when no retry hint
 survives the runtime boundary, and defer every execution role (including
-planner/reviewer) without consuming the Task's execution retry budget. Model
+planner/reviewer) within the Task's execution retry budget. Model
 context/output bounds and finite failed-provider retry policy remain intrinsic
 runtime safety constraints, not productive-work turn or wall-clock budgets.
 If an explicit runtime tool/time/output policy produces a limit, the failure
@@ -1615,6 +1639,11 @@ Hashed JavaScript and CSS assets receive immutable one-year cache headers and
 eligible responses are Brotli/gzip compressed; HTML navigation responses remain
 uncached so deployments pick up the current asset graph. The production client
 keeps route screens and editor-backed dialogs behind dynamic import boundaries.
+
+HTTP request and response logs carry `client_addr` from the peer socket via
+Axum `ConnectInfo<SocketAddr>`. When supplied, `X-Forwarded-For` is recorded
+separately as `forwarded_for`; it is untrusted diagnostic metadata and does not
+change authentication or the peer address.
 
 ### Durable events and the in-process event bus
 
@@ -1869,6 +1898,17 @@ commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
+Attention consumer health buffers successful progress, flushing at an event
+boundary after five seconds or 100 processed events, and immediately on errors.
+Batch release flushes remaining progress and clears any published processing
+lease. New batch owners and lease renewals are buffered; empty polls write health
+at most once every five seconds. Buffered deltas and the latest successful
+sequence/time are preserved when flushing; a published lease expiry remains visible
+during processing. Each event's authoritative cursor and receipt still commit
+individually. Health counters are diagnostic: a crash may lose up to 99 buffered
+increments, without losing event delivery. The stale threshold remains 90
+seconds since the last successfully processed event.
+
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,
 review-ready and active work, embedded-agent health/current scope/focus,
@@ -2106,11 +2146,31 @@ review before retrying integration. A failed or
 blocked child stops the sequence at that child so the Project Agent can inspect
 evidence, reassign it, or otherwise coordinate recovery.
 
-Child terminal/reassignment cleanup never owns the shared root workspace. A
-root cancellation terminalizes active child executions before scheduling root
-cleanup; a scheduled cleanup is deferred while any execution still holds the
-workspace, and a newly admitted sibling clears an older terminal cleanup
-deadline before reusing the branch.
+Forge owns Task workspace cleanup. Entering a terminal workflow state schedules
+cleanup without waiting for filesystem deletion. The deadline worker removes
+the Task's exact worktree through `git worktree remove --force` and removes its
+build output. Built-in `done` Tasks are eligible promptly; `cancelled` Tasks
+retain their worktrees and managed homes for 24 hours to preserve uncommitted
+work. Broad Git worktree pruning runs only in Forge-owned `.repos/` caches;
+user-owned repositories retain all unrelated worktree registrations.
+Task branches and execution logs are retained; only
+`.codex-managed-home` (including task scratch) is removed from the Task's logs
+directory. Cleanup is deferred while any execution or WorkspaceLease is active.
+A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
+including missing worktrees and managed homes left by older installs; failed
+workspace cleanup is also retried with backoff by the deadline worker. The sweep
+honors cleanup deadlines and grace periods, and ineligible scheduled rows have
+their deadlines cleared so they cannot starve later cleanup. Cleanup failures
+are logged by the worker and never reported as transition effect failures.
+
+Operators must not delete worktrees based on execution status. A completed or
+failed execution can belong to a Task still in `review` or `merge_failed`, whose
+workspace remains live until the Task itself reaches a terminal workflow state.
+Child terminal/reassignment cleanup never owns the shared root workspace; a
+terminal child releases only its own managed Codex home. A root cancellation
+terminalizes active child executions before root cleanup, and root cleanup also
+waits for every child to become terminal. Reopening a terminal Task waits for
+physical cleanup before its workspace can be rebuilt from the retained branch.
 
 Dependency IDs are separate directed prerequisite-DAG edges. `depends_on_ids`
 on the direct MCP task-creation API (and `depends_on_task_ids` on the native
@@ -2271,6 +2331,28 @@ latest worker thread) records its execution. Task responses derive
 `awaiting_human` from the same Task snapshot as the returned optimistic
 `version`; a running barrier therefore cannot expose a gate decision using a
 version that the barrier-clear write is about to invalidate.
+
+When `run_ci_steps` finalizes a failed Review during a non-user entry (including
+an entry-barrier retry), the engine clears the barrier and settles the verdict
+through `TaskService::review_failure_target` before any reviewer dispatch or
+review-authority carry. This also applies to older workflows whose CI hook uses
+log-only failure handling. The normal review budget applies: the remediation
+transition records a rejection; exhaustion records `review_budget_exhausted`
+instead of leaving an unannotated Review gate. A human approval requirement
+parks a passing review, but does not suppress automatic remediation of failed
+CI. User-entered reviews retain their existing entry-check and human-decision
+behavior.
+
+Active-task recovery also settles a reviewer state's latest Failed Review
+after two minutes from its failure write, when the verdict belongs to the
+current non-user state entry, the Task has no blocker or blocked entry barrier,
+is not awaiting a human, and has no running execution or completion cascade. It claims
+the Task version before using that same failure routing; stale snapshots lose
+the CAS, and a remediation transition or budget blocker makes repeat scans inert.
+An abandoned running entry barrier is cleared if its checks already produced
+that failed verdict; a newer entry retry remains fenced. Recovery rechecks the
+latest Review and running executions after claiming the Task snapshot.
+User routing overrides and historical verdicts from earlier entries are excluded.
 
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
@@ -2479,6 +2561,22 @@ snapshot and its agent still owns the exact Task role.
 
 ### Crash recovery
 
+Explicit Task recovery whose only refusal is Agent capacity is accepted into
+the durable dispatch queue. Clearing its interruption and recording its action,
+reason, and context share a Task-version CAS and a no-running-execution check.
+The dispatcher retries that intent before ordinary scheduling once capacity
+is available, revalidating the current workflow and execution admission. The
+replay carries its queue ID through execution admission, and only its own
+Running execution INSERT consumes the queued intent in the same transaction,
+so restart cannot replay an already admitted recovery. While queued, the Task
+reports `Retry Queued` through the existing deferred-dispatch health projection.
+Repeated recovery requests return that queued Task without replacing the
+intent. Resume fallback launches share this queue and replay the Resume path.
+Only capacity refusals remain queued: permanent pre-claim/replay failures,
+including paused/offline Agents or an unrelated execution taking the slot,
+atomically remove the intent and restore its saved interruption with the error
+as its reason. Task-version and queue-ID checks protect newer decisions.
+
 `CrashRecovery` runs at server and Solo startup and deterministically reconciles
 ownerless or expired running executions left by an earlier process. Migration
 `V089` does not invent ownership for pre-existing rows: a running row without
@@ -2584,9 +2682,28 @@ require `WHERE version = ?` and increment on success. Version mismatch →
 ## Database
 
 SQLite with WAL mode. Schema in
-`crates/db/migrations/V001__initial_schema.sql`. Migrations are numbered
-`V{NNN}__{name}.sql` and tracked in `_migration` table. All primary keys are
+`crates/db/migrations/V001__initial_schema.sql`. All primary keys are
 app-generated UUID v4; all timestamps are app-generated RFC3339.
+
+Migrations are files named `V{version}__{name}.sql`, embedded in the binary
+and recorded by version and name in the `_migration` table. Versions up to
+V149 are sequential. Later migrations use their UTC creation time
+(`VYYYYMMDDHHMM`), so branches written in parallel cannot claim the same
+version. The runner applies every missing version in ascending order, so a
+branch that merges after a newer-stamped migration still runs. It refuses to
+start, before applying anything, in two cases:
+
+- two bundled files share a version;
+- the database already applied a different migration under a version this
+  build uses.
+
+Without that check, the second migration would be skipped without an error and
+its schema would never exist. The one known reconciled exception is a V053
+`integration_credentials` row from early hosts, which V054 repairs.
+
+To recover a refused host, compare `SELECT version, name FROM _migration` with
+`crates/db/migrations/`. Apply the build's migration by hand if its schema is
+missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=5000` per connection.
@@ -2728,7 +2845,18 @@ candidate route instead of a single adapter:
   precheck (`check_candidate_availability`, defaulting to the family-level
   check). Real task failures terminate the chain immediately. Adapters
   classify only structured signals (Smith stream events / result statuses,
-  Claude Code stderr and `is_error` result events); assistant output text is
+  Codex protocol errors, Claude Code stderr and `is_error` result events,
+  and Gemini stderr/error documents). Usage/rate-limit and HTTP 429 forms
+  become `UsageExhausted`, with reset hints parsed from structured fields,
+  relative delays, epoch timestamps, RFC3339 timestamps, and CLI clock/date
+  messages (clock-only messages use the executor host's local time unless
+  they explicitly say UTC; Codex dates may precede or follow the clock).
+  Numeric 429 signals require an HTTP/status context or an explicit error
+  `status`/`code` field; usage counters and costs are excluded. Codex stderr
+  diagnostics and errors marked `willRetry: true` do not trigger fallback.
+  Gemini capacity classification applies only after a failed process exit;
+  a clean exit remains successful even if the stream contained an error.
+  Assistant output text is
   never an input, and unclassifiable failures stay generic (no fallback).
 - **Cooldowns** — an in-memory, process-lifetime registry keyed by
   `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
@@ -2744,9 +2872,18 @@ candidate route instead of a single adapter:
   notifications without them degrade to generic executor-failed handling.
   The service layer maps `ExecutorUnavailable` to
   `FailureKind::ExecutorUnavailable` from these fields only — never prose.
-- **Availability recovery** — `executor_unavailable` bypasses the execution
-  retry budget entirely. Transient exhaustion (retry time known) schedules a
-  deferred dispatch at the structured `retry_at` plus deterministic jitter;
+- **Availability recovery** — transient `executor_unavailable` failures use
+  the existing finite execution retry budget. Capacity exhaustion schedules
+  a deferred dispatch at the structured `retry_at` plus deterministic jitter,
+  bounded by exponential backoff and a maximum six-hour wait. Without a reset
+  hint, CLI account cooldown defaults to 15 minutes; absent or malformed
+  terminal hints use execution backoff. Each deferred attempt consumes one
+  retry, and duplicate terminal delivery does not consume another. Exhaustion
+  blocks with explicit recovery actions. A zero execution retry budget blocks
+  with a disabled-retries message; an exhausted budget is identified separately.
+  Stale project versions cannot settle the Task or schedule retries.
+  Workflow health shows `Retry Scheduled`
+  or `Retry Queued` with the capacity/usage-limit reason while waiting;
   permanent unavailability (auth/install failure everywhere) blocks the task
   for manual reconfiguration with no automatic redispatch.
 - **Sticky selection and resume** — the winner's resolved config is written
@@ -2780,6 +2917,15 @@ receive JSON as safely quoted `FORGE_GOVERNING_CONTEXT` and
 Review admission requires server access to the candidate git objects; an
 inaccessible remote worktree fails admission rather than receiving an unverifiable
 contract.
+
+Review reruns, the `run_ci_steps` entry hook, and reviewer-completion conformance
+checks call `task_service::workspace::prepare_workspace` before using the Task
+checkout. They share executor dispatch's repository-authority checks and
+missing/unusable worktree recovery. A stale Ready workspace row with a surviving
+Task branch is rebuilt in place with the same workspace identity; a missing
+branch retains the existing explicit reset-required failure rather than
+reviewing a new candidate silently. Subtasks continue to use the root-owned
+shared workspace.
 
 Before an agent review launches, Forge freezes an execution-specific contract
 with Task-scoped requirement IDs, checks, completed pre-review CI results,
@@ -2881,13 +3027,38 @@ inputs make conformance unverified while retaining the parsed review.
 Natural-language Charter text never becomes an executable command;
 product-specific deterministic checks must be configured explicitly.
 
-The frozen Task source includes bounded worklog comments and active attached
+The frozen prompt context includes bounded worklog comments and active attached
 media metadata, giving read-only discovery Tasks a reviewable deliverable sink.
 Such Tasks own no implementation requirement IDs. Execution setup counts an
 implementation commit only when a non-reviewer execution changes `before_sha` to
 a different `after_sha`; the repository's unchanged base commit is not evidence
 of implementation.
 
+New contracts store `context.source_digest_version: 2` in their existing JSON.
+The v2 source digest fingerprints only review authority: the Charter revision ID
+and content digest plus the Task's Charter reference; Task title, description
+(including acceptance criteria), and plan; effective requirement IDs and
+allocations; linked Document revision IDs and content digests; effective
+`setup_steps`, `ci_steps`, `check_timeout_seconds` (30 minutes when unset), and
+requirement-linked `conformance_checks`; the review state's workflow config and
+Task overrides; and the Task's read-only review mode. The plan is authority
+because the resolver includes it in the universal `task:acceptance` requirement.
+Project environment variables are injected into review commands, so their names
+are fingerprinted, never their values. Whole Project settings/workflow blobs,
+reviewer assignments, worklog/media evidence, and other audit metadata do not
+enter the v2 digest. Changing unrelated settings or other workflow states does
+not revoke a v2 approval.
+
+A missing `source_digest_version` means v1. Such contracts still verify with
+`legacy_v1_source_digest`, the exact whole-source algorithm used when they were
+frozen, including its settings, workflow, assignment, and evidence inputs. The
+missing version stays omitted when serializing v1, preserving contract digests and
+immutable assessment equality. No migration or review is required merely by
+upgrading; changing a v1 input still requires fresh review. Fingerprint versions
+are independent of the conformance policy version.
+
+Acceptance and reviewer completion recheck the source digest using the version
+frozen in the contract; completion also validates current governing material.
 Acceptance rechecks source provenance inside the SQLite write transaction.
 Direct integration holds the authority write lock during the local git operation,
 compares source and target commits, fast-forwards only the immutable reviewed
@@ -2919,8 +3090,8 @@ usual:
   every one with exit code 0 (with no checks, nothing verified the new tree);
 - the Review attempt immediately before this entry passed and is still current
   authority under the same checks integration makes: passed conformance, current
-  policy, an unchanged governing-context digest (Charter, Task scope, workflow,
-  reviewer assignment) and a matching frozen assessment;
+  policy, an unchanged source digest under the contract's frozen fingerprint
+  version and a matching frozen assessment;
 - every path `HEAD` changes relative to the target tip is in the approved
   contract's `candidate_changed_paths`, `HEAD` descends from the current target
   tip, the worktree is clean and no handed-off file adds conflict markers;
@@ -2940,7 +3111,8 @@ current passed contract's, else the contract's own `commit_sha`/`base_sha`.
 Integration and PR publication compare `HEAD` and the target tip with that
 candidate, so a newer real review (a different contract execution) supersedes
 all earlier carries automatically. A stored workflow change (such as migration
-`V148`) alters the governing context and therefore also forces one fresh review.
+`V148`) forces a fresh v1 review; for v2, only a change to review authority
+invalidates the source digest.
 
 The manual review-rerun endpoint consumes the same result categories as automatic
 review completion. Passed reruns cascade into merging, failed reruns use the

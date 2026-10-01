@@ -573,7 +573,7 @@ async fn completed_reviewer_execution_keeps_the_task_retry_budget_it_has_spent()
 }
 
 #[tokio::test]
-async fn reviewer_provider_unavailability_defers_without_consuming_task_retry_budget() {
+async fn reviewer_provider_unavailability_uses_bounded_task_retry_budget() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -665,11 +665,221 @@ async fn reviewer_provider_unavailability_defers_without_consuming_task_retry_bu
         metadata.get("deferred_dispatch").is_some(),
         "reviewer execution should wait for provider recovery: {metadata}"
     );
-    assert!(
-        metadata.get("execution_retry_count").is_none(),
-        "provider availability must not spend Task retry budget: {metadata}"
-    );
+    assert_eq!(metadata["execution_retry_count"], 1);
     assert!(task_after.blocked_json.is_none());
+}
+
+struct CapacityLimitedExecutor {
+    retry_after: Option<std::time::Duration>,
+}
+
+#[async_trait]
+impl TaskExecutor for CapacityLimitedExecutor {
+    async fn execute(
+        &self,
+        _ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Failed,
+            error: Some("You've hit your usage limit".to_owned()),
+            failure_class: Some(executors::ExecutionFailureClass::ExecutorUnavailable),
+            retry_after: self.retry_after,
+            route_attempts: vec![executors::RouteAttempt {
+                candidate_key: "only-candidate".to_owned(),
+                outcome: executors::RouteAttemptOutcome::UsageExhausted,
+            }],
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn capacity_limit_without_fallback_defers_until_reset_or_backoff() {
+    for hint in [
+        Some(std::time::Duration::from_secs(3900)),
+        None,
+        Some(std::time::Duration::from_secs(7 * 86400)),
+    ] {
+        let db = Arc::new(sqlite_db().await);
+        let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+        let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+        let agent_id = seed_agent(&db).await;
+        let task = service
+            .create_task(
+                project_id,
+                "Wait for quota",
+                Some("implement the task".to_owned()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let claimed = service
+            .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+            .await
+            .unwrap();
+        let retry_count = u64::from(hint.is_none());
+        if retry_count > 0 {
+            sqlx::query("UPDATE task SET metadata_json = ?, version = version + 1 WHERE id = ?")
+                .bind(json!({"execution_retry_count": retry_count}).to_string())
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let before = chrono::Utc::now();
+        let execution = service
+            .run_execution(
+                claimed.execution.id,
+                &CapacityLimitedExecutor { retry_after: hint },
+            )
+            .await
+            .unwrap();
+        let after = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata: Value =
+            serde_json::from_str(after.metadata_json.as_deref().unwrap()).unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(
+            metadata["deferred_dispatch"]["not_before"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let delay = (at.with_timezone(&chrono::Utc) - before).num_seconds();
+        let expected = hint.map_or(20, |hint| hint.as_secs().min(6 * 3600)) as i64;
+        assert!(
+            delay >= expected && delay <= expected + 30,
+            "{delay} vs {expected}"
+        );
+        assert_eq!(metadata["execution_retry_count"], retry_count + 1);
+        let persisted_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted_execution.resume_policy,
+            Some(db::ResumePolicy::Auto)
+        );
+        assert!(after.version > claimed.task.version);
+        assert!(after.blocked_json.is_none());
+        assert!(after.failed_json.is_none());
+        assert!(after.error_annotation.is_none());
+        let assignments = db::TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+            .await
+            .unwrap();
+        let health = crate::task_diagnostics::derive_workflow_health(
+            &after,
+            &crate::workflow::default_workflow::default_workflow(),
+            &assignments,
+            None,
+            Some(&execution),
+            false,
+            None,
+        );
+        assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+        assert_eq!(health.label, "Retry Scheduled");
+        assert!(health.message.unwrap().contains("usage limit"));
+
+        service
+            .annotate_executor_unavailable_block(
+                &execution,
+                hint.map(|hint| {
+                    (chrono::Utc::now() + chrono::Duration::seconds(hint.as_secs() as i64))
+                        .to_rfc3339()
+                }),
+                json!([{"outcome": "usage_exhausted"}]),
+            )
+            .await
+            .unwrap();
+        let repeated = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.metadata_json, after.metadata_json);
+        assert_eq!(repeated.version, after.version);
+    }
+}
+
+#[tokio::test]
+async fn capacity_limit_retry_budget_exhaustion_blocks() {
+    assert_capacity_limit_retry_block(3, 3, "retry budget exhausted").await;
+}
+
+#[tokio::test]
+async fn capacity_limit_zero_retry_budget_blocks_as_disabled() {
+    assert_capacity_limit_retry_block(0, 0, "automatic retries are disabled").await;
+}
+
+async fn assert_capacity_limit_retry_block(budget: u64, retry_count: u64, reason: &str) {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Exhausted quota retries",
+            Some("implement the task".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET metadata_json = ?, task_state_config = ?, version = version + 1 WHERE id = ?")
+        .bind(json!({"execution_retry_count": retry_count}).to_string())
+        .bind(json!({"retry_budgets": {"execution": budget}}).to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let execution = service
+        .run_execution(
+            claimed.execution.id,
+            &CapacityLimitedExecutor {
+                retry_after: Some(std::time::Duration::from_secs(3900)),
+            },
+        )
+        .await
+        .unwrap();
+    let after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let annotation: api_types::TaskBlockingAnnotation =
+        serde_json::from_str(after.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::ExecutorUnavailable
+    );
+    let message = annotation.message.unwrap();
+    assert!(message.contains(reason), "{message}");
+    if budget == 0 {
+        assert!(!message.contains("retry budget exhausted"), "{message}");
+    }
+    assert!(after.blocked_json.is_some());
+    assert!(after.failed_json.is_none());
+    assert_eq!(execution.resume_policy, Some(db::ResumePolicy::Manual));
+    let metadata: Value = serde_json::from_str(after.metadata_json.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["execution_retry_count"], retry_count);
+    assert!(metadata.get("deferred_dispatch").is_none());
 }
 
 #[tokio::test]
@@ -3372,6 +3582,59 @@ async fn timed_out_review_checks_rerun_alone_then_park_without_a_new_reviewer() 
         .await
         .expect("duplicate delivery is inert");
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn reviewer_conformance_recovers_deleted_worktree_before_checks() {
+    let (db, service, task, execution, repo_dir) = seed_admitted_review_with(
+        r#"{"retry_budgets":{"execution":3,"review":3},"review":{"ci_steps":["test -f README.md"]}}"#,
+    ).await;
+    let workspace_root = TempDir::new().unwrap();
+    let service = service.with_workspace_root(workspace_root.path().to_path_buf());
+    let workspace = WorkspaceRepo::get_by_id(&*db, execution.workspace_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let worktree = ::workspace::WorkspaceManager::new(workspace_root.path().to_path_buf())
+        .create_worktree_named(repo_dir.path().to_str().unwrap(), &task.id, "forge", "main")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace SET worktree_path = ?, branch = ? WHERE id = ?")
+        .bind(worktree.to_string_lossy().as_ref())
+        .bind(::workspace::task_branch_name(&task.id))
+        .bind(&workspace.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let sha = git::get_current_sha(&worktree).await.unwrap();
+    std::fs::remove_dir_all(&worktree).unwrap();
+    run_git(repo_dir.path(), &["worktree", "prune"]);
+
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"pass","reason":"acceptance satisfied"}"#,
+    )
+    .await;
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(review.status, ReviewStatus::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert_eq!(git::get_current_sha(&worktree).await.unwrap(), sha);
+    let recovered = WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, workspace.id);
+    assert_eq!(recovered.branch, ::workspace::task_branch_name(&task.id));
 }
 
 #[tokio::test]
@@ -6343,7 +6606,7 @@ async fn failed_resume_does_not_restore_metadata_over_running_replacement() {
     .expect("recovery clear commits");
     let _replacement = seed_running_coder_execution(&db, &task.id, None, None).await;
 
-    let result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &*db,
         &cleared.id,
         cleared.version,
@@ -6352,6 +6615,7 @@ async fn failed_resume_does_not_restore_metadata_over_running_replacement() {
         annotated.failed_json.clone(),
         &now_rfc3339(),
         Some("workspace-after-reset"),
+        Vec::new(),
         Vec::new(),
     )
     .await;

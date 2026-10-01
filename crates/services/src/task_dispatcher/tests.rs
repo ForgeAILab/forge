@@ -1,5 +1,6 @@
 use std::{future::pending, path::Path, sync::Arc};
 
+use api_types::{Actor, SystemComponent};
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
@@ -14,7 +15,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
-use crate::deferred_dispatch;
+use crate::{deferred_dispatch, ServiceError};
 
 use super::*;
 
@@ -112,7 +113,7 @@ async fn seed_project_repo(db: &db::SqliteDb, repo_path: &Path) -> (String, Stri
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "forge".to_owned(),
-            remote_url: repo_path.to_string_lossy().into_owned(),
+            remote_url: Some(repo_path.to_string_lossy().into_owned()),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch,
@@ -704,7 +705,7 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "forge".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -838,7 +839,7 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "manual-pause-repo".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch,
@@ -913,7 +914,7 @@ async fn stale_repository_resume_cannot_clear_a_later_manual_pause() {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "stale-resume-repo".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch,
@@ -1004,7 +1005,7 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "unborn".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -1094,7 +1095,7 @@ async fn stale_repository_pause_cannot_pause_after_repository_attachment() {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "stale-pause-repo".to_owned(),
-            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch,
@@ -1451,6 +1452,315 @@ struct MergeGateFixture {
     task: Task,
     merge_service: Arc<crate::merge_service::MergeService>,
     dispatcher: TaskDispatcher,
+}
+
+struct FailedReviewFixture {
+    db: Arc<db::SqliteDb>,
+    task: Task,
+    dispatcher: TaskDispatcher,
+    _repo_dir: TempDir,
+}
+
+async fn failed_review_fixture(failed_ago: chrono::Duration, budget: i32) -> FailedReviewFixture {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
+    let task = seed_task(&db, &project_id, "stranded failed CI", "review", 0).await;
+    let candidate = seed_completed_coder_execution(&db, &task.id).await;
+    let failed_at = (chrono::Utc::now() - failed_ago).to_rfc3339();
+    let entered_at = (chrono::Utc::now() - failed_ago - chrono::Duration::seconds(1)).to_rfc3339();
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate,
+            attempt_number: 1,
+            status: ReviewStatus::Failed,
+            step_results_json: r#"{"ci_steps":[{"index":0,"command":"false","exit_code":1}]}"#
+                .to_owned(),
+            started_at: failed_at.clone(),
+            created_at: failed_at.clone(),
+            updated_at: failed_at,
+        },
+    )
+    .await
+    .unwrap();
+    TransitionLogRepo::insert(
+        &*db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "merge_failed".to_owned(),
+            to_state: "review".to_owned(),
+            trigger_name: None,
+            triggered_by: Actor::system(SystemComponent::Workflow).display(),
+            trigger_reason: "user action".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: entered_at,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(serde_json::json!({"retry_budgets":{"review":budget}}).to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let event_bus = Arc::new(EventBus::new(32));
+    let service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+    let dispatcher = TaskDispatcher::new(Arc::clone(&db), event_bus, service);
+    FailedReviewFixture {
+        db,
+        task,
+        dispatcher,
+        _repo_dir: repo_dir,
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_recovers_after_grace_idempotently() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(current.blocked_json.is_none());
+    assert!(current.review_passed_at.is_none());
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        1
+    );
+    // The remediation transition fences a duplicate delivery of this entry.
+    assert!(!fixture
+        .dispatcher
+        .recover_failed_review(&fixture.task)
+        .await
+        .unwrap());
+    let entries = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()[0]
+            .status,
+        ReviewStatus::Failed
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_records_exhausted_budget_once() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 1).await;
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "review");
+    let annotation: serde_json::Value =
+        serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["type"], "review_budget_exhausted");
+    assert!(!fixture
+        .dispatcher
+        .recover_failed_review(&current)
+        .await
+        .unwrap());
+    let unchanged = TaskRepo::get_by_id(&*fixture.db, &current.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version, current.version);
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_respects_grace_and_recovery_fences() {
+    for fence in [
+        "grace",
+        "annotation",
+        "blocked",
+        "running",
+        "awaiting_human",
+        "user",
+        "barrier",
+        "cascade",
+        "old_review",
+        "new_review",
+    ] {
+        let age = if fence == "grace" {
+            chrono::Duration::seconds(30)
+        } else {
+            chrono::Duration::minutes(3)
+        };
+        let fixture = failed_review_fixture(age, 3).await;
+        let cascade_slot = if fence == "cascade" {
+            fixture
+                .dispatcher
+                .task_service
+                .claim_completion_cascade(&fixture.task.id)
+        } else {
+            None
+        };
+        match fence {
+            "annotation" => {
+                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                    .bind(r#"{"type":"review_blocked","message":"owner action required"}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "blocked" => {
+                sqlx::query("UPDATE task SET blocked_json = '{}' WHERE id = ?")
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "running" => {
+                let agent =
+                    seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+                seed_running_execution(&fixture.db, &fixture.task.id, &agent, "coder").await;
+            }
+            "awaiting_human" => {
+                sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+                    .bind(r#"{"awaiting_human":true}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "user" => {
+                sqlx::query("UPDATE transition_log SET triggered_by = 'user:override:api' WHERE task_id = ?")
+                .bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
+            }
+            "barrier" => {
+                sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+                    .bind(serde_json::json!({"state":"review","status":"running","retry_started_at":now_rfc3339()}).to_string())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "old_review" => {
+                sqlx::query("UPDATE transition_log SET created_at = ? WHERE task_id = ?")
+                    .bind(now_rfc3339())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "new_review" => {
+                let candidate = seed_completed_coder_execution(&fixture.db, &fixture.task.id).await;
+                let now = now_rfc3339();
+                ReviewRepo::create(
+                    &*fixture.db,
+                    db::CreateReview {
+                        id: new_uuid_v4(),
+                        task_id: fixture.task.id.clone(),
+                        execution_id: candidate,
+                        attempt_number: 2,
+                        status: ReviewStatus::Running,
+                        step_results_json: r#"{"ci_steps":[]}"#.to_owned(),
+                        started_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            _ => {}
+        }
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !fixture
+                .dispatcher
+                .recover_failed_review(&task)
+                .await
+                .unwrap(),
+            "{fence}"
+        );
+        let current = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, task.version, "{fence}");
+        assert_eq!(current.status, "review", "{fence}");
+        drop(cascade_slot);
+    }
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_clears_abandoned_running_entry_barrier() {
+    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
+    sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({"state":"review", "status":"running",
+            "started_at":(chrono::Utc::now() - chrono::Duration::minutes(4)).to_rfc3339()})
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(current.entry_barrier_json.is_none());
+}
+
+#[tokio::test]
+async fn dispatcher_failed_review_rejects_stale_task_version() {
+    for budget in [1, 3] {
+        let fixture = failed_review_fixture(chrono::Duration::minutes(3), budget).await;
+        sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let error = fixture
+            .dispatcher
+            .recover_failed_review(&fixture.task)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Db(db::DbError::VersionConflict)
+        ));
+        let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, "review");
+        assert!(current.blocked_json.is_none());
+    }
 }
 
 async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
@@ -2371,6 +2681,570 @@ async fn dispatcher_skips_task_when_agent_offline() {
     assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
+    for (action, bind_execution) in [
+        (api_types::RecoveryAction::Reexecute, false),
+        (api_types::RecoveryAction::Reexecute, true),
+        (api_types::RecoveryAction::ResumeSession, true),
+        (api_types::RecoveryAction::OpenInteractive, true),
+    ] {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let workspace_dir = TempDir::new().expect("workspace dir creates");
+        let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let busy = seed_task(&db, &project_id, "occupies capacity", "in_progress", 0).await;
+        assign_role(&db, &busy.id, "coder", &agent_id).await;
+        seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
+        crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
+
+        let task = seed_task(&db, &project_id, "recover", "in_progress", 0).await;
+        assign_role(&db, &task.id, "coder", &agent_id).await;
+        let stopped = seed_cancelled_execution(
+            &db,
+            &task.id,
+            &agent_id,
+            "coder",
+            Some(StopReason::UserCancelled),
+            Some(ResumePolicy::Manual),
+        )
+        .await;
+        sqlx::query("UPDATE execution SET agent_session_id = ? WHERE id = ?")
+            .bind("recovery-session")
+            .bind(&stopped.id)
+            .execute(db.pool())
+            .await
+            .expect("stopped session persists");
+        let annotation = serde_json::json!({
+            "type": "recovery_required",
+            "blocking_reason": "crash_recovery",
+            "blocked_execution_id": bind_execution.then_some(&stopped.id),
+            "recovery_actions": [action],
+        });
+        let task = TaskRepo::update(
+            &*db,
+            UpdateTask {
+                id: task.id.clone(),
+                expected_version: task.version,
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                error_annotation: Some(Some(annotation.to_string())),
+                blocked_json: Some(Some(
+                    serde_json::json!({
+                        "kind": "recovery_required",
+                        "reason": "crash_recovery",
+                    })
+                    .to_string(),
+                )),
+                failed_json: None,
+                task_state_config: None,
+                parent_task_id: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("interruption persists");
+        let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+        let queued = dispatcher
+            .task_service
+            .recover_task(
+                &task.id,
+                action,
+                Some("operator retry".to_owned()),
+                Some("keep this recovery guidance".to_owned()),
+            )
+            .await
+            .expect("capacity-only recovery is accepted");
+        assert!(queued.version > task.version);
+        assert!(queued.error_annotation.is_none());
+        assert!(queued.blocked_json.is_none());
+        let intent = deferred_dispatch::queued_recovery(&queued).expect("intent persists");
+        let deferred_dispatch::QueuedRecoveryRequest::Recover(request) = &intent.request else {
+            panic!("recovery request expected")
+        };
+        assert_eq!(request.action, action);
+        assert_eq!(request.reason.as_deref(), Some("operator retry"));
+        assert_eq!(
+            request.context.as_deref(),
+            Some("keep this recovery guidance")
+        );
+        let assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+            .await
+            .expect("assignments load");
+        let health = crate::task_diagnostics::derive_workflow_health(
+            &queued,
+            &crate::workflow::default_workflow::default_workflow(),
+            &assignments,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+        assert_eq!(health.label, "Retry Queued");
+        assert_eq!(dispatcher.check_once().await.expect("full scan runs"), 0);
+        assert!(rx.try_recv().is_err());
+        assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .expect("executions load")
+            .is_empty());
+
+        sqlx::query(
+            "UPDATE execution SET status = 'cancelled', resume_policy = 'manual' WHERE task_id = ?",
+        )
+        .bind(&busy.id)
+        .execute(db.pool())
+        .await
+        .expect("capacity frees");
+        // A new dispatcher proves the accepted intent survives runtime restart.
+        let (restarted, mut restarted_rx) =
+            build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+        assert_eq!(restarted.check_once().await.expect("recovery scan runs"), 1);
+        let ctx = tokio::time::timeout(Duration::from_secs(2), restarted_rx.recv())
+            .await
+            .expect("queued recovery dispatches")
+            .expect("execution context arrives");
+        assert_eq!(ctx.task_id, task.id);
+        assert!(ctx.description.contains("keep this recovery guidance"));
+        let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        if action == api_types::RecoveryAction::ResumeSession {
+            assert_eq!(
+                execution.agent_session_id.as_deref(),
+                Some("recovery-session")
+            );
+            assert_eq!(
+                execution.parent_execution_id.as_deref(),
+                Some(stopped.id.as_str())
+            );
+        }
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert!(deferred_dispatch::queued_recovery(&current).is_none());
+        assert!(deferred_dispatch::pending_until(&current).is_none());
+        assert_eq!(restarted.check_once().await.expect("replay scan runs"), 0);
+        assert!(restarted_rx.try_recv().is_err());
+    }
+}
+
+async fn seed_capacity_recovery(
+    db: &Arc<db::SqliteDb>,
+    dispatcher: &TaskDispatcher,
+    project_id: &str,
+    action: api_types::RecoveryAction,
+) -> (db::Task, String, String) {
+    let agent_id = seed_agent(db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let busy = seed_task(db, project_id, "occupies capacity", "in_progress", 0).await;
+    seed_running_execution(db, &busy.id, &agent_id, "coder").await;
+    crate::test_support::set_test_agent_capacity(db, &agent_id, 1).await;
+    let task = seed_task(db, project_id, "recover", "in_progress", 0).await;
+    assign_role(db, &task.id, "coder", &agent_id).await;
+    let blocked_execution_id = if action == api_types::RecoveryAction::ResumeSession {
+        let stopped = seed_cancelled_execution(
+            db,
+            &task.id,
+            &agent_id,
+            "coder",
+            Some(StopReason::UserCancelled),
+            Some(ResumePolicy::Manual),
+        )
+        .await;
+        sqlx::query("UPDATE execution SET agent_session_id = 'recovery-session' WHERE id = ?")
+            .bind(&stopped.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        Some(stopped.id)
+    } else {
+        None
+    };
+    sqlx::query("UPDATE task SET error_annotation = ?, blocked_json = ?, version = version + 1 WHERE id = ?")
+        .bind(serde_json::json!({
+            "type": "recovery_required", "blocking_reason": "crash_recovery",
+            "blocked_by": "original-owner", "blocked_execution_id": blocked_execution_id, "recovery_actions": [action],
+        }).to_string())
+        .bind(serde_json::json!({ "kind": "recovery_required", "reason": "crash_recovery", "blocked_by": "original-owner" }).to_string())
+        .bind(&task.id).execute(db.pool()).await.unwrap();
+    let queued = dispatcher
+        .task_service
+        .recover_task(&task.id, action, None, None)
+        .await
+        .expect("recovery queues");
+    (queued, agent_id, busy.id)
+}
+
+#[tokio::test]
+async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
+    for failure in [
+        "deleted",
+        "unassigned",
+        "interactive",
+        "paused",
+        "offline",
+        "unrelated",
+        "unrelated_moved",
+        "session",
+        "unassigned_session",
+    ] {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().unwrap();
+        let workspace_dir = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+        let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+        let action = match failure {
+            "interactive" => api_types::RecoveryAction::OpenInteractive,
+            "session" | "unassigned_session" => api_types::RecoveryAction::ResumeSession,
+            _ => api_types::RecoveryAction::Reexecute,
+        };
+        let (queued, agent_id, busy_id) =
+            seed_capacity_recovery(&db, &dispatcher, &project_id, action).await;
+        match failure {
+            "deleted" => {
+                AgentRepo::archive(&*db, &agent_id, &now_rfc3339())
+                    .await
+                    .unwrap();
+            }
+            "unassigned" | "interactive" | "unassigned_session" => {
+                sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ?")
+                    .bind(&queued.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            "paused" => {
+                sqlx::query(
+                    "UPDATE agent_identity SET paused = 1, version = version + 1 WHERE id = ?",
+                )
+                .bind(&agent_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            "offline" => {
+                let agent = AgentRepo::get_by_id(&*db, &agent_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                sqlx::query("UPDATE daemon SET status = 'offline' WHERE id = ?")
+                    .bind(agent.daemon_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            "unrelated" | "unrelated_moved" => {
+                let other_agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+                seed_running_execution(&db, &queued.id, &other_agent, "interactive").await;
+                let current = TaskRepo::get_by_id(&*db, &queued.id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    current.metadata_json, queued.metadata_json,
+                    "unrelated admission preserves intent"
+                );
+                if failure == "unrelated_moved" {
+                    sqlx::query(
+                        "UPDATE task SET status = 'planning', version = version + 1 WHERE id = ?",
+                    )
+                    .bind(&queued.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+            }
+            "session" => {
+                sqlx::query("UPDATE execution SET agent_session_id = NULL WHERE task_id = ?")
+                    .bind(&queued.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE execution SET status = 'cancelled', resume_policy = 'manual' WHERE task_id = ?")
+                    .bind(&busy_id).execute(db.pool()).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let latest = TaskRepo::get_by_id(&*db, &queued.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = dispatcher
+            .task_service
+            .dispatch_queued_recovery(&latest)
+            .await
+            .expect_err("permanent replay refusal is reported once");
+        let restored = TaskRepo::get_by_id(&*db, &queued.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(restored.version > queued.version);
+        assert!(
+            deferred_dispatch::queued_recovery(&restored).is_none(),
+            "{failure}"
+        );
+        assert!(deferred_dispatch::pending_until(&restored).is_none());
+        let annotation: serde_json::Value =
+            serde_json::from_str(restored.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["blocked_by"], "original-owner");
+        assert_eq!(annotation["blocking_reason"], error.to_string());
+        let blocked: serde_json::Value =
+            serde_json::from_str(restored.blocked_json.as_deref().unwrap()).unwrap();
+        assert_eq!(blocked["blocked_by"], "original-owner");
+        assert_eq!(blocked["reason"], error.to_string());
+        assert!(dispatcher
+            .task_service
+            .available_recovery_actions(&queued.id)
+            .await
+            .unwrap()
+            .contains(&action));
+        assert!(!dispatcher
+            .task_service
+            .dispatch_queued_recovery(&restored)
+            .await
+            .unwrap());
+        assert!(rx.try_recv().is_err());
+        if failure == "unassigned" {
+            assign_role(&db, &queued.id, "coder", &agent_id).await;
+            let requeued = dispatcher
+                .task_service
+                .recover_task(&queued.id, action, None, None)
+                .await
+                .expect("restored blocker can be recovered after reassignment");
+            assert!(deferred_dispatch::queued_recovery(&requeued).is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
+    for previous_session in [None, Some(false), Some(true)] {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().unwrap();
+        let workspace_dir = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let busy = seed_task(&db, &project_id, "busy", "in_progress", 0).await;
+        seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
+        crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
+        let task = seed_task(&db, &project_id, "resume", "in_progress", 0).await;
+        assign_role(&db, &task.id, "coder", &agent_id).await;
+        let stopped = if let Some(session) = previous_session {
+            let stopped = seed_cancelled_execution(
+                &db,
+                &task.id,
+                &agent_id,
+                "coder",
+                Some(StopReason::UserCancelled),
+                Some(ResumePolicy::Manual),
+            )
+            .await;
+            if session {
+                sqlx::query(
+                    "UPDATE execution SET agent_session_id = 'resume-session' WHERE id = ?",
+                )
+                .bind(&stopped.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            Some(stopped)
+        } else {
+            None
+        };
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+        let queued = dispatcher
+            .task_service
+            .perform_task_action(
+                &task.id,
+                api_types::TaskAction::Resume,
+                Some("resume guidance".to_owned()),
+                Some(current.version),
+            )
+            .await
+            .expect("Resume queues at capacity")
+            .task;
+        assert!(deferred_dispatch::queued_recovery(&queued).is_some());
+        assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!dispatcher
+            .task_service
+            .dispatch_queued_recovery(&queued)
+            .await
+            .unwrap());
+        sqlx::query(
+            "UPDATE execution SET status = 'cancelled', resume_policy = 'manual' WHERE task_id = ?",
+        )
+        .bind(&busy.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(dispatcher
+            .task_service
+            .dispatch_queued_recovery(&queued)
+            .await
+            .unwrap());
+        let ctx = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ctx.description.contains("resume guidance"));
+        let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if previous_session == Some(true) {
+            assert_eq!(
+                execution.parent_execution_id,
+                stopped.map(|stopped| stopped.id)
+            );
+            let snapshot: serde_json::Value =
+                serde_json::from_str(execution.executor_config_snapshot_json.as_deref().unwrap())
+                    .unwrap();
+            assert_eq!(
+                snapshot["dispatch"]["execution_policy"],
+                "resume_latest_target_role_thread"
+            );
+        }
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deferred_dispatch::queued_recovery(&current).is_none());
+        assert!(deferred_dispatch::pending_until(&current).is_none());
+    }
+}
+
+#[tokio::test]
+async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let busy = seed_task(&db, &project_id, "occupies capacity", "in_progress", 0).await;
+    seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
+    crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
+    let task = seed_task(&db, &project_id, "recover", "in_progress", 0).await;
+    assign_role(&db, &task.id, "coder", &agent_id).await;
+    let stopped = seed_cancelled_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        "coder",
+        Some(StopReason::UserCancelled),
+        Some(ResumePolicy::Manual),
+    )
+    .await;
+    let annotation = serde_json::json!({
+        "type": "recovery_required",
+        "blocking_reason": "crash_recovery",
+        "blocked_execution_id": stopped.id,
+        "recovery_actions": ["resume_session", "reexecute"],
+    });
+    let task = TaskRepo::update(
+        &*db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation.to_string())),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("interruption persists");
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    for (action, message) in [
+        (
+            api_types::RecoveryAction::ResumeSession,
+            "no resumable session",
+        ),
+        (api_types::RecoveryAction::RetryHook, "not allowed"),
+    ] {
+        let error = dispatcher
+            .task_service
+            .recover_task(&task.id, action, None, None)
+            .await
+            .expect_err("invalid recovery is refused even at capacity");
+        assert!(
+            matches!(error, crate::ServiceError::InvalidOperation { message: ref actual } if actual.contains(message))
+        );
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert_eq!(current.error_annotation, task.error_annotation);
+        assert_eq!(current.version, task.version);
+        assert!(deferred_dispatch::queued_recovery(&current).is_none());
+    }
+    sqlx::query("UPDATE agent_identity SET paused = 1, version = version + 1 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent pauses");
+    let error = dispatcher
+        .task_service
+        .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+        .await
+        .expect_err("paused agent is refused even at capacity");
+    assert!(matches!(error, crate::ServiceError::AgentPaused { .. }));
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.error_annotation, task.error_annotation);
+    assert!(deferred_dispatch::queued_recovery(&current).is_none());
+    sqlx::query("UPDATE agent_identity SET paused = 0, version = version + 1 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE daemon SET status = 'offline' WHERE id = ?")
+        .bind(agent.daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let error = dispatcher
+        .task_service
+        .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+        .await
+        .expect_err("offline agent is refused even at capacity");
+    assert!(
+        matches!(error, crate::ServiceError::InvalidOperation { ref message } if message.contains("offline"))
+    );
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.error_annotation, task.error_annotation);
+    assert!(deferred_dispatch::queued_recovery(&current).is_none());
 }
 
 #[tokio::test]

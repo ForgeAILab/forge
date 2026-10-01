@@ -49,7 +49,7 @@ async fn seed_base(db: &SqliteDb) {
             id: "receipt-repo".to_owned(),
             project_id: "receipt-project".to_owned(),
             name: "receipt".to_owned(),
-            remote_url: "https://example.test/receipt.git".to_owned(),
+            remote_url: Some("https://example.test/receipt.git".to_owned()),
             local_path: Some("/tmp/receipt".to_owned()),
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

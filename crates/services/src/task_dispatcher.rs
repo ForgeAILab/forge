@@ -118,6 +118,7 @@ impl TaskDispatcher {
                 continue;
             }
             let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+            dispatched += self.dispatch_queued_recoveries(&project).await?;
             // Work already in flight goes first. Scheduling new Tasks first
             // let every fresh `todo` claim a single-slot agent before an
             // interrupted Task — one whose execution a restart stopped with
@@ -159,6 +160,33 @@ impl TaskDispatcher {
             }
         }
         Ok(items)
+    }
+
+    async fn dispatch_queued_recoveries(&self, project: &Project) -> Result<u64> {
+        let tasks = TaskRepo::list_by_project_with_metadata_key(
+            &*self.db,
+            &project.id,
+            crate::deferred_dispatch::QUEUED_RECOVERY_KEY,
+        )
+        .await?;
+        let mut dispatched = 0;
+        for task in tasks {
+            if self.is_stopped() {
+                break;
+            }
+            match self.task_service.dispatch_queued_recovery(&task).await {
+                Ok(true) => dispatched += 1,
+                Ok(false) => {}
+                Err(crate::ServiceError::Db(db::DbError::VersionConflict))
+                | Err(crate::ServiceError::Db(db::DbError::TaskVersionConflict { .. })) => {
+                    tracing::debug!(task_id = %task.id, "queued recovery lost version race");
+                }
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, %error, "queued recovery failed");
+                }
+            }
+        }
+        Ok(dispatched)
     }
 
     /// Reconcile host-owned plan publication claims before workflow-state and

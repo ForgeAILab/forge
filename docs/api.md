@@ -16,6 +16,10 @@ proxy in front of it.
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
 
+Request tracing records the peer `client_addr` and untrusted `x-forwarded-for`
+header on the `http.request` span only. The logged `forwarded_for` value is
+limited to the first 256 characters.
+
 This reference describes the singular Main/Project Agent Chat surface shipped
 by the forward-only `V071+` migrations. Retired collaboration routes are not a
 supported integration point even when their source rows remain in an upgraded
@@ -676,8 +680,11 @@ A CLI profile's `config_json` may include an ordered `fallbacks` array of
 executor reports quota exhaustion or is unavailable, execution falls back to
 the next candidate (same CLI with a different account profile, or a
 different CLI); a task interrupted because every candidate is unavailable
-carries the `executor_unavailable` failure kind and does not consume its
-execution retry budget. Duplicate candidates and unknown executor types are
+carries the `executor_unavailable` failure kind. Usage/rate limits and HTTP 429
+advance the fallback chain. If capacity remains unavailable, Forge schedules
+a deferred retry using the provider reset hint (at most six hours) or backoff,
+within the Task's execution retry budget; budget exhaustion blocks for recovery.
+Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
 [architecture.md](architecture.md#executor-fallback-chains).
 
@@ -772,6 +779,14 @@ whose `AgentAction` is still `pending_approval` or has been `approved`.
 Entries carry actor, canonical scope, operation, input digest, policy result,
 status, correlation id, optional committed outcome, and occurrence time. The
 projection never returns an action payload body.
+
+The `consumer_health` projection flushes successful progress at an event boundary
+after five seconds or 100 events, with immediate writes on errors. Batch release
+flushes remaining progress and clears any published lease. New batch owners and
+lease renewals are buffered; empty polls write at most once every five seconds.
+Its processed-event counter is diagnostic and can lose up to 99 buffered increments on a crash;
+durable delivery cursors and receipts remain authoritative. `stale` continues
+to mean more than 90 seconds since the last successfully processed event.
 
 Without `project_id`, authorized account/Main activity and all visible Project
 activity are included. Account/Main Chat entries are visible only to the
@@ -1034,7 +1049,8 @@ and readiness treats a receipt-backed `task_validation` result as release
 authority exactly as it treats a user attestation.
 
 Task sessions capture evidence with the typed `task.evidence` operation. A
-`capture` payload names a `kind`, a `caption`, and exactly one of `path` (a
+`capture` payload names a `kind` (`screenshot`, `walkthrough_video`, `log`,
+`report`, or `other`), a `caption`, and exactly one of `path` (a
 workspace-relative file the run produced) or `content` (verbatim captured
 output). Forge stores the bytes in the media store, derives the SHA-256
 checksum a milestone evidence attachment compares against, and returns the
@@ -1042,6 +1058,9 @@ checksum a milestone evidence attachment compares against, and returns the
 captures what that Task's own run did. Captured Task media is promoted to a
 project-scoped `media_asset`, so a single run's artifact can back every
 acceptance check it demonstrates.
+Agent capture accepts other non-empty kind strings as `other`, preserving the
+original kind as a `[kind]` caption prefix (and in the stored filename for
+native Task capture). Public evidence types retain the closed kind enum.
 
 Task sessions record progress with the typed `task.worklog` operation. An
 `append` payload carries a `kind` (`progress`, `decision`, `validation`, or
@@ -1084,8 +1103,13 @@ place it may write. The harness appends one JSON object per line to
 `worklog.jsonl` (`{"kind","summary"}`, as `task.worklog`) and `evidence.jsonl`
 (`{"kind","caption"}` plus exactly one of `path` or `content`, as
 `task.evidence`; `path` is worktree-relative or an absolute path inside the
-outbox). Before an implementation execution starts, Forge copies the canonical
-Task plan into its private plan path. `$FORGE_PLAN_PATH` is the supported
+outbox). Ingestion also accepts concatenated or pretty-printed JSON objects;
+genuinely malformed content is reported and parsing resumes at the next line.
+Unknown evidence kinds become `other` with the original kind prefixed to the
+stored caption. Replayed worklog and evidence receipts are successful without
+adding another comment or artifact, including concurrent ingestion. Before an
+implementation execution starts, Forge copies the canonical Task plan into its
+private plan path. `$FORGE_PLAN_PATH` is the supported
 plan-write contract for CLI agents. Managed Codex cannot write the surrounding
 Task directory; a CLI adapter without an OS sandbox may still have ambient
 filesystem ability to edit sibling files, so universal confinement is not
@@ -1134,7 +1158,9 @@ exactly one of `path` (a file under its Project workspace) or `content`
 result it backs; Forge stores the bytes as a Project `media_asset` and
 performs the same attach in one call. Readiness treats validation-sourced
 evidence with no Task provenance as fresh exactly while the cited validation
-result is current.
+result is current. Agent `capture` also normalizes unknown kinds to `other`
+and preserves the original kind in the attached caption; `attach` uses the
+closed evidence kind enum.
 
 ## Agent Chats
 
@@ -2071,7 +2097,13 @@ identities, typed setup requirements, and the durable provisioning operation
 when one exists.
 
 Repository selection is Project-owned. `project.primary_repo_id` must resolve
-to a Repo owned by that same Project and is the only pre-execution repository
+to a Repo owned by that same Project. Repo `remote_url` is optional: creation
+accepts omission or `null`, and empty or whitespace-only values are stored and
+returned as `null`. Updating `remote_url` with `null` or a blank string clears
+it; omission preserves it. Local-only repositories use `local_path` without a
+remote URL.
+
+The primary repository is the only pre-execution repository
 authority for every Task in the Project. Task create/update requests do not
 accept a repository selector, and Task responses no longer contain `repo_id`.
 A Task accepted before repository attachment therefore needs no Task mutation
@@ -2407,11 +2439,31 @@ Review attempt with a user manual-override record, and preserves the failed
 attempt as immutable history. It is rejected while a reviewer or auditor
 execution is running.
 
+`POST /api/v1/tasks/{id}/recover` returns `200` with the normal `TaskResponse`
+when the recovery can run immediately or its only refusal is agent capacity
+(including a configured daemon session cap). A capacity-bound recovery clears
+the blocking annotation and persists the selected action, reason, and context
+for the dispatcher to apply when a slot becomes available. Its
+`workflow_health.kind` is `waiting_for_agent` with label `Retry Queued`.
+Session resumes keep their session lineage; re-execution keeps the supplied
+guidance. The dispatcher rechecks admission before launching queued recovery.
+Repeating the same recovery while it is queued returns the queued Task with
+`200` and preserves the original intent. Resume fallback launches use this
+same capacity queue and retain their session lineage and guidance. Only the
+queued replay's own execution admission consumes the intent; an unrelated
+execution preserves it for reconciliation. A permanent replay refusal restores
+the saved blocker with the refusal as its reason and removes the queue entry.
+Paused or offline Agents are refused rather than shown as waiting for capacity,
+including when availability changes while recovery is queued. Other refusals
+retain their existing errors and do not queue the action.
+
 Task `workflow_health` also represents active non-agent work. A running
 interactive execution reports `kind: "running"`, label `Interactive`. A
 deferred execution retry reports `kind: "waiting_for_agent"` with label
 `Retry Scheduled` before its eligibility time and `Retry Queued` afterward;
-the latter means it is waiting for capacity, not wedged or idle.
+the latter means it is waiting for capacity, not wedged or idle. Provider
+usage-limit retries include their capacity reason and scheduled time in the
+health message, and only become blocked once execution retries are exhausted.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:
@@ -2439,6 +2491,21 @@ normal pagination fields:
   "board_revision": 42
 }
 ```
+
+`items` contains `TaskListItemResponse` objects: identity, title/type/status,
+canonical phase, assignment and ordering fields, retry budgets, annotations,
+workflow health/exception, review/archive timestamps, issue links, version, and
+creation/update timestamps. `execution_observability` is always present and
+contains only `latest_execution_id` (a string or `null`), used to identify stale
+annotations. Page decoration batches
+reviews, execution authority/running rows, roles, retry transitions, and issue
+links for all Tasks on the page.
+
+The Project list omits `description`, `task_state_config`, `workspace`,
+`plan_progress`, `plan_artifact`, `execution_actions`, `execution_evidence`, and
+`execution_blocker`, plus usage/cost/runtime observability fields. Load the existing
+`GET /api/v1/tasks/{id}/detail` response's `task` for that content. Single-Task
+responses and `GET /api/v1/agents/{id}/tasks` retain `TaskResponse`.
 
 The revision is a monotonic project token for task creation/deletion and
 changes to status, board position, archive state, or soft-deletion state. Each
@@ -3808,13 +3875,19 @@ execution-retry path and eventually exposes a durable recovery blocker; it
 neither dispatches a coder nor grants acceptance. Embedded reviewers get up to
 two follow-up turns to supply a missing result block before that happens.
 
-Policy `forge.review-conformance/3` is the only current contract policy; v1
-and v2 contracts remain historical and require a fresh review before their
+Policy `forge.review-conformance/3` is the only current contract policy; policy
+versions 1 and 2 remain historical and require a fresh review before their
 result can authorize current integration. Assessments stored before this
 response format (with `contract_digest`, `verdict`, `requirements`, and
 `findings`) were migrated in place: their verdict became the `result`, their
 recorded conformance reason the `reason`, and the original JSON is kept as a
 fenced block in `report`.
+
+Contracts expose `context.source_digest_version`, independent of the policy
+version. New contracts use fingerprint version 2, scoped to review authority
+(see [Architecture](architecture.md#charter-conformance-at-review)). A missing
+field means fingerprint version 1 and verifies against the original whole-source
+algorithm, without rewriting stored contracts or forcing a review on upgrade.
 
 `default_review_config` on Project settings and Task review state configuration
 accepts `requirement_ids` and `conformance_checks`. `requirement_ids` names the
@@ -3873,6 +3946,24 @@ explicit retry or recovery action.
 When review configuration names an auditor, the Task's reviewer role
 assignment must already materialize that authority; configuration alone does
 not synthesize an Agent-backed reviewer during a rerun.
+
+Review reruns recover a deleted or unusable Task checkout from its existing
+branch before running checks. Review-entry CI and reviewer conformance checks
+use the same workspace preparation and recovery as executor dispatch; the Ready
+workspace row alone is not taken as proof that its directory still exists.
+
+A CI failure during a system/Agent entry into review, including completion of
+a merge-conflict repair, routes through the same failure outcome as a review
+rerun: the configured remediation target with a review-budget rejection, or
+the existing `review_budget_exhausted` blocker. The dispatcher recovers an
+unblocked latest failed Review belonging to the current non-user review entry
+after a two-minute grace, provided no execution or completion cascade is running,
+no blocked/newer entry barrier remains, and the Task is not awaiting a human.
+An abandoned running barrier whose checks already failed is cleared. User routing
+overrides keep their existing entry checks and human-review behavior; this automatic
+recovery does not reroute a user-entered review. Passing human-approval gates
+still wait for approval, while failed checks on a non-user entry return to
+remediation.
 
 `conformance_checks` is an array of `{id, command, requirement_ids}`. IDs must be
 unique, commands nonempty, and requirement IDs present in the resulting Task

@@ -325,7 +325,10 @@ pub(crate) async fn verify_review_source(
         Some(&contract.execution_id),
     )
     .await?;
-    if api_types::canonical_digest(&source).map_err(json_error)? != contract.context.source_digest {
+    if api_types::review_source_digest(&source, contract.context.source_digest_version.unwrap_or(1))
+        .map_err(DbError::Check)?
+        != contract.context.source_digest
+    {
         return Err(DbError::Check(
             "review governing context changed; fresh review required".into(),
         ));
@@ -359,7 +362,11 @@ async fn verified_passed_contract(
     }
     let contract_source = review_source_in_tx(conn, task_id, Some(&contract.execution_id)).await?;
     if contract.context.task_id != task_id
-        || api_types::canonical_digest(&contract_source).map_err(json_error)?
+        || api_types::review_source_digest(
+            &contract_source,
+            contract.context.source_digest_version.unwrap_or(1),
+        )
+        .map_err(DbError::Check)?
             != contract.context.source_digest
     {
         return Err(DbError::Check(

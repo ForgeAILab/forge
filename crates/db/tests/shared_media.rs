@@ -303,6 +303,42 @@ async fn unreferenced_task_media_is_claimed_and_gc_is_idempotent() {
 }
 
 #[tokio::test]
+async fn evidence_context_normalizes_blank_remote_url() {
+    let (db, project_id, task_id) = fixture().await;
+    let media = upload(&db, &task_id, "asset-local-evidence").await;
+    let mut expected_digest = None;
+    for (index, remote_url) in [None, Some(""), Some(" \t\r\n"), Some("\u{2003}")]
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query("UPDATE repo SET remote_url = ? WHERE id = 'repo-media'")
+            .bind(remote_url)
+            .execute(db.pool())
+            .await
+            .expect("remote seeds");
+        let mut input = evidence_attachment(
+            &format!("local-evidence-{index}"),
+            &project_id,
+            &task_id,
+            &media.id,
+            "",
+        );
+        input.source_execution_id = None;
+        let attachment = SharedMediaRepo::create_project_media_attachment(&db, input)
+            .await
+            .expect("local-only evidence context captures");
+        let digest = attachment
+            .source_context_digest
+            .expect("context digest captures");
+        if let Some(expected) = expected_digest.as_ref() {
+            assert_eq!(&digest, expected);
+        } else {
+            expected_digest = Some(digest);
+        }
+    }
+}
+
+#[tokio::test]
 async fn active_project_evidence_blocks_task_media_gc_until_removed() {
     let (db, project_id, task_id) = fixture().await;
     let media = upload(&db, &task_id, "asset-evidence").await;

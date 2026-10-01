@@ -84,6 +84,28 @@ impl ExternalLinkRepo for SqliteDb {
         rows.iter().map(map_external_link).collect()
     }
 
+    async fn list_latest_links_for_tasks(
+        &self,
+        task_ids: &[&str],
+    ) -> Result<Vec<TaskExternalLink>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT * FROM (
+                 SELECT task_external_link.*, ROW_NUMBER() OVER (
+                     PARTITION BY task_id ORDER BY created_at DESC, id DESC
+                 ) AS rn FROM task_external_link WHERE task_id IN (",
+        );
+        let mut ids = query.separated(", ");
+        for task_id in task_ids {
+            ids.push_bind(*task_id);
+        }
+        ids.push_unseparated(") ) ranked WHERE rn = 1 ORDER BY task_id");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.iter().map(map_external_link).collect()
+    }
+
     async fn list_by_integration(&self, integration_id: &str) -> Result<Vec<TaskExternalLink>> {
         let rows = sqlx::query(
             "SELECT * FROM task_external_link WHERE integration_id = ? ORDER BY created_at DESC, id DESC",

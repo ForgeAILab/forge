@@ -12,6 +12,7 @@ import {
 } from './workflow-utils'
 import type { StateDefinition, StateKind, Task, WorkflowDefinition } from '@/types/generated'
 import { emptyUsage } from '@/test-utils/usage'
+import { taskListItem } from '@/test-utils/task-list-item'
 
 const emptyHooks = {
   before_exit: [],
@@ -162,6 +163,17 @@ describe('task interruption annotations', () => {
       updated_at: '2026-05-01T00:00:00Z',
     }
   }
+
+  it('uses compact list observability to identify stale annotations', () => {
+    const fullTask = taskWithExecutionIds('execution-old', 'execution-new')
+    const task = taskListItem({
+      error_annotation: fullTask.error_annotation,
+      execution_observability: { latest_execution_id: 'execution-new' },
+    })
+    expect(taskHasError(task)).toBe(false)
+    expect(getBlockingAnnotation(task)).toBeNull()
+    expect(getStaleBlockingAnnotation(task)?.message).toBe('Previous execution failed')
+  })
 
   it('treats annotations from older executions as historical warnings', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')

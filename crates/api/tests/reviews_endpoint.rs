@@ -288,7 +288,7 @@ async fn seed_review_with_status(
             name: "repo".to_owned(),
             local_path: Some("/tmp/forge-reviews-repo".to_owned()),
             work_mode: db::WorkMode::DirectMerge,
-            remote_url: String::new(),
+            remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
