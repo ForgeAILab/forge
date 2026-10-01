@@ -21,7 +21,7 @@ import {
 } from '@/lib/workflow-utils'
 import { useFilterStore } from '@/stores/filters'
 import type { WorkflowDefinition } from '@/types/generated'
-import type { TaskListItem as Task } from '@/types/task-list'
+import type { TaskListItem as Task } from '@/types/generated'
 import type { BoardFilterPatch } from './BoardToolbar'
 import { orderingEligibility } from './board-ordering'
 import { useBoardData } from './useBoardData'

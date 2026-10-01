@@ -63,7 +63,18 @@ export function boardReducer(state: BoardState, action: BoardAction): BoardState
       return { ...state, phase: 'committing', rendered: action.snapshot }
     case 'commit_succeeded': {
       const tasks = state.rendered.tasks
-        .map((task) => (task.id === action.response.task.id ? action.response.task : task))
+        .map((task) =>
+          task.id === action.response.task.id
+            ? {
+                ...task,
+                ...action.response.task,
+                execution_observability: {
+                  latest_execution_id:
+                    action.response.task.execution_observability?.latest_execution_id ?? null,
+                },
+              }
+            : task,
+        )
         .sort(compareBoardTasks)
       return {
         ...state,

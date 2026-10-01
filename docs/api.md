@@ -16,6 +16,10 @@ proxy in front of it.
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
 
+Request tracing records the peer `client_addr` and untrusted `x-forwarded-for`
+header on the `http.request` span only. The logged `forwarded_for` value is
+limited to the first 256 characters.
+
 This reference describes the singular Main/Project Agent Chat surface shipped
 by the forward-only `V071+` migrations. Retired collaboration routes are not a
 supported integration point even when their source rows remain in an upgraded
@@ -2443,8 +2447,9 @@ normal pagination fields:
 `items` contains `TaskListItemResponse` objects: identity, title/type/status,
 canonical phase, assignment and ordering fields, retry budgets, annotations,
 workflow health/exception, review/archive timestamps, issue links, version, and
-creation/update timestamps. `execution_observability` contains only
-`latest_execution_id`, used to identify stale annotations. Page decoration batches
+creation/update timestamps. `execution_observability` is always present and
+contains only `latest_execution_id` (a string or `null`), used to identify stale
+annotations. Page decoration batches
 reviews, execution authority/running rows, roles, retry transitions, and issue
 links for all Tasks on the page.
 

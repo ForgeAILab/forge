@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/cn'
 import { isInitialKind } from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
-import type { TaskListItem as Task } from '@/types/task-list'
+import type { TaskListItem as Task } from '@/types/generated'
 import type { ColumnGroup } from '@/lib/workflow-utils'
 import { KanbanTaskCard } from './kanban-task-card'
 

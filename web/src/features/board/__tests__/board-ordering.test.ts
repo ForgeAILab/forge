@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { Task, TasksResponse } from '@/types/generated'
+import type { TaskListItem, TasksResponse } from '@/types/generated'
+import { taskListItem } from '@/test-utils/task-list-item'
 import {
   assembleBoardSnapshot,
   orderingEligibility,
@@ -9,8 +10,8 @@ import {
 
 const columnStates = { todo: ['todo'], review: ['review', 'review_failed'] }
 
-function task(id: string, status: string, position: number, version = 1): Task {
-  return {
+function task(id: string, status: string, position: number, version = 1): TaskListItem {
+  return taskListItem({
     id,
     project_id: 'project',
     title: id,
@@ -23,10 +24,10 @@ function task(id: string, status: string, position: number, version = 1): Task {
     version,
     created_at: `2026-07-22T00:00:0${position}Z`,
     updated_at: '2026-07-22T00:00:00Z',
-  }
+  })
 }
 
-function snapshot(tasks: Task[]): BoardSnapshot {
+function snapshot(tasks: TaskListItem[]): BoardSnapshot {
   return { tasks, boardRevision: 41, complete: true, mixedRevisions: false }
 }
 

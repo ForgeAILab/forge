@@ -3,7 +3,7 @@ import { DragDropContext, type DragStart, type DragUpdate, type DropResult } fro
 import { KanbanColumn } from '@/components/kanban-column'
 import type { ColumnGroup } from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
-import type { TaskListItem as Task } from '@/types/task-list'
+import type { TaskListItem as Task } from '@/types/generated'
 
 export function BoardView({
   columns,
