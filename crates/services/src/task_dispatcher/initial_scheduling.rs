@@ -127,6 +127,9 @@ impl TaskDispatcher {
         }
 
         let mut tasks = self.list_tasks(&project.id, initial_states).await?;
+        if tasks.is_empty() {
+            return Ok(0);
+        }
         tasks.sort_by(|left, right| {
             right
                 .priority
@@ -135,7 +138,7 @@ impl TaskDispatcher {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        let mut slots = super::slots::load_project_slots(&self.db, project).await?;
+        let mut project_slots = None;
         let mut dispatched = 0;
         for task in tasks {
             if self.is_stopped() {
@@ -204,6 +207,12 @@ impl TaskDispatcher {
                 // explicit `wake_task_dispatch` clears the disposition.
                 continue;
             }
+            // Only an actual admission candidate needs the capacity query.
+            // Blocked Tasks, coordination containers, and empty queues skip it.
+            if project_slots.is_none() {
+                project_slots = Some(super::slots::load_project_slots(&self.db, project).await?);
+            }
+            let slots = project_slots.as_mut().expect("admission slot projection");
             let waiting_message = if slots.limit == 0 {
                 None
             } else if slots.active >= slots.limit {

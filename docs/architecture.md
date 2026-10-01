@@ -692,15 +692,25 @@ bounded output, pause/last-check/next-check times) persists in
 Migration V202610010410 clears legacy Task environment annotations without deleting
 Tasks or their execution history.
 
-`environment_pause_sync` re-runs the recorded failing checks when due in the
-primary checkout, with Project `env` and without assets. The interval defaults
-to 600 seconds (60–86400). Failure refreshes detail and schedules another check;
+`environment_pause_sync` starts a background job for recorded failing checks
+when due in the primary checkout, with Project `env` and without assets. The tick
+only starts or observes a job; operations refresh does not wait for host checks.
+Scheduled and manual re-checks share single-flight ownership per Project. Results
+use the original Project version and pause timestamp in the existing CAS, so a
+new pause, settings edit, or user pause wins over stale results. Check timeouts
+accept 1–300 seconds (default 120); execution clamps legacy stored values too.
+The interval defaults to 600 seconds (60–86400). Failure refreshes detail and schedules another check;
 success compare-and-clears only the environment pause and publishes a Project
 resumed event. The next tick re-dispatches Tasks in their current states.
 `POST /projects/{id}/environment/recheck` runs every configured check immediately
 and returns per-check results plus the Project; all passing clears a matching
-environment pause. Manual resume clears it too; another failing launch pauses
-the Project again. Running executions are left to finish.
+environment pause. A manual check returns HTTP 409 immediately if another
+re-check is running. An empty check list never resumes automatically: asset-copy
+failures and removed probes stay paused with an explicit manual-resume message.
+Checks that were already passing do not resume such a pause on a timer; the
+owner's own "Check now" runs every configured check and resumes when all pass.
+Manual resume clears the pause too; another failing launch pauses the Project
+again. Running executions are left to finish.
 
 Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks
@@ -2333,13 +2343,19 @@ environment pause synchronization (if the repository pause did not change),
 plan-publication reconciliation, the paused-Project skip, recovery of admitted
 work, then slot-gated initial scheduling. A changed pause skips dispatch for
 that tick so the next scan reads the updated Project. Repository and environment
-synchronizers only clear the system pause reason they own.
+synchronizers only clear the system pause reason they own. Invalid environment
+pause/settings JSON or a failed slot projection is logged and skips that Project;
+later Projects still get their dispatch scan.
 
 Initial scheduling admits ready Tasks in the existing queue order only while
 `active < settings.max_active_tasks` and `parked < 2 * limit`. The default limit
 is 5 for new and existing Projects; 0 disables both gates. Slot counting follows
 the effective workflow's `active` and `gate` kinds, excludes blocking annotations
-and awaiting-human Reviews, and excludes coordination roots whose subtasks run.
+and awaiting-human Reviews. One SQL aggregate reads the counts without loading
+Task or Review bodies; unlimited Projects skip it and report zero counts, and
+dispatch skips it when no initial Task waits for admission. Coordination roots
+whose children hold active slots do not consume another slot; once no child is
+active, a root's own running execution, review, or merge holds one slot.
 Planning, implementation, review, merging, and conflict repair therefore hold
 slots, even without a running execution. Agent concurrency remains a separate
 limit. Recovery and re-dispatch of already-admitted work never fail for Project
@@ -2409,6 +2425,9 @@ An abandoned running entry barrier is cleared if its checks already produced
 that failed verdict; a newer entry retry remains fenced. Recovery rechecks the
 latest Review and running executions after claiming the Task snapshot.
 User routing overrides and historical verdicts from earlier entries are excluded.
+If failed-review recovery cannot parse details or conformance, it logs a warning
+and uses plain review-failure remediation without finding routing. Live reviewer
+completion retains strict parsing.
 
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
@@ -3053,11 +3072,13 @@ execution-retry path, eventually creates a durable execution blocker, and never
 dispatches a coder.
 
 Before coder remediation, a reviewer `fail` tagged `fixable_by: owner`, or a
-`repeat: true` failure after a failed previous Review attempt, parks the Task
+`repeat: true` failure after the immediately preceding attempt recorded a
+reviewer `fail` assessment, parks the Task
 with `FailureKind::ReviewNeedsOwner`. The annotation message records
 `fixable by owner` or `repeated finding` plus the reason. Forge does not dispatch
 the coder or consume review retry budget. A first-attempt repeat does not park,
-and failures from Forge's own checks retain their normal routing. The dispatcher
+and failures from Forge's own checks retain their normal routing. Reviewer
+crashes, unverified results, and CI-only failures are not prior findings. The dispatcher
 uses this same routing for stranded failed Reviews after the base's recovery
 grace and authority fences; failed non-user review-entry CI still consumes the
 review retry budget and records exhaustion when appropriate. Owner recovery
@@ -3065,6 +3086,8 @@ actions are `reexecute` with guidance, `mark_reviewed` with a reason,
 `defer_to_follow_up`, `open_interactive`, and `cancel_task`.
 Deferring requires a reason and atomically creates a linked backlog Task carrying
 the finding and records a manual pass naming it, allowing the original to merge.
+The follow-up uses normal service insertion, including current-Charter governance
+and a Project work-epoch increment, in that same transaction.
 
 Before an embedded reviewer run completes, Forge parses its reply with the same
 parser; a reply with no readable result block gets up to two short follow-up

@@ -760,6 +760,55 @@ async fn update_recovery_metadata_inner(
 
 #[async_trait]
 impl TaskRepo for SqliteDb {
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<(i64, i64, i64)> {
+        Ok(sqlx::query_as(
+            "WITH project_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') THEN
+                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.error_annotation) THEN
+                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
+                           ELSE 0 END
+                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
+                                     WHERE r.task_id = t.id
+                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       ELSE 0 END AS parked
+                FROM task t
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.name = t.status
+                WHERE t.project_id = ? AND t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT
+               COALESCE(SUM(kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               )), 0),
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0),
+               COALESCE(SUM(kind = 'initial'), 0)
+             FROM visible",
+        )
+        .bind(project_states_json).bind(subtask_states_json).bind(blocking_kinds_json).bind(project_id)
+        .fetch_one(self.pool()).await?)
+    }
+
     async fn create(&self, input: CreateTask) -> Result<Task> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;

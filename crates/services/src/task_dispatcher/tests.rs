@@ -1570,6 +1570,63 @@ async fn dispatcher_failed_review_recovers_after_grace_idempotently() {
 }
 
 #[tokio::test]
+async fn dispatcher_failed_review_corrupt_details_routes_once() {
+    for details in [
+        "{corrupt",
+        "true",
+        r#"{"conformance":{"status":"unknown"}}"#,
+    ] {
+        let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
+        sqlx::query("UPDATE review SET step_results_json = ? WHERE task_id = ?")
+            .bind(details)
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let review = ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .remove(0);
+        let execution = ExecutionRepo::get_by_id(&*fixture.db, &review.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fixture
+                .dispatcher
+                .task_service
+                .reconcile_settled_reviewer_completion(&fixture.task, &execution, &review, true)
+                .await
+                .is_err(),
+            "live completion remains strict"
+        );
+        assert!(fixture
+            .dispatcher
+            .recover_failed_review(&fixture.task)
+            .await
+            .unwrap());
+        let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, "in_progress");
+        assert!(!fixture
+            .dispatcher
+            .recover_failed_review(&current)
+            .await
+            .unwrap());
+        assert_eq!(
+            TaskRepo::get_by_id(&*fixture.db, &current.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            current.version
+        );
+    }
+}
+
+#[tokio::test]
 async fn dispatcher_failed_review_composes_finding_routing_with_ci_budget() {
     for (owner, repeat, failed_check, expected_rejections) in [
         (true, false, false, 0),
@@ -1609,7 +1666,7 @@ async fn dispatcher_failed_review_composes_finding_routing_with_ci_budget() {
                     execution_id: review.execution_id.clone(),
                     attempt_number: 1,
                     status: ReviewStatus::Failed,
-                    step_results_json: "{}".to_owned(),
+                    step_results_json: details.to_string(),
                     started_at: review.started_at.clone(),
                     created_at: review.created_at.clone(),
                     updated_at: review.updated_at.clone(),
@@ -5582,6 +5639,230 @@ async fn seed_environment_pause(
         .unwrap()
 }
 
+async fn finish_environment_recheck(dispatcher: &TaskDispatcher, project_id: &str) {
+    let job = dispatcher
+        .environment_rechecks
+        .lock()
+        .unwrap()
+        .remove(project_id)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), job)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn environment_recheck_is_single_flight_off_tick_and_stale_result_preserves_user_pause() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let other_repo = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    seed_environment_pause(&db, &project_id, serde_json::json!({"checks":[{
+        "name":"disk", "command":"echo started >> starts; while ! test -f release-check; do sleep 0.05; done", "timeout_seconds":30
+    }]}), &["disk"], "2026-01-01T00:00:00Z").await;
+    let (other, _) = seed_project_repo(&db, other_repo.path()).await;
+    let agent = seed_agent(&db, 2, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &other, "unrelated admission", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once())
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !repo_dir.path().join("starts").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once())
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(matches!(
+        dispatcher
+            .task_service
+            .recheck_project_environment(&project_id)
+            .await,
+        Err(crate::ServiceError::Conflict(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.path().join("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    ProjectRepo::set_paused_at(&*db, &project_id, Some(now_rfc3339()))
+        .await
+        .unwrap();
+    let user_pause = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(repo_dir.path().join("release-check"), "yes").unwrap();
+    finish_environment_recheck(&dispatcher, &project_id).await;
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version, user_pause.version);
+    assert_eq!(current.paused_at, user_pause.paused_at);
+    assert!(current.system_pause_reason.is_none());
+}
+
+#[tokio::test]
+async fn environment_recheck_without_rerunnable_checks_stays_paused() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    seed_environment_pause(
+        &db,
+        &project_id,
+        serde_json::json!({}),
+        &[],
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    dispatcher.check_once().await.unwrap();
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.paused_at.is_some());
+    assert!(crate::project_environment::pause_detail(&current)
+        .unwrap()
+        .unwrap()
+        .output
+        .contains("No re-runnable"));
+    dispatcher.check_once().await.unwrap();
+    assert_eq!(
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        current.version
+    );
+    let (results, current) = dispatcher
+        .task_service
+        .recheck_project_environment(&project_id)
+        .await
+        .unwrap();
+    assert!(results.is_empty());
+    assert!(current.paused_at.is_some());
+    sqlx::query("UPDATE project SET settings = ?, version = version + 1 WHERE id = ?")
+        .bind(r#"{"environment":{"checks":[{"name":"fixed","command":"true"}]}}"#)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // The manual empty check rescheduled the detail; force it due again.
+    sqlx::query("UPDATE project SET environment_pause_json = json_set(environment_pause_json, '$.next_check_at', '2026-01-01T00:00:00Z') WHERE id = ?")
+        .bind(&project_id).execute(db.pool()).await.unwrap();
+    // A configured check that passes says nothing about the failure that
+    // caused this pause, so the dispatcher must not resume on it.
+    dispatcher.check_once().await.unwrap();
+    assert!(dispatcher
+        .environment_rechecks
+        .lock()
+        .unwrap()
+        .get(&project_id)
+        .is_none());
+    assert!(ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .paused_at
+        .is_some());
+    // The owner's own "Check now" is an explicit decision and does resume.
+    let (results, current) = dispatcher
+        .task_service
+        .recheck_project_environment(&project_id)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(current.paused_at.is_none());
+}
+
+#[tokio::test]
+async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
+    let db = Arc::new(sqlite_db().await);
+    let workspace = TempDir::new().unwrap();
+    let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let mut repos = Vec::new();
+    for (index, corruption) in ["pause", "environment-settings", "slot-settings"]
+        .into_iter()
+        .enumerate()
+    {
+        let repo = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+        if corruption != "slot-settings" {
+            seed_environment_pause(
+                &db,
+                &project_id,
+                serde_json::json!({"checks":[{"name":"disk","command":"true"}]}),
+                &["disk"],
+                "2026-01-01T00:00:00Z",
+            )
+            .await;
+        } else {
+            let task = seed_task(&db, &project_id, "waiting for admission", "todo", 0).await;
+            assign_role(&db, &task.id, "coder", &agent).await;
+        }
+        if corruption == "pause" {
+            sqlx::query("UPDATE project SET environment_pause_json = 'invalid' WHERE id = ?")
+                .bind(&project_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE project SET settings = 'invalid' WHERE id = ?")
+                .bind(&project_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE project SET created_at = ? WHERE id = ?")
+            .bind(format!("2000-01-0{}T00:00:00Z", index + 1))
+            .bind(&project_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        repos.push(repo);
+    }
+    let repo = TempDir::new().unwrap();
+    let (healthy, _) = seed_project_repo(&db, repo.path()).await;
+    let task = seed_task(&db, &healthy, "healthy admission", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task.id
+    );
+}
+
 #[tokio::test]
 async fn environment_recheck_resumes_and_redispatches_current_task_states() {
     let db = Arc::new(sqlite_db().await);
@@ -5643,6 +5924,7 @@ async fn environment_recheck_resumes_and_redispatches_current_task_states() {
         0,
         "resume skips the stale snapshot"
     );
+    finish_environment_recheck(&dispatcher, &project_id).await;
     let resumed = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
@@ -5727,6 +6009,7 @@ async fn environment_recheck_still_failing_reschedules_without_dispatch() {
     let mut events = dispatcher.event_bus.subscribe();
     let before = chrono::Utc::now();
     assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    finish_environment_recheck(&dispatcher, &project_id).await;
     let current = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
@@ -6295,6 +6578,41 @@ async fn dispatcher_owner_reexecute_resumes_over_project_limit() {
 }
 
 #[tokio::test]
+async fn dispatcher_project_limit_skips_projection_without_admission_candidate() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let mut project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    project.settings = "invalid".to_owned();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    let task = seed_task(&db, &project_id, "blocked initial Task", "todo", 0).await;
+    sqlx::query("UPDATE task SET blocked_json = '{}' WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn dispatcher_zero_project_limit_disables_capacity_and_parked_guard() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().unwrap();
@@ -6328,7 +6646,7 @@ async fn dispatcher_zero_project_limit_disables_capacity_and_parked_guard() {
     let slots = super::slots::load_project_slots(&db, &project)
         .await
         .unwrap();
-    assert_eq!((slots.limit, slots.active, slots.parked), (0, 6, 10));
+    assert_eq!((slots.limit, slots.active, slots.parked), (0, 0, 0));
 }
 
 #[tokio::test]
@@ -6423,12 +6741,14 @@ async fn dispatcher_coordination_root_advance_is_not_capacity_gated() {
         .unwrap();
     assert_eq!(advanced.status, "review");
     assert!(deferred_dispatch::dispatch_disposition_for_test(&advanced).is_none());
+    // The advance itself was not gated; the root's own aggregate review now
+    // holds a slot because no child does.
     assert_eq!(
         super::slots::load_project_slots(&db, &project)
             .await
             .unwrap()
             .active,
-        1
+        2
     );
     assert!(rx.try_recv().is_err());
 }

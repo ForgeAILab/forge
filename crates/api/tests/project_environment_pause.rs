@@ -188,3 +188,24 @@ async fn project_patch_refuses_invalid_environment_recheck_interval() {
         60
     );
 }
+
+#[tokio::test]
+async fn project_patch_refuses_unbounded_environment_check_timeout() {
+    let root = common::TestDir::new("environment-timeout-api");
+    let harness = common::test_app(root.path(), "environment-timeout-api").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Timeout"}),
+        StatusCode::OK,
+    )
+    .await;
+    for timeout in [0, 301, u64::MAX] {
+        let error: ErrorResponse = common::json_request(&harness.app, Method::PATCH,
+            &format!("/api/v1/projects/{}", project.id), json!({"version":project.version,
+                "settings":{"environment":{"checks":[{"name":"disk", "command":"true", "timeout_seconds":timeout}]}}}),
+            StatusCode::BAD_REQUEST).await;
+        assert!(error.message.contains("timeout_seconds"));
+    }
+}

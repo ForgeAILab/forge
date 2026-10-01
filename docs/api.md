@@ -2055,7 +2055,9 @@ ten-minute review at a time:
   targets, and sources inside (or containing) the worktree are refused.
 - `checks` run with `bash -lc` in the worktree, in order, immediately before a
   local execution whose role is listed in `roles` (empty means every role).
-  `timeout_seconds` defaults to 120. The first failing check fails the
+  `timeout_seconds` defaults to 120 and accepts 1–300 seconds. Invalid values
+  are refused with HTTP 400 on write; previously stored values are clamped to
+  that range when checks run. The first failing check fails the
   execution before any provider call and pauses the **Project** with
   `system_pause_reason: "environment_not_ready"`. The Task keeps its current
   workflow state without a blocking annotation. Existing executions may finish;
@@ -2064,11 +2066,15 @@ ten-minute review at a time:
 - `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
   While environment-paused, Forge automatically re-runs the recorded failing
   checks in the primary checkout, with the Project `env` and without copying
-  assets. Role-scoped checks that triggered the pause are included. Every check
+  assets. Checks run in background jobs, at most one per Project, so dispatcher
+  ticks and operations refresh do not wait for them. Role-scoped checks that
+  triggered the pause are included. Every check
   passing clears only the environment pause; Tasks then re-dispatch in their
   current states. Another failure updates the output and schedules the next
   check. Checks that depend on worktree assets may pass here and fail at launch,
-  which pauses the Project again.
+  which pauses the Project again. An asset-copy failure or a pause with no
+  re-runnable check stays paused; its output explains that the owner must fix
+  the environment and resume, or configure a real check.
 
 `ProjectResponse.environment_pause` is `null` when there is no environment
 pause detail. Its persisted shape is:
@@ -2089,9 +2095,10 @@ collapsible output, the relative next check time, and **Check now**.
 `POST /api/v1/projects/{id}/environment/recheck` runs every configured check
 immediately (including role-scoped checks), with no request fields. It returns
 `{checks, project}`: each check has `name`, `passed`, nullable `exit_code`, and
-bounded `output_tail`; `project` is the updated `ProjectResponse`. If all
-checks pass, an environment pause is cleared. A user or repository pause remains
-in place. For example:
+bounded `output_tail`; `project` is the updated `ProjectResponse`. If
+at least one check runs and all checks pass, an environment pause is cleared. A user or repository pause remains
+in place. If a scheduled or manual re-check is already running for this Project,
+the endpoint returns HTTP 409 immediately. For example:
 
 ```json
 {
@@ -2108,7 +2115,7 @@ dispatch; no per-Task recovery is needed.
 `PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
 invalid or reserved, whose asset source is not absolute or whose target
 escapes/overlaps another target, or whose checks are unnamed, duplicated,
-empty, use unknown or duplicate roles, have a zero timeout, or specify an
+empty, use unknown or duplicate roles, have a timeout outside 1–300 seconds, or specify an
 out-of-range re-check interval. Unknown fields
 in the environment document are refused instead of being ignored.
 
@@ -2120,11 +2127,13 @@ unlimited. A slot is held by an unparked Task in a workflow state of kind
 `active` or `gate` (default workflow: `planning`, `in_progress`, `review`,
 `merging`, `merge_failed`). A blocking annotation or an `awaiting_human`
 Review parks the Task and frees its slot. Coordination roots with running
-subtasks do not take a slot themselves; their subtasks do.
+subtasks do not take a slot themselves; their subtasks do. Once no child holds an
+active slot, a root with its own running execution, review, or merge holds one.
 
 `ProjectResponse.slots` is `{limit, active, parked, queued}`, for example
 `{"limit":5,"active":4,"parked":3,"queued":7}`. The header shows
-**Active 4/5 · Parked 3 · Queued 7**, or **Active 4 (no limit)** when unlimited.
+**Active 4/5 · Parked 3 · Queued 7**. With limit 0, the counts are zero and the
+capacity query is skipped.
 At least twice the limit parked in slot-eligible states also stops new
 admission, with **waiting on you: N parked**. The guard is disabled for limit 0.
 

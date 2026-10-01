@@ -23,6 +23,15 @@ pub const TASK_ENVIRONMENT_CONFIG_KEY: &str = "_forge_task_environment";
 /// Bytes of check output retained from a preflight probe.
 const CHECK_OUTPUT_TAIL_BYTES: usize = 4096;
 
+/// Maximum runtime of a host environment check, including legacy settings.
+pub const MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS: u64 = 300;
+
+fn check_timeout_seconds(check: &EnvironmentCheck) -> u64 {
+    check
+        .timeout_seconds
+        .clamp(1, MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS)
+}
+
 /// Makes sibling staging paths unique within this Forge process.
 static ASSET_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -99,9 +108,9 @@ pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<
         if check.command.trim().is_empty() {
             return Err(format!("environment check {} has no command", check.name));
         }
-        if check.timeout_seconds == 0 {
+        if !(1..=MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS).contains(&check.timeout_seconds) {
             return Err(format!(
-                "environment check {} needs a positive timeout",
+                "environment check {} timeout_seconds must be between 1 and 300",
                 check.name
             ));
         }
@@ -410,8 +419,11 @@ pub async fn run_environment_check(
         .envs(env)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let outcome =
-        tokio::time::timeout(Duration::from_secs(check.timeout_seconds), command.output()).await;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(check_timeout_seconds(check)),
+        command.output(),
+    )
+    .await;
     match outcome {
         Err(_) => EnvironmentCheckResult {
             passed: false,
@@ -482,6 +494,26 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             timeout_seconds: 10,
         }
+    }
+
+    #[test]
+    fn environment_timeout_is_bounded_on_write_and_legacy_read() {
+        let mut environment = ProjectEnvironment::default();
+        let mut check = EnvironmentCheck {
+            name: "slow".to_owned(),
+            command: "true".to_owned(),
+            roles: Vec::new(),
+            timeout_seconds: u64::MAX,
+        };
+        environment.checks.push(check.clone());
+        assert!(validate_project_environment(&environment)
+            .unwrap_err()
+            .contains("timeout_seconds"));
+        assert_eq!(check_timeout_seconds(&check), 300);
+        check.timeout_seconds = 0;
+        assert_eq!(check_timeout_seconds(&check), 1);
+        environment.checks[0].timeout_seconds = 300;
+        assert!(validate_project_environment(&environment).is_ok());
     }
 
     #[test]

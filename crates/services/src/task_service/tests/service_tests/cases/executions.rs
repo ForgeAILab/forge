@@ -3890,7 +3890,8 @@ async fn seed_previous_review_attempt(db: &SqliteDb, task_id: &str, status: Revi
             execution_id: current.execution_id,
             attempt_number: 1,
             status,
-            step_results_json: json!({"ci_steps": [], "auditor": {"verdict": "fail"}}).to_string(),
+            step_results_json: json!({"conformance": {"status":"failed", "contract":null,
+                "checks":[], "reason":"previous finding", "assessment":{"result":"fail", "reason":"previous finding"}}}).to_string(),
             started_at: current.started_at,
             created_at: current.created_at,
             updated_at: current.updated_at,
@@ -4068,6 +4069,42 @@ async fn review_finding_routing_repeat_after_failed_attempt_parks() {
 }
 
 #[tokio::test]
+async fn review_finding_routing_repeat_requires_previous_reviewer_finding() {
+    for details in [
+        json!({"auditor":{"verdict":"fail", "reason":"reviewer crashed"}}),
+        json!({"ci_steps":[{"exit_code":1}]}),
+        json!({"conformance":{"status":"unverified", "contract":null, "checks":[], "reason":"no result"}}),
+        json!({"conformance":{"status":"failed", "contract":null,
+            "checks":[{"check_id":"ci", "command":"false", "exit_code":1, "output":"failed"}],
+            "reason":"CI failed", "assessment":{"result":"fail", "reason":"finding"}}}),
+    ] {
+        let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+        seed_previous_review_attempt(&db, &task.id, ReviewStatus::Failed).await;
+        sqlx::query(
+            "UPDATE review SET step_results_json = ? WHERE task_id = ? AND attempt_number = 1",
+        )
+        .bind(details.to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        complete_review_with(
+            &db,
+            &service,
+            &execution,
+            r#"{"result":"fail","reason":"Null input crashes","repeat":true}"#,
+        )
+        .await;
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+        assert!(current.blocked_json.is_none());
+    }
+}
+
+#[tokio::test]
 async fn review_finding_routing_first_attempt_repeat_returns_to_coder() {
     let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
     complete_review_with(
@@ -4215,6 +4252,93 @@ async fn review_finding_routing_owner_manual_pass_clears_the_park() {
             .status,
         ReviewStatus::Passed
     );
+}
+
+#[tokio::test]
+async fn review_finding_routing_defer_follow_up_is_charter_dispatchable() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(
+        &db,
+        &service,
+        &execution,
+        r#"{"result":"fail","reason":"Owner must collect measurements","fixable_by":"owner"}"#,
+    )
+    .await;
+    let now = now_rfc3339();
+    let owner = new_uuid_v4();
+    let charter = new_uuid_v4();
+    let revision = new_uuid_v4();
+    sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES (?, ?, 'unused', ?, ?)")
+        .bind(&owner).bind(format!("{owner}@example.com")).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&owner)
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO project_charter (id, account_id, project_id, project_mode, maturity, lifecycle, created_at, updated_at)
+                 VALUES (?, ?, ?, 'compact', 'prototype', 'attached', ?, ?)")
+        .bind(&charter).bind(&owner).bind(&task.project_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO project_charter_revision (id, charter_id, revision, lifecycle, schema_version, render_version,
+                 content_json, rendered_view, author_type, source_refs_json, content_digest, rendered_digest, created_at)
+                 VALUES (?, ?, 1, 'approved', 'forge.project-charter/v1', 'forge.project-charter-render/v1', '{}', '# Charter', 'user', '[]', 'content', 'render', ?)")
+        .bind(&revision).bind(&charter).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE project_charter SET current_approved_revision_id = ? WHERE id = ?")
+        .bind(&revision)
+        .bind(&charter)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project SET current_charter_id = ?, current_charter_revision_id = ?,
+                 current_charter_version = 1, charter_status = 'charter_backed', charter_setup_required = 0,
+                 version = version + 1 WHERE id = ?")
+        .bind(&charter).bind(&revision).bind(&task.project_id).execute(db.pool()).await.unwrap();
+    let project = ProjectRepo::get_by_id(&*db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let governance = service
+        .prepare_task_governance(&project, "task", None)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service
+        .insert_task_governance(&mut tx, &task.id, &project.id, governance, &now)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::DeferToFollowUp,
+            Some("Schedule the measurements separately".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let follow_ups = TaskRepo::list_by_project_with_metadata_key(&*db, &project.id, "follow_up_of")
+        .await
+        .unwrap();
+    assert_eq!(follow_ups.len(), 1);
+    let follow_up = &follow_ups[0];
+    service
+        .ensure_task_runnable(follow_up)
+        .await
+        .expect("follow-up passes normal Charter dispatch admission");
+    let current = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.project_work_epoch, project.project_work_epoch + 1);
+    let governance: (String, i64) = sqlx::query_as(
+        "SELECT charter_revision_id, runnable FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&follow_up.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(governance, (revision, 1));
 }
 
 #[tokio::test]

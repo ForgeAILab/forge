@@ -281,7 +281,9 @@ impl TaskService {
                 ));
             }
         }
-        let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        let task = self
+            .insert_created_task_in_tx(&mut transaction, create_task, prepared_governance)
+            .await?;
         if let Some(parent_task_id) = task.parent_task_id.as_deref() {
             // Creating the first child atomically converts its parent into a
             // coordination container. Preserve only aggregate-review roles;
@@ -338,25 +340,6 @@ impl TaskService {
                 .await?;
             }
         }
-        if !task.is_automation {
-            ProjectRepo::increment_project_work_epoch(
-                &*self.db,
-                &mut transaction,
-                &task.project_id,
-                1,
-            )
-            .await?;
-        }
-        if let Some(governance) = prepared_governance {
-            self.insert_task_governance(
-                &mut transaction,
-                &task.id,
-                &task.project_id,
-                governance,
-                &now,
-            )
-            .await?;
-        }
         for dependency_id in &dependency_ids {
             TaskDependencyRepo::add_dependency_in_tx(
                 &*self.db,
@@ -404,6 +387,27 @@ impl TaskService {
             },
         });
 
+        Ok(task)
+    }
+
+    /// Normal Task insertion shared with atomic recovery-created follow-ups.
+    /// Governance and the Project work epoch commit with the Task row.
+    pub(super) async fn insert_created_task_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateTask,
+        prepared_governance: Option<super::governance::PreparedTaskGovernance>,
+    ) -> Result<Task> {
+        let now = input.created_at.clone();
+        let task = TaskRepo::create_in_tx(&*self.db, transaction, input).await?;
+        if !task.is_automation {
+            ProjectRepo::increment_project_work_epoch(&*self.db, transaction, &task.project_id, 1)
+                .await?;
+        }
+        if let Some(governance) = prepared_governance {
+            self.insert_task_governance(transaction, &task.id, &task.project_id, governance, &now)
+                .await?;
+        }
         Ok(task)
     }
 

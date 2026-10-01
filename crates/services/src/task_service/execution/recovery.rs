@@ -2528,6 +2528,12 @@ impl TaskService {
                 })
             })
             .transpose()?;
+        let follow_up_governance = if let Some(follow_up) = &follow_up {
+            self.prepare_task_governance(&project, &follow_up.task_type, None)
+                .await?
+        } else {
+            None
+        };
         let reason = match &follow_up {
             Some(follow_up) => format!(
                 "deferred to follow-up {} ({}): {owner_reason}",
@@ -2559,7 +2565,9 @@ impl TaskService {
         };
         let (review, task) = if let Some(follow_up) = follow_up {
             let mut transaction = db::begin_immediate(self.db.pool()).await?;
-            let follow_up = TaskRepo::create_in_tx(&*self.db, &mut transaction, follow_up).await?;
+            let follow_up = self
+                .insert_created_task_in_tx(&mut transaction, follow_up, follow_up_governance)
+                .await?;
             let linked = sqlx::query(
                 "UPDATE task SET metadata_json = ?, version = version + 1
                  WHERE id = ? AND version = ?",

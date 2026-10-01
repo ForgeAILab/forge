@@ -1,5 +1,6 @@
 //! Root-Task and ordered-subtask classification and policy.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use api_types::{CanonicalPhase, StateKind, WorkflowDefinition};
@@ -161,6 +162,7 @@ pub(crate) async fn coordination_root_has_subtasks(db: &SqliteDb, task: &Task) -
 
 /// Project-scoped batch form of `coordination_root_has_subtasks`, with the
 /// same visible-child semantics, for slot counting without a query per root.
+#[cfg(test)]
 pub(crate) async fn coordination_root_ids_with_subtasks(
     db: &SqliteDb,
     project_id: &str,

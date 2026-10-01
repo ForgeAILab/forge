@@ -18,6 +18,16 @@ pub trait TaskRepo: Send + Sync {
         include_deleted: bool,
     ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
+    /// One aggregate over visible Tasks and their latest Reviews. Workflow maps
+    /// carry effective state kinds and whether the state holds root-owned work.
+    /// Returns (active, parked, queued), without loading Task or Review bodies.
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<(i64, i64, i64)>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
     /// independently of the current workflow's state classification.

@@ -3,7 +3,7 @@
 use super::*;
 use crate::project_environment::{
     bounded_output_tail, next_check_at, pause_detail, ENVIRONMENT_NOT_READY,
-    ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX,
+    ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX, NO_RERUNNABLE_CHECK,
 };
 use executors::environment::{
     mark_task_environment, materialize_assets, run_environment_check, run_environment_checks,
@@ -50,7 +50,11 @@ impl TaskService {
         let worktree = std::path::Path::new(worktree_path);
         let (message, checks, output) =
             match materialize_assets(worktree, &environment.assets).await {
-                Err(message) => (message.clone(), Vec::new(), bounded_output_tail(&message)),
+                Err(message) => (
+                    message.clone(),
+                    Vec::new(),
+                    bounded_output_tail(&format!("{message}\n{NO_RERUNNABLE_CHECK}")),
+                ),
                 Ok(()) => {
                     let Some(failure) = run_environment_checks(
                         worktree,
@@ -146,6 +150,9 @@ impl TaskService {
         &self,
         project_id: &str,
     ) -> Result<(Vec<api_types::ProjectEnvironmentCheckResult>, db::Project)> {
+        let _check = self.claim_environment_recheck(project_id).ok_or_else(|| {
+            ServiceError::Conflict("Project environment re-check is already running".to_owned())
+        })?;
         let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
@@ -166,7 +173,7 @@ impl TaskService {
             });
         }
         if project.system_pause_reason.as_deref() == Some(ENVIRONMENT_NOT_READY) {
-            if results.iter().all(|result| result.passed) {
+            if !results.is_empty() && results.iter().all(|result| result.passed) {
                 self.clear_environment_pause(&project).await?;
             } else if let Some(mut detail) = pause_detail(&project)? {
                 let now = chrono::Utc::now();
@@ -177,14 +184,18 @@ impl TaskService {
                     .filter(|result| !result.passed)
                     .map(|result| result.name.clone())
                     .collect();
-                detail.output = bounded_output_tail(
-                    &results
-                        .iter()
-                        .filter(|result| !result.passed)
-                        .map(|result| format!("{}: {}", result.name, result.output_tail))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                detail.output = if results.is_empty() {
+                    bounded_output_tail(&format!("{}\n{NO_RERUNNABLE_CHECK}", detail.output))
+                } else {
+                    bounded_output_tail(
+                        &results
+                            .iter()
+                            .filter(|result| !result.passed)
+                            .map(|result| format!("{}: {}", result.name, result.output_tail))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                };
                 self.update_environment_pause(&project, &detail).await?;
             }
         }
@@ -192,6 +203,23 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         Ok((results, current))
+    }
+
+    pub(crate) fn claim_environment_recheck(
+        &self,
+        project_id: &str,
+    ) -> Option<EnvironmentRecheckGuard> {
+        let mut running = self
+            .environment_rechecks
+            .lock()
+            .expect("environment re-check lock");
+        if !running.insert(project_id.to_owned()) {
+            return None;
+        }
+        Some(EnvironmentRecheckGuard {
+            running: Arc::clone(&self.environment_rechecks),
+            project_id: project_id.to_owned(),
+        })
     }
 
     pub(crate) async fn clear_environment_pause(&self, project: &db::Project) -> Result<bool> {
@@ -264,5 +292,20 @@ fn check_failure_message(failure: &EnvironmentCheckFailure) -> String {
         failure.message()
     } else {
         format!("{}\n{output}", failure.message())
+    }
+}
+
+/// Releases single-flight ownership on success, error, cancellation or panic.
+pub(crate) struct EnvironmentRecheckGuard {
+    running: Arc<std::sync::Mutex<HashSet<String>>>,
+    project_id: String,
+}
+
+impl Drop for EnvironmentRecheckGuard {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .expect("environment re-check lock")
+            .remove(&self.project_id);
     }
 }

@@ -63,6 +63,19 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
     }
 }
 
+pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = &[
+    "manual_stop",
+    "workspace_error",
+    "agent_timeout",
+    "recovery_required",
+    "workspace_reset_required",
+    "max_turns_exceeded",
+    "before_work_hook_failed",
+    "before_work_hook_timeout",
+    "review_needs_owner",
+    crate::workflow::engine::DISPATCH_FAILED_ANNOTATION,
+];
+
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     if task.blocked_json.is_some() || task.failed_json.is_some() {
         return true;
@@ -76,19 +89,7 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     let Some(kind) = annotation.get("type").and_then(Value::as_str) else {
         return false;
     };
-    matches!(
-        kind,
-        "manual_stop"
-            | "workspace_error"
-            | "agent_timeout"
-            | "recovery_required"
-            | "workspace_reset_required"
-            | "max_turns_exceeded"
-            | "before_work_hook_failed"
-            | "before_work_hook_timeout"
-            | "review_needs_owner"
-            | crate::workflow::engine::DISPATCH_FAILED_ANNOTATION
-    )
+    BLOCKING_ANNOTATION_KINDS.contains(&kind)
 }
 
 pub(super) fn awaiting_human(task: &db::Task) -> bool {

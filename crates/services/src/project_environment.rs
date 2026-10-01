@@ -5,6 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::{Result, ServiceError};
 
+pub(crate) const NO_RERUNNABLE_CHECK: &str = "No re-runnable environment check; resume manually after fixing the environment or configure a real check.";
+
 pub(crate) const ENVIRONMENT_NOT_READY: &str = "environment_not_ready";
 /// Durable pre-dispatch tag. The original launch failure prefix also lets
 /// migrated Tasks retry their legacy environment-failed executions.

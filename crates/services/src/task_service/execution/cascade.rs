@@ -1866,7 +1866,7 @@ impl TaskService {
                     "review outcome was committed without its task cascade; reconciling"
                 );
                 return self
-                    .reconcile_settled_reviewer_completion(&task, execution, &review)
+                    .reconcile_settled_reviewer_completion(&task, execution, &review, true)
                     .await;
             }
             tracing::debug!(
@@ -2245,6 +2245,7 @@ impl TaskService {
         task: &Task,
         execution: &Execution,
         review: &Review,
+        strict_details: bool,
     ) -> Result<()> {
         let now = now_rfc3339();
         match review.status {
@@ -2283,13 +2284,26 @@ impl TaskService {
                     )
                     .await?
                 };
-                let details = strict_review_details(review)?;
-                if let Some(conformance) =
-                    details.get("conformance").filter(|value| !value.is_null())
-                {
-                    let conformance: api_types::ReviewConformance =
-                        serde_json::from_value(conformance.clone())
-                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                let conformance = strict_review_details(review).and_then(|details| {
+                    details
+                        .get("conformance")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            serde_json::from_value::<api_types::ReviewConformance>(value.clone())
+                                .map_err(|error| ServiceError::invalid_operation(error.to_string()))
+                        })
+                        .transpose()
+                });
+                let conformance = match conformance {
+                    Ok(conformance) => conformance,
+                    Err(error) if !strict_details => {
+                        tracing::warn!(task_id = %task.id, review_id = %review.id, %error,
+                            "invalid failed review details; recovering with plain remediation routing");
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(conformance) = conformance {
                     if conformance.status == api_types::ConformanceStatus::Blocked {
                         return self
                             .block_task_for_review_environment(
@@ -2825,7 +2839,26 @@ fn owner_review_failure_message(
         .iter()
         .filter(|previous| previous.attempt_number < review.attempt_number)
         .max_by_key(|previous| (previous.attempt_number, previous.id.as_str()))
-        .is_some_and(|previous| previous.status == ReviewStatus::Failed);
+        .is_some_and(|previous| {
+            previous.status == ReviewStatus::Failed
+                && strict_review_details(previous)
+                    .ok()
+                    .and_then(|details| {
+                        serde_json::from_value::<api_types::ReviewConformance>(
+                            details["conformance"].clone(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|conformance| {
+                        conformance.status == api_types::ConformanceStatus::Failed
+                            && conformance.checks.iter().all(|check| check.exit_code == 0)
+                            && conformance.assessment.as_ref().is_some_and(|assessment| {
+                                assessment.result == api_types::ReviewResult::Fail
+                                    && conformance.reason.as_deref()
+                                        == Some(assessment.reason.as_str())
+                            })
+                    })
+        });
     (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
 }
 

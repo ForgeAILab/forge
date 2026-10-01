@@ -463,7 +463,7 @@ impl TaskDispatcher {
         // Share finding routing with terminal reviewer reconciliation. CI-only
         // failures still spend the normal remediation budget; owner findings park.
         self.task_service
-            .reconcile_settled_reviewer_completion(&task, &execution, &review)
+            .reconcile_settled_reviewer_completion(&task, &execution, &review, false)
             .await?;
         Ok(true)
     }
