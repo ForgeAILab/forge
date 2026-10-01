@@ -50,16 +50,15 @@ node_modules/
 
 docs/spec/
 
-# Canonical generated TypeScript bindings live under web/src/types/generated.
-crates/api-types/bindings/ProjectHook*.ts
 .codegraph/
 
 # Editor/agent tool state
 .cursor/
 .omo/
 
-# Local sibling override for coordinated Agent Runtime development.
-/.cargo/
+# Local sibling overrides; the shared binding export configuration is committed.
+/.cargo/*
+!/.cargo/config.toml
 
 # Local verification output and test-data backups (never committed)
 /artifacts/

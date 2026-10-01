@@ -3,19 +3,19 @@ import type { EvidenceAvailability } from "./EvidenceAvailability";
 import type { EvidenceKind } from "./EvidenceKind";
 import type { PrincipalRef } from "./PrincipalRef";
 
-export type EvidenceAttachment = { id: string, project_id: string, asset_id: string, task_id: string | null, source_task_id: string | null, source_run_id: string | null, source_validation_id: string | null,
+export type EvidenceAttachment = { id: string, project_id: string, asset_id: string, task_id: string | null, source_task_id: string | null, source_run_id: string | null, source_validation_id: string | null, 
 /**
  * Exact Task row version observed when this evidence was captured.
  * A missing value is legacy/unpinned and cannot satisfy a required
  * release-gating evidence requirement.
  */
-source_task_version: bigint | null,
+source_task_version: bigint | null, 
 /**
  * Digest of the repository/execution/review context observed when this
  * evidence was captured.  It is compared with the current readiness
  * context before evidence can support release.
  */
-source_context_digest: string | null,
+source_context_digest: string | null, 
 /**
  * The immutable milestone definition revision that governed the
  * attachment.  This is separate from the attachment's own row version.

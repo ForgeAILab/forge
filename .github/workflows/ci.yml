@@ -38,6 +38,19 @@ jobs:
       - name: Run Rust CI
         run: ./scripts/ci-rust.sh
 
+      - name: Check TypeScript binding drift
+        if: ${{ !cancelled() }}
+        run: |
+          make types
+          if ! git diff --exit-code -- web/src/types/generated; then
+            echo "::error::TypeScript bindings are out of date. Run 'make types' and commit the generated files."
+            exit 1
+          fi
+          if [[ -n "$(git ls-files --others --exclude-standard -- web/src/types/generated)" ]]; then
+            echo "::error::Uncommitted TypeScript bindings found. Run 'make types' and commit the generated files."
+            exit 1
+          fi
+
       - name: Test performance collector
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v

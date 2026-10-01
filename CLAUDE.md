@@ -79,7 +79,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 ## When working on this repo
 
 - **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
-- **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Update all four in one change.
+- **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Run `make types` to regenerate bindings in `web/src/types/generated/bindings/` and commit them with the other updates in the same change.
 - **State-machine changes** must keep `crates/api/tests/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
 - **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
@@ -121,4 +121,4 @@ For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory database
 
 ## Frontend
 
-React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses `@` path alias → `web/src/`. API client at `web/src/api/client.ts` calls `/api/v1/*` endpoints. Types in `web/src/types/generated/api.ts` must match `api-types` crate responses — when you change a response shape on the Rust side, regenerate or hand-update the TS types in the same change.
+React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses `@` path alias → `web/src/`. API client at `web/src/api/client.ts` calls `/api/v1/*` endpoints. When you change a response shape in `api-types`, run `make types` and commit the regenerated bindings under `web/src/types/generated/bindings/` in the same change. Do not hand-format generated bindings; ESLint and Prettier exclude them.

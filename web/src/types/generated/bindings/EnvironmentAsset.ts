@@ -5,11 +5,11 @@
  * fixtures) that every worktree needs. Copied only when `target` is absent,
  * so a tracked or already-present path is never overwritten.
  */
-export type EnvironmentAsset = {
+export type EnvironmentAsset = { 
 /**
  * Absolute path on the Forge host.
  */
-source: string,
+source: string, 
 /**
  * Path relative to the worktree root.
  */

@@ -16,24 +16,24 @@ import type { PrincipalRef } from "./PrincipalRef";
  * fetch. `approve_target`/`reject_target` name the same Decision candidates
  * REST routes the dedicated resource already exposes.
  */
-export type PendingDecisionSummary = { id: string, project_id: string, lifecycle: DecisionEditorState, version: bigint, question: string, options: Array<string>, recommendation: string | null, rationale: string | null, decision_class: DecisionClass, affected_records: PendingDecisionAffectedRecords, proposed_by: PrincipalRef,
+export type PendingDecisionSummary = { id: string, project_id: string, lifecycle: DecisionEditorState, version: bigint, question: string, options: Array<string>, recommendation: string | null, rationale: string | null, decision_class: DecisionClass, affected_records: PendingDecisionAffectedRecords, proposed_by: PrincipalRef, 
 /**
  * The principal class permitted to approve/reject this candidate.
  * Always `user`: the shared candidate command service rejects any
  * other principal's approval/rejection authorization.
  */
-required_principal: PrincipalKind, validity: PendingDecisionValidity,
+required_principal: PrincipalKind, validity: PendingDecisionValidity, 
 /**
  * Present only when `validity` is `malformed`; the exact reason no
  * approval action is offered.
  */
-invalid_reason: string | null,
+invalid_reason: string | null, 
 /**
  * Absent when `validity` is `malformed`: approving a candidate whose
  * shape violates the D19 invariant would promote that malformed shape
  * into a permanent effective Decision, so no surface may offer it.
  */
-approve_target: PendingDecisionActionTarget | null,
+approve_target: PendingDecisionActionTarget | null, 
 /**
  * Always present: rejecting a candidate never propagates its shape
  * into anything consequential, so it remains how a malformed row is

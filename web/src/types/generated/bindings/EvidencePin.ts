@@ -2,7 +2,7 @@
 import type { EvidenceAvailability } from "./EvidenceAvailability";
 import type { ReleaseEvidenceAvailability } from "./ReleaseEvidenceAvailability";
 
-export type EvidencePin = { id: string, release_id: string, attachment_id: string, asset_id: string, attachment_digest: string, asset_checksum: string, availability: EvidenceAvailability,
+export type EvidencePin = { id: string, release_id: string, attachment_id: string, asset_id: string, attachment_digest: string, asset_checksum: string, availability: EvidenceAvailability, 
 /**
  * Read-time overlay derived from an immutable, audited media tombstone.
  * The historical `availability` above is never mutated after pinning.

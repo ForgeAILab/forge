@@ -5,21 +5,21 @@
  * action and dispatch the named operation; they do not infer a command from
  * free-form text or from other Overview fields.
  */
-export type ProjectNextAction = {
+export type ProjectNextAction = { 
 /**
  * Stable machine-readable action identifier.
  */
-code: string,
+code: string, 
 /**
  * Principal class expected to perform the action (`user`,
  * `project_agent`, `worker`, `reviewer`, or `system`).
  */
-required_principal: string, target_type: string, target_id: string, title: string, explanation: string,
+required_principal: string, target_type: string, target_id: string, title: string, explanation: string, 
 /**
  * Stable presentation/interaction category such as `approval`,
  * `reconciliation`, `setup`, `validation`, `readiness`, or `release`.
  */
-action_kind: string,
+action_kind: string, 
 /**
  * Canonical operation identifier, not a client-assembled URL.
  */
