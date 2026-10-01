@@ -64,6 +64,7 @@ pub mod project_charter_commands;
 pub mod project_creation;
 pub mod project_decision_commands;
 pub mod project_documents;
+pub(crate) mod project_environment;
 pub mod project_execution_setup;
 pub mod project_execution_setup_projection;
 pub mod project_hooks;

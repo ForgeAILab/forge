@@ -101,6 +101,7 @@ fn export_typescript() {
     ReviewGoverningContext::export().expect("export ReviewGoverningContext");
     ReviewContract::export().expect("export ReviewContract");
     ReviewResult::export().expect("export ReviewResult");
+    FixableBy::export().expect("export FixableBy");
     ReviewAssessment::export().expect("export ReviewAssessment");
     ConformanceStatus::export().expect("export ConformanceStatus");
     ConformanceCheckResult::export().expect("export ConformanceCheckResult");
@@ -112,6 +113,10 @@ fn export_typescript() {
     LifecycleHookDef::export().expect("export LifecycleHookDef");
     ProjectSettings::export().expect("export ProjectSettings");
     ProjectEnvironment::export().expect("export ProjectEnvironment");
+    ProjectEnvironmentPause::export().expect("export ProjectEnvironmentPause");
+    ProjectEnvironmentCheckResult::export().expect("export ProjectEnvironmentCheckResult");
+    ProjectEnvironmentRecheckRequest::export().expect("export ProjectEnvironmentRecheckRequest");
+    ProjectEnvironmentRecheckResponse::export().expect("export ProjectEnvironmentRecheckResponse");
     EnvironmentAsset::export().expect("export EnvironmentAsset");
     EnvironmentCheck::export().expect("export EnvironmentCheck");
     FailureKind::export().expect("export FailureKind");
@@ -220,6 +225,7 @@ fn export_typescript() {
     AgentsResponse::export().expect("export AgentsResponse");
     Project::export().expect("export Project");
     ProjectResponse::export().expect("export ProjectResponse");
+    ProjectSlots::export().expect("export ProjectSlots");
     ProjectHookRule::export().expect("export ProjectHookRule");
     ProjectHookTrigger::export().expect("export ProjectHookTrigger");
     ProjectHookAction::export().expect("export ProjectHookAction");

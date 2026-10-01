@@ -295,7 +295,7 @@ impl TaskDispatcher {
                 .await
             {
                 Ok(true) => {
-                    deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    self.clear_dispatch_disposition(&task).await?;
                     dispatched += 1;
                 }
                 Ok(false) => {}
@@ -457,15 +457,14 @@ impl TaskDispatcher {
             task
         };
         tracing::info!(task_id = %task.id, review_id = %review.id, "routing stranded failed review");
-        let (task, target, reason) = self
-            .task_service
-            .review_failure_target(&task, Some(&review.execution_id))
+        let execution = ExecutionRepo::get_by_id(&*self.db, &review.execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", review.execution_id.clone()))?;
+        // Share finding routing with terminal reviewer reconciliation. CI-only
+        // failures still spend the normal remediation budget; owner findings park.
+        self.task_service
+            .reconcile_settled_reviewer_completion(&task, &execution, &review)
             .await?;
-        if let Some(target) = target {
-            self.task_service
-                .cascade_completed_review_task(&task, &target, &reason, true)
-                .await?;
-        }
         Ok(true)
     }
 
@@ -639,7 +638,8 @@ impl TaskDispatcher {
         execution: &db::Execution,
         project_version: i64,
     ) -> Result<ReviewerReconciliation> {
-        if !crate::task_service::execution::should_block_task_for_failed_execution(execution)
+        if crate::project_environment::is_environment_pre_dispatch_failure(execution)
+            || !crate::task_service::execution::should_block_task_for_failed_execution(execution)
             || role_name == crate::workflow::default_roles::REVIEWER
             || helpers::has_blocking_annotation(task)
             || deferred_dispatch::is_pending(task, chrono::Utc::now())

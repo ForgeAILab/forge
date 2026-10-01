@@ -24,6 +24,11 @@ enum ProjectCmd {
         name: String,
     },
     List,
+    /// Run all Project environment checks and resume an environment pause on success.
+    EnvRecheck {
+        /// Project id.
+        project: String,
+    },
     /// Token and cost accounting for one Project, by surface, model and agent.
     Analytics {
         /// Project id.
@@ -63,6 +68,32 @@ impl ProjectArgs {
                     OutputFormat::Json => print_json(&response),
                     OutputFormat::Table => {
                         print_project_analytics(&response);
+                        Ok(())
+                    }
+                }
+            }
+            ProjectCmd::EnvRecheck { project } => {
+                let response: api_types::ProjectEnvironmentRecheckResponse = client
+                    .post(
+                        &format!("/api/v1/projects/{project}/environment/recheck"),
+                        &api_types::ProjectEnvironmentRecheckRequest {},
+                    )
+                    .await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        for check in &response.checks {
+                            let status = if check.passed { "passed" } else { "failed" };
+                            let exit = check
+                                .exit_code
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "-".to_owned());
+                            println!("{}: {status} (exit {exit})", check.name);
+                            if !check.output_tail.is_empty() {
+                                println!("{}", check.output_tail);
+                            }
+                        }
+                        print_table_projects(std::slice::from_ref(&response.project));
                         Ok(())
                     }
                 }
@@ -269,6 +300,20 @@ fn surface_name(surface: api_types::UsageSurface) -> String {
 #[cfg(test)]
 mod tests {
     use super::analytics_path;
+
+    #[test]
+    fn environment_recheck_subcommand_parses_project() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from(["project", "env-recheck", "project-1"]).unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project } if project == "project-1")
+        );
+    }
 
     #[test]
     fn analytics_path_percent_encodes_rfc3339_offset() {

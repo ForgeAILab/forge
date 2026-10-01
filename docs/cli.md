@@ -187,7 +187,7 @@ idempotency key.
 | `login`   | Authenticate the CLI and store a reusable token |
 | `logout`  | Remove stored CLI credentials |
 | `whoami`  | Show stored CLI login state |
-| `project` | Create / list / show projects |
+| `project` | Create / list / show projects, re-check environment checks |
 | `analytics` | Inspect account-wide usage, cost coverage, and pricing provenance |
 | `repo`    | Add / list repos under a project |
 | `memory`  | Search and retrieve project-scoped memory |
@@ -255,6 +255,21 @@ forge-ctl task cancel <TASK_ID>
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
+
+### Project environment re-check
+
+```bash
+forge-ctl project env-recheck <PROJECT_ID>
+forge-ctl --output json project env-recheck <PROJECT_ID>
+```
+
+Runs every configured environment check immediately via
+`POST /api/v1/projects/{id}/environment/recheck`. Table output lists each
+check's passed/failed status, exit code, output tail, and the updated Project;
+JSON output returns `{checks, project}`. All checks passing resumes an
+environment-paused Project. User and repository pauses are left in place.
+Scheduled re-checks use `settings.environment.recheck_interval_seconds`
+(default 600 seconds); this command does not wait for the next scheduled check.
 
 ### Usage and cost analytics
 

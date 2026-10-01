@@ -344,7 +344,7 @@ pub(crate) struct DispatchDisposition {
     pub safe_message: String,
 }
 
-fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
+pub(crate) fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
     serde_json::from_value(metadata.extra.get(DISPOSITION_METADATA_KEY)?.clone()).ok()
 }
@@ -360,53 +360,74 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
 
 /// The disposition still in force for this Task, if any.
 ///
-/// A recorded disposition means the dispatcher has stopped attempting this
-/// capability and will not reconsider until the Task changes or something
-/// wakes it — which is exactly the state a user needs to see, rather than the
-/// Task reading as ordinary queueing.
+/// Role dispositions wait for a Task change or explicit wake. The
+/// `project_capacity` capability instead explains temporary queueing and is
+/// rechecked each tick, since another Task can free a slot without a wake.
 pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
     dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
 }
 
 /// Persist the disposition observed for a dispatch attempt that just failed
-/// deterministically. Callers reach this only after
-/// `dispatch_disposition_is_current` established there was nothing current to
-/// skip, so every call is a genuinely new observation and is safe to log once.
+/// deterministically. Return whether the stored disposition actually changed;
+/// an identical observation preserves its timestamp and produces no refresh.
 pub(crate) async fn record_dispatch_disposition(
     db: &db::SqliteDb,
     task: &Task,
     capability: &str,
     safe_message: &str,
-) -> Result<()> {
-    TaskRepo::mutate_metadata(
+) -> Result<bool> {
+    let blocker_digest = dispatch_blocker_digest(safe_message);
+    let safe_message = bounded_safe_message(safe_message);
+    if dispatch_disposition(task).is_some_and(|disposition| {
+        disposition.task_version == task.version
+            && disposition.capability == capability
+            && disposition.blocker_digest == blocker_digest
+            && disposition.safe_message == safe_message
+    }) {
+        return Ok(false);
+    }
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let value = json!({
+        "task_version": task.version,
+        "capability": capability,
+        "blocker_digest": blocker_digest,
+        "recorded_at": now_rfc3339(),
+        "safe_message": safe_message,
+    });
+    let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
+        Some(expected) => TaskMetadataMutation::SetIf {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            expected: expected.clone(),
+            value,
+        },
+        None => TaskMetadataMutation::SetIfAbsent {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            value,
+        },
+    };
+    let (_, changed) = TaskRepo::mutate_metadata_with_change(
         db,
         &task.id,
         Some(task.version),
-        vec![TaskMetadataMutation::Set {
-            key: DISPOSITION_METADATA_KEY.to_owned(),
-            value: json!({
-                "task_version": task.version,
-                "capability": capability,
-                "blocker_digest": dispatch_blocker_digest(safe_message),
-                "recorded_at": now_rfc3339(),
-                "safe_message": bounded_safe_message(safe_message),
-            }),
-        }],
+        vec![mutation],
         &now_rfc3339(),
     )
     .await?;
-    Ok(())
+    Ok(changed)
 }
 
-/// Clear a stored disposition, e.g. once dispatch succeeds again.
-pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -> Result<()> {
+/// Clear a stored disposition, e.g. once dispatch succeeds again, returning
+/// whether the conditional removal actually changed stored metadata.
+pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -> Result<bool> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let Some(expected) = metadata.extra.get(DISPOSITION_METADATA_KEY).cloned() else {
-        return Ok(());
+        return Ok(false);
     };
-    TaskRepo::mutate_metadata(
+    let (_, changed) = TaskRepo::mutate_metadata_with_change(
         db,
         &task.id,
         None,
@@ -417,7 +438,7 @@ pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -
         &now_rfc3339(),
     )
     .await?;
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]

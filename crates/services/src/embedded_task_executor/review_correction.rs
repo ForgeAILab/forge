@@ -20,8 +20,9 @@ pub(super) fn correction_prompt(problem: &str) -> String {
         "Forge could not read the result of your review, so nothing has been recorded yet.\n\n\
          Problem: {problem}\n\n\
          Reply with ONLY the result block for the review you just wrote, for example:\n\
-         {{\"result\": \"fail\", \"reason\": \"one sentence\"}}\n\
-         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation."
+         {{\"result\": \"fail\", \"reason\": \"one sentence\", \"fixable_by\": \"coder\", \"repeat\": false}}\n\
+         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation.\n\n{}",
+        crate::workflow::dispatch::REVIEW_FINDING_ROUTING_CONTRACT
     )
 }
 
@@ -142,6 +143,9 @@ mod tests {
         let prompts = prompts.into_inner();
         assert_eq!(prompts.len(), 1);
         assert!(prompts[0].contains("Problem: cannot parse garbled"));
+        assert!(prompts[0].contains("`fixable_by` is \"coder\" (default) or \"owner\""));
+        assert!(prompts[0].contains("previous review attempt raised the same blocking finding"));
+        assert!(prompts[0].contains("Owner example:") && prompts[0].contains("Repeat example:"));
     }
 
     #[tokio::test]

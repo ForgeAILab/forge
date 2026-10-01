@@ -1977,6 +1977,7 @@ impl TaskService {
         };
         let passed = conformance.status == api_types::ConformanceStatus::Passed;
         let blocked = conformance.status == api_types::ConformanceStatus::Blocked;
+        let owner_finding = owner_review_failure_message(&conformance, &review, &reviews);
         let status = if passed && user_approval_required {
             ReviewStatus::AwaitingHuman
         } else if passed {
@@ -2111,6 +2112,16 @@ impl TaskService {
                         .block_task_for_review_environment(&task, execution, reason)
                         .await;
                 }
+                if let Some(message) = owner_finding {
+                    return self
+                        .block_task_for_review_finding(
+                            &task,
+                            execution,
+                            api_types::FailureKind::ReviewNeedsOwner,
+                            message,
+                        )
+                        .await;
+                }
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
                     .await?;
@@ -2136,9 +2147,37 @@ impl TaskService {
         reason: String,
     ) -> Result<()> {
         let message = format!("review blocked by its environment: {reason}");
+        self.block_task_for_review_finding(
+            task,
+            execution,
+            api_types::FailureKind::ReviewBlocked,
+            message,
+        )
+        .await
+    }
+
+    /// Park a failed review without spending the remediation retry budget.
+    async fn block_task_for_review_finding(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        kind: api_types::FailureKind,
+        message: String,
+    ) -> Result<()> {
+        let mut recovery_actions = vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::MarkReviewed,
+        ];
+        if kind == api_types::FailureKind::ReviewNeedsOwner {
+            recovery_actions.push(api_types::RecoveryAction::DeferToFollowUp);
+        }
+        recovery_actions.extend([
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ]);
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ReviewBlocked,
-            blocking_reason: "review_blocked".to_owned(),
+            annotation_type: kind,
+            blocking_reason: kind.to_string(),
             blocked_by: Some(
                 api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
             ),
@@ -2151,22 +2190,17 @@ impl TaskService {
             }),
             message: Some(message.clone()),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::MarkReviewed,
-                api_types::RecoveryAction::OpenInteractive,
-                api_types::RecoveryAction::CancelTask,
-            ],
+            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
-                "failed to serialize review-blocked annotation: {error}"
+                "failed to serialize review blocking annotation: {error}"
             ))
         })?;
         let blocked_meta = json!({
             "reason": message,
             "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::ReviewBlocked,
+            "kind": kind,
             "execution_id": execution.id,
         });
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
@@ -2198,7 +2232,7 @@ impl TaskService {
             context: EventContext::TaskBlocked {
                 project_id: updated.project_id,
                 reason: message,
-                kind: Some(api_types::FailureKind::ReviewBlocked),
+                kind: Some(kind),
                 source: None,
                 execution_id: Some(execution.id.clone()),
             },
@@ -2206,7 +2240,7 @@ impl TaskService {
         Ok(())
     }
 
-    async fn reconcile_settled_reviewer_completion(
+    pub(crate) async fn reconcile_settled_reviewer_completion(
         &self,
         task: &Task,
         execution: &Execution,
@@ -2249,6 +2283,38 @@ impl TaskService {
                     )
                     .await?
                 };
+                let details = strict_review_details(review)?;
+                if let Some(conformance) =
+                    details.get("conformance").filter(|value| !value.is_null())
+                {
+                    let conformance: api_types::ReviewConformance =
+                        serde_json::from_value(conformance.clone())
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    if conformance.status == api_types::ConformanceStatus::Blocked {
+                        return self
+                            .block_task_for_review_environment(
+                                &task,
+                                execution,
+                                conformance.reason.unwrap_or_else(|| {
+                                    "reviewer reported a blocked environment".to_owned()
+                                }),
+                            )
+                            .await;
+                    }
+                    let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
+                    if let Some(message) =
+                        owner_review_failure_message(&conformance, review, &reviews)
+                    {
+                        return self
+                            .block_task_for_review_finding(
+                                &task,
+                                execution,
+                                api_types::FailureKind::ReviewNeedsOwner,
+                                message,
+                            )
+                            .await;
+                    }
+                }
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
                     .await?;
@@ -2732,6 +2798,37 @@ impl TaskService {
 /// timeout parks the Task instead of retrying.
 const REVIEW_CHECK_ATTEMPTS: u32 = 3;
 
+/// Honor routing only when the reviewer verdict caused the failure. Forge
+/// replaces the assessment reason when setup, checks, or reproduction fail.
+fn owner_review_failure_message(
+    conformance: &api_types::ReviewConformance,
+    review: &Review,
+    reviews: &[Review],
+) -> Option<String> {
+    let assessment = conformance.assessment.as_ref()?;
+    if conformance.status != api_types::ConformanceStatus::Failed
+        || assessment.result != api_types::ReviewResult::Fail
+        || conformance.checks.iter().any(|check| check.exit_code != 0)
+        || conformance.reason.as_deref().unwrap_or_default() != assessment.reason
+    {
+        return None;
+    }
+    let reason = if assessment.reason.is_empty() {
+        "reviewer reported a blocking finding"
+    } else {
+        &assessment.reason
+    };
+    if assessment.fixable_by == api_types::FixableBy::Owner {
+        return Some(format!("fixable by owner: {reason}"));
+    }
+    let previous_failed = reviews
+        .iter()
+        .filter(|previous| previous.attempt_number < review.attempt_number)
+        .max_by_key(|previous| (previous.attempt_number, previous.id.as_str()))
+        .is_some_and(|previous| previous.status == ReviewStatus::Failed);
+    (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
+}
+
 /// Whether `task` is already parked by a review-environment block that this
 /// reviewer execution raised.
 fn review_blocked_by_execution(task: &Task, execution_id: &str) -> bool {
@@ -3144,6 +3241,8 @@ mod reviewer_message_tests {
         let assessment = api_types::ReviewAssessment {
             result: api_types::ReviewResult::Fail,
             reason: "api not exported".to_owned(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: "## R1\n\nExpected the api exported; `src/lib.rs:3` does not.".to_owned(),
         };
         let mut failed = conformance(Some(assessment.clone()));
@@ -3158,6 +3257,8 @@ mod reviewer_message_tests {
         let mut blocked = conformance(Some(api_types::ReviewAssessment {
             result: api_types::ReviewResult::Blocked,
             reason: "tsc not found".to_owned(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: String::new(),
         }));
         blocked.status = api_types::ConformanceStatus::Blocked;

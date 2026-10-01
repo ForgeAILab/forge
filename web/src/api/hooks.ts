@@ -33,6 +33,7 @@ import {
   markAllNotificationsRead,
   markNotificationRead,
   recoverTask,
+  recheckProjectEnvironment,
   refreshOperations,
   removeDependency,
   removeMember,
@@ -466,6 +467,17 @@ export function useResumeProject() {
         method: 'POST',
       }),
     onSuccess: (project) => {
+      void queryClient.invalidateQueries({ queryKey: qk.project(project.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.projects })
+    },
+  })
+}
+
+export function useRecheckProjectEnvironment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: recheckProjectEnvironment,
+    onSuccess: ({ project }) => {
       void queryClient.invalidateQueries({ queryKey: qk.project(project.id) })
       void queryClient.invalidateQueries({ queryKey: qk.projects })
     },

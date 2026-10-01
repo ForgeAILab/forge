@@ -12,6 +12,7 @@ import { productTerm } from '@/lib/i18n'
 // only appears when that summary is absent.
 
 function humanizeBlockingReason(reason: string) {
+  if (reason === 'review_needs_owner') return 'Needs owner'
   const withSpaces = reason.replace(/_/g, ' ')
   return withSpaces.charAt(0).toUpperCase() + withSpaces.slice(1)
 }

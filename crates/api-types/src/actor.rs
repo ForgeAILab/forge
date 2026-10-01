@@ -174,6 +174,7 @@ impl fmt::Display for RecoveryAction {
             Self::ResetToInitial => "reset_to_initial",
             Self::CancelTask => "cancel_task",
             Self::MarkReviewed => "mark_reviewed",
+            Self::DeferToFollowUp => "defer_to_follow_up",
             Self::RetryHook => "retry_hook",
             Self::ResumeProcess => "resume_process",
             Self::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",

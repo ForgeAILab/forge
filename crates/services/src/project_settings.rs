@@ -40,6 +40,11 @@ pub async fn validate_project_settings(
 ) -> Result<()> {
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
+    if settings.max_active_tasks > 1000 {
+        return Err(ServiceError::invalid_operation(
+            "max_active_tasks must be between 0 and 1000 (0 means unlimited)",
+        ));
+    }
     let role_names: HashSet<&str> = workflow
         .roles
         .iter()

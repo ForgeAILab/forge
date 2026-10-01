@@ -1239,6 +1239,19 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        let (task, _) = self
+            .mutate_metadata_with_change(id, expected_version, mutations, updated_at)
+            .await?;
+        Ok(task)
+    }
+
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
@@ -1261,7 +1274,7 @@ impl TaskRepo for SqliteDb {
         }
         if !changed {
             transaction.commit().await?;
-            return Ok(task);
+            return Ok((task, false));
         }
         let metadata_json = metadata.to_json();
         sqlx::query(
@@ -1277,7 +1290,7 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.updated_at = updated_at.to_owned();
         transaction.commit().await?;
-        Ok(task)
+        Ok((task, true))
     }
 
     async fn mutate_metadata_and_bump_version(

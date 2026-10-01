@@ -13,6 +13,8 @@ import type { TokenCounters } from './bindings/TokenCounters'
 import type { UsageAggregate } from './bindings/UsageAggregate'
 import type { UsageBreakdown } from './bindings/UsageBreakdown'
 import type { WorkflowDefinition as GeneratedWorkflowDefinition } from './bindings/WorkflowDefinition'
+import type { ProjectEnvironmentPause } from './bindings/ProjectEnvironmentPause'
+import type { ProjectSlots } from './bindings/ProjectSlots'
 
 export type TaskStatus = string
 
@@ -73,6 +75,7 @@ export type RecoveryAction =
   | 'reset_to_initial'
   | 'cancel_task'
   | 'mark_reviewed'
+  | 'defer_to_follow_up'
   | 'retry_hook'
   | 'resume_process'
   | 'update_workspace_and_retry_hook'
@@ -171,6 +174,7 @@ export type FailureKind =
   | 'review_gate_failed'
   | 'review_budget_exhausted'
   | 'review_blocked'
+  | 'review_needs_owner'
   | 'environment_not_ready'
   | 'retry_exhausted'
   | 'merge_fix_budget_exhausted'
@@ -272,6 +276,7 @@ export interface LifecycleHookTestResponse {
 }
 
 export interface ProjectSettings {
+  max_active_tasks: number
   retry_budgets: RetryBudgets
   default_role_assignments: DefaultRoleAssignment[]
   lifecycle_hooks: LifecycleHooks
@@ -280,6 +285,7 @@ export interface ProjectSettings {
 }
 
 export interface ProjectEnvironment {
+  recheck_interval_seconds: number
   env: Record<string, string>
   assets: EnvironmentAsset[]
   checks: EnvironmentCheck[]
@@ -799,6 +805,8 @@ export interface Project {
   workflow_template_name?: string | null
   paused_at: string | null
   system_pause_reason?: string | null
+  environment_pause: ProjectEnvironmentPause | null
+  slots: ProjectSlots
   paused: boolean
   charter_status: string
   charter_setup_required: boolean

@@ -69,7 +69,7 @@ told:
   - `crates/services/src/task_service/execution/cascade.rs` — owner/repeat routing next to `block_task_for_review_environment`
   - review result parsing and the reviewer prompt
   - `crates/api-types` (`ProjectEnvironment`, `ProjectSettings`, `ReviewAssessment`, `FailureKind`, `RecoveryAction`, `Project` response)
-  - `crates/db` migration V149
+  - `crates/db` migration V202610010410
   - `crates/api/src/routes/projects.rs`, `docs/api.md`, `docs/architecture.md`, `CHANGELOG.md`
   - web project header/card, task queue reason, review tab
   - `forge-ctl`: `project env-recheck`

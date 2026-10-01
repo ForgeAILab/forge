@@ -24,7 +24,9 @@ export function environmentTextFromSettings(settings: unknown): string {
     (Array.isArray(value) && value.length === 0) ||
     (typeof value === 'object' && value !== null && Object.keys(value).length === 0)
   if (isEmpty(record.env) && isEmpty(record.assets) && isEmpty(record.checks)) return ''
-  return JSON.stringify(environment, null, 2)
+  const fields = { ...record }
+  delete fields.recheck_interval_seconds
+  return JSON.stringify(fields, null, 2)
 }
 
 /** Keep the environment draft isolated from the other Project settings form. */

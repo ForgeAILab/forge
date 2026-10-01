@@ -4,6 +4,8 @@ import type { WorkflowHealthSummary } from '@/types/generated'
 const prominentKinds = new Set(['blocked', 'failed', 'stuck'])
 
 export function workflowLabelFromKind(value: string): string {
+  if (value === 'review_needs_owner') return 'Needs owner'
+  if (value === 'defer_to_follow_up') return 'Defer to follow-up'
   return value
     .split('_')
     .filter(Boolean)

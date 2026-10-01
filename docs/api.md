@@ -2018,6 +2018,7 @@ ten-minute review at a time:
 {
   "settings": {
     "environment": {
+      "recheck_interval_seconds": 600,
       "env": { "GODOT_BIN": "/home/bot/opt/godot/4.7.2/godot" },
       "assets": [
         {
@@ -2055,16 +2056,92 @@ ten-minute review at a time:
 - `checks` run with `bash -lc` in the worktree, in order, immediately before a
   local execution whose role is listed in `roles` (empty means every role).
   `timeout_seconds` defaults to 120. The first failing check fails the
-  execution before any provider call and parks the Task with an
-  `environment_not_ready` blocking annotation whose message names the check,
-  its exit status, and the tail of its output. `reexecute` retries once the
-  host or the settings are fixed; `cancel_task` is the other recovery.
+  execution before any provider call and pauses the **Project** with
+  `system_pause_reason: "environment_not_ready"`. The Task keeps its current
+  workflow state without a blocking annotation. Existing executions may finish;
+  no new execution launches while the Project is paused. A user or repository
+  pause is never overwritten.
+- `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
+  While environment-paused, Forge automatically re-runs the recorded failing
+  checks in the primary checkout, with the Project `env` and without copying
+  assets. Role-scoped checks that triggered the pause are included. Every check
+  passing clears only the environment pause; Tasks then re-dispatch in their
+  current states. Another failure updates the output and schedules the next
+  check. Checks that depend on worktree assets may pass here and fail at launch,
+  which pauses the Project again.
+
+`ProjectResponse.environment_pause` is `null` when there is no environment
+pause detail. Its persisted shape is:
+
+```json
+{
+  "checks": ["disk"],
+  "role": "coder",
+  "output": "disk: exit 1\nroot free: 7G",
+  "paused_at": "2026-09-30T05:30:00Z",
+  "last_checked_at": "2026-09-30T05:30:00Z",
+  "next_check_at": "2026-09-30T05:40:00Z"
+}
+```
+
+The project list and header show **Environment paused**, the failing checks,
+collapsible output, the relative next check time, and **Check now**.
+`POST /api/v1/projects/{id}/environment/recheck` runs every configured check
+immediately (including role-scoped checks), with no request fields. It returns
+`{checks, project}`: each check has `name`, `passed`, nullable `exit_code`, and
+bounded `output_tail`; `project` is the updated `ProjectResponse`. If all
+checks pass, an environment pause is cleared. A user or repository pause remains
+in place. For example:
+
+```json
+{
+  "checks": [{"name": "disk", "passed": true, "exit_code": 0, "output_tail": "root free: 17G"}],
+  "project": {"id": "<project-id>", "paused": false, "system_pause_reason": null, "environment_pause": null, "...": "other ProjectResponse fields"}
+}
+```
+
+Manual Project resume also clears the environment pause. If the host is still
+not ready, the next launch pauses it again. Migration V202610010410 clears legacy Task
+`environment_not_ready` blocking annotations so those Tasks re-enter normal
+dispatch; no per-Task recovery is needed.
 
 `PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
 invalid or reserved, whose asset source is not absolute or whose target
 escapes/overlaps another target, or whose checks are unnamed, duplicated,
-empty, use unknown or duplicate roles, or have a zero timeout. Unknown fields
+empty, use unknown or duplicate roles, have a zero timeout, or specify an
+out-of-range re-check interval. Unknown fields
 in the environment document are refused instead of being ignored.
+
+### Project active task limit
+
+`settings.max_active_tasks` defaults to **5**, including existing Projects.
+`PATCH /api/v1/projects/{id}` accepts an integer from 0 to 1000; **0** means
+unlimited. A slot is held by an unparked Task in a workflow state of kind
+`active` or `gate` (default workflow: `planning`, `in_progress`, `review`,
+`merging`, `merge_failed`). A blocking annotation or an `awaiting_human`
+Review parks the Task and frees its slot. Coordination roots with running
+subtasks do not take a slot themselves; their subtasks do.
+
+`ProjectResponse.slots` is `{limit, active, parked, queued}`, for example
+`{"limit":5,"active":4,"parked":3,"queued":7}`. The header shows
+**Active 4/5 · Parked 3 · Queued 7**, or **Active 4 (no limit)** when unlimited.
+At least twice the limit parked in slot-eligible states also stops new
+admission, with **waiting on you: N parked**. The guard is disabled for limit 0.
+
+Only new admission out of the initial state is gated, in ready-queue order.
+Recovery, un-parking, re-dispatch, and transitions of admitted Tasks can exceed
+the limit; the Agent's execution concurrency limit still applies.
+Capacity waits record a current dispatch disposition with capability
+`project_capacity` and reason `project_at_capacity` or
+`project_waiting_on_owner`. Task responses expose its explanation through
+`workflow_health.message` (for example **Waiting for a slot (5/5 active)**),
+with `kind: "waiting_for_agent"` and the reason in `stale_reason`. Cards and
+Task detail render this message. The compact `TaskListItemResponse` carries the
+same `workflow_health` without fetching Task detail. Capacity is reconsidered
+each dispatcher tick. `slots.queued` counts initial-state Tasks once; an admitted
+Task queued for recovery at Agent capacity remains in `slots.active` unless
+parked. Its health reports `Retry Queued` with
+`execution_retry_waiting_for_capacity`, distinct from the Project admission wait.
 
 A ready Project Agent can configure the independent checks without receiving
 general settings authority through the typed native `project.review_config`
@@ -2456,6 +2533,13 @@ the saved blocker with the refusal as its reason and removes the queue entry.
 Paused or offline Agents are refused rather than shown as waiting for capacity,
 including when availability changes while recovery is queued. Other refusals
 retain their existing errors and do not queue the action.
+
+For `review_needs_owner`, the recovery allowlist is `reexecute`,
+`mark_reviewed`, `defer_to_follow_up`, `open_interactive`, and `cancel_task`.
+`reexecute` takes guidance in `context`. `defer_to_follow_up` requires a
+non-empty `reason`, creates a linked `backlog` Task in the same Project with
+the parked finding in its description, and records a manual review pass naming
+that follow-up so the original proceeds to merge. Both effects commit atomically.
 
 Task `workflow_health` also represents active non-agent work. A running
 interactive execution reports `kind: "running"`, label `Interactive`. A
@@ -3844,7 +3928,7 @@ remaining Project requirements that milestone readiness must settle.
 The reviewer answers in Markdown and ends its reply with one result block:
 
 ```json
-{"result": "pass", "reason": "one sentence"}
+{"result": "fail", "reason": "Forge linked_documents is empty", "fixable_by": "owner", "repeat": false}
 ```
 
 `result` is `pass`, `fail`, or `blocked` (the review environment, not the code,
@@ -3852,7 +3936,13 @@ prevented a verdict — for example a missing toolchain). The block is read
 leniently so any model can produce it: the last JSON object in the reply that
 names a result wins, unknown keys are ignored, `verdict` is accepted for
 `result`, case does not matter, and a Markdown fence around the block is
-allowed. The stored `assessment` is `{result, reason, report}`, where `report`
+allowed. Optional `fixable_by` is `coder` (default) or `owner`; owner-only
+findings need another OS/hardware, an external service or credential,
+Forge metadata, a scope/product decision, or changed acceptance criteria.
+Optional `repeat` defaults to `false`; `true` means the previous review raised
+the same blocking finding and it remains unaddressed. Missing or unknown values
+use the defaults. The stored `assessment` is
+`{result, reason, fixable_by, repeat, report}`, where `report`
 is the reviewer's Markdown with the block removed. A reply with no readable
 result block is `unverified`.
 
@@ -3867,6 +3957,15 @@ required reason. The latter creates a distinct passed Review attempt so the
 failed automated result remains auditable. A `pass` is only as strong as the
 checks Forge ran, so configure `setup_steps` and `conformance_checks` for any
 Task whose acceptance depends on a build or test.
+
+A reviewer `fail` with `fixable_by: "owner"`, or a `fail` with `repeat: true`
+after the previous Review attempt also failed, instead parks the Task with
+`review_needs_owner`. Forge does not dispatch the coder or spend review retry
+budget; Forge's own failing checks still follow their existing failure path.
+A repeat flag on a first attempt is ignored for routing. The review tab shows
+**Needs owner**, the finding, a **fixable by owner** or **repeated finding**
+badge, and **Retry with guidance**, **Mark reviewed**, **Defer to follow-up**,
+**Open interactive**, and **Cancel Task**. These parked Tasks free their slots.
 
 An `unverified` result other than a check timeout (described below) — no
 readable result block, or a review context or commit that changed under the

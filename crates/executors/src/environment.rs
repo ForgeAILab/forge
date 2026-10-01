@@ -20,7 +20,7 @@ use api_types::{EnvironmentAsset, EnvironmentCheck, ProjectEnvironment};
 /// execution snapshot is loaded, never authored profile configuration.
 pub const TASK_ENVIRONMENT_CONFIG_KEY: &str = "_forge_task_environment";
 
-/// Bytes of check output kept for the blocking annotation.
+/// Bytes of check output retained from a preflight probe.
 const CHECK_OUTPUT_TAIL_BYTES: usize = 4096;
 
 /// Makes sibling staging paths unique within this Forge process.
@@ -52,6 +52,9 @@ pub fn task_environment(config: &serde_json::Value) -> BTreeMap<String, String> 
 
 /// Reject an environment Forge could not apply safely.
 pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<(), String> {
+    if !(60..=86400).contains(&environment.recheck_interval_seconds) {
+        return Err("recheck_interval_seconds must be between 60 and 86400".to_owned());
+    }
     for key in environment.env.keys() {
         let valid = !key.is_empty()
             && !key.starts_with(|c: char| c.is_ascii_digit())
@@ -384,6 +387,57 @@ impl EnvironmentCheckFailure {
     }
 }
 
+/// Outcome of a single check, including bounded, redacted output on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCheckResult {
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output_tail: String,
+}
+
+/// Run one check independently of its role selector. Used by the owner's
+/// on-demand re-check, which must report every configured check.
+pub async fn run_environment_check(
+    worktree: &Path,
+    env: &BTreeMap<String, String>,
+    check: &EnvironmentCheck,
+) -> EnvironmentCheckResult {
+    let mut command = tokio::process::Command::new("bash");
+    command
+        .args(["-lc", &check.command])
+        .current_dir(worktree)
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(check.timeout_seconds), command.output()).await;
+    match outcome {
+        Err(_) => EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: true,
+            output_tail: String::new(),
+        },
+        Ok(Err(error)) => EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: false,
+            output_tail: output_tail(&redact_environment_values(&error.to_string(), env)),
+        },
+        Ok(Ok(output)) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            EnvironmentCheckResult {
+                passed: output.status.success(),
+                exit_code: output.status.code(),
+                timed_out: false,
+                output_tail: output_tail(&redact_environment_values(&text, env)),
+            }
+        }
+    }
+}
+
 /// Run the checks gating `role`, in order, stopping at the first failure.
 pub async fn run_environment_checks(
     worktree: &Path,
@@ -392,33 +446,15 @@ pub async fn run_environment_checks(
     role: &str,
 ) -> Option<EnvironmentCheckFailure> {
     for check in checks.iter().filter(|check| check.applies_to(role)) {
-        let mut command = tokio::process::Command::new("bash");
-        command
-            .args(["-lc", &check.command])
-            .current_dir(worktree)
-            .envs(env)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(check.timeout_seconds), command.output())
-                .await;
-        let failure = |exit_code, timed_out, output_tail| EnvironmentCheckFailure {
-            name: check.name.clone(),
-            command: check.command.clone(),
-            exit_code,
-            timed_out,
-            output_tail,
-        };
-        match outcome {
-            Err(_) => return Some(failure(None, true, String::new())),
-            Ok(Err(error)) => return Some(failure(None, false, error.to_string())),
-            Ok(Ok(output)) if !output.status.success() => {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                let text = redact_environment_values(&text, env);
-                return Some(failure(output.status.code(), false, output_tail(&text)));
-            }
-            Ok(Ok(_)) => {}
+        let result = run_environment_check(worktree, env, check).await;
+        if !result.passed {
+            return Some(EnvironmentCheckFailure {
+                name: check.name.clone(),
+                command: check.command.clone(),
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+                output_tail: result.output_tail,
+            });
         }
     }
     None
@@ -446,6 +482,49 @@ mod tests {
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             timeout_seconds: 10,
         }
+    }
+
+    #[test]
+    fn environment_recheck_interval_defaults_and_rejects_invalid_values() {
+        let default: ProjectEnvironment = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.recheck_interval_seconds, 600);
+        assert_eq!(ProjectEnvironment::default().recheck_interval_seconds, 600);
+        for interval in [0, 5, 59, 86401, u64::MAX] {
+            let environment = ProjectEnvironment {
+                recheck_interval_seconds: interval,
+                ..Default::default()
+            };
+            assert!(validate_project_environment(&environment)
+                .unwrap_err()
+                .contains("recheck_interval_seconds"));
+        }
+        for interval in [60, 600, 86400] {
+            assert!(validate_project_environment(&ProjectEnvironment {
+                recheck_interval_seconds: interval,
+                ..Default::default()
+            })
+            .is_ok());
+        }
+        assert!(
+            serde_json::from_str::<ProjectEnvironment>(r#"{"recheck_interval_seconds":-1}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<ProjectEnvironment>(r#"{"unknown":true}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn individual_environment_check_keeps_success_output_and_ignores_roles() {
+        let root = tempfile::TempDir::new().unwrap();
+        let env = BTreeMap::from([("TOKEN".to_owned(), "private-value".to_owned())]);
+        let result = run_environment_check(
+            root.path(),
+            &env,
+            &check("browser", "printf '%s ready' \"$TOKEN\"", &["reviewer"]),
+        )
+        .await;
+        assert!(result.passed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output_tail, "[REDACTED] ready");
     }
 
     #[test]

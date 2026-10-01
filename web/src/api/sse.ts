@@ -163,6 +163,25 @@ function runProjectSummaryInvalidation(
   void queryClient.invalidateQueries({ queryKey: qk.projectPagesRoot }, { cancelRefetch: false })
 }
 
+function invalidateProjectSlotUsage(queryClient: QueryClient, projectId?: string): void {
+  if (projectId) {
+    invalidateProjectSummaries(queryClient, projectId)
+    return
+  }
+  // Review and awaiting-human events carry only the Task id. Refresh summary
+  // projections without invalidating every Project-owned detail query.
+  void queryClient.invalidateQueries(
+    {
+      predicate: (query) =>
+        query.queryKey[0] === 'projects' &&
+        query.queryKey.length === 2 &&
+        query.queryKey[1] !== 'pages',
+    },
+    { cancelRefetch: false },
+  )
+  runProjectSummaryInvalidation(queryClient, [])
+}
+
 function invalidateProjectSummaries(queryClient: QueryClient, projectId: string): void {
   let state = projectSummaryInvalidationStates.get(queryClient)
   if (!state) {
@@ -357,6 +376,9 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
   if (scopeType === 'task' && scopeId) {
     void queryClient.invalidateQueries({ queryKey: qk.task(scopeId) })
     invalidateProjectTaskLists(queryClient)
+    if (entityType === 'task' || entityType === 'review') {
+      invalidateProjectSlotUsage(queryClient, payload.project_id)
+    }
     if (entityType === 'review') {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(scopeId) })
     }
@@ -418,6 +440,14 @@ export function routeSsePayload(
     const taskId = payload.task_id ?? payload.entity_id
     void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
     invalidateProjectTaskLists(queryClient, payload.project_id)
+    if (
+      TASK_RELATION_SUMMARY_EVENTS.has(eventType) ||
+      eventType === 'task.awaiting_human' ||
+      eventType === 'task.unblocked' ||
+      eventType === 'task.recovery_applied'
+    ) {
+      invalidateProjectSlotUsage(queryClient, payload.project_id)
+    }
     if (payload.project_id && TASK_RELATION_SUMMARY_EVENTS.has(eventType)) {
       invalidateProjectTaskRelations(queryClient, payload.project_id, taskId)
     }
@@ -525,6 +555,7 @@ export function routeSsePayload(
   }
 
   if ((eventType.startsWith('review.') || eventType.startsWith('merge.')) && payload.task_id) {
+    invalidateProjectSlotUsage(queryClient, payload.project_id)
     void queryClient.invalidateQueries({ queryKey: qk.task(payload.task_id) })
     if (eventType.startsWith('review.')) {
       void queryClient.invalidateQueries({ queryKey: qk.reviews(payload.task_id) })

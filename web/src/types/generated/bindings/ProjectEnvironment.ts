@@ -9,7 +9,11 @@ import type { EnvironmentCheck } from "./EnvironmentCheck";
  * Forge applies it immediately before an execution launches: `env` is set on
  * the executor process (and on review steps and lifecycle hooks), `assets`
  * are copied into the worktree, and the `checks` for the execution's role
- * must pass or the Task is parked as `environment_not_ready` without
+ * must pass or the Project is paused as `environment_not_ready` without
  * spending an agent run.
  */
-export type ProjectEnvironment = { env: { [key in string]?: string }, assets: Array<EnvironmentAsset>, checks: Array<EnvironmentCheck>, };
+export type ProjectEnvironment = { env: { [key in string]?: string }, assets: Array<EnvironmentAsset>, checks: Array<EnvironmentCheck>, 
+/**
+ * Seconds between automatic re-checks while environment-paused (60–86400).
+ */
+recheck_interval_seconds: bigint, };
