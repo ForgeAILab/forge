@@ -1,5 +1,8 @@
 use super::*;
-use crate::{AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, TaskRoleAssignment};
+use crate::{
+    AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, RestoreQueuedRecovery,
+    TaskRoleAssignment,
+};
 use std::collections::HashSet;
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
@@ -660,7 +663,7 @@ async fn set_error_annotation_if_no_running_execution_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn restore_recovery_metadata_if_no_running_execution_inner(
+async fn update_recovery_metadata_inner(
     db: &SqliteDb,
     id: &str,
     expected_version: i64,
@@ -670,6 +673,8 @@ async fn restore_recovery_metadata_if_no_running_execution_inner(
     updated_at: &str,
     workspace_id: Option<&str>,
     overlapping_roles: Vec<String>,
+    metadata_mutations: Vec<TaskMetadataMutation>,
+    expected_queued_recovery_id: Option<&str>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
@@ -684,8 +689,28 @@ async fn restore_recovery_metadata_if_no_running_execution_inner(
     if task.version != expected_version {
         return Err(DbError::VersionConflict);
     }
-    ensure_no_running_execution_in_tx(&mut transaction, id, None, workspace_id, overlapping_roles)
+    if let Some(expected_id) = expected_queued_recovery_id {
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        if metadata
+            .extra
+            .get("queued_recovery")
+            .and_then(|queued| queued.get("id"))
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_id)
+        {
+            return Err(DbError::VersionConflict);
+        }
+    } else {
+        ensure_no_running_execution_in_tx(
+            &mut transaction,
+            id,
+            None,
+            workspace_id,
+            overlapping_roles,
+        )
         .await?;
+    }
 
     let previous_error_annotation = task.error_annotation.clone();
     let previous_blocked_json = task.blocked_json.clone();
@@ -693,17 +718,26 @@ async fn restore_recovery_metadata_if_no_running_execution_inner(
     task.error_annotation = error_annotation;
     task.blocked_json = blocked_json;
     task.failed_json = failed_json;
+    if !metadata_mutations.is_empty() {
+        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        for mutation in metadata_mutations {
+            apply_metadata_mutation(&mut metadata, mutation)?;
+        }
+        task.metadata_json = metadata.to_json();
+    }
     task.updated_at = updated_at.to_owned();
     task.version += 1;
     let result = sqlx::query(
         "UPDATE task
-         SET error_annotation = ?, blocked_json = ?, failed_json = ?,
+         SET error_annotation = ?, blocked_json = ?, failed_json = ?, metadata_json = ?,
              version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND deleted_at IS NULL",
     )
     .bind(task.error_annotation.as_deref())
     .bind(task.blocked_json.as_deref())
     .bind(task.failed_json.as_deref())
+    .bind(task.metadata_json.as_deref())
     .bind(&task.updated_at)
     .bind(&task.id)
     .bind(expected_version)
@@ -1099,7 +1133,7 @@ impl TaskRepo for SqliteDb {
         .await
     }
 
-    async fn restore_recovery_metadata_if_no_running_execution(
+    async fn update_recovery_metadata_if_no_running_execution(
         &self,
         id: &str,
         expected_version: i64,
@@ -1109,8 +1143,9 @@ impl TaskRepo for SqliteDb {
         updated_at: &str,
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
+        metadata_mutations: Vec<TaskMetadataMutation>,
     ) -> Result<Task> {
-        restore_recovery_metadata_if_no_running_execution_inner(
+        update_recovery_metadata_inner(
             self,
             id,
             expected_version,
@@ -1120,6 +1155,32 @@ impl TaskRepo for SqliteDb {
             updated_at,
             workspace_id,
             overlapping_roles,
+            metadata_mutations,
+            None,
+        )
+        .await
+    }
+
+    async fn restore_queued_recovery(&self, input: RestoreQueuedRecovery) -> Result<Task> {
+        update_recovery_metadata_inner(
+            self,
+            &input.task_id,
+            input.expected_version,
+            input.error_annotation,
+            input.blocked_json,
+            None,
+            &input.updated_at,
+            None,
+            Vec::new(),
+            vec![
+                TaskMetadataMutation::Remove {
+                    key: "queued_recovery".to_owned(),
+                },
+                TaskMetadataMutation::Remove {
+                    key: "deferred_dispatch".to_owned(),
+                },
+            ],
+            Some(&input.queued_recovery_id),
         )
         .await
     }

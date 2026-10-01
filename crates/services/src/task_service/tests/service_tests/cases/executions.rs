@@ -6606,7 +6606,7 @@ async fn failed_resume_does_not_restore_metadata_over_running_replacement() {
     .expect("recovery clear commits");
     let _replacement = seed_running_coder_execution(&db, &task.id, None, None).await;
 
-    let result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+    let result = TaskRepo::update_recovery_metadata_if_no_running_execution(
         &*db,
         &cleared.id,
         cleared.version,
@@ -6615,6 +6615,7 @@ async fn failed_resume_does_not_restore_metadata_over_running_replacement() {
         annotated.failed_json.clone(),
         &now_rfc3339(),
         Some("workspace-after-reset"),
+        Vec::new(),
         Vec::new(),
     )
     .await;

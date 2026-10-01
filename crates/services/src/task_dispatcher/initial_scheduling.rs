@@ -119,6 +119,9 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            if deferred_dispatch::queued_recovery(&task).is_some() {
+                continue;
+            }
             if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, &task).await? {
                 continue;
             }

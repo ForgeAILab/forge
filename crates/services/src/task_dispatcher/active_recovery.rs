@@ -64,6 +64,9 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            if deferred_dispatch::queued_recovery(&task).is_some() {
+                continue;
+            }
             task = match crate::task_service::execution::clear_stale_plan_publication_claim(
                 &self.db, &task,
             )

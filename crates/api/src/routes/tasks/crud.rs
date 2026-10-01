@@ -347,6 +347,7 @@ pub async fn recover_task(
     Path(id): Path<String>,
     Json(body): Json<RecoverTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    // Capacity-only refusals are accepted with the queued Task snapshot.
     let task = state
         .task_service
         .recover_task(id, body.action, body.reason, body.context)

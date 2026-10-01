@@ -276,6 +276,171 @@ async fn task_response_action_projection_paginates_execution_history() {
 }
 
 #[tokio::test]
+async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
+    let workspace_root = common::TestDir::new("facade-recovery-capacity");
+    let repo_root = common::TestDir::new("facade-recovery-capacity-repo");
+    let repo_path = common::setup_git_repo(repo_root.path());
+    let harness = common::test_app(workspace_root.path(), "facade-recovery-capacity").await;
+    let (project_id, repo_id) =
+        common::create_project_and_repo(&harness.app, "Recovery capacity", &repo_path).await;
+    let (agent_id, _) =
+        common::create_shell_agents(&harness.app, workspace_root.path(), "recovery-capacity").await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
+    let busy = create_task(&harness.app, &project_id, "occupies capacity").await;
+    let now = db::now_rfc3339();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        CreateExecution {
+            id: db::new_uuid_v4(),
+            task_id: busy.id,
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("capacity occupant creates");
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 1, paused = 1, version = version + 1 WHERE id = ?")
+        .bind(&agent_id).execute(harness.state.db.pool()).await.expect("agent capacity and pause persist");
+    let task = create_task(&harness.app, &project_id, "recover").await;
+    db::TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("coder assigns");
+    let annotation = json!({
+        "type": "recovery_required",
+        "blocking_reason": "crash_recovery",
+        "recovery_actions": ["reexecute"],
+    })
+    .to_string();
+    let task = TaskRepo::update_status(
+        &*harness.state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "in_progress".to_owned(),
+            assignee_id: None,
+            error_annotation: Some(Some(annotation.clone())),
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("recoverable task persists");
+    let url = format!("/api/v1/tasks/{}/recover", task.id);
+    let invalid: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        json!({ "action": "resume_session" }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert!(invalid.message.contains("not allowed"));
+    let paused: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        json!({ "action": "reexecute" }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(paused.code, "agent_paused");
+    let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(
+        current.error_annotation.as_deref(),
+        Some(annotation.as_str())
+    );
+    let metadata: Value = current
+        .metadata_json
+        .as_deref()
+        .map(|raw| serde_json::from_str(raw).expect("metadata parses"))
+        .unwrap_or_else(|| json!({}));
+    assert!(metadata.get("queued_recovery").is_none());
+
+    sqlx::query("UPDATE agent_identity SET paused = 0, version = version + 1 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(harness.state.db.pool())
+        .await
+        .expect("agent unpauses");
+    let response: TaskResponse = common::json_request(
+        &harness.app, Method::POST, &url,
+        json!({ "action": "reexecute", "reason": "operator retry", "context": "recovery guidance" }),
+        StatusCode::OK,
+    ).await;
+    assert_eq!(response.id, task.id);
+    assert_eq!(response.status, "in_progress");
+    assert!(response.error_annotation.is_none());
+    assert!(response.blocked.is_none());
+    let queued = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let repeated: TaskResponse = common::json_request(
+        &harness.app, Method::POST, &url,
+        json!({ "action": "reexecute", "reason": "operator retry", "context": "recovery guidance" }),
+        StatusCode::OK,
+    ).await;
+    assert_eq!(repeated.version, response.version);
+    let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.metadata_json, queued.metadata_json);
+    let health = response.workflow_health.expect("queued health returns");
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+    assert_eq!(health.label, "Retry Queued");
+    assert!(health
+        .message
+        .as_deref()
+        .is_some_and(|detail| detail.contains("waiting for capacity")));
+    assert!(
+        ExecutionRepo::list_running_by_task(&*harness.state.db, &task.id)
+            .await
+            .expect("task executions load")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
     let workspace_root = common::TestDir::new("facade-actor");
     let repo_root = common::TestDir::new("facade-actor-repo");
