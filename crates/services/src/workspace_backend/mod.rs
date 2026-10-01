@@ -327,3 +327,6 @@ impl WorkspaceBackendRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -255,7 +255,7 @@ async fn location_verify_accepts_equivalent_remotes_and_rejects_different_reposi
 }
 
 #[tokio::test]
-async fn duplicate_operation_id_returns_recorded_result_after_ack_and_restart() {
+async fn duplicate_operation_id_returns_recorded_result_before_ack_after_restart() {
     let fixture = Fixture::new().await;
     let params = serde_json::to_value(fixture.run(
         "run-once",
@@ -278,12 +278,6 @@ async fn duplicate_operation_id_returns_recorded_result_after_ack_and_restart() 
         std::fs::read_to_string(fixture.path().join("marker")).unwrap(),
         "x"
     );
-    fixture
-        .journal
-        .acknowledge(&JournalAckParams {
-            entry_id: result["entry_id"].as_str().unwrap().into(),
-        })
-        .unwrap();
     let journal = Arc::new(DaemonJournal::new(fixture.dir.path()));
     let restarted = DaemonWorkspaceBackend::new(
         fixture.dir.path().to_owned(),
@@ -303,6 +297,13 @@ async fn duplicate_operation_id_returns_recorded_result_after_ack_and_restart() 
         std::fs::read_to_string(fixture.path().join("marker")).unwrap(),
         "x"
     );
+    fixture
+        .journal
+        .acknowledge(&JournalAckParams {
+            entry_id: result["entry_id"].as_str().unwrap().into(),
+        })
+        .unwrap();
+    assert!(fixture.journal.operation("run-once").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -867,7 +868,7 @@ async fn run_timeout_and_output_caps_are_enforced() {
 }
 
 #[tokio::test]
-async fn cleanup_replays_until_ack_and_duplicate_remains_idempotent() {
+async fn cleanup_replays_until_ack_and_releases_receipt() {
     let fixture = Fixture::new().await;
     let params = serde_json::to_value(WorkspaceCleanupParams {
         fence: fence("cleanup-1", 1, &fixture.prepared.workspace.base_sha),
@@ -880,6 +881,41 @@ async fn cleanup_replays_until_ack_and_duplicate_remains_idempotent() {
         .await
         .unwrap();
     assert!(!fixture.path().exists());
+    assert_eq!(
+        fixture
+            .backend
+            .handle(METHOD_WORKSPACE_CLEANUP, params.clone(), Vec::new)
+            .await
+            .unwrap(),
+        result
+    );
+    let describe = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_DESCRIBE,
+            serde_json::to_value(WorkspaceDescribeParams {
+                workspace: fixture.reference(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    assert_eq!(describe["exists"], false);
+    let backend = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        crate::daemon_config::DaemonConfig::default().run_policy(),
+        Arc::clone(&fixture.journal),
+    )
+    .unwrap();
+    assert_eq!(
+        backend
+            .handle(METHOD_WORKSPACE_CLEANUP, params, Vec::new)
+            .await
+            .unwrap(),
+        result
+    );
     let restarted = DaemonJournal::new(fixture.dir.path());
     let replay = restarted
         .pending()
@@ -895,24 +931,30 @@ async fn cleanup_replays_until_ack_and_duplicate_remains_idempotent() {
         replay,
         vec![(METHOD_WORKSPACE_CLEANUP.into(), result.clone())]
     );
-    restarted
-        .acknowledge(&JournalAckParams {
+    backend
+        .acknowledge_journal(&JournalAckParams {
             entry_id: result["entry_id"].as_str().unwrap().into(),
         })
+        .await
         .unwrap();
+    assert!(!backend
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&fixture.prepared.workspace.workspace_handle));
+    assert!(!fixture
+        .journal
+        .load_workspace_state::<WorkspaceRegistry>()
+        .unwrap()
+        .handles
+        .contains_key(&fixture.prepared.workspace.workspace_handle));
     assert!(!restarted
         .pending()
         .unwrap()
         .iter()
         .any(|entry| entry.replay_notification().is_some()));
-    assert_eq!(
-        fixture
-            .backend
-            .handle(METHOD_WORKSPACE_CLEANUP, params, Vec::new)
-            .await
-            .unwrap(),
-        result
-    );
+    assert!(restarted.operation("cleanup-1").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -945,3 +987,182 @@ async fn describe_lists_active_and_journaled_executions_for_this_handle() {
 }
 
 mod protocol;
+
+#[tokio::test]
+async fn retired_placement_does_not_leave_a_daemon_wide_runtime_pin() {
+    let fixture = Fixture::new().await;
+    fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_CLEANUP,
+            serde_json::to_value(WorkspaceCleanupParams {
+                fence: fence("cleanup-retired", 1, &fixture.prepared.workspace.base_sha),
+                workspace_handle: fixture.prepared.workspace.workspace_handle.clone(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    let restarted = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        crate::daemon_config::DaemonConfig::default().run_policy(),
+        Arc::new(DaemonJournal::new(fixture.dir.path())),
+    )
+    .unwrap();
+    restarted
+        .verify(RepoLocationVerifyParams {
+            repo_location_id: "new-location".into(),
+            daemon_id: "daemon-1".into(),
+            runtime_id: "new-runtime".into(),
+            path: fixture.repo.to_string_lossy().into(),
+            kind: DaemonRepoLocationKind::PrimaryCheckout,
+            default_branch: "main".into(),
+            remote_url: None,
+            expected_version: 0,
+            probe: None,
+        })
+        .await
+        .unwrap();
+    let mut cross_runtime = fence("cross-runtime", 1, &fixture.prepared.workspace.base_sha);
+    cross_runtime.placement_id = "another-placement".into();
+    let failure = restarted
+        .prepare(WorkspacePrepareParams {
+            fence: cross_runtime,
+            repo_location_id: "new-location".into(),
+            workspace_id: "another-workspace".into(),
+            task_id: "another-task".into(),
+            base_ref: "main".into(),
+            branch: "task/another".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(failure.code, WRONG_OWNER);
+    assert!(!git::branch_exists(&fixture.repo, "task/another")
+        .await
+        .unwrap());
+    let mut wrong_owner = fixture.reference();
+    wrong_owner.runtime_id = "new-runtime".into();
+    assert_eq!(
+        restarted.workspace(&wrong_owner, false).unwrap_err().code,
+        WRONG_OWNER // The cleaned handle stays fenced until acknowledgement.
+    );
+    // The same invariant applies to completion, cancellation, and placement removal:
+    // ownership is scoped to handles, with no daemon-wide mutable runtime pin.
+    let state: Value = serde_json::from_slice(
+        &std::fs::read(fixture.journal.directory().join("workspace-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(state.get("runtime_id").is_none());
+}
+
+#[tokio::test]
+async fn command_drain_preserves_output_without_claiming_size_truncation() {
+    let mut command = Command::new("bash");
+    command.args([
+        "-lc",
+        "printf last-lines; printf error-lines >&2; sleep 3 &",
+    ]);
+    let output = bounded_command(command, 5, 4096, true).await.unwrap();
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, b"last-lines");
+    assert_eq!(output.stderr, b"error-lines");
+    assert!(!output.stdout_truncated && !output.stderr_truncated);
+    assert!(output.stdout_drain_incomplete && output.stderr_drain_incomplete);
+}
+
+#[tokio::test]
+async fn cleanup_prunes_handle_and_execution_ids_on_ack() {
+    let fixture = Fixture::new().await;
+    fixture
+        .backend
+        .register_execution("execution-1", fixture.path())
+        .await
+        .unwrap();
+    let handle = fixture.prepared.workspace.workspace_handle.clone();
+    let params = serde_json::to_value(WorkspaceCleanupParams {
+        fence: fence("prune-cleanup", 1, &fixture.prepared.workspace.base_sha),
+        workspace_handle: handle.clone(),
+    })
+    .unwrap();
+    let result = fixture
+        .backend
+        .handle(METHOD_WORKSPACE_CLEANUP, params.clone(), Vec::new)
+        .await
+        .unwrap();
+    assert!(fixture
+        .backend
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&handle));
+    let restarted = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        fixture.backend.policy.clone(),
+        Arc::new(DaemonJournal::new(fixture.dir.path())),
+    )
+    .unwrap();
+    assert!(restarted
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&handle));
+    assert_eq!(
+        restarted
+            .handle(METHOD_WORKSPACE_CLEANUP, params, Vec::new)
+            .await
+            .unwrap(),
+        result
+    );
+    restarted
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: result["entry_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    assert!(!restarted
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&handle));
+    let persisted: WorkspaceRegistry = restarted.journal.load_workspace_state().unwrap();
+    assert!(!persisted.handles.contains_key(&handle));
+}
+
+#[tokio::test]
+async fn refused_workspace_fences_leave_no_journal_intents() {
+    let fixture = Fixture::new().await;
+    let before = fixture.journal.pending().unwrap().len();
+    for (name, expected) in [
+        ("unknown", INVALID_INPUT),
+        ("owner", WRONG_OWNER),
+        ("generation", STALE_GENERATION),
+    ] {
+        let mut params = fixture.run(name, WorkspaceRunPurpose::CiStep, "true");
+        match name {
+            "unknown" => params.workspace_handle = format!("workspace-{}", uuid::Uuid::new_v4()),
+            "owner" => params.fence.runtime_id = "another-runtime".into(),
+            _ => params.fence.generation = 0,
+        }
+        assert_eq!(
+            fixture
+                .backend
+                .handle(
+                    METHOD_WORKSPACE_RUN,
+                    serde_json::to_value(params).unwrap(),
+                    Vec::new
+                )
+                .await
+                .unwrap_err()
+                .code,
+            expected
+        );
+        assert!(fixture.journal.operation(name).unwrap().is_none());
+        assert_eq!(fixture.journal.pending().unwrap().len(), before);
+    }
+}

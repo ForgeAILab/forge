@@ -35,6 +35,50 @@ pub(crate) fn is_capacity_refusal(error: &crate::ServiceError) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn placement_upgrade_refusal_requires_an_otherwise_eligible_owner_and_no_retry_candidate() {
+        use PlacementFilterCode::*;
+        let refusal = |codes: Vec<Vec<PlacementFilterCode>>| PlacementUnavailable {
+            task_id: "task".into(),
+            repo_id: "repo".into(),
+            rejected_candidates: codes
+                .into_iter()
+                .map(|filter_codes| CandidateRejection {
+                    repo_location_id: "location".into(),
+                    owner_kind: "daemon".into(),
+                    daemon_id: Some("daemon".into()),
+                    runtime_id: Some("runtime".into()),
+                    filter_codes,
+                })
+                .collect(),
+        };
+        assert!(refusal(vec![vec![
+            DaemonUpgradeRequired,
+            CapabilityMissing,
+            RunPurposeDenied
+        ]])
+        .needs_daemon_upgrade());
+        for independent in [
+            PinMismatch,
+            NotVisible,
+            OwnerUnreachable,
+            ExecutorUnavailable,
+            AgentCapacity,
+            DaemonCapacity,
+        ] {
+            assert!(
+                !refusal(vec![vec![DaemonUpgradeRequired, independent]]).needs_daemon_upgrade(),
+                "{independent:?}"
+            );
+        }
+        for retry in [LocationNotReady, AgentCapacity, DaemonCapacity] {
+            let refusal = refusal(vec![vec![DaemonUpgradeRequired], vec![retry]]);
+            assert!(!refusal.needs_daemon_upgrade(), "{retry:?}");
+        }
+        assert!(
+            refusal(vec![vec![DaemonUpgradeRequired], vec![PinMismatch]]).needs_daemon_upgrade()
+        );
+    }
+    #[test]
     fn placement_recovery_queues_only_capacity_refusals() {
         let error = |codes| {
             crate::ServiceError::PlacementUnavailable(PlacementUnavailable {

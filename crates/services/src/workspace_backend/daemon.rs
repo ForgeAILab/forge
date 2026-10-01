@@ -332,6 +332,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             return Err(ServiceError::invalid_operation("review command timed out").into());
         }
         if spec.purpose == WorkspaceRunPurpose::CiStep
+            && spec.max_output_bytes != usize::MAX
             && (result.stdout_truncated || result.stderr_truncated)
         {
             return Err(ServiceError::invalid_operation(

@@ -380,7 +380,8 @@ pub async fn agent_availability(
     require_agent_visible(&agent, &user, &id)?;
     let active_assigned_task_count =
         AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
-    let effective_status = compute_effective_status(&state.db, &agent).await?;
+    let effective_status =
+        compute_effective_status(&state.db, &agent, Some(&state.daemon_connections)).await?;
     let resolved_daemon = resolve_daemon_for_agent(&state.db, &agent).await.ok();
     let available = effective_status.as_str() == "active" || effective_status.as_str() == "busy";
     let reason = if available {
@@ -391,6 +392,9 @@ pub async fn agent_availability(
                 "No daemon with authenticated {} executor found",
                 agent.executor_type
             ),
+            api_types::DAEMON_UPGRADE_REQUIRED => {
+                api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE.to_owned()
+            }
             "daemon_offline" => "Pinned daemon is offline".to_owned(),
             "deactivated" => "Pinned daemon does not have this executor authenticated".to_owned(),
             "connection_degraded" => "Embedded provider connection is degraded".to_owned(),
@@ -466,10 +470,11 @@ async fn build_agent_response(
     agent: Agent,
     active_assigned_task_count: Option<i64>,
 ) -> ApiResult<AgentResponse> {
-    let effective_status = compute_effective_status(&state.db, &agent)
-        .await?
-        .as_str()
-        .to_owned();
+    let effective_status =
+        compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
+            .await?
+            .as_str()
+            .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
     let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
     // Derived here rather than threaded through every caller: this is the

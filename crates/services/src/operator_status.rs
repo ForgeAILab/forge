@@ -26,6 +26,7 @@ use log_snapshot::ExecutionLogSnapshots;
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
     log_snapshots: ExecutionLogSnapshots,
+    daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
@@ -37,6 +38,7 @@ impl OperatorStatusService {
         Self {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
+            daemon_connections: None,
             workspace_backend_router,
         }
     }
@@ -52,11 +54,20 @@ impl OperatorStatusService {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
+            daemon_connections: None,
         }
     }
 
     pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
         self.workspace_backend_router = router;
+        self
+    }
+
+    pub fn with_daemon_connections(
+        mut self,
+        registry: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    ) -> Self {
+        self.daemon_connections = Some(registry);
         self
     }
 
@@ -256,16 +267,24 @@ impl OperatorStatusService {
         let rows = sqlx::query(
             "SELECT id, hostname, status, last_report_at, updated_at
              FROM daemon
-             WHERE status = 'offline'
-                OR status = 'error'
-                OR (last_report_at IS NOT NULL AND last_report_at < ?)
              ORDER BY updated_at DESC, id ASC",
         )
-        .bind(stale_before.to_rfc3339())
         .fetch_all(self.db.pool())
         .await?;
 
         rows.into_iter()
+            .filter(|row| {
+                let id: String = row.get("id");
+                let status: String = row.get("status");
+                let last: Option<String> = row.get("last_report_at");
+                matches!(status.as_str(), "offline" | "error")
+                    || last.is_some_and(|last| last < stale_before.to_rfc3339())
+                    || self
+                        .daemon_connections
+                        .as_ref()
+                        .and_then(|registry| registry.get(&id))
+                        .is_some_and(|connection| connection.needs_upgrade())
+            })
             .map(|row| {
                 let status: String = row.try_get("status")?;
                 let last_report_at: Option<String> = row.try_get("last_report_at")?;
@@ -274,8 +293,22 @@ impl OperatorStatusService {
                     "offline" => ("offline".to_owned(), OperatorSeverity::Attention),
                     _ => ("stale".to_owned(), OperatorSeverity::Attention),
                 };
+                let id: String = row.try_get("id")?;
+                let issue = if self
+                    .daemon_connections
+                    .as_ref()
+                    .and_then(|registry| registry.get(&id))
+                    .is_some_and(|connection| connection.needs_upgrade())
+                {
+                    format!(
+                        "upgrade_required: {}",
+                        api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+                    )
+                } else {
+                    issue
+                };
                 Ok(DaemonIssueSummary {
-                    daemon_id: row.try_get("id")?,
+                    daemon_id: id,
                     hostname: row.try_get("hostname")?,
                     issue,
                     severity,
@@ -979,6 +1012,49 @@ mod tests {
         assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
         assert_eq!(status.blocked_tasks.len(), 1);
         assert_eq!(status.blocked_tasks[0].task_id, task_id);
+    }
+
+    #[tokio::test]
+    async fn revision_two_daemon_waits_for_upgrade_and_operator_sees_action() {
+        let (db, service) = test_service().await;
+        let daemon_id = insert_daemon(&db, "online").await;
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, mut outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.clone());
+        let id = connection.id();
+        registry.register(daemon_id.clone(), connection);
+        registry.dispatch_incoming_for_connection(&daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: serde_json::json!({"protocol_revision":2, "capabilities":["execution.terminal.usage_reports", "execution.terminal.ack"]}),
+        });
+        let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+            panic!("upgrade error expected")
+        };
+        assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert_eq!(error.message, api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE);
+        let result: Result<Value, ServiceError> = registry
+            .send_request(
+                &daemon_id,
+                api_types::METHOD_EXECUTION_START,
+                serde_json::json!({}),
+                1,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::DaemonUpgradeRequired { .. })
+        ));
+        assert!(outbound.try_recv().is_err());
+        let service = service.with_daemon_connections(registry);
+        let status = service.compute_status().await.unwrap();
+        let issue = status
+            .daemon_issues
+            .iter()
+            .find(|issue| issue.daemon_id == daemon_id)
+            .unwrap();
+        assert_eq!(issue.issue, format!("upgrade_required: {}", error.message));
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
     }
 
     #[tokio::test]

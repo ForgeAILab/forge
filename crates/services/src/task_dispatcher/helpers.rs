@@ -48,6 +48,8 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. } => true,
+        ServiceError::DaemonUpgradeRequired { .. } => true,
+        ServiceError::PlacementUnavailable(error) => error.needs_daemon_upgrade(),
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
         // A slot held by a concurrently running execution frees itself the
         // moment that execution terminalises, and nothing about that clears a
@@ -76,6 +78,10 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     let Some(kind) = annotation.get("type").and_then(Value::as_str) else {
         return false;
     };
+    is_blocking_annotation_type(kind)
+}
+
+pub(crate) fn is_blocking_annotation_type(kind: &str) -> bool {
     matches!(
         kind,
         "manual_stop"

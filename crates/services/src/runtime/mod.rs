@@ -657,10 +657,13 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&task_service),
             Arc::clone(&notification_service),
         ));
-        let operator_status_service = Arc::new(OperatorStatusService::new_with_router(
-            Arc::clone(&self.db),
-            Arc::clone(&workspace_backend_router),
-        ));
+        let operator_status_service = Arc::new(
+            OperatorStatusService::new_with_router(
+                Arc::clone(&self.db),
+                Arc::clone(&workspace_backend_router),
+            )
+            .with_daemon_connections(Arc::clone(&daemon_connections)),
+        );
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::new(Arc::clone(&self.event_bus)));
         let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(

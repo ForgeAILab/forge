@@ -65,6 +65,13 @@ impl TaskDispatcher {
                     &error.to_string(),
                 )
                 .await?;
+                crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                    &self.db,
+                    &task.id,
+                    &task.status,
+                    &error,
+                )
+                .await?;
                 tracing::warn!(
                     task_id = %task.id,
                     %error,
@@ -202,6 +209,13 @@ impl TaskDispatcher {
                         &error.to_string(),
                     )
                     .await?;
+                    crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                        &self.db,
+                        &task.id,
+                        &task.status,
+                        &error,
+                    )
+                    .await?;
                     tracing::warn!(
                         task_id = %task.id,
                         from_state = %task.status,
@@ -262,7 +276,7 @@ impl TaskDispatcher {
         let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
-        if compute_effective_status(&self.db, &agent).await? != EffectiveStatus::Active {
+        if compute_effective_status(&self.db, &agent, None).await? != EffectiveStatus::Active {
             return Ok(false);
         }
         crate::ensure_execution_role_principal(

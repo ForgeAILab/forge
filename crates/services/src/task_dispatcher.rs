@@ -19,6 +19,7 @@ use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
 
 mod active_recovery;
 mod helpers;
+pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
 mod repo_pause_sync;
 mod workspace_blocking;

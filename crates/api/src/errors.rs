@@ -226,9 +226,10 @@ impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
             ServiceError::PlacementUnavailable(error) => Self::conflict_with_code_and_details(
-                "placement_unavailable",
+                if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
                 error.to_string(),
                 json!({
+                    "needs_human": error.needs_daemon_upgrade(),
                     "task_id": error.task_id,
                     "repo_id": error.repo_id,
                     "rejected_candidates": error.rejected_candidates,
@@ -307,6 +308,18 @@ impl From<ServiceError> for ApiError {
                     json!({ "session_id": session_id }),
                 )
             }
+            ServiceError::DaemonNotReady { daemon_id } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "daemon_not_ready",
+                message: format!("daemon {daemon_id} has not sent its command handshake; wait for it to become ready"),
+                details: Some(json!({ "daemon_id": daemon_id })),
+            },
+            ServiceError::DaemonUpgradeRequired { daemon_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: api_types::DAEMON_UPGRADE_REQUIRED,
+                message: api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE.to_owned(),
+                details: Some(json!({ "daemon_id": daemon_id, "needs_human": true })),
+            },
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "daemon_unavailable",
@@ -616,6 +629,40 @@ impl From<std::io::Error> for ApiError {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
+
+    #[test]
+    fn daemon_upgrade_maps_to_human_action_and_readiness_stays_transient() {
+        let upgrade = ApiError::from(ServiceError::DaemonUpgradeRequired {
+            daemon_id: "old".into(),
+        });
+        assert_eq!(upgrade.status, StatusCode::CONFLICT);
+        assert_eq!(upgrade.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert!(upgrade.message.contains("upgrade the daemon"));
+        assert_eq!(upgrade.details.unwrap()["needs_human"], true);
+        let ready = ApiError::from(ServiceError::DaemonNotReady {
+            daemon_id: "new".into(),
+        });
+        assert_eq!(ready.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ready.code, "daemon_not_ready");
+        assert!(!ready.message.contains("upgrade"));
+        let placement = ApiError::from(ServiceError::PlacementUnavailable(
+            services::placement::PlacementUnavailable {
+                task_id: "task".into(),
+                repo_id: "repo".into(),
+                rejected_candidates: vec![services::placement::CandidateRejection {
+                    repo_location_id: "location".into(),
+                    owner_kind: "daemon".into(),
+                    daemon_id: Some("old".into()),
+                    runtime_id: Some("runtime".into()),
+                    filter_codes: vec![
+                        services::placement::PlacementFilterCode::DaemonUpgradeRequired,
+                    ],
+                }],
+            },
+        ));
+        assert_eq!(placement.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert_eq!(placement.details.unwrap()["needs_human"], true);
+    }
 
     #[test]
     fn placement_unavailable_preserves_candidate_rejections_in_409() {

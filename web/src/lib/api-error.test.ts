@@ -3,6 +3,21 @@ import { ApiError } from '@/api/client'
 import { getApiErrorMessage } from './api-error'
 
 describe('placement admission errors', () => {
+  it('includes candidate reasons for daemon upgrade refusals', () => {
+    const error = new ApiError('Upgrade the daemon', 409, undefined, {
+      code: 'daemon_upgrade_required',
+      message: 'Upgrade the daemon',
+      request_id: '',
+      details: { rejected_candidates: [{
+        owner_kind: 'daemon', daemon_id: 'old-daemon', repo_location_id: 'checkout',
+        filter_codes: ['daemon_upgrade_required', 'capability_missing'],
+      }] },
+    })
+    const message = getApiErrorMessage(error)
+    expect(message).toContain('Daemon old-daemon, location checkout')
+    expect(message).toContain('Upgrade the daemon to the server release (protocol revision 3 or newer) (daemon_upgrade_required)')
+    expect(message).toContain('Executor lacks required capabilities (capability_missing)')
+  })
   it('shows every candidate and filter code with a readable explanation', () => {
     const message = 'No compatible workspace owner'
     const error = new ApiError(message, 409, 'request-1', {

@@ -30,6 +30,7 @@ pub const METHOD_TERMINAL_OUTPUT: &str = "terminal.output";
 pub const METHOD_TERMINAL_EXITED: &str = "terminal.exited";
 
 pub const DAEMON_UNAVAILABLE: &str = "daemon_unavailable";
+pub const DAEMON_UPGRADE_REQUIRED: &str = "daemon_upgrade_required";
 pub const DAEMON_TIMEOUT: &str = "daemon_timeout";
 pub const UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const INVALID_FRAME: &str = "invalid_frame";
@@ -46,8 +47,9 @@ pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
 /// Revision 3 adds daemon-owned workspaces and the shared journal ack.
 pub const DAEMON_PROTOCOL_REVISION: u32 = 3;
-/// Revision 2 remains accepted for server-owned execution and filesystem access.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 2;
+/// Every command RPC requires revision 3.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 3;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 3 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_WORKSPACE: &str = "workspace.v1";
@@ -62,13 +64,6 @@ pub const DAEMON_REQUIRED_CAPABILITIES: &[&str] = &[
 pub fn daemon_protocol_is_compatible(revision: u32, capabilities: &[String]) -> bool {
     if revision < DAEMON_MIN_PROTOCOL_REVISION {
         return false;
-    }
-    // Revision 2 advertises the original terminal accounting contract. This
-    // accepts that handshake; the command protocol has only journal.ack.
-    if revision == DAEMON_MIN_PROTOCOL_REVISION {
-        return [DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack"]
-            .iter()
-            .all(|required| capabilities.iter().any(|capability| capability == required));
     }
     DAEMON_REQUIRED_CAPABILITIES
         .iter()
@@ -270,7 +265,7 @@ pub struct WorkspaceRunParams {
     pub env: Vec<(String, String)>,
     /// Zero preserves the CI runner's unbounded duration (ci_step only).
     pub timeout_secs: u64,
-    /// u64::MAX preserves full CI output; other values are strict per-stream budgets.
+    /// u64::MAX accepts bounded CI output tails; other values are strict per-stream budgets.
     pub max_output_bytes: u64,
 }
 
@@ -285,6 +280,11 @@ pub struct WorkspaceRunResult {
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The shell exited while descendants still held the output pipe open.
+    #[serde(default)]
+    pub stdout_drain_incomplete: bool,
+    #[serde(default)]
+    pub stderr_drain_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1217,10 +1217,7 @@ mod tests {
             DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
             "execution.terminal.ack".to_owned(),
         ];
-        assert!(daemon_protocol_is_compatible(
-            DAEMON_MIN_PROTOCOL_REVISION,
-            &revision_2_capabilities
-        ));
+        assert!(!daemon_protocol_is_compatible(2, &revision_2_capabilities));
         assert!(!daemon_protocol_is_compatible(
             DAEMON_MIN_PROTOCOL_REVISION,
             &revision_2_capabilities[..1]
@@ -1230,7 +1227,7 @@ mod tests {
             &revision_2_capabilities
         ));
         assert_eq!(DAEMON_PROTOCOL_REVISION, 3);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 2);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 3);
     }
 
     #[test]
@@ -1358,7 +1355,9 @@ mod tests {
             "duration_ms": 1234,
             "timed_out": false,
             "stdout_truncated": true,
-            "stderr_truncated": false
+            "stderr_truncated": false,
+            "stdout_drain_incomplete": false,
+            "stderr_drain_incomplete": false
         }));
         assert!(serde_json::from_value::<WorkspaceRunPurpose>(json!("shell")).is_err());
         assert_round_trip::<WorkspaceRunPolicy>(json!({ "allowed_purposes": ["ci_step"] }));

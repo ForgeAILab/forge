@@ -597,7 +597,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        match compute_effective_status(&self.db, &agent).await? {
+        match compute_effective_status(&self.db, &agent, None).await? {
             EffectiveStatus::Active | EffectiveStatus::Busy => Ok(agent),
             EffectiveStatus::Paused => Err(ServiceError::AgentPaused { agent_id: agent.id }),
             status => Err(ServiceError::invalid_operation(format!(

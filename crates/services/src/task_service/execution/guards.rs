@@ -140,7 +140,7 @@ impl TaskService {
                     EffectiveStatus::Active
                 }
             } else {
-                compute_effective_status(&self.db, &agent).await?
+                compute_effective_status(&self.db, &agent, None).await?
             };
             if status == EffectiveStatus::Active
                 || self

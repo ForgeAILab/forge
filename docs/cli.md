@@ -342,6 +342,15 @@ registration/report that does not keep the command stream open.
 The configured workspace root is created automatically before the daemon
 registers or reports.
 
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
 After a daemon has been linked once, use `forge-ctl daemon start` to run it
 again from the saved daemon credentials without registering or claiming it
 again:
@@ -365,6 +374,32 @@ before placement. A daemon may execute a server-owned workspace only through
 a verified `shared_mount` location; matching absolute paths alone are
 insufficient. Daemon-owned placement requires a direct-merge repository and
 CLI Agents for every role that touches its worktree.
+
+The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
+(default: `[ci_step]`). Hook and environment setup purposes require local opt-in.
+This dispatch policy has the trust limits described above.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
 
 ### Installing MCP client config
 

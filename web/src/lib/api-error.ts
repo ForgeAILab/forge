@@ -59,6 +59,7 @@ export function getApiConflictDetails(error: unknown): ApiConflictDetails | unde
 
 const placementFilterMessages: Record<string, string> = {
   owner_unreachable: 'Owner is offline or unreachable',
+  daemon_upgrade_required: 'Upgrade the daemon to the server release (protocol revision 3 or newer)',
   workspace_protocol_missing: 'Daemon lacks workspace protocol support',
   location_not_ready: 'Repository location is not ready',
   executor_unavailable: 'Executor is not installed, authenticated, or enabled',
@@ -73,7 +74,7 @@ const placementFilterMessages: Record<string, string> = {
 }
 
 function getPlacementRejectionMessage(error: ApiError): string | undefined {
-  if (getApiErrorCode(error) !== 'placement_unavailable') return undefined
+  if (!['placement_unavailable', 'daemon_upgrade_required'].includes(getApiErrorCode(error) ?? '')) return undefined
   const candidates = getApiConflictDetails(error)?.rejected_candidates
   if (!Array.isArray(candidates)) return undefined
   if (candidates.length === 0) return 'No eligible repository locations.'

@@ -157,6 +157,12 @@ impl DaemonLocationVerifier for RemoteDaemonLocationVerifier {
                 LocationVerification::invalid("shared_mount_probe_mismatch")
             }
             Ok(_) => LocationVerification::ready(),
+            Err(WorkspaceClientError::Transport(
+                error @ ServiceError::DaemonUpgradeRequired { .. },
+            )) => LocationVerification {
+                status: location.status.clone(),
+                last_error: Some(error.to_string()),
+            },
             Err(WorkspaceClientError::Transport(ServiceError::DaemonUnavailable { .. })) => {
                 LocationVerification::unavailable(api_types::DAEMON_UNAVAILABLE)
             }
@@ -543,6 +549,12 @@ impl RepoLocationService {
             } else {
                 match self.daemon_verifier.verify(repo, &location, &runtime).await {
                     Ok(result) => result,
+                    Err(error @ ServiceError::DaemonUpgradeRequired { .. }) => {
+                        LocationVerification {
+                            status: location.status.clone(),
+                            last_error: Some(error.to_string()),
+                        }
+                    }
                     Err(ServiceError::DaemonUnavailable { .. }) => {
                         LocationVerification::unavailable("daemon_unavailable")
                     }
@@ -791,6 +803,46 @@ mod tests {
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn revision_two_verifier_error_preserves_location_status() {
+        struct UpgradeVerifier;
+        #[async_trait]
+        impl DaemonLocationVerifier for UpgradeVerifier {
+            async fn verify(
+                &self,
+                _: &Repo,
+                _: &RepoLocation,
+                runtime: &Runtime,
+            ) -> Result<LocationVerification> {
+                Err(ServiceError::DaemonUpgradeRequired {
+                    daemon_id: runtime.daemon_id.clone(),
+                })
+            }
+        }
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let (_, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let location = RepoLocationRepo::get_by_id(&*db, &placement.repo_location_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let repo = RepoRepo::get_by_id(&*db, &location.repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let service = RepoLocationService::new(db.clone(), Arc::new(UpgradeVerifier));
+        let verified = service
+            .verify_registered_location(&repo, location.clone())
+            .await
+            .unwrap();
+        assert_eq!(verified.status, location.status);
+        assert!(verified
+            .last_error
+            .unwrap()
+            .contains(api_types::DAEMON_UPGRADE_REQUIRED));
     }
 
     #[tokio::test]

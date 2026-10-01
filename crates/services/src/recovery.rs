@@ -2058,7 +2058,12 @@ impl HeartbeatMonitor {
                         let owner_online = DaemonRepo::get_by_id(&*self.db, daemon_id)
                             .await?
                             .is_some_and(|daemon| daemon.status == db::DaemonStatus::Online);
-                        if !owner_online || !registry.is_connected(daemon_id) || owner_changed {
+                        if !owner_online
+                            || !registry.get(daemon_id).is_some_and(|connection| {
+                                !connection.is_stale() && connection.protocol_allows_dispatch()
+                            })
+                            || owner_changed
+                        {
                             settled +=
                                 disconnect_daemon_placements(&self.db, &self.event_bus, daemon_id)
                                     .await?;
@@ -2068,6 +2073,22 @@ impl HeartbeatMonitor {
             }
             // Receipts outlive placement cleanup. Sweep every capable online
             // owner so a committed result with a lost ACK is retried as well.
+            let upgraded_daemons: Vec<String> = registry
+                .connection_snapshots()
+                .into_iter()
+                .filter(|(daemon_id, _)| {
+                    registry
+                        .get(daemon_id)
+                        .is_some_and(|connection| connection.protocol_allows_dispatch())
+                })
+                .map(|(daemon_id, _)| daemon_id)
+                .collect();
+            if let Err(error) =
+                crate::workflow::engine::wake_upgraded_daemon_tasks(&self.db, &upgraded_daemons)
+                    .await
+            {
+                tracing::warn!(%error, "daemon upgrade dispatch wake failed");
+            }
             for (daemon_id, facts) in registry.connection_snapshots() {
                 if facts.workspace_incapable
                     || !DaemonRepo::get_by_id(&*self.db, &daemon_id)
@@ -5931,6 +5952,53 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
         assert_eq!(executions, 1);
+    }
+
+    #[tokio::test]
+    async fn revision_two_ready_placement_disconnects_and_expires_despite_rest_online() {
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::default());
+        let (_, placement, _) = daemon_owned_fixture(&db).await;
+        let mut update = placement_update(&placement, PlacementState::Ready, None);
+        update.disconnected_at = Some(None);
+        let ready = WorkspacePlacementRepo::update(&*db, update).await.unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let daemon_id = ready.daemon_id.as_deref().unwrap();
+        let (connection, _outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+        });
+        let monitor = HeartbeatMonitor::new(db.clone(), bus)
+            .with_daemon_connections(registry)
+            .with_max_disconnect(Duration::from_secs(86400));
+        monitor.check_workspace_placements().await.unwrap();
+        let disconnected = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(disconnected.state, PlacementState::Disconnected);
+        assert!(disconnected.disconnected_at.is_some());
+        let mut expired = placement_update(
+            &disconnected,
+            PlacementState::Disconnected,
+            Some(PlacementFailureCause::OwnerDisconnected),
+        );
+        expired.disconnected_at = Some(Some((Utc::now() - ChronoDuration::hours(25)).to_rfc3339()));
+        WorkspacePlacementRepo::update(&*db, expired).await.unwrap();
+        monitor.check_workspace_placements().await.unwrap();
+        let failed = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, PlacementState::Failed);
+        assert_eq!(
+            failed.failure_cause,
+            Some(PlacementFailureCause::OwnerDisconnectedTimeout)
+        );
     }
 
     #[tokio::test]

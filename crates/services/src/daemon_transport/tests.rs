@@ -401,7 +401,7 @@ async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
     let api_types::DaemonFrame::Error { error, .. } = rejection else {
         panic!("expected protocol rejection error");
     };
-    assert_eq!(error.code, api_types::DAEMON_PROTOCOL_INCOMPATIBLE);
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
     assert!(!registry.is_connected("daemon-incompatible"));
 
     let result: Result<TestResponse, ServiceError> = registry
@@ -425,49 +425,13 @@ async fn pre_handshake_dispatch_is_rejected_without_sending_a_request() {
         .await;
     assert!(matches!(
         result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+        Err(ServiceError::DaemonNotReady { daemon_id })
+            if daemon_id == "daemon-pre-handshake"
     ));
     assert!(matches!(
         outbound.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
-}
-
-#[tokio::test]
-async fn revision_two_terminal_success_uses_revision_two_ack_wire_format() {
-    let registry =
-        DaemonConnectionRegistry::new(Arc::new(EventBus::new(16)), Arc::new(NoopHandler));
-    let (connection, mut outbound) = DaemonConnection::new("daemon-revision-two".into());
-    let connection_id = connection.id();
-    registry.register("daemon-revision-two".into(), connection);
-    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Notification {
-        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
-        params: json!({"protocol_revision": 2, "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack"]}),
-    });
-    assert!(registry
-        .get("daemon-revision-two")
-        .unwrap()
-        .protocol_compatible());
-    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Notification {
-        method: api_types::METHOD_EXECUTION_TERMINAL.into(),
-        params: json!({"terminal_report_id":"report-two", "execution_id":"execution-two", "exit_code":0, "signal":null, "error":null, "ts":now_rfc3339(), "usage_reports":[]}),
-    });
-    let ack = tokio::time::timeout(Duration::from_secs(2), outbound.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let api_types::DaemonFrame::Request { id, method, params } = ack else {
-        panic!("expected ack request");
-    };
-    assert_eq!(method, "execution.terminal.ack");
-    assert_eq!(
-        params,
-        json!({"terminal_report_id":"report-two", "execution_id":"execution-two"})
-    );
-    registry.dispatch_incoming_for_connection("daemon-revision-two", connection_id, api_types::DaemonFrame::Response {
-        id, result: json!({"terminal_report_id":"report-two", "execution_id":"execution-two", "acknowledged":true}),
-    });
 }
 
 #[tokio::test]
@@ -939,7 +903,7 @@ async fn connection_snapshot_retains_handshake_facts_only_for_current_incarnatio
 }
 
 #[tokio::test]
-async fn connection_snapshot_revision_two_stays_connected_but_is_workspace_incapable() {
+async fn connection_snapshot_revision_two_needs_upgrade_and_cannot_dispatch() {
     let registry = make_registry();
     let (connection, _outbound) = DaemonConnection::new("old-owner".to_owned());
     let id = connection.id();
@@ -949,16 +913,17 @@ async fn connection_snapshot_revision_two_stays_connected_but_is_workspace_incap
         params: json!({"protocol_revision": 2, "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, "execution.terminal.ack", "workspace.v1"]}),
     });
     assert!(registry.is_connected("old-owner"));
-    let snapshots = registry.connection_snapshots();
-    let facts = &snapshots["old-owner"];
-    assert_eq!(facts.handshake.protocol_revision, 2);
-    assert!(facts.workspace_incapable);
-    assert!(facts.handshake.executor_capabilities.is_empty());
-    assert!(facts
-        .handshake
-        .workspace_run_policy
-        .allowed_purposes
-        .is_empty());
+    assert!(registry.connection_snapshots().is_empty());
+    let connection = registry.get("old-owner").unwrap();
+    assert!(connection.needs_upgrade());
+    assert!(!connection.protocol_allows_dispatch());
+    let result: Result<TestResponse, ServiceError> = registry
+        .send_request("old-owner", "execution.start", json!({}), 1)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::DaemonUpgradeRequired { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1019,4 +984,44 @@ async fn journal_drain_waits_for_terminal_outbox_and_owner_ack() {
         .await
         .unwrap());
     responder.await.unwrap();
+}
+
+#[tokio::test]
+async fn revision_two_refuses_all_commands_but_an_unknown_handshake_is_not_an_upgrade() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("old-owner".into());
+    let id = connection.id();
+    registry.register("old-owner".into(), connection);
+    let not_ready: Result<serde_json::Value, _> = registry
+        .send_request("old-owner", api_types::METHOD_FS_LIST, json!({}), 1)
+        .await;
+    assert!(matches!(
+        not_ready,
+        Err(ServiceError::DaemonNotReady { .. })
+    ));
+    assert!(!registry.get("old-owner").unwrap().needs_upgrade());
+    assert!(outbound.try_recv().is_err());
+    registry.dispatch_incoming_for_connection("old-owner", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+    });
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("upgrade notice");
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    for method in [
+        api_types::METHOD_EXECUTION_START,
+        api_types::METHOD_REPO_LOCATION_VERIFY,
+        api_types::METHOD_FS_LIST,
+        api_types::METHOD_FS_BRANCHES,
+        api_types::METHOD_TERMINAL_START,
+    ] {
+        let result: Result<serde_json::Value, _> = registry
+            .send_request("old-owner", method, json!({}), 1)
+            .await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, ServiceError::DaemonUpgradeRequired { .. }));
+        assert!(error.to_string().contains("upgrade the daemon"));
+    }
+    assert!(outbound.try_recv().is_err());
 }

@@ -360,7 +360,7 @@ pub async fn eligible_project_execution_agents(
         // hold the role at all, so only unhealthy or unavailable states
         // disqualify it.
         if !matches!(
-            compute_effective_status(db, &agent).await?,
+            compute_effective_status(db, &agent, None).await?,
             EffectiveStatus::Active | EffectiveStatus::Busy
         ) {
             continue;

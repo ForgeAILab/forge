@@ -418,9 +418,7 @@ impl HookAction for DispatchRoleAgent {
                         Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                             reason: "project paused".to_string(),
                         },
-                        Err(error) => HookResult::Failed {
-                            reason: error.to_string(),
-                        },
+                        Err(error) => dispatch_failure(ctx, error).await,
                     };
                 }
 
@@ -466,9 +464,7 @@ impl HookAction for DispatchRoleAgent {
                     Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                         reason: "project paused".to_string(),
                     },
-                    Err(error) => HookResult::Failed {
-                        reason: error.to_string(),
-                    },
+                    Err(error) => dispatch_failure(ctx, error).await,
                 }
             }
             Some(assignment)
@@ -648,5 +644,21 @@ impl HookAction for NotifyRoleHolder {
                 reason: "role not assigned".to_string(),
             },
         }
+    }
+}
+
+async fn dispatch_failure(ctx: &HookContext, error: crate::ServiceError) -> HookResult {
+    if let Err(annotation_error) = crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+        &ctx.db,
+        &ctx.task_id,
+        &ctx.to_state,
+        &error,
+    )
+    .await
+    {
+        tracing::warn!(task_id = %ctx.task_id, %annotation_error, "failed to record daemon upgrade refusal");
+    }
+    HookResult::Failed {
+        reason: error.to_string(),
     }
 }

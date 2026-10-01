@@ -5501,3 +5501,172 @@ async fn disconnected_owner_is_skipped_before_dispatch_and_never_falls_back() {
         ExecutionStatus::Running
     );
 }
+
+#[tokio::test]
+async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_action() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let daemon_id = agent.daemon_id.as_deref().unwrap();
+    sqlx::query("UPDATE daemon SET machine_id = 'remote-upgrade-test' WHERE id = ?")
+        .bind(daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let runtime = db::RuntimeRepo::create(
+        &*db,
+        db::CreateRuntime {
+            id: new_uuid_v4(),
+            daemon_id: daemon_id.into(),
+            kind: "local".into(),
+            workspace_root: workspace_dir.path().to_string_lossy().into(),
+            status: db::RuntimeStatus::Ready,
+            labels_json: "{}".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Server,
+            daemon_id: Some(daemon_id.into()),
+            runtime_id: Some(runtime.id),
+            path: repo_dir.path().to_string_lossy().into(),
+            kind: db::RepoLocationKind::SharedMount,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let task = seed_task(&db, &project_id, "upgrade refused", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent_id).await;
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let (connection, _outbound) = crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+    let id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+        method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params:serde_json::json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+    });
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspace_dir.path()).await;
+    let service = Arc::new(
+        dispatcher
+            .task_service
+            .as_ref()
+            .clone()
+            .with_daemon_connections(registry.clone()),
+    );
+    let dispatcher = TaskDispatcher::new(db.clone(), dispatcher.event_bus.clone(), service);
+    dispatcher.check_once().await.unwrap();
+    let refused = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refused.status, "todo");
+    let annotation: serde_json::Value = serde_json::from_str(
+        refused
+            .error_annotation
+            .as_deref()
+            .expect("upgrade annotation"),
+    )
+    .unwrap();
+    assert_eq!(annotation["code"], api_types::DAEMON_UPGRADE_REQUIRED);
+    assert_eq!(annotation["daemon_ids"], serde_json::json!([daemon_id]));
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db::WorkspacePlacementRepo::get_for_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(rx.try_recv().is_err());
+    // The refusal is parked; the accepted handshake wakes it through the monitor.
+    dispatcher.check_once().await.unwrap();
+    let (connection, mut upgraded_outbound) =
+        crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+    let id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+        method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params:serde_json::json!({"protocol_revision":3,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports"],
+            "executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["ci_step","hook","environment_setup"]}}),
+    });
+    let responses = registry.clone();
+    let response_daemon = daemon_id.to_owned();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let responder = tokio::spawn(async move {
+        while let Some(api_types::DaemonFrame::Request {
+            id: request_id,
+            method,
+            params,
+        }) = upgraded_outbound.recv().await
+        {
+            let result = match method.as_str() {
+                api_types::METHOD_REPO_LOCATION_VERIFY => serde_json::json!({
+                    "repo_location_id":params["repo_location_id"],"path":params["path"],
+                    "default_branch_sha":"verified-head","origin_url":null,
+                    "probe_content":params["probe"]["content"],
+                }),
+                api_types::METHOD_EXECUTION_START => {
+                    started_tx
+                        .send(params["execution_id"].as_str().unwrap().to_owned())
+                        .unwrap();
+                    serde_json::json!({"execution_id":params["execution_id"],"accepted":true})
+                }
+                _ => panic!("unexpected owner request {method}"),
+            };
+            responses.dispatch_incoming_for_connection(
+                &response_daemon,
+                id,
+                api_types::DaemonFrame::Response {
+                    id: request_id,
+                    result,
+                },
+            );
+        }
+    });
+    crate::HeartbeatMonitor::new(db.clone(), dispatcher.event_bus.clone())
+        .with_daemon_connections(registry)
+        .check_once()
+        .await
+        .unwrap();
+    let woken = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(woken.error_annotation.is_none());
+    dispatcher.check_once().await.unwrap();
+    let executions = ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "{:?}",
+        TaskRepo::get_by_id(&*db, &task.id, false).await.unwrap()
+    );
+    let started = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started, executions[0].id);
+    responder.abort();
+}

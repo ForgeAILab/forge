@@ -2042,11 +2042,30 @@ through `execution.terminal`.
 Protocol revision 3 adds `workspace.v1`: `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
-Revision 2 daemons remain connected for execution and filesystem browsing on
-server-owned placements, but are marked `workspace_incapable` and cannot own
-workspaces. Mutations carry an operation ID, placement generation, expected
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+Mutations carry an operation ID, placement generation, expected
 base SHA or version, and handle or placement ID. Duplicate operation IDs return
-the recorded result; stale generations and wrong owners are rejected. Handles
+the recorded result until acknowledgement; stale generations and wrong owners are rejected. Handles
 map only to workspaces created under the daemon root. Direct merge writes the
 verified primary checkout and refuses a dirty target.
 
@@ -2087,14 +2106,57 @@ accept newline-delimited, concatenated, and pretty-printed JSON objects, resume
 at the next physical line after malformed input, and retain unknown evidence
 kinds as `other` with the original kind in the caption. Entry positions use
 stable `line` or `line:column` strings for ingestion receipts. Terminal and cleanup
-results replay after reconnect until `journal.ack { entry_id }`; revision 2
-connections use `execution.terminal.ack`. The journal retains operation receipts
-after acknowledgement so a repeated mutation cannot repeat its side effects.
-CI steps may request `timeout_secs = 0` and `max_output_bytes = u64::MAX` to
-preserve unbounded CI semantics. Their full redacted results survive replay and
-acknowledgement without the journal's bounded-result byte ceiling; the pending
-entry-count limit still applies. Other command purposes require positive time
-and output budgets.
+results replay after reconnect until `journal.ack { entry_id }`. The server must
+persist a result before acknowledging it. The daemon then deletes the receipt; repeated acks are
+idempotent. Unacknowledged results survive a crash between completion and ack.
+The journal caps receipts at 1,024 and all persisted journal files (including the
+workspace registry) at 32 MiB, with 16 MiB per receipt. Usage is indexed once and
+updated on writes. Mutation deduplication opens only its operation receipt with
+a buffered reader. `workspace.describe` scans pending entries for terminal IDs,
+then the command runtime scans them again to replay pending notifications.
+CI steps may request `timeout_secs = 0` for unbounded execution time, but output
+is capped at 1 MiB per stream, even with `max_output_bytes = u64::MAX`. Truncated
+log tails start with `[Forge: CI log truncated]` and set the stream's truncation flag.
+Logs keep their UTF-8-safe tail and may be trimmed further, or dropped entirely,
+to fit the shared journal. Admission reserves completion headroom for every run;
+exit code, identity, and flags survive journal pressure. An unbounded CI request
+accepts a truncated tail and retains the actual exit verdict; bounded conformance
+commands still reject output over their budget. If a descendant holds a pipe open
+after shell exit, the two-second drain retains the bytes read and sets
+`stdout_drain_incomplete`/`stderr_drain_incomplete`, independently of size truncation.
+Cleanup retains the handle and its execution IDs until the cleanup receipt is
+acknowledged, so describe-first retries can replay its result. Reset and review release similarly retain retired review handles until their
+receipts are acknowledged, preserving generation fences. Each acknowledgement
+prunes only the handles retired by that operation.
+Corrupt or non-regular `entry-*.json` files are quarantined as
+`corrupt-<original name>` when possible and logged with their paths. Quarantine
+rename or directory-sync failures are logged and skipped; valid entries still replay. A failed command-stream task terminates the
+daemon promptly instead of continuing REST-only reporting.
+Other command purposes require positive time and output budgets. Environment
+values are redacted before journal writes; requests retain variable names and
+a digest of the redacted request for replay identity, never secret values or a
+caller-supplied digest. Owner-operation environments also retain only variable
+names, and their check commands are redacted. Redaction applies to request commands,
+result stdout/stderr, error messages, and terminal output text; identities,
+accounting fields, exit codes, and identity paths are preserved.
+Managed Codex resolves cache symlink chains before granting writable roots. It
+normalizes the macOS `/System/Volumes/Data` prefix before comparisons and rejects
+roots that contain HOME (also comparing device/inode identities of its ancestors),
+the worktree, its parent, or the managed home. It rejects roots inside credential
+directories, `<daemon root>/.forge`, the managed home, or another Task directory.
+The daemon root itself is not protected, so `--workspace-root "$HOME"` permits
+ordinary caches. Default caches are allowed even when mounted. A default cache
+redirected by a symlink is refused only when its resolved path is exactly a mount root. Linux compares `/proc/self/mountinfo` mount-point strings
+without opening the mounts; other platforms infer the mount root from device
+boundaries or the filesystem root. Explicit cache environment-variable relocations
+are exempt from the mount-root rule. Defaults are compared through canonical HOME,
+so a symlink in HOME alone does not count as a cache redirect. Forge's exact
+scratch and execution-outbox directories remain designated grants, and ordinary
+relocated caches are allowed.
+
+Ownership remains fenced per location and workspace handle. There is no sticky
+daemon-wide runtime pin to survive Task completion, cancellation, or placement
+removal.
 See [Daemon journal migration](getting-started.md#daemon-journal-migration) for
 the on-disk upgrade.
 
@@ -2104,16 +2166,19 @@ the on-disk upgrade.
 server-side Task or Project configuration, using the embedded backend's shell
 semantics and command budgets. The daemon reads `workspace.run.allow` from its
 local `daemon.yaml` beside its credentials; the default is `[ci_step]`. Hooks
-and environment setup require explicit local opt-in. The server cannot change
-this policy. Admission rejects a candidate with `run_purpose_denied` when required
+and environment setup require explicit local opt-in. Requests cannot override
+the effective policy loaded at startup. Admission rejects a candidate with `run_purpose_denied` when required
 purposes are disallowed; the daemon also rejects the command with `purpose_denied`,
 which is never retried. See the [configuration example](getting-started.md#daemon-run-policy).
 
-Dispatch policy controls which configured commands Forge may send to a machine.
-It does not bound what a resulting process can reach. The daemon is not a sandbox:
-processes have the daemon user's `HOME`, credentials, and network access. Anyone
-who can edit server-side review steps, hooks, or environment commands can run
-those commands on a daemon that permits their purpose.
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
 
 A write-capable embedded worker turn checks its repository delivery boundary
 before it reports completion. If the final HEAD is unchanged while the

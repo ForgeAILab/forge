@@ -476,6 +476,14 @@ impl DaemonRuntime {
         self: &Arc<Self>,
         params: ExecutionStartParams,
     ) -> CommandResult<ExecutionStartResult> {
+        let workspace_root = self
+            .workspace_root
+            .to_str()
+            .ok_or_else(|| DaemonErrorPayload {
+                code: api_types::INVALID_INPUT.to_owned(),
+                message: "workspace root is not UTF-8".to_owned(),
+                details: None,
+            })?;
         let worktree_path = daemon_fs::validate_within_root(
             Path::new(params.workspace_path.trim()),
             &self.workspace_root,
@@ -488,12 +496,19 @@ impl DaemonRuntime {
         }
         let logs_path = local_execution_log_path(&self.workspace_root, &params.execution_id);
         let description = prompt_description(&params.prompt);
+        let mut executor_config = params.executor_config;
+        if let Some(config) = executor_config.as_object_mut() {
+            config.insert(
+                "_forge_workspace_root".into(),
+                serde_json::Value::String(workspace_root.to_owned()),
+            );
+        }
         let ctx = ExecutionContext {
             task_id: params.task_id.clone(),
             execution_id: params.execution_id.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             description,
-            agent_config: params.executor_config,
+            agent_config: executor_config,
             logs_path: logs_path.to_string_lossy().into_owned(),
             heartbeat_interval_seconds: 30,
             max_turns: params.max_turns,
@@ -532,6 +547,9 @@ impl DaemonRuntime {
         &self,
         params: JournalAckParams,
     ) -> CommandResult<JournalAckResult> {
+        if let Some(workspace) = &self.workspace {
+            return workspace.acknowledge_journal(&params).await;
+        }
         self.journal.acknowledge(&params).map_err(|error| {
             let message = error.to_string();
             let code = if message.contains(TERMINAL_REPORT_CONFLICT) {
@@ -570,6 +588,7 @@ async fn run_execution_task(
     );
 
     let execution_id = ctx.execution_id.clone();
+    let environment = executors::environment::task_environment(&ctx.agent_config);
     let worktree_path = PathBuf::from(&ctx.worktree_path);
     let workspace_root = journal
         .directory()
@@ -650,6 +669,7 @@ async fn run_execution_task(
         },
     };
     notification.outbox_entries = outbox_entries;
+    crate::daemon_persistence::sanitize_terminal_report(&mut notification, &environment);
     daemon_outbox::fit_report(&mut notification);
     match journal.retain(&notification) {
         Ok(()) => emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification),
@@ -940,6 +960,68 @@ mod tests {
             .map(|entry| entry.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, ["src", "README.md"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_workspace_root_rejects_execution_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        // Reject the configured path before filesystem access; some filesystems
+        // cannot create a non-UTF-8 directory at all.
+        Arc::get_mut(&mut runtime).unwrap().workspace_root = root;
+        let result = runtime
+            .start(ExecutionStartParams {
+                task_id: "task".into(),
+                execution_id: "execution".into(),
+                workspace_path: "unused".into(),
+                executor_type: "shell".into(),
+                executor_config: serde_json::json!({}),
+                prompt: serde_json::json!({}),
+                max_turns: None,
+            })
+            .await;
+        assert_eq!(result.unwrap_err().code, api_types::INVALID_INPUT);
+        assert!(runtime.active_executions.running_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_runtime_redacts_execution_environment_without_changing_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let mut config = serde_json::json!({"executor_type":"shell","config":{}});
+        executors::environment::mark_task_environment(
+            &mut config,
+            &BTreeMap::from([("CI".into(), "1".into())]),
+        );
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-1".into(),
+                execution_id: "execution-1".into(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "shell".into(),
+                executor_config: config,
+                prompt: serde_json::json!({"description":"exit 1"}),
+                max_turns: None,
+            })
+            .await
+            .unwrap();
+        let report = next_terminal_notification(&mut rx, "execution-1").await;
+        assert_eq!(report.execution_id, "execution-1");
+        assert_eq!(report.exit_code, Some(1));
+        assert!(report.error.as_deref().unwrap().contains("[REDACTED]"));
+        let JournalEntry::Terminal { report: retained } =
+            runtime.journal.pending().unwrap().remove(0)
+        else {
+            panic!("terminal report");
+        };
+        assert_eq!(retained, report);
     }
 
     #[tokio::test]

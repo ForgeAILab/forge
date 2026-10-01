@@ -3571,3 +3571,248 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
         ),
     }
 }
+
+#[tokio::test]
+async fn dispatch_failure_preserves_other_annotations_and_wakes_only_its_upgrade_owner() {
+    let db = sqlite_db().await;
+    for kind in [
+        "manual_stop",
+        "workspace_error",
+        "agent_timeout",
+        "recovery_required",
+        "workspace_reset_required",
+        "max_turns_exceeded",
+        "before_work_hook_failed",
+        "before_work_hook_timeout",
+    ] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        let original = json!({"type":kind,"message":"keep"}).to_string();
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        super::annotate_dispatch_failure(&db, &task_id, "in_progress", "upgrade", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            TaskRepo::get_by_id(&db, &task_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .error_annotation
+                .as_deref(),
+            Some(original.as_str())
+        );
+    }
+    let task_id = new_uuid_v4();
+    seed_project_repo_and_task(&db, &task_id, "todo").await;
+    let error = ServiceError::DaemonUpgradeRequired {
+        daemon_id: "owner".into(),
+    };
+    super::annotate_upgrade_dispatch_refusal(&db, &task_id, "in_progress", &error)
+        .await
+        .unwrap();
+    super::annotate_dispatch_failure(&db, &task_id, "in_progress", &error.to_string(), None)
+        .await
+        .unwrap();
+    super::wake_upgraded_daemon_tasks(&db, &["other-owner".into()])
+        .await
+        .unwrap();
+    assert!(TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .error_annotation
+        .is_some());
+    super::wake_upgraded_daemon_tasks(&db, &["owner".into()])
+        .await
+        .unwrap();
+    assert!(TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .error_annotation
+        .is_none());
+}
+
+#[tokio::test]
+async fn dispatch_failure_overwrites_nonblocking_and_malformed_annotations() {
+    let db = sqlite_db().await;
+    for original in [
+        r#"{"type":"old_notice"}"#,
+        r#"{"message":"old"}"#,
+        "{broken",
+    ] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        super::annotate_dispatch_failure(&db, &task_id, "in_progress", "new failure", None)
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: serde_json::Value =
+            serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["type"], "dispatch_failed");
+        assert_eq!(annotation["message"], "new failure");
+    }
+}
+
+#[tokio::test]
+async fn dispatch_failure_upgrade_metadata_wakes_with_blocking_annotation_and_skips_deleted_tasks()
+{
+    let db = sqlite_db().await;
+    for deleted in [false, true] {
+        let task_id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &task_id, "todo").await;
+        let original = json!({"type":"manual_stop","message":"keep"}).to_string();
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        crate::deferred_dispatch::record_dispatch_disposition(&db, &task, "coder", "upgrade")
+            .await
+            .unwrap();
+        super::annotate_upgrade_dispatch_refusal(
+            &db,
+            &task_id,
+            "in_progress",
+            &ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+        )
+        .await
+        .unwrap();
+        if deleted {
+            sqlx::query("UPDATE task SET deleted_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(&task_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        super::wake_upgraded_daemon_tasks(&db, &["owner".into(), "other-owner".into()])
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, &task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.error_annotation.as_deref(), Some(original.as_str()));
+        let metadata: serde_json::Value = task
+            .metadata_json
+            .as_deref()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .unwrap_or(json!({}));
+        assert_eq!(metadata.get("daemon_upgrade_refusal").is_some(), deleted);
+        assert_eq!(metadata.get("dispatch_disposition").is_some(), deleted);
+    }
+}
+
+#[tokio::test]
+async fn dispatch_failure_upgrade_wake_preserves_a_concurrent_manual_deferral() {
+    let db = sqlite_db().await;
+    let task_id = new_uuid_v4();
+    seed_project_repo_and_task(&db, &task_id, "todo").await;
+    super::annotate_upgrade_dispatch_refusal(
+        &db,
+        &task_id,
+        "in_progress",
+        &ServiceError::DaemonUpgradeRequired {
+            daemon_id: "owner".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let observed = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    // Metadata writes need not bump Task.version. The wake fences those too.
+    crate::deferred_dispatch::set(
+        &db,
+        &observed,
+        "in_progress",
+        "2099-01-01T00:00:00Z",
+        "manual action",
+    )
+    .await
+    .unwrap();
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &observed)
+        .await
+        .unwrap());
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::deferred_dispatch::pending_until(&current)
+            .unwrap()
+            .reason,
+        "manual action"
+    );
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    super::wake_upgraded_daemon_tasks(&db, &["owner".into()])
+        .await
+        .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(crate::deferred_dispatch::pending_until(&current).is_some());
+    crate::deferred_dispatch::clear(&db, &current)
+        .await
+        .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    let cleared = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    crate::deferred_dispatch::set(
+        &db,
+        &cleared,
+        "in_progress",
+        "2099-01-01T00:00:00Z",
+        "new manual action",
+    )
+    .await
+    .unwrap();
+    let current = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!super::clear_upgrade_dispatch_refusal(&db, &current)
+        .await
+        .unwrap());
+    assert!(crate::deferred_dispatch::pending_until(
+        &TaskRepo::get_by_id(&db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+    )
+    .is_some());
+}

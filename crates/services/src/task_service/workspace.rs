@@ -2249,6 +2249,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_two_only_owner_waits_without_execution_with_upgrade_reason() {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query("DELETE FROM execution WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace_placement WHERE id = ?")
+            .bind(&placement.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace WHERE id = ?")
+            .bind(&placement.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, placement.agent_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        sqlx::query("UPDATE daemon SET detected_clis_json = ? WHERE id = ?")
+            .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
+            .bind(daemon_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, _outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+        });
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry.clone());
+        let error = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .err()
+            .expect("revision two is refused");
+        let ServiceError::PlacementUnavailable(ref refusal) = error else {
+            panic!("placement refusal");
+        };
+        assert!(refusal.needs_daemon_upgrade(), "{refusal:?}");
+        assert!(!crate::placement::is_capacity_refusal(&error));
+        assert_eq!(execution_count(&db, &task.id).await, 0);
+        let stored = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, task.status);
+        assert!(stored.failed_json.is_none());
+        assert!(stored.error_annotation.is_none());
+        crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+            &db,
+            &task.id,
+            &task.status,
+            &error,
+        )
+        .await
+        .unwrap();
+        let stored = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: Value =
+            serde_json::from_str(stored.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["type"], "dispatch_failed");
+        assert!(annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        assert!(annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade the daemon"));
+        assert_eq!(
+            crate::agent_service::compute_effective_status(&db, &agent, Some(&registry))
+                .await
+                .unwrap(),
+            crate::agent_service::EffectiveStatus::DaemonUpgradeRequired
+        );
+        let location = db::RepoLocationRepo::get_by_id(&*db, &placement.repo_location_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let repo = RepoRepo::get_by_id(&*db, &location.repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = db::RuntimeRepo::get_by_id(&*db, placement.runtime_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let verifier = crate::repo_location::RemoteDaemonLocationVerifier::new(
+            registry.clone(),
+            PathBuf::from("unused"),
+        );
+        let verification = crate::repo_location::DaemonLocationVerifier::verify(
+            &verifier, &repo, &location, &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verification.status, location.status);
+        assert!(verification
+            .last_error
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        let location_service =
+            crate::repo_location::RepoLocationService::new(db.clone(), Arc::new(verifier));
+        location_service
+            .retry_verification_on_reconnect(daemon_id)
+            .await
+            .unwrap();
+        let stored_location = db::RepoLocationRepo::get_by_id(&*db, &location.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_location.status, location.status);
+        assert!(stored_location
+            .last_error
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        let error = service
+            .reserve_claim_workspace(&stored, Some(&agent), "coder")
+            .await
+            .err()
+            .unwrap();
+        let ServiceError::PlacementUnavailable(refusal) = error else {
+            panic!("placement refusal")
+        };
+        assert!(refusal.needs_daemon_upgrade());
+    }
+
+    #[tokio::test]
     async fn placement_admission_prepare_failure_keeps_retry_budget() {
         let db = Arc::new(sqlite_db().await);
         let repo_dir = TempDir::new().unwrap();

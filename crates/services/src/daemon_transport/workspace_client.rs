@@ -906,16 +906,6 @@ impl DaemonWorkspaceClient {
             .ok_or_else(unavailable)?;
         self.registry
             .ensure_protocol_dispatchable(daemon_id, &connection)?;
-        if connection
-            .protocol_revision
-            .load(std::sync::atomic::Ordering::Acquire)
-            < 3
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "{DAEMON_PROTOCOL_INCOMPATIBLE}: workspace RPCs require revision 3"
-            ))
-            .into());
-        }
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();

@@ -406,7 +406,20 @@ pub fn outcome_for_service_error_with_correction(
                 None,
             )
         }
-        ServiceError::DaemonUnavailable { .. }
+        ServiceError::DaemonUpgradeRequired { .. } => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::PlacementUnavailable(error) if error.needs_daemon_upgrade() => (
+            OutcomeCode::SetupRequired,
+            api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE,
+            None,
+            None,
+        ),
+        ServiceError::DaemonNotReady { .. }
+        | ServiceError::DaemonUnavailable { .. }
         | ServiceError::PlacementUnavailable(_)
         | ServiceError::PrepareFailed { .. }
         | ServiceError::DaemonTimeout { .. }

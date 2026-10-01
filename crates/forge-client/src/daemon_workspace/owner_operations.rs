@@ -56,9 +56,14 @@ impl DaemonWorkspaceBackend {
                         "only a detached review checkout may be released",
                     ));
                 }
-                self.reclaim_review_checkouts(&owned, active_ids).await?;
-                self.remove_owned_workspace(&params.workspace_handle, &owned)
+                self.reclaim_review_checkouts(&owned, active_ids, &params.fence.operation_id)
                     .await?;
+                self.remove_owned_workspace(
+                    &params.workspace_handle,
+                    &owned,
+                    &params.fence.operation_id,
+                )
+                .await?;
                 return Ok(WorkspaceOwnerOperationResult {
                     entry_id: operation_entry_id(&params.fence.operation_id),
                     operation_id: params.fence.operation_id,
@@ -246,6 +251,7 @@ impl DaemonWorkspaceBackend {
                     version: 0,
                     prepared: false,
                     cleaned: false,
+                    retired_by_operation_id: None,
                     execution_ids: Vec::new(),
                     review_parent: Some(parent_handle.into()),
                     review_operation_id: Some(fence.operation_id.clone()),
@@ -289,6 +295,7 @@ impl DaemonWorkspaceBackend {
         &self,
         parent: &OwnedWorkspace,
         active_ids: &[String],
+        operation_id: &str,
     ) -> CommandResult<()> {
         // A root cleanup also reclaims review worktrees left by an interrupted
         // assessment, including detached checkouts created from other scratches.
@@ -323,7 +330,8 @@ impl DaemonWorkspaceBackend {
             ensure_inactive(child, active_ids)?;
         }
         for (handle, child) in children {
-            self.remove_owned_workspace(&handle, &child).await?;
+            self.remove_owned_workspace(&handle, &child, operation_id)
+                .await?;
         }
         Ok(())
     }
@@ -332,6 +340,7 @@ impl DaemonWorkspaceBackend {
         &self,
         handle: &str,
         owned: &OwnedWorkspace,
+        operation_id: &str,
     ) -> CommandResult<()> {
         if owned.cleaned {
             return Ok(());
@@ -352,9 +361,10 @@ impl DaemonWorkspaceBackend {
             Ok(()) | Err(workspace::WorkspaceError::NotFound) => {}
             Err(failure) => return Err(workspace_error(failure)),
         }
-        let mut owned = owned.clone();
-        owned.cleaned = true;
-        owned.version += 1;
-        self.save_workspace(handle, owned)
+        let mut retired = owned.clone();
+        retired.cleaned = true;
+        retired.retired_by_operation_id = Some(operation_id.to_owned());
+        retired.version += 1;
+        self.save_workspace(handle, retired)
     }
 }

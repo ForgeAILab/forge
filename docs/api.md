@@ -1932,10 +1932,26 @@ The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
 the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
-conflict. The minimum daemon protocol revision is 2; revision 3 adds workspace
-ownership. A revision-2 daemon retains execution and filesystem features on
-server-owned placements and cannot own a workspace. The server uses the actual reported provider/model and never
-infers it from the executor family.
+conflict. The minimum command protocol revision is 3. A revision-2 daemon
+receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
+from the server's release (protocol revision 3 or newer). Every command RPC is
+refused, including execution, repository verification, `fs.list`, `fs.branches`,
+workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
+`409 daemon_upgrade_required` with `needs_human: true`; placement rejection
+includes that filter code in `rejected_candidates`. An upgrade-only dispatch
+refusal records an actionable blocker and creates no Execution; reservation
+returns the typed error without modifying the Task. The heartbeat sweep clears
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 3.
+Repository locations retain the upgrade reason in `last_error` after a verification
+attempt, without changing their verification status; pinned Agents expose
+`effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
+reports `upgrade_required` with the same instruction. A socket without its
+handshake returns HTTP `503 daemon_not_ready`. Existing ready placements become
+disconnected and fail after `max_disconnect` (default 24 hours) if the owner is
+still unusable. Upgrade the server first, then every daemon. Old binaries log the
+connect instruction via their warning handler; new binaries also print it to
+stderr. The server uses the actual reported provider/model and never infers it
+from the executor family.
 
 This is a public-beta breaking cutover. The old nullable `cost_usd` field,
 flattened execution-usage authority, merged `execution_count` meaning, and
@@ -3483,10 +3499,19 @@ from a different setup dimension.
 Workspace admission errors use HTTP `409`. `placement_unavailable` includes
 `details.task_id`, `details.repo_id`, and `details.rejected_candidates`: each
 candidate names its repository location, owner, daemon/runtime and `filter_codes`.
-Codes include `owner_unreachable`, `workspace_protocol_missing`,
+Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
 `agent_capacity`, `daemon_capacity`, `work_mode_unsupported`,
 `native_backend_unsupported`, `run_purpose_denied`, and `not_visible`.
+`daemon_upgrade_required` applies only if an otherwise eligible candidate is
+blocked solely by the upgrade (ignoring facts absent from its revision-3
+handshake), with no candidate blocked solely by capacity or transient conditions.
+The dispatch-failure annotation and Task metadata record the refused daemon IDs.
+The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
+daemon reconnects at revision 3, even when a blocking annotation was preserved.
+Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
+`recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
+`before_work_hook_failed`, and `before_work_hook_timeout` annotations.
 No eligible candidate means no fallback and no Execution. `prepare_failed`
 includes `details.placement_id` and `details.failure_cause`; failed or expired
 preparation creates no Execution or lease and does not spend the Task retry budget.
@@ -3518,9 +3543,12 @@ dispatch. A daemon workspace handle is never interpreted as a server path.
 
 ### Workspace daemon protocol
 
-Protocol revision 3 negotiates `workspace.v1`. Revision 2 remains accepted for
-server-owned execution and filesystem browsing and is `workspace_incapable` for
-placement admission. The handshake includes per-executor adapter facts
+Protocol revision 3 negotiates `workspace.v1` and is required for every command
+RPC, including execution, verification, filesystem browsing, and PTY terminals.
+Revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Task admission refusals (as defined above) create no Execution and resume dispatch
+automatically after the daemon upgrade. Existing placements disconnect
+and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
 (`structured_events`, `usage`, `resume`, `cancel_ack`, `terminal_observed`) and
 the daemon's effective `workspace.run` policy; absent facts are unsupported.
 
@@ -3538,17 +3566,34 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
 `generation`, and `expected` (a base SHA or version). Existing workspaces also
-carry `workspace_handle`. Duplicate operation IDs replay their journaled result;
+carry `workspace_handle`. Duplicate operation IDs replay their journaled result
+until acknowledgement;
 `stale_generation` and `wrong_owner` refuse changes. No method accepts an arbitrary
 shell command outside the three configured run purposes. `purpose_denied` is
-never retried. CI preserves unbounded command execution/output semantics;
-conformance commands retain their configured time and output budgets.
+never retried. CI permits unbounded execution time, with output capped at 1 MiB
+per stream. UTF-8-safe tails start with `[Forge: CI log truncated]` and set
+`stdout_truncated`/`stderr_truncated` when size-bounded. Unbounded CI requests
+(`max_output_bytes = u64::MAX`) accept these tails and retain their exit verdict.
+Bounded conformance commands still fail on size overflow. A shell whose
+descendants retain an output pipe returns bytes read before the two-second drain
+limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
+of size truncation. These booleans default to false when absent.
 
 The single daemon journal retains terminal reports with bounded worklog/evidence
 outbox entries, operation results, and cleanup acknowledgements. Revision 3 uses
-`journal.ack { entry_id }`; revision 2 uses `execution.terminal.ack`. Retained
-terminal and cleanup results replay after reconnect, and acknowledged mutation
-receipts remain available for idempotent retries.
+`journal.ack { entry_id }`. Retained terminal and cleanup results replay after
+reconnect until the server durably records their result and acknowledges it.
+Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt
+is already gone. The server must not redispatch an acknowledged operation.
+The journal caps all persisted files at 32 MiB, receipts at 1,024, and each receipt
+at 16 MiB. Logs may be shortened to their tail or omitted entirely; run admission reserves
+headroom so completion identity, exit codes, and flags fit even under pressure.
+Cleanup removes a handle and its execution IDs when its receipt is acknowledged.
+Requests store environment names and a digest of the redacted request; incoming
+`_request_digest` is ignored. Redaction is scoped to request commands, stdout,
+stderr, error messages, and terminal output text, preserving IDs and exit codes.
+Undecodable entry files are quarantined as `corrupt-<original name>` with a warning
+and do not stop journal initialization.
 
 When a follow-up, re-execute, or launch collides with an already-running
 execution, REST returns HTTP `409` with code `execution.already_running`.
