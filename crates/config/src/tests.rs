@@ -645,6 +645,7 @@ fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
 
 fn clear_forge_env() {
     for key in [
+        "FORGE_EVENT_CONSUMER_STALL_SECONDS",
         "FORGE_SERVER_BIND",
         "FORGE_PUBLIC_BASE_URL",
         "FORGE_PUBLIC_SEARCH_ENDPOINT",
@@ -696,4 +697,38 @@ fn scaffold_command_defaults_then_file_then_env() {
     assert_eq!(config.scaffold.command, "/usr/local/bin/create-spark-fake");
 
     clear_forge_env();
+}
+
+#[test]
+fn consumer_stall_setting_follows_config_precedence_and_validates() {
+    let _guard = env_lock().lock().expect("env lock");
+    clear_forge_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("forge.yaml");
+    let defaults = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    assert_eq!(defaults.server.event_consumer_stall_seconds, 300);
+    fs::write(&path, "server:\n  event_consumer_stall_seconds: 600\n").unwrap();
+    let file = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    assert_eq!(file.server.event_consumer_stall_seconds, 600);
+    env::set_var("FORGE_EVENT_CONSUMER_STALL_SECONDS", "60");
+    let env_config = ForgeConfig::load(Some(&path), ConfigOverrides::default()).unwrap();
+    assert_eq!(env_config.server.event_consumer_stall_seconds, 60);
+    let cli = ForgeConfig::load(
+        Some(&path),
+        ConfigOverrides {
+            event_consumer_stall_seconds: Some(120),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(cli.server.event_consumer_stall_seconds, 120);
+    clear_forge_env();
+    assert!(ForgeConfig::load(
+        Some(&path),
+        ConfigOverrides {
+            event_consumer_stall_seconds: Some(0),
+            ..Default::default()
+        }
+    )
+    .is_err());
 }

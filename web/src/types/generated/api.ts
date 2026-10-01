@@ -1562,7 +1562,24 @@ export interface McpConfigActionRequest {
 
 export type OperatorSeverity = 'healthy' | 'attention' | 'blocked' | 'error'
 
+export interface EventConsumerStatus {
+  consumer_name: string
+  last_sequence: number
+  lag: number
+  oldest_unprocessed_at: string | null
+  oldest_unprocessed_age_seconds: number | null
+  last_advanced_at: string | null
+  stalled: boolean
+}
+
+export interface DatabaseStorageStatus {
+  incremental_vacuum: boolean
+  free_pages: number
+}
+
 export interface OperatorStatusResponse {
+  event_consumers: EventConsumerStatus[]
+  database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]
   blocked_tasks: BlockedTaskSummary[]

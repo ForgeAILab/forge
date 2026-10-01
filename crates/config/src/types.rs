@@ -121,6 +121,8 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     #[serde(default = "default_media_upload_limit_bytes")]
     pub media_upload_limit_bytes: u64,
+    #[serde(default = "default_event_consumer_stall_seconds")]
+    pub event_consumer_stall_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +250,7 @@ pub struct ConfigOverrides {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 impl ForgeConfig {
@@ -337,6 +340,11 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.event_consumer_stall_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.event_consumer_stall_seconds must be positive".to_owned(),
+            });
+        }
         self.terminal.validate()?;
         self.public_search.validate()?;
         self.providers.validate()
@@ -362,6 +370,7 @@ impl Default for ForgeConfig {
                 bcrypt_cost: DEFAULT_BCRYPT_COST,
                 cors_origins: vec![DEFAULT_CORS_ORIGIN.to_owned()],
                 media_upload_limit_bytes: DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+                event_consumer_stall_seconds: default_event_consumer_stall_seconds(),
             },
             workspace: WorkspaceConfig {
                 root: default_workspace_root(),
@@ -553,4 +562,8 @@ fn parse_trusted_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     let origin = url.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+fn default_event_consumer_stall_seconds() -> u32 {
+    300
 }

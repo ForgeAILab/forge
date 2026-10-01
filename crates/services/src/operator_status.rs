@@ -1,10 +1,13 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
-    DaemonPressureSummary, EffectiveExecutionPolicy, OperatorSeverity, OperatorStatusResponse,
-    PlanProgressSummary, RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary,
-    UsageSummary, WorkspaceCleanupSummary,
+    DaemonPressureSummary, DatabaseStorageStatus, EffectiveExecutionPolicy, EventConsumerStatus,
+    OperatorSeverity, OperatorStatusResponse, PlanProgressSummary, RecentErrorSummary,
+    RetryPressureSummary, TokenTotalsSummary, UsageSummary, WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::SqliteDb;
@@ -25,6 +28,8 @@ use log_snapshot::ExecutionLogSnapshots;
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
     log_snapshots: ExecutionLogSnapshots,
+    consumer_stall_seconds: u32,
+    expected_event_consumers: RwLock<Vec<&'static str>>,
 }
 
 impl OperatorStatusService {
@@ -32,7 +37,28 @@ impl OperatorStatusService {
         Self {
             db,
             log_snapshots: ExecutionLogSnapshots::default(),
+            expected_event_consumers: RwLock::new(Vec::new()),
+            consumer_stall_seconds: config::ForgeConfig::default()
+                .server
+                .event_consumer_stall_seconds,
         }
+    }
+
+    pub fn with_consumer_stall_seconds(mut self, seconds: u32) -> Self {
+        self.consumer_stall_seconds = seconds;
+        self
+    }
+
+    /// Monitor only durable consumers owned by the process's started workers.
+    /// Persisted cursors from other assemblies are not evidence of a live worker.
+    pub fn set_runtime_workers(&self, workers: &[crate::runtime::RuntimeWorker]) {
+        *self
+            .expected_event_consumers
+            .write()
+            .expect("event consumer set lock") = workers
+            .iter()
+            .filter_map(|worker| worker.event_consumer_name())
+            .collect();
     }
 
     pub async fn compute_status(&self) -> Result<OperatorStatusResponse, ServiceError> {
@@ -63,7 +89,24 @@ impl OperatorStatusService {
         let active_execution_count = u32::try_from(active_executions.len())
             .map_err(|_| ServiceError::Db(db::DbError::InvalidTransition))?;
         let usage_summary = Some(self.usage_summary(active_execution_count).await?);
-        let recent_errors = self.recent_errors(now).await?;
+        let event_consumers = self.event_consumers(now).await?;
+        let storage = db::sqlite_storage_status(self.db.pool()).await?;
+        let database = DatabaseStorageStatus {
+            incremental_vacuum: storage.incremental_vacuum,
+            free_pages: storage.free_pages,
+        };
+        let mut recent_errors = self.recent_errors(now).await?;
+        // Reuse the existing operator issue/severity surface. These current
+        // alerts disappear on cursor recovery; no new alert ledger is needed.
+        for consumer in event_consumers.iter().filter(|consumer| consumer.stalled) {
+            recent_errors.push(RecentErrorSummary {
+                entity_type: "event_consumer".to_owned(),
+                entity_id: consumer.consumer_name.clone(),
+                error: format!("Event consumer stalled: cursor has not advanced for more than {} seconds; sequence lag {}", self.consumer_stall_seconds, consumer.lag),
+                occurred_at: consumer.last_advanced_at.clone().or_else(|| consumer.oldest_unprocessed_at.clone()).unwrap_or_else(|| computed_at.clone()),
+                severity: OperatorSeverity::Attention,
+            });
+        }
 
         let mut overall_severity = OperatorSeverity::Healthy;
         if !daemon_issues.is_empty() || !workspace_cleanup.is_empty() {
@@ -77,7 +120,10 @@ impl OperatorStatusService {
         if !blocked_tasks.is_empty() {
             raise_severity(&mut overall_severity, OperatorSeverity::Blocked);
         }
-        if !recent_errors.is_empty() || daemon_error_count > 0 {
+        for issue in &recent_errors {
+            raise_severity(&mut overall_severity, issue.severity.clone());
+        }
+        if daemon_error_count > 0 {
             raise_severity(&mut overall_severity, OperatorSeverity::Error);
         }
 
@@ -92,8 +138,51 @@ impl OperatorStatusService {
             retry_pressure,
             usage_summary,
             recent_errors,
+            event_consumers,
+            database,
             computed_at,
         })
+    }
+
+    async fn event_consumers(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<EventConsumerStatus>, ServiceError> {
+        let expected = self
+            .expected_event_consumers
+            .read()
+            .expect("event consumer set lock")
+            .clone();
+        let lag = self.db.domain_event_consumer_lag(&expected).await?;
+        Ok(lag
+            .into_iter()
+            .map(|consumer| {
+                // Both clocks must be old. An idle consumer has an old cursor,
+                // so an event that arrived a moment ago is not a stall.
+                let threshold = f64::from(self.consumer_stall_seconds);
+                let stalled = consumer.lag > 0
+                    && consumer
+                        .oldest_unprocessed_at
+                        .as_deref()
+                        .is_some_and(|pending| seconds_since(pending, now) > threshold)
+                    && consumer
+                        .last_advanced_at
+                        .as_deref()
+                        .is_none_or(|last| seconds_since(last, now) > threshold);
+                EventConsumerStatus {
+                    consumer_name: consumer.consumer_name,
+                    last_sequence: consumer.last_sequence,
+                    lag: consumer.lag,
+                    oldest_unprocessed_age_seconds: consumer
+                        .oldest_unprocessed_at
+                        .as_deref()
+                        .map(|created| seconds_since(created, now)),
+                    oldest_unprocessed_at: consumer.oldest_unprocessed_at,
+                    last_advanced_at: consumer.last_advanced_at,
+                    stalled,
+                }
+            })
+            .collect())
     }
 
     async fn active_executions(
@@ -674,6 +763,7 @@ mod tests {
         run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
         let service = OperatorStatusService::new(Arc::clone(&db));
+        service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
     }
 
@@ -1130,5 +1220,127 @@ mod tests {
             .unwrap()
             .blocked_tasks
             .is_empty());
+    }
+    #[tokio::test]
+    async fn consumer_lag_uses_sequence_distance_and_stalls_use_existing_attention_alerts() {
+        let (db, service) = test_service().await;
+        let now = Utc::now();
+        let old = (now - Duration::minutes(10)).to_rfc3339();
+        sqlx::query("INSERT INTO domain_event (sequence, id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES (1, 'processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?), (10, 'pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
+            .bind(&old).bind(&old).execute(db.pool()).await.unwrap();
+        for consumer in crate::runtime::COMMON_WORKERS
+            .into_iter()
+            .filter_map(|worker| worker.event_consumer_name())
+        {
+            sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 10, ?) ON CONFLICT(consumer_name) DO UPDATE SET last_sequence = 10, updated_at = excluded.updated_at")
+                .bind(consumer).bind(&old).execute(db.pool()).await.unwrap();
+        }
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'sse-broadcast'").execute(db.pool()).await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        let stalled = status
+            .event_consumers
+            .iter()
+            .find(|c| c.consumer_name == "sse-broadcast")
+            .unwrap();
+        assert_eq!(stalled.lag, 9); // Only one row is pending; gaps count in the metric.
+        assert!(stalled.stalled);
+        assert!(stalled.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
+        assert_eq!(status.recent_errors.len(), 1);
+        assert_eq!(status.recent_errors[0].entity_type, "event_consumer");
+        assert_eq!(
+            status.recent_errors[0].severity,
+            OperatorSeverity::Attention
+        );
+        assert!(status.database.incremental_vacuum);
+        assert_eq!(status.event_consumers.len(), 5);
+        assert!(status
+            .event_consumers
+            .iter()
+            .filter(|c| c.consumer_name != "sse-broadcast")
+            .all(|c| c.lag == 0
+                && !c.stalled
+                && c.oldest_unprocessed_at.is_none()
+                && c.last_advanced_at.as_deref() == Some(old.as_str())));
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'sse-broadcast'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
+        let recovered = service.compute_status().await.unwrap();
+        assert_eq!(recovered.overall_severity, OperatorSeverity::Healthy);
+        assert!(recovered.recent_errors.is_empty());
+        assert!(recovered
+            .event_consumers
+            .iter()
+            .all(|c| c.lag == 0 && !c.stalled));
+    }
+
+    #[tokio::test]
+    async fn consumer_stall_threshold_missing_cursors_and_empty_outbox_are_visible() {
+        let (db, service) = test_service().await;
+        let now = Utc::now();
+        let empty = service.event_consumers(now).await.unwrap();
+        assert_eq!(empty.len(), 5);
+        assert!(empty.iter().all(|c| c.lag == 0 && !c.stalled));
+        let old = (now - Duration::seconds(301)).to_rfc3339();
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(&old).execute(db.pool()).await.unwrap();
+        let missing = service.event_consumers(now).await.unwrap();
+        let consumer = missing
+            .iter()
+            .find(|c| c.consumer_name == "sse-broadcast")
+            .unwrap();
+        assert_eq!(consumer.lag, 1);
+        assert_eq!(consumer.last_advanced_at, None);
+        assert!(consumer.stalled);
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 0, ?)").bind((now - Duration::seconds(300)).to_rfc3339()).execute(db.pool()).await.unwrap();
+        let at_threshold = service.event_consumers(now).await.unwrap();
+        assert!(
+            !at_threshold
+                .iter()
+                .find(|c| c.consumer_name == "sse-broadcast")
+                .unwrap()
+                .stalled
+        );
+        let shorter = service
+            .with_consumer_stall_seconds(299)
+            .event_consumers(now)
+            .await
+            .unwrap();
+        assert!(
+            shorter
+                .iter()
+                .find(|c| c.consumer_name == "sse-broadcast")
+                .unwrap()
+                .stalled
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_consumer_with_old_cursor_is_never_stalled() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers.len(), 1);
+        let consumer = &status.event_consumers[0];
+        assert_eq!(consumer.lag, 0);
+        assert!(!consumer.stalled);
+        assert_eq!(consumer.oldest_unprocessed_age_seconds, None);
+        assert_eq!(
+            consumer.last_advanced_at.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+
+        // An event that just arrived is pending, not a stall, even though the
+        // idle cursor's last advance is decades old.
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('fresh', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
+            .bind(Utc::now().to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers[0].lag, 1);
+        assert!(!status.event_consumers[0].stalled);
+        assert!(status.recent_errors.is_empty());
     }
 }

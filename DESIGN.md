@@ -551,6 +551,19 @@ identifiers at 375/768/1280px. Loading uses the existing Skeleton; empty results
 the absence of assessment. Failed and unverified results keep their reason visible
 when collapsed.
 
+### Operations consumer and storage diagnostics
+
+The Operations page reuses its Section, StatCard, SeverityBadge, and operator
+issue rows for durable consumer diagnostics. Consumer names and sequence counters use the
+existing mono `text-xs`; timestamps and oldest pending age use muted metadata.
+Rows wrap on compact screens. Stalls show both the word “Stalled” and the existing
+Attention badge; caught-up rows say “Caught up”. Database mode and free pages use
+existing stat cards. Current stall alerts share the Errors and Alerts section,
+using semantic warning/destructive icons. Existing page loading, error, refresh,
+and empty states remain the state harness; the healthy empty message is withheld
+while any consumer has sequence lag. No new typography, spacing, or color tokens
+are introduced.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |

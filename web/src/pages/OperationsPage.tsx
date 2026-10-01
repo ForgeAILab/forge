@@ -17,6 +17,7 @@ import type {
   AgentPressureSummary,
   DaemonIssueSummary,
   DaemonPressureSummary,
+  EventConsumerStatus,
   OperatorSeverity,
   RecentErrorSummary,
   RetryPressureSummary,
@@ -459,16 +460,57 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
   )
 }
 
+function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
+  return (
+    <Section title="Event Consumers" count={items.length}>
+      <div className="divide-y">
+        {items.map((item) => (
+          <div
+            key={item.consumer_name}
+            className="flex min-w-0 flex-wrap items-start justify-between gap-4 px-4 py-3"
+          >
+            <div className="min-w-0">
+              <p className="break-all font-mono text-xs text-foreground">{item.consumer_name}</p>
+              <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
+                <span>Sequence lag {item.lag}</span>
+                <span>Cursor {item.last_sequence}</span>
+                <span>Last advanced {formatDate(item.last_advanced_at)}</span>
+                {item.oldest_unprocessed_age_seconds !== null ? (
+                  <span>
+                    Oldest pending {formatRuntimeSeconds(item.oldest_unprocessed_age_seconds)}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 text-xs">
+              <span>
+                {item.stalled ? 'Stalled' : item.oldest_unprocessed_at ? 'Processing' : 'Caught up'}
+              </span>
+              {item.stalled ? <SeverityBadge severity="attention" /> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
 function RecentErrorsSection({ errors }: { errors: RecentErrorSummary[] }) {
   return (
-    <Section title="Recent Errors" count={errors.length}>
+    <Section title="Errors and Alerts" count={errors.length}>
       <div className="divide-y">
         {errors.map((error) => (
           <div
             key={`${error.entity_type}-${error.entity_id}-${error.occurred_at}`}
             className="flex min-w-0 items-start gap-3 px-4 py-3 transition-colors hover:bg-muted/20"
           >
-            <WarningCircle size={16} className="mt-0.5 shrink-0 text-red-500" />
+            <WarningCircle
+              size={16}
+              className={cn(
+                'mt-0.5 shrink-0',
+                error.severity === 'attention' ? 'text-warning' : 'text-destructive',
+              )}
+            />
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <SeverityBadge severity={error.severity} />
@@ -525,7 +567,8 @@ export function OperationsPage() {
     status.agent_pressure.length === 0 &&
     status.workspace_cleanup.length === 0 &&
     status.retry_pressure.length === 0 &&
-    status.recent_errors.length === 0
+    status.recent_errors.length === 0 &&
+    status.event_consumers.every((consumer) => consumer.lag === 0)
 
   return (
     <div className="space-y-4">
@@ -567,6 +610,15 @@ export function OperationsPage() {
         <StatCard label="Retries" value={status.retry_pressure.length} />
         <StatCard label="Errors" value={status.recent_errors.length} />
       </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <StatCard
+          label="Database vacuum"
+          value={status.database.incremental_vacuum ? 'Incremental' : 'Conversion required'}
+        />
+        <StatCard label="Database free pages" value={status.database.free_pages} />
+      </div>
+      <EventConsumersSection items={status.event_consumers} />
 
       {status.usage_summary ? (
         <div className="space-y-3">

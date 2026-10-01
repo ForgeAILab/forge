@@ -340,7 +340,55 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+
+### Database space and consumer health
+
+Configure the consumer stall threshold with the usual
+**CLI > environment > file > default** precedence:
+
+```yaml
+server:
+  event_consumer_stall_seconds: 300    # positive seconds; default five minutes
+```
+
+The server flag is `--event-consumer-stall-seconds`; the environment variable is
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`. A consumer is stalled only while it has
+unprocessed events and its cursor has not advanced for longer than the threshold.
+A caught-up consumer is never stalled. The expected set follows the workers this
+process starts; disabled workers and their historical cursors are omitted.
+
+Pool connections use WAL with `synchronous=NORMAL`. Committed transactions survive
+process crashes; a power loss or OS crash can lose the most recent commits, while
+WAL recovery preserves database consistency. New databases enable incremental
+auto-vacuum before the first table is created. Every five seconds the storage
+maintenance worker runs
+`PRAGMA incremental_vacuum(100)` to reclaim at most 100 free pages. At 4 KiB per
+page, about 580 MB of free pages can drain in two hours, with each write-lock
+acquisition bounded to 100 pages. The worker is a no-op outside incremental mode.
+The Operations status reports the current mode and free-page count; free pages
+remain reusable even without vacuum.
+
+Existing databases keep their current auto-vacuum mode. To convert one, stop all
+Forge processes using that data directory, then run:
+
+```bash
+forge --data-dir ./test --convert-db-to-incremental-vacuum
+# Installed default data directory:
+forge --convert-db-to-incremental-vacuum
+```
+
+This command runs a one-time full `VACUUM` and exits without starting the server,
+workers, or migrations. It holds the same `<data-dir>/runtime.lock` as the server
+and Solo, and an exclusive SQLite lock for the conversion. Normal requests and
+other database connections cannot use the file during the rebuild. Plan free
+disk at least comparable to the database size; SQLite can require **up to twice
+the database size in additional free disk space** for the temporary rebuild and
+journal/WAL. Data is preserved. Conversion failure reports an error; restart
+Forge only after the command exits. Already-incremental databases are left in
+that mode without another full rebuild. Existing databases are never fully
+vacuumed automatically.
 
 ### Commands an Agent may run in its workspace
 

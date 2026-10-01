@@ -76,6 +76,9 @@ async fn operations_status_response_has_expected_structure() {
     assert!(status.get("retry_pressure").is_some());
     assert!(status.get("usage_summary").is_some());
     assert!(status.get("recent_errors").is_some());
+    assert!(status["event_consumers"].is_array());
+    assert!(status["database"]["incremental_vacuum"].is_boolean());
+    assert!(status["database"]["free_pages"].is_number());
 }
 
 #[tokio::test]
@@ -136,4 +139,41 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
     .expect("blocked task inserts");
 
     task_id
+}
+
+#[tokio::test]
+async fn operations_status_reports_stalled_consumer_and_database_storage() {
+    let workspace_root = common::TestDir::new("operations-status-outbox");
+    let harness = common::test_app(workspace_root.path(), "operations-status-outbox").await;
+    // This route harness has no supervisor; model one started broadcast worker.
+    harness
+        .state
+        .operator_status_service
+        .set_runtime_workers(&[services::RuntimeWorker::DomainEventBroadcast]);
+    let old = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(old).execute(harness.state.db.pool()).await.unwrap();
+    let status: OperatorStatusResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/operations/status",
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    let consumer = status
+        .event_consumers
+        .iter()
+        .find(|c| c.consumer_name == "sse-broadcast")
+        .unwrap();
+    assert_eq!(consumer.lag, 1);
+    assert!(consumer.stalled);
+    assert!(consumer.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
+    assert_eq!(status.overall_severity, OperatorSeverity::Attention);
+    assert!(status
+        .recent_errors
+        .iter()
+        .any(|alert| alert.entity_id == "sse-broadcast"
+            && alert.severity == OperatorSeverity::Attention));
+    assert!(status.database.incremental_vacuum);
+    assert!(status.database.free_pages >= 0);
 }

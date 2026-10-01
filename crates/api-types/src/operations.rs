@@ -78,6 +78,8 @@ pub struct OperatorStatusResponse {
     pub retry_pressure: Vec<RetryPressureSummary>,
     pub usage_summary: Option<UsageSummary>,
     pub recent_errors: Vec<RecentErrorSummary>,
+    pub event_consumers: Vec<EventConsumerStatus>,
+    pub database: DatabaseStorageStatus,
     pub computed_at: String,
 }
 
@@ -243,4 +245,28 @@ pub struct PlanProgressSummary {
     pub remaining: u32,
     pub available: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventConsumerStatus {
+    pub consumer_name: String,
+    #[ts(type = "number")]
+    pub last_sequence: i64,
+    /// Sequence distance, including gaps left by deleted events.
+    #[ts(type = "number")]
+    pub lag: i64,
+    pub oldest_unprocessed_at: Option<String>,
+    pub oldest_unprocessed_age_seconds: Option<f64>,
+    /// Null when an expected consumer has never established its cursor.
+    pub last_advanced_at: Option<String>,
+    pub stalled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DatabaseStorageStatus {
+    pub incremental_vacuum: bool,
+    #[ts(type = "number")]
+    pub free_pages: i64,
 }

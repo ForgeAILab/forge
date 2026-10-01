@@ -33,6 +33,9 @@ use crate::{
     WorkspaceExecutionLockManager,
 };
 
+mod storage_maintenance;
+use storage_maintenance::StorageMaintenanceWorker;
+
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Stable module paths for callers that want to keep builder and supervisor
@@ -126,9 +129,23 @@ pub enum RuntimeWorker {
     ProjectHooks,
     WorkspaceCleanup,
     DomainEventBroadcast,
+    StorageMaintenance,
 }
 
-const COMMON_WORKERS: [RuntimeWorker; 14] = [
+impl RuntimeWorker {
+    pub(crate) fn event_consumer_name(self) -> Option<&'static str> {
+        match self {
+            Self::Memory => Some(crate::memory_consumer_name()),
+            Self::Coordination => Some(crate::coordination_consumer_name()),
+            Self::Attention => Some(crate::attention_service::attention_consumer_name()),
+            Self::WakeDelivery => Some(crate::wake_turn_consumer_name()),
+            Self::DomainEventBroadcast => Some(crate::domain_event_broadcast_consumer_name()),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) const COMMON_WORKERS: [RuntimeWorker; 15] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -143,6 +160,7 @@ const COMMON_WORKERS: [RuntimeWorker; 14] = [
     RuntimeWorker::ProjectHooks,
     RuntimeWorker::WorkspaceCleanup,
     RuntimeWorker::DomainEventBroadcast,
+    RuntimeWorker::StorageMaintenance,
 ];
 
 /// Abortable ownership for a compatibility worker that starts before a
@@ -230,6 +248,7 @@ pub struct ForgeRuntime {
     pub attention_projection: Arc<AttentionService>,
     pub wake_turn_consumer: Arc<WakeTurnConsumer>,
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
+    storage_maintenance: Arc<StorageMaintenanceWorker>,
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
@@ -629,7 +648,10 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&task_service),
             Arc::clone(&notification_service),
         ));
-        let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&self.db)));
+        let operator_status_service = Arc::new(
+            OperatorStatusService::new(Arc::clone(&self.db))
+                .with_consumer_stall_seconds(effective_config.server.event_consumer_stall_seconds),
+        );
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::new(Arc::clone(&self.event_bus)));
         let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
@@ -687,6 +709,7 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         ));
+        let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new(
             Arc::clone(&self.db),
@@ -732,6 +755,7 @@ impl ForgeRuntimeBuilder {
             attention_projection,
             wake_turn_consumer,
             domain_event_broadcast,
+            storage_maintenance,
             lifecycle_emitter,
             workspace_exec_locks,
             repo_cache_locks,
@@ -918,8 +942,19 @@ impl RuntimeSupervisor {
         ));
         self.handles.push((
             RuntimeWorker::DomainEventBroadcast,
-            Arc::clone(&self.runtime.domain_event_broadcast).start(shutdown),
+            Arc::clone(&self.runtime.domain_event_broadcast).start(shutdown.clone()),
         ));
+        self.handles.push((
+            RuntimeWorker::StorageMaintenance,
+            Arc::clone(&self.runtime.storage_maintenance).start(shutdown),
+        ));
+        self.runtime.operator_status_service.set_runtime_workers(
+            &self
+                .handles
+                .iter()
+                .map(|(worker, _)| *worker)
+                .collect::<Vec<_>>(),
+        );
         self.started = true;
         tracing::info!(mode = ?self.mode, recovered, "Forge runtime started");
         Ok(recovered)
@@ -984,6 +1019,9 @@ impl RuntimeSupervisor {
                 }
             }
         }
+        self.runtime
+            .operator_status_service
+            .set_runtime_workers(&[]);
         graceful_result
     }
 }
@@ -993,6 +1031,9 @@ impl Drop for RuntimeSupervisor {
         self.runtime.shutdown_signal.request();
         self.runtime.heartbeat_monitor.stop();
         self.runtime.task_dispatcher.stop();
+        self.runtime
+            .operator_status_service
+            .set_runtime_workers(&[]);
         for (_, handle) in self.handles.drain(..) {
             handle.abort();
         }
@@ -1047,12 +1088,47 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 14);
+        assert_eq!(COMMON_WORKERS.len(), 15);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
         assert_eq!(COMMON_WORKERS[4], RuntimeWorker::TaskDispatcher);
         assert_eq!(COMMON_WORKERS[13], RuntimeWorker::DomainEventBroadcast);
+        assert_eq!(COMMON_WORKERS[14], RuntimeWorker::StorageMaintenance);
+    }
+
+    #[tokio::test]
+    async fn consumer_monitoring_excludes_a_disabled_worker_with_or_without_a_cursor() {
+        let runtime = runtime().await;
+        let service = &runtime.operator_status_service;
+        assert!(service
+            .compute_status()
+            .await
+            .unwrap()
+            .event_consumers
+            .is_empty());
+        let enabled: Vec<_> = COMMON_WORKERS
+            .into_iter()
+            .filter(|worker| *worker != RuntimeWorker::Memory)
+            .collect();
+        service.set_runtime_workers(&enabled);
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(runtime.db.pool()).await.unwrap();
+        for has_cursor in [false, true] {
+            if has_cursor {
+                sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, '2000-01-01T00:00:00Z')")
+                    .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
+            }
+            let status = service.compute_status().await.unwrap();
+            assert_eq!(status.event_consumers.len(), 4);
+            assert!(status
+                .event_consumers
+                .iter()
+                .all(|consumer| consumer.consumer_name != crate::memory_consumer_name()));
+            assert!(!status
+                .recent_errors
+                .iter()
+                .any(|error| error.entity_id == crate::memory_consumer_name()));
+        }
     }
 
     #[tokio::test]
@@ -1063,14 +1139,27 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 14);
-        assert_eq!(supervisor.worker_handle_count(), 13);
+        assert_eq!(supervisor.workers().len(), 15);
+        assert_eq!(supervisor.worker_handle_count(), 14);
+        let monitored = runtime_graph
+            .operator_status_service
+            .compute_status()
+            .await
+            .unwrap();
+        assert_eq!(monitored.event_consumers.len(), 5);
         assert_eq!(supervisor.start().await.expect("second start is no-op"), 0);
         supervisor.shutdown().await.expect("runtime shuts down");
         supervisor
             .shutdown()
             .await
             .expect("second shutdown is no-op");
+        assert!(runtime_graph
+            .operator_status_service
+            .compute_status()
+            .await
+            .unwrap()
+            .event_consumers
+            .is_empty());
 
         let second_runtime = runtime().await;
         let mut rejected = RuntimeSupervisor::new(second_runtime, RuntimeAssemblyMode::Solo);
@@ -1084,7 +1173,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 13);
+        assert_eq!(supervisor.worker_handle_count(), 14);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

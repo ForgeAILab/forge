@@ -1671,6 +1671,35 @@ actor, correlation/causation, bounded reaction depth, and dedupe identity.
 Consumers claim durable cursors/leases and checkpoint only after idempotent
 projection, so lag and restart replay cannot duplicate chat turn jobs,
 Attention rows, actions, memory indexing, or commitment reconciliation.
+
+`domain_event` rows are not pruned. The table also serves as an idempotency
+ledger (including lookups by `dedupe_key`) and as history for lease, execution,
+milestone, and project logic. Age and consumer progress alone cannot establish
+that a row is safe to delete. Event retention is planned with the outbox redesign,
+which will first separate the idempotency ledger and domain history from delivery
+bookkeeping.
+
+The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
+seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
+step of the statement. At 4 KiB per page this can drain about 580 MB of free pages
+in two hours, while limiting each write-lock acquisition to 100 pages. It shares
+the runtime shutdown channel and skips missed ticks. It does nothing on a
+database outside incremental mode.
+
+New SQLite files enable `auto_vacuum=INCREMENTAL` before the WAL switch and their
+first table. WAL pool connections use `synchronous=NORMAL`. Existing files retain
+their mode until an operator runs the explicit offline full-VACUUM conversion.
+Server and Solo data-root process locking excludes that conversion from a
+running runtime. Operator status reports free pages, incremental mode, consumer
+sequence lag and oldest pending age. Its expected consumers are derived from the
+workers the supervisor starts; persisted cursors for workers outside that set
+are omitted. All five durable consumers currently start unconditionally in both
+Server and Solo, including when MCP or the embedded daemon is disabled. A cursor
+is stalled only when unprocessed events exist and it has not advanced for longer
+than the configured threshold; an idle consumer with zero lag is never stalled.
+See [getting-started.md](getting-started.md#database-space-and-consumer-health)
+for the stall threshold, durability tradeoffs, and offline conversion requirements.
+
 The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
 terminal Task transition events into one task-outcome inbox item and, for a
 scope-validated originating commitment, one delivery evidence/lifecycle

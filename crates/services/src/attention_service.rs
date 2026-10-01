@@ -27,6 +27,11 @@ use tokio::time::Instant;
 use crate::{Result, ServiceError};
 
 const CONSUMER_NAME: &str = "attention_projection";
+
+pub(crate) fn attention_consumer_name() -> &'static str {
+    CONSUMER_NAME
+}
+
 const CONSUMER_LEASE_SECONDS: i64 = 30;
 const CONSUMER_STALE_SECONDS: i64 = 90;
 const MAX_ATTENTION_SUMMARY_LEN: usize = 160;

@@ -5,6 +5,8 @@ use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{errors::ApiResult, routes::auth::RequireAdmin, state::AppState};
 
+/// Admin snapshot including durable consumer lag/stall alerts and SQLite
+/// incremental-vacuum mode/freelist diagnostics, computed by the shared service.
 pub async fn get_operations_status(
     _admin: RequireAdmin,
     State(state): State<AppState>,

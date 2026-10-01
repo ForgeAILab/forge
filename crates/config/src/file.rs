@@ -58,6 +58,7 @@ pub(crate) struct FileServerConfig {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

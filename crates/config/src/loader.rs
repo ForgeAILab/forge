@@ -60,6 +60,9 @@ impl ForgeConfig {
             if let Some(media_upload_limit_bytes) = server.media_upload_limit_bytes {
                 self.server.media_upload_limit_bytes = media_upload_limit_bytes;
             }
+            if let Some(seconds) = server.event_consumer_stall_seconds {
+                self.server.event_consumer_stall_seconds = seconds;
+            }
         }
 
         if let Some(workspace) = file.workspace {
@@ -176,6 +179,10 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_EVENT_CONSUMER_STALL_SECONDS") {
+            self.server.event_consumer_stall_seconds =
+                parse_env_u32("FORGE_EVENT_CONSUMER_STALL_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_BIND") {
             self.server.bind = value;
         }
@@ -239,6 +246,9 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(seconds) = overrides.event_consumer_stall_seconds {
+            self.server.event_consumer_stall_seconds = seconds;
+        }
         if let Some(server_bind) = overrides.server_bind {
             self.server.bind = server_bind;
         }
