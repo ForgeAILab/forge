@@ -6,6 +6,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Changed
+
+- Agents now get guidance that keeps a Project easy to merge. Charter
+  discovery asks for small modules with clear ownership and no hub file that
+  every feature must edit. The Project Agent names the paths each Task owns,
+  gives parallel Tasks disjoint files, and orders shared-file edits with
+  dependencies. Task planners and the `AGENTS.md` written into a scaffolded
+  repository tell workers to stay inside those paths and report a required
+  edit outside them. Sessions and turns admitted before the upgrade keep the
+  text they started with.
+- Rust tests set up a fresh database by copying a migrated snapshot, built
+  once per test process, where they used to replay every migration. Production
+  builds, existing databases and custom migration directories are unchanged.
+  `libsqlite3-sys`, `sqlx-core` and `sqlx-sqlite` build at `opt-level = 3` in
+  the dev profile. See `docs/ci.md`.
+
+### Fixed
+
+- A Main Agent turn admitted under the second baseline revision is no longer
+  treated as a discovery turn after an upgrade.
+
 ## [0.13.12] - 2026-10-01
 
 ### Breaking
