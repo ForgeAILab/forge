@@ -2375,7 +2375,7 @@ impl MilestoneRuntime {
         let mut context = Vec::new();
         for task in tasks {
             let rows = sqlx::query(
-                "SELECT repo.id AS repo_id, repo.name AS repository_name,
+                "SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
                         CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END AS remote_url,
                         repo.default_branch,
                         e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
@@ -2417,6 +2417,7 @@ impl MilestoneRuntime {
                 task_version: task.version,
                 repository_id: row.try_get("repo_id")?,
                 repository_name: row.try_get("repository_name")?,
+                repository_kind: row.try_get("repository_kind")?,
                 remote_url: db::normalize_repo_remote_url(row.try_get("remote_url")?),
                 default_branch: row.try_get("default_branch")?,
                 execution_id: row.try_get("execution_id")?,
@@ -3473,6 +3474,7 @@ struct RepositoryContextReference {
     task_version: i64,
     repository_id: String,
     repository_name: String,
+    repository_kind: String,
     remote_url: Option<String>,
     default_branch: String,
     execution_id: Option<String>,
@@ -3500,6 +3502,7 @@ fn validate_repository_context_reference(
         || reference.task_version <= 0
         || reference.repository_id.trim().is_empty()
         || reference.repository_name.trim().is_empty()
+        || reference.repository_kind.trim().is_empty()
         || reference.default_branch.trim().is_empty()
         || reference.observed_at.trim().is_empty()
         || reference
@@ -4790,6 +4793,80 @@ mod tests {
                 assert!(validate_repository_context_reference(&incomplete).is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn repository_context_digest_includes_stored_repository_kind() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let observed_at = "2026-09-30T10:11:12Z";
+        sqlx::query(
+            "INSERT INTO project
+             (id, name, settings, workflow_definition, primary_repo_id, created_at, updated_at)
+             VALUES ('project-digest', 'Digest Project', '{}', '{}', NULL, ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("project inserts");
+        sqlx::query(
+            "INSERT INTO repo
+             (id, project_id, name, remote_url, work_mode, default_branch, created_at, updated_at)
+             VALUES ('repo-digest', 'project-digest', 'Digest Repo',
+                     'https://example.test/digest.git', 'pull_request', 'release', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("repository inserts");
+        sqlx::query(
+            "UPDATE project SET primary_repo_id = 'repo-digest' WHERE id = 'project-digest'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("primary repository selects");
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, title, task_type, status, created_at, updated_at)
+             VALUES ('task-digest', 'project-digest', 'Digest Task', 'task', 'done', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("task inserts");
+
+        let runtime = MilestoneRuntime::new(Arc::clone(&db));
+        let mut tx = db.pool().begin().await.expect("transaction begins");
+        let contexts = runtime
+            .commit_build_check_context_in_tx(
+                &mut tx,
+                "project-digest",
+                &[ReadinessTaskState {
+                    task_id: "task-digest".to_owned(),
+                    version: 3,
+                    task_type: "task".to_owned(),
+                    state: "done".to_owned(),
+                    observed_at: observed_at.to_owned(),
+                }],
+            )
+            .await
+            .expect("repository context builds");
+        tx.rollback().await.expect("transaction rolls back");
+
+        let reference: RepositoryContextReference =
+            serde_json::from_str(&contexts[0]).expect("repository context decodes");
+        assert_eq!(reference.repository_kind, "pull_request");
+        assert_eq!(
+            canonical_digest_with_schema(MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION, &reference)
+                .expect("release reference digest computes"),
+            "58b2fd11c4b612dda1dd63aca95a472fffc117d212c79cc95e0612aaaa587f47"
+        );
     }
 
     #[tokio::test]

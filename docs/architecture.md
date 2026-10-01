@@ -1127,8 +1127,8 @@ for proof.
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
 Repository/build context permits an absent remote URL for local-only
 repositories; blank remote URLs normalize to `NULL`/`None` at repository writes
-and context reads. Repository identity, name, default branch, Task version, and
-observed timestamp remain required immutable metadata.
+and context reads. Repository identity, name, work mode, default branch, Task
+version, and observed timestamp remain required immutable metadata.
 
 Each snapshot records the exact input manifest, source versions, evidence attachment
 IDs/digests, policy references, result (`ready`, `blocked`, `failed`, or
@@ -3022,7 +3022,8 @@ completion retains strict parsing.
 The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
 runs `run_merge` when its last entry is at least two minutes old, it has no
 blocking annotation or running entry barrier, and no execution, merge hook, or
-completion cascade is running for the Task. Human approval gates remain parked.
+completion cascade is running for the Task. Human approval gates and legacy
+pull-request merge waits remain parked until an operator chooses Retry Merge.
 Recovery uses the same versioned, same-state engine entry path as paused
 integration retries, so entry hooks and their normal success/failure cascades
 run again; a version conflict skips the tick. The merge hook is tracked through
@@ -3492,7 +3493,7 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   projection, and `WorkspaceCleanupScheduler`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
   runs configured checks before ordinary reviewer dispatch. `ReviewRunner`
-  owns reviewer/auditor execution and explicit review reruns. Task configuration
+  owns explicit reviewer/auditor reruns. Task configuration
   overrides the Project's `default_review_config`; otherwise the Project
   defaults are inherited. A ready Project Agent can replace both
   default lists through the versioned, receipt-atomic `project.review_config`
@@ -3585,8 +3586,9 @@ candidate route instead of a single adapter:
   equality is not sufficient).
 - **mcp-server** — JSON-RPC dispatch over `POST /mcp` with its own `McpState`.
   Does not depend on the `api` crate.
-- **workspace** — Keyed in-process locks serialize repository-cache/integration
-  and Workspace execution operations. Path validation prevents traversal escapes.
+- **workspace** — `.forge.lock` records task-worktree lock state; keyed in-process
+  locks serialize repository-cache/integration and Workspace execution operations.
+  Path validation prevents traversal escapes.
 - **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
   file > defaults. Default bind uses loopback with an OS-selected port, then
   persists the selected port under the Forge data directory.

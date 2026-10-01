@@ -2285,6 +2285,70 @@ async fn dispatcher_merge_gate_completes_already_merged_branch() {
 }
 
 #[tokio::test]
+async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    run_git(fixture._repo_dir.path(), &["reset", "--hard", "HEAD~2"]);
+    let candidate_sha = run_git(
+        fixture._workspace_dir.path().join("worktree").as_path(),
+        &["rev-parse", "HEAD"],
+    );
+    assert_ne!(
+        run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]),
+        candidate_sha
+    );
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "awaiting_human": true,
+                "awaiting_human_reason": "pull_request_merge",
+                "awaiting_human_marker_id": "legacy-pr-marker",
+            })
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+    let parked = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.status, "merging");
+    assert_eq!(
+        fixture
+            .dispatcher
+            .task_service
+            .available_recovery_actions(&parked.id)
+            .await
+            .unwrap(),
+        vec![api_types::RecoveryAction::RetryHook]
+    );
+
+    let merged = fixture
+        .dispatcher
+        .task_service
+        .recover_task(
+            &parked.id,
+            api_types::RecoveryAction::RetryHook,
+            Some("operator approved direct merge".to_owned()),
+            None,
+        )
+        .await
+        .expect("human merge retry integrates the reviewed candidate");
+    assert_eq!(merged.status, "done");
+    assert_eq!(
+        run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]),
+        candidate_sha
+    );
+    let metadata = db::TaskMetadata::parse(merged.metadata_json.as_deref()).unwrap();
+    assert!(metadata.extra.get("awaiting_human").is_none());
+    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+    assert!(metadata.extra.get("awaiting_human_marker_id").is_none());
+}
+
+#[tokio::test]
 async fn dispatcher_merge_gate_respects_entry_grace() {
     let fixture = merge_gate_fixture(chrono::Duration::seconds(30)).await;
     assert_merge_gate_untouched(&fixture).await;

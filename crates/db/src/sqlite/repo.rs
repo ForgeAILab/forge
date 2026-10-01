@@ -194,6 +194,10 @@ impl RepoRepo for SqliteDb {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query("DELETE FROM pr_provider_config WHERE repo_id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         let result = sqlx::query("DELETE FROM repo WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)

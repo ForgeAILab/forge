@@ -15,8 +15,8 @@ use std::{
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
 // Embedded migration bundle revision: V202610010600 (typed chat turn failures,
-// bounded deferrals, and invocation backfill; includes pull-request work-mode
-// removal at V202610010520).
+// bounded deferrals, and invocation backfill; V202610010520 preserves work-mode
+// digest provenance and clears legacy pull-request tokens).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later

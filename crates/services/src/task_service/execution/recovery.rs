@@ -41,6 +41,9 @@ impl TaskService {
                 ]);
             }
         }
+        if is_pull_request_merge_wait(&task) {
+            return Ok(vec![api_types::RecoveryAction::RetryHook]);
+        }
         let mut actions = self
             .recovery_annotation(&task)
             .map(|annotation| annotation.recovery_actions)
@@ -349,6 +352,14 @@ impl TaskService {
                     }
                 }
             }
+        }
+        if is_pull_request_merge_wait(&task) {
+            if action != api_types::RecoveryAction::RetryHook {
+                return Err(ServiceError::invalid_operation(
+                    "recovery action is not allowed for a Task awaiting pull-request merge; allowed: retry_hook",
+                ));
+            }
+            return self.recover_pull_request_merge_wait(task, reason).await;
         }
         let annotation = self.recovery_annotation(&task);
         if let Ok(explicit) = &annotation {
@@ -3143,6 +3154,37 @@ impl TaskService {
         Ok(recovered)
     }
 
+    async fn recover_pull_request_merge_wait(
+        &self,
+        task: Task,
+        reason: Option<String>,
+    ) -> Result<Task> {
+        let cleared = TaskRepo::mutate_metadata_and_bump_version(
+            &*self.db,
+            &task.id,
+            task.version,
+            vec![TaskMetadataMutation::CompareAndMutate {
+                key: "awaiting_human_reason".to_owned(),
+                expected: Value::String("pull_request_merge".to_owned()),
+                mutations: vec![
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human".to_owned(),
+                    },
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human_reason".to_owned(),
+                    },
+                    TaskMetadataMutation::Remove {
+                        key: "awaiting_human_marker_id".to_owned(),
+                    },
+                ],
+            }],
+            &now_rfc3339(),
+        )
+        .await?;
+        self.recover_retry_current_state_hooks(cleared, reason)
+            .await
+    }
+
     async fn recover_manual_merge_repair_for_review(
         &self,
         task: Task,
@@ -3749,6 +3791,21 @@ fn is_retry_exhausted_blocked_metadata(raw_metadata: &str) -> bool {
 
 fn is_recoverable_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
     annotation.annotation_type.is_merge_recoverable()
+}
+
+fn is_pull_request_merge_wait(task: &Task) -> bool {
+    task.status == crate::workflow::default_states::MERGING
+        && task
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|metadata| {
+                metadata.get("awaiting_human").and_then(Value::as_bool) == Some(true)
+                    && metadata
+                        .get("awaiting_human_reason")
+                        .and_then(Value::as_str)
+                        == Some("pull_request_merge")
+            })
 }
 
 fn is_human_merge_gate_annotation(annotation: &api_types::TaskBlockingAnnotation) -> bool {
