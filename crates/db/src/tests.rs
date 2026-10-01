@@ -1708,6 +1708,51 @@ async fn seed_workspace_for_task(db: &SqliteDb, task_id: &str, repo_id: &str) ->
 }
 
 #[tokio::test]
+async fn clearing_workspace_cleanup_deadline_clears_retry_state() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "done".to_owned(),
+        "cleanup retry reset",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    sqlx::query(
+        "UPDATE workspace
+         SET cleanup_attempts = 3, last_cleanup_error = 'cleanup failed'
+         WHERE id = ?",
+    )
+    .bind(&workspace_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let workspace = WorkspaceRepo::set_cleanup_after(
+        &db,
+        &workspace_id,
+        Some("2026-10-01T12:00:00Z".to_owned()),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(workspace.cleanup_attempts, 3);
+    assert_eq!(
+        workspace.last_cleanup_error.as_deref(),
+        Some("cleanup failed")
+    );
+
+    let workspace = WorkspaceRepo::set_cleanup_after(&db, &workspace_id, None, &now_rfc3339())
+        .await
+        .unwrap();
+    assert!(workspace.cleanup_after.is_none());
+    assert_eq!(workspace.cleanup_attempts, 0);
+    assert!(workspace.last_cleanup_error.is_none());
+}
+
+#[tokio::test]
 async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;

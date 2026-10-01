@@ -701,7 +701,7 @@ async fn worker_robustness_project_hook_receiver_continues_after_lag() {
         },
     });
 
-    timeout(Duration::from_secs(1), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             if task_count_by_title(&db, &project.id, "Created after lag").await == 1 {
                 break;

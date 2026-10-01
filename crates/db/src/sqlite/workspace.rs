@@ -77,13 +77,21 @@ impl WorkspaceRepo for SqliteDb {
         cleanup_after: Option<String>,
         updated_at: &str,
     ) -> Result<Workspace> {
-        let result =
-            sqlx::query("UPDATE workspace SET cleanup_after = ?, updated_at = ? WHERE id = ?")
-                .bind(cleanup_after.as_deref())
-                .bind(updated_at)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET cleanup_after = ?,
+                 cleanup_attempts = CASE WHEN ? IS NULL THEN 0 ELSE cleanup_attempts END,
+                 last_cleanup_error = CASE WHEN ? IS NULL THEN NULL ELSE last_cleanup_error END,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }

@@ -218,18 +218,27 @@ impl WorkspaceCleanupScheduler {
             transaction.commit().await?;
             return Ok(());
         };
-        let delay = cleanup_backoff(previous_attempts);
+        let owner_unreachable = matches!(cleanup_error, ServiceError::DaemonUnavailable { .. });
+        let delay = if owner_unreachable {
+            TICK_INTERVAL
+        } else {
+            cleanup_backoff(previous_attempts)
+        };
         let cleanup_after = chrono::Utc::now()
             + chrono::Duration::from_std(delay).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid cleanup delay: {error}"))
             })?;
+        let last_cleanup_error = cleanup_error.to_string();
+        let last_cleanup_error =
+            crate::project_environment::bounded_output_tail(&last_cleanup_error);
         sqlx::query(
             "UPDATE workspace
-             SET cleanup_attempts = cleanup_attempts + 1,
+             SET cleanup_attempts = cleanup_attempts + ?,
                  last_cleanup_error = ?, cleanup_after = ?, updated_at = ?
              WHERE task_id = ? AND status != 'cleaned'",
         )
-        .bind(cleanup_error.to_string())
+        .bind(if owner_unreachable { 0_i64 } else { 1_i64 })
+        .bind(last_cleanup_error)
         .bind(cleanup_after.to_rfc3339())
         .bind(now_rfc3339())
         .bind(task_id)
@@ -689,6 +698,14 @@ mod tests {
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         Arc::new(SqliteDb::new(pool))
+    }
+
+    #[test]
+    fn cleanup_backoff_starts_at_one_minute_and_caps_at_one_hour() {
+        assert_eq!(cleanup_backoff(0), Duration::from_secs(60));
+        assert_eq!(cleanup_backoff(1), Duration::from_secs(120));
+        assert_eq!(cleanup_backoff(6), Duration::from_secs(3600));
+        assert_eq!(cleanup_backoff(7), Duration::from_secs(3600));
     }
 
     async fn seed_workspace(
@@ -1169,6 +1186,86 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_persistence_bounds_errors_and_keeps_offline_retry_fixed() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (offline_id, _) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let offline_task_id = WorkspaceRepo::get_by_id(&*db, &offline_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        sqlx::query(
+            "UPDATE workspace
+             SET cleanup_attempts = 6, last_cleanup_error = 'prior failure'
+             WHERE id = ?",
+        )
+        .bind(&offline_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        let before = chrono::Utc::now();
+        scheduler
+            .record_cleanup_failure(
+                &offline_task_id,
+                &ServiceError::DaemonUnavailable {
+                    daemon_id: "offline-owner".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let after = chrono::Utc::now();
+        let offline = WorkspaceRepo::get_by_id(&*db, &offline_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_at = chrono::DateTime::parse_from_rfc3339(
+            offline
+                .cleanup_after
+                .as_deref()
+                .expect("retry is scheduled"),
+        )
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+        assert_eq!(offline.cleanup_attempts, 6);
+        assert!(retry_at >= before + chrono::Duration::seconds(60));
+        assert!(retry_at <= after + chrono::Duration::seconds(60));
+
+        let (bounded_id, _) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let bounded_task_id = WorkspaceRepo::get_by_id(&*db, &bounded_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id;
+        let long_error = format!("{}diagnostic-tail", "界".repeat(2_000));
+        scheduler
+            .record_cleanup_failure(
+                &bounded_task_id,
+                &ServiceError::invalid_operation(long_error),
+            )
+            .await
+            .unwrap();
+        let bounded = WorkspaceRepo::get_by_id(&*db, &bounded_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = bounded
+            .last_cleanup_error
+            .as_deref()
+            .expect("last cleanup error is stored");
+        assert_eq!(
+            error.chars().count(),
+            crate::project_environment::BLOCK_MESSAGE_OUTPUT_CHARS
+        );
+        assert!(error.ends_with("diagnostic-tail"));
     }
 
     #[tokio::test]
