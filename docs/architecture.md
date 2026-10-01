@@ -1954,9 +1954,11 @@ change authentication or the peer address.
 Agent-critical mutations commit a monotonic `domain_event` row in the same
 SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
-Consumers claim durable cursors/leases and checkpoint only after idempotent
-projection, so lag and restart replay cannot duplicate chat turn jobs,
-Attention rows, actions, memory indexing, or commitment reconciliation.
+Durable consumers checkpoint only after their projection is safe to commit, so
+lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
+memory indexing, or commitment reconciliation. The memory consumer uses the
+single-process worker runtime described below; the other four consumers still
+use the legacy cursor/lease/receipt protocol.
 
 `domain_event` rows are not pruned. The table also serves as an idempotency
 ledger (including lookups by `dedupe_key`) and as history for lease, execution,
@@ -1964,6 +1966,57 @@ milestone, and project logic. Age and consumer progress alone cannot establish
 that a row is safe to delete. Event retention is planned with the outbox redesign,
 which will first separate the idempotency ledger and domain history from delivery
 bookkeeping.
+
+#### Worker runtime contract
+
+`services::worker_runtime::WorkerRuntime` is the shared execution contract for
+ordered, single-process durable-event workers. A worker declares one stable
+name and a non-empty set of event types. The name is also its
+`event_consumer_cursor` key, so migration preserves the existing checkpoint.
+The runtime selects only subscribed types in SQL and processes their sequences
+strictly in ascending order. A successful checkpoint may jump over deleted or
+unsubscribed sequences; a trailing run of unsubscribed events advances the
+cursor and health once for the whole run and writes no lease or receipt rows.
+
+Handling has two phases. `handle(event)` runs before a write transaction and
+returns `Done(prepared)`, `RetryAfter(duration)`, or `DeadLetter(reason)`. It may
+perform slow or external work. For `Done`, `commit(transaction, event,
+prepared)` may await database operations only. The prepared effect, cursor
+advance, and health update commit in that one short transaction; an error rolls
+all three back. This split forbids holding a SQLite write transaction across a
+network, process, timer, or other external await.
+
+There is one poison-event policy. A failed event remains at the cursor head and
+is retried with bounded back-off. Retry sequence, attempts, and next-attempt
+time live in the worker's single health row rather than a per-event lease. On
+the fifth failed attempt the runtime writes one `worker_dead_letter` row with a
+bounded, payload-free error and advances the cursor. `DeadLetter(reason)` takes
+that path immediately. Historical lease and receipt rows from a worker's
+pre-migration implementation remain for normal retention; the runtime neither
+reads nor adds to them.
+
+`worker_health` is the source of truth for a migrated worker. It records the
+cursor, global domain-event head, exact count of pending subscribed events,
+oldest pending subscribed-event timestamp, a bounded last error and its time,
+restart count, last success time, cursor-advance time, and durable retry state.
+The last error is cleared only by the next successful handled event. A row with
+zero lag and no oldest-pending timestamp is idle; positive lag plus an old
+cursor/pending timestamp is stalled. Operator status maps this row onto the
+existing consumer-status response. Legacy consumers continue to report the
+conservative global `head - cursor` lag.
+
+Idle reads use exponential polling from 250 milliseconds through five seconds
+without opening a write transaction when caught up. Append paths for a
+runtime worker's subscribed events wake the process-local `tokio::sync::Notify`
+only after their transaction commits; polling remains the durable fallback for
+a missed notification. Each runtime worker has an outer supervisor which
+restarts a returned or panicked
+task with bounded back-off, increments `restart_count`, and makes both retry and
+restart waits interruptible by shutdown.
+
+Only `scoped-memory-agent-chat-indexer` runs on `WorkerRuntime` so far. The
+coordination, Attention, wake-turn, and SSE relay consumers intentionally remain
+on their existing loops in this slice.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
@@ -1979,7 +2032,9 @@ Server and Solo data-root process locking excludes that conversion from a
 running runtime. Operator status reports free pages, incremental mode, consumer
 sequence lag and oldest pending age. Its expected consumers are derived from the
 workers the supervisor starts; persisted cursors for workers outside that set
-are omitted. All five durable consumers currently start unconditionally in both
+are omitted. Migrated workers read this status from `worker_health`; legacy
+consumers derive it from the cursor and global event head. All five durable
+consumers currently start unconditionally in both
 Server and Solo, including when MCP or the embedded daemon is disabled. A cursor
 is stalled only when unprocessed events exist and it has not advanced for longer
 than the configured threshold; an idle consumer with zero lag is never stalled.

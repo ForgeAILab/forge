@@ -72,6 +72,88 @@ fn reject_retired_room_memory(item: &MemoryItem) -> Result<()> {
     Ok(())
 }
 
+impl SqliteDb {
+    /// Insert an event-derived memory item inside a caller-owned transaction.
+    /// WorkerRuntime uses this so the projection effect and its durable cursor
+    /// advance share one commit boundary.
+    pub async fn insert_memory_item_if_source_absent_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        item: &MemoryItem,
+        source_type: &str,
+        source_ref: &str,
+    ) -> Result<bool> {
+        reject_retired_room_memory(item)?;
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM memory_item
+                WHERE scope_type = ? AND scope_id = ? AND source_type = ?
+                  AND source_type <> 'room' AND kind <> 'room_message'
+                  AND json_valid(metadata_json)
+                  AND json_extract(metadata_json, '$.source_ref') = ?
+             )",
+        )
+        .bind(&item.scope_type)
+        .bind(&item.scope_id)
+        .bind(source_type)
+        .bind(source_ref)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if exists != 0 {
+            return Ok(false);
+        }
+
+        sqlx::query("INSERT INTO memory_item (id, project_id, task_id, execution_id, scope_type, scope_id, visibility, owner_identity_id, authority, sensitivity, retention_priority, provenance_json, publication_source_id, supersedes_id, valid_from, valid_until, source_event_id, source_scope_type, source_scope_id, source_revision, source_type, kind, title, summary, body, metadata_json, confidence, quality_score, created_by_type, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&item.id)
+            .bind(item.project_id.as_deref())
+            .bind(item.task_id.as_deref())
+            .bind(item.execution_id.as_deref())
+            .bind(&item.scope_type)
+            .bind(&item.scope_id)
+            .bind(&item.visibility)
+            .bind(item.owner_identity_id.as_deref())
+            .bind(&item.authority)
+            .bind(&item.sensitivity)
+            .bind(item.retention_priority)
+            .bind(&item.provenance_json)
+            .bind(item.publication_source_id.as_deref())
+            .bind(item.supersedes_id.as_deref())
+            .bind(item.valid_from.as_deref())
+            .bind(item.valid_until.as_deref())
+            .bind(item.source_event_id.as_deref())
+            .bind(item.source_scope_type.as_deref())
+            .bind(item.source_scope_id.as_deref())
+            .bind(item.source_revision.as_deref())
+            .bind(&item.source_type)
+            .bind(&item.kind)
+            .bind(&item.title)
+            .bind(item.summary.as_deref())
+            .bind(&item.body)
+            .bind(&item.metadata_json)
+            .bind(item.confidence.as_deref())
+            .bind(item.quality_score)
+            .bind(item.created_by_type.as_deref())
+            .bind(item.created_by_id.as_deref())
+            .bind(&item.created_at)
+            .execute(&mut **transaction)
+            .await?;
+        sqlx::query(
+            "INSERT INTO memory_source_receipt
+             (source_type, source_scope_type, source_scope_id, source_ref, memory_item_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(source_type)
+        .bind(&item.scope_type)
+        .bind(&item.scope_id)
+        .bind(source_ref)
+        .bind(&item.id)
+        .bind(&item.created_at)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl MemoryRepository for SqliteDb {
     async fn insert_memory_item(&self, item: &MemoryItem) -> Result<()> {

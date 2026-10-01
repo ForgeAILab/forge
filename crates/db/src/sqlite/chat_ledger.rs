@@ -349,6 +349,9 @@ pub(super) async fn complete_agent_chat_turn_with_usage(
     .await?;
     let turn = current_chat_turn(&mut transaction, &terminal.turn_job_id).await?;
     transaction.commit().await?;
+    if inserted {
+        db.notify_domain_event_committed();
+    }
     Ok(CompletedAgentChatTurn { response, turn })
 }
 

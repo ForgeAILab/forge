@@ -95,6 +95,7 @@ pub mod turn_log_sink;
 pub mod types;
 pub mod usage_projection;
 pub mod wake_turn_consumer;
+pub mod worker_runtime;
 pub mod workflow;
 pub mod workspace_backend;
 pub mod workspace_cleanup;
@@ -114,9 +115,7 @@ pub use adaptive_task_operations::{
     adaptive_task_operation_supported_values, parse_persisted_adaptive_envelope,
     validate_adaptive_task_operations, ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
 };
-pub use agent_chat_memory_consumer::{
-    memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
-};
+pub use agent_chat_memory_consumer::{memory_consumer_name, AgentChatMemoryConsumer};
 pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
 pub use agent_chat_service::{
     append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,

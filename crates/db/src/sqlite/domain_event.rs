@@ -8,12 +8,43 @@ pub(super) async fn next_existing_sequence(
     transaction: &mut Transaction<'_, Sqlite>,
     cursor: i64,
 ) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MIN(sequence) FROM domain_event WHERE sequence > ?",
-    )
-    .bind(cursor)
-    .fetch_one(&mut **transaction)
-    .await?)
+    next_existing_sequence_for_types(transaction, cursor, &[]).await
+}
+
+async fn next_existing_sequence_for_types(
+    transaction: &mut Transaction<'_, Sqlite>,
+    cursor: i64,
+    event_types: &[&str],
+) -> Result<Option<i64>> {
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "SELECT MIN(sequence) FROM domain_event WHERE sequence > ",
+    );
+    query.push_bind(cursor);
+    if !event_types.is_empty() {
+        query.push(" AND event_type IN (");
+        let mut separated = query.separated(", ");
+        for event_type in event_types {
+            separated.push_bind(*event_type);
+        }
+        separated.push_unseparated(")");
+    }
+    Ok(query
+        .build_query_scalar::<Option<i64>>()
+        .fetch_one(&mut **transaction)
+        .await?)
+}
+
+impl SqliteDb {
+    /// Gap-tolerant ordered lookup shared by the legacy delivery code and the
+    /// filtered single-process worker runtime.
+    pub async fn next_existing_domain_event_sequence_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        cursor: i64,
+        event_types: &[&str],
+    ) -> Result<Option<i64>> {
+        next_existing_sequence_for_types(transaction, cursor, event_types).await
+    }
 }
 
 #[async_trait]
@@ -22,6 +53,7 @@ impl DomainEventRepo for SqliteDb {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let event = self.append_event_in_tx(&mut transaction, &input).await?;
         transaction.commit().await?;
+        self.notify_domain_event_committed();
         Ok(event)
     }
 

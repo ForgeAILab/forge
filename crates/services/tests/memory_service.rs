@@ -77,9 +77,27 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
         .expect("project creation provisions the singular chat")
         .id;
 
+    // Simulate an upgrade from the lease/receipt consumer. The new runtime
+    // must reuse this exact stable cursor and begin strictly after it.
+    let pre_upgrade_cursor: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM domain_event")
+            .fetch_one(db.pool())
+            .await
+            .expect("pre-upgrade head loads");
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(services::memory_consumer_name())
+    .bind(pre_upgrade_cursor)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .expect("legacy cursor seeds");
+
     // Append the durable event before its source row to simulate a process
     // crash between event admission and projection. The first consumer run
-    // claims the event but cannot complete it, leaving only an expiring lease.
+    // cannot complete it and leaves the cursor at the legacy checkpoint.
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent {
@@ -104,23 +122,28 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     )
     .await
     .expect("event appends");
-    let _first = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-before-crash")
+    let first = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
         .await
         .expect("failed projection is retryable");
-    // Project/task setup may have produced unrelated durable events before
-    // this source event. They are checkpointed by the shared ledger consumer,
-    // but the missing message itself must remain leased for retry.
-    let first_receipt: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_projection_receipt
-         WHERE consumer_name = ? AND event_id = ?",
+    assert_eq!(first, 0);
+    let cursor_after_failure: i64 = sqlx::query_scalar(
+        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
     )
     .bind(services::memory_consumer_name())
-    .bind(&event_id)
     .fetch_one(db.pool())
     .await
     .expect("missing source remains uncheckpointed");
-    assert_eq!(first_receipt, 0);
+    assert_eq!(cursor_after_failure, pre_upgrade_cursor);
+    for table in ["event_processing_lease", "event_projection_receipt"] {
+        let query = format!("SELECT COUNT(*) FROM {table} WHERE consumer_name = ?");
+        let rows: i64 = sqlx::query_scalar(&query)
+            .bind(services::memory_consumer_name())
+            .fetch_one(db.pool())
+            .await
+            .expect("legacy delivery rows count");
+        assert_eq!(rows, 0, "the migrated worker writes no {table} rows");
+    }
 
     sqlx::query(
         "INSERT INTO agent_chat_message (
@@ -136,25 +159,17 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     .execute(db.pool())
     .await
     .expect("message inserts after source recovery");
-    sqlx::query(
-        "UPDATE event_processing_lease
-         SET leased_until = '2000-01-01T00:00:00Z'
-         WHERE consumer_name = ?",
-    )
-    .bind(services::memory_consumer_name())
-    .execute(db.pool())
-    .await
-    .expect("lease expires");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    let second = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-after-restart")
+    let second = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
         .await
-        .expect("expired event replays");
+        .expect("event retries after runtime backoff");
     assert_eq!(second, 1);
-    let third = AgentChatMemoryConsumer::new(Arc::clone(&db), "consumer-third-process")
+    let third = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
         .await
-        .expect("receipt suppresses duplicate");
+        .expect("cursor suppresses duplicate");
     assert_eq!(third, 0);
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM memory_item WHERE source_type = 'agent_chat' AND json_extract(metadata_json, '$.source_ref') = ?",
@@ -212,7 +227,7 @@ async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying
     .await
     .expect("failure event appends");
 
-    let consumer = AgentChatMemoryConsumer::new(Arc::clone(&db), "failure-consumer");
+    let consumer = AgentChatMemoryConsumer::new(Arc::clone(&db));
     assert!(consumer.run_once(10).await.expect("failure event consumes") >= 1);
     assert_eq!(consumer.run_once(10).await.expect("replay is empty"), 0);
 }

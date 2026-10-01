@@ -552,12 +552,10 @@ where
             .await?)
     }
 
-    /// Index one finalized Agent Chat message in the chat's canonical memory
-    /// scope. The singular-chat visibility label and chat id are the
-    /// canonical ACL/provenance boundary. The
-    /// source-receipt write is part of the repository transaction, so replay
-    /// after a lease expiry cannot create a duplicate memory item.
-    pub async fn record_agent_chat_message_event(
+    /// Build the projection for one finalized Agent Chat message without
+    /// writing it. WorkerRuntime performs this preparation before opening the
+    /// short transaction that applies the item and advances its cursor.
+    pub(crate) fn prepare_agent_chat_message_event(
         &self,
         event: &DomainEvent,
         chat: &AgentChat,
@@ -646,6 +644,22 @@ where
             created_by_type: Some(message.author_type.to_string()),
             created_by_id: message.author_id.clone(),
             created_at: now,
+        };
+        Ok(Some(item))
+    }
+
+    /// Index one finalized Agent Chat message in the chat's canonical memory
+    /// scope. Direct callers retain the repository's source-receipt
+    /// idempotency; the durable worker uses the prepared form above so its
+    /// effect and cursor can commit together.
+    pub async fn record_agent_chat_message_event(
+        &self,
+        event: &DomainEvent,
+        chat: &AgentChat,
+        message: &AgentChatMessage,
+    ) -> Result<Option<MemoryItem>> {
+        let Some(item) = self.prepare_agent_chat_message_event(event, chat, message)? else {
+            return Ok(None);
         };
         let (item, inserted) = self
             .db

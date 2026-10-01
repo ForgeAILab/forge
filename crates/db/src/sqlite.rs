@@ -72,7 +72,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
+use tokio::sync::Notify;
 
 mod action;
 mod agent;
@@ -137,6 +138,7 @@ mod workspace_placement;
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
+    domain_event_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,11 +148,28 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            domain_event_notify: Arc::new(Notify::new()),
+        }
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Process-local wakeup for workers that consume committed domain events.
+    /// Durable cursors remain authoritative; a missed notification only falls
+    /// back to the worker's bounded idle poll.
+    pub fn domain_event_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.domain_event_notify)
+    }
+
+    /// Wake durable-event workers after the transaction containing an event
+    /// has committed. Callers that append inside a larger transaction must
+    /// invoke this only after their own commit succeeds.
+    pub fn notify_domain_event_committed(&self) {
+        self.domain_event_notify.notify_waiters();
     }
 }
 

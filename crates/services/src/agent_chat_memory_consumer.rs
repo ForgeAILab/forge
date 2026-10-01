@@ -1,39 +1,43 @@
 //! Durable semantic-memory projection for singular Agent Chats.
-//!
-//! Chat admission and turn completion remain the source-of-truth writes.  This
-//! consumer only claims durable domain events and writes the derived memory
-//! item; an indexing failure leaves the event leased so a later process can
-//! retry it after expiry.
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
-use db::{
-    now_rfc3339, AgentChatMessageRepo, AgentChatRepo, ClaimDomainEvents, CompleteDomainEvent,
-    DomainEventRepo, SqliteDb,
-};
-use tokio::{sync::watch, task::JoinHandle, time::Duration as TokioDuration};
-use uuid::Uuid;
+use async_trait::async_trait;
+use db::{AgentChatMessageRepo, AgentChatRepo, DomainEvent, MemoryItem, SqliteDb};
+use sqlx::{Sqlite, Transaction};
+use tokio::{sync::watch, task::JoinHandle};
 
-use crate::{MemoryService, Result};
+use crate::{
+    worker_runtime::{Worker, WorkerError, WorkerOutcome, WorkerRuntime},
+    MemoryService, Result,
+};
 
 const CONSUMER_NAME: &str = "scoped-memory-agent-chat-indexer";
+const EVENT_TYPES: &[&str] = &[
+    "agent_chat.message.admitted",
+    "agent_chat.response.completed",
+    "agent_chat.message.completed",
+];
+
+#[derive(Debug)]
+pub struct PreparedMemoryProjection {
+    item: Option<MemoryItem>,
+    source_ref: String,
+}
 
 #[derive(Clone)]
 pub struct AgentChatMemoryConsumer {
     db: Arc<SqliteDb>,
     memory: MemoryService<SqliteDb>,
     consumer_name: String,
-    lease_owner: String,
 }
 
 impl AgentChatMemoryConsumer {
-    pub fn new(db: Arc<SqliteDb>, lease_owner: impl Into<String>) -> Self {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         Self {
             memory: MemoryService::new(Arc::clone(&db)),
             db,
             consumer_name: CONSUMER_NAME.to_owned(),
-            lease_owner: lease_owner.into(),
         }
     }
 
@@ -42,102 +46,86 @@ impl AgentChatMemoryConsumer {
         self
     }
 
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(TokioDuration::from_secs(1));
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Err(error) = self.run_once(100).await {
-                            tracing::warn!(consumer = %self.consumer_name, %error, "Agent Chat memory consumer poll failed");
-                        }
-                    }
-                }
-            }
-        })
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        let runtime = Arc::new(WorkerRuntime::new(Arc::clone(&self.db), self));
+        runtime.start(shutdown)
     }
 
     pub async fn run_once(&self, limit: i64) -> Result<usize> {
-        let now = now_rfc3339();
-        let events = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: self.consumer_name.clone(),
-                lease_owner: self.lease_owner.clone(),
-                now: now.clone(),
-                leased_until: lease_until(&now),
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
+        WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
+            .run_once(limit.clamp(1, 100) as usize)
+            .await
+    }
+}
 
-        let mut processed = 0;
-        for event in events {
-            let should_index = matches!(
-                event.event_type.as_str(),
-                "agent_chat.message.admitted"
-                    | "agent_chat.response.completed"
-                    | "agent_chat.message.completed"
-            ) && event.entity_type == "agent_chat_message";
-            if should_index {
-                if let Err(error) = self.index_agent_chat_event(&event).await {
-                    tracing::warn!(
-                        consumer = %self.consumer_name,
-                        event_id = %event.id,
-                        error = %error,
-                        "Agent Chat memory indexing will retry"
-                    );
-                    continue;
-                }
-            }
+#[async_trait]
+impl Worker for AgentChatMemoryConsumer {
+    type Prepared = PreparedMemoryProjection;
 
-            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
-            DomainEventRepo::complete_claimed_event(
-                &*self.db,
-                CompleteDomainEvent {
-                    consumer_name: self.consumer_name.clone(),
-                    lease_owner: self.lease_owner.clone(),
-                    event_sequence: event.sequence,
-                    event_id: event.id,
-                    dedupe_key,
-                    completed_at: now_rfc3339(),
-                },
-            )
-            .await?;
-            processed += 1;
-        }
-        Ok(processed)
+    fn name(&self) -> &str {
+        &self.consumer_name
     }
 
-    async fn index_agent_chat_event(&self, event: &db::DomainEvent) -> Result<()> {
+    fn event_types(&self) -> &'static [&'static str] {
+        EVENT_TYPES
+    }
+
+    async fn handle(
+        &self,
+        event: &DomainEvent,
+    ) -> std::result::Result<WorkerOutcome<Self::Prepared>, WorkerError> {
+        if event.entity_type != "agent_chat_message" {
+            return Ok(WorkerOutcome::Done(PreparedMemoryProjection {
+                item: None,
+                source_ref: event.entity_id.clone(),
+            }));
+        }
         let chat = AgentChatRepo::get_agent_chat(&*self.db, &event.scope_id)
-            .await?
-            .ok_or(db::DbError::NotFound)?;
+            .await
+            .map_err(|error| WorkerError::new(format!("Agent Chat lookup failed: {error}")))?
+            .ok_or_else(|| WorkerError::new("Agent Chat source was not found"))?;
         let message = AgentChatMessageRepo::get_agent_chat_message(&*self.db, &event.entity_id)
-            .await?
-            .ok_or(db::DbError::NotFound)?;
-        self.memory
-            .record_agent_chat_message_event(event, &chat, &message)
-            .await?;
+            .await
+            .map_err(|error| {
+                WorkerError::new(format!("Agent Chat message lookup failed: {error}"))
+            })?
+            .ok_or_else(|| WorkerError::new("Agent Chat message source was not found"))?;
+        let item = self
+            .memory
+            .prepare_agent_chat_message_event(event, &chat, &message)
+            .map_err(|error| {
+                WorkerError::new(format!("Agent Chat memory preparation failed: {error}"))
+            })?;
+        Ok(WorkerOutcome::Done(PreparedMemoryProjection {
+            item,
+            source_ref: message.id,
+        }))
+    }
+
+    async fn commit(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        _event: &DomainEvent,
+        prepared: &Self::Prepared,
+    ) -> std::result::Result<(), WorkerError> {
+        let Some(item) = prepared.item.as_ref() else {
+            return Ok(());
+        };
+        self.db
+            .insert_memory_item_if_source_absent_in_tx(
+                transaction,
+                item,
+                "agent_chat",
+                &prepared.source_ref,
+            )
+            .await
+            .map_err(|error| {
+                WorkerError::new(format!("Agent Chat memory write failed: {error}"))
+            })?;
         Ok(())
     }
 }
 
-fn lease_until(now: &str) -> String {
-    DateTime::parse_from_rfc3339(now)
-        .map(|value| (value.with_timezone(&Utc) + Duration::seconds(60)).to_rfc3339())
-        .unwrap_or_else(|_| now.to_owned())
-}
-
 pub fn memory_consumer_name() -> &'static str {
     CONSUMER_NAME
-}
-
-pub fn memory_consumer_lease_owner() -> String {
-    format!("agent-chat-memory-consumer-{}", Uuid::new_v4())
 }

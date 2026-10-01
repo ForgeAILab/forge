@@ -13,13 +13,31 @@ impl SqliteDb {
             query.push(" UNION SELECT ").push_bind(*consumer);
         }
         query.push(
-            ") SELECT consumers.consumer_name, COALESCE(cursor.last_sequence, 0) AS last_sequence,
-                cursor.updated_at,
-                MAX(0, COALESCE((SELECT MAX(sequence) FROM domain_event), 0) - COALESCE(cursor.last_sequence, 0)) AS lag,
-                (SELECT created_at FROM domain_event WHERE sequence > COALESCE(cursor.last_sequence, 0)
-                 ORDER BY julianday(created_at), sequence LIMIT 1) AS oldest_unprocessed_at
-             FROM consumers LEFT JOIN event_consumer_cursor AS cursor USING (consumer_name)
-             ORDER BY consumers.consumer_name"
+            ") SELECT consumers.consumer_name,
+                CASE WHEN health.worker_name IS NOT NULL
+                     THEN health.cursor_sequence
+                     ELSE COALESCE(cursor.last_sequence, 0)
+                END AS last_sequence,
+                CASE WHEN health.worker_name IS NOT NULL
+                     THEN health.cursor_updated_at
+                     ELSE cursor.updated_at
+                END AS updated_at,
+                CASE WHEN health.worker_name IS NOT NULL
+                     THEN health.lag
+                     ELSE MAX(0, COALESCE((SELECT MAX(sequence) FROM domain_event), 0)
+                                      - COALESCE(cursor.last_sequence, 0))
+                END AS lag,
+                CASE WHEN health.worker_name IS NOT NULL
+                     THEN health.oldest_pending_at
+                     ELSE (SELECT created_at FROM domain_event
+                           WHERE sequence > COALESCE(cursor.last_sequence, 0)
+                           ORDER BY julianday(created_at), sequence LIMIT 1)
+                END AS oldest_unprocessed_at
+             FROM consumers
+             LEFT JOIN event_consumer_cursor AS cursor USING (consumer_name)
+             LEFT JOIN worker_health AS health
+               ON health.worker_name = consumers.consumer_name
+             ORDER BY consumers.consumer_name",
         );
         query
             .build()

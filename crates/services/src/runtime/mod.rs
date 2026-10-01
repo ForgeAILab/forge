@@ -729,10 +729,7 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         ));
-        let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(
-            Arc::clone(&self.db),
-            crate::memory_consumer_lease_owner(),
-        ));
+        let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(Arc::clone(&self.db)));
         let coordination_consumer = Arc::new(CoordinationOutcomeConsumer::new(
             Arc::clone(&self.db),
             crate::coordination_consumer_lease_owner(),

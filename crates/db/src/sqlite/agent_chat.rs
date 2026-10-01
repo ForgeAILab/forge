@@ -1194,6 +1194,7 @@ impl AgentChatTransactionRepo for SqliteDb {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let admitted = admit_agent_chat_turn_in_tx(self, &mut transaction, input).await?;
         transaction.commit().await?;
+        self.notify_domain_event_committed();
         Ok(admitted)
     }
 
@@ -1421,6 +1422,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             .map_err(DbError::from)
             .and_then(map_agent_chat_turn_job)?;
         transaction.commit().await?;
+        self.notify_domain_event_committed();
         Ok(CompletedAgentChatTurn { response, turn })
     }
 
@@ -2029,6 +2031,7 @@ impl AgentChatTransactionRepo for SqliteDb {
             .map_err(DbError::from)
             .and_then(map_agent_chat_turn_job)?;
         transaction.commit().await?;
+        self.notify_domain_event_committed();
         Ok(AdmittedAgentHandoff {
             handoff,
             message,
