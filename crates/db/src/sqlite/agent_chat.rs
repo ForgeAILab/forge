@@ -2549,7 +2549,10 @@ async fn validate_agent_chat_turn_admission(
 pub fn supported_main_baseline_revision(revision: &str) -> bool {
     matches!(
         revision,
-        "forge.main.baseline/v1@1" | "forge.main.baseline/v1@2" | "forge.main.baseline/v1@3"
+        "forge.main.baseline/v1@1"
+            | "forge.main.baseline/v1@2"
+            | "forge.main.baseline/v1@3"
+            | "forge.main.baseline/v1@4"
     )
 }
 
@@ -2562,10 +2565,11 @@ mod main_baseline_revision_tests {
         assert!(supported_main_baseline_revision("forge.main.baseline/v1@1"));
         assert!(supported_main_baseline_revision("forge.main.baseline/v1@2"));
         assert!(supported_main_baseline_revision("forge.main.baseline/v1@3"));
+        assert!(supported_main_baseline_revision("forge.main.baseline/v1@4"));
         // A revision this build has no compiled body for is refused, so a
         // downgrade cannot render a contract it does not have.
         assert!(!supported_main_baseline_revision(
-            "forge.main.baseline/v1@4"
+            "forge.main.baseline/v1@5"
         ));
         assert!(!supported_main_baseline_revision(
             "forge.main.project-discovery/v2@2"

@@ -388,7 +388,7 @@ Charter amendment rotates current binding/approval pointers while retaining the
 same receipt. Already admitted retrying turns continue to use their frozen
 binding/Profile/skill provenance.
 
-The Project operating skill (`forge.project.orchestration/v1@16`) is a
+The Project operating skill (`forge.project.orchestration/v1@17`) is a
 doctrine index, not a doctrine dump: the resident prompt carries the mission,
 authority boundaries, standing invariants, and autonomous-drive rules, plus an
 index of server-owned doctrine sections (`research`, `documents`,
@@ -399,6 +399,24 @@ identity and digests, and the Agent reads the full rendered text with the
 `project.charter` native read whenever its details matter. This keeps a
 Project Chat turn's fixed prompt cost small enough that LCM compaction has a
 real conversation budget to work with on small provider profiles.
+
+Merge-friendly doctrine is delivered where layout and scope are decided: Main
+Genesis (`forge.main.project-discovery/v2@6`) calls for small modules with clear
+ownership, per-feature files, and thin mechanical composition instead of shared
+hub files. The account baseline (`forge.main.baseline/v1@4`) carries that advice
+into discovery. Project standing invariants require owned repository-relative
+paths in Task descriptions, disjoint files for parallel Tasks, and dependency
+ordering for shared-file edits. On-demand document and Task sections apply this
+to architecture and splitting; planning prompts carry the same constraints in
+both native and outbox delivery. Scaffolded `AGENTS.md` tells Task Workers to
+stay in owned paths, add feature files, and report scope discoveries.
+
+Migration `V202610010500__merge_friendly_doctrine.sql` inserts new digest-pinned
+Main/Project revisions and advances current skill pointers and Project bindings.
+It retains previous revision rows, session prompts, and frozen turn admissions.
+The compiled baseline retains exact bodies for revisions @1–@3; unknown
+revisions still fail closed. These instructions guide agents; they do not
+change merge, rebase, review, or enforce file ownership as a capability grant.
 
 An autonomous `delivery_followup` admission also freezes a typed postcondition
 on its server-authored trigger: one Project-scoped event must commit at a

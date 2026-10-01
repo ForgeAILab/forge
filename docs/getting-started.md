@@ -443,6 +443,12 @@ templates (`bun /path/to/spark/packages/create-spark/src/cli.ts`); the
 `SPARK_ROOT` environment variable is passed through. A missing runtime is a
 typed, retryable `scaffold_runtime_unavailable` provisioning failure.
 
+Forge's layout guidance favors small feature modules with clear ownership and
+thin composition points. Name owned repository-relative paths in each Task;
+parallel Tasks should edit disjoint files, and shared-file edits need a dependency
+to order them. The Forge section exported to a scaffold's `AGENTS.md` tells
+workers to add feature files and report required edits outside their Task scope.
+
 ### Local development data dir
 
 `make dev` and friends point data at `./test/` (gitignored) so dev state never

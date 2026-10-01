@@ -84,6 +84,12 @@ async fn prompt_preview_matches_direct_effective_prompt_build() {
 
     let expected =
         direct_prompt_for_accept_to_planning(Arc::clone(&harness.state.db), &task.id).await;
+    for phrase in ["owned repository-relative paths", "out-of-scope edit"] {
+        assert!(
+            preview.user.contains(phrase),
+            "missing planner rule: {phrase}"
+        );
+    }
     assert_eq!(preview.system, expected.system);
     assert_eq!(preview.user, expected.user);
     let expected_tools = if expected.tools.is_empty() {

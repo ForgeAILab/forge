@@ -897,7 +897,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
     if operations.contains("task.propose") {
         lines.push(concat!(
             "task.propose — create a Task in the bound Project. Fields: ",
-            "title (required); description (outcome plus acceptance criteria); ",
+            "title (required); description (outcome, acceptance criteria, and owned repository-relative paths); ",
             "priority (integer, higher runs sooner); ",
             "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
             "plan_item_id (optional traceability to a stable item in the active execution ",
@@ -910,7 +910,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "those); risk_class (only when the baseline declares allowed classes). ",
             "depends_on_task_ids (optional accepted Task ids in this Project; these are ",
             "prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; ",
-            "each prerequisite must reach done before this Task can dispatch). ",
+            "each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. ",
             "Forge binds implementation authority to the Project's current approved Charter. ",
             "Baseline references are optional traceability; never echo baseline ids or digests.",
         ));
@@ -1016,7 +1016,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "description": {
                 "type": ["string", "null"],
-                "description": "task.propose: outcome plus acceptance criteria."
+                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths."
             },
             "priority": {
                 "type": ["integer", "null"],
@@ -1654,6 +1654,9 @@ mod tests {
         }
         let operations = BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]);
         let guidance = coordination_payload_guidance(&operations);
+        assert!(guidance.contains("owned repository-relative paths"));
+        assert!(guidance.contains("parallel Tasks disjoint files"));
+        assert!(guidance.contains("dependencies to order shared-file edits"));
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
@@ -1662,6 +1665,12 @@ mod tests {
                 .as_str()
                 .expect("flat prerequisite guidance")
                 .contains("prerequisite DAG edges only")
+        );
+        assert!(
+            properties["description"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("owned repository-relative paths")
         );
         // A field the server requires but the flat surface never declares is
         // a field a declared-properties-only provider cannot send at all:

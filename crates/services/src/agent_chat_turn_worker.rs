@@ -52,7 +52,6 @@ use crate::{
         canonical_main_operating_skill_body, canonical_project_operating_skill_body,
         render_main_baseline_operating_skill, render_project_operating_skill,
         EffectiveProjectStateContext, MainBaselineSkillContext, ProjectOperatingSkillContext,
-        LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION,
         MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
         MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
         MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST,
@@ -3989,8 +3988,7 @@ impl AgentChatTurnWorker {
             .operating_skill_revision_id
             .as_deref()
             .is_some_and(|revision| {
-                revision == MAIN_BASELINE_OPERATING_SKILL_REVISION
-                    || revision == LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION
+                canonical_main_baseline_operating_skill_body_for_revision(revision).is_some()
             });
         let mut control_transfer = None;
         let mut result = None;
@@ -4716,9 +4714,7 @@ fn replace_rendered_skill_body(
 /// transition after admission must not turn a baseline job into discovery (or
 /// the reverse) while it waits in the queue.
 fn main_skill_key_for_frozen_revision(revision_id: &str) -> &'static str {
-    if revision_id == MAIN_BASELINE_OPERATING_SKILL_REVISION
-        || revision_id == LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION
-    {
+    if canonical_main_baseline_operating_skill_body_for_revision(revision_id).is_some() {
         MAIN_BASELINE_OPERATING_SKILL_KEY
     } else {
         MAIN_OPERATING_SKILL_KEY
@@ -5958,7 +5954,7 @@ mod tests {
             MAIN_BASELINE_OPERATING_SKILL_KEY
         );
         assert_eq!(
-            main_skill_key_for_frozen_revision(LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION),
+            main_skill_key_for_frozen_revision("forge.main.baseline/v1@1"),
             MAIN_BASELINE_OPERATING_SKILL_KEY
         );
         assert_eq!(
@@ -6273,6 +6269,61 @@ mod tests {
                 .expect("historical body should be retained");
         assert!(historical.starts_with("historical skill body\n\n## BOUNDED CONTEXT"));
         assert!(!historical.starts_with(current));
+    }
+
+    #[tokio::test]
+    async fn frozen_operating_skill_bodies_survive_merge_friendly_upgrade() {
+        let db = worker_test_db().await;
+        for (revision, rendered, current, expected_digest) in [
+            (
+                "forge.main.project-discovery/v2@5",
+                crate::render_main_operating_skill(&crate::MainOperatingSkillContext::default())
+                    .unwrap(),
+                canonical_main_operating_skill_body(),
+                "e7c86568049d54ed42e2f09a9cbaceee77e69f4b043546bb975a3679d43ded11",
+            ),
+            (
+                "forge.project.orchestration/v1@16",
+                render_project_operating_skill(&ProjectOperatingSkillContext::new("p", "b")),
+                canonical_project_operating_skill_body(),
+                "83dc68545c9a154ca279a7469cca3a7805dcf5165a18a60ae18856180e8e1d29",
+            ),
+        ] {
+            let (body, digest): (String, String) = sqlx::query_as(
+                "SELECT canonical_body, content_digest FROM operating_skill_revision WHERE id = ?",
+            )
+            .bind(revision)
+            .fetch_one(db.pool())
+            .await
+            .expect("historical contract retained");
+            assert_eq!(digest, expected_digest);
+            assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
+            let frozen = replace_rendered_skill_body(rendered, Some(&body), current)
+                .expect("frozen admitted contract renders after upgrade");
+            assert!(frozen.starts_with(&body));
+            assert!(!frozen.contains("Name owned repository-relative paths"));
+            assert!(!frozen.contains("PROJECT LAYOUT"));
+        }
+        for revision in [
+            "forge.main.baseline/v1@1",
+            "forge.main.baseline/v1@2",
+            "forge.main.baseline/v1@3",
+        ] {
+            assert_eq!(
+                main_skill_key_for_frozen_revision(revision),
+                MAIN_BASELINE_OPERATING_SKILL_KEY
+            );
+            let (body, _) = canonical_main_baseline_operating_skill_body_for_revision(revision)
+                .expect("historical compiled contract retained");
+            let frozen = replace_rendered_skill_body(
+                render_main_baseline_operating_skill(&MainBaselineSkillContext::default()),
+                Some(body),
+                canonical_main_baseline_operating_skill_body(),
+            )
+            .expect("frozen baseline renders");
+            assert!(frozen.starts_with(body));
+            assert!(!frozen.contains("carry the settled constraints into Product Genesis"));
+        }
     }
 
     #[test]

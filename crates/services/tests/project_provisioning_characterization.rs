@@ -1103,6 +1103,18 @@ async fn charter_scaffold_runs_the_command_and_commits_the_exported_charter() {
     assert!(agents.starts_with("# AGENTS.md\n"));
     assert!(agents.contains("\n## Forge\n"));
     assert!(agents.contains("`worker-guidelines` lens is in force"));
+    for phrase in [
+        "small modules with clear ownership",
+        "thin, mechanical composition",
+        "owned repository-relative paths",
+        "new feature file instead of growing a shared one",
+        "Report a required out-of-scope edit",
+    ] {
+        assert!(
+            agents.contains(phrase),
+            "missing scaffold worker rule: {phrase}"
+        );
+    }
     assert!(fixture.repo_path.join("spark.config.json").is_file());
     assert!(git::is_worktree_clean(&fixture.repo_path)
         .await
