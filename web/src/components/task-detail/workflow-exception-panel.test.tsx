@@ -53,6 +53,7 @@ const task = {
   board_position: 0,
   role_assignments: [],
   remaining_retries: {},
+  placement: null,
   workflow_exception: {
     type: 'review_blocked',
     message: 'The reviewer could not access the provider.',
