@@ -35,7 +35,7 @@ impl HookActionHandler for DispatchAgentAction<'_> {
             )));
         }
 
-        match compute_effective_status(&context.service.db, &agent).await? {
+        match compute_effective_status(&context.service.db, &agent, None).await? {
             EffectiveStatus::Active => {}
             status => {
                 return Ok(ActionOutcome::skipped(format!(

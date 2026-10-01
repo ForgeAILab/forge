@@ -232,13 +232,23 @@ cleanup(placement)       -> CleanupAck
 ### D7. Daemon protocol revision 3
 
 - `DAEMON_PROTOCOL_REVISION` becomes 3, and the handshake gains the
-  capability `workspace.v1`. The minimum accepted revision stays 2, so an
-  older daemon keeps execution and fs features for server-owned placements
-  and is marked `workspace_incapable`.
+  capability `workspace.v1`. The minimum command revision is 3. Revision-2
+  sockets remain visible for upgrade diagnostics but every command RPC is
+  refused, including execution, filesystem browsing, verification, and PTY
+  terminals. `daemon_upgrade_required` is a human-action refusal on Task
+  admission, repository locations, and pinned Agents; admission creates no
+  Execution. Task admission requires an otherwise eligible upgrade-only candidate
+  and no capacity-only or transient-only alternative; the accepted upgraded handshake
+  clears that refusal and wakes dispatch automatically. Reservation writes no Task
+  annotation. A socket awaiting its handshake is not ready, not outdated.
+  Upgrade the server first, then every daemon from the same release.
 - Every mutating request carries `{workspace_handle | placement_id,
   operation_id, generation, expected}`. The daemon records
   `(operation_id → result)` and returns the recorded result for a duplicate
-  `operation_id`. A request with a stale `generation` fails with
+  `operation_id` until acknowledgement. The server must durably store the
+  result before `journal.ack`; the daemon then deletes its receipt and prunes
+  cleaned handles and their execution IDs. Retired review handles remain fenced
+  until their reset or release receipt is acknowledged. A request with a stale `generation` fails with
   `stale_generation`.
 - **One daemon journal.** The operation journal extends the existing
   `DaemonTerminalStore` (`forge-client/src/daemon_runtime.rs`) rather than
@@ -259,6 +269,10 @@ cleanup(placement)       -> CleanupAck
   example an exact-Execution guidance channel) are new capability names,
   not new protocol revisions.
 
+Deleted worktrees are recreated through their owner from the surviving Task
+branch. A damaged worktree on a daemon owner requires a reset; other describe
+errors do not trigger recreation.
+
 ### D8. Disconnect, reconnect, cleanup
 
 - The daemon monitor marks the owner or remote execution provider offline,
@@ -267,6 +281,7 @@ cleanup(placement)       -> CleanupAck
   remote daemon through a shared mount. They do not requeue elsewhere: a
   second execution must not start in a live worktree on that shared mount
   while the first CLI may still be writing.
+- A daemon requiring a protocol upgrade is unusable even while its REST heartbeat is online; the monitor treats its placements as disconnected and starts no reconcile worker until a supported handshake arrives.
 - **Leases are frozen while disconnected.** Today a remote lease lasts 60s
   (`REMOTE_EXECUTION_LEASE_SECONDS`), and after that
   `execution_events.rs` silently drops any notification from the expired

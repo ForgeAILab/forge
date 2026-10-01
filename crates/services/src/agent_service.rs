@@ -14,6 +14,7 @@ pub enum EffectiveStatus {
     Deactivated,
     DaemonOffline,
     DaemonUnavailable,
+    DaemonUpgradeRequired,
     ConnectionDegraded,
     ConnectionUnavailable,
     SourceDisabled,
@@ -29,6 +30,7 @@ impl EffectiveStatus {
             Self::Deactivated => "deactivated",
             Self::DaemonOffline => "daemon_offline",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::DaemonUpgradeRequired => api_types::DAEMON_UPGRADE_REQUIRED,
             Self::ConnectionDegraded => "connection_degraded",
             Self::ConnectionUnavailable => "connection_unavailable",
             Self::SourceDisabled => "source_disabled",
@@ -45,8 +47,12 @@ impl fmt::Display for EffectiveStatus {
     }
 }
 
-#[tracing::instrument(skip(db, agent), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
-pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<EffectiveStatus> {
+#[tracing::instrument(skip(db, agent, connections), fields(agent_id = %agent.id, daemon_id = ?agent.daemon_id))]
+pub async fn compute_effective_status(
+    db: &SqliteDb,
+    agent: &Agent,
+    connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
+) -> Result<EffectiveStatus> {
     if agent.status == AgentStatus::Error {
         return Ok(EffectiveStatus::Error);
     }
@@ -85,6 +91,12 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
             return Ok(EffectiveStatus::DaemonOffline);
         };
+        if connections
+            .and_then(|registry| registry.get(daemon_id))
+            .is_some_and(|connection| connection.needs_upgrade())
+        {
+            return Ok(EffectiveStatus::DaemonUpgradeRequired);
+        }
         if daemon.status == DaemonStatus::Offline {
             return Ok(EffectiveStatus::DaemonOffline);
         }
@@ -905,7 +917,7 @@ mod tests {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Error);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -919,7 +931,7 @@ mod tests {
         let db = sqlite_db().await;
         let agent = detached_agent(AgentStatus::Idle);
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -938,7 +950,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -957,7 +969,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -977,7 +989,7 @@ mod tests {
         .await;
         seed_active_task(&db, &agent.id).await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -997,7 +1009,7 @@ mod tests {
         .await;
         agent.paused = true;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1016,7 +1028,7 @@ mod tests {
         )
         .await;
 
-        let status = compute_effective_status(&db, &agent)
+        let status = compute_effective_status(&db, &agent, None)
             .await
             .expect("status computes");
 
@@ -1062,7 +1074,7 @@ mod tests {
         .expect("CLI runtime disables");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("disabled status computes"),
             EffectiveStatus::SourceDisabled
@@ -1079,7 +1091,7 @@ mod tests {
         .await
         .expect("CLI runtime reenables");
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("reenabled status computes"),
             EffectiveStatus::Active
@@ -1163,7 +1175,7 @@ mod tests {
         .expect("provider Agent creates");
 
         assert_eq!(
-            compute_effective_status(&db, &agent)
+            compute_effective_status(&db, &agent, None)
                 .await
                 .expect("provider-disabled status computes"),
             EffectiveStatus::SourceDisabled

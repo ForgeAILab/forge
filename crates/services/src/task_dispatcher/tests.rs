@@ -152,6 +152,23 @@ async fn seed_agent(
     daemon_status: DaemonStatus,
     agent_status: AgentStatus,
 ) -> String {
+    seed_agent_with_executor(
+        db,
+        max_concurrent_tasks,
+        daemon_status,
+        agent_status,
+        "shell",
+    )
+    .await
+}
+
+async fn seed_agent_with_executor(
+    db: &db::SqliteDb,
+    max_concurrent_tasks: i64,
+    daemon_status: DaemonStatus,
+    agent_status: AgentStatus,
+    executor_type: &str,
+) -> String {
     let now = now_rfc3339();
     let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
@@ -178,7 +195,9 @@ async fn seed_agent(
         db,
         UpdateDaemonReport {
             id: daemon_id.clone(),
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            detected_clis_json:
+                serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])
+                    .to_string(),
             labels_json: None,
             status: daemon_status,
             last_report_at: now.clone(),
@@ -193,9 +212,9 @@ async fn seed_agent(
         db,
         CreateAgent {
             id: agent_id.clone(),
-            name: "shell".to_owned(),
+            name: executor_type.to_owned(),
             description: None,
-            executor_type: "shell".to_owned(),
+            executor_type: executor_type.to_owned(),
             model: None,
             reasoning_effort: None,
             permission_policy: None,
@@ -220,6 +239,12 @@ async fn seed_agent(
     .await
     .expect("agent creates");
     agent_id
+}
+
+// Keep stopped execution snapshots aligned with their prompt-consuming Agent.
+async fn set_prompt_execution_snapshots(db: &db::SqliteDb, agent_id: &str) {
+    sqlx::query("UPDATE execution SET executor_config_snapshot_json = json_set(executor_config_snapshot_json, '$.executor_type', 'codex') WHERE agent_id = ?")
+        .bind(agent_id).execute(db.pool()).await.unwrap();
 }
 
 async fn seed_task(
@@ -2695,7 +2720,9 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         let repo_dir = TempDir::new().expect("repo dir creates");
         let workspace_dir = TempDir::new().expect("workspace dir creates");
         let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
-        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let agent_id =
+            seed_agent_with_executor(&db, 1, DaemonStatus::Online, AgentStatus::Idle, "codex")
+                .await;
         let busy = seed_task(&db, &project_id, "occupies capacity", "in_progress", 0).await;
         assign_role(&db, &busy.id, "coder", &agent_id).await;
         seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
@@ -2750,6 +2777,7 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         )
         .await
         .expect("interruption persists");
+        set_prompt_execution_snapshots(&db, &agent_id).await;
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let queued = dispatcher
             .task_service
@@ -2806,9 +2834,9 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         let (restarted, mut restarted_rx) =
             build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         assert_eq!(restarted.check_once().await.expect("recovery scan runs"), 1);
-        let ctx = restarted_rx
-            .recv()
+        let ctx = tokio::time::timeout(Duration::from_secs(30), restarted_rx.recv())
             .await
+            .expect("recovery dispatch completes")
             .expect("execution context arrives");
         assert_eq!(ctx.task_id, task.id);
         assert!(ctx.description.contains("keep this recovery guidance"));
@@ -3036,7 +3064,9 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
         let repo_dir = TempDir::new().unwrap();
         let workspace_dir = TempDir::new().unwrap();
         let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
-        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let agent_id =
+            seed_agent_with_executor(&db, 1, DaemonStatus::Online, AgentStatus::Idle, "codex")
+                .await;
         let busy = seed_task(&db, &project_id, "busy", "in_progress", 0).await;
         seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
         crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
@@ -3069,6 +3099,7 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .await
             .unwrap()
             .unwrap();
+        set_prompt_execution_snapshots(&db, &agent_id).await;
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let queued = dispatcher
             .task_service
@@ -3103,7 +3134,10 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .dispatch_queued_recovery(&queued)
             .await
             .unwrap());
-        let ctx = rx.recv().await.unwrap();
+        let ctx = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("recovery dispatch completes")
+            .unwrap();
         assert!(ctx.description.contains("resume guidance"));
         let execution = ExecutionRepo::get_by_id(&*db, &ctx.execution_id)
             .await
@@ -5489,4 +5523,173 @@ async fn disconnected_owner_is_skipped_before_dispatch_and_never_falls_back() {
             .status,
         ExecutionStatus::Running
     );
+}
+
+#[tokio::test]
+async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_action() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let daemon_id = agent.daemon_id.as_deref().unwrap();
+    sqlx::query("UPDATE daemon SET machine_id = 'remote-upgrade-test' WHERE id = ?")
+        .bind(daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let runtime = db::RuntimeRepo::create(
+        &*db,
+        db::CreateRuntime {
+            id: new_uuid_v4(),
+            daemon_id: daemon_id.into(),
+            kind: "local".into(),
+            workspace_root: workspace_dir.path().to_string_lossy().into(),
+            status: db::RuntimeStatus::Ready,
+            labels_json: "{}".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Server,
+            daemon_id: Some(daemon_id.into()),
+            runtime_id: Some(runtime.id),
+            path: repo_dir.path().to_string_lossy().into(),
+            kind: db::RepoLocationKind::SharedMount,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let task = seed_task(&db, &project_id, "upgrade refused", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent_id).await;
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let (connection, _outbound) = crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+    let id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+        method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params:serde_json::json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+    });
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspace_dir.path()).await;
+    let service = Arc::new(
+        dispatcher
+            .task_service
+            .as_ref()
+            .clone()
+            .with_daemon_connections(registry.clone()),
+    );
+    let dispatcher = TaskDispatcher::new(db.clone(), dispatcher.event_bus.clone(), service);
+    dispatcher.check_once().await.unwrap();
+    let refused = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refused.status, "todo");
+    let annotation: serde_json::Value = serde_json::from_str(
+        refused
+            .error_annotation
+            .as_deref()
+            .expect("upgrade annotation"),
+    )
+    .unwrap();
+    assert_eq!(annotation["code"], api_types::DAEMON_UPGRADE_REQUIRED);
+    assert_eq!(annotation["daemon_ids"], serde_json::json!([daemon_id]));
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db::WorkspacePlacementRepo::get_for_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(rx.try_recv().is_err());
+    // The refusal is parked; the accepted handshake wakes it through the monitor.
+    dispatcher.check_once().await.unwrap();
+    let (connection, mut upgraded_outbound) =
+        crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+    let id = connection.id();
+    registry.register(daemon_id.into(), connection);
+    registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+        method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params:serde_json::json!({"protocol_revision":3,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports"],
+            "executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["ci_step","hook","environment_setup"]}}),
+    });
+    let responses = registry.clone();
+    let response_daemon = daemon_id.to_owned();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let responder = tokio::spawn(async move {
+        while let Some(api_types::DaemonFrame::Request {
+            id: request_id,
+            method,
+            params,
+        }) = upgraded_outbound.recv().await
+        {
+            let result = match method.as_str() {
+                api_types::METHOD_REPO_LOCATION_VERIFY => serde_json::json!({
+                    "repo_location_id":params["repo_location_id"],"path":params["path"],
+                    "default_branch_sha":"verified-head","origin_url":null,
+                    "probe_content":params["probe"]["content"],
+                }),
+                api_types::METHOD_EXECUTION_START => {
+                    started_tx
+                        .send(params["execution_id"].as_str().unwrap().to_owned())
+                        .unwrap();
+                    serde_json::json!({"execution_id":params["execution_id"],"accepted":true})
+                }
+                _ => panic!("unexpected owner request {method}"),
+            };
+            responses.dispatch_incoming_for_connection(
+                &response_daemon,
+                id,
+                api_types::DaemonFrame::Response {
+                    id: request_id,
+                    result,
+                },
+            );
+        }
+    });
+    crate::HeartbeatMonitor::new(db.clone(), dispatcher.event_bus.clone())
+        .with_daemon_connections(registry)
+        .check_once()
+        .await
+        .unwrap();
+    let woken = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(woken.error_annotation.is_none());
+    dispatcher.check_once().await.unwrap();
+    let executions = ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        executions.len(),
+        1,
+        "{:?}",
+        TaskRepo::get_by_id(&*db, &task.id, false).await.unwrap()
+    );
+    let started = tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started, executions[0].id);
+    responder.abort();
 }

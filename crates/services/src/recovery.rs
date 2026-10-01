@@ -2008,7 +2008,9 @@ impl HeartbeatMonitor {
                 })
             });
             if daemon.status != db::DaemonStatus::Online
-                || !registry.is_connected(daemon_id)
+                || !registry.get(daemon_id).is_some_and(|connection| {
+                    !connection.is_stale() && connection.protocol_allows_dispatch()
+                })
                 || owner_changed
             {
                 owners.insert(daemon_id.to_owned());
@@ -2086,13 +2088,31 @@ impl HeartbeatMonitor {
         let Some(registry) = &self.daemon_connections else {
             return Ok(settled);
         };
+        let upgraded_daemons: Vec<_> = registry
+            .connection_snapshots()
+            .into_iter()
+            .filter(|(id, _)| {
+                registry.get(id).is_some_and(|connection| {
+                    !connection.is_stale() && connection.protocol_allows_dispatch()
+                })
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if !upgraded_daemons.is_empty() {
+            if let Err(error) =
+                crate::workflow::engine::wake_upgraded_daemon_tasks(&self.db, &upgraded_daemons)
+                    .await
+            {
+                tracing::warn!(%error, "daemon upgrade dispatch wake failed");
+            }
+        }
         let retained = serde_json::to_string(&registry.retained_terminal_execution_ids())
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let recent = (Utc::now() - ChronoDuration::seconds(60)).to_rfc3339();
         let ready_to_retry: HashSet<String> = sqlx::query_scalar(
             "SELECT p.id FROM workspace_placement p WHERE p.state = 'ready' AND (
                 EXISTS (SELECT 1 FROM execution e JOIN json_each(?) report ON e.id = report.value WHERE e.workspace_id = p.workspace_id)
-                OR EXISTS (SELECT 1 FROM domain_event ev WHERE ev.entity_id = p.id
+                OR EXISTS (SELECT 1 FROM domain_event ev WHERE ev.entity_type = 'workspace_placement' AND ev.entity_id = p.id
                     AND ev.event_type = 'workspace.owner_reconciled' AND ev.created_at >= ?))")
             .bind(retained).bind(recent).fetch_all(self.db.pool()).await?.into_iter().collect();
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
@@ -2117,7 +2137,9 @@ impl HeartbeatMonitor {
             }
         }
         for (daemon_id, ids) in groups {
-            if !registry.is_connected(&daemon_id) {
+            if !registry.get(&daemon_id).is_some_and(|connection| {
+                !connection.is_stale() && connection.protocol_allows_dispatch()
+            }) {
                 continue;
             }
             let mut keys = vec![format!("daemon:{daemon_id}")];
@@ -2204,9 +2226,11 @@ impl HeartbeatMonitor {
                         if matches!(error, ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }) { return; }
                     }
                 }
-                if let Err(error) = registry.retry_retained_terminals(&daemon_id).await {
-                    tracing::warn!(%daemon_id, placement_ids = ?ids, %error, "terminal acknowledgement remains pending");
-                }
+                tokio::spawn(async move {
+                    if let Err(error) = registry.retry_retained_terminals(&daemon_id).await {
+                        tracing::warn!(%daemon_id, placement_ids = ?ids, %error, "terminal acknowledgement remains pending");
+                    }
+                });
             }));
         }
         Ok(settled)
@@ -2982,8 +3006,8 @@ async fn complete_workspace_reconciliation(
         .bind(format!("task-owner-wait:{}", ready.task_id)).execute(&mut *transaction).await?;
     transaction.commit().await?;
     if let Some(task_service) = task_service {
-        // The detached owner worker keeps its permit/in-flight guard through
-        // cascade and ACK. A ready-placement sweep can redrive a crash here.
+        // Cascades and terminal ACK retries run outside the owner permit.
+        // A ready-placement sweep can redrive a crash here.
         if let Err(error) =
             finish_reconciled_cascades(db, registry, Some(task_service), &ready).await
         {
@@ -3027,13 +3051,18 @@ async fn finish_reconciled_cascades(
          ORDER BY e.created_at DESC, e.id DESC")
         .bind(&placement.workspace_id).fetch_all(db.pool()).await? {
         let Some(execution) = ExecutionRepo::get_by_id(db, &execution_id).await? else { continue; };
-        if owner_execution_failure_cause(&execution).is_none()
-            && !task_service.try_cascade_executor_completion(&execution_id).await? {
-            return Ok(());
+        if owner_execution_failure_cause(&execution).is_none() {
+            task_service.try_cascade_executor_completion(&execution_id).await?;
         }
     }
     if let Some(daemon_id) = placement_execution_daemon_id(placement) {
-        registry.retry_retained_terminals(daemon_id).await?;
+        let registry = registry.clone();
+        let daemon_id = daemon_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = registry.retry_retained_terminals(&daemon_id).await {
+                tracing::warn!(%daemon_id, %error, "reconciled terminal acknowledgement remains pending");
+            }
+        });
     }
     Ok(())
 }
@@ -5943,6 +5972,68 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn revision_two_ready_placement_disconnects_and_expires_despite_rest_online() {
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::default());
+        let (_, placement, _) = daemon_owned_fixture(&db).await;
+        let mut update = placement_update(&placement, PlacementState::Ready, None);
+        update.disconnected_at = Some(None);
+        let ready = WorkspacePlacementRepo::update(&*db, update).await.unwrap();
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let daemon_id = ready.daemon_id.as_deref().unwrap();
+        let (connection, _outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+        });
+        let monitor = HeartbeatMonitor::new(db.clone(), bus)
+            .with_daemon_connections(registry)
+            .with_max_disconnect(Duration::from_secs(86400));
+        monitor.check_once().await.unwrap();
+        let disconnected = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(disconnected.state, PlacementState::Disconnected);
+        assert!(disconnected.disconnected_at.is_some());
+        let mut expired = placement_update(
+            &disconnected,
+            PlacementState::Disconnected,
+            Some(PlacementFailureCause::OwnerDisconnected),
+        );
+        expired.disconnected_at = Some(Some((Utc::now() - ChronoDuration::hours(25)).to_rfc3339()));
+        WorkspacePlacementRepo::update(&*db, expired).await.unwrap();
+        monitor.check_once().await.unwrap();
+        let failed = WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, PlacementState::Failed);
+        assert_eq!(
+            failed.failure_cause,
+            Some(PlacementFailureCause::OwnerDisconnectedTimeout)
+        );
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(monitor.daemon_connections.as_ref().unwrap().clone());
+        let error = service
+            .recover_task(
+                ready.task_id,
+                api_types::RecoveryAction::Reexecute,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ServiceError::DaemonUpgradeRequired { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_owned_workspace_lease_expiry_cas_loses_to_heartbeat_and_socket_disconnect() {
         let db = Arc::new(sqlite_db().await);
         let bus = Arc::new(EventBus::new(32));
@@ -7381,6 +7472,7 @@ pub(crate) mod tests {
             api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
         ))
         .await;
+        tokio::time::resume();
         monitor.finish_placement_workers().await;
         assert_eq!(
             WorkspacePlacementRepo::get_by_id(&*db, &good.id)
@@ -7686,7 +7778,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn placement_launch_recreates_damaged_daemon_worktree() {
+    async fn placement_launch_leaves_damaged_daemon_worktree_for_reset() {
         assert_daemon_launch_recreates_worktree(true).await;
     }
 
@@ -7727,7 +7819,7 @@ pub(crate) mod tests {
                                 },
                             },
                         );
-                        continue;
+                        break;
                     }
                     let result = match step {
                         0 | 3 => {
@@ -7755,6 +7847,7 @@ pub(crate) mod tests {
                         api_types::DaemonFrame::Response { id, result },
                     );
                 }
+                outbound
             })
         };
         let root = tempfile::TempDir::new().unwrap();
@@ -7765,7 +7858,7 @@ pub(crate) mod tests {
             .with_daemon(Arc::new(
                 crate::workspace_backend::DaemonWorkspaceBackend::new(db.clone(), registry),
             ));
-        let workspace = crate::task_service::workspace::prepare_workspace(
+        let prepared = crate::task_service::workspace::prepare_workspace(
             &db,
             root.path(),
             &task,
@@ -7773,8 +7866,26 @@ pub(crate) mod tests {
             None,
             &router,
         )
-        .await
-        .unwrap();
+        .await;
+        if damaged {
+            assert!(
+                matches!(prepared, Err(ServiceError::Git(_))),
+                "{prepared:?}"
+            );
+            assert!(
+                responder.await.unwrap().try_recv().is_err(),
+                "damaged describe must not send prepare"
+            );
+            assert_eq!(
+                WorkspacePlacementRepo::get_by_id(&*db, &ready.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ready
+            );
+            return;
+        }
+        let workspace = prepared.unwrap();
         let reused = crate::task_service::workspace::prepare_workspace(
             &db,
             root.path(),

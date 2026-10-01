@@ -597,7 +597,7 @@ async fn detached_review_handles_are_fenced_replayable_and_reclaimed() {
         fence: fence("cleanup-with-reviews", 1, &candidate),
         workspace_handle: handle.clone(),
     };
-    restarted
+    let result = restarted
         .handle(
             METHOD_WORKSPACE_CLEANUP,
             serde_json::to_value(cleanup).unwrap(),
@@ -607,7 +607,24 @@ async fn detached_review_handles_are_fenced_replayable_and_reclaimed() {
         .unwrap();
     assert!(!orphan_path.exists());
     assert!(!fixture.path().exists());
-    assert!(restarted.state.lock().unwrap().handles[&orphan].cleaned);
+    assert!(restarted
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&orphan));
+    restarted
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: result["entry_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    assert!(!restarted
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(&orphan));
 }
 
 #[tokio::test]
@@ -860,9 +877,9 @@ async fn ci_unbounded_sentinels_do_not_remove_other_purpose_budgets() {
 }
 
 #[tokio::test]
-async fn unbounded_ci_output_survives_small_journal_budget_ack_and_restart() {
+async fn ci_output_is_bounded_redacted_and_replayed_only_before_ack() {
     let fixture = Fixture::new().await;
-    let journal = Arc::new(DaemonJournal::with_limits(fixture.dir.path(), 1024, 4096));
+    let journal = Arc::new(DaemonJournal::with_limits(fixture.dir.path(), 1024, 8192));
     let backend = DaemonWorkspaceBackend::new(
         fixture.dir.path().to_owned(),
         "daemon-1".into(),
@@ -879,17 +896,30 @@ async fn unbounded_ci_output_survives_small_journal_budget_ack_and_restart() {
         .handle(METHOD_WORKSPACE_RUN, request.clone(), Vec::new)
         .await
         .unwrap();
+    let stored_bytes: u64 = std::fs::read_dir(journal.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert!(
+        stored_bytes <= 8192,
+        "receipt and workspace registry share the byte cap: {stored_bytes}, files: {:?}",
+        std::fs::read_dir(journal.directory())
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), entry.metadata().unwrap().len())
+            })
+            .collect::<Vec<_>>()
+    );
     let output: WorkspaceRunResult = decode(result.clone()).unwrap();
     assert_eq!(output.exit_code, Some(0));
-    assert!(output.stdout.len() >= 1_100_000);
+    assert!(output.stdout.len() <= crate::daemon_persistence::MAX_CI_LOG_BYTES);
+    assert!(output
+        .stdout
+        .starts_with(crate::daemon_persistence::CI_LOG_TRUNCATION_MARKER));
     assert!(!output.stdout.contains("secret-value"));
     assert_eq!(output.stderr, "stderr");
-    assert!(!output.timed_out && !output.stdout_truncated && !output.stderr_truncated);
-    journal
-        .acknowledge(&JournalAckParams {
-            entry_id: output.entry_id,
-        })
-        .unwrap();
+    assert!(!output.timed_out && output.stdout_truncated && !output.stderr_truncated);
     let restarted = DaemonWorkspaceBackend::new(
         fixture.dir.path().to_owned(),
         "daemon-1".into(),
@@ -904,6 +934,12 @@ async fn unbounded_ci_output_survives_small_journal_budget_ack_and_restart() {
             .unwrap(),
         result
     );
+    journal
+        .acknowledge(&JournalAckParams {
+            entry_id: output.entry_id,
+        })
+        .unwrap();
+    assert!(journal.operation("unbounded-ci").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1042,7 +1078,7 @@ async fn reviewed_merge_refuses_changed_objects_and_unreviewed_merge_preserves_c
 }
 
 #[tokio::test]
-async fn interrupted_run_is_settled_before_ack_and_never_rerun() {
+async fn interrupted_run_is_settled_and_never_replayed_before_ack() {
     let fixture = Fixture::new().await;
     let params = serde_json::to_value(fixture.run(
         "interrupted-run",
@@ -1075,15 +1111,6 @@ async fn interrupted_run_is_settled_before_ack_and_never_rerun() {
         .unwrap()
         .outcome
         .is_some());
-    assert!(
-        fixture
-            .journal
-            .acknowledge(&JournalAckParams {
-                entry_id: result.entry_id
-            })
-            .unwrap()
-            .acknowledged
-    );
     assert_eq!(
         fixture
             .backend
@@ -1093,6 +1120,20 @@ async fn interrupted_run_is_settled_before_ack_and_never_rerun() {
             .code,
         DAEMON_UNAVAILABLE
     );
+    assert!(
+        fixture
+            .journal
+            .acknowledge(&JournalAckParams {
+                entry_id: result.entry_id
+            })
+            .unwrap()
+            .acknowledged
+    );
+    assert!(fixture
+        .journal
+        .operation("interrupted-run")
+        .unwrap()
+        .is_none());
     assert!(!fixture.path().join("never-run").exists());
 }
 
@@ -1226,4 +1267,172 @@ async fn reconciliation_returns_retained_full_run_result_and_rejects_another_han
             .code,
         WRONG_OWNER
     );
+}
+
+#[tokio::test]
+async fn late_review_release_ack_prunes_only_its_retired_handle() {
+    let fixture = Fixture::new().await;
+    let main = &fixture.prepared.workspace.workspace_handle;
+    let review = owner(
+        &fixture,
+        "late-review",
+        main,
+        WorkspaceOwnerOperation::ReviewCheckout {
+            commit_sha: fixture.prepared.workspace.base_sha.clone(),
+            environment: ProjectEnvironment::default(),
+            prepare: true,
+        },
+    )
+    .await;
+    let WorkspaceOwnerOperationOutcome::ReviewCheckout {
+        workspace_handle: review,
+    } = review.outcome
+    else {
+        panic!("review handle")
+    };
+    let released = owner(
+        &fixture,
+        "late-release",
+        &review,
+        WorkspaceOwnerOperation::ReleaseReviewCheckout,
+    )
+    .await;
+    let cleanup = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_CLEANUP,
+            serde_json::to_value(WorkspaceCleanupParams {
+                fence: fence("pending-cleanup", 1, &fixture.prepared.workspace.base_sha),
+                workspace_handle: main.clone(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    fixture
+        .backend
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: released.entry_id,
+        })
+        .await
+        .unwrap();
+    let state = fixture
+        .journal
+        .load_workspace_state::<WorkspaceRegistry>()
+        .unwrap();
+    assert!(!state.handles.contains_key(&review));
+    assert!(
+        state.handles.contains_key(main),
+        "cleanup is still unacknowledged"
+    );
+    let describe = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_DESCRIBE,
+            serde_json::to_value(WorkspaceDescribeParams {
+                workspace: fixture.reference(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    assert_eq!(describe["exists"], false);
+    fixture
+        .backend
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: cleanup["entry_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    assert!(!fixture
+        .backend
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .contains_key(main));
+}
+
+#[tokio::test]
+async fn late_reset_ack_prunes_only_the_review_handles_it_retired() {
+    let fixture = Fixture::new().await;
+    let main = &fixture.prepared.workspace.workspace_handle;
+    let review = owner(
+        &fixture,
+        "pre-reset-review",
+        main,
+        WorkspaceOwnerOperation::ReviewCheckout {
+            commit_sha: fixture.prepared.workspace.base_sha.clone(),
+            environment: ProjectEnvironment::default(),
+            prepare: true,
+        },
+    )
+    .await;
+    let WorkspaceOwnerOperationOutcome::ReviewCheckout {
+        workspace_handle: review,
+    } = review.outcome
+    else {
+        panic!("review handle")
+    };
+    let reset = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_RESET,
+            serde_json::to_value(WorkspaceResetParams {
+                fence: fence("pending-reset", 2, &fixture.prepared.workspace.base_sha),
+                workspace_handle: main.clone(),
+                base_ref: "main".into(),
+                branch: "task/test".into(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    let cleanup = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_CLEANUP,
+            serde_json::to_value(WorkspaceCleanupParams {
+                fence: fence(
+                    "post-reset-cleanup",
+                    2,
+                    &fixture.prepared.workspace.base_sha,
+                ),
+                workspace_handle: main.clone(),
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    // Retiring-operation ownership survives a registry reload.
+    let backend = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        crate::daemon_config::DaemonConfig::default().run_policy(),
+        fixture.journal.clone(),
+    )
+    .unwrap();
+    backend
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: reset["entry_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    let state = fixture
+        .journal
+        .load_workspace_state::<WorkspaceRegistry>()
+        .unwrap();
+    assert!(!state.handles.contains_key(&review));
+    assert!(state.handles.contains_key(main));
+    backend
+        .acknowledge_journal(&JournalAckParams {
+            entry_id: cleanup["entry_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    assert!(!backend.state.lock().unwrap().handles.contains_key(main));
 }

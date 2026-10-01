@@ -42,16 +42,6 @@ const PROTOCOL_UNKNOWN: u8 = 0;
 const PROTOCOL_COMPATIBLE: u8 = 1;
 const PROTOCOL_INCOMPATIBLE: u8 = 2;
 
-// Revision 2 wire format. Revision negotiation selects this shape only for
-// connections that advertised the original terminal acknowledgement contract.
-const REVISION_TWO_TERMINAL_ACK: &str = "execution.terminal.ack";
-
-#[derive(Serialize)]
-struct RevisionTwoTerminalAckParams {
-    terminal_report_id: String,
-    execution_id: String,
-}
-
 /// Stable owner token for one authenticated daemon socket incarnation.  The
 /// durable daemon id identifies the registered machine; the connection id
 /// prevents a delayed frame from an old socket from renewing or terminalizing
@@ -243,6 +233,16 @@ impl DaemonConnection {
 
     pub fn protocol_allows_dispatch(&self) -> bool {
         self.protocol_compatible()
+    }
+
+    pub fn negotiated_revision(&self) -> Option<u32> {
+        (!self.is_stale() && self.protocol_known())
+            .then(|| self.protocol_revision.load(Ordering::Acquire))
+    }
+
+    pub fn needs_upgrade(&self) -> bool {
+        self.negotiated_revision()
+            .is_some_and(|revision| revision < api_types::DAEMON_MIN_PROTOCOL_REVISION)
     }
 
     pub fn snapshot(&self) -> Option<DaemonConnectionSnapshot> {
@@ -452,8 +452,18 @@ impl DaemonConnectionRegistry {
         if connection.protocol_allows_dispatch() {
             return Ok(());
         }
+        if connection.needs_upgrade() {
+            return Err(ServiceError::DaemonUpgradeRequired {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
+        if !connection.protocol_known() {
+            return Err(ServiceError::DaemonNotReady {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
         Err(ServiceError::invalid_operation(format!(
-            "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
+            "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} is missing required command capabilities"
         )))
     }
 
@@ -531,9 +541,13 @@ impl DaemonConnectionRegistry {
 
         if !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
-            return Err(ServiceError::invalid_operation(format!(
-                "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
-            )));
+            return self
+                .ensure_protocol_dispatchable(daemon_id, &connection)
+                .and_then(|()| {
+                    Err(ServiceError::DaemonUnavailable {
+                        daemon_id: daemon_id.to_owned(),
+                    })
+                });
         }
 
         let frame = api_types::DaemonFrame::Request {
@@ -618,9 +632,13 @@ impl DaemonConnectionRegistry {
         if !self.is_current(daemon_id, connection_id) || !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
             if !connection.protocol_allows_dispatch() {
-                return Err(ServiceError::invalid_operation(format!(
-                    "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
-                )));
+                return self
+                    .ensure_protocol_dispatchable(daemon_id, &connection)
+                    .and_then(|()| {
+                        Err(ServiceError::DaemonUnavailable {
+                            daemon_id: daemon_id.to_owned(),
+                        })
+                    });
             }
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
@@ -970,39 +988,21 @@ impl DaemonConnectionRegistry {
             disposition,
             DaemonTerminalDisposition::Acknowledge | DaemonTerminalDisposition::Ignore
         ) {
-            let revision = self
-                .get(daemon_id)
-                .filter(|connection| connection.id() == connection_id)
-                .map(|connection| connection.protocol_revision.load(Ordering::Acquire));
-            if revision == Some(2) {
-                self.send_request_for_connection::<_, Value>(
+            let acknowledgement = self
+                .send_request_for_connection::<_, api_types::JournalAckResult>(
                     daemon_id,
                     connection_id,
-                    REVISION_TWO_TERMINAL_ACK,
-                    RevisionTwoTerminalAckParams {
-                        terminal_report_id: notification.terminal_report_id,
-                        execution_id: notification.execution_id.clone(),
+                    METHOD_JOURNAL_ACK,
+                    JournalAckParams {
+                        entry_id: notification.terminal_report_id.clone(),
                     },
                     api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
                 )
                 .await?;
-            } else {
-                let ack = self
-                    .send_request_for_connection::<_, api_types::JournalAckResult>(
-                        daemon_id,
-                        connection_id,
-                        METHOD_JOURNAL_ACK,
-                        JournalAckParams {
-                            entry_id: notification.terminal_report_id,
-                        },
-                        api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
-                    )
-                    .await?;
-                if !ack.acknowledged {
-                    return Err(ServiceError::invalid_operation(
-                        "daemon did not acknowledge terminal journal entry",
-                    ));
-                }
+            if !acknowledgement.acknowledged {
+                return Err(ServiceError::invalid_operation(
+                    "daemon did not acknowledge terminal journal entry",
+                ));
             }
             lock(&self.inner.journal_terminals).remove(&(
                 daemon_id.to_owned(),
@@ -1119,6 +1119,9 @@ impl DaemonConnectionRegistry {
                         "accepted daemon command protocol"
                     );
                     self.inner.reconciliation_notify.notify_one();
+                } else if handshake.protocol_revision == 2 {
+                    self.send_upgrade_required(&connection);
+                    self.inner.reconciliation_notify.notify_one();
                 } else {
                     self.reject_incompatible_protocol(&connection, daemon_id, connection_id);
                 }
@@ -1136,20 +1139,37 @@ impl DaemonConnectionRegistry {
         }
     }
 
+    fn send_upgrade_required(&self, connection: &DaemonConnection) {
+        let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
+            id: None,
+            error: api_types::DaemonErrorPayload {
+                code: api_types::DAEMON_UPGRADE_REQUIRED.to_owned(),
+                message: api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE.to_owned(),
+                details: None,
+            },
+        });
+    }
+
     fn reject_incompatible_protocol(
         &self,
         connection: &DaemonConnection,
         daemon_id: &str,
         connection_id: u64,
     ) {
-        let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
-            id: None,
-            error: api_types::DaemonErrorPayload {
-                code: DAEMON_PROTOCOL_INCOMPATIBLE.to_owned(),
-                message: "daemon does not advertise the required command protocol".to_owned(),
-                details: None,
-            },
-        });
+        if connection.needs_upgrade() {
+            self.send_upgrade_required(connection);
+        } else {
+            let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
+                id: None,
+                error: api_types::DaemonErrorPayload {
+                    code: DAEMON_PROTOCOL_INCOMPATIBLE.to_owned(),
+                    message:
+                        "daemon handshake is malformed or missing required command capabilities"
+                            .to_owned(),
+                    details: None,
+                },
+            });
+        }
         connection.mark_stale();
         tracing::warn!(
             daemon_id,

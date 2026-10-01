@@ -1227,16 +1227,36 @@ or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
 For containers sharing server workspaces, register a server-owned `shared_mount`
 location instead. Forge verifies a server-written probe through the daemon at
 the same path before using it as an execution provider. Matching absolute paths
-alone are insufficient. Revision 2 daemons remain connected for server-owned
-execution and filesystem browsing but report `workspace_incapable`; daemon
-ownership requires revision 3 with `workspace.v1`.
+alone are insufficient. Daemon ownership requires revision 3 with `workspace.v1`.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
 
 ### Daemon run policy
 
 The daemon reads `daemon.yaml` beside its credentials file when it starts
 (`~/.forge/daemon.yaml` by default; with `--credentials`, use that file's
-directory). This is local machine policy; the server cannot change it.
-`workspace.run.allow` defaults to `[ci_step]`. To opt into Project hooks and
+directory). This is local configuration; requests cannot override the effective
+policy loaded at startup. `workspace.run.allow` defaults to `[ci_step]`. To opt into Project hooks and
 environment setup too, save:
 
 ```yaml
@@ -1251,11 +1271,14 @@ and claim rejects a daemon with `run_purpose_denied` if the Task's review, hooks
 or environment needs a disallowed purpose. A refused command returns
 `purpose_denied` and is never retried.
 
-This policy controls what Forge may dispatch. The daemon is not a sandbox:
-processes can reach the daemon user's `HOME`, credentials, and network. People
-who can edit server-side review steps, Project hooks, or environment commands
-can run those commands on your machine for purposes you allow. Choose the allow
-list with that access in mind.
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
 
 ### Daemon journal migration
 
@@ -1269,8 +1292,20 @@ on the next start. Unknown files in the old directory are left intact.
 
 Restart with the same workspace root to migrate its pending reports. No manual
 copy is needed. Unacknowledged terminal and cleanup results replay after
-reconnect until `journal.ack`; operation receipts remain for deduplication after
-acknowledgement.
+reconnect until `journal.ack`. After the server durably stores the result, ack
+removes the receipt and releases its space. The whole journal (including its
+registry) is capped at 32 MiB and 1,024 receipts. CI output is capped at 1 MiB per
+stream with a marker before the retained tail; execution time may remain
+unbounded. Unbounded CI retains its exit verdict even when logs are shortened or
+omitted. Completion metadata has reserved headroom in the shared budget. Cleanup
+prunes workspace handles and their execution IDs when its receipt is acknowledged;
+reset and release keep retired review handles fenced until acknowledgement too.
+Requests store environment
+variable names and a digest of the redacted request. Output and errors are
+redacted without changing identities or exit codes. Corrupt or non-regular entries
+are quarantined as `corrupt-<original name>` when possible and logged. A failed
+quarantine is logged and skipped so other entries still replay. Command-stream
+initialization failure stops the process promptly.
 
 ## Where to next
 

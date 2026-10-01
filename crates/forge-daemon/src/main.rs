@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         active_executions.clone(),
         shutdown_rx.clone(),
     ));
-    let connect_handle = tokio::spawn(connect::run(
+    let mut connect_handle = tokio::spawn(connect::run(
         Arc::clone(&client),
         workspace_root.clone(),
         active_executions,
@@ -122,7 +122,15 @@ async fn main() -> Result<()> {
         run_policy,
     ));
 
-    wait_for_shutdown(shutdown_rx.clone()).await;
+    tokio::select! {
+        result = &mut connect_handle => {
+            reporter_handle.abort();
+            result.context("daemon command loop task failed")??;
+            if *shutdown_rx.borrow() { return Ok(()); }
+            anyhow::bail!("daemon command loop stopped unexpectedly");
+        }
+        () = wait_for_shutdown(shutdown_rx.clone()) => {}
+    }
     tracing::info!("forge-daemon shutting down");
 
     if let Err(error) = reporter_handle.await.context("join daemon reporter task")? {

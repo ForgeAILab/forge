@@ -1693,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_coder_preserves_workflow_role_prompt() {
+    fn shell_coder_runs_task_command_not_workflow_role_prompt() {
         let task: Task = serde_json::from_value(json!({
             "id": "task", "project_id": "project", "parent_task_id": null,
             "assignee_type": null, "assignee_id": null, "title": "title",
@@ -1714,7 +1714,7 @@ mod tests {
                 &task,
                 &json!({"executor_type": "shell"})
             ),
-            "Forge role contract (authoritative): ...",
+            "printf ok",
         );
         assert_eq!(
             execution_description(
@@ -2366,6 +2366,13 @@ fn execution_description(
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .and_then(|config| config.pointer("/review/review_prompt").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_else(|| "printf '%s\\n' 'Shell reviewer requires an explicit review_prompt producing a conformance assessment' >&2; exit 1".to_owned())
+    } else if is_shell_executor {
+        // A shell executor runs its input as a script. Workflow dispatches
+        // store the LLM role prompt in `summary`, so always run the Task's
+        // own command instead.
+        task.description
+            .clone()
+            .unwrap_or_else(|| task.title.clone())
     } else {
         summary
             .map(str::to_owned)

@@ -793,6 +793,7 @@ impl TaskService {
                 tracing::warn!(task_id = %task.id, %error, "failed to re-project cancelled prerequisite onto dependents");
             }
             self.reconcile_terminal_subtask(&task).await;
+            crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
             return TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task.id));
@@ -818,6 +819,7 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
         // Re-read after the root transition hooks and cancel once more. Any
         // child execution that committed between the pre-cancel snapshot and
         // the root transition is now visible, while the transactional parent

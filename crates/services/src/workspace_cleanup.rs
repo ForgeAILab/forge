@@ -438,9 +438,21 @@ impl WorkspaceCleanupScheduler {
                 &self.workspace_root,
             )
             .await?;
-            if workspace.status != WorkspaceStatus::Cleaned
-                || resolved.backend.describe(&resolved.placement).await?.exists
-            {
+            let present = if workspace.status != WorkspaceStatus::Cleaned {
+                true
+            } else {
+                match resolved.backend.describe(&resolved.placement).await {
+                    Ok(state) => state.exists,
+                    Err(error)
+                        if resolved.placement.state == PlacementState::Cleaned
+                            && crate::workspace_backend::is_unknown_workspace_handle(&error) =>
+                    {
+                        false
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if present {
                 self.cleanup_workspace(workspace).await
             } else {
                 Ok(())
@@ -1779,5 +1791,81 @@ mod tests {
         )
         .await
         .expect("branch kept"));
+    }
+    #[tokio::test]
+    async fn cleanup_terminal_sweep_removes_managed_home_after_owner_handle_retirement() {
+        let db = sqlite_db().await;
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query(
+            "UPDATE task SET status = 'done', updated_at = '1970-01-01T00:00:00Z' WHERE id = ?",
+        )
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?").bind(&execution.id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE workspace SET status = 'cleaned' WHERE id = ?")
+            .bind(&placement.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_placement SET state = 'cleaned' WHERE id = ?")
+            .bind(&placement.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let root = TempDir::new().unwrap();
+        let home = root
+            .path()
+            .join(".forge/logs")
+            .join(&task.project_id)
+            .join(&task.id)
+            .join(".codex-managed-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let daemon_id = placement.daemon_id.unwrap();
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let service = crate::TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().into());
+        let router = Arc::new(
+            (*service.workspace_backend_router())
+                .clone()
+                .with_daemon(Arc::new(
+                    crate::workspace_backend::DaemonWorkspaceBackend::new(
+                        db.clone(),
+                        registry.clone(),
+                    ),
+                )),
+        );
+        let scheduler = WorkspaceCleanupScheduler::new(
+            db.clone(),
+            Arc::new(EventBus::default()),
+            root.path().into(),
+        );
+        scheduler.set_workspace_backend_router(router);
+        let responder = tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, .. } = outbound.recv().await.unwrap()
+            else {
+                panic!("describe request");
+            };
+            assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+            registry.dispatch_incoming_for_connection(
+                &daemon_id,
+                connection_id,
+                api_types::DaemonFrame::Error {
+                    id: Some(id),
+                    error: api_types::DaemonErrorPayload {
+                        code: "invalid_input".into(),
+                        message: "unknown workspace_handle".into(),
+                        details: None,
+                    },
+                },
+            );
+        });
+        scheduler.sweep().await.unwrap();
+        responder.await.unwrap();
+        assert!(!home.exists());
     }
 }

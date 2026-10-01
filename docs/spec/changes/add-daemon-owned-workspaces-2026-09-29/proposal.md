@@ -86,10 +86,10 @@ ignores the repository, the platform, and the workspace.
 - **BREAKING**: an unpinned CLI Agent no longer silently runs on the
   embedded provider. It runs on the owner its placement selects, and
   admission fails with a structured reason when no compatible owner exists.
-- **BREAKING**: daemon protocol revision 2 → 3. Daemons older than revision
-  3 stay connected for execution and filesystem browsing on server-owned
-  placements, but they cannot own workspaces. The server marks them
-  `workspace_incapable` rather than disconnecting them.
+- **BREAKING**: daemon protocol revision 2 → 3. Revision-2 daemons remain
+  visible for upgrade diagnostics, but all command RPCs are refused
+  with `daemon_upgrade_required`, including execution, verification, filesystem
+  browsing, and terminals. Upgrade the server first, then every daemon.
 - **BREAKING**: the executor snapshot drops `resolved_daemon_id` in favor of
   `placement_id`. Task and Workspace responses gain a `placement` object.
   `docs/architecture.md` loses the "same absolute path" caveat, and a

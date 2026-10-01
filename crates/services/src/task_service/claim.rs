@@ -354,6 +354,8 @@ impl TaskService {
                 return Err(error);
             }
         }
+        crate::placement::admission::resolve_workspace_attention_in_tx(&mut transaction, &task_id)
+            .await?;
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can

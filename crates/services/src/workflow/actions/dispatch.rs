@@ -661,7 +661,20 @@ async fn dispatch_refusal(ctx: &HookContext, error: crate::ServiceError) -> Hook
     .await;
     match result {
         Ok(true) => HookResult::Skipped { reason },
-        Ok(false) => HookResult::Failed { reason },
+        Ok(false) => {
+            if let Err(annotation_error) =
+                crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                    &ctx.db,
+                    &ctx.task_id,
+                    &ctx.to_state,
+                    &error,
+                )
+                .await
+            {
+                tracing::warn!(task_id = %ctx.task_id, %annotation_error, "failed to record daemon upgrade refusal");
+            }
+            HookResult::Failed { reason }
+        }
         Err(error) => HookResult::Failed {
             reason: error.to_string(),
         },

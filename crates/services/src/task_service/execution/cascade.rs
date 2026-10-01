@@ -77,10 +77,32 @@ impl TaskService {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
             return Ok(true);
         };
-        let Some(_slot) = self.claim_completion_cascade(&execution.task_id) else {
+        let Some(slot) = self.claim_completion_cascade(&execution.task_id) else {
             return Ok(false);
         };
-        self.cascade_executor_completion(execution_id).await?;
+        let service = self.clone();
+        let execution_id = execution_id.to_owned();
+        tokio::spawn(async move {
+            let result = service.cascade_executor_completion(&execution_id).await;
+            drop(slot);
+            if let Err(error) = result {
+                tracing::warn!(%execution_id, %error, "detached completion cascade remains pending");
+                return;
+            }
+            if let Some(registry) = &service.daemon_connections {
+                if let Ok(Some(placement)) =
+                    db::WorkspacePlacementRepo::get_for_task(&*service.db, &execution.task_id).await
+                {
+                    if let Some(daemon_id) =
+                        crate::recovery::placement_execution_daemon_id(&placement)
+                    {
+                        if let Err(error) = registry.retry_retained_terminals(daemon_id).await {
+                            tracing::warn!(%daemon_id, %error, "cascade acknowledgement remains pending");
+                        }
+                    }
+                }
+            }
+        });
         Ok(true)
     }
 

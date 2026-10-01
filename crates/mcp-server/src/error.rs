@@ -345,8 +345,8 @@ impl From<ServiceError> for McpToolError {
         let protected_cause = error.to_string();
         let mapped = match error {
             ServiceError::PlacementUnavailable(error) => {
-                Self::new(-32029, "workspace placement unavailable").with_data(json!({
-                    "code": "placement_unavailable",
+                Self::new(-32029, if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE } else { "workspace placement unavailable" }).with_data(json!({
+                    "code": if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
                     "task_id": error.task_id,
                     "repo_id": error.repo_id,
                     "rejected_candidates": error.rejected_candidates,
@@ -496,6 +496,10 @@ impl From<ServiceError> for McpToolError {
                     "code": TERMINAL_INVALID_INPUT
                 }))
             }
+            ServiceError::DaemonNotReady { daemon_id } => Self::new(-32029, "daemon command handshake is not ready")
+                .with_data(json!({"code":"daemon_not_ready", "daemon_id":daemon_id})),
+            ServiceError::DaemonUpgradeRequired { daemon_id } => Self::new(-32029, api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE)
+                .with_data(json!({"code":api_types::DAEMON_UPGRADE_REQUIRED, "daemon_id":daemon_id, "needs_human":true})),
             ServiceError::DaemonUnavailable { daemon_id } => {
                 Self::new(-32029, format!("daemon {daemon_id} unavailable"))
                     .with_data(json!({"code": "daemon_unavailable", "daemon_id": daemon_id}))

@@ -226,7 +226,7 @@ pub async fn configure_execution_test_setup(
         .expect("test worker lookup")
         .expect("test worker exists");
     assert_eq!(
-        services::agent_service::compute_effective_status(db, &worker)
+        services::agent_service::compute_effective_status(db, &worker, None)
             .await
             .expect("test worker effective status"),
         services::agent_service::EffectiveStatus::Active,
@@ -238,7 +238,7 @@ pub async fn configure_execution_test_setup(
             .expect("test reviewer lookup")
             .expect("test reviewer exists");
         assert_eq!(
-            services::agent_service::compute_effective_status(db, &reviewer)
+            services::agent_service::compute_effective_status(db, &reviewer, None)
                 .await
                 .expect("test reviewer effective status"),
             services::agent_service::EffectiveStatus::Active,

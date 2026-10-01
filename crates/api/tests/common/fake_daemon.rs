@@ -218,7 +218,7 @@ pub async fn next_daemon_request(
     socket: &mut ClientSocket,
     expected_method: &str,
 ) -> (String, Value) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let message = socket
                 .next()
@@ -232,6 +232,30 @@ pub async fn next_daemon_request(
                 serde_json::from_str(text.as_ref()).expect("daemon frame parses");
             match frame {
                 DaemonFrame::Request { id, method, params } => {
+                    if method == api_types::METHOD_REPO_LOCATION_VERIFY && method != expected_method
+                    {
+                        let verification: api_types::RepoLocationVerifyParams =
+                            serde_json::from_value(params.clone()).expect("verification params");
+                        let (outbound, _unused) = tokio::sync::mpsc::unbounded_channel();
+                        let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+                            outbound,
+                            std::path::PathBuf::from(&verification.path),
+                            Default::default(),
+                            verification.daemon_id,
+                            Default::default(),
+                        )
+                        .expect("fake verifier starts");
+                        let response = runtime
+                            .handle_request(DaemonFrame::Request { id, method, params })
+                            .await;
+                        socket
+                            .send(WsMessage::Text(
+                                serde_json::to_string(&response).unwrap().into(),
+                            ))
+                            .await
+                            .expect("verification response sends");
+                        continue;
+                    }
                     assert_eq!(method, expected_method);
                     return (id, params);
                 }

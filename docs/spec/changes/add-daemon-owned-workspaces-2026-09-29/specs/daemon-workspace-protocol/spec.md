@@ -1,12 +1,13 @@
 ## ADDED Requirements
 
 ### Requirement: Workspace protocol capability
-The daemon protocol SHALL advance to revision 3 and add the handshake capability `workspace.v1`. The server SHALL keep accepting revision 2 daemons for execution and filesystem browsing on server-owned placements, SHALL mark them `workspace_incapable`, and SHALL NOT place a workspace on them.
+The daemon protocol SHALL advance to revision 3 and add the handshake capability `workspace.v1`. The server SHALL refuse every command RPC from revision 2 daemons, including execution, verification, filesystem browsing, and PTY terminals, with the actionable `daemon_upgrade_required` reason. Their sockets SHALL remain visible for upgrade diagnostics. A socket awaiting its handshake SHALL be reported as not ready.
 
 #### Scenario: Old daemon connects
 - **WHEN** a revision 2 daemon completes the handshake
-- **THEN** it stays connected and reports `workspace_incapable`
-- **AND** placement admission rejects it with filter `workspace_protocol_missing`
+- **THEN** its socket remains visible and receives `daemon_upgrade_required`
+- **AND** otherwise eligible upgrade-only admission, with no transient or capacity alternative, rejects it with filter `daemon_upgrade_required`, without creating an Execution
+- **AND** dispatch records the human-action blocker and clears it automatically after that owner's supported handshake
 
 ### Requirement: Operation-level workspace RPCs
 A `workspace.v1` daemon SHALL implement `repo_location.verify`, `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`, `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`. `workspace.run` SHALL accept only the purposes `environment_setup`, `hook`, and `ci_step`, with commands from server-side Task or Project configuration. It SHALL run them with the same shell semantics, time limit, and output cap as the embedded backend. The protocol SHALL NOT offer a general command-execution method.
@@ -22,7 +23,7 @@ A `workspace.v1` daemon SHALL implement `repo_location.verify`, `workspace.prepa
 - **AND** returns the merged SHA or the same conflict, dirty, and target-dirty outcomes as the embedded backend
 
 ### Requirement: Idempotent, fenced mutations
-Every mutating workspace request SHALL carry the workspace handle or placement id, a unique `operation_id`, the placement `generation`, and an expected base SHA or version. The daemon SHALL journal each operation's result under its workspace root. It SHALL return the recorded result for a repeated `operation_id`, and SHALL reject a request with a stale generation (`stale_generation`) or for a placement it does not own (`wrong_owner`).
+Every mutating workspace request SHALL carry the workspace handle or placement id, a unique `operation_id`, the placement `generation`, and an expected base SHA or version. The daemon SHALL journal each operation's result under its workspace root. It SHALL return the recorded result for a repeated `operation_id` until acknowledgement, delete the receipt on ack after the server durably stores it, and SHALL reject a request with a stale generation (`stale_generation`) or for a placement it does not own (`wrong_owner`).
 
 #### Scenario: Retried prepare after timeout
 - **WHEN** the server resends `workspace.prepare` with the same `operation_id` after a transport timeout
@@ -40,7 +41,7 @@ A daemon SHALL map workspace handles only to directories it created under its ow
 - **THEN** the daemon rejects it and performs no filesystem change
 
 ### Requirement: Journal replay on reconnect
-The daemon SHALL replay unacknowledged `execution.terminal` and `workspace.cleanup` results after reconnecting, until the server acknowledges each one. The server SHALL apply each result at most once.
+The daemon SHALL replay unacknowledged `execution.terminal` and `workspace.cleanup` results after reconnecting, until the server acknowledges each one. The server SHALL apply each result at most once. Reports for deleted executions SHALL be acknowledged. Cleaned placements SHALL treat an acknowledged, retired handle as absent.
 
 #### Scenario: Cleanup ack after reconnect
 - **WHEN** a daemon removes a worktree while disconnected from the server

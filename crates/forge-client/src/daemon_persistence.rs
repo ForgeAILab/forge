@@ -1,11 +1,11 @@
 //! One crash-safe journal for terminal reports, workspace results and cleanup.
-//! Results are installed before emission. Operation receipts survive an ack so
-//! resending an operation id cannot repeat its side effects.
+//! Results are installed before emission and retained until the server durably
+//! records them and acknowledges that replay is no longer needed.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,11 +24,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const JOURNAL_DIRECTORY: &str = ".forge/journal";
-// Queue bounds apply to unacknowledged entries. Acknowledged operation
-// receipts remain available for deduplication without starving new reports.
+// Bounds include every receipt and the workspace registry.
 pub const MAX_JOURNAL_ENTRIES: usize = 1024;
 pub const MAX_JOURNAL_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_REPORT_SIZE: usize = 1024 * 1024;
+pub const MAX_CI_LOG_BYTES: usize = 1024 * 1024;
+pub const CI_LOG_TRUNCATION_MARKER: &str = "\n[Forge: CI log truncated]\n";
 // A run can retain one MiB per stream; escaped JSON may expand each byte six
 // times. Terminal reports keep their separate one-MiB cap above.
 const MAX_JOURNAL_ENTRY_SIZE: usize = 16 * 1024 * 1024;
@@ -58,17 +59,6 @@ pub struct JournalOperation {
 }
 
 impl JournalEntry {
-    fn has_unbounded_ci_output(&self) -> bool {
-        matches!(self, Self::Operation { operation }
-            if operation.method == METHOD_WORKSPACE_RUN
-                && operation.request["purpose"].as_str() == Some("ci_step")
-                && operation.request["max_output_bytes"].as_u64() == Some(u64::MAX))
-    }
-
-    fn is_pending(&self) -> bool {
-        !matches!(self, Self::Operation { operation } if operation.acknowledged)
-    }
-
     pub fn entry_id(&self) -> &str {
         match self {
             Self::Terminal { report } => &report.terminal_report_id,
@@ -95,6 +85,15 @@ impl JournalEntry {
     }
 }
 
+#[derive(Default)]
+struct JournalUsage {
+    files: HashMap<PathBuf, u64>,
+    bytes: u64,
+    entries: usize,
+    reservations: HashMap<PathBuf, u64>,
+    skipped: HashSet<PathBuf>,
+}
+
 pub struct DaemonJournal {
     directory: PathBuf,
     workspace_root: Option<PathBuf>,
@@ -102,6 +101,9 @@ pub struct DaemonJournal {
     max_bytes: u64,
     temp_sequence: AtomicU64,
     write_lock: Mutex<()>,
+    usage: Mutex<Option<JournalUsage>>,
+    #[cfg(test)]
+    fail_next_directory_sync: std::sync::atomic::AtomicBool,
 }
 
 impl DaemonJournal {
@@ -122,6 +124,9 @@ impl DaemonJournal {
             max_bytes,
             temp_sequence: AtomicU64::new(1),
             write_lock: Mutex::new(()),
+            usage: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_directory_sync: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -133,6 +138,9 @@ impl DaemonJournal {
             max_bytes: MAX_JOURNAL_BYTES,
             temp_sequence: AtomicU64::new(1),
             write_lock: Mutex::new(()),
+            usage: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_directory_sync: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -143,6 +151,10 @@ impl DaemonJournal {
     /// Convert the old queue on startup; delete each source only after the new
     /// entry and its directory have been synced. A partial conversion retries.
     pub fn initialize(&self) -> Result<()> {
+        {
+            let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.current_usage()?;
+        }
         let Some(root) = &self.workspace_root else {
             return Ok(());
         };
@@ -184,23 +196,35 @@ impl DaemonJournal {
 
     pub fn retain_entry(&self, entry: &JournalEntry) -> Result<()> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = sanitized_entry(entry);
         let path = self.path_for_entry(entry.entry_id())?;
-        if path.exists() {
+        self.current_usage()?;
+        if path.exists() && !self.is_skipped(&path) {
             let existing = read_entry(&path)?;
-            if serde_json::to_value(&existing)? == serde_json::to_value(entry)? {
+            if serde_json::to_value(&existing)? == serde_json::to_value(&entry)? {
                 return Ok(());
             }
             bail!(
                 "{TERMINAL_REPORT_CONFLICT}: journal entry ID was reused with a different payload"
             );
         }
-        self.write_entry(entry)
+        self.write_entry(&entry).map(|_| ())
     }
 
     /// Replace only a matching unfinished intent with its final result.
-    pub fn finish_operation(&self, operation: &JournalOperation) -> Result<()> {
+    pub fn finish_operation(&self, operation: &JournalOperation) -> Result<JournalOperation> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let existing = read_entry(&self.path_for_entry(&operation.entry_id)?)?;
+        let JournalEntry::Operation { operation } = sanitized_entry(&JournalEntry::Operation {
+            operation: operation.clone(),
+        }) else {
+            unreachable!()
+        };
+        let path = self.path_for_entry(&operation.entry_id)?;
+        self.current_usage()?;
+        if !path.exists() || self.is_skipped(&path) {
+            bail!("operation intent is missing");
+        }
+        let existing = read_entry(&path)?;
         let JournalEntry::Operation { operation: intent } = existing else {
             bail!("{TERMINAL_REPORT_CONFLICT}: operation collides with a terminal report");
         };
@@ -210,15 +234,19 @@ impl DaemonJournal {
         {
             bail!("{TERMINAL_REPORT_CONFLICT}: operation intent does not match");
         }
-        self.write_entry(&JournalEntry::Operation {
-            operation: operation.clone(),
-        })
+        let JournalEntry::Operation { operation } =
+            self.write_entry(&JournalEntry::Operation { operation })?
+        else {
+            unreachable!()
+        };
+        Ok(operation)
     }
 
     pub fn operation(&self, operation_id: &str) -> Result<Option<JournalOperation>> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.path_for_entry(&operation_entry_id(operation_id))?;
-        if !path.exists() {
+        self.current_usage()?;
+        if !path.exists() || self.is_skipped(&path) {
             return Ok(None);
         }
         match read_entry(&path)? {
@@ -238,6 +266,7 @@ impl DaemonJournal {
     pub fn pending(&self) -> Result<Vec<JournalEntry>> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.ensure_confined()?;
+        self.current_usage()?;
         if !self.directory.exists() {
             return Ok(Vec::new());
         }
@@ -252,8 +281,11 @@ impl DaemonJournal {
         paths.sort();
         let mut entries = Vec::new();
         for path in paths {
+            if self.is_skipped(&path) {
+                continue;
+            }
             let entry = read_entry(&path)?;
-            if entry.is_pending() {
+            if !matches!(&entry, JournalEntry::Operation { operation } if operation.acknowledged) {
                 entries.push(entry);
             }
         }
@@ -263,33 +295,44 @@ impl DaemonJournal {
     pub fn acknowledge(&self, params: &JournalAckParams) -> Result<JournalAckResult> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.path_for_entry(&params.entry_id)?;
-        if !path.exists() {
+        self.current_usage()?;
+        if !path.exists() || self.is_skipped(&path) {
             return Ok(JournalAckResult {
                 entry_id: params.entry_id.clone(),
-                acknowledged: false,
+                // A repeated ack after response loss must also settle the
+                // server's durable acknowledgement receipt.
+                acknowledged: true,
             });
         }
-        let mut entry = read_entry(&path)?;
+        let entry = read_entry(&path)?;
         if entry.entry_id() != params.entry_id {
             bail!("{TERMINAL_REPORT_CONFLICT}: journal acknowledgement identity does not match");
         }
-        match &mut entry {
-            JournalEntry::Terminal { .. } => {
-                fs::remove_file(&path)?;
-                sync_directory(&self.directory)?;
-            }
-            JournalEntry::Operation { operation } => {
-                if operation.outcome.is_none() {
-                    bail!("cannot acknowledge an unfinished operation");
-                }
-                operation.acknowledged = true;
-                self.write_entry(&entry)?;
-            }
+        if matches!(&entry, JournalEntry::Operation { operation } if operation.outcome.is_none()) {
+            bail!("cannot acknowledge an unfinished operation");
         }
+        self.current_usage()?;
+        fs::remove_file(&path)?;
+        self.update_usage(&path, None, 0);
+        self.sync_directory()?;
         Ok(JournalAckResult {
             entry_id: params.entry_id.clone(),
             acknowledged: true,
         })
+    }
+
+    pub(crate) fn entry(&self, entry_id: &str) -> Result<Option<JournalEntry>> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.path_for_entry(entry_id)?;
+        self.current_usage()?;
+        if !path.exists() || self.is_skipped(&path) {
+            return Ok(None);
+        }
+        let entry = read_entry(&path)?;
+        if entry.entry_id() != entry_id {
+            bail!("{TERMINAL_REPORT_CONFLICT}: journal entry identity does not match");
+        }
+        Ok(Some(entry))
     }
 
     pub(crate) fn load_workspace_state<T: DeserializeOwned + Default>(&self) -> Result<T> {
@@ -309,7 +352,14 @@ impl DaemonJournal {
         if payload.len() as u64 > MAX_JOURNAL_BYTES {
             bail!("workspace registry exceeds bounded size");
         }
-        self.atomic_write(&self.directory.join("workspace-state.json"), &payload)
+        let path = self.directory.join("workspace-state.json");
+        self.check_capacity(&path, payload.len() as u64)?;
+        if let Err(error) = self.atomic_write(&path, &payload) {
+            *self.usage.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return Err(error);
+        }
+        self.update_usage(&path, Some(payload.len() as u64), 0);
+        Ok(())
     }
 
     fn path_for_entry(&self, entry_id: &str) -> Result<PathBuf> {
@@ -339,40 +389,102 @@ impl DaemonJournal {
         Ok(())
     }
 
-    fn write_entry(&self, entry: &JournalEntry) -> Result<()> {
-        let payload = serde_json::to_vec(entry)?;
-        if !entry.has_unbounded_ci_output() && payload.len() > MAX_JOURNAL_ENTRY_SIZE {
+    fn write_entry(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        let path = self.path_for_entry(entry.entry_id())?;
+        let (_, bytes) = self.current_usage()?;
+        let old_bytes = self
+            .usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|usage| usage.files.get(&path))
+            .copied()
+            .unwrap_or(0);
+        let reserved = self.reserved_bytes_except(&path);
+        let available = self
+            .max_bytes
+            .saturating_sub(bytes.saturating_sub(old_bytes).saturating_add(reserved));
+        let mut entry = entry.clone();
+        fit_run_receipt(&mut entry, available.min(MAX_JOURNAL_ENTRY_SIZE as u64))?;
+        let payload = serde_json::to_vec(&entry)?;
+        let reservation = run_result_reservation(&entry)?;
+        if (payload.len() as u64).saturating_add(reservation) > MAX_JOURNAL_ENTRY_SIZE as u64 {
             bail!("journal entry exceeds bounded size");
         }
-        let path = self.path_for_entry(entry.entry_id())?;
-        let old_entry = path.exists().then(|| read_entry(&path)).transpose()?;
-        let old_pending = old_entry.as_ref().is_some_and(JournalEntry::is_pending);
-        let old_bytes = if old_pending
-            && !old_entry
-                .as_ref()
-                .is_some_and(JournalEntry::has_unbounded_ci_output)
-        {
-            fs::metadata(&path)?.len()
-        } else {
-            0
-        };
+        self.check_capacity(&path, (payload.len() as u64).saturating_add(reservation))?;
+        if let Err(error) = self.atomic_write(&path, &payload) {
+            *self.usage.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return Err(error);
+        }
+        self.update_usage(&path, Some(payload.len() as u64), reservation);
+        Ok(entry)
+    }
+
+    fn check_capacity(&self, path: &Path, new_bytes: u64) -> Result<()> {
         let (count, bytes) = self.current_usage()?;
-        let retained_count =
-            count.saturating_sub(usize::from(old_pending)) + usize::from(entry.is_pending());
-        if retained_count > self.max_entries {
+        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        let old_bytes = usage.as_ref().and_then(|u| u.files.get(path)).copied();
+        if count + usize::from(is_entry_path(path) && old_bytes.is_none()) > self.max_entries {
             bail!("journal reached its record bound ({})", self.max_entries);
         }
-        if bytes.saturating_sub(old_bytes).saturating_add(
-            if entry.is_pending() && !entry.has_unbounded_ci_output() {
-                payload.len() as u64
-            } else {
-                0
-            },
-        ) > self.max_bytes
+        if bytes
+            .saturating_sub(old_bytes.unwrap_or(0))
+            .saturating_add(new_bytes)
+            .saturating_add(usage.as_ref().map_or(0, |u| {
+                u.reservations
+                    .iter()
+                    .filter(|(p, _)| p.as_path() != path)
+                    .map(|(_, bytes)| *bytes)
+                    .sum::<u64>()
+            }))
+            > self.max_bytes
         {
             bail!("journal reached its byte bound ({})", self.max_bytes);
         }
-        self.atomic_write(&path, &payload)
+        Ok(())
+    }
+
+    fn reserved_bytes_except(&self, path: &Path) -> u64 {
+        self.usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |usage| {
+                usage
+                    .reservations
+                    .iter()
+                    .filter(|(p, _)| p.as_path() != path)
+                    .map(|(_, bytes)| *bytes)
+                    .sum()
+            })
+    }
+
+    fn update_usage(&self, path: &Path, bytes: Option<u64>, reservation: u64) {
+        let mut usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(usage) = usage.as_mut() {
+            usage.skipped.remove(path);
+            usage.reservations.remove(path);
+            if reservation > 0 {
+                usage.reservations.insert(path.to_owned(), reservation);
+            }
+            if let Some(old) = usage.files.remove(path) {
+                usage.bytes -= old;
+                usage.entries -= usize::from(is_entry_path(path));
+            }
+            if let Some(bytes) = bytes {
+                usage.files.insert(path.to_owned(), bytes);
+                usage.bytes += bytes;
+                usage.entries += usize::from(is_entry_path(path));
+            }
+        }
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_directory_sync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+        sync_directory(&self.directory)
     }
 
     fn atomic_write(&self, path: &Path, payload: &[u8]) -> Result<()> {
@@ -395,7 +507,7 @@ impl DaemonJournal {
             temp.write_all(payload)?;
             temp.sync_all()?;
             fs::rename(&temp_path, path)?;
-            sync_directory(&self.directory)?;
+            self.sync_directory()?;
             Ok(())
         })();
         if result.is_err() {
@@ -404,29 +516,368 @@ impl DaemonJournal {
         result
     }
 
+    // Load metadata once per process. RPC lookup reads only its hashed receipt;
+    // writing updates counters without parsing every historical payload.
     fn current_usage(&self) -> Result<(usize, u64)> {
-        if !self.directory.exists() {
-            return Ok((0, 0));
-        }
-        let mut count = 0;
-        let mut bytes = 0_u64;
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("entry-")
-                && entry.path().extension().is_some_and(|ext| ext == "json")
-            {
-                let record = read_entry(&entry.path())?;
-                if !record.is_pending() {
-                    continue;
+        let mut cached = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        if cached.is_none() {
+            self.ensure_confined()?;
+            let mut usage = JournalUsage::default();
+            if self.directory.exists() {
+                for entry in fs::read_dir(&self.directory)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !is_entry_path(&path) && entry.file_name() != "workspace-state.json" {
+                        // Atomic-write scratch files are never replayable.
+                        if entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".journal.tmp.")
+                        {
+                            if let Err(error) = fs::remove_file(&path) {
+                                tracing::warn!(path = %path.display(), %error, "could not remove journal scratch file");
+                            }
+                        }
+                        continue;
+                    }
+                    if is_entry_path(&path) {
+                        // One-time compaction can read the pre-fix, unbounded
+                        // CI receipts. Normal RPC reads are always bounded.
+                        let decoded = (|| -> Result<JournalEntry> {
+                            if !fs::symlink_metadata(&path)?.is_file() {
+                                bail!("non-regular journal entry");
+                            }
+                            Ok(serde_json::from_reader(BufReader::new(File::open(&path)?))?)
+                        })();
+                        let record = match decoded {
+                            Ok(record) => record,
+                            Err(error) => {
+                                let quarantine = self.directory.join(format!(
+                                    "corrupt-{}",
+                                    entry.file_name().to_string_lossy()
+                                ));
+                                match fs::rename(&path, &quarantine) {
+                                    Ok(()) => {
+                                        tracing::warn!(path = %path.display(), quarantine = %quarantine.display(), %error, "quarantined invalid daemon journal entry");
+                                        if let Err(sync_error) = self.sync_directory() {
+                                            tracing::warn!(path = %quarantine.display(), %sync_error, "could not sync journal quarantine");
+                                        }
+                                    }
+                                    Err(quarantine_error) => {
+                                        tracing::warn!(path = %path.display(), %error, %quarantine_error, "could not quarantine daemon journal entry; skipping it");
+                                        usage.skipped.insert(path);
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+                        if matches!(&record, JournalEntry::Operation { operation } if operation.acknowledged)
+                        {
+                            if let Err(error) = fs::remove_file(&path) {
+                                tracing::warn!(path = %path.display(), %error, "could not remove acknowledged journal entry; skipping it");
+                                usage.skipped.insert(path);
+                            } else if let Err(error) = self.sync_directory() {
+                                tracing::warn!(path = %path.display(), %error, "could not sync acknowledged journal entry removal");
+                            }
+                            continue;
+                        }
+                        // Scrub existing pre-fix receipts as part of the one-time
+                        // journal scan, retaining their replay identity and result.
+                        let retained = sanitized_entry(&record);
+                        let reservation = run_result_reservation(&retained)?;
+                        if reservation > 0 {
+                            usage.reservations.insert(path.clone(), reservation);
+                        }
+                        if serde_json::to_value(&retained)? != serde_json::to_value(&record)? {
+                            self.atomic_write(&path, &serde_json::to_vec(&retained)?)?;
+                        }
+                    }
+                    let bytes = fs::metadata(&path)?.len();
+                    usage.bytes = usage.bytes.saturating_add(bytes);
+                    usage.entries += usize::from(is_entry_path(&path));
+                    usage.files.insert(path, bytes);
                 }
-                count += 1;
-                if !record.has_unbounded_ci_output() {
-                    bytes = bytes.saturating_add(entry.metadata()?.len());
+            }
+            // Pre-fix CI receipts were excluded from the queue byte bound.
+            // Compact their logs to fit the shared budget without discarding
+            // pending completion metadata or intents needed for crash replay.
+            let reserved: u64 = usage.reservations.values().sum();
+            if usage.bytes.saturating_add(reserved) > self.max_bytes {
+                let mut paths = usage
+                    .files
+                    .iter()
+                    .map(|(path, bytes)| (path.clone(), *bytes))
+                    .collect::<Vec<_>>();
+                paths.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+                for (path, old_bytes) in paths {
+                    if usage.bytes.saturating_add(reserved) <= self.max_bytes {
+                        break;
+                    }
+                    if !is_entry_path(&path) {
+                        continue;
+                    }
+                    let mut record = read_entry(&path)?;
+                    let available = self.max_bytes.saturating_sub(
+                        usage
+                            .bytes
+                            .saturating_sub(old_bytes)
+                            .saturating_add(reserved),
+                    );
+                    fit_run_receipt(&mut record, available)?;
+                    let payload = serde_json::to_vec(&record)?;
+                    if (payload.len() as u64) < old_bytes {
+                        self.atomic_write(&path, &payload)?;
+                        usage.bytes = usage.bytes - old_bytes + payload.len() as u64;
+                        usage.files.insert(path, payload.len() as u64);
+                    }
+                }
+            }
+            *cached = Some(usage);
+        }
+        let usage = cached.as_ref().expect("usage initialized");
+        Ok((usage.entries, usage.bytes))
+    }
+
+    fn is_skipped(&self, path: &Path) -> bool {
+        self.usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|usage| usage.skipped.contains(path))
+    }
+}
+
+fn is_entry_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("entry-"))
+        && path.extension().is_some_and(|ext| ext == "json")
+}
+
+// Bind replay to the redacted request, never a caller-supplied digest or secrets.
+pub(crate) fn journal_request(request: &Value) -> Value {
+    let mut retained = request.clone();
+    let env = request_environment(request);
+    if let Some(object) = retained.as_object_mut() {
+        object.remove("_request_digest");
+        if let Some(command) = object.get_mut("command") {
+            redact_text(command, &env);
+        }
+        if let Some(environment) = object.get_mut("env") {
+            // Already-sanitized names remain names during startup compaction.
+            if !environment
+                .as_array()
+                .is_some_and(|names| names.iter().all(Value::is_string))
+            {
+                *environment = serde_json::json!(env.keys().collect::<Vec<_>>());
+            }
+        }
+        if let Some(environment) = object
+            .get_mut("operation")
+            .and_then(|op| op.get_mut("environment"))
+        {
+            if let Some(values) = environment
+                .get_mut("env")
+                .filter(|values| values.is_object())
+            {
+                *values = serde_json::json!(values.as_object().unwrap().keys().collect::<Vec<_>>());
+            }
+            if let Some(checks) = environment.get_mut("checks").and_then(Value::as_array_mut) {
+                for check in checks {
+                    if let Some(command) = check.get_mut("command") {
+                        redact_text(command, &env);
+                    }
                 }
             }
         }
-        Ok((count, bytes))
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&retained).expect("JSON value serializes"))
+        );
+        retained["_request_digest"] = Value::String(digest);
     }
+    retained
+}
+
+fn request_environment(request: &Value) -> std::collections::BTreeMap<String, String> {
+    let mut env: std::collections::BTreeMap<String, String> = request
+        .get("env")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<Vec<(String, String)>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if let Some(values) = request
+        .pointer("/operation/environment/env")
+        .and_then(Value::as_object)
+    {
+        env.extend(values.iter().filter_map(|(key, value)| {
+            value.as_str().map(|value| (key.clone(), value.to_owned()))
+        }));
+    }
+    env
+}
+
+fn redact_text(value: &mut Value, env: &std::collections::BTreeMap<String, String>) {
+    if let Value::String(text) = value {
+        *text = executors::environment::redact_environment_values(text, env);
+    }
+}
+
+pub(crate) fn sanitize_terminal_report(
+    report: &mut ExecutionTerminalNotification,
+    env: &std::collections::BTreeMap<String, String>,
+) {
+    for text in [&mut report.summary, &mut report.error]
+        .into_iter()
+        .flatten()
+    {
+        *text = executors::environment::redact_environment_values(text, env);
+    }
+    for entry in &mut report.outbox_entries {
+        match entry {
+            api_types::ExecutionOutboxEntry::Worklog { summary, .. } => {
+                *summary = executors::environment::redact_environment_values(summary, env);
+            }
+            api_types::ExecutionOutboxEntry::Evidence {
+                caption, content, ..
+            } => {
+                *caption = executors::environment::redact_environment_values(caption, env);
+                if let Some(text) = content {
+                    *text = executors::environment::redact_environment_values(text, env);
+                }
+            }
+        }
+    }
+}
+
+// A prefix says the beginning was omitted. Keep a UTF-8-safe byte tail.
+fn marked_tail(text: &str, budget: usize) -> String {
+    let body = text.strip_prefix(CI_LOG_TRUNCATION_MARKER).unwrap_or(text);
+    if budget < CI_LOG_TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let mut start = body
+        .len()
+        .saturating_sub(budget - CI_LOG_TRUNCATION_MARKER.len());
+    while !body.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{CI_LOG_TRUNCATION_MARKER}{}", &body[start..])
+}
+
+fn sanitized_entry(entry: &JournalEntry) -> JournalEntry {
+    let mut retained = entry.clone();
+    if let JournalEntry::Operation { operation } = &mut retained {
+        let env = request_environment(&operation.request);
+        operation.request = journal_request(&operation.request);
+        if let Some(outcome) = &mut operation.outcome {
+            match outcome {
+                Ok(value) => {
+                    for stream in ["stdout", "stderr"] {
+                        if let Some(text) = value.get_mut(stream) {
+                            redact_text(text, &env);
+                        }
+                        if operation.method == METHOD_WORKSPACE_RUN {
+                            if let Some(text) = value[stream].as_str().filter(|s| {
+                                s.len() > MAX_CI_LOG_BYTES
+                                    || (!s.starts_with(CI_LOG_TRUNCATION_MARKER)
+                                        && value[format!("{stream}_truncated")] == true
+                                        && operation.request["max_output_bytes"]
+                                            .as_u64()
+                                            .is_some_and(|cap| cap > MAX_CI_LOG_BYTES as u64))
+                            }) {
+                                value[stream] = Value::String(marked_tail(text, MAX_CI_LOG_BYTES));
+                                value[format!("{stream}_truncated")] = Value::Bool(true);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    error.message =
+                        executors::environment::redact_environment_values(&error.message, &env);
+                }
+            }
+        }
+    }
+    retained
+}
+
+// Admission reserves room for a run's completion without logs. Other writes
+// cannot consume it while the command runs, including workspace-registry writes.
+fn run_result_reservation(entry: &JournalEntry) -> Result<u64> {
+    let JournalEntry::Operation { operation } = entry else {
+        return Ok(0);
+    };
+    if operation.method != METHOD_WORKSPACE_RUN || operation.outcome.is_some() {
+        return Ok(0);
+    }
+    let mut completed = operation.clone();
+    completed.outcome = Some(Ok(serde_json::json!({
+        "entry_id": operation.entry_id, "operation_id": operation.fence.operation_id,
+        "exit_code": i32::MIN, "duration_ms": u64::MAX, "timed_out": false,
+        "stdout":"", "stderr":"", "stdout_truncated":true, "stderr_truncated":true,
+        "stdout_drain_incomplete":true, "stderr_drain_incomplete":true
+    })));
+    Ok((serde_json::to_vec(&JournalEntry::Operation {
+        operation: completed,
+    })?
+    .len() as u64)
+        .saturating_sub(serde_json::to_vec(entry)?.len() as u64)
+        .saturating_add(4096))
+}
+
+/// Preserve completion metadata under pressure, dropping all log text if needed.
+fn fit_run_receipt(entry: &mut JournalEntry, available: u64) -> Result<()> {
+    if serde_json::to_vec(entry)?.len() as u64 <= available {
+        return Ok(());
+    }
+    let JournalEntry::Operation { operation } = entry else {
+        return Ok(());
+    };
+    if operation.method != METHOD_WORKSPACE_RUN {
+        return Ok(());
+    }
+    let Some(Ok(value)) = operation.outcome.as_mut() else {
+        return Ok(());
+    };
+    let logs = ["stdout", "stderr"].map(|stream| {
+        let text = value[stream].as_str().unwrap_or_default().to_owned();
+        let flag = value.get(format!("{stream}_truncated")).cloned();
+        if !text.is_empty() {
+            value[stream] = Value::String(String::new());
+            value[format!("{stream}_truncated")] = Value::Bool(true);
+        }
+        (stream, text, flag)
+    });
+    let overhead = serde_json::to_vec(entry)?.len() as u64;
+    let streams = logs.iter().filter(|(_, text, _)| !text.is_empty()).count();
+    if streams == 0 || overhead > available {
+        return Ok(());
+    }
+    // JSON escaping expands each byte by at most six, including the marker.
+    let budget = available.saturating_sub(overhead) / (6 * streams as u64);
+    let JournalEntry::Operation { operation } = entry else {
+        unreachable!();
+    };
+    let Some(Ok(value)) = operation.outcome.as_mut() else {
+        unreachable!();
+    };
+    for (stream, text, flag) in logs {
+        if text.is_empty() {
+            continue;
+        }
+        if text.len() as u64 <= budget {
+            value[stream] = Value::String(text);
+            if let Some(flag) = flag {
+                value[format!("{stream}_truncated")] = flag;
+            } else if let Some(object) = value.as_object_mut() {
+                object.remove(&format!("{stream}_truncated"));
+            }
+        } else {
+            value[stream] = Value::String(marked_tail(&text, budget as usize));
+        }
+    }
+    Ok(())
 }
 
 pub fn operation_entry_id(operation_id: &str) -> String {
@@ -438,13 +889,13 @@ fn read_entry(path: &Path) -> Result<JournalEntry> {
     if !metadata.is_file() {
         bail!("invalid journal file {}", path.display());
     }
-    // Unbounded CI is also unbounded in its durable receipt. The other entry
-    // kinds retain their queue and per-entry limits.
-    let entry: JournalEntry = serde_json::from_reader(File::open(path)?)
-        .with_context(|| format!("decode {}", path.display()))?;
-    if !entry.has_unbounded_ci_output() && metadata.len() > MAX_JOURNAL_ENTRY_SIZE as u64 {
+    if metadata.len() > MAX_JOURNAL_ENTRY_SIZE as u64 {
         bail!("oversized journal file {}", path.display());
     }
+    let entry: JournalEntry = serde_json::from_reader(BufReader::new(
+        File::open(path)?.take(MAX_JOURNAL_ENTRY_SIZE as u64 + 1),
+    ))
+    .with_context(|| format!("decode {}", path.display()))?;
     Ok(entry)
 }
 
@@ -536,7 +987,7 @@ mod tests {
         );
         assert!(restarted.pending().unwrap().is_empty());
         assert!(
-            !restarted
+            restarted
                 .acknowledge(&JournalAckParams {
                     entry_id: "report/one".into()
                 })
@@ -609,31 +1060,26 @@ mod tests {
             .unwrap();
         store.retain(&notification("terminal-after-run")).unwrap();
         assert_eq!(store.pending().unwrap().len(), 1);
-        let receipt = store.operation("run-once").unwrap().unwrap();
-        assert!(receipt.acknowledged);
-        assert_eq!(
-            receipt.outcome.unwrap().unwrap(),
-            operation.outcome.unwrap().unwrap()
-        );
+        assert!(store.operation("run-once").unwrap().is_none());
     }
 
     #[test]
-    fn unbounded_ci_receipt_retains_full_output_beyond_entry_and_queue_byte_limits() {
+    fn operation_receipt_is_bounded_replays_before_ack_and_shrinks_after_ack() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DaemonJournal::with_limits(dir.path(), 2, 4096);
+        let store = DaemonJournal::with_limits(dir.path(), 2, 2 * MAX_CI_LOG_BYTES as u64);
         let mut operation = JournalOperation {
-            entry_id: operation_entry_id("full-ci-result"),
+            entry_id: operation_entry_id("ci-result"),
             fence: WorkspaceMutationFence {
                 daemon_id: "daemon-1".into(),
                 runtime_id: "runtime-1".into(),
                 placement_id: "placement-1".into(),
-                operation_id: "full-ci-result".into(),
+                operation_id: "ci-result".into(),
                 generation: 1,
                 expected: api_types::WorkspaceOperationExpected::Version { version: 1 },
             },
             workspace_handle: Some("handle".into()),
             method: METHOD_WORKSPACE_RUN.into(),
-            request: serde_json::json!({"purpose": "ci_step", "timeout_secs": 0, "max_output_bytes": u64::MAX}),
+            request: serde_json::json!({"purpose":"ci_step", "max_output_bytes":u64::MAX}),
             outcome: None,
             acknowledged: false,
         };
@@ -642,29 +1088,566 @@ mod tests {
                 operation: operation.clone(),
             })
             .unwrap();
-        let stdout = "x".repeat(MAX_JOURNAL_ENTRY_SIZE + 1);
-        operation.outcome = Some(Ok(serde_json::json!({"stdout": stdout})));
+        operation.outcome = Some(Ok(
+            serde_json::json!({"stdout": "🦀".repeat(MAX_CI_LOG_BYTES), "stderr":""}),
+        ));
         store.finish_operation(&operation).unwrap();
-        // Full CI results must not prevent a bounded terminal report being retained.
-        store
-            .retain(&notification("terminal-after-full-ci"))
-            .unwrap();
-        let restarted = DaemonJournal::with_limits(dir.path(), 2, 4096);
-        assert_eq!(restarted.pending().unwrap().len(), 2);
+        drop(store); // Crash between durable completion and server acknowledgement.
+        let restarted = DaemonJournal::with_limits(dir.path(), 2, 2 * MAX_CI_LOG_BYTES as u64);
+        let receipt = restarted.operation("ci-result").unwrap().unwrap();
+        let result = receipt.outcome.unwrap().unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(stdout.len() <= MAX_CI_LOG_BYTES);
+        assert!(stdout.starts_with(CI_LOG_TRUNCATION_MARKER));
+        assert_eq!(result["stdout_truncated"], true);
+        let before = restarted.current_usage().unwrap().1;
+        let too_small = DaemonJournal::with_limits(dir.path(), 2, before);
+        assert!(too_small
+            .retain(&notification("would-overflow"))
+            .unwrap_err()
+            .to_string()
+            .contains("byte bound"));
         restarted
             .acknowledge(&JournalAckParams {
-                entry_id: operation.entry_id,
+                entry_id: operation.entry_id.clone(),
             })
             .unwrap();
-        let receipt = restarted.operation("full-ci-result").unwrap().unwrap();
-        assert!(receipt.acknowledged);
+        assert!(restarted.current_usage().unwrap().1 < before);
+        assert!(!restarted
+            .path_for_entry(&operation.entry_id)
+            .unwrap()
+            .exists());
+        assert!(restarted.operation("ci-result").unwrap().is_none());
+        assert!(
+            restarted
+                .acknowledge(&JournalAckParams {
+                    entry_id: operation.entry_id.clone()
+                })
+                .unwrap()
+                .acknowledged
+        );
+        // Startup compacts pre-fix oversized CI logs to the shared byte cap.
+        let mut legacy = operation;
+        legacy.outcome = Some(Ok(
+            serde_json::json!({"stdout": "x".repeat(MAX_JOURNAL_ENTRY_SIZE + 1), "stderr":""}),
+        ));
+        fs::write(
+            restarted.path_for_entry(&legacy.entry_id).unwrap(),
+            serde_json::to_vec(&JournalEntry::Operation {
+                operation: legacy.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        legacy.fence.operation_id = "other-legacy-ci".into();
+        legacy.entry_id = operation_entry_id(&legacy.fence.operation_id);
+        legacy.outcome = Some(Ok(
+            serde_json::json!({"stdout": "x".repeat(MAX_CI_LOG_BYTES + 1), "stderr":""}),
+        ));
+        fs::write(
+            restarted.path_for_entry(&legacy.entry_id).unwrap(),
+            serde_json::to_vec(&JournalEntry::Operation { operation: legacy }).unwrap(),
+        )
+        .unwrap();
+        let migrated = DaemonJournal::with_limits(dir.path(), 2, 2 * MAX_CI_LOG_BYTES as u64);
+        migrated.initialize().unwrap();
+        assert!(migrated.current_usage().unwrap().1 <= 2 * MAX_CI_LOG_BYTES as u64);
+        assert_eq!(migrated.pending().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn operation_journal_never_persists_environment_secret_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        let secret = "super-secret-token-123";
+        let mut operation = JournalOperation {
+            entry_id: operation_entry_id("secret-run"),
+            fence: WorkspaceMutationFence {
+                daemon_id: "daemon-1".into(),
+                runtime_id: "runtime-1".into(),
+                placement_id: "placement-1".into(),
+                operation_id: "secret-run".into(),
+                generation: 1,
+                expected: api_types::WorkspaceOperationExpected::Version { version: 1 },
+            },
+            workspace_handle: Some("handle".into()),
+            method: METHOD_WORKSPACE_RUN.into(),
+            request: serde_json::json!({"env":[["TOKEN",secret]], "command":format!("printf {secret}")}),
+            outcome: None,
+            acknowledged: false,
+        };
+        journal
+            .retain_entry(&JournalEntry::Operation {
+                operation: operation.clone(),
+            })
+            .unwrap();
+        let path = journal.path_for_entry(&operation.entry_id).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains(secret));
+        operation.outcome = Some(Ok(serde_json::json!({"stdout":secret})));
+        journal.finish_operation(&operation).unwrap();
+        let stored = fs::read_to_string(path).unwrap();
+        assert!(!stored.contains(secret));
+        let receipt = journal.operation("secret-run").unwrap().unwrap();
+        assert_eq!(receipt.request["env"], serde_json::json!(["TOKEN"]));
+        assert_eq!(receipt.request, journal_request(&operation.request));
+        let mut changed = operation.request.clone();
+        changed["env"][0][1] = serde_json::json!("changed-secret");
+        changed["command"] = serde_json::json!("printf changed-secret");
+        assert_eq!(receipt.request, journal_request(&changed)); // Secret values are deliberately excluded from replay identity.
+        assert_eq!(receipt.outcome.unwrap().unwrap()["stdout"], "[REDACTED]");
+        // Startup also scrubs receipts written by the pre-fix daemon.
+        let path = journal.path_for_entry(&operation.entry_id).unwrap();
+        drop(journal);
+        fs::write(
+            &path,
+            serde_json::to_vec(&JournalEntry::Operation { operation }).unwrap(),
+        )
+        .unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        restarted.initialize().unwrap();
+        assert!(!fs::read_to_string(path).unwrap().contains(secret));
+        for kind in ["review_checkout", "materialize_assets"] {
+            let mut operation = run_intent(kind);
+            operation.method = api_types::METHOD_WORKSPACE_RESET.into();
+            operation.request = serde_json::json!({"operation": {
+                "kind": kind, "commit_sha":"commit-1", "prepare":true,
+                "environment": {"env":{"TOKEN":secret}, "checks":[{"command":format!("echo {secret}")}], "assets":[]}
+            }});
+            restarted
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            let path = restarted.path_for_entry(&operation.entry_id).unwrap();
+            assert!(!fs::read_to_string(&path).unwrap().contains(secret));
+            operation.outcome = Some(Err(DaemonErrorPayload {
+                code: "check_failed".into(),
+                message: format!("check printed {secret}"),
+                details: None,
+            }));
+            restarted.finish_operation(&operation).unwrap();
+            assert!(!fs::read_to_string(&path).unwrap().contains(secret));
+            let receipt = restarted.operation(kind).unwrap().unwrap();
+            assert_eq!(
+                receipt.request["operation"]["environment"]["env"],
+                serde_json::json!(["TOKEN"])
+            );
+            assert_eq!(
+                receipt.request["operation"]["environment"]["checks"][0]["command"],
+                "echo [REDACTED]"
+            );
+            assert_eq!(
+                receipt.outcome.unwrap().unwrap_err().message,
+                "check printed [REDACTED]"
+            );
+            // Existing raw owner-operation receipts are scrubbed on startup too.
+            fs::write(
+                &path,
+                serde_json::to_vec(&JournalEntry::Operation { operation }).unwrap(),
+            )
+            .unwrap();
+            DaemonJournal::new(dir.path()).initialize().unwrap();
+            assert!(!fs::read_to_string(path).unwrap().contains(secret));
+        }
+    }
+
+    fn run_intent(id: &str) -> JournalOperation {
+        JournalOperation {
+            entry_id: operation_entry_id(id),
+            fence: WorkspaceMutationFence {
+                daemon_id: "daemon-1".into(),
+                runtime_id: "runtime-1".into(),
+                placement_id: "placement-1".into(),
+                operation_id: id.into(),
+                generation: 1,
+                expected: api_types::WorkspaceOperationExpected::Version { version: 1 },
+            },
+            workspace_handle: Some("handle-1".into()),
+            method: METHOD_WORKSPACE_RUN.into(),
+            request: serde_json::json!({"command":"echo 1", "env":[["CI","1"]], "max_output_bytes":u64::MAX}),
+            outcome: None,
+            acknowledged: false,
+        }
+    }
+
+    #[test]
+    fn short_environment_values_preserve_result_and_error_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        for failed in [false, true] {
+            let mut operation = run_intent(if failed { "error-1" } else { "result-1" });
+            let entry_id = operation.entry_id.clone();
+            let operation_id = operation.fence.operation_id.clone();
+            journal
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            operation.outcome = Some(if failed {
+                Err(DaemonErrorPayload {
+                    code: "error-1".into(),
+                    message: "printed 1".into(),
+                    details: Some(
+                        serde_json::json!({"entry_id":entry_id,"operation_id":operation_id}),
+                    ),
+                })
+            } else {
+                Ok(
+                    serde_json::json!({"entry_id":entry_id, "operation_id":operation_id,
+                    "exit_code":1, "stdout":"1", "stderr":"1"}),
+                )
+            });
+            journal.finish_operation(&operation).unwrap();
+            let restarted = DaemonJournal::new(dir.path());
+            restarted.initialize().unwrap();
+            let stored = restarted.operation(&operation_id).unwrap().unwrap();
+            assert_eq!(stored.entry_id, entry_id);
+            assert_eq!(stored.fence.operation_id, operation_id);
+            assert_eq!(stored.fence.daemon_id, "daemon-1");
+            assert_eq!(stored.workspace_handle.as_deref(), Some("handle-1"));
+            match stored.outcome.unwrap() {
+                Ok(value) => {
+                    assert_eq!(value["entry_id"], entry_id);
+                    assert_eq!(value["operation_id"], operation_id);
+                    assert_eq!(value["exit_code"], 1);
+                    assert_eq!(value["stdout"], "[REDACTED]");
+                    assert_eq!(value["stderr"], "[REDACTED]");
+                }
+                Err(error) => {
+                    assert_eq!(error.code, "error-1");
+                    assert_eq!(error.message, "printed [REDACTED]");
+                    assert_eq!(error.details.unwrap()["entry_id"], entry_id);
+                }
+            }
+            let bytes = fs::read_to_string(restarted.path_for_entry(&entry_id).unwrap()).unwrap();
+            // Numeric exit codes and IDs containing 1 stay intact; the secret
+            // string value itself is absent from the persisted JSON bytes.
+            assert!(!bytes.contains("\"1\""));
+            assert!(!bytes.contains("echo 1"));
+            assert!(
+                restarted
+                    .acknowledge(&JournalAckParams { entry_id })
+                    .unwrap()
+                    .acknowledged
+            );
+            assert!(restarted.operation(&operation_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn caller_digest_cannot_skip_redaction_or_hash_secret_values() {
+        let request = serde_json::json!({"command":"echo 1", "env":[["CI","1"]], "_request_digest":"trusted?"});
+        let clean = journal_request(&request);
+        assert_eq!(clean["command"], "echo [REDACTED]");
+        assert_eq!(clean["env"], serde_json::json!(["CI"]));
+        assert_ne!(clean["_request_digest"], "trusted?");
+        assert_eq!(clean, journal_request(&clean));
         assert_eq!(
-            receipt.outcome.unwrap().unwrap()["stdout"]
-                .as_str()
-                .unwrap(),
-            stdout
+            clean,
+            journal_request(&serde_json::json!({"command":"echo 0", "env":[["CI","0"]]}))
+        );
+    }
+
+    #[test]
+    fn journal_tail_is_utf8_safe_and_stable_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        let mut operation = run_intent("tail");
+        operation.outcome = Some(Ok(serde_json::json!({
+            "stdout":format!("{}last failure lines", "🦀".repeat(MAX_CI_LOG_BYTES)),
+            "stderr":"", "stdout_truncated":true
+        })));
+        journal
+            .retain_entry(&JournalEntry::Operation {
+                operation: operation.clone(),
+            })
+            .unwrap();
+        let path = journal.path_for_entry(&operation.entry_id).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        for _ in 0..3 {
+            let restarted = DaemonJournal::new(dir.path());
+            restarted.initialize().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            let result = restarted
+                .operation("tail")
+                .unwrap()
+                .unwrap()
+                .outcome
+                .unwrap()
+                .unwrap();
+            let tail = result["stdout"].as_str().unwrap();
+            assert!(tail.starts_with(CI_LOG_TRUNCATION_MARKER));
+            assert!(tail.ends_with("last failure lines"));
+            assert_eq!(tail.matches(CI_LOG_TRUNCATION_MARKER).count(), 1);
+        }
+    }
+
+    #[test]
+    fn undecodable_entry_is_quarantined_without_blocking_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.retain(&notification("valid")).unwrap();
+        let corrupt = journal.directory().join("entry-bad.json");
+        fs::write(&corrupt, b"{partial").unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        restarted.initialize().unwrap();
+        assert!(!corrupt.exists());
+        assert_eq!(
+            fs::read(journal.directory().join("corrupt-entry-bad.json")).unwrap(),
+            b"{partial"
         );
         assert_eq!(restarted.pending().unwrap().len(), 1);
+        restarted.retain(&notification("next")).unwrap();
+    }
+
+    #[test]
+    fn quarantine_failures_and_non_regular_entries_do_not_stop_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.retain(&notification("valid")).unwrap();
+        let corrupt = journal.directory().join("entry-bad.json");
+        fs::write(&corrupt, b"{partial").unwrap();
+        let blocked = journal.directory().join("corrupt-entry-bad.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("occupied"), b"keep").unwrap();
+        fs::create_dir(journal.directory().join("entry-directory.json")).unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        restarted
+            .fail_next_directory_sync
+            .store(true, Ordering::Relaxed);
+        restarted.initialize().unwrap();
+        assert!(corrupt.exists()); // Rename failed, but the entry is skipped.
+        assert_eq!(restarted.pending().unwrap().len(), 1);
+        restarted.retain(&notification("next")).unwrap();
+        assert_eq!(restarted.pending().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn skipped_entries_are_absent_for_ack_retain_and_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.retain(&notification("valid")).unwrap();
+        let mut operation = run_intent("quarantine-blocked");
+        let path = journal.path_for_entry(&operation.entry_id).unwrap();
+        fs::write(&path, b"{broken").unwrap();
+        let quarantine = journal.directory().join(format!(
+            "corrupt-{}",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir(&quarantine).unwrap();
+        fs::write(quarantine.join("occupied"), b"keep").unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        restarted.initialize().unwrap();
+        assert!(
+            restarted
+                .acknowledge(&JournalAckParams {
+                    entry_id: operation.entry_id.clone()
+                })
+                .unwrap()
+                .acknowledged
+        );
+        operation.outcome = Some(Ok(serde_json::json!({"exit_code":0})));
+        assert!(restarted
+            .finish_operation(&operation)
+            .unwrap_err()
+            .to_string()
+            .contains("intent is missing"));
+        operation.outcome = None;
+        restarted
+            .retain_entry(&JournalEntry::Operation {
+                operation: operation.clone(),
+            })
+            .unwrap();
+        assert!(restarted
+            .operation(&operation.fence.operation_id)
+            .unwrap()
+            .is_some());
+        operation.outcome = Some(Ok(serde_json::json!({"exit_code":0})));
+        restarted.finish_operation(&operation).unwrap();
+        assert_eq!(restarted.pending().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn startup_scratch_removal_and_acknowledged_entry_sync_errors_do_not_stop_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.retain(&notification("valid")).unwrap();
+        let mut operation = run_intent("old-acknowledged");
+        operation.outcome = Some(Ok(serde_json::json!({"exit_code":0})));
+        operation.acknowledged = true;
+        fs::write(
+            journal.path_for_entry(&operation.entry_id).unwrap(),
+            serde_json::to_vec(&JournalEntry::Operation { operation }).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir(journal.directory().join(".journal.tmp.blocked")).unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        restarted
+            .fail_next_directory_sync
+            .store(true, Ordering::Relaxed);
+        restarted.initialize().unwrap();
+        assert_eq!(restarted.pending().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_acknowledged_entry_removal_failure_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.retain(&notification("valid")).unwrap();
+        let mut operation = run_intent("cannot-remove");
+        operation.outcome = Some(Ok(serde_json::json!({"exit_code":0})));
+        operation.acknowledged = true;
+        fs::write(
+            journal.path_for_entry(&operation.entry_id).unwrap(),
+            serde_json::to_vec(&JournalEntry::Operation {
+                operation: operation.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let permissions = fs::metadata(journal.directory()).unwrap().permissions();
+        fs::set_permissions(journal.directory(), fs::Permissions::from_mode(0o500)).unwrap();
+        let restarted = DaemonJournal::new(dir.path());
+        let result = restarted.initialize();
+        fs::set_permissions(journal.directory(), permissions).unwrap();
+        result.unwrap();
+        assert_eq!(restarted.pending().unwrap().len(), 1);
+        assert!(
+            restarted
+                .acknowledge(&JournalAckParams {
+                    entry_id: operation.entry_id
+                })
+                .unwrap()
+                .acknowledged
+        );
+    }
+
+    #[test]
+    fn completion_headroom_survives_a_full_shared_journal_without_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::with_limits(dir.path(), 16, 16 * 1024);
+        let mut operation = run_intent("reserved-result");
+        journal
+            .retain_entry(&JournalEntry::Operation {
+                operation: operation.clone(),
+            })
+            .unwrap();
+        let path = journal.path_for_entry(&operation.entry_id).unwrap();
+        let usage = journal.current_usage().unwrap().1;
+        let reservation = run_result_reservation(&JournalEntry::Operation {
+            operation: operation.clone(),
+        })
+        .unwrap();
+        journal
+            .save_workspace_state(
+                &"r".repeat((journal.max_bytes - usage - reservation - 2) as usize),
+            )
+            .unwrap();
+        assert!(journal.retain(&notification("no-room")).is_err());
+        operation.outcome = Some(Ok(serde_json::json!({
+            "entry_id":operation.entry_id, "operation_id":operation.fence.operation_id,
+            "exit_code":1, "stdout":"x".repeat(MAX_CI_LOG_BYTES), "stderr":"failure last line",
+            "duration_ms":7, "timed_out":false, "stdout_truncated":false, "stderr_truncated":false
+        })));
+        let result = journal
+            .finish_operation(&operation)
+            .unwrap()
+            .outcome
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["entry_id"], operation.entry_id);
+        assert_eq!(result["stdout_truncated"], true);
+        assert!(journal.current_usage().unwrap().1 <= journal.max_bytes);
+        assert_eq!(
+            journal
+                .operation("reserved-result")
+                .unwrap()
+                .unwrap()
+                .outcome
+                .unwrap()
+                .unwrap(),
+            result
+        );
+        // A budget below even the marker retains only metadata and flags.
+        let mut receipt = JournalEntry::Operation { operation };
+        fit_run_receipt(&mut receipt, 0).unwrap();
+        let JournalEntry::Operation { operation } = receipt else {
+            unreachable!()
+        };
+        assert_eq!(operation.outcome.unwrap().unwrap()["stdout"], "");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn usage_tracks_rename_and_removal_even_when_directory_sync_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        journal.initialize().unwrap();
+        journal
+            .fail_next_directory_sync
+            .store(true, Ordering::Relaxed);
+        assert!(journal
+            .retain(&notification("renamed"))
+            .unwrap_err()
+            .to_string()
+            .contains("sync failure"));
+        assert_eq!(journal.current_usage().unwrap().0, 1);
+        let path = journal.path_for_entry("renamed").unwrap();
+        assert_eq!(
+            journal.current_usage().unwrap().1,
+            fs::metadata(&path).unwrap().len()
+        );
+        journal
+            .fail_next_directory_sync
+            .store(true, Ordering::Relaxed);
+        assert!(journal
+            .acknowledge(&JournalAckParams {
+                entry_id: "renamed".into()
+            })
+            .is_err());
+        assert!(!path.exists());
+        assert_eq!(journal.current_usage().unwrap(), (0, 0));
+        journal.retain(&notification("next")).unwrap();
+        assert_eq!(journal.current_usage().unwrap().0, 1);
+    }
+
+    #[test]
+    fn terminal_output_redaction_preserves_accounting_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = DaemonJournal::new(dir.path());
+        let mut report = notification("report-1");
+        report.summary = Some("printed 1".into());
+        report.error = Some("error 1".into());
+        report
+            .outbox_entries
+            .push(api_types::ExecutionOutboxEntry::Worklog {
+                position: "1".into(),
+                kind: api_types::ExecutionOutboxWorklogKind::Progress,
+                summary: "1".into(),
+            });
+        sanitize_terminal_report(
+            &mut report,
+            &std::collections::BTreeMap::from([("CI".into(), "1".into())]),
+        );
+        journal.retain(&report).unwrap();
+        let JournalEntry::Terminal { report: stored } = journal.pending().unwrap().remove(0) else {
+            unreachable!()
+        };
+        assert_eq!(stored.terminal_report_id, "report-1");
+        assert_eq!(stored.execution_id, "execution-1");
+        assert_eq!(stored.summary.as_deref(), Some("printed [REDACTED]"));
+        assert_eq!(stored.error.as_deref(), Some("error [REDACTED]"));
+        let api_types::ExecutionOutboxEntry::Worklog {
+            position, summary, ..
+        } = &stored.outbox_entries[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(position, "1");
+        assert_eq!(summary, "[REDACTED]");
     }
 
     #[test]

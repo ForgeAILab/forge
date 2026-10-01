@@ -34,6 +34,12 @@ pub(crate) fn consume_embedded_execution_outbox(worktree: &str, execution_id: &s
 
 pub type Result<T> = std::result::Result<T, WorkspaceBackendError>;
 
+pub(crate) fn is_unknown_workspace_handle(error: &WorkspaceBackendError) -> bool {
+    matches!(error, WorkspaceBackendError::Other(error)
+        if matches!(&**error, ServiceError::InvalidOperation { message }
+            if message == "invalid_input: unknown workspace_handle"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareSpec {
     pub base_ref: String,
@@ -332,3 +338,6 @@ impl WorkspaceBackendRouter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

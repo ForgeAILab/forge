@@ -67,7 +67,7 @@ impl TaskService {
             updated_at = ?, version = version + 1
             WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL")
             .bind(barrier.to_string()).bind(annotation.to_string())
-            .bind((!retry).then(|| json!({"kind": kind, "reason": reason, "blocked_by": "system:workflow", "blocked_at": now}).to_string()))
+            .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
             .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
             .execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {

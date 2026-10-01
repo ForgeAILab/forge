@@ -48,6 +48,14 @@ impl HookAction for RunCiSteps {
             Err(reason) => return HookResult::Failed { reason },
         };
         if ci_steps.is_empty() {
+            if let Err(error) =
+                crate::placement::admission::resolve_review_ci_attention(&ctx.db, &ctx.task_id)
+                    .await
+            {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
             return HookResult::Skipped {
                 reason: "no ci steps".to_string(),
             };
@@ -169,6 +177,13 @@ impl HookAction for RunCiSteps {
                 return HookResult::Failed { reason };
             }
         };
+        if let Err(error) =
+            crate::placement::admission::resolve_review_ci_attention(&ctx.db, &ctx.task_id).await
+        {
+            return HookResult::Failed {
+                reason: error.to_string(),
+            };
+        }
         let mut review_details = json!({ "ci_steps": ci_results });
         let now = now_rfc3339();
 

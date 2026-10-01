@@ -547,6 +547,45 @@ mod retry_projection_tests {
         retry_budget_exhausted_for_state,
     };
 
+    #[tokio::test]
+    async fn owner_wait_and_review_ci_blockers_project_in_task_response() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('project', 'projection', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')")
+            .execute(db.pool()).await.unwrap();
+        let service = services::TaskService::new_for_test(
+            db.clone(),
+            std::sync::Arc::new(events::EventBus::default()),
+        );
+        let workflow = services::workflow::default_workflow::default_workflow();
+        for kind in [
+            api_types::FailureKind::RecoveryRequired,
+            api_types::FailureKind::BeforeWorkHookFailed,
+        ] {
+            let mut task = test_task();
+            task.blocked_json = Some(serde_json::json!({"reason":"owner unavailable", "created_at":"2026-10-01T00:00:00Z", "kind":kind, "execution_id":null}).to_string());
+            let response = super::task_response_inner(
+                &db,
+                &service.workspace_backend_router(),
+                task,
+                false,
+                false,
+                None,
+                None,
+                &workflow,
+            )
+            .await
+            .unwrap();
+            let blocked = response
+                .blocked
+                .expect("public blocked field must survive projection");
+            assert_eq!(blocked.kind, Some(kind));
+            assert_eq!(blocked.reason, "owner unavailable");
+            assert_eq!(blocked.created_at, "2026-10-01T00:00:00Z");
+        }
+    }
+
     fn annotation(actions: Vec<api_types::RecoveryAction>) -> api_types::TaskBlockingAnnotation {
         api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::RecoveryRequired,

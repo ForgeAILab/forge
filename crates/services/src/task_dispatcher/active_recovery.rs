@@ -383,6 +383,13 @@ impl TaskDispatcher {
                         &error.to_string(),
                     )
                     .await?;
+                    crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                        &self.db,
+                        &task.id,
+                        &task.status,
+                        &error,
+                    )
+                    .await?;
                     tracing::warn!(
                         task_id = %task.id,
                         from_state = %task.status,
@@ -888,16 +895,11 @@ impl TaskDispatcher {
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        match compute_effective_status(&self.db, &agent).await? {
-            EffectiveStatus::Error
-            | EffectiveStatus::Paused
-            | EffectiveStatus::DaemonOffline
-            | EffectiveStatus::DaemonUnavailable
-            | EffectiveStatus::ConnectionDegraded
-            | EffectiveStatus::ConnectionUnavailable
-            | EffectiveStatus::SourceDisabled
-            | EffectiveStatus::Deactivated => return Ok(false),
-            EffectiveStatus::Active | EffectiveStatus::Busy => {}
+        if !matches!(
+            compute_effective_status(&self.db, &agent, None).await?,
+            EffectiveStatus::Active | EffectiveStatus::Busy
+        ) {
+            return Ok(false);
         }
         if !has_execution_capacity(
             &self.db,

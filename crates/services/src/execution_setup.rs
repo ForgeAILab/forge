@@ -325,7 +325,7 @@ pub async fn ensure_execution_role_principal(
             .find(|agent| agent.id == identity_id)
         {
             if matches!(
-                compute_effective_status(db, &agent).await?,
+                compute_effective_status(db, &agent, None).await?,
                 EffectiveStatus::DaemonOffline
             ) {
                 return Err(ServiceError::DaemonUnavailable {
@@ -381,7 +381,7 @@ pub async fn eligible_project_execution_agents(
         // hold the role at all, so only unhealthy or unavailable states
         // disqualify it.
         if !matches!(
-            compute_effective_status(db, &agent).await?,
+            compute_effective_status(db, &agent, None).await?,
             EffectiveStatus::Active | EffectiveStatus::Busy
         ) {
             continue;

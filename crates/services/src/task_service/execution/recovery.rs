@@ -258,6 +258,16 @@ impl TaskService {
                             let online =
                                 match crate::recovery::placement_execution_daemon_id(&placement) {
                                     Some(daemon_id) => {
+                                        if self
+                                            .daemon_connections
+                                            .as_ref()
+                                            .and_then(|registry| registry.get(daemon_id))
+                                            .is_some_and(|connection| connection.needs_upgrade())
+                                        {
+                                            return Err(ServiceError::DaemonUpgradeRequired {
+                                                daemon_id: daemon_id.to_owned(),
+                                            });
+                                        }
                                         DaemonRepo::get_by_id(&*self.db, daemon_id)
                                             .await?
                                             .is_some_and(|daemon| {
@@ -613,7 +623,7 @@ impl TaskService {
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-        match compute_effective_status(&self.db, &agent).await? {
+        match compute_effective_status(&self.db, &agent, None).await? {
             EffectiveStatus::Active | EffectiveStatus::Busy => Ok(agent),
             EffectiveStatus::Paused => Err(ServiceError::AgentPaused { agent_id: agent.id }),
             status => Err(ServiceError::invalid_operation(format!(
@@ -2583,6 +2593,7 @@ impl TaskService {
             (TaskRepo::update_status(&*self.db, reset_input).await?, None)
         };
         let (recovered, retry_boundary_id) = retry_boundary_id;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &recovered.id).await?;
         if let Some(boundary_id) = retry_boundary_id.as_deref() {
             self.publish_recovery_applied(
                 &recovered,
@@ -2835,6 +2846,15 @@ impl TaskService {
                     reason: reason.unwrap_or_else(|| "retry_merge_fix".to_owned()),
                 },
             });
+            if recovered
+                .entry_barrier_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .is_none_or(|barrier| barrier["status"] != "blocked")
+            {
+                crate::placement::admission::resolve_review_ci_attention(&self.db, &recovered.id)
+                    .await?;
+            }
             return Ok(recovered);
         }
         if task.entry_barrier_json.is_some() {
@@ -2889,6 +2909,15 @@ impl TaskService {
                     reason: reason.unwrap_or_else(|| "retry_hook".to_owned()),
                 },
             });
+            if recovered
+                .entry_barrier_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .is_none_or(|barrier| barrier["status"] != "blocked")
+            {
+                crate::placement::admission::resolve_review_ci_attention(&self.db, &recovered.id)
+                    .await?;
+            }
             return Ok(recovered);
         }
         let recovered = self.clear_blocking_metadata(&task.id).await?;
@@ -2901,6 +2930,7 @@ impl TaskService {
                 reason: reason.unwrap_or_else(|| "retry_hook".to_owned()),
             },
         });
+        crate::placement::admission::resolve_review_ci_attention(&self.db, &recovered.id).await?;
         Ok(recovered)
     }
 

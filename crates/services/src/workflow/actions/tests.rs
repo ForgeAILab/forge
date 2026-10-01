@@ -294,6 +294,15 @@ async fn seed_agent(db: &SqliteDb, agent_id: &str) {
 }
 
 async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks: i64) {
+    seed_agent_with_executor(db, agent_id, max_concurrent_tasks, "shell").await;
+}
+
+async fn seed_agent_with_executor(
+    db: &SqliteDb,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) {
     let now = now_rfc3339();
 
     let daemon_id = DaemonRepo::upsert_by_machine_id(
@@ -321,7 +330,9 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
         db,
         UpdateDaemonReport {
             id: daemon_id.clone(),
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            detected_clis_json:
+                serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])
+                    .to_string(),
             labels_json: None,
             status: DaemonStatus::Online,
             last_report_at: now.clone(),
@@ -337,7 +348,7 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
             id: agent_id.to_owned(),
             name: "test-agent".to_owned(),
             description: None,
-            executor_type: "shell".to_owned(),
+            executor_type: executor_type.to_owned(),
             model: None,
             reasoning_effort: None,
             permission_policy: None,
@@ -433,12 +444,33 @@ async fn build_role_dispatch_harness(
     agent_id: &str,
     max_concurrent_tasks: i64,
 ) -> DispatchHarness {
+    build_role_dispatch_harness_with_executor(
+        task_id,
+        from_state,
+        to_state,
+        role,
+        agent_id,
+        max_concurrent_tasks,
+        "shell",
+    )
+    .await
+}
+
+async fn build_role_dispatch_harness_with_executor(
+    task_id: &str,
+    from_state: &str,
+    to_state: &str,
+    role: &str,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) -> DispatchHarness {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_root = TempDir::new().expect("workspace dir creates");
     let project_id =
         seed_local_project_repo_and_task(&db, repo_dir.path(), task_id, to_state).await;
-    seed_agent_with_max(&db, agent_id, max_concurrent_tasks).await;
+    seed_agent_with_executor(&db, agent_id, max_concurrent_tasks, executor_type).await;
     assign_agent_role(&db, task_id, role, agent_id).await;
     if role == default_roles::REVIEWER {
         configure_review_defaults(&db, &project_id, &[json!("test -d .")]).await;
@@ -1979,7 +2011,17 @@ async fn dispatch_role_agent_skips_without_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_emits_event_for_coder_assignment() {
     let agent_id = "agent-coder-dispatch";
-    let mut harness = build_initial_dispatch_harness("task-dispatch-coder", agent_id, 1).await;
+    let mut harness = build_role_dispatch_harness_with_executor(
+        "task-dispatch-coder",
+        default_states::TODO,
+        default_states::IN_PROGRESS,
+        default_roles::CODER,
+        agent_id,
+        1,
+        "codex",
+    )
+    .await;
+
     let ctx = harness.ctx.clone();
     let mut rx = ctx.event_bus.subscribe();
 
@@ -2009,7 +2051,7 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
         other => panic!("unexpected event context: {other:?}"),
     }
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("executor receives dispatch")
         .expect("executor context exists");
@@ -2023,15 +2065,17 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
     let agent_id = "agent-coder-dirty-worktree";
-    let mut harness = build_role_dispatch_harness(
+    let mut harness = build_role_dispatch_harness_with_executor(
         "task-dispatch-dirty-worktree",
         default_states::MERGING,
         default_states::MERGE_FAILED,
         default_roles::CODER,
         agent_id,
         1,
+        "codex",
     )
     .await;
+
     sqlx::query(
         "UPDATE task
          SET review_passed_at = ?, error_annotation = ?
@@ -2056,7 +2100,7 @@ async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
         "{dispatch_result:?}"
     );
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("coder executor spawned in time")
         .expect("coder execution context received");

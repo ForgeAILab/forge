@@ -306,7 +306,17 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
                 },
             )
             .await
-            .map_err(|error| Self::error(placement, None, error))?;
+            .map_err(|error| match error {
+                WorkspaceClientError::Daemon(error) if error.code == "workspace_error" => {
+                    ServiceError::Git(git::GitError::CommandFailed {
+                        command: "workspace.describe".into(),
+                        stdout: String::new(),
+                        stderr: error.message,
+                    })
+                    .into()
+                }
+                error => Self::error(placement, None, error),
+            })?;
         self.check_generation(placement, result.generation)?;
         if result.workspace_handle != workspace_handle(placement)? {
             return Err(WorkspaceBackendError::WrongOwner {
@@ -376,6 +386,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             return Err(ServiceError::invalid_operation("review command timed out").into());
         }
         if spec.purpose == WorkspaceRunPurpose::CiStep
+            && spec.max_output_bytes != usize::MAX
             && (result.stdout_truncated || result.stderr_truncated)
         {
             return Err(ServiceError::invalid_operation(
@@ -705,10 +716,10 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
         // Cleaning is the durable cleanup intent. A replayed, acknowledged
         // cleanup may already have retired the owner's handle.
         let unknown_handle = |error: &WorkspaceBackendError| {
-            placement.state == db::PlacementState::Cleaning
-                && matches!(error, WorkspaceBackendError::Other(error)
-                if matches!(&**error, ServiceError::InvalidOperation { message }
-                    if message == "invalid_input: unknown workspace_handle"))
+            matches!(
+                placement.state,
+                db::PlacementState::Cleaning | db::PlacementState::Cleaned
+            ) && super::is_unknown_workspace_handle(error)
         };
         let state = match self.describe(placement).await {
             Ok(state) => state,
@@ -1046,7 +1057,11 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_acknowledged_handle_is_already_cleaned_only_with_intent() {
-        for cleaning in [true, false] {
+        for state in [
+            db::PlacementState::Cleaning,
+            db::PlacementState::Cleaned,
+            db::PlacementState::Ready,
+        ] {
             let daemon = ScriptedDaemon::new(vec![rejection(
                 "invalid_input",
                 "unknown workspace_handle",
@@ -1054,13 +1069,9 @@ mod tests {
             )]);
             let backend = backend(&daemon).await;
             let mut placement = placement();
-            placement.state = if cleaning {
-                db::PlacementState::Cleaning
-            } else {
-                db::PlacementState::Ready
-            };
+            placement.state = state;
             let result = backend.cleanup(&placement).await;
-            if cleaning {
+            if placement.state != db::PlacementState::Ready {
                 assert!(!result.unwrap().removed);
             } else {
                 assert!(result.is_err());

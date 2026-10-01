@@ -105,6 +105,7 @@ impl SelectionContext {
 #[serde(rename_all = "snake_case")]
 pub enum PlacementFilterCode {
     OwnerUnreachable,
+    DaemonUpgradeRequired,
     WorkspaceProtocolMissing,
     LocationNotReady,
     ExecutorUnavailable,
@@ -125,6 +126,20 @@ pub struct CandidateRejection {
     pub daemon_id: Option<String>,
     pub runtime_id: Option<String>,
     pub filter_codes: Vec<PlacementFilterCode>,
+}
+
+impl CandidateRejection {
+    fn blocked_only_for_upgrade(&self) -> bool {
+        use PlacementFilterCode::*;
+        self.filter_codes.contains(&DaemonUpgradeRequired)
+            && self.filter_codes.iter().all(|code| {
+                // These facts are absent from the revision-2 handshake.
+                matches!(
+                    code,
+                    DaemonUpgradeRequired | CapabilityMissing | RunPurposeDenied
+                )
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,11 +169,59 @@ pub struct PlacementSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("no compatible workspace placement for task {task_id}")]
+#[error("no compatible workspace placement for task {task_id}{hint}", hint = self.upgrade_hint())]
 pub struct PlacementUnavailable {
     pub task_id: String,
     pub repo_id: String,
     pub rejected_candidates: Vec<CandidateRejection>,
+}
+
+impl PlacementUnavailable {
+    pub fn needs_daemon_upgrade(&self) -> bool {
+        use PlacementFilterCode::*;
+        let upgrade_only = self
+            .rejected_candidates
+            .iter()
+            .any(CandidateRejection::blocked_only_for_upgrade);
+        let can_retry = self.rejected_candidates.iter().any(|candidate| {
+            let handshake_missing = candidate.filter_codes.contains(&OwnerUnreachable)
+                && !candidate.filter_codes.contains(&DaemonUpgradeRequired);
+            !candidate.filter_codes.is_empty()
+                && candidate.filter_codes.iter().all(|code| {
+                    matches!(
+                        code,
+                        OwnerUnreachable | LocationNotReady | AgentCapacity | DaemonCapacity
+                    ) || (handshake_missing
+                        && matches!(
+                            code,
+                            CapabilityMissing
+                                | WorkspaceProtocolMissing
+                                | RunPurposeDenied
+                                | ExecutorUnavailable
+                        ))
+                })
+        });
+        upgrade_only && !can_retry
+    }
+
+    pub(crate) fn upgrade_daemon_ids(&self) -> impl Iterator<Item = &str> {
+        self.rejected_candidates
+            .iter()
+            .filter(|candidate| candidate.blocked_only_for_upgrade())
+            .filter_map(|candidate| candidate.daemon_id.as_deref())
+    }
+
+    fn upgrade_hint(&self) -> String {
+        if self.needs_daemon_upgrade() {
+            format!(
+                ": {}: {}",
+                api_types::DAEMON_UPGRADE_REQUIRED,
+                api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+            )
+        } else {
+            String::new()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +392,15 @@ fn filter_candidate(
     // An offline owner's missing handshake is unknown capability/policy
     // evidence, not a permanent refusal. Admission still fails closed below.
     let owner_facts_known = candidate.embedded_execution || candidate.negotiated_revision.is_some();
-    if !candidate.connected
+    let needs_upgrade = !candidate.embedded_execution
+        && candidate.execution_daemon_id.is_some()
+        && candidate
+            .negotiated_revision
+            .is_some_and(|revision| revision < api_types::DAEMON_MIN_PROTOCOL_REVISION);
+    if needs_upgrade {
+        filters.insert(DaemonUpgradeRequired);
+    }
+    if (!candidate.connected && !needs_upgrade)
         || !candidate.runtime_ready
         || (daemon_owned
             && (candidate.location.daemon_id.is_none()
@@ -339,6 +410,7 @@ fn filter_candidate(
         filters.insert(OwnerUnreachable);
     }
     if daemon_owned
+        && !needs_upgrade
         && (candidate
             .negotiated_revision
             .is_none_or(|revision| revision < 3)
@@ -688,7 +760,9 @@ pub async fn load_selection_context(
                 || connection.as_ref().is_some_and(|connection| {
                     !connection.is_stale() && connection.protocol_allows_dispatch()
                 }),
-            negotiated_revision: handshake.map(|facts| facts.handshake.protocol_revision),
+            negotiated_revision: connection
+                .as_ref()
+                .and_then(|connection| connection.negotiated_revision()),
             workspace_v1: handshake.is_some_and(|facts| {
                 facts
                     .handshake
@@ -974,6 +1048,38 @@ mod tests {
     }
 
     #[test]
+    fn placement_upgrade_refusal_is_transient_with_an_offline_owner_missing_handshake() {
+        let mut context = context();
+        let upgrade = &mut context.candidates[0];
+        upgrade.negotiated_revision = Some(2);
+        upgrade.workspace_v1 = false;
+        upgrade.allowed_run_purposes.clear();
+        for facts in upgrade.executors.values_mut() {
+            facts.capabilities = ExecutorAdapterCapabilityFacts::default();
+        }
+        let mut offline = candidate(&context, "offline-location", Some("offline"));
+        offline.connected = false;
+        offline.negotiated_revision = None;
+        offline.workspace_v1 = false;
+        offline.allowed_run_purposes.clear();
+        for facts in offline.executors.values_mut() {
+            facts.capabilities = ExecutorAdapterCapabilityFacts::default();
+        }
+        let codes = filter_candidate(&context, &offline);
+        assert_eq!(
+            codes,
+            vec![
+                PlacementFilterCode::OwnerUnreachable,
+                PlacementFilterCode::WorkspaceProtocolMissing,
+                PlacementFilterCode::ExecutorUnavailable,
+            ]
+        );
+        context.candidates.push(offline);
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(!refusal.needs_daemon_upgrade());
+    }
+
+    #[test]
     fn only_daemon_location_selects_authenticated_cli_roles() {
         let result = selected(&context());
         assert_eq!(result.candidate.execution_daemon_id.as_deref(), Some("mac"));
@@ -1217,8 +1323,9 @@ mod tests {
             (PlacementFilterCode::OwnerUnreachable, |context| {
                 context.candidates[0].runtime_ready = false
             }),
-            (PlacementFilterCode::WorkspaceProtocolMissing, |context| {
-                context.candidates[0].negotiated_revision = Some(2)
+            (PlacementFilterCode::DaemonUpgradeRequired, |context| {
+                context.candidates[0].negotiated_revision = Some(2);
+                context.candidates[0].connected = false;
             }),
             (PlacementFilterCode::WorkspaceProtocolMissing, |context| {
                 context.candidates[0].workspace_v1 = false
@@ -1252,12 +1359,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_mount_supports_revision_two_execution_but_requires_a_ready_location() {
+    fn shared_mount_requires_revision_three_and_a_ready_location() {
         let mut context = context();
         context.candidates[0].location.owner_kind = RepoLocationOwnerKind::Server;
         context.candidates[0].location.kind = RepoLocationKind::SharedMount;
         context.candidates[0].negotiated_revision = Some(2);
         context.candidates[0].workspace_v1 = false;
+        context.candidates[0].connected = false;
+        rejected(&context, PlacementFilterCode::DaemonUpgradeRequired);
+        context.candidates[0].negotiated_revision = Some(3);
+        context.candidates[0].connected = true;
         selected(&context);
         context.candidates[0].location.status = RepoLocationStatus::Unverified;
         rejected(&context, PlacementFilterCode::LocationNotReady);

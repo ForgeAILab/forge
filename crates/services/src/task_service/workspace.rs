@@ -136,22 +136,36 @@ impl TaskService {
             "recovery_actions": ["reexecute", "cancel_task"]})
             .to_string()
         });
+        let unchanged_reason = !expired
+            && crate::deferred_dispatch::pending_until(task).is_some_and(|pending| {
+                pending.reason == reason && pending.target_state == task.status
+            })
+            && metadata
+                .extra
+                .get("owner_wait")
+                .and_then(|wait| wait["daemon_id"].as_str())
+                == daemon_id.as_deref();
+        let blocked = expired.then(|| {
+            json!({"reason": reason, "created_at": now.to_rfc3339(),
+            "kind": api_types::FailureKind::RecoveryRequired, "execution_id": null})
+            .to_string()
+        });
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let result = sqlx::query("UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
             json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
             error_annotation = COALESCE(?, error_annotation),
-            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
-            .bind(&deferral).bind(&deferral).bind(&annotation).bind(&annotation).bind(now.to_rfc3339())
+            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ?")
+            .bind(&deferral).bind(&deferral).bind(&annotation).bind(&blocked).bind(now.to_rfc3339()).bind(i64::from(!unchanged_reason))
             .bind(&task.id).bind(task.version).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict.into());
         }
-        if let Some(owner_wait) = owner_wait {
+        if let Some(owner_wait) = owner_wait.filter(|_| !unchanged_reason) {
             sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ?")
                 .bind(owner_wait).bind(&task.id).execute(&mut *tx).await?;
         }
-        if daemon_id.is_some() {
+        if daemon_id.is_some() && !unchanged_reason {
             crate::placement::admission::record_wait_attention_in_tx(
                 &self.db,
                 &mut tx,
@@ -171,8 +185,9 @@ impl TaskService {
     }
 
     pub(crate) async fn expire_owner_wait(&self, task: &Task) -> Result<bool> {
-        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let Ok(metadata) = db::TaskMetadata::parse(task.metadata_json.as_deref()) else {
+            return Ok(false);
+        };
         let Some(wait) = metadata.extra.get("owner_wait") else {
             return Ok(false);
         };
@@ -187,14 +202,30 @@ impl TaskService {
         if !expired || task.blocked_json.is_some() {
             return Ok(false);
         }
-        self.defer_placement_refusal(
-            task,
-            &ServiceError::DaemonUnavailable {
-                daemon_id: daemon_id.into(),
-            },
-        )
-        .await?;
-        Ok(true)
+        let error = ServiceError::DaemonUnavailable {
+            daemon_id: daemon_id.into(),
+        };
+        self.defer_placement_refusal(task, &error).await?;
+        // A placement may become terminal between the scan and admission. Only
+        // skip normal recovery if the expiry actually wrote its blocker.
+        let Some(current) = TaskRepo::get_by_id(&*self.db, &task.id, false).await? else {
+            return Ok(false);
+        };
+        if current.error_annotation.as_deref().is_some_and(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|annotation| {
+                annotation["blocking_reason"] == "owner_disconnected_timeout"
+            })
+        }) && current.blocked_json.is_some()
+        {
+            return Ok(true);
+        }
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
+            .bind(&task.id).bind(current.version).execute(&mut *tx).await?;
+        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key = ? AND status <> 'resolved'")
+            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id)).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(false)
     }
 
     pub(super) async fn reserve_claim_workspace(
@@ -746,7 +777,12 @@ impl TaskService {
             .await
             {
                 Ok(state) => !state.exists,
-                Err(error) if worktree_describe_needs_recreation(&error) => true,
+                Err(error)
+                    if admission.placement.owner_kind == PlacementOwnerKind::Server
+                        && worktree_describe_needs_recreation(&error) =>
+                {
+                    true
+                }
                 Err(error) => {
                     let cause = match &error {
                         crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
@@ -1113,9 +1149,7 @@ fn worktree_describe_needs_recreation(
     error: &crate::workspace_backend::WorkspaceBackendError,
 ) -> bool {
     matches!(error, crate::workspace_backend::WorkspaceBackendError::Other(error)
-        if matches!(&**error, ServiceError::Git(_))
-            || matches!(&**error, ServiceError::InvalidOperation { message }
-                if message.starts_with("workspace_error:")))
+        if matches!(&**error, ServiceError::Git(_)))
 }
 
 /// Prepare a workspace and report whether this call won creation ownership.
@@ -1161,7 +1195,6 @@ pub(crate) async fn prepare_workspace_owned(
                 let resolved = router.resolve(db, &workspace).await?;
                 let needs_recreation = match resolved.backend.describe(&resolved.placement).await {
                     Ok(state) => !state.exists,
-                    Err(error) if worktree_describe_needs_recreation(&error) => true,
                     Err(error) => return Err(error.into()),
                 };
                 if needs_recreation {
@@ -2090,6 +2123,11 @@ pub(super) async fn reset_daemon_workspace(
     sqlx::query("UPDATE workspace SET status = 'ready', before_sha = ?, branch = ?, cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?")
         .bind(prepared.base_sha).bind(prepared.branch).bind(now_rfc3339()).bind(&workspace.id)
         .execute(&mut *transaction).await?;
+    crate::placement::admission::resolve_workspace_attention_in_tx(
+        &mut transaction,
+        &placement.task_id,
+    )
+    .await?;
     transaction.commit().await?;
     WorkspaceRepo::get_by_id(db, &workspace.id)
         .await?
@@ -2169,6 +2207,7 @@ pub(super) async fn reset_workspace(
     )
     .await?;
 
+    crate::placement::admission::resolve_workspace_attention(db, &task.id).await?;
     if let Some(workspace) = daemon_reset {
         return Ok(workspace);
     }
@@ -2889,6 +2928,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_two_only_owner_waits_without_execution_with_upgrade_reason() {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query("DELETE FROM execution WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace_placement WHERE id = ?")
+            .bind(&placement.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM workspace WHERE id = ?")
+            .bind(&placement.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, placement.agent_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        sqlx::query("UPDATE daemon SET detected_clis_json = ? WHERE id = ?")
+            .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
+            .bind(daemon_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, _outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params: json!({"protocol_revision":2,"capabilities":["execution.terminal.usage_reports","execution.terminal.ack"]}),
+        });
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry.clone());
+        let error = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .err()
+            .expect("revision two is refused");
+        let ServiceError::PlacementUnavailable(ref refusal) = error else {
+            panic!("placement refusal");
+        };
+        assert!(refusal.needs_daemon_upgrade(), "{refusal:?}");
+        assert!(!crate::placement::is_retryable_admission_refusal(&error));
+        assert_eq!(execution_count(&db, &task.id).await, 0);
+        let stored = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, task.status);
+        assert!(stored.failed_json.is_none());
+        assert!(stored.error_annotation.is_none());
+        crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+            &db,
+            &task.id,
+            &task.status,
+            &error,
+        )
+        .await
+        .unwrap();
+        let stored = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: Value =
+            serde_json::from_str(stored.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["type"], "dispatch_failed");
+        assert!(annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        assert!(annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains("upgrade the daemon"));
+        assert_eq!(
+            crate::agent_service::compute_effective_status(&db, &agent, Some(&registry))
+                .await
+                .unwrap(),
+            crate::agent_service::EffectiveStatus::DaemonUpgradeRequired
+        );
+        let location = db::RepoLocationRepo::get_by_id(&*db, &placement.repo_location_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let repo = RepoRepo::get_by_id(&*db, &location.repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = db::RuntimeRepo::get_by_id(&*db, placement.runtime_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let verifier = crate::repo_location::RemoteDaemonLocationVerifier::new(
+            registry.clone(),
+            PathBuf::from("unused"),
+        );
+        let verification = crate::repo_location::DaemonLocationVerifier::verify(
+            &verifier, &repo, &location, &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verification.status, location.status);
+        assert!(verification
+            .last_error
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        let location_service =
+            crate::repo_location::RepoLocationService::new(db.clone(), Arc::new(verifier));
+        location_service
+            .retry_verification_on_reconnect(daemon_id)
+            .await
+            .unwrap();
+        let stored_location = db::RepoLocationRepo::get_by_id(&*db, &location.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_location.status, location.status);
+        assert!(stored_location
+            .last_error
+            .unwrap()
+            .contains("daemon_upgrade_required"));
+        let error = service
+            .reserve_claim_workspace(&stored, Some(&agent), "coder")
+            .await
+            .err()
+            .unwrap();
+        let ServiceError::PlacementUnavailable(refusal) = error else {
+            panic!("placement refusal")
+        };
+        assert!(refusal.needs_daemon_upgrade());
+    }
+
+    #[tokio::test]
     async fn placement_admission_prepare_failure_keeps_retry_budget() {
         let db = Arc::new(sqlite_db().await);
         let repo_dir = TempDir::new().unwrap();
@@ -3040,7 +3220,7 @@ mod tests {
         .await
         .unwrap();
         let details: String = sqlx::query_scalar(
-            "SELECT details_json FROM attention_projection WHERE attention_type = 'workspace_fence_rejected'",
+            "SELECT details_json FROM attention_projection WHERE attention_type = 'execution_failed' AND dedupe_key LIKE 'workspace-fence:%'",
         ).fetch_one(db.pool()).await.unwrap();
         let details: Value = serde_json::from_str(&details).unwrap();
         assert_eq!(details["failure_cause"], "wrong_owner");
@@ -4007,6 +4187,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attention, 1);
+        let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let attention_version: i64 =
+            sqlx::query_scalar("SELECT version FROM attention_projection WHERE dedupe_key = ?")
+                .bind(format!("task-owner-wait:{}", task.id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(service
+            .defer_placement_refusal(&waiting, &refusal)
+            .await
+            .unwrap());
+        let again = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.version, waiting.version);
+        let unchanged: i64 =
+            sqlx::query_scalar("SELECT version FROM attention_projection WHERE dedupe_key = ?")
+                .bind(format!("task-owner-wait:{}", task.id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(unchanged, attention_version);
         sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.owner_wait.started_at', ?) WHERE id = ?")
             .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()).bind(&task.id).execute(db.pool()).await.unwrap();
         let dispatcher = crate::task_dispatcher::TaskDispatcher::new(
@@ -4019,7 +4225,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(task.blocked_json.is_some());
+        let blocked: api_types::InterruptionMetadata =
+            serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
+        assert_eq!(blocked.kind, Some(api_types::FailureKind::RecoveryRequired));
+        assert!(!blocked.reason.is_empty());
+        assert!(!blocked.created_at.is_empty());
         let metadata: Value = serde_json::from_str(task.metadata_json.as_deref().unwrap()).unwrap();
         assert_eq!(metadata["concurrent_note"], "retained");
         assert!(task
@@ -4029,5 +4239,107 @@ mod tests {
             .contains("owner_disconnected_timeout"));
         assert!(crate::deferred_dispatch::pending_until(&task).is_none());
         assert_eq!(execution_count(&db, &task.id).await, 0);
+    }
+    #[tokio::test]
+    async fn placement_expired_owner_wait_on_terminal_placement_falls_through() {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_max_disconnect(Duration::ZERO);
+        for state in [
+            PlacementState::Failed,
+            PlacementState::Cleaning,
+            PlacementState::Cleaned,
+        ] {
+            sqlx::query("UPDATE workspace_placement SET state = ? WHERE id = ?")
+                .bind(state.to_string())
+                .bind(&placement.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+                .bind(json!({"owner_wait":{"daemon_id":placement.daemon_id,"started_at":"1970-01-01T00:00:00Z"}}).to_string())
+                .bind(&task.id).execute(db.pool()).await.unwrap();
+            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!service.expire_owner_wait(&task).await.unwrap());
+            let current = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let metadata: Value =
+                serde_json::from_str(current.metadata_json.as_deref().unwrap()).unwrap();
+            assert!(metadata.get("owner_wait").is_none());
+            assert!(current.blocked_json.is_none());
+        }
+        let mut malformed = task;
+        malformed.metadata_json = Some("{malformed".into());
+        assert!(!service.expire_owner_wait(&malformed).await.unwrap());
+    }
+    #[tokio::test]
+    async fn placement_daemon_describe_failure_is_transient_without_prepare() {
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query(
+            "UPDATE workspace_placement SET state = 'ready', disconnected_at = NULL WHERE id = ?",
+        )
+        .bind(&placement.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry.clone());
+        let router = Arc::new(
+            (*service.workspace_backend_router())
+                .clone()
+                .with_daemon(Arc::new(
+                    crate::workspace_backend::DaemonWorkspaceBackend::new(
+                        db.clone(),
+                        registry.clone(),
+                    ),
+                )),
+        );
+        let responder = tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, .. } = outbound.recv().await.unwrap()
+            else {
+                panic!("describe request");
+            };
+            assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+            registry.dispatch_incoming_for_connection(
+                &daemon_id,
+                connection_id,
+                api_types::DaemonFrame::Error {
+                    id: Some(id),
+                    error: api_types::DaemonErrorPayload {
+                        code: "workspace_error".into(),
+                        message: "temporary Git read failure".into(),
+                        details: None,
+                    },
+                },
+            );
+            outbound
+        });
+        let error = prepare_workspace(
+            &db,
+            std::path::Path::new("/owner-only"),
+            &task,
+            &task.id,
+            None,
+            &router,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServiceError::Git(_)), "{error:?}");
+        assert!(
+            responder.await.unwrap().try_recv().is_err(),
+            "describe failure must not send prepare"
+        );
     }
 }

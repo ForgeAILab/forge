@@ -412,6 +412,15 @@ pub enum ServiceError {
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },
 
+    #[error("daemon_not_ready: daemon {daemon_id} has not sent its command handshake")]
+    DaemonNotReady { daemon_id: String },
+
+    #[error(
+        "daemon_upgrade_required: daemon {daemon_id}: {}",
+        api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+    )]
+    DaemonUpgradeRequired { daemon_id: String },
+
     #[error("daemon command timed out for daemon {daemon_id}: {method}")]
     DaemonTimeout { daemon_id: String, method: String },
 

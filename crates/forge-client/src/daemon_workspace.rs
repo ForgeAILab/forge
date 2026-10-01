@@ -17,7 +17,9 @@ use workspace::WorkspaceManager;
 
 use crate::{
     daemon_fs,
-    daemon_persistence::{operation_entry_id, DaemonJournal, JournalEntry, JournalOperation},
+    daemon_persistence::{
+        journal_request, operation_entry_id, DaemonJournal, JournalEntry, JournalOperation,
+    },
 };
 
 const WORKTREE_DIRECTORY: &str = ".forge/workspaces";
@@ -30,7 +32,6 @@ type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct WorkspaceRegistry {
-    runtime_id: Option<String>,
     locations: HashMap<String, VerifiedLocation>,
     handles: HashMap<String, OwnedWorkspace>,
 }
@@ -58,6 +59,8 @@ struct OwnedWorkspace {
     prepared: bool,
     cleaned: bool,
     execution_ids: Vec<String>,
+    #[serde(default)]
+    retired_by_operation_id: Option<String>,
     #[serde(default)]
     review_parent: Option<String>,
     #[serde(default)]
@@ -170,26 +173,19 @@ impl DaemonWorkspaceBackend {
             }
             _ => unreachable!("workspace read methods returned above"),
         }
-        self.check_owner(&fence.daemon_id, &fence.runtime_id)?;
         validate_id(&fence.operation_id)?;
         let existing = self.workspace_for_placement(&fence.placement_id);
-        if let Some((_, workspace)) = &existing {
-            self.check_generation(fence.generation, workspace.generation, recreating)?;
-        }
         let handle = if method == METHOD_WORKSPACE_PREPARE {
             existing.as_ref().map(|(handle, _)| handle.as_str())
         } else {
             params.get("workspace_handle").and_then(Value::as_str)
         };
-        if let Some(handle) = handle {
-            self.workspace(&reference(&fence, handle), recreating)?;
-        }
         let resuming = if let Some(operation) = self
             .journal
             .operation(&fence.operation_id)
             .map_err(storage_error)?
         {
-            if operation.method != method || operation.request != params {
+            if operation.method != method || operation.request != journal_request(&params) {
                 return Err(error(
                     TERMINAL_REPORT_CONFLICT,
                     "operation_id was reused for a different request",
@@ -208,6 +204,13 @@ impl DaemonWorkspaceBackend {
             }
             true
         } else {
+            self.check_owner(&fence.daemon_id, &fence.runtime_id)?;
+            if let Some((_, workspace)) = &existing {
+                self.check_generation(fence.generation, workspace.generation, recreating)?;
+            }
+            if let Some(handle) = handle {
+                self.workspace(&reference(&fence, handle), recreating)?;
+            }
             let operation = JournalOperation {
                 entry_id: operation_entry_id(&fence.operation_id),
                 fence: fence.clone(),
@@ -225,6 +228,9 @@ impl DaemonWorkspaceBackend {
                 .map_err(storage_error)?;
             false
         };
+        if let Some(handle) = handle {
+            self.workspace(&reference(&fence, handle), recreating)?;
+        }
         let mut outcome = match method {
             METHOD_WORKSPACE_PREPARE => {
                 self.prepare(decode(params.clone())?).await.and_then(encode)
@@ -267,11 +273,48 @@ impl DaemonWorkspaceBackend {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
+        operation.request = params;
         operation.outcome = Some(outcome.clone());
         self.journal
             .finish_operation(&operation)
-            .map_err(storage_error)?;
-        outcome
+            .map_err(storage_error)?
+            .outcome
+            .ok_or_else(|| error(WORKSPACE_ERROR, "operation result is missing"))?
+    }
+
+    pub async fn acknowledge_journal(
+        &self,
+        params: &JournalAckParams,
+    ) -> CommandResult<JournalAckResult> {
+        let _guard = self.operation_lock.lock().await;
+        if let Some(JournalEntry::Operation { operation }) = self
+            .journal
+            .entry(&params.entry_id)
+            .map_err(storage_error)?
+        {
+            let retires_handles = operation.method == METHOD_WORKSPACE_CLEANUP
+                || (operation.method == METHOD_WORKSPACE_RESET
+                    && (operation.request.get("operation").is_none()
+                        || operation
+                            .request
+                            .pointer("/operation/kind")
+                            .and_then(Value::as_str)
+                            == Some("release_review_checkout")));
+            if retires_handles && matches!(operation.outcome, Some(Ok(_))) {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let mut updated = state.clone();
+                updated.handles.retain(|_, owned| {
+                    !(owned.cleaned
+                        && owned.retired_by_operation_id.as_deref()
+                            == Some(operation.fence.operation_id.as_str()))
+                });
+                self.journal
+                    .save_workspace_state(&updated)
+                    .map_err(storage_error)?;
+                *state = updated;
+            }
+        }
+        self.journal.acknowledge(params).map_err(storage_error)
     }
 
     fn check_owner(&self, daemon_id: &str, runtime_id: &str) -> CommandResult<()> {
@@ -280,16 +323,6 @@ impl DaemonWorkspaceBackend {
                 WRONG_OWNER,
                 "request does not belong to this daemon runtime",
             ));
-        }
-        if self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .runtime_id
-            .as_deref()
-            .is_some_and(|id| id != runtime_id)
-        {
-            return Err(error(WRONG_OWNER, "request belongs to another runtime"));
         }
         Ok(())
     }
@@ -516,7 +549,6 @@ impl DaemonWorkspaceBackend {
             }
         }
         let mut updated = state.clone();
-        updated.runtime_id = Some(params.runtime_id.clone());
         updated.locations.insert(
             params.repo_location_id.clone(),
             VerifiedLocation {
@@ -604,7 +636,15 @@ impl DaemonWorkspaceBackend {
         &self,
         params: WorkspacePrepareParams,
     ) -> CommandResult<WorkspacePrepareResult> {
-        let (_, repo_path) = self.location_path(&params.repo_location_id).await?;
+        let (location, repo_path) = self.location_path(&params.repo_location_id).await?;
+        if location.daemon_id != params.fence.daemon_id
+            || location.runtime_id != params.fence.runtime_id
+        {
+            return Err(error(
+                WRONG_OWNER,
+                "repository location belongs to another runtime",
+            ));
+        }
         let base_sha = resolve_commit(&repo_path, &params.base_ref).await?;
         validate_branch(&repo_path, &params.branch).await?;
         let (handle, mut owned) = match self.workspace_for_placement(&params.fence.placement_id) {
@@ -651,6 +691,7 @@ impl DaemonWorkspaceBackend {
                     },
                     prepared: false,
                     cleaned: false,
+                    retired_by_operation_id: None,
                     execution_ids: Vec::new(),
                     review_parent: None,
                     review_operation_id: None,
@@ -877,11 +918,15 @@ impl DaemonWorkspaceBackend {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
-        let start = Instant::now();
-        let output_cap = usize::try_from(params.max_output_bytes).unwrap_or(usize::MAX);
-        let output = bounded_command(command, params.timeout_secs, output_cap, true).await?;
+        // Persist the version before launching; journal pressure after the
+        // command exits must never discard its exit result.
         owned.version += 1;
         self.save_workspace(&params.workspace_handle, owned)?;
+        let start = Instant::now();
+        let output_cap = usize::try_from(params.max_output_bytes)
+            .unwrap_or(usize::MAX)
+            .min(crate::daemon_persistence::MAX_CI_LOG_BYTES);
+        let output = bounded_command(command, params.timeout_secs, output_cap, true).await?;
         let environment: BTreeMap<String, String> = params.env.into_iter().collect();
         let (stdout, stdout_truncated) = redacted_tail(&output.stdout, &environment, output_cap);
         let (stderr, stderr_truncated) = redacted_tail(&output.stderr, &environment, output_cap);
@@ -895,6 +940,8 @@ impl DaemonWorkspaceBackend {
             timed_out: output.timed_out,
             stdout_truncated: output.stdout_truncated || stdout_truncated,
             stderr_truncated: output.stderr_truncated || stderr_truncated,
+            stdout_drain_incomplete: output.stdout_drain_incomplete,
+            stderr_drain_incomplete: output.stderr_drain_incomplete,
         })
     }
 
@@ -1194,7 +1241,8 @@ impl DaemonWorkspaceBackend {
                 ));
             }
             self.check_expected(&owned, &params.fence.expected).await?;
-            self.reclaim_review_checkouts(&owned, active_ids).await?;
+            self.reclaim_review_checkouts(&owned, active_ids, &params.fence.operation_id)
+                .await?;
             if owned.path.exists() {
                 verify_git_dir(&owned.path, &self.workspace_root).await?;
                 self.manager
@@ -1224,6 +1272,7 @@ impl DaemonWorkspaceBackend {
             owned.generation = params.fence.generation;
             owned.prepared = true;
             owned.cleaned = false;
+            owned.retired_by_operation_id = None;
             owned.version += 1;
             self.save_workspace(&params.workspace_handle, owned.clone())?;
         }
@@ -1245,7 +1294,8 @@ impl DaemonWorkspaceBackend {
         let (_, repo_path) = self.location_path(&owned.repo_location_id).await?;
         if !owned.cleaned {
             self.check_expected(&owned, &params.fence.expected).await?;
-            self.reclaim_review_checkouts(&owned, active_ids).await?;
+            self.reclaim_review_checkouts(&owned, active_ids, &params.fence.operation_id)
+                .await?;
             if owned.path.exists() {
                 verify_git_dir(&owned.path, &self.workspace_root).await?;
                 git::remove_worktree(&repo_path, &owned.path)
@@ -1267,6 +1317,7 @@ impl DaemonWorkspaceBackend {
                 Err(error) => return Err(workspace_error(error)),
             }
             owned.cleaned = true;
+            owned.retired_by_operation_id = Some(params.fence.operation_id.clone());
             owned.version += 1;
             self.save_workspace(&params.workspace_handle, owned.clone())?;
         }
@@ -1400,6 +1451,8 @@ struct BoundedOutput {
     timed_out: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_drain_incomplete: bool,
+    stderr_drain_incomplete: bool,
 }
 
 async fn bounded_command(
@@ -1424,8 +1477,20 @@ async fn bounded_command(
         .stderr
         .take()
         .ok_or_else(|| error(WORKSPACE_ERROR, "child stderr is unavailable"))?;
-    let mut stdout_task = tokio::spawn(read_bounded_stream(stdout, cap, keep_tail));
-    let mut stderr_task = tokio::spawn(read_bounded_stream(stderr, cap, keep_tail));
+    let stdout_capture = Arc::new(Mutex::new(StreamCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(StreamCapture::default()));
+    let mut stdout_task = tokio::spawn(read_bounded_stream(
+        stdout,
+        cap,
+        keep_tail,
+        stdout_capture.clone(),
+    ));
+    let mut stderr_task = tokio::spawn(read_bounded_stream(
+        stderr,
+        cap,
+        keep_tail,
+        stderr_capture.clone(),
+    ));
     let wait = if seconds == 0 {
         Ok(child.wait().await)
     } else {
@@ -1448,53 +1513,62 @@ async fn bounded_command(
         }
     };
     let collect = async {
-        let stdout = (&mut stdout_task)
+        (&mut stdout_task)
             .await
             .map_err(|e| error(WORKSPACE_ERROR, e.to_string()))?
             .map_err(io_error)?;
-        let stderr = (&mut stderr_task)
+        (&mut stderr_task)
             .await
             .map_err(|e| error(WORKSPACE_ERROR, e.to_string()))?
             .map_err(io_error)?;
-        Ok::<_, DaemonErrorPayload>((stdout, stderr))
+        Ok::<_, DaemonErrorPayload>(())
     };
-    let collect = if seconds == 0 && cap == usize::MAX {
-        Ok(collect.await)
-    } else {
-        tokio::time::timeout(Duration::from_secs(2), collect).await
-    };
-    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) = match collect {
-        Ok(result) => result?,
+    match tokio::time::timeout(Duration::from_secs(2), collect).await {
+        Ok(result) => {
+            result?;
+        }
         Err(_) => {
             stdout_task.abort();
             stderr_task.abort();
-            ((Vec::new(), true), (Vec::new(), true))
         }
-    };
+    }
+    let stdout = stdout_capture.lock().unwrap_or_else(|p| p.into_inner());
+    let stderr = stderr_capture.lock().unwrap_or_else(|p| p.into_inner());
     Ok(BoundedOutput {
         exit_code,
-        stdout,
-        stderr,
+        stdout: stdout.bytes.clone(),
+        stderr: stderr.bytes.clone(),
         timed_out,
-        stdout_truncated,
-        stderr_truncated,
+        stdout_truncated: stdout.seen > cap as u64,
+        stderr_truncated: stderr.seen > cap as u64,
+        stdout_drain_incomplete: !stdout.eof,
+        stderr_drain_incomplete: !stderr.eof,
     })
+}
+
+#[derive(Default)]
+struct StreamCapture {
+    bytes: Vec<u8>,
+    seen: u64,
+    eof: bool,
 }
 
 async fn read_bounded_stream(
     mut stream: impl AsyncRead + Unpin,
     cap: usize,
     keep_tail: bool,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut tail = Vec::new();
-    let mut seen = 0_u64;
+    capture: Arc<Mutex<StreamCapture>>,
+) -> std::io::Result<()> {
     let mut chunk = [0_u8; 8192];
     loop {
         let count = stream.read(&mut chunk).await?;
+        let mut capture = capture.lock().unwrap_or_else(|p| p.into_inner());
         if count == 0 {
+            capture.eof = true;
             break;
         }
-        seen += count as u64;
+        capture.seen += count as u64;
+        let tail = &mut capture.bytes;
         if !keep_tail {
             let remaining = cap.saturating_sub(tail.len());
             tail.extend_from_slice(&chunk[..remaining.min(count)]);
@@ -1507,7 +1581,7 @@ async fn read_bounded_stream(
             tail.extend_from_slice(&chunk[..count]);
         }
     }
-    Ok((tail, seen > cap as u64))
+    Ok(())
 }
 
 fn redacted_tail(

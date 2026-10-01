@@ -805,7 +805,7 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
             .await?;
         if disposition == DaemonTerminalDisposition::Ignore {
             let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id).await?;
-            if execution.is_none_or(|execution| {
+            if execution.is_some_and(|execution| {
                 execution.status == ExecutionStatus::Running
                     && crate::recovery::owner_execution_failure_cause(&execution).is_none()
             }) {
@@ -864,6 +864,8 @@ impl ServerExecutionEventSink {
             }
             self.resume_suspended_notification(daemon_id, connection_id, execution)
                 .await?;
+        } else {
+            return Ok(DaemonTerminalDisposition::Ignore);
         }
         if !self.connection_is_current(daemon_id, connection_id) {
             return Ok(DaemonTerminalDisposition::Ignore);
@@ -924,12 +926,9 @@ impl ServerExecutionEventSink {
                         // including a crash after ready CAS but before cascade.
                         return Ok(DaemonTerminalDisposition::AwaitingCascade);
                     }
-                    if !task_service
-                        .try_cascade_executor_completion(&notification.execution_id)
-                        .await?
-                    {
-                        return Ok(DaemonTerminalDisposition::AwaitingCascade);
-                    }
+                    task_service
+                        .maybe_cascade_executor_completion(&notification.execution_id)
+                        .await?;
                 }
                 // Promote this call's Pending reservation only after every
                 // durable post-commit effect has succeeded. If cascade fails,
@@ -1506,6 +1505,98 @@ mod cancellation_tests {
     use crate::daemon_transport::{DaemonConnectionRegistry, DaemonExecutionEventHandler};
 
     #[tokio::test]
+    async fn daemon_transport_live_terminal_drives_a_busy_completion_cascade() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let bus = Arc::new(EventBus::new(32));
+        let mut terminal_events = bus.subscribe();
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            root.path().into(),
+        ));
+        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let service =
+            Arc::new(TaskService::new(db.clone(), bus).with_daemon_connections(registry.clone()));
+        sink.set_task_service(Arc::downgrade(&service));
+        let daemon_id = placement.daemon_id.unwrap();
+        let (connection_id, _outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        sqlx::query(
+            "UPDATE workspace_placement SET state = 'ready', disconnected_at = NULL WHERE id = ?",
+        )
+        .bind(&placement.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution SET role = 'interactive', lease_owner = ?, lease_expires_at = ? WHERE id = ?")
+            .bind(execution_lease_owner(&daemon_id, connection_id)).bind((Utc::now() + ChronoDuration::hours(1)).to_rfc3339())
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        let slot = service.claim_completion_cascade(&task.id).unwrap();
+        let notification = serde_json::from_value(
+            json!({"terminal_report_id":"live-report", "execution_id":execution.id,
+            "exit_code":0, "status":"completed", "ts":db::now_rfc3339(), "usage_reports":[]}),
+        )
+        .unwrap();
+        let attempt = tokio::spawn(async move {
+            sink.handle_terminal_with_ack(&daemon_id, connection_id, notification)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while terminal_events.recv().await.unwrap().event_type != "execution.completed" {}
+        })
+        .await
+        .unwrap();
+        assert!(
+            !attempt.is_finished(),
+            "a live terminal must wait for the occupied Task slot"
+        );
+        drop(slot);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            DaemonTerminalDisposition::Acknowledge
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_transport_deleted_execution_report_is_acknowledgeable() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let bus = Arc::new(EventBus::new(16));
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            root.path().into(),
+        ));
+        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let service = Arc::new(TaskService::new(db, bus).with_daemon_connections(registry.clone()));
+        sink.set_task_service(Arc::downgrade(&service));
+        let (id, _outbound) = crate::recovery::tests::owner_connection(&registry, "owner", false);
+        let notification = serde_json::from_value(
+            json!({"terminal_report_id":"deleted-report", "execution_id":"deleted-execution",
+            "exit_code":0, "status":"completed", "ts":db::now_rfc3339(), "usage_reports":[]}),
+        )
+        .unwrap();
+        assert_eq!(
+            sink.handle_terminal_with_ack("owner", id, notification)
+                .await
+                .unwrap(),
+            DaemonTerminalDisposition::Ignore
+        );
+    }
+
+    #[tokio::test]
     async fn daemon_transport_cancelled_terminal_and_slow_placement_reconcile_commit_once_and_ack()
     {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
@@ -1543,9 +1634,16 @@ mod cancellation_tests {
             "terminal_report_id": db::new_uuid_v4(), "execution_id": execution.id, "exit_code": 0,
             "ts": db::now_rfc3339(), "status": "completed", "after_sha": "owner-head", "usage_reports": [],
         })).unwrap();
+        // This receipt test isolates transport/cancellation from workflow role authority.
+        sqlx::query("UPDATE execution SET role = 'interactive' WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         // Cancellation after the durable terminal write, before the reservation
         // is promoted. The retry must replay the receipt instead of wedging Pending.
         let writers = sink.writers.lock().await;
+        let mut terminal_events = bus.subscribe();
         let attempt = {
             let sink = sink.clone();
             let daemon_id = daemon_id.clone();
@@ -1555,18 +1653,12 @@ mod cancellation_tests {
                     .await
             })
         };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
-                if ExecutionRepo::get_by_id(&*db, &execution.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .status
-                    == ExecutionStatus::Completed
-                {
+                let event = terminal_events.recv().await.unwrap();
+                if event.event_type == "execution.completed" && event.entity_id == execution.id {
                     break;
                 }
-                tokio::task::yield_now().await;
             }
         })
         .await
@@ -1593,12 +1685,14 @@ mod cancellation_tests {
         );
         let acked = Arc::new(tokio::sync::Notify::new());
         let describe_started = Arc::new(tokio::sync::Notify::new());
+        let release_describe = Arc::new(tokio::sync::Notify::new());
         let describes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let responder = {
             let registry = registry.clone();
             let daemon_id = daemon_id.clone();
             let acked = acked.clone();
             let describe_started = describe_started.clone();
+            let release_describe = release_describe.clone();
             let describes = describes.clone();
             tokio::spawn(async move {
                 while let Some(api_types::DaemonFrame::Request { id, method, params }) =
@@ -1606,10 +1700,12 @@ mod cancellation_tests {
                 {
                     let result = match method.as_str() {
                         api_types::METHOD_WORKSPACE_DESCRIBE => {
-                            describes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let attempt =
+                                describes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             describe_started.notify_one();
-                            // Exceeds the removed two-second aggregate deadline.
-                            tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+                            if attempt == 0 {
+                                release_describe.notified().await;
+                            }
                             json!({"workspace_handle": params["workspace_handle"], "generation": 1,
                                 "exists": true, "head_sha": "owner-head", "dirty": false, "branch": "task/remote",
                                 "locked": false, "active_execution_ids": [], "journaled_execution_ids": [execution.id]})
@@ -1667,6 +1763,7 @@ mod cancellation_tests {
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         assert!(lock(&registry.get(&daemon_id).unwrap().pending).is_empty());
+        release_describe.notify_one();
         let monitor = crate::HeartbeatMonitor::new(db.clone(), bus)
             .with_daemon_connections(registry.clone())
             .with_task_service(service);

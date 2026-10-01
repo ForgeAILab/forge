@@ -715,12 +715,35 @@ impl DaemonWorkspaceClient {
              ORDER BY result.committed_at, result.id LIMIT 128",
         ).bind(daemon_id).fetch_all(db.pool()).await.map_err(ServiceError::from)?;
         for result in results {
-            let result: Value = serde_json::from_str(&result)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            self.acknowledge_receipt(daemon_id, &result["owner_result"])
+            let result: Value = match serde_json::from_str(&result) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%daemon_id, %error, "invalid workspace acknowledgement receipt");
+                    continue;
+                }
+            };
+            self.retry_receipt_acknowledgement(daemon_id, &result["owner_result"])
                 .await?;
         }
         Ok(())
+    }
+
+    async fn retry_receipt_acknowledgement(&self, daemon_id: &str, value: &Value) -> Result<()> {
+        match self.acknowledge_receipt(daemon_id, value).await {
+            Ok(()) => Ok(()),
+            Err(
+                error @ WorkspaceClientError::Transport(
+                    ServiceError::DaemonUnavailable { .. }
+                    | ServiceError::DaemonTimeout { .. }
+                    | ServiceError::DaemonNotReady { .. }
+                    | ServiceError::DaemonUpgradeRequired { .. },
+                ),
+            ) => Err(error),
+            Err(error) => {
+                tracing::warn!(%daemon_id, entry_id = ?value["entry_id"], %error, "workspace acknowledgement refused; continuing batch");
+                Ok(())
+            }
+        }
     }
 
     /// Inspect retained run/merge intents on reconnect without rerunning either
@@ -805,7 +828,8 @@ impl DaemonWorkspaceClient {
                 }
                 _ => unreachable!("query selects only run and merge intents"),
             }
-            self.acknowledge_receipt(daemon_id, &value).await?;
+            self.retry_receipt_acknowledgement(daemon_id, &value)
+                .await?;
         }
         Ok(())
     }
@@ -905,16 +929,6 @@ impl DaemonWorkspaceClient {
             .ok_or_else(unavailable)?;
         self.registry
             .ensure_protocol_dispatchable(daemon_id, &connection)?;
-        if connection
-            .protocol_revision
-            .load(std::sync::atomic::Ordering::Acquire)
-            < 3
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "{DAEMON_PROTOCOL_INCOMPATIBLE}: workspace RPCs require revision 3"
-            ))
-            .into());
-        }
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
@@ -1103,6 +1117,54 @@ pub(crate) mod tests {
         pub registry: Arc<DaemonConnectionRegistry>,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    #[tokio::test]
+    async fn daemon_transport_ack_retry_continues_after_receipt_refusal() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let (_, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let client = DaemonWorkspaceClient::new(registry.clone()).with_receipts(db.clone());
+        for index in 0..2 {
+            client.retain_result(&daemon_id, METHOD_WORKSPACE_PREPARE,
+                &json!({"placement_id": placement.id, "runtime_id": placement.runtime_id, "generation":placement.generation, "operation_id":format!("op-{index}")}),
+                &json!({"entry_id":format!("entry-{index}"), "operation_id":format!("op-{index}")})).await.unwrap();
+        }
+        let responder = {
+            let daemon_id = daemon_id.clone();
+            tokio::spawn(async move {
+                let mut accepted = None;
+                for index in 0..2 {
+                    let DaemonFrame::Request { id, method, params } =
+                        outbound.recv().await.unwrap()
+                    else {
+                        panic!("ack request");
+                    };
+                    assert_eq!(method, METHOD_JOURNAL_ACK);
+                    if index == 1 {
+                        accepted = params["entry_id"].as_str().map(str::to_owned);
+                    }
+                    registry.dispatch_incoming_for_connection(&daemon_id, connection_id, DaemonFrame::Response {
+                        id, result: json!({"entry_id":params["entry_id"], "acknowledged":index == 1}),
+                    });
+                }
+                accepted.unwrap()
+            })
+        };
+        client.retry_acknowledgements(&daemon_id).await.unwrap();
+        let accepted = responder.await.unwrap();
+        let acknowledged: Vec<String> = sqlx::query_scalar(
+            "SELECT idempotency_key FROM command_receipt WHERE operation LIKE '%.ack'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(acknowledged, vec![accepted]);
     }
 
     impl ScriptedDaemon {

@@ -40,8 +40,8 @@ completed_at:
 - [x] 4.4 Focused route tests: register, verify failure, delete-in-use 409
 
 ## 5. Daemon protocol revision 3 (daemon side)
-- [x] 5.1 `api-types`: revision 3, `workspace.v1` capability, params and results for the 9 RPCs; minimum accepted revision stays 2
-- [x] 5.1a Server sends the revision-2 `execution.terminal.ack` wire shape to revision-2 connections and `journal.ack` to revision ≥ 3 (surfaced during 5.1)
+- [x] 5.1 `api-types`: revision 3, `workspace.v1` capability, params and results for the 9 RPCs; minimum command revision is 3
+- [x] 5.1a Revision-2 sockets remain visible for upgrade diagnostics; all command RPCs are refused with `daemon_upgrade_required`, and only revision ≥ 3 uses `journal.ack`
 - [x] 5.2 Daemon workspace backend in `forge-client` (reuse the `workspace` and `git` crates), handle map, and confinement checks
 - [x] 5.3 Extend `DaemonTerminalStore` into the single daemon journal (terminal, operation, and cleanup entries; `journal.ack`), with idempotent replay, generation fencing, and wrong-owner rejection
 - [x] 5.3a Handshake advertises per-executor adapter capability facts and the local `workspace.run` policy; the daemon enforces the policy (`purpose_denied`)

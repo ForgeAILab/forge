@@ -872,26 +872,48 @@ impl CodexAdapter {
             // root, its outbox (worklog and evidence delivery), and the host's
             // package-manager caches (so dependency installs and builds work).
             let managed_writable_roots = if managed_task {
-                managed_scratch_root
-                    .iter()
-                    .cloned()
-                    .chain(executors::execution_outbox_path(
-                        Path::new(&ctx.worktree_path),
-                        &ctx.execution_id,
-                    ))
-                    .chain(dirs::home_dir().map_or_else(Vec::new, |home| {
-                        package_cache_roots(&home, |key| std::env::var_os(key))
-                            .into_iter()
-                            .filter(|root| {
-                                cache_root_is_disjoint_from_task(
-                                    root,
-                                    Path::new(&ctx.worktree_path),
-                                )
-                            })
-                            .collect()
-                    }))
-                    .map(|root| resolve_symlinked_root(&root))
-                    .collect::<Vec<_>>()
+                let home = dirs::home_dir();
+                let daemon_root = ctx.agent_config["_forge_workspace_root"]
+                    .as_str()
+                    .map(Path::new);
+                let managed_home = managed_scratch_root.as_deref().and_then(Path::parent);
+                let cache_roots = home.as_deref().map_or_else(Vec::new, |home| {
+                    package_cache_roots(home, |key| std::env::var_os(key))
+                        .into_iter()
+                        .zip(package_cache_roots(home, |_| None))
+                        .filter_map(|(root, default)| {
+                            safe_writable_root(
+                                &root,
+                                &default,
+                                Some(home),
+                                Path::new(&ctx.worktree_path),
+                                daemon_root,
+                                managed_home,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                // Forge creates these exact delivery/scratch directories. Cache
+                // configuration must never grant additional Task or daemon paths.
+                let scratch =
+                    managed_home.map(|home| resolve_path_for_overlap(home).join("task-scratch"));
+                let outbox = Path::new(&ctx.worktree_path).parent().map(|task| {
+                    resolve_path_for_overlap(task)
+                        .join(".forge-outbox")
+                        .join(&ctx.execution_id)
+                });
+                managed_scratch_root.iter().cloned()
+                    .chain(executors::execution_outbox_path(Path::new(&ctx.worktree_path), &ctx.execution_id))
+                    .filter_map(|root| {
+                        let resolved = resolve_path_for_overlap(&root);
+                        if scratch.as_ref() == Some(&resolved) || outbox.as_ref() == Some(&resolved) {
+                            Some(resolved)
+                        } else {
+                            tracing::warn!(root = %root.display(), resolved = %resolved.display(), "dropped redirected Codex scratch or outbox root");
+                            None
+                        }
+                    })
+                    .chain(cache_roots).collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -1258,24 +1280,166 @@ fn ambient_codex_home() -> PathBuf {
 /// Codex rejects writable roots with a symlink component (for example a
 /// relocated `~/.npm` or macOS `/tmp`). Resolve the deepest existing ancestor
 /// and keep any not-yet-created remainder as is.
-fn resolve_symlinked_root(root: &Path) -> PathBuf {
-    let mut existing = root;
-    let mut remainder = Vec::new();
-    loop {
-        if let Ok(resolved) = std::fs::canonicalize(existing) {
-            return remainder
-                .iter()
-                .rev()
-                .fold(resolved, |path, component| path.join(component));
-        }
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                remainder.push(name.to_owned());
-                existing = parent;
+/// Never grant a resolved root that contains a protected authority directory.
+/// Resolve both sides, including relative links and chains, before comparison.
+fn safe_writable_root(
+    root: &Path,
+    default_root: &Path,
+    home: Option<&Path>,
+    worktree: &Path,
+    daemon_root: Option<&Path>,
+    managed_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let resolved = resolve_path_for_overlap(root);
+    let contains = |path: &Path| resolve_path_for_overlap(path).starts_with(&resolved);
+    let overlaps = |path: &Path| {
+        let path = resolve_path_for_overlap(path);
+        resolved.starts_with(&path) || path.starts_with(&resolved)
+    };
+    let scratch = managed_home.map(|home| resolve_path_for_overlap(&home.join("task-scratch")));
+    let inside_protected = daemon_root.is_some_and(|root| overlaps(&root.join(".forge")))
+        || worktree.parent().is_some_and(overlaps)
+        || managed_home.is_some_and(|home| overlaps(home) && scratch.as_ref() != Some(&resolved))
+        || home.is_some_and(|home| {
+            [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".kube",
+                ".docker",
+                ".config/gh",
+                ".codex",
+                ".claude",
+                ".forge",
+            ]
+            .iter()
+            .any(|name| overlaps(&home.join(name)))
+        });
+    let inside_other_task = worktree
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|tasks| resolved.starts_with(resolve_path_for_overlap(tasks)));
+    if !cache_root_is_disjoint_from_task(root, worktree)
+        || resolved.parent().is_none()
+        || home
+            .into_iter()
+            .chain([worktree])
+            .chain(worktree.parent())
+            .chain(managed_home)
+            .any(contains)
+        || home.is_some_and(|home| aliases_home_ancestor(&resolved, home))
+        || inside_protected
+        || inside_other_task
+        || redirected_volume_refusal(
+            root,
+            &resolved,
+            default_root,
+            home,
+            redirected_root_is_whole_volume,
+        )
+    {
+        tracing::warn!(root = %root.display(), resolved = %resolved.display(), "dropped unsafe Codex writable root");
+        return None;
+    }
+    Some(resolved)
+}
+
+fn redirected_volume_refusal(
+    root: &Path,
+    resolved: &Path,
+    default_root: &Path,
+    home: Option<&Path>,
+    whole_volume: impl FnOnce(&Path) -> bool,
+) -> bool {
+    // A relocation variable is an explicit choice. Only a default cache
+    // redirected by a symlink is subject to the whole-volume check.
+    if lexical_normalize(root) != lexical_normalize(default_root) {
+        return false;
+    }
+    // Resolve HOME, but not the default cache's own symlinks. A symlink in
+    // HOME must not make all otherwise ordinary caches look redirected.
+    let default = home
+        .and_then(|home| {
+            default_root
+                .strip_prefix(home)
+                .ok()
+                .map(|suffix| resolve_path_for_overlap(home).join(suffix))
+        })
+        .unwrap_or_else(|| normalize_platform_path(&lexical_normalize(default_root)));
+    resolved != default && whole_volume(resolved)
+}
+
+fn normalize_macos_data_path(path: &Path) -> PathBuf {
+    path.strip_prefix("/System/Volumes/Data")
+        .map(|suffix| Path::new("/").join(suffix))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn normalize_platform_path(path: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        normalize_macos_data_path(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(unix)]
+fn aliases_home_ancestor(root: &Path, home: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(root) = std::fs::metadata(root) else {
+        return false;
+    };
+    resolve_path_for_overlap(home).ancestors().any(|ancestor| {
+        std::fs::metadata(ancestor)
+            .is_ok_and(|metadata| (root.dev(), root.ino()) == (metadata.dev(), metadata.ino()))
+    })
+}
+
+#[cfg(not(unix))]
+fn aliases_home_ancestor(_root: &Path, _home: &Path) -> bool {
+    false
+}
+
+// Compare mount-table strings without touching each mount: an unavailable
+// network filesystem must not delay cache admission.
+#[cfg(any(target_os = "linux", test))]
+fn mount_table_contains_root(table: &str, root: &Path) -> bool {
+    table
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .any(|mount| {
+            let mount = mount
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\");
+            normalize_platform_path(Path::new(&mount)) == root
+        })
+}
+
+fn redirected_root_is_whole_volume(root: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") {
+        return mount_table_contains_root(&table, root);
+    }
+    root == inferred_mount_root(root)
+}
+
+fn inferred_mount_root(root: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for path in root.ancestors() {
+            if let Some(parent) = path.parent()
+                && let (Ok(child), Ok(parent)) =
+                    (std::fs::metadata(path), std::fs::metadata(parent))
+                && child.dev() != parent.dev()
+            {
+                return path.to_path_buf();
             }
-            _ => return root.to_path_buf(),
         }
     }
+    root.ancestors().last().unwrap_or(root).to_path_buf()
 }
 
 /// Package-manager cache directories a managed Task may write so dependency
@@ -1336,17 +1500,19 @@ fn resolve_path_for_overlap(path: &Path) -> PathBuf {
     let mut suffix = Vec::new();
     loop {
         if let Ok(canonical) = std::fs::canonicalize(existing) {
-            return suffix
-                .into_iter()
-                .rev()
-                .fold(canonical, |path, component| path.join(component));
+            return normalize_platform_path(
+                &suffix
+                    .into_iter()
+                    .rev()
+                    .fold(canonical, |path, component| path.join(component)),
+            );
         }
         let Some(name) = existing.file_name() else {
-            return normalized;
+            return normalize_platform_path(&normalized);
         };
         suffix.push(name.to_os_string());
         let Some(parent) = existing.parent() else {
-            return normalized;
+            return normalize_platform_path(&normalized);
         };
         existing = parent;
     }
@@ -1886,15 +2052,308 @@ mod tests {
         let link = base.join(".npm");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        assert_eq!(resolve_symlinked_root(&link), target);
+        assert_eq!(resolve_path_for_overlap(&link), target);
         assert_eq!(
-            resolve_symlinked_root(&link.join("missing/child")),
+            resolve_path_for_overlap(&link.join("missing/child")),
             target.join("missing/child")
         );
         assert_eq!(
-            resolve_symlinked_root(&base.join("absent")),
+            resolve_path_for_overlap(&base.join("absent")),
             base.join("absent")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_writable_roots_drop_resolved_protected_ancestors() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let daemon = base.join("daemon");
+        let worktree = base.join("workspaces/task/repo");
+        let managed = base.join("logs/.codex-managed-home");
+        for path in [&home, &daemon, &worktree, &managed] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir(daemon.join(".forge")).unwrap();
+        for (name, target) in [
+            ("filesystem", Path::new("/")),
+            ("home", home.as_path()),
+            ("worktree", worktree.as_path()),
+            ("daemon-state", daemon.join(".forge").as_path()),
+            ("managed", managed.as_path()),
+            ("ancestor", base.as_path()),
+        ] {
+            let link = base.join(format!("link-{name}"));
+            symlink(target, &link).unwrap();
+            assert!(
+                safe_writable_root(
+                    &link,
+                    &link,
+                    Some(&home),
+                    &worktree,
+                    Some(&daemon),
+                    Some(&managed)
+                )
+                .is_none(),
+                "{name}"
+            );
+        }
+        let chain = base.join("chain");
+        symlink(base.join("link-ancestor"), &chain).unwrap();
+        assert!(
+            safe_writable_root(
+                &chain,
+                &chain,
+                Some(&home),
+                &worktree,
+                Some(&daemon),
+                Some(&managed)
+            )
+            .is_none()
+        );
+        let relative = home.join(".cache");
+        symlink("..", &relative).unwrap();
+        assert!(
+            safe_writable_root(
+                &relative,
+                &relative,
+                Some(&home),
+                &worktree,
+                Some(&daemon),
+                Some(&managed)
+            )
+            .is_none()
+        );
+        let safe = base.join("actual-cache");
+        std::fs::create_dir(&safe).unwrap();
+        let safe_link = home.join(".npm");
+        symlink("../actual-cache", &safe_link).unwrap();
+        assert_eq!(
+            safe_writable_root(
+                &safe_link,
+                &safe_link,
+                Some(&home),
+                &worktree,
+                Some(&daemon),
+                Some(&managed)
+            ),
+            Some(safe)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_writable_roots_refuse_descendants_credentials_and_mounts() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let daemon = base.join("daemon");
+        let worktree = base.join("workspaces/task/repo");
+        let managed = base.join("managed");
+        for path in [&home, &daemon, &worktree, &managed] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let refused = |path: &Path| {
+            assert!(
+                safe_writable_root(
+                    path,
+                    path,
+                    Some(&home),
+                    &worktree,
+                    Some(&daemon),
+                    Some(&managed)
+                )
+                .is_none(),
+                "{}",
+                path.display()
+            );
+        };
+        for path in [
+            daemon.join(".forge/child/cache"),
+            managed.join("plugins/cache"),
+            managed.join("task-scratch/child"),
+            base.join("workspaces/other-task/repo/cache"),
+            worktree.parent().unwrap().join("notes/cache"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+            refused(&path);
+        }
+        for name in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".kube",
+            ".docker",
+            ".config/gh",
+            ".codex",
+            ".claude",
+            ".forge",
+        ] {
+            let credential = home.join(name).join("child");
+            std::fs::create_dir_all(&credential).unwrap();
+            let link = base.join("credential-link");
+            symlink(&credential, &link).unwrap();
+            refused(&link);
+            std::fs::remove_file(link).unwrap();
+        }
+        let scratch = managed.join("task-scratch");
+        assert_eq!(
+            safe_writable_root(
+                &scratch,
+                &scratch,
+                Some(&home),
+                &worktree,
+                Some(&daemon),
+                Some(&managed)
+            ),
+            Some(scratch)
+        );
+        // A relocated root at the filesystem root is always refused.
+        let volume = home.join(".cache");
+        symlink("/", &volume).unwrap();
+        refused(&volume);
+        let ordinary = base.join("caches/npm");
+        std::fs::create_dir_all(&ordinary).unwrap();
+        let npm = home.join(".npm");
+        symlink(&ordinary, &npm).unwrap();
+        assert_eq!(
+            safe_writable_root(
+                &npm,
+                &npm,
+                Some(&home),
+                &worktree,
+                Some(&daemon),
+                Some(&managed)
+            ),
+            Some(ordinary)
+        );
+    }
+
+    #[test]
+    fn codex_macos_data_prefix_normalization_is_component_aware() {
+        for (input, expected) in [
+            ("/System/Volumes/Data", "/"),
+            ("/System/Volumes/Data/Users/x", "/Users/x"),
+            ("/System/Volumes/Data/Users/x/.ssh", "/Users/x/.ssh"),
+            (
+                "/System/Volumes/Database/Users/x",
+                "/System/Volumes/Database/Users/x",
+            ),
+            ("/Users/x/.cache", "/Users/x/.cache"),
+        ] {
+            assert_eq!(
+                normalize_macos_data_path(Path::new(input)),
+                PathBuf::from(expected)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_default_caches_allow_home_workspace_roots_and_unredirected_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let worktree = home.join(".forge-worktrees/task/repo");
+        let managed = home.join("logs/managed");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        for cache in package_cache_roots(&home, |_| None) {
+            std::fs::create_dir_all(&cache).unwrap();
+            assert_eq!(
+                safe_writable_root(
+                    &cache,
+                    &cache,
+                    Some(&home),
+                    &worktree,
+                    Some(&home),
+                    Some(&managed)
+                ),
+                Some(cache.clone())
+            );
+            // Simulate this exact default cache being a Docker volume/dataset.
+            assert!(!redirected_volume_refusal(
+                &cache,
+                &cache,
+                &cache,
+                Some(&home),
+                |_| true
+            ));
+        }
+        let cache = home.join(".npm");
+        let volume = home.join("volume");
+        std::fs::create_dir(&volume).unwrap();
+        std::fs::remove_dir(&cache).unwrap();
+        std::os::unix::fs::symlink(&volume, &cache).unwrap();
+        assert!(redirected_volume_refusal(
+            &cache,
+            &resolve_path_for_overlap(&cache),
+            &cache,
+            Some(&home),
+            |path| path == volume
+        ));
+        // An explicit environment relocation is exempt from the mount rule.
+        assert!(!redirected_volume_refusal(
+            &volume,
+            &volume,
+            &cache,
+            Some(&home),
+            |path| path == volume
+        ));
+        assert!(!redirected_volume_refusal(
+            &cache,
+            &volume.join("npm"),
+            &cache,
+            Some(&home),
+            |path| path == volume
+        ));
+    }
+
+    #[test]
+    fn codex_mount_table_parser_compares_escaped_mount_strings() {
+        let table = r"21 1 0:2 / / rw - rootfs rootfs rw
+22 21 0:3 / /dead/network rw - nfs unreachable:/share rw
+23 21 0:4 / /cache\040volume rw - ext4 /dev/test rw
+24 21 0:5 / /cache\134name rw - ext4 /dev/test rw";
+        assert!(mount_table_contains_root(table, Path::new("/cache volume")));
+        assert!(mount_table_contains_root(table, Path::new(r"/cache\name")));
+        assert!(!mount_table_contains_root(
+            table,
+            Path::new("/cache volume/npm")
+        ));
+        assert!(!mount_table_contains_root(
+            table,
+            Path::new("/dead/network/cache")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_default_caches_under_symlinked_home_are_not_redirected() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual_home = dir.path().join("actual-home");
+        std::fs::create_dir(&actual_home).unwrap();
+        let home = dir.path().join("home");
+        std::os::unix::fs::symlink(&actual_home, &home).unwrap();
+        let worktree = home.join("tasks/task/repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        for cache in package_cache_roots(&home, |_| None) {
+            std::fs::create_dir_all(&cache).unwrap();
+            let resolved = resolve_path_for_overlap(&cache);
+            assert!(!redirected_volume_refusal(
+                &cache,
+                &resolved,
+                &cache,
+                Some(&home),
+                |_| true
+            ));
+            assert_eq!(
+                safe_writable_root(&cache, &cache, Some(&home), &worktree, Some(&home), None),
+                Some(resolved)
+            );
+        }
     }
 
     #[test]
