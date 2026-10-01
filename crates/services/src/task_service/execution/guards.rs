@@ -1,6 +1,23 @@
 use super::*;
 
 impl TaskService {
+    /// Refuse paused Projects before placement or launch side effects. The
+    /// execution INSERT still rechecks admission atomically for concurrent pauses.
+    pub(in crate::task_service) async fn ensure_project_not_paused(
+        &self,
+        task: &Task,
+    ) -> Result<()> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if project.paused_at.is_some() {
+            return Err(ServiceError::ProjectPaused {
+                project_id: project.id,
+            });
+        }
+        Ok(())
+    }
+
     /// Admit an execution attempt against the coordination hierarchy before a
     /// caller transitions a Task or prepares a workspace.  A root with
     /// children is a container: only its aggregate reviewer may run after

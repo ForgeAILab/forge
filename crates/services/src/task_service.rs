@@ -413,6 +413,7 @@ pub struct TaskService {
     cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
     review_runner: Option<Arc<ReviewRunner>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
+    placement_adapter_registry: Option<Arc<executors::AdapterRegistry>>,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     terminal_activity: Option<Arc<TerminalActivityTracker>>,
@@ -508,6 +509,7 @@ impl TaskService {
             cleanup_scheduler: None,
             review_runner: None,
             task_executor: None,
+            placement_adapter_registry: None,
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
@@ -533,6 +535,8 @@ impl TaskService {
             None,
         );
         let mut service = Self::new_with_router(db, event_bus, router);
+        service.placement_adapter_registry =
+            Some(Arc::new(cli_adapters::test_support::test_registry()));
         service.test_workspace_backend = true;
         service
     }
@@ -596,6 +600,15 @@ impl TaskService {
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
+        self
+    }
+
+    /// Supply the adapters used to determine embedded placement availability.
+    pub fn with_placement_adapter_registry(
+        mut self,
+        registry: Arc<executors::AdapterRegistry>,
+    ) -> Self {
+        self.placement_adapter_registry = Some(registry);
         self
     }
 

@@ -743,7 +743,7 @@ async fn test_app_with_state() -> (Router, AppState) {
         db,
         event_bus,
         true,
-        Arc::new(cli_adapters::default_registry()),
+        Arc::new(cli_adapters::test_support::test_registry()),
     );
 
     let web_dist_dir = std::env::temp_dir().join(format!("forge-api-e2e-{}", uuid::Uuid::new_v4()));

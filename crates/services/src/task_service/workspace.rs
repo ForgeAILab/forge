@@ -235,6 +235,9 @@ impl TaskService {
         role: &str,
     ) -> Result<WorkspaceAdmission> {
         use crate::placement::{load_selection_context, select_placement, SelectionLoadInput};
+        if agent.is_some() {
+            self.ensure_project_not_paused(task).await?;
+        }
         let authority = resolve_task_repository_authority(&self.db, task).await?;
         let repo = &authority.repo;
         let settings: ProjectSettings =
@@ -303,6 +306,7 @@ impl TaskService {
         let server_facts = server_executor_facts(
             &self.db,
             claiming_agent.iter().chain(worktree_agents.iter()),
+            self.placement_adapter_registry.as_deref(),
         )
         .await?;
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
@@ -1077,8 +1081,16 @@ fn connection_handshakes(
 async fn server_executor_facts<'a>(
     db: &SqliteDb,
     agents: impl Iterator<Item = &'a crate::placement::WorktreeAgent>,
+    registry: Option<&executors::AdapterRegistry>,
 ) -> Result<crate::placement::ServerFacts> {
-    let registry = cli_adapters::default_registry();
+    let default_registry;
+    let registry = match registry {
+        Some(registry) => registry,
+        None => {
+            default_registry = cli_adapters::default_registry();
+            &default_registry
+        }
+    };
     let mut server = crate::placement::ServerFacts {
         execution_daemon_id: sqlx::query_scalar::<_, String>(
             "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",

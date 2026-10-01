@@ -621,6 +621,7 @@ impl ForgeRuntimeBuilder {
                 Arc::clone(&self.event_bus),
                 Arc::clone(&workspace_backend_router),
             )
+            .with_placement_adapter_registry(Arc::clone(&self.adapter_registry))
             .with_merge_service(Arc::clone(&merge_service))
             .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
             .with_review_runner(Arc::clone(&review_runner))

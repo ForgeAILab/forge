@@ -2213,6 +2213,18 @@ Daemon placements require direct-merge repositories and CLI Agents for every
 assigned worktree role (coder, reviewer, planner); pull-request mode and native
 Agents are rejected with `work_mode_unsupported` or `native_backend_unsupported`.
 
+Agent claims, initial launches, re-execution, resume, and follow-ups refuse a
+paused Project with `ProjectPaused` before placement selection, reservation,
+workspace preparation, or recovery metadata changes. The execution admission
+transaction also checks the pause to fence concurrent Project changes. Recovery
+keeps the `project_paused(<detail>)` refusal and still permits other actions,
+such as cancelling the Task.
+
+Embedded executor availability comes from the runtime's adapter registry.
+Service and API fixtures inject `cli_adapters::test_support::test_registry`:
+availability is fixture-controlled without CLI lookup or home credential
+discovery, while Shell retains its local execution behavior.
+
 Claim admission runs **reserve → prepare → start**:
 
 1. Under `BEGIN IMMEDIATE`, select a compatible ready location and persist a

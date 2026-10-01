@@ -67,6 +67,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.ensure_project_not_paused(&task).await?;
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
@@ -190,6 +191,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         if crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await? {
             return Err(ServiceError::invalid_operation(
                 "root tasks with subtasks are coordination containers; launch a subtask instead",
@@ -376,6 +378,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -650,6 +653,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
+        self.ensure_project_not_paused(&task).await?;
         // The role assignment owns the execution principal: the INSERT
         // transaction compares the launched Agent against that row. Carrying
         // the parent execution's Agent over made re-execute fail as a bare

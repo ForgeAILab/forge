@@ -5,6 +5,164 @@ use db::{PageRequest, SortBy, SortOrder};
 use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
+async fn claim_uses_injected_cli_availability() {
+    use cli_adapters::test_support::TestAdapter;
+    use executors::{AdapterRegistry, AvailabilityStatus};
+
+    let db = Arc::new(sqlite_db().await);
+    let workspace_root = TempDir::new().unwrap();
+    let mut service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let task = seed_task_with_status(&db, &project_id, "todo".into()).await;
+
+    for status in [AvailabilityStatus::NotFound, AvailabilityStatus::Installed] {
+        let mut registry = AdapterRegistry::new();
+        registry.register(Box::new(TestAdapter::new(ExecutorKind::Codex, status)));
+        service = service.with_placement_adapter_registry(Arc::new(registry));
+        let error = service
+            .claim_task(&task.id, Assignee::Agent(agent_id.clone()), None)
+            .await
+            .expect_err("unavailable fixture adapter must refuse claim");
+        let ServiceError::PlacementUnavailable(refusal) = error else {
+            panic!("unexpected refusal: {error:?}");
+        };
+        assert!(refusal.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .filter_codes
+                .contains(&crate::placement::PlacementFilterCode::ExecutorUnavailable)
+        }));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_placement")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "refused claim cannot reserve placement");
+    }
+
+    service = service
+        .with_placement_adapter_registry(Arc::new(cli_adapters::test_support::test_registry()));
+    let claimed = service
+        .claim_task(&task.id, Assignee::Agent(agent_id.clone()), None)
+        .await
+        .expect("available fixture adapter admits claim");
+    assert_eq!(
+        claimed.execution.agent_id.as_deref(),
+        Some(agent_id.as_str())
+    );
+    assert_eq!(claimed.execution.status, ExecutionStatus::Running);
+}
+
+#[tokio::test]
+async fn project_pause_precedes_placement_on_every_execution_launch_path() {
+    let db = Arc::new(sqlite_db().await);
+    let workspace_root = TempDir::new().unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        // Any placement attempt would fail availability even on a signed-in host.
+        .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new()));
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let claimable = seed_task_with_status(&db, &project_id, "todo".into()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".into()).await;
+    seed_role_assignment(&db, &task.id, "coder", Some(&agent_id)).await;
+    let parent = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        "coder",
+        ExecutionStatus::Completed,
+        Some("fixture-session"),
+        &now_rfc3339(),
+    )
+    .await;
+    sqlx::query("UPDATE project SET paused_at = ?, system_pause_reason = 'environment_not_ready' WHERE id = ?")
+        .bind(now_rfc3339()).bind(&project_id).execute(db.pool()).await.unwrap();
+
+    let mut errors = vec![service
+        .claim_task(&claimable.id, Assignee::Agent(agent_id.clone()), None)
+        .await
+        .expect_err("paused Project refuses launch")];
+    errors.push(
+        service
+            .launch_execution(&task.id, &agent_id, None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .dispatch_initial_role_execution(&task.id, &agent_id, "coder", "Continue".into())
+            .await
+            .expect_err("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .re_execute_execution(&parent.id)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .follow_up_execution(&parent.id, "Continue".into(), None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .follow_up_interactive_execution(&parent.id, "Continue".into(), None, None)
+            .await
+            .err()
+            .expect("paused Project refuses launch"),
+    );
+    errors.push(
+        service
+            .resume_task_execution(
+                &task,
+                &crate::workflow::default_workflow::default_workflow(),
+                None,
+                task.version,
+            )
+            .await
+            .expect_err("paused Project refuses launch"),
+    );
+    for error in errors {
+        assert!(
+            matches!(error, ServiceError::ProjectPaused { project_id: id } if id == project_id)
+        );
+    }
+    for table in [
+        "workspace",
+        "workspace_placement",
+        "workspace_lease",
+        "review",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "paused launch cannot mutate {table}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "paused launch cannot create an execution");
+    for original in [claimable, task] {
+        let current = TaskRepo::get_by_id(&*db, &original.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, original.version);
+        assert_eq!(current.status, original.status);
+        assert_eq!(current.metadata_json, original.metadata_json);
+        assert_eq!(current.error_annotation, original.error_annotation);
+    }
+}
+
+#[tokio::test]
 async fn unpinned_cli_execution_routes_start_and_cancel_to_ledger_daemon() {
     use crate::daemon_transport::{DaemonConnection, DaemonConnectionRegistry};
     use db::{PricingSubjectRepo, UserRepo};
@@ -295,7 +453,7 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    // This case drives the real adapter registry, so the agent has to be the
+    // This case executes through the adapter registry, so the agent has to be the
     // shell harness: it runs the Task's own command and logs its output.
     // Any other harness shells out to a CLI that is not on the host.
     let agent_id = seed_agent(&db).await;
@@ -358,7 +516,7 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     )
     .expect("workspace dir creates");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(claimed.execution.id, &executor)
@@ -455,7 +613,7 @@ async fn run_execution_applies_the_project_environment() {
     )
     .await;
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(execution.id, &executor)
@@ -512,7 +670,7 @@ async fn a_failed_environment_check_pauses_the_project_without_blocking_the_task
         .expect("task loads before dispatch")
         .expect("task exists before dispatch");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(execution.id, &executor)
@@ -6739,7 +6897,7 @@ async fn interactive_execution_completion_does_not_trigger_review_cascade() {
         .await
         .expect("launch succeeds");
 
-    let registry = Arc::new(cli_adapters::default_registry());
+    let registry = Arc::new(cli_adapters::test_support::test_registry());
     let executor = executors::AdapterExecutor::new(registry);
     let execution = service
         .run_execution(launched.execution.id.clone(), &executor)

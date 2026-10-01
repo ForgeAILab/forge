@@ -42,7 +42,7 @@ async fn setup(terminal: TerminalConfig) -> Harness {
 
     let workspace_root = common::TestDir::new("forge-terminal-workspaces");
     let event_bus = Arc::new(EventBus::new(256));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),

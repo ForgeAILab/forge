@@ -11,6 +11,7 @@ pub mod null;
 pub mod opencode;
 pub mod shell;
 pub mod smith;
+pub mod test_support;
 
 pub use claude::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;

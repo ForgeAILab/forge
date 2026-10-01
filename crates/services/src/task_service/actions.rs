@@ -566,6 +566,7 @@ impl TaskService {
                 actual: current.version,
             }));
         }
+        self.ensure_project_not_paused(&current).await?;
         if !Self::is_replaying_recovery(&task.id)
             && crate::deferred_dispatch::queued_recovery(&current).is_some()
         {

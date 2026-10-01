@@ -265,6 +265,7 @@ impl DaemonRuntime {
             active_executions,
             None,
             crate::daemon_config::DaemonConfig::default().run_policy(),
+            Arc::new(cli_adapters::default_registry()),
         )
         .expect("initialize daemon journal")
     }
@@ -282,6 +283,7 @@ impl DaemonRuntime {
             active_executions,
             Some(daemon_id),
             run_policy,
+            Arc::new(cli_adapters::default_registry()),
         )
     }
 
@@ -291,8 +293,8 @@ impl DaemonRuntime {
         active_executions: ActiveExecutionTracker,
         daemon_id: Option<String>,
         run_policy: api_types::WorkspaceRunPolicy,
+        registry: Arc<executors::AdapterRegistry>,
     ) -> Result<Arc<Self>> {
-        let registry = Arc::new(cli_adapters::default_registry());
         let journal = Arc::new(DaemonJournal::new(&workspace_root));
         journal.initialize()?;
         let workspace = daemon_id
@@ -935,13 +937,45 @@ mod tests {
     };
     use tokio::sync::mpsc;
 
+    fn test_runtime(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+    ) -> Arc<DaemonRuntime> {
+        DaemonRuntime::build(
+            outbound,
+            workspace_root,
+            ActiveExecutionTracker::default(),
+            None,
+            crate::daemon_config::DaemonConfig::default().run_policy(),
+            Arc::new(cli_adapters::test_support::test_registry()),
+        )
+        .expect("initialize test daemon journal")
+    }
+
+    fn test_owned_runtime(
+        outbound: mpsc::UnboundedSender<DaemonFrame>,
+        workspace_root: PathBuf,
+        active_executions: ActiveExecutionTracker,
+        daemon_id: String,
+        run_policy: api_types::WorkspaceRunPolicy,
+    ) -> Result<Arc<DaemonRuntime>> {
+        DaemonRuntime::build(
+            outbound,
+            workspace_root,
+            active_executions,
+            Some(daemon_id),
+            run_policy,
+            Arc::new(cli_adapters::test_support::test_registry()),
+        )
+    }
+
     #[tokio::test]
     async fn fs_list_returns_entries_under_workspace_root() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         fs::create_dir_all(dir.path().join("src")).expect("src creates");
         fs::write(dir.path().join("README.md"), "readme").expect("readme writes");
         let (tx, _rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
 
         let frame = DaemonFrame::Request {
             id: "fs-1".to_owned(),
@@ -971,7 +1005,7 @@ mod tests {
             .path()
             .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()));
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let mut runtime = test_runtime(tx, dir.path().to_path_buf());
         // Reject the configured path before filesystem access; some filesystems
         // cannot create a non-UTF-8 directory at all.
         Arc::get_mut(&mut runtime).unwrap().workspace_root = root;
@@ -994,7 +1028,7 @@ mod tests {
     async fn terminal_runtime_redacts_execution_environment_without_changing_ids() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
         let mut config = serde_json::json!({"executor_type":"shell","config":{}});
         executors::environment::mark_task_environment(
             &mut config,
@@ -1028,7 +1062,7 @@ mod tests {
     async fn shell_execution_reports_completion_notification() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
         let execution_id = "exec-shell-ok".to_owned();
 
         let result = runtime
@@ -1068,7 +1102,7 @@ mod tests {
         let sha = git::commit_all(&repo, "base").await.unwrap();
         let policy = crate::daemon_config::DaemonConfig::default().run_policy();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new_owned(
+        let runtime = test_owned_runtime(
             tx,
             dir.path().to_owned(),
             ActiveExecutionTracker::default(),
@@ -1131,7 +1165,7 @@ mod tests {
         );
         drop(runtime);
         let (tx, mut replay_rx) = mpsc::unbounded_channel();
-        let restarted = DaemonRuntime::new_owned(
+        let restarted = test_owned_runtime(
             tx,
             dir.path().to_owned(),
             ActiveExecutionTracker::default(),
@@ -1174,7 +1208,7 @@ mod tests {
     async fn terminal_report_is_retained_until_acknowledged() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
         let execution_id = "exec-shell-retained".to_owned();
 
         runtime
@@ -1227,7 +1261,7 @@ mod tests {
     async fn shell_execution_can_be_cancelled() {
         let dir = tempfile::tempdir().expect("temp dir creates");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let runtime = test_runtime(tx, dir.path().to_path_buf());
         let execution_id = "exec-shell-cancel".to_owned();
 
         runtime
