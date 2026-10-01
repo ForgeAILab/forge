@@ -1178,6 +1178,7 @@ pub(crate) async fn ensure_valid(
     task: &Task,
     workspace: Workspace,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    delete_missing_workspace: bool,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
 ) -> Result<Workspace> {
     if let Some(placement) = WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await? {
@@ -1240,10 +1241,9 @@ pub(crate) async fn ensure_valid(
         .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let worktree_path = resolved.embedded_path()?;
-    match worktree_readiness(&worktree_path).await {
+    match worktree_readiness(&worktree_path).await? {
         WorktreeReadiness::Ready => clear_workspace_cleanup_after(db, workspace).await,
         WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-            let delete_missing_workspace = workspace.task_id == task.id;
             let owner_task_id = workspace.task_id.clone();
             clear_workspace_cleanup_after(
                 db,
@@ -1304,6 +1304,7 @@ pub(crate) async fn prepare_workspace_owned(
                         task,
                         workspace,
                         repo_cache_locks,
+                        false,
                         router,
                     )
                     .await?,
@@ -1345,6 +1346,7 @@ pub(crate) async fn prepare_workspace_owned(
                     task,
                     workspace,
                     repo_cache_locks,
+                    false,
                     router,
                 )
                 .await?,
@@ -1362,9 +1364,8 @@ pub(crate) async fn prepare_workspace_owned(
             // next execution rebuilds it here instead of failing admission
             // on a row that can never become ready by itself.
             let repo_source = resolve_repo_source(&authority.repo, workspace_root).await?;
-            let branch_exists = git::branch_exists(Path::new(&repo_source), &workspace.branch)
-                .await
-                .unwrap_or(false);
+            let branch_exists =
+                recovery_branch_exists(Path::new(&repo_source), &workspace.branch).await?;
             if !branch_exists {
                 // Nothing left to recover: start over from the default
                 // branch. Deleting the row only unlinks past executions
@@ -1412,6 +1413,7 @@ pub(crate) async fn prepare_workspace_owned(
                     task,
                     workspace,
                     repo_cache_locks,
+                    true,
                     router,
                 )
                 .await?,
@@ -1472,7 +1474,10 @@ async fn recover_missing_worktree(
 ) -> Result<Workspace> {
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let existing_path = resolved.embedded_path()?;
-    let readiness = worktree_readiness(&existing_path).await;
+    let readiness = worktree_readiness(&existing_path).await?;
+    if matches!(readiness, WorktreeReadiness::Ready) {
+        return Ok(workspace);
+    }
     warn!(
         task_id = task_id,
         workspace_id = %workspace.id,
@@ -1502,9 +1507,7 @@ async fn recover_missing_worktree(
     }
 
     let branch = &workspace.branch;
-    let branch_exists = git::branch_exists(Path::new(&repo_source), branch)
-        .await
-        .unwrap_or(false);
+    let branch_exists = recovery_branch_exists(Path::new(&repo_source), branch).await?;
 
     if branch_exists {
         if !matches!(readiness, WorktreeReadiness::Missing) {
@@ -1539,15 +1542,12 @@ async fn recover_missing_worktree(
         if delete_missing_workspace {
             WorkspaceRepo::delete(db, &workspace.id).await?;
         } else {
-            // A child may discover that the root branch disappeared while
-            // preparing the shared worktree. Keep the root-owned row so the
-            // required reset remains an explicit root operation; a child
-            // must never delete the delivery workspace as a side effect of
-            // its own admission attempt.
+            // Delivery and child admission checks keep the persisted row so
+            // the required reset remains an explicit owner operation.
             warn!(
                 task_id = task_id,
                 workspace_id = %workspace.id,
-                "shared root branch is gone; preserving workspace row for root reset"
+                "task branch is gone; preserving workspace row for explicit reset"
             );
         }
         warn!(
@@ -1566,23 +1566,127 @@ async fn recover_missing_worktree(
 }
 
 #[derive(Debug)]
-enum WorktreeReadiness {
+pub(crate) enum WorktreeReadiness {
     Ready,
     Missing,
     Invalid,
 }
 
-async fn worktree_readiness(worktree_path: &Path) -> WorktreeReadiness {
-    if !worktree_path.exists() {
-        return WorktreeReadiness::Missing;
+pub(crate) async fn worktree_readiness(worktree_path: &Path) -> Result<WorktreeReadiness> {
+    if !tokio::fs::try_exists(worktree_path)
+        .await
+        .map_err(git::GitError::Io)?
+    {
+        return Ok(WorktreeReadiness::Missing);
     }
-    if !worktree_path.join(".git").exists() {
-        return WorktreeReadiness::Invalid;
+    if !tokio::fs::try_exists(worktree_path.join(".git"))
+        .await
+        .map_err(git::GitError::Io)?
+    {
+        return Ok(WorktreeReadiness::Invalid);
     }
-    match git::get_current_sha(worktree_path).await {
-        Ok(_) => WorktreeReadiness::Ready,
-        Err(_) => WorktreeReadiness::Invalid,
+    match probe_worktree_head(worktree_path).await {
+        Ok(_) => Ok(WorktreeReadiness::Ready),
+        Err(error) if git_error_reports_unusable_worktree(&error) => Ok(WorktreeReadiness::Invalid),
+        Err(error) => Err(error.into()),
     }
+}
+
+fn git_error_reports_unusable_worktree(error: &git::GitError) -> bool {
+    let git::GitError::CommandFailed { stdout, stderr, .. } = error else {
+        return false;
+    };
+    [stdout, stderr].iter().any(|output| {
+        let output = output.to_ascii_lowercase();
+        output.contains("not a git repository") || output.contains("invalid gitfile format")
+    })
+}
+
+async fn probe_worktree_head(worktree_path: &Path) -> git::Result<String> {
+    #[cfg(test)]
+    if let Some(failure) = take_injected_worktree_probe_failure(worktree_path) {
+        return Err(match failure {
+            InjectedWorktreeProbeFailure::Io => {
+                git::GitError::Io(std::io::Error::other("injected worktree probe failure"))
+            }
+            InjectedWorktreeProbeFailure::NotRepository => git::GitError::CommandFailed {
+                command: "git rev-parse HEAD".to_owned(),
+                stdout: String::new(),
+                stderr: "fatal: not a git repository".to_owned(),
+            },
+        });
+    }
+    git::get_current_sha(worktree_path).await
+}
+
+async fn recovery_branch_exists(repo_source: &Path, branch: &str) -> git::Result<bool> {
+    #[cfg(test)]
+    if take_injected_branch_lookup_failure(repo_source) {
+        return Err(git::GitError::Io(std::io::Error::other(
+            "injected branch lookup failure",
+        )));
+    }
+    git::branch_exists(repo_source, branch).await
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum InjectedWorktreeProbeFailure {
+    Io,
+    NotRepository,
+}
+
+#[cfg(test)]
+fn injected_worktree_probe_failures() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, InjectedWorktreeProbeFailure>,
+> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, InjectedWorktreeProbeFailure>,
+        >,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn inject_worktree_probe_failure(path: &Path, failure: InjectedWorktreeProbeFailure) {
+    injected_worktree_probe_failures()
+        .lock()
+        .expect("worktree probe injection lock")
+        .insert(path.to_path_buf(), failure);
+}
+
+#[cfg(test)]
+fn take_injected_worktree_probe_failure(path: &Path) -> Option<InjectedWorktreeProbeFailure> {
+    injected_worktree_probe_failures()
+        .lock()
+        .expect("worktree probe injection lock")
+        .remove(path)
+}
+
+#[cfg(test)]
+fn injected_branch_lookup_failures(
+) -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static FAILURES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    > = std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+fn inject_branch_lookup_failure(path: &Path) {
+    injected_branch_lookup_failures()
+        .lock()
+        .expect("branch lookup injection lock")
+        .insert(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn take_injected_branch_lookup_failure(path: &Path) -> bool {
+    injected_branch_lookup_failures()
+        .lock()
+        .expect("branch lookup injection lock")
+        .remove(path)
 }
 
 async fn try_repair_worktree_gitdir(repo_source: &Path, worktree_path: &Path) -> bool {
@@ -3960,6 +4064,120 @@ mod tests {
         assert_eq!(recovered.id, fresh.id);
         assert!(worktree_path.join(".git").exists());
         assert!(git::get_current_sha(&worktree_path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn transient_worktree_probe_failure_preserves_workspace() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+        let fresh = prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        let worktree_path = std::path::PathBuf::from(fresh.embedded_worktree_path_for_backend());
+        let sentinel = worktree_path.join("uncommitted.txt");
+        std::fs::write(&sentinel, "keep me\n").expect("sentinel writes");
+        inject_worktree_probe_failure(&worktree_path, InjectedWorktreeProbeFailure::Io);
+
+        let result =
+            prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None).await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::Git(git::GitError::Io(_)))
+        ));
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&db, &fresh.id)
+                .await
+                .expect("workspace reloads"),
+            Some(fresh)
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("sentinel survives"),
+            "keep me\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_reprobe_ready_preserves_existing_directory() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+        let fresh = prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        let worktree_path = std::path::PathBuf::from(fresh.embedded_worktree_path_for_backend());
+        let sentinel = worktree_path.join("uncommitted.txt");
+        std::fs::write(&sentinel, "keep me\n").expect("sentinel writes");
+        inject_worktree_probe_failure(&worktree_path, InjectedWorktreeProbeFailure::NotRepository);
+
+        let recovered =
+            prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+                .await
+                .expect("ready re-probe returns the existing workspace");
+
+        assert_eq!(recovered.id, fresh.id);
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("sentinel survives"),
+            "keep me\n"
+        );
+        let parent = worktree_path.parent().expect("worktree has a parent");
+        assert!(std::fs::read_dir(parent)
+            .expect("worktree parent reads")
+            .all(|entry| !entry
+                .expect("directory entry reads")
+                .file_name()
+                .to_string_lossy()
+                .contains(".broken-")));
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_io_failure_preserves_workspace() {
+        let db = sqlite_db().await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let workspace_root = TempDir::new().expect("workspace root creates");
+        let task = seed_task(&db, &project_id, None).await;
+        let fresh = prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None)
+            .await
+            .expect("first workspace creates");
+        let worktree_path = std::path::PathBuf::from(fresh.embedded_worktree_path_for_backend());
+        std::fs::remove_dir_all(&worktree_path).expect("worktree removes");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(repo_dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git worktree prune runs");
+        assert!(output.status.success());
+        std::fs::create_dir_all(&worktree_path).expect("unusable directory creates");
+        let sentinel = worktree_path.join("uncommitted.txt");
+        std::fs::write(&sentinel, "keep me\n").expect("sentinel writes");
+        inject_branch_lookup_failure(repo_dir.path());
+
+        let result =
+            prepare_workspace_for_test(&db, workspace_root.path(), &task, &task.id, None).await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::Git(git::GitError::Io(_)))
+        ));
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&db, &fresh.id)
+                .await
+                .expect("workspace reloads"),
+            Some(fresh)
+        );
+        assert_eq!(
+            std::fs::read_to_string(sentinel).expect("sentinel survives"),
+            "keep me\n"
+        );
     }
 
     #[tokio::test]

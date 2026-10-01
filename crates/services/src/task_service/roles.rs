@@ -1016,6 +1016,14 @@ impl TaskService {
         }
 
         if reset_worktree {
+            if task.parent_task_id.is_some() {
+                tracing::info!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    "skipping shared worktree reset for subtask reassignment"
+                );
+                return Ok((false, false));
+            }
             let workspace = if let Some(workspace_id) = execution.workspace_id.as_deref() {
                 WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?
             } else {
@@ -1030,6 +1038,7 @@ impl TaskService {
                     task,
                     workspace,
                     self.repo_cache_locks.clone(),
+                    false,
                     &self.workspace_backend_router,
                 )
                 .await?;

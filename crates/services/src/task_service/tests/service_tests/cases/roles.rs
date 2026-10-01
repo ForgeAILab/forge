@@ -513,6 +513,69 @@ async fn reassign_mid_exec_coder_with_reset_worktree_recovers_deleted_directory(
 }
 
 #[tokio::test]
+async fn reassign_subtask_with_reset_worktree_preserves_shared_root_worktree() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let mut rx = event_bus.subscribe();
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
+    service
+        .reassign_role(
+            role_assignment_input(&subtask.id, "coder", Some(agent_a.clone()), None),
+            false,
+            false,
+        )
+        .await
+        .expect("initial subtask role assignment succeeds");
+    let _ = next_role_reassigned_event(&mut rx).await;
+    let workspace_id = seed_workspace_for_task(&db, &root, &repo_id, workspace_root.path()).await;
+    let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let worktree_path = std::path::PathBuf::from(workspace.embedded_worktree_path_for_backend());
+    let sentinel = worktree_path.join("sibling-uncommitted.txt");
+    std::fs::write(&sentinel, "shared work\n").expect("shared work writes");
+    seed_running_coder_execution(&db, &subtask.id, Some(agent_a), Some(workspace_id)).await;
+
+    service
+        .reassign_role(
+            role_assignment_input(&subtask.id, "coder", Some(agent_b), None),
+            false,
+            true,
+        )
+        .await
+        .expect("subtask reassignment skips the shared worktree reset");
+
+    let event = next_role_reassigned_event(&mut rx).await;
+    match event.context {
+        EventContext::TaskRoleReassigned {
+            reset_workspace,
+            reset_worktree,
+            transitioned_to_todo,
+            triggered_cancellation,
+            ..
+        } => {
+            assert!(!reset_workspace);
+            assert!(!reset_worktree);
+            assert!(transitioned_to_todo);
+            assert!(triggered_cancellation);
+        }
+        other => panic!("unexpected event context: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(sentinel).expect("shared work survives"),
+        "shared work\n"
+    );
+}
+
+#[tokio::test]
 async fn reassign_coder_with_workspace_allows_reset_workspace() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
