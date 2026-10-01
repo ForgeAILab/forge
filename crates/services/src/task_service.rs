@@ -528,6 +528,7 @@ impl TaskService {
     }
 
     /// Embedded-only fixture constructor for tests outside this crate.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_test(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
         let router = crate::lifecycle::context::embedded_workspace_router_for_test(
             Arc::clone(&db),

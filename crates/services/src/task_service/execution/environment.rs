@@ -211,8 +211,8 @@ impl TaskService {
         Ok((results, current))
     }
 
-    /// Re-check the exact workspace that caused the pause. A checkout check
-    /// without a Task workspace stays on the embedded backend command path.
+    /// Re-check on the recorded daemon workspace while it is usable; otherwise
+    /// use the primary checkout on the embedded backend command path.
     pub(crate) async fn run_project_environment_checks(
         &self,
         project: &db::Project,
@@ -223,18 +223,25 @@ impl TaskService {
                 ServiceError::invalid_operation(format!("invalid project settings: {error}"))
             })?
             .environment;
-        let workspace = if let Some(id) =
-            pause_detail(project)?.and_then(|detail| detail.workspace_id)
-        {
-            let workspace = db::WorkspaceRepo::get_by_id(&*self.db, &id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("workspace", id))?;
-            let resolved = self.resolve_task_workspace(&workspace).await?;
-            (resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon).then_some(resolved)
-        } else {
-            None
-        };
-        let checkout = if workspace.is_none() {
+        let mut workspace =
+            if let Some(id) = pause_detail(project)?.and_then(|detail| detail.workspace_id) {
+                match db::WorkspaceRepo::get_by_id(&*self.db, &id).await? {
+                    Some(workspace) => {
+                        self.resolve_task_workspace(&workspace)
+                            .await
+                            .ok()
+                            .filter(|resolved| {
+                                resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+                                    && resolved.placement.state == db::PlacementState::Ready
+                                    && resolved.handle().is_ok()
+                            })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+        let mut checkout = if workspace.is_none() {
             Some(self.environment_check_checkout(project).await?)
         } else {
             None
@@ -249,6 +256,19 @@ impl TaskService {
                 self.workspace_backend_router
                     .run_environment_checkout(checkout.as_deref().expect("checkout target"), &spec)
                     .await
+            };
+            let outcome = match outcome {
+                Err(WorkspaceBackendError::OwnerUnreachable { .. }) if workspace.is_some() => {
+                    workspace = None;
+                    checkout = Some(self.environment_check_checkout(project).await?);
+                    self.workspace_backend_router
+                        .run_environment_checkout(
+                            checkout.as_deref().expect("checkout target"),
+                            &spec,
+                        )
+                        .await
+                }
+                outcome => outcome,
             };
             let result = match outcome {
                 Err(error @ WorkspaceBackendError::PurposeDenied { .. }) => {
@@ -605,5 +625,115 @@ mod tests {
         assert!(pause_detail(&project).unwrap().unwrap().checks.is_empty());
         assert!(project.paused_at.is_some());
         responder.abort();
+    }
+
+    async fn pause_with_primary_checkout(
+        db: &db::SqliteDb,
+        service: &TaskService,
+        task: &Task,
+        execution: &Execution,
+        workspace: &ResolvedWorkspace,
+    ) -> tempfile::TempDir {
+        assert!(service
+            .prepare_execution_environment(task, execution, workspace, &mut json!({}))
+            .await
+            .unwrap()
+            .is_some());
+        let primary = tempfile::TempDir::new().unwrap();
+        git::init(primary.path()).await.unwrap();
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = (SELECT repo_id FROM workspace WHERE id = ?)")
+            .bind(primary.path().to_str().unwrap())
+            .bind(&workspace.placement.workspace_id)
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE project SET primary_repo_id = (SELECT repo_id FROM workspace WHERE id = ?), settings = ? WHERE id = ?")
+            .bind(&workspace.placement.workspace_id)
+            .bind(json!({"environment":{"env":{"SECRET":"redact-me"},"checks":[{"name":"owner-probe","command":"test \"$SECRET\" = redact-me && pwd"}]}}).to_string())
+            .bind(&task.project_id).execute(db.pool()).await.unwrap();
+        primary
+    }
+
+    async fn assert_primary_checkout_recheck(
+        service: &TaskService,
+        task: &Task,
+        primary: &std::path::Path,
+    ) {
+        let (results, project) = service
+            .recheck_project_environment(&task.project_id)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].passed);
+        assert_eq!(
+            results[0].output_tail,
+            primary.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(project.paused_at.is_none());
+        assert!(project.environment_pause_json.is_none());
+    }
+
+    #[tokio::test]
+    async fn environment_recheck_deleted_workspace_uses_primary_checkout() {
+        let (db, service, task, execution, workspace, responder) = fixture(false).await;
+        let primary =
+            pause_with_primary_checkout(&db, &service, &task, &execution, &workspace).await;
+        sqlx::query("DELETE FROM workspace WHERE id = ?")
+            .bind(&workspace.placement.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_primary_checkout_recheck(&service, &task, primary.path()).await;
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn environment_recheck_disconnected_owner_uses_primary_checkout() {
+        let (db, service, task, execution, workspace, responder) = fixture(false).await;
+        let primary =
+            pause_with_primary_checkout(&db, &service, &task, &execution, &workspace).await;
+        // The placement can still say ready while its transport is offline.
+        let offline =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let router = (*service.workspace_backend_router())
+            .clone()
+            .with_daemon(Arc::new(DaemonWorkspaceBackend::new(db.clone(), offline)));
+        let service = service.with_workspace_backend_router(Arc::new(router));
+        assert_primary_checkout_recheck(&service, &task, primary.path()).await;
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn environment_recheck_unready_or_unresolved_workspace_uses_primary_checkout() {
+        for state in [
+            "reserved",
+            "preparing",
+            "disconnected",
+            "cleaning",
+            "cleaned",
+            "failed",
+            "unresolved",
+        ] {
+            let (db, service, task, execution, workspace, responder) = fixture(false).await;
+            let primary =
+                pause_with_primary_checkout(&db, &service, &task, &execution, &workspace).await;
+            let service = if state == "unresolved" {
+                // Keep the daemon placement, but remove its resolving backend.
+                let router = crate::lifecycle::context::embedded_workspace_router_for_test(
+                    db.clone(),
+                    primary.path().to_path_buf(),
+                    None,
+                );
+                service.with_workspace_backend_router(router)
+            } else {
+                sqlx::query("UPDATE workspace_placement SET state = ? WHERE id = ?")
+                    .bind(state)
+                    .bind(&workspace.placement.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                service
+            };
+            assert_primary_checkout_recheck(&service, &task, primary.path()).await;
+            responder.abort();
+        }
     }
 }

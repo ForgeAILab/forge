@@ -11,6 +11,7 @@ pub mod null;
 pub mod opencode;
 pub mod shell;
 pub mod smith;
+#[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use claude::ClaudeCodeAdapter;

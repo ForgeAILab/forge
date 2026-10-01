@@ -3497,6 +3497,32 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .expect("Resume queues at capacity")
             .task;
         assert!(deferred_dispatch::queued_recovery(&queued).is_some());
+        ProjectRepo::set_paused_at(&*db, &project_id, Some(now_rfc3339()))
+            .await
+            .unwrap();
+        let paused_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let repeated = dispatcher
+            .task_service
+            .perform_task_action(
+                &task.id,
+                api_types::TaskAction::Resume,
+                Some("resume guidance".to_owned()),
+                Some(paused_task.version),
+            )
+            .await
+            .expect("repeating a queued Resume is a no-op while the Project is paused")
+            .task;
+        assert_eq!(repeated, paused_task);
+        ProjectRepo::set_paused_at(&*db, &project_id, None)
+            .await
+            .unwrap();
+        let queued = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
             .await
             .unwrap()
@@ -6384,32 +6410,65 @@ async fn environment_recheck_preserves_user_pause_and_stale_resume_loses() {
 }
 
 #[tokio::test]
-async fn environment_recheck_missing_checkout_retries_without_changing_detail() {
+async fn environment_recheck_missing_checkout_reschedules_without_immediate_respawn() {
     let db = Arc::new(sqlite_db().await);
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_dir = TempDir::new().unwrap();
-    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let repo = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
     let paused = seed_environment_pause(
         &db,
         &project_id,
-        serde_json::json!({
-            "checks": [{"name": "disk", "command": "true"}]
-        }),
+        serde_json::json!({"checks":[{"name":"disk","command":"true"}], "recheck_interval_seconds": 60}),
         &["disk"],
         "2026-01-01T00:00:00Z",
     )
     .await;
-    std::fs::remove_dir_all(repo_dir.path().join(".git")).unwrap();
-    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    // Repository sync leaves an environment-owned pause alone, but the
+    // re-check cannot resolve a usable primary checkout.
+    std::fs::remove_dir_all(repo.path().join(".git")).unwrap();
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    let started_at = chrono::Utc::now();
     assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if dispatcher.environment_rechecks.lock().unwrap()[&project_id].is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let current = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(current.version, paused.version);
+    let detail = crate::project_environment::pause_detail(&current)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.paused_at, paused.paused_at);
+    assert_eq!(detail.checks, vec!["disk"]);
+    assert!(detail.output.contains("primary checkout is unavailable"));
+    assert!(chrono::DateTime::parse_from_rfc3339(&detail.last_checked_at).unwrap() >= started_at);
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&detail.next_check_at).unwrap()
+            >= started_at + chrono::Duration::seconds(60)
+    );
+    // Observe the finished job, then scan once more against the new due time.
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert!(!dispatcher
+        .environment_rechecks
+        .lock()
+        .unwrap()
+        .contains_key(&project_id));
     assert_eq!(
-        current.environment_pause_json,
-        paused.environment_pause_json
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        current.version
     );
 }
 

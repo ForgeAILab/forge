@@ -566,12 +566,12 @@ impl TaskService {
                 actual: current.version,
             }));
         }
-        self.ensure_project_not_paused(&current).await?;
         if !Self::is_replaying_recovery(&task.id)
             && crate::deferred_dispatch::queued_recovery(&current).is_some()
         {
             return Ok(current);
         }
+        self.ensure_project_not_paused(&current).await?;
         if current.failed_json.is_some() {
             return Err(ServiceError::TaskActionUnavailable {
                 available_actions: Vec::new(),

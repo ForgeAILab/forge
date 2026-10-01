@@ -89,31 +89,41 @@ impl TaskDispatcher {
         let project_id = project.id.clone();
         let job = tokio::spawn(async move {
             let _guard = guard;
-            let (results, policy_denied) = service
+            match service
                 .run_project_environment_checks(&project, &checks)
-                .await?;
-            let failures: Vec<_> = results
-                .into_iter()
-                .filter(|result| !result.passed)
-                .collect();
-            if failures.is_empty() {
-                return service.clear_environment_pause(&project).await;
+                .await
+            {
+                Ok((results, policy_denied)) => {
+                    let failures: Vec<_> = results
+                        .into_iter()
+                        .filter(|result| !result.passed)
+                        .collect();
+                    if failures.is_empty() {
+                        return service.clear_environment_pause(&project).await;
+                    }
+                    detail.output = bounded_output_tail(
+                        &failures
+                            .iter()
+                            .map(|failure| format!("{}: {}", failure.name, failure.output_tail))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    if policy_denied {
+                        detail.checks.clear();
+                        detail.output = bounded_output_tail(&format!(
+                            "{}\n{NO_RERUNNABLE_CHECK}",
+                            detail.output
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "environment re-check failed; scheduling next check");
+                    detail.output = bounded_output_tail(&error.to_string());
+                }
             }
             let now = Utc::now();
             detail.last_checked_at = now.to_rfc3339();
             detail.next_check_at = next_check_at(now, environment.recheck_interval_seconds);
-            detail.output = bounded_output_tail(
-                &failures
-                    .iter()
-                    .map(|failure| format!("{}: {}", failure.name, failure.output_tail))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-            if policy_denied {
-                detail.checks.clear();
-                detail.output =
-                    bounded_output_tail(&format!("{}\n{NO_RERUNNABLE_CHECK}", detail.output));
-            }
             service.update_environment_pause(&project, &detail).await?;
             Ok(false)
         });

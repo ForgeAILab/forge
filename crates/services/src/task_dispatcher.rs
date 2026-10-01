@@ -127,8 +127,8 @@ impl TaskDispatcher {
                 match self.sync_environment_pause(&project).await {
                     Ok(changed) => changed,
                     Err(error) => {
-                        tracing::warn!(project_id = %project.id, %error, "environment pause synchronization failed; skipping Project");
-                        continue;
+                        tracing::warn!(project_id = %project.id, %error, "environment pause synchronization failed; continuing Project scan");
+                        false
                     }
                 }
             };

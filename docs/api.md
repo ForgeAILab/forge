@@ -2206,7 +2206,7 @@ ten-minute review at a time:
   configuration, not a secret store. Use the executor's credential provider
   for tokens and passwords.
 - `assets` copy a host file or directory (absolute `source`) to a
-  worktree-relative `target` immediately before each local execution and before
+  worktree-relative `target` immediately before each local or daemon execution and before
   Forge re-runs the review checks in the Task worktree. A target that already exists is
   never overwritten, so tracked content and earlier copies are left alone.
   Copies are staged and renamed atomically; symbolic links, overlapping
@@ -2224,13 +2224,16 @@ ten-minute review at a time:
 - `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
   While environment-paused, Forge automatically re-runs the recorded failing
   checks in the primary checkout for embedded workspaces, or through the recorded
-  daemon owner in the workspace that failed, with the Project `env` and without
+  daemon owner in the ready workspace that failed, with the Project `env` and without
   copying assets. Checks run in background jobs, at most one per Project, so dispatcher
   ticks and operations refresh do not wait for them. Role-scoped checks that
   triggered the pause are included. Every check
   passing clears only the environment pause; Tasks then re-dispatch in their
-  current states. Another failure updates the output and schedules the next
-  check. Checks that depend on worktree assets may pass here and fail at launch,
+  current states. If the recorded workspace is missing or cannot be resolved,
+  or its daemon placement is not ready or its owner is unreachable, re-checks
+  fall back to the primary checkout. Another failure, including a re-check error,
+  updates the output and schedules the next check at the same interval.
+  Checks that depend on worktree assets may pass here and fail at launch,
   which pauses the Project again. A daemon run-policy denial pauses with a clear
   `purpose_denied` reason and no automatic re-check. Enable `environment_setup`
   on that owner and use **Check now**. An asset-copy failure or a pause with no
@@ -2238,7 +2241,7 @@ ten-minute review at a time:
   the environment and resume, or configure a real check.
 
 `ProjectResponse.environment_pause` is `null` when there is no environment
-pause detail. `workspace_id` records the placement used at failure and is nullable
+pause detail. `workspace_id` records the workspace used at failure and is nullable
 for checkout-only checks. Its persisted shape is:
 
 ```json

@@ -751,10 +751,11 @@ workflow.
 #### Project environment
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,
-`recheck_interval_seconds`) is applied at the
-single local launch point, `TaskService::run_execution`, after the workspace
-lock and the final WorkspaceLease verification and before ledger admission
-(`task_service/execution/environment.rs`). The env map is stamped onto the
+`recheck_interval_seconds`) is applied before local or daemon execution starts.
+Local preflight runs in `TaskService::run_execution`, after the workspace lock
+and the final WorkspaceLease verification and before ledger admission; remote
+preflight runs before the provider RPC. Both use the placement's workspace
+backend (`task_service/execution/environment.rs`). The env map is stamped onto the
 in-memory executor config under `_forge_task_environment` — runtime authority
 like the Task role, carried through fallback-candidate normalization
 (`executors::adapter::apply_runtime_scope`) but never part of candidate
@@ -768,20 +769,24 @@ pre-dispatch environment failure path and pauses the Project with
 workflow state or adding a Task annotation. No provider call or retry budget
 is spent. The stopped execution is tagged as an environment pre-dispatch
 failure so it does not block re-dispatch after resume. User and repository
-pauses are never overwritten. Pause detail (check names, triggering role,
+pauses are never overwritten. Pause detail (workspace ID, check names, triggering role,
 bounded output, pause/last-check/next-check times) persists in
 `project.environment_pause_json` and is returned as `environment_pause`.
 Migration V202610010410 clears legacy Task environment annotations without deleting
 Tasks or their execution history.
 
 `environment_pause_sync` starts a background job for recorded failing checks
-when due in the primary checkout, with Project `env` and without assets. The tick
+when due on the recorded ready daemon placement, with Project `env` and without
+assets. Embedded work, missing or unresolved workspaces, and daemon placements
+that are not ready or whose owner is unreachable use the primary checkout. The tick
 only starts or observes a job; operations refresh does not wait for host checks.
 Scheduled and manual re-checks share single-flight ownership per Project. Results
 use the original Project version and pause timestamp in the existing CAS, so a
 new pause, settings edit, or user pause wins over stale results. Check timeouts
 accept 1–300 seconds (default 120); execution clamps legacy stored values too.
-The interval defaults to 600 seconds (60–86400). Failure refreshes detail and schedules another check;
+The interval defaults to 600 seconds (60–86400). Failure, including a re-check
+error, refreshes detail and schedules another check; an error is logged once at
+warn and does not skip the Project's plan-publication reconciliation;
 success compare-and-clears only the environment pause and publishes a Project
 resumed event. The next tick re-dispatches Tasks in their current states.
 `POST /projects/{id}/environment/recheck` runs every configured check immediately
@@ -2213,17 +2218,23 @@ Daemon placements require direct-merge repositories and CLI Agents for every
 assigned worktree role (coder, reviewer, planner); pull-request mode and native
 Agents are rejected with `work_mode_unsupported` or `native_backend_unsupported`.
 
-Agent claims, initial launches, re-execution, resume, and follow-ups refuse a
+Agent claims, initial launches, ordinary re-execution, and resume refuse a
 paused Project with `ProjectPaused` before placement selection, reservation,
-workspace preparation, or recovery metadata changes. The execution admission
-transaction also checks the pause to fence concurrent Project changes. Recovery
-keeps the `project_paused(<detail>)` refusal and still permits other actions,
-such as cancelling the Task.
+or workspace preparation. Repeating an already queued resume returns the Task
+without placement work, even while paused. Follow-ups check the pause before
+placement work, after transitioning the Task to its role's active state or
+clearing its annotation. Re-execute recovery for a disconnected or timed-out
+owner may update the placement and reconcile the owner before reaching the
+pause guard. The execution admission transaction also checks the pause to
+fence concurrent Project changes. Recovery keeps the `project_paused(<detail>)`
+refusal and still permits other actions, such as cancelling the Task.
 
 Embedded executor availability comes from the runtime's adapter registry.
 Service and API fixtures inject `cli_adapters::test_support::test_registry`:
 availability is fixture-controlled without CLI lookup or home credential
-discovery, while Shell retains its local execution behavior.
+discovery, while Shell retains its local execution behavior. The fixture registry
+and `TaskService::new_for_test` are gated by the `test-support` Cargo feature;
+unit tests also compile the constructor. Production builds omit the fixture registry.
 
 Claim admission runs **reserve → prepare → start**:
 
@@ -2639,7 +2650,9 @@ Project environment pauses do not add Task failure states. Embedded checks and
 review CI use the workspace backend command path; remote starts perform the same
 preflight before their provider RPC. Environment pauses retain the failed
 workspace ID: scheduled and manual re-checks use the primary checkout for embedded
-work and the recorded daemon placement for remote work. An owner run-policy denial
+work and the recorded ready daemon placement for remote work. Missing or unresolved
+workspaces, non-ready placements, and unreachable owners fall back to the primary
+checkout. An owner run-policy denial
 records `purpose_denied` and suppresses scheduled re-checks until an explicit check
 succeeds after the policy changes.
 

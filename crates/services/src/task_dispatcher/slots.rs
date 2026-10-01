@@ -527,20 +527,56 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let kinds = [
-            "owner_disconnected_timeout",
-            "review_ci_infrastructure",
-            "review_ci_infrastructure_exhausted",
-            "review_ci_unavailable",
-            "workspace_reset_required",
-            "recovery_required",
-            "before_work_hook_failed",
+        let annotations = [
+            (
+                "recovery_required",
+                "owner_disconnected_timeout",
+                serde_json::json!(["reexecute", "cancel_task"]),
+            ),
+            (
+                "before_work_hook_failed",
+                "review_ci_infrastructure",
+                serde_json::json!(["retry_hook", "cancel_task"]),
+            ),
+            (
+                "before_work_hook_failed",
+                "review_ci_infrastructure_exhausted",
+                serde_json::json!(["retry_hook", "cancel_task"]),
+            ),
+            (
+                "before_work_hook_failed",
+                "review_ci_unavailable",
+                serde_json::json!(["retry_hook", "cancel_task"]),
+            ),
+            (
+                "workspace_reset_required",
+                "workspace_reset_required",
+                serde_json::json!(["reset_to_initial", "cancel_task"]),
+            ),
+            (
+                "recovery_required",
+                "owner_lost_execution",
+                serde_json::json!(["reexecute", "cancel_task"]),
+            ),
+            (
+                "before_work_hook_failed",
+                "before_work_hook_failed",
+                serde_json::json!(["retry_hook", "cancel_task"]),
+            ),
         ];
-        for kind in kinds {
+        for (kind, blocking_reason, actions) in &annotations {
             assert!(helpers::is_blocking_annotation_type(kind));
             let parked = task(&db, &project, "review", None).await;
             sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
-                .bind(serde_json::json!({"type":kind}).to_string())
+                .bind(
+                    serde_json::json!({
+                        "type": kind, "blocking_reason": blocking_reason,
+                        "blocked_at": db::now_rfc3339(), "blocked_by": "system:workflow",
+                        "message": "workspace owner could not run the operation",
+                        "recovery_actions": actions,
+                    })
+                    .to_string(),
+                )
                 .bind(&parked.id)
                 .execute(db.pool())
                 .await
@@ -552,7 +588,7 @@ mod tests {
             assert!(helpers::has_blocking_annotation(&parked));
         }
         let slots = load_project_slots(&db, &project).await.unwrap();
-        assert_eq!((slots.active, slots.parked), (2, kinds.len() as u32));
+        assert_eq!((slots.active, slots.parked), (2, annotations.len() as u32));
         assert_eq!(slots, walk_project_slots(&db, &project).await.unwrap());
     }
 }

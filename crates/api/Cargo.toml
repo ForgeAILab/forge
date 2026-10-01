@@ -45,7 +45,7 @@ services = { path = "../services", features = ["test-support"] }
 async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-cli-adapters = { path = "../cli-adapters" }
+cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
 events = { path = "../events" }
 forge-client = { path = "../forge-client" }

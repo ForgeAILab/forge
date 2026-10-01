@@ -173,6 +173,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   steps, hooks or environment checks can run commands on the daemon, that the
   run policy is not a security boundary against a malicious server, and that
   the server can read files under the daemon's workspace root.
+- Daemon execution starts stage Project environment assets and run the role's
+  environment checks on the workspace owner before the provider starts. A
+  failing check fails the attempt before launch and pauses the Project; it
+  does not change the Task's workflow state or spend a provider retry.
+- `ProjectResponse.environment_pause` has a nullable `workspace_id`: the
+  workspace whose check caused the pause. Re-checks run on that workspace
+  while its daemon placement is ready and reachable, and otherwise in the
+  Project's primary checkout.
+- Agent tool outcomes can carry `placement_unavailable`,
+  `daemon_upgrade_required` and `workspace_reset_required` in `denied_by`.
+  They apply to that request only and do not withdraw the operation for the
+  rest of the turn.
 
 ### Added
 

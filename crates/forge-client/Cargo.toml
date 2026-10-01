@@ -34,6 +34,7 @@ dirs = "6"
 time = { version = "0.3", features = ["formatting", "macros"] }
 
 [dev-dependencies]
+cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 api = { path = "../api" }
 db = { path = "../db", features = ["test-template"] }
 events = { path = "../events" }
