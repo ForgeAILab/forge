@@ -159,11 +159,10 @@ async fn find_or_create_demo_project(db: &SqliteDb, now: &str) -> Result<Project
 
 async fn find_or_create_demo_repo(db: &SqliteDb, project_id: &str, now: &str) -> Result<Repo> {
     let repos = RepoRepo::list_by_project(db, project_id, page_request()).await?;
-    if let Some(repo) = repos
-        .items
-        .into_iter()
-        .find(|repo| repo.name == "demo-repo" && repo.remote_url == "https://example.com/demo.git")
-    {
+    if let Some(repo) = repos.items.into_iter().find(|repo| {
+        repo.name == "demo-repo"
+            && repo.remote_url.as_deref() == Some("https://example.com/demo.git")
+    }) {
         return Ok(repo);
     }
 
@@ -173,7 +172,7 @@ async fn find_or_create_demo_repo(db: &SqliteDb, project_id: &str, now: &str) ->
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
             name: "demo-repo".to_owned(),
-            remote_url: "https://example.com/demo.git".to_owned(),
+            remote_url: Some("https://example.com/demo.git".to_owned()),
             local_path: None,
             work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

@@ -269,7 +269,7 @@ async fn populate_evidence_context_in_tx(
         "repository_id": repository.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?.unwrap_or_default(),
         "repository_name": repository.as_ref().map(|row| row.try_get::<String, _>("name")).transpose()?.unwrap_or_default(),
         "repository_kind": repository.as_ref().map(|row| row.try_get::<String, _>("work_mode")).transpose()?.unwrap_or_default(),
-        "remote_url": repository.as_ref().map(|row| row.try_get::<String, _>("remote_url")).transpose()?,
+        "remote_url": normalize_repo_remote_url(repository.as_ref().map(|row| row.try_get::<Option<String>, _>("remote_url")).transpose()?.flatten()),
         "default_branch": repository.as_ref().map(|row| row.try_get::<String, _>("default_branch")).transpose()?.unwrap_or_default(),
         "execution_id": execution.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?,
         "execution_status": execution.as_ref().map(|row| row.try_get::<String, _>("status")).transpose()?,

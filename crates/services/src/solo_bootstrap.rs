@@ -1378,10 +1378,9 @@ impl SoloBootstrapService {
                     id: db::new_uuid_v4(),
                     project_id: project.id.clone(),
                     name: repository_name(request),
-                    // The Repo schema requires a remote URL even for a local
-                    // source.  The canonical identity is stable and avoids a
-                    // fabricated network origin.
-                    remote_url: request.canonical_repository.clone(),
+                    // The canonical source identity is stable across checkout
+                    // moves and avoids a fabricated network origin.
+                    remote_url: Some(request.canonical_repository.clone()),
                     local_path: Some(request.source_path().to_owned()),
                     work_mode: WorkMode::DirectMerge,
                     default_branch: request.default_branch.clone(),
@@ -2232,7 +2231,7 @@ fn status_next_step(status: &EffectiveStatus) -> &'static str {
 }
 
 fn is_same_repo_identity(repo: &Repo, request: &SoloBootstrapRequest) -> bool {
-    repo.remote_url == request.canonical_repository
+    repo.remote_url.as_deref() == Some(request.canonical_repository.as_str())
         && repo.default_branch == request.default_branch
         && repo.work_mode == WorkMode::DirectMerge
 }

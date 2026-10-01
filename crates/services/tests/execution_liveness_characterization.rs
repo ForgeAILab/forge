@@ -72,7 +72,7 @@ async fn fixture() -> ExecutionFixture {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "execution-liveness".to_owned(),
-            remote_url: "https://example.invalid/execution-liveness.git".to_owned(),
+            remote_url: Some("https://example.invalid/execution-liveness.git".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

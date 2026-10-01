@@ -866,7 +866,7 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "repository".to_owned(),
-            remote_url: "https://example.invalid/repository.git".to_owned(),
+            remote_url: Some("https://example.invalid/repository.git".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

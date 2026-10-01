@@ -751,7 +751,7 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             id: repo_id.clone(),
             project_id: project_id.clone(),
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -3030,7 +3030,7 @@ async fn sqlite_repo_create_round_trips_local_path() {
             id: repo_id,
             project_id,
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: Some("/tmp/forge-test-repo".to_owned()),
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -3043,7 +3043,10 @@ async fn sqlite_repo_create_round_trips_local_path() {
 
     assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, Some("/tmp/forge-test-repo".to_owned()));
-    assert_eq!(repo.remote_url, "https://example.com/forge.git");
+    assert_eq!(
+        repo.remote_url.as_deref(),
+        Some("https://example.com/forge.git")
+    );
 }
 
 #[tokio::test]
@@ -3075,7 +3078,7 @@ async fn sqlite_repo_create_round_trips_remote_url() {
             id: repo_id,
             project_id,
             name: "forge".to_owned(),
-            remote_url: "https://example.com/forge.git".to_owned(),
+            remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
@@ -3088,11 +3091,14 @@ async fn sqlite_repo_create_round_trips_remote_url() {
 
     assert_eq!(repo.work_mode, WorkMode::DirectMerge);
     assert_eq!(repo.local_path, None);
-    assert_eq!(repo.remote_url, "https://example.com/forge.git");
+    assert_eq!(
+        repo.remote_url.as_deref(),
+        Some("https://example.com/forge.git")
+    );
 }
 
 #[tokio::test]
-async fn sqlite_repo_create_rejects_missing_remote_url() {
+async fn sqlite_repo_create_accepts_missing_remote_url() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
@@ -3127,7 +3133,119 @@ async fn sqlite_repo_create_rejects_missing_remote_url() {
         .await
         .map_err(crate::DbError::from);
 
-    assert!(matches!(result, Err(DbError::Sqlx(_))));
+    result.expect("local-only repository accepts a NULL remote URL");
+}
+
+#[tokio::test]
+async fn sqlite_repo_create_normalizes_blank_remote_url() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    for remote_url in [None, Some(""), Some(" \t\r\n"), Some("\u{2003}")] {
+        let project = ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: new_uuid_v4(),
+                name: "Local Project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project creates");
+        for primary in [false, true] {
+            let input = CreateRepo {
+                id: new_uuid_v4(),
+                project_id: project.id.clone(),
+                name: "Local Repo".to_owned(),
+                remote_url: remote_url.map(str::to_owned),
+                local_path: Some("/tmp/local-repo".to_owned()),
+                work_mode: WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            let repo = if primary {
+                RepoRepo::create_primary_for_project(&db, input, None, project.version, now.clone())
+                    .await
+            } else {
+                RepoRepo::create(&db, input).await
+            }
+            .expect("local repo creates");
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT remote_url FROM repo WHERE id = ?")
+                    .bind(&repo.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("stored remote loads");
+            assert_eq!(stored, None);
+            assert_eq!(repo.remote_url, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn sqlite_repo_update_and_read_normalize_blank_remote_url() {
+    let db = sqlite_db().await;
+    let (_, repo_id, _) = seed_project_repo_agent(&db).await;
+    let original = Some("https://example.com/forge.git".to_owned());
+    for (input, expected) in [
+        (None, original.clone()),
+        (Some(None), None),
+        (Some(Some(String::new())), None),
+        (Some(Some(" \t\r\n".to_owned())), None),
+        (Some(original.clone()), original.clone()),
+    ] {
+        sqlx::query("UPDATE repo SET remote_url = ? WHERE id = ?")
+            .bind(&original)
+            .bind(&repo_id)
+            .execute(db.pool())
+            .await
+            .expect("remote resets");
+        let repo = RepoRepo::update(
+            &db,
+            UpdateRepo {
+                id: repo_id.clone(),
+                name: None,
+                local_path: None,
+                remote_url: input,
+                work_mode: None,
+                default_branch: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("remote updates");
+        let stored: Option<String> = sqlx::query_scalar("SELECT remote_url FROM repo WHERE id = ?")
+            .bind(&repo_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("stored remote loads");
+        assert_eq!(stored, expected);
+        assert_eq!(repo.remote_url, expected);
+    }
+
+    sqlx::query("UPDATE repo SET remote_url = '  ' WHERE id = ?")
+        .bind(&repo_id)
+        .execute(db.pool())
+        .await
+        .expect("unnormalized remote seeds");
+    let repo = RepoRepo::get_by_id(&db, &repo_id)
+        .await
+        .expect("repo loads")
+        .expect("repo exists");
+    assert_eq!(repo.remote_url, None);
+    assert_eq!(
+        RepoRepo::list_by_project(&db, &repo.project_id, page(10))
+            .await
+            .expect("repos list")
+            .items[0]
+            .remote_url,
+        None
+    );
 }
 
 #[tokio::test]

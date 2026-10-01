@@ -2082,7 +2082,13 @@ identities, typed setup requirements, and the durable provisioning operation
 when one exists.
 
 Repository selection is Project-owned. `project.primary_repo_id` must resolve
-to a Repo owned by that same Project and is the only pre-execution repository
+to a Repo owned by that same Project. Repo `remote_url` is optional: creation
+accepts omission or `null`, and empty or whitespace-only values are stored and
+returned as `null`. Updating `remote_url` with `null` or a blank string clears
+it; omission preserves it. Local-only repositories use `local_path` without a
+remote URL.
+
+The primary repository is the only pre-execution repository
 authority for every Task in the Project. Task create/update requests do not
 accept a repository selector, and Task responses no longer contain `repo_id`.
 A Task accepted before repository attachment therefore needs no Task mutation

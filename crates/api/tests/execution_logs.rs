@@ -167,7 +167,7 @@ async fn seed_execution(db: &db::SqliteDb, logs_path: Option<PathBuf>) -> String
             name: "repo".to_owned(),
             local_path: Some("/tmp/forge-execution-logs-repo".to_owned()),
             work_mode: db::WorkMode::DirectMerge,
-            remote_url: String::new(),
+            remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

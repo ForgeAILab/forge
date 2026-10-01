@@ -285,7 +285,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "repo".to_owned(),
-                remote_url: "https://example.com/repo.git".to_owned(),
+                remote_url: Some("https://example.com/repo.git".to_owned()),
                 local_path: None,
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),

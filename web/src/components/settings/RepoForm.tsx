@@ -269,13 +269,9 @@ export function RepoForm({
   }
 
   const submit = () => {
-    const remoteUrl =
-      form.source_mode === 'local'
-        ? form.remote_url.trim() || form.local_path.trim()
-        : form.remote_url.trim()
     onSubmit({
       ...form,
-      remote_url: remoteUrl,
+      remote_url: form.remote_url.trim(),
       default_branch: effectiveDefaultBranch || form.default_branch,
     })
   }

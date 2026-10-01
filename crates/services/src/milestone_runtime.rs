@@ -2376,7 +2376,8 @@ impl MilestoneRuntime {
         for task in tasks {
             let rows = sqlx::query(
                 "SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
-                        repo.remote_url, repo.default_branch,
+                        CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END AS remote_url,
+                        repo.default_branch,
                         e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
                         e.before_sha, e.after_sha, e.summary AS execution_summary,
                         e.created_at AS execution_created_at, e.updated_at AS execution_updated_at,
@@ -2417,7 +2418,7 @@ impl MilestoneRuntime {
                 repository_id: row.try_get("repo_id")?,
                 repository_name: row.try_get("repository_name")?,
                 repository_kind: row.try_get("repository_kind")?,
-                remote_url: row.try_get("remote_url")?,
+                remote_url: db::normalize_repo_remote_url(row.try_get("remote_url")?),
                 default_branch: row.try_get("default_branch")?,
                 execution_id: row.try_get("execution_id")?,
                 execution_status: row.try_get("execution_status")?,
@@ -4697,6 +4698,102 @@ mod tests {
             release_evidence_tombstone("purged").expect("purge overlay"),
             api_types::ReleaseEvidenceAvailability::EvidenceUnavailable
         );
+    }
+
+    #[tokio::test]
+    async fn repository_context_builds_without_remote_url() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = "2026-09-30T00:00:00Z";
+        let runtime = MilestoneRuntime::new(Arc::clone(&db));
+        for (index, remote_url) in [None, Some(""), Some(" \t\r\n"), Some("\u{2003}")]
+            .into_iter()
+            .enumerate()
+        {
+            let project_id = format!("project-local-{index}");
+            let repo_id = format!("repo-local-{index}");
+            let task_id = format!("task-local-{index}");
+            sqlx::query(
+                "INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at)
+                 VALUES (?, 'Local Project', '{}', '{}', ?, ?)",
+            )
+            .bind(&project_id)
+            .bind(now)
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .expect("project inserts");
+            let repo = db::RepoRepo::create(
+                &*db,
+                db::CreateRepo {
+                    id: repo_id.clone(),
+                    project_id: project_id.clone(),
+                    name: "Local Repo".to_owned(),
+                    remote_url: remote_url.map(str::to_owned),
+                    local_path: Some("/tmp/local-repo".to_owned()),
+                    work_mode: db::WorkMode::DirectMerge,
+                    default_branch: "main".to_owned(),
+                    created_at: now.to_owned(),
+                    updated_at: now.to_owned(),
+                },
+            )
+            .await
+            .expect("repo creates");
+            assert_eq!(repo.remote_url, None);
+            sqlx::query("UPDATE project SET primary_repo_id = ? WHERE id = ?")
+                .bind(&repo_id)
+                .bind(&project_id)
+                .execute(db.pool())
+                .await
+                .expect("primary repo selects");
+            sqlx::query(
+                "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+                 VALUES (?, ?, 'Local Task', 'task', 'done', ?, ?)",
+            )
+            .bind(&task_id)
+            .bind(&project_id)
+            .bind(now)
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .expect("task inserts");
+            for raw_remote in [None, remote_url] {
+                sqlx::query("UPDATE repo SET remote_url = ? WHERE id = ?")
+                    .bind(raw_remote)
+                    .bind(&repo_id)
+                    .execute(db.pool())
+                    .await
+                    .expect("raw remote seeds");
+                let mut tx = db.pool().begin().await.expect("transaction begins");
+                let contexts = runtime
+                    .commit_build_check_context_in_tx(
+                        &mut tx,
+                        &project_id,
+                        &[ReadinessTaskState {
+                            task_id: task_id.clone(),
+                            version: 1,
+                            task_type: "task".to_owned(),
+                            state: "done".to_owned(),
+                            observed_at: now.to_owned(),
+                        }],
+                    )
+                    .await
+                    .expect("local repository context builds");
+                tx.rollback().await.expect("transaction rolls back");
+                assert_eq!(contexts.len(), 1);
+                let reference: RepositoryContextReference =
+                    serde_json::from_str(&contexts[0]).expect("context decodes");
+                assert_eq!(reference.repository_id, repo_id);
+                assert_eq!(reference.remote_url, None);
+                validate_repository_context_reference(&reference).expect("local context validates");
+                let mut incomplete = reference;
+                incomplete.repository_name.clear();
+                assert!(validate_repository_context_reference(&incomplete).is_err());
+            }
+        }
     }
 
     #[tokio::test]

@@ -79,7 +79,7 @@ async fn fixture_with_allowed_operations(
             id: REPO_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
             name: "plan04".to_owned(),
-            remote_url: "file:///tmp/plan04".to_owned(),
+            remote_url: Some("file:///tmp/plan04".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

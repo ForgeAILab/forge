@@ -49,7 +49,7 @@ impl RepoArgs {
             } => {
                 validate_source(*kind, local_path.as_deref(), remote_url.as_deref())?;
                 let request = CreateRepoRequest {
-                    remote_url: remote_url.clone().unwrap_or_default(),
+                    remote_url: remote_url.clone().filter(|value| !value.trim().is_empty()),
                     local_path: local_path.clone(),
                     name: Some(name.clone()),
                     default_branch: default_branch.clone(),

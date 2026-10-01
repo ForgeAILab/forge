@@ -78,7 +78,7 @@ async fn create_remote_repo(app: &common::Harness, project_id: &str) -> String {
             id: uuid::Uuid::new_v4().to_string(),
             project_id: project_id.to_owned(),
             name: "remote-setup-repo".to_owned(),
-            remote_url: "https://example.invalid/forge/setup".to_owned(),
+            remote_url: Some("https://example.invalid/forge/setup".to_owned()),
             local_path: None,
             work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),

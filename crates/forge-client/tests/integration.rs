@@ -496,7 +496,7 @@ async fn create_repo(client: &ForgeClient, project_id: &str, local_path: &str) -
         .post(
             &format!("/api/v1/projects/{project_id}/repos"),
             &CreateRepoRequest {
-                remote_url: local_path.to_owned(),
+                remote_url: Some(local_path.to_owned()),
                 local_path: Some(local_path.to_owned()),
                 name: Some("forge".to_owned()),
                 default_branch: None,

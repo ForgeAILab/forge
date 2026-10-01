@@ -66,7 +66,10 @@ async fn forge_happy_path_end_to_end() {
         returned_local_path.as_deref(),
         Some(expected_local_path.as_path())
     );
-    assert_eq!(repo.remote_url, repo_path.to_string_lossy().as_ref());
+    assert_eq!(
+        repo.remote_url.as_deref(),
+        Some(repo_path.to_string_lossy().as_ref())
+    );
 
     let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(

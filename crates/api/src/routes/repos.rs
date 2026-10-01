@@ -7,8 +7,8 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, ProjectRepo, RepoRepo,
-    UpdateRepo, WorkMode,
+    new_uuid_v4, normalize_repo_remote_url, now_rfc3339, CreatePrProviderConfig, CreateRepo,
+    ProjectRepo, RepoRepo, UpdateRepo, WorkMode,
 };
 
 use crate::{
@@ -33,9 +33,15 @@ pub async fn create_repo(
         ));
     }
     let local_path = normalize_optional_local_path(request.local_path)?;
-    let name = request
-        .name
-        .unwrap_or_else(|| repo_name_from_remote_url(&request.remote_url));
+    let remote_url = normalize_repo_remote_url(request.remote_url);
+    let name = request.name.unwrap_or_else(|| {
+        repo_name_from_remote_url(
+            remote_url
+                .as_deref()
+                .or(local_path.as_deref())
+                .unwrap_or("repo"),
+        )
+    });
     let now = now_rfc3339();
     let repo_id = new_uuid_v4();
     let repo = CreateRepo {
@@ -43,7 +49,7 @@ pub async fn create_repo(
         project_id: project_id.clone(),
         name,
         local_path,
-        remote_url: request.remote_url,
+        remote_url,
         work_mode: request
             .work_mode
             .map(work_mode_domain)
@@ -109,7 +115,7 @@ pub async fn update_repo(
             id,
             name: request.name,
             local_path,
-            remote_url: request.remote_url,
+            remote_url: request.remote_url.map(normalize_repo_remote_url),
             work_mode: request.work_mode.map(work_mode_domain),
             default_branch: request.default_branch,
             updated_at: now_rfc3339(),

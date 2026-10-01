@@ -106,7 +106,11 @@ fn repo_source(value: &RepoResponse) -> String {
     format!(
         "[{}] {}",
         serialized_label(&value.work_mode),
-        value.remote_url
+        value
+            .remote_url
+            .as_deref()
+            .or(value.local_path.as_deref())
+            .unwrap_or("—")
     )
 }
 

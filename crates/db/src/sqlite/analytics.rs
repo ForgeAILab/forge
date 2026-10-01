@@ -304,7 +304,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "analytics-repo".to_owned(),
-                remote_url: "https://example.com/forge-analytics.git".to_owned(),
+                remote_url: Some("https://example.com/forge-analytics.git".to_owned()),
                 local_path: Some("/tmp/forge-analytics-test-repo".to_owned()),
                 work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),

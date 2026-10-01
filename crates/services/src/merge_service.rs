@@ -565,7 +565,16 @@ impl MergeService {
         if managed.exists() {
             return Ok(managed.to_string_lossy().into_owned());
         }
-        ensure_managed_clone(&repo.remote_url, &managed).await
+        let remote_url = repo
+            .remote_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "repository has no available local path or remote URL",
+                )
+            })?;
+        ensure_managed_clone(remote_url, &managed).await
     }
 
     fn managed_repo_path(&self, repo_id: &str) -> PathBuf {
@@ -804,7 +813,7 @@ mod tests {
                 id: repo_id.clone(),
                 project_id: project_id.clone(),
                 name: "repo".to_owned(),
-                remote_url: repo_path.to_string_lossy().into_owned(),
+                remote_url: Some(repo_path.to_string_lossy().into_owned()),
                 local_path: Some(repo_path.to_string_lossy().into_owned()),
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
@@ -942,7 +951,7 @@ mod tests {
                 id: replacement_repo_id.clone(),
                 project_id: task.project_id.clone(),
                 name: "replacement".to_owned(),
-                remote_url: temp.path().join("replacement.git").display().to_string(),
+                remote_url: Some(temp.path().join("replacement.git").display().to_string()),
                 local_path: None,
                 work_mode: db::WorkMode::DirectMerge,
                 default_branch: "trunk".to_owned(),
