@@ -415,7 +415,9 @@ mod tests {
         let DaemonFrame::Response { result, .. } = response else {
             panic!("expected terminal ack response");
         };
-        assert_eq!(result["acknowledged"], false);
+        // An entry the journal no longer holds is a repeated ack after a lost
+        // response; it settles as acknowledged.
+        assert_eq!(result["acknowledged"], true);
 
         remove_dir(&dir);
     }

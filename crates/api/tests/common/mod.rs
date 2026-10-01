@@ -74,11 +74,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
         Arc::clone(&event_bus),
         Arc::clone(&adapter_registry),
     ));
-    let mut config = config::ForgeConfig::default();
-    config.forge.data_dir = workspace_root.join("test-data");
-    config.workspace.root = workspace_root.to_path_buf();
-    let state = Arc::new(
-        AppState::with_adapter_registry_services_and_shutdown(
+    let state = Arc::new(AppState::with_adapter_registry_services_and_shutdown(
             db,
             event_bus,
             true,
@@ -90,9 +86,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
             api::state::test_workflows_dir(),
             api::state::test_jwt_secret(),
             api::state::test_bcrypt_cost(),
-        )
-        .with_effective_config(config),
-    );
+    ));
 
     let web_dist_dir = TestDir::new(&format!("{prefix}-web"));
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
