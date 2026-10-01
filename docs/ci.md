@@ -101,6 +101,8 @@ replay. `file_backed_migrations_apply_cleanly` replays the bundled directory
 through `run_migrations_from`, so every migration body still runs against a
 real file in each CI run. Query-only pools retain replay errors, and disk
 copies check writability through sqlx before using the backup connection.
+Tests that stop at a historical migration to inspect its immediate effect must
+apply the remaining migrations before calling current repository row mappers.
 Duplicate-version and applied-name guards remain on that path, and the
 cached template itself uses that validated replay runner.
 Snapshot tests compare every `sqlite_master` field, complete `_migration`
