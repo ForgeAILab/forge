@@ -1267,6 +1267,18 @@ async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
     assert_eq!(health.version, 3); // lease acquisition, 100-event flush, lease release
     assert!(health.lease_owner.is_none());
     assert!(health.lease_until.is_none());
+    // Idle polls still claim/release ledger leases, but must not churn health.
+    sqlx::query("CREATE TRIGGER reject_health_write BEFORE UPDATE ON attention_consumer_health BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
+        .execute(db.pool()).await.unwrap();
+    for _ in 0..10 {
+        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+    }
+    let idle_health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(idle_health.version, health.version);
+    assert_eq!(idle_health.processed_events, 100);
 }
 
 #[tokio::test]

@@ -164,7 +164,7 @@ pub const FORGE_LCM_SIZER_REVISION: &str = "forge-lcm-sizer-1";
 /// it from the durable timeline instead.
 ///
 /// **Bump this whenever any of those three change.**
-pub const FORGE_LCM_POLICY_REVISION: &str = "forge-lcm-policy-3";
+pub const FORGE_LCM_POLICY_REVISION: &str = "forge-lcm-policy-2";
 
 /// Characters charged as one token by the host sizers.
 const LCM_CHARS_PER_TOKEN: u64 = 4;

@@ -1504,14 +1504,22 @@ an account-owned Forge provider entry and lease.
 
 Protected session/checkpoint payloads use a versioned zstd envelope inside
 authenticated encryption; earlier encrypted JSON rows remain readable and are
-converted on their next state change. Snapshot digests exclude the save
-timestamp, so unchanged saves do no encryption or database write. Checkpoints
+converted on their next state change. Snapshot digests use domain-separated
+HMAC-SHA256 with the protected store key and exclude the save timestamp, so
+unchanged saves do no encryption or database write. Checkpoints
 are idempotent by session, turn, revision, and operation fingerprint, and retain
 the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
 also serves as the session snapshot (NULL standalone snapshot columns reference
 it); only independent canonical state changes need a separate snapshot. Writes
-use the protected row's revision CAS, and snapshot/checkpoint LCM policy markers
-are tracked separately so a standalone save cannot relabel an older checkpoint.
+use the protected row's revision CAS. A competing snapshot save supersedes the
+losing save; a checkpoint save reloads and retries once if it can still advance
+the winning turn. Newer turns/revisions, conflicting fingerprints, and any
+remaining CAS conflict supersede the losing save. The store handles these races
+for every runtime caller without failing the turn. Snapshot/checkpoint LCM policy markers are tracked
+separately so a standalone save cannot relabel an older checkpoint. A checkpoint
+decode failure returns an error naming the runtime session; it cannot safely
+fall back to fresh state because that would discard provider/tool recovery
+barriers.
 
 Forge does not configure Agent Runtime's tool-step or turn-time limits; their
 defaults are `None`. Task workflow `max_turns` is also optional and has no
@@ -1585,15 +1593,6 @@ and failing every admission with "LCM context cannot fit". A failed turn's
 input and tool rounds stay in the persistent session history, so when a retry
 would re-send a message that already sits unanswered at the end of that
 history, the native host sends a short continuation instead of a second copy.
-
-Forge retains no additional completed raw entries at hard pressure: the runtime
-already protects the active user turn, while its default four-entry retention
-can exclude a short but oversized completed turn entirely. LCM bounds the
-projected model context, not the canonical transcript stored in a snapshot.
-The pinned runtime's `compact_hard_result` / `compact_once` exclude everything
-from the latest user message onward, and `project_state` rejects summaries
-overlapping the active turn. A single ongoing tool loop can therefore still
-exceed the input budget; fixing that boundary requires an Agent Runtime change.
 
 Forge selects and authorizes domain context; Agent Runtime alone budgets and
 serializes final model context. `context_manifest` records the offered source
@@ -1890,9 +1889,11 @@ budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
 Attention consumer health buffers successful progress, flushing at an event
-boundary after five seconds or 100 processed events, and immediately on errors and lease changes
-(including batch start/release). Buffered deltas and the latest successful
-sequence/time are preserved when flushing; the lease expiry remains visible
+boundary after five seconds or 100 processed events, and immediately on errors.
+Batch release flushes remaining progress and clears any published processing
+lease. New batch owners and lease renewals are buffered; empty polls write health
+at most once every five seconds. Buffered deltas and the latest successful
+sequence/time are preserved when flushing; a published lease expiry remains visible
 during processing. Each event's authoritative cursor and receipt still commit
 individually. Health counters are diagnostic: a crash may lose up to 99 buffered
 increments, without losing event delivery. The stale threshold remains 90
