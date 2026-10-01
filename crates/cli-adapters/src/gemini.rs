@@ -242,7 +242,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
 
         let stream = stream_result?;
 
-        if (!status.success() || stream.error.is_some())
+        if !status.success()
             && let Some(retry_after) = stream.capacity.retry_after
         {
             return Err(ExecutorError::UsageExhausted {
@@ -251,7 +251,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
             });
         }
 
-        let (outcome, error) = if status.success() && stream.error.is_none() {
+        let (outcome, error) = if status.success() {
             (ExecutionOutcome::Completed, None)
         } else {
             (
@@ -575,6 +575,62 @@ fn executable_in_path(name: &str) -> bool {
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemini_capacity_preserves_exit_status_success_semantics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (message, exit_code) in [
+            ("model rejected", 0),
+            ("HTTP 429; retry in 90s", 0),
+            ("model rejected", 1),
+            ("HTTP 429; retry in 90s", 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("gemini.sh");
+            let document = serde_json::json!({"error": {"message": message}});
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s\\n' '{document}'\nexit {exit_code}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = GeminiAdapter::new()
+                .execute(ExecutionContext {
+                    task_id: "task-1".to_owned(),
+                    execution_id: "gemini-capacity".to_owned(),
+                    worktree_path: dir.path().display().to_string(),
+                    description: "do the task".to_owned(),
+                    agent_config: serde_json::json!({
+                        "base_command_override": script.display().to_string(),
+                        "auto_commit": false,
+                    }),
+                    logs_path: dir.path().join("gemini.jsonl").display().to_string(),
+                    heartbeat_interval_seconds: 30,
+                    max_turns: None,
+                    log_sender: None,
+                })
+                .await;
+            match (exit_code, message.starts_with("HTTP 429")) {
+                (0, _) => {
+                    let result = result.unwrap();
+                    assert_eq!(result.status, ExecutionOutcome::Completed);
+                    assert!(result.error.is_none());
+                }
+                (_, true) => assert!(matches!(
+                    result,
+                    Err(ExecutorError::UsageExhausted { retry_after: Some(delay), .. })
+                        if delay == Duration::from_secs(90)
+                )),
+                (_, false) => {
+                    let result = result.unwrap();
+                    assert_eq!(result.status, ExecutionOutcome::Failed);
+                    assert!(result.error.unwrap().contains(message));
+                }
+            }
+        }
+    }
 
     #[test]
     fn gemini_capacity_error_document_preserves_retry_hint() {

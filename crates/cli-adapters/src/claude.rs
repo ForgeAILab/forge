@@ -108,7 +108,6 @@ impl AvailabilitySignals {
             return;
         }
         self.saw_error_result = true;
-        self.capacity.observe(&value.to_string());
         if let Some(text) = value.get("result").and_then(|v| v.as_str()) {
             self.classify_error_channel_line(text);
         }
@@ -1093,6 +1092,24 @@ mod tests {
             Some(ExecutorError::UsageExhausted { retry_after: Some(delay), .. })
                 if delay == Duration::from_secs(45 * 60)
         ));
+    }
+
+    #[test]
+    fn claude_capacity_ignores_numeric_result_metadata() {
+        for event in [
+            r#"{"type":"result","is_error":true,"result":"model rejected","usage":{"input_tokens":429}}"#,
+            r#"{"type":"result","is_error":true,"result":"model rejected","total_cost_usd":0.429}"#,
+            r#"{"type":"result","is_error":true,"result":"model rejected after 429 tokens"}"#,
+            r#"{"type":"result","is_error":true,"result":"model rejected","diagnostic":"usage limit"}"#,
+        ] {
+            let mut signals = AvailabilitySignals::default();
+            signals.classify_stdout_event(event);
+            assert!(signals.saw_error_result);
+            assert!(
+                signals.into_availability_error(false, Vec::new()).is_none(),
+                "{event}"
+            );
+        }
     }
 
     #[test]

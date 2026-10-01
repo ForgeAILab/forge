@@ -229,7 +229,6 @@ impl CodexClient {
                     .await?;
                 }
                 Some(line) = stderr_rx.recv() => {
-                    result.capacity.observe(&line);
                     write_log(&writer, LogKind::Stderr, json!({ "line": line })).await?;
                 }
                 message = self.messages.recv() => {
@@ -550,6 +549,11 @@ fn is_sub_agent_event(raw: &Value, root_thread_id: &str) -> bool {
 }
 
 fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<String> {
+    if raw.get("method").and_then(Value::as_str) == Some("error")
+        && raw.pointer("/params/willRetry").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
     let error = super::codex_event_error_message(raw)?;
     result.capacity.observe(&error);
     for path in [
@@ -558,7 +562,7 @@ fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<Strin
         "/params/status/error",
     ] {
         if let Some(payload) = raw.pointer(path) {
-            result.capacity.observe(&payload.to_string());
+            result.capacity.observe_error(payload);
         }
     }
 
@@ -789,6 +793,96 @@ mod tests {
             assert!(set_error_if_present(&raw, &mut result).is_none());
         }
         assert!(result.capacity.retry_after.is_none());
+    }
+
+    #[test]
+    fn codex_capacity_ignores_numeric_error_metadata() {
+        for error in [
+            json!({"message": "model rejected", "input_tokens": 429}),
+            json!({"message": "model rejected", "total_cost_usd": 0.429}),
+            json!({"message": "model rejected after 429 tokens"}),
+            json!({"message": "model rejected", "diagnostic": "usage limit"}),
+        ] {
+            let mut result = TurnRunResult::default();
+            let raw = json!({"method": "error", "params": {"willRetry": false, "error": error}});
+            assert!(set_error_if_present(&raw, &mut result).is_some());
+            assert!(result.error.is_some());
+            assert!(result.capacity.retry_after.is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn codex_capacity_ignores_retrying_error_notifications() {
+        let mut result = TurnRunResult::default();
+        for error in [
+            json!({"message": "HTTP 429", "retry_after_seconds": 90}),
+            json!({"message": "You've hit your usage limit"}),
+            json!({"message": "model rejected", "input_tokens": 429}),
+        ] {
+            let raw = json!({"method": "error", "params": {"willRetry": true, "error": error}});
+            assert!(set_error_if_present(&raw, &mut result).is_none());
+        }
+        assert!(result.error.is_none());
+        assert!(result.capacity.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_capacity_ignores_stderr_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut client = CodexClient::spawn(
+            child.stdin.take().unwrap(),
+            child.stdout.take().unwrap(),
+            dir.path(),
+            cancel.clone(),
+        );
+        let log_path = dir.path().join("codex.jsonl");
+        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
+            &log_path,
+            "execution-id".to_owned(),
+            1024 * 1024,
+        )));
+        let (stderr_tx, stderr_rx) = mpsc::channel(2);
+        stderr_tx
+            .send("HTTP 429; retry in 90s".to_owned())
+            .await
+            .unwrap();
+        stderr_tx
+            .send("input_tokens: 429; total_cost_usd: 0.429".to_owned())
+            .await
+            .unwrap();
+        let rpc = client.rpc.clone();
+        let run = client.run_until_turn_complete(writer, stderr_rx, 30, "root");
+        let send_completion = async {
+            // The stderr queue is drained before sending the terminal event.
+            drop(stderr_tx.reserve_many(2).await.unwrap());
+            rpc.notify(
+                "turn/completed",
+                Some(json!({"threadId": "root", "turn": {"id": "turn-1", "error": {"message": "model rejected"}}})),
+            ).await.unwrap();
+        };
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(run, send_completion)
+        })
+        .await
+        .unwrap();
+        let result = result.unwrap();
+        assert_eq!(result.outcome, Some(ExecutionOutcome::Failed));
+        assert_eq!(result.error.as_deref(), Some("model rejected"));
+        assert!(result.capacity.retry_after.is_none());
+        assert!(
+            std::fs::read_to_string(log_path)
+                .unwrap()
+                .contains("HTTP 429")
+        );
+        cancel.cancel();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
     }
 
     #[derive(Clone, Default)]

@@ -642,13 +642,11 @@ async fn reviewer_provider_unavailability_uses_bounded_task_retry_budget() {
 
     assert_eq!(updated.status, ExecutionStatus::Failed);
     assert_eq!(updated.role, "reviewer");
-    assert!(
-        updated
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("provider unavailable")
-    );
+    assert!(updated
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("provider unavailable"));
 
     let execution_after = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
         .await
@@ -814,6 +812,15 @@ async fn capacity_limit_without_fallback_defers_until_reset_or_backoff() {
 
 #[tokio::test]
 async fn capacity_limit_retry_budget_exhaustion_blocks() {
+    assert_capacity_limit_retry_block(3, 3, "retry budget exhausted").await;
+}
+
+#[tokio::test]
+async fn capacity_limit_zero_retry_budget_blocks_as_disabled() {
+    assert_capacity_limit_retry_block(0, 0, "automatic retries are disabled").await;
+}
+
+async fn assert_capacity_limit_retry_block(budget: u64, retry_count: u64, reason: &str) {
     let db = Arc::new(sqlite_db().await);
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -836,8 +843,9 @@ async fn capacity_limit_retry_budget_exhaustion_blocks() {
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
         .unwrap();
-    sqlx::query("UPDATE task SET metadata_json = ?, version = version + 1 WHERE id = ?")
-        .bind(json!({"execution_retry_count": 3}).to_string())
+    sqlx::query("UPDATE task SET metadata_json = ?, task_state_config = ?, version = version + 1 WHERE id = ?")
+        .bind(json!({"execution_retry_count": retry_count}).to_string())
+        .bind(json!({"retry_budgets": {"execution": budget}}).to_string())
         .bind(&task.id)
         .execute(db.pool())
         .await
@@ -861,17 +869,16 @@ async fn capacity_limit_retry_budget_exhaustion_blocks() {
         annotation.annotation_type,
         api_types::FailureKind::ExecutorUnavailable
     );
-    assert!(
-        annotation
-            .message
-            .unwrap()
-            .contains("retry budget exhausted")
-    );
+    let message = annotation.message.unwrap();
+    assert!(message.contains(reason), "{message}");
+    if budget == 0 {
+        assert!(!message.contains("retry budget exhausted"), "{message}");
+    }
     assert!(after.blocked_json.is_some());
     assert!(after.failed_json.is_none());
     assert_eq!(execution.resume_policy, Some(db::ResumePolicy::Manual));
     let metadata: Value = serde_json::from_str(after.metadata_json.as_deref().unwrap()).unwrap();
-    assert_eq!(metadata["execution_retry_count"], 3);
+    assert_eq!(metadata["execution_retry_count"], retry_count);
     assert!(metadata.get("deferred_dispatch").is_none());
 }
 

@@ -2733,7 +2733,13 @@ candidate route instead of a single adapter:
   become `UsageExhausted`, with reset hints parsed from structured fields,
   relative delays, epoch timestamps, RFC3339 timestamps, and CLI clock/date
   messages (clock-only messages use the executor host's local time unless
-  they explicitly say UTC). Assistant output text is
+  they explicitly say UTC; Codex dates may precede or follow the clock).
+  Numeric 429 signals require an HTTP/status context or an explicit error
+  `status`/`code` field; usage counters and costs are excluded. Codex stderr
+  diagnostics and errors marked `willRetry: true` do not trigger fallback.
+  Gemini capacity classification applies only after a failed process exit;
+  a clean exit remains successful even if the stream contained an error.
+  Assistant output text is
   never an input, and unclassifiable failures stay generic (no fallback).
 - **Cooldowns** — an in-memory, process-lifetime registry keyed by
   `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
@@ -2756,7 +2762,10 @@ candidate route instead of a single adapter:
   hint, CLI account cooldown defaults to 15 minutes; absent or malformed
   terminal hints use execution backoff. Each deferred attempt consumes one
   retry, and duplicate terminal delivery does not consume another. Exhaustion
-  blocks with explicit recovery actions. Workflow health shows `Retry Scheduled`
+  blocks with explicit recovery actions. A zero execution retry budget blocks
+  with a disabled-retries message; an exhausted budget is identified separately.
+  Stale project versions cannot settle the Task or schedule retries.
+  Workflow health shows `Retry Scheduled`
   or `Retry Queued` with the capacity/usage-limit reason while waiting;
   permanent unavailability (auth/install failure everywhere) blocks the task
   for manual reconfiguration with no automatic redispatch.

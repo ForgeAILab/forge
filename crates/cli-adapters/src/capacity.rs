@@ -14,7 +14,15 @@ pub(crate) struct CapacitySignal {
 
 impl CapacitySignal {
     pub fn observe(&mut self, error: &str) {
-        if let Some(retry_after) = classify(error, Local::now().fixed_offset()) {
+        self.record(classify(error, Local::now().fixed_offset()));
+    }
+
+    pub fn observe_error(&mut self, error: &Value) {
+        self.record(classify_error(error, Local::now().fixed_offset()));
+    }
+
+    fn record(&mut self, signal: Option<Option<Duration>>) {
+        if let Some(retry_after) = signal {
             match &mut self.retry_after {
                 Some(existing) if existing.is_none() => *existing = retry_after,
                 None => self.retry_after = Some(retry_after),
@@ -25,18 +33,54 @@ impl CapacitySignal {
 }
 
 fn classify(error: &str, now: DateTime<FixedOffset>) -> Option<Option<Duration>> {
+    if let Ok(value) = serde_json::from_str::<Value>(error) {
+        return classify_error(&value, now);
+    }
     let text = error.to_ascii_lowercase().replace(['_', '-'], " ");
     static LIMIT: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"usage ?limit|rate ?limit|too many requests|resource ?exhausted|insufficient quota|quota ?(?:exceeded|exhausted)|exceeded your current quota|you['’]ve hit your limit|\b429\b").unwrap()
+        Regex::new(r"usage ?limit|rate ?limit|too many requests|resource ?exhausted|insufficient quota|quota ?(?:exceeded|exhausted)|exceeded your current quota|you['’]ve hit your limit").unwrap()
     });
-    if !LIMIT.is_match(&text) {
+    static HTTP_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:http(?:/\d(?:\.\d)?)?(?:\s+status(?:\s+code)?)?|status(?:\s+code)?)\s*[:=]?\s*429\b").unwrap()
+    });
+    if !LIMIT.is_match(&text) && !HTTP_STATUS.is_match(error) {
         return None;
     }
-    let hint = serde_json::from_str::<Value>(error)
-        .ok()
-        .and_then(|value| json_retry_hint(&value, now))
-        .or_else(|| text_retry_hint(error, now));
+    let hint = text_retry_hint(error, now);
     Some(hint.map(|delay| delay.min(MAX_RESET_DELAY)))
+}
+
+/// Inspect error messages and explicit provider status fields, excluding usage
+/// counters, costs, and other event metadata. Read reset metadata only after
+/// the error has been identified as a capacity failure.
+fn classify_error(error: &Value, now: DateTime<FixedOffset>) -> Option<Option<Duration>> {
+    let signal = match error {
+        Value::String(text) => classify(text, now),
+        Value::Object(fields) => ["message", "errorMessage", "reason", "type", "status"]
+            .iter()
+            .filter_map(|key| fields.get(*key).and_then(Value::as_str))
+            .find_map(|text| classify(text, now))
+            .or_else(|| {
+                ["status", "code"]
+                    .iter()
+                    .filter_map(|key| fields.get(*key))
+                    .any(|value| value.as_i64() == Some(429) || value.as_str() == Some("429"))
+                    .then_some(None)
+            })
+            .or_else(|| {
+                ["error", "data", "cause", "details"]
+                    .iter()
+                    .filter_map(|key| fields.get(*key))
+                    .find_map(|value| classify_error(value, now))
+            }),
+        Value::Array(values) => values.iter().find_map(|value| classify_error(value, now)),
+        _ => None,
+    }?;
+    Some(
+        json_retry_hint(error, now)
+            .or(signal)
+            .map(|delay| delay.min(MAX_RESET_DELAY)),
+    )
 }
 
 fn until(at: DateTime<FixedOffset>, now: DateTime<FixedOffset>) -> Duration {
@@ -132,14 +176,19 @@ fn text_retry_hint(error: &str, now: DateTime<FixedOffset>) -> Option<Duration> 
         return Duration::try_from_secs_f64(seconds.min(MAX_RESET_DELAY.as_secs_f64())).ok();
     }
     static CLOCK: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)(?:try again at|resets?(?: at)?)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b(?:\s+on\s+([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}))?").unwrap()
+        Regex::new(r"(?i)(?:try again at|resets?(?: at)?)\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?\b(?:\s+on\s+(?P<month>[a-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<year>\d{4}))?").unwrap()
     });
-    let clock = CLOCK.captures(error)?;
-    let mut hour = clock[1].parse::<u32>().ok()?;
+    static DATE_FIRST_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:try again at|resets?(?: at)?)\s+(?P<month>[a-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<year>\d{4})\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?\b").unwrap()
+    });
+    let clock = CLOCK
+        .captures(error)
+        .or_else(|| DATE_FIRST_CLOCK.captures(error))?;
+    let mut hour = clock["hour"].parse::<u32>().ok()?;
     let minute = clock
-        .get(2)
+        .name("minute")
         .map_or(Some(0), |m| m.as_str().parse::<u32>().ok())?;
-    if let Some(meridiem) = clock.get(3) {
+    if let Some(meridiem) = clock.name("meridiem") {
         if !(1..=12).contains(&hour) {
             return None;
         }
@@ -156,8 +205,8 @@ fn text_retry_hint(error: &str, now: DateTime<FixedOffset>) -> Option<Duration> 
         *now.offset()
     };
     let local_now = now.with_timezone(&timezone);
-    let date = if let Some(month) = clock.get(4) {
-        let date = format!("{} {} {}", month.as_str(), &clock[5], &clock[6]);
+    let date = if let Some(month) = clock.name("month") {
+        let date = format!("{} {} {}", month.as_str(), &clock["day"], &clock["year"]);
         NaiveDate::parse_from_str(&date, "%B %d %Y")
             .or_else(|_| NaiveDate::parse_from_str(&date, "%b %d %Y"))
             .ok()?
@@ -167,7 +216,7 @@ fn text_retry_hint(error: &str, now: DateTime<FixedOffset>) -> Option<Duration> 
     let mut at = timezone
         .from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
         .single()?;
-    if clock.get(4).is_none() && at <= local_now {
+    if clock.name("month").is_none() && at <= local_now {
         at += chrono::Duration::days(1);
     }
     Some(until(at, now))
@@ -176,6 +225,48 @@ fn text_retry_hint(error: &str, now: DateTime<FixedOffset>) -> Option<Duration> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_429_requires_http_status_context() {
+        let now = Local::now().fixed_offset();
+        for error in [
+            "request failed after 429 tokens",
+            "request cost was 0.429 dollars",
+            "429",
+            r#"{"error":{"message":"model rejected","input_tokens":429}}"#,
+            r#"{"error":{"message":"model rejected","total_cost_usd":0.429}}"#,
+            r#"{"error":{"code":4290,"message":"model rejected"}}"#,
+            r#"{"error":{"status":429.5,"message":"model rejected"}}"#,
+            r#"{"error":{"message":"model rejected","diagnostic":"usage limit"}}"#,
+        ] {
+            assert_eq!(classify(error, now), None, "{error}");
+        }
+        for error in [
+            "status 429",
+            "HTTP 429",
+            "HTTP/1.1 429",
+            "429 Too Many Requests",
+            r#"{"error":{"status":429,"message":"request rejected"}}"#,
+            r#"{"error":{"code":429,"message":"request rejected"}}"#,
+        ] {
+            assert_eq!(classify(error, now), Some(None), "{error}");
+        }
+    }
+
+    #[test]
+    fn capacity_codex_reset_on_another_day_accepts_both_orders() {
+        let now = DateTime::parse_from_rfc3339("2026-09-30T23:00:00-04:00").unwrap();
+        for error in [
+            "You've hit your usage limit. Try again at Oct 1st, 2026 1:05 AM.",
+            "You've hit your usage limit. Try again at 1:05 AM on October 1st, 2026.",
+        ] {
+            assert_eq!(
+                classify(error, now),
+                Some(Some(Duration::from_secs(7500))),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn capacity_reset_times() {
