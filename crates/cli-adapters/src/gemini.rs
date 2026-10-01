@@ -242,12 +242,23 @@ impl CodingExecutorAdapter for GeminiAdapter {
 
         let stream = stream_result?;
 
+        if !status.success()
+            && let Some(retry_after) = stream.capacity.retry_after
+        {
+            return Err(ExecutorError::UsageExhausted {
+                retry_after,
+                usage_reports: Vec::new(),
+            });
+        }
+
         let (outcome, error) = if status.success() {
             (ExecutionOutcome::Completed, None)
         } else {
             (
                 ExecutionOutcome::Failed,
-                Some(format!("gemini exited with status {status}")),
+                stream
+                    .error
+                    .or_else(|| Some(format!("gemini exited with status {status}"))),
             )
         };
 
@@ -306,6 +317,34 @@ impl CodingExecutorAdapter for GeminiAdapter {
 struct StreamResult {
     summary: Option<String>,
     agent_session_id: Option<String>,
+    error: Option<String>,
+    capacity: crate::capacity::CapacitySignal,
+}
+
+fn observe_gemini_error(value: &serde_json::Value, stream: &mut StreamResult) {
+    let kind = value.get("type").and_then(serde_json::Value::as_str);
+    if matches!(
+        kind,
+        Some("assistant" | "tool_call" | "tool_use" | "tool_result")
+    ) {
+        return;
+    }
+    let error = value
+        .get("error")
+        .filter(|error| !error.is_null() && error.as_bool() != Some(false))
+        .or_else(|| {
+            (kind == Some("error")
+                || value.get("is_error").and_then(serde_json::Value::as_bool) == Some(true))
+            .then_some(value)
+        });
+    if let Some(error) = error {
+        let error = error
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        stream.capacity.observe(&error);
+        stream.error = Some(error);
+    }
 }
 
 /// Cap on the buffered stdout used to recover the final `--output-format=json`
@@ -344,6 +383,12 @@ async fn stream_child_output(
     let mut summary = None;
     let mut agent_session_id = None;
     let mut stdout_tail = String::new();
+    let mut stream = StreamResult {
+        summary: None,
+        agent_session_id: None,
+        error: None,
+        capacity: crate::capacity::CapacitySignal::default(),
+    };
     let mut saw_output = false;
     let first_output_timeout =
         tokio::time::sleep(Duration::from_secs(FIRST_OUTPUT_TIMEOUT_SECONDS));
@@ -365,6 +410,7 @@ async fn stream_child_output(
                             stdout_tail.push('\n');
                         }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                            observe_gemini_error(&json, &mut stream);
                             let kind = json
                                 .get("type")
                                 .and_then(|v| v.as_str())
@@ -409,6 +455,7 @@ async fn stream_child_output(
                 match line {
                     Ok(Some(line)) => {
                         saw_output = true;
+                        stream.capacity.observe(&line);
                         writer
                             .write(
                                 LogKind::Stderr,
@@ -427,9 +474,8 @@ async fn stream_child_output(
     // `--output-format=json` prints the final document pretty-printed over many
     // lines, so the per-line parse above never sees it. Recover the session id
     // and response text from the buffered tail.
-    if (agent_session_id.is_none() || summary.is_none())
-        && let Some(document) = parse_final_json_document(&stdout_tail)
-    {
+    if let Some(document) = parse_final_json_document(&stdout_tail) {
+        observe_gemini_error(&document, &mut stream);
         if agent_session_id.is_none() {
             agent_session_id = document
                 .get("session_id")
@@ -444,10 +490,9 @@ async fn stream_child_output(
         }
     }
 
-    Ok(StreamResult {
-        summary,
-        agent_session_id,
-    })
+    stream.summary = summary;
+    stream.agent_session_id = agent_session_id;
+    Ok(stream)
 }
 
 /// Parse the last top-level JSON object out of buffered stdout. Scans forward
@@ -530,6 +575,100 @@ fn executable_in_path(name: &str) -> bool {
 mod tests {
     use super::*;
     use executors::CommandOverrides;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gemini_capacity_preserves_exit_status_success_semantics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (message, exit_code) in [
+            ("model rejected", 0),
+            ("HTTP 429; retry in 90s", 0),
+            ("model rejected", 1),
+            ("HTTP 429; retry in 90s", 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("gemini.sh");
+            let document = serde_json::json!({"error": {"message": message}});
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s\\n' '{document}'\nexit {exit_code}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = GeminiAdapter::new()
+                .execute(ExecutionContext {
+                    task_id: "task-1".to_owned(),
+                    execution_id: "gemini-capacity".to_owned(),
+                    worktree_path: dir.path().display().to_string(),
+                    description: "do the task".to_owned(),
+                    agent_config: serde_json::json!({
+                        "base_command_override": script.display().to_string(),
+                        "auto_commit": false,
+                    }),
+                    logs_path: dir.path().join("gemini.jsonl").display().to_string(),
+                    heartbeat_interval_seconds: 30,
+                    max_turns: None,
+                    log_sender: None,
+                })
+                .await;
+            match (exit_code, message.starts_with("HTTP 429")) {
+                (0, _) => {
+                    let result = result.unwrap();
+                    assert_eq!(result.status, ExecutionOutcome::Completed);
+                    assert!(result.error.is_none());
+                }
+                (_, true) => assert!(matches!(
+                    result,
+                    Err(ExecutorError::UsageExhausted { retry_after: Some(delay), .. })
+                        if delay == Duration::from_secs(90)
+                )),
+                (_, false) => {
+                    let result = result.unwrap();
+                    assert_eq!(result.status, ExecutionOutcome::Failed);
+                    assert!(result.error.unwrap().contains(message));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_capacity_error_document_preserves_retry_hint() {
+        let document = parse_final_json_document(
+            "{\n  \"error\": {\n    \"code\": 429,\n    \"status\": \"RESOURCE_EXHAUSTED\",\n    \"details\": [{\"retryDelay\": \"90s\"}]\n  }\n}\n",
+        ).unwrap();
+        let mut stream = StreamResult {
+            summary: None,
+            agent_session_id: None,
+            error: None,
+            capacity: crate::capacity::CapacitySignal::default(),
+        };
+        observe_gemini_error(&document, &mut stream);
+        assert!(stream.error.is_some());
+        assert_eq!(
+            stream.capacity.retry_after,
+            Some(Some(Duration::from_secs(90)))
+        );
+    }
+
+    #[test]
+    fn gemini_capacity_classification_ignores_assistant_and_tool_text() {
+        let mut stream = StreamResult {
+            summary: None,
+            agent_session_id: None,
+            error: None,
+            capacity: crate::capacity::CapacitySignal::default(),
+        };
+        for value in [
+            serde_json::json!({"type": "assistant", "message": "rate limit"}),
+            serde_json::json!({"type": "tool_result", "error": {"code": 429}}),
+            serde_json::json!({"response": "usage limit reached"}),
+        ] {
+            observe_gemini_error(&value, &mut stream);
+        }
+        assert!(stream.capacity.retry_after.is_none());
+        assert!(stream.error.is_none());
+    }
 
     #[tokio::test]
     async fn discovery_advertises_current_models_and_aliases() {

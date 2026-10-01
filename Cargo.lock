@@ -699,11 +699,13 @@ version = "0.13.11"
 dependencies = [
  "api-types",
  "async-trait",
+ "chrono",
  "command-group",
  "dirs",
  "executors",
  "futures-util",
  "git",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

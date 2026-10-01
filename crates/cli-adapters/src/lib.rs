@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod capacity;
 pub mod claude;
 pub mod codex;
 pub mod command;

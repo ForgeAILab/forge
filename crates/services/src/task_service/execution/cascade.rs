@@ -3,6 +3,22 @@ use super::*;
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
+struct CapacityRetry<'a> {
+    retry_at: Option<&'a str>,
+    reason: &'static str,
+}
+
+enum ExecutionRetryDisposition {
+    Scheduled,
+    NotScheduled(&'static str),
+}
+
+impl ExecutionRetryDisposition {
+    fn is_scheduled(&self) -> bool {
+        matches!(self, Self::Scheduled)
+    }
+}
+
 /// Holds one Task's slot in `TaskService::completion_cascades` and frees it on
 /// drop, including when the cascade returns early or errors. Serializing by
 /// Task prevents two completed same-role executions from publishing different
@@ -1200,10 +1216,9 @@ impl TaskService {
     }
 
     /// Handle an execution that failed because no executor candidate could
-    /// run (`FailureKind::ExecutorUnavailable`). Never consumes the task's
-    /// execution retry budget: transient exhaustion (a retry time is known)
-    /// schedules a deferred dispatch; permanent unavailability blocks the
-    /// task for manual reconfiguration with no automatic redispatch loop.
+    /// run (`FailureKind::ExecutorUnavailable`). Transient capacity failures
+    /// use the bounded execution retry budget; permanent unavailability
+    /// blocks for manual reconfiguration.
     pub(crate) async fn annotate_executor_unavailable_block(
         &self,
         execution: &Execution,
@@ -1228,81 +1243,44 @@ impl TaskService {
             return Ok(());
         }
 
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "invalid task metadata for {}: {error}",
-                task.id
-            ))
-        })?;
-
-        if execution.role != "interactive" {
-            if let Some(retry_at) = retry_at.as_deref() {
-                let dispatch_at = executor_unavailable_dispatch_time(retry_at, &task.id);
-                let already_recorded = metadata
-                    .extra
-                    .get("executor_unavailable_execution_id")
-                    .and_then(Value::as_str)
-                    == Some(execution.id.as_str());
-                if already_recorded {
-                    if !self
-                        .latest_execution_authority_is_current(&task, execution, project.version)
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                } else {
-                    if !crate::deferred_dispatch::set_with_mutations_for_latest_execution(
-                        &self.db,
-                        &task,
-                        super::latest_execution_authority(execution, project.version),
-                        &task.status,
-                        &dispatch_at,
-                        "executor unavailable; retrying when usage recovers",
-                        vec![db::TaskMetadataMutation::Set {
-                            key: "executor_unavailable_execution_id".to_owned(),
-                            value: Value::String(execution.id.clone()),
-                        }],
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                ExecutionRepo::update(
-                    &*self.db,
-                    db::UpdateExecution {
-                        id: execution.id.clone(),
-                        status: None,
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: Some(Some(db::ResumePolicy::Auto)),
-                        stopped_at: None,
-                        agent_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: None,
-                        error: None,
-                        executor_config_snapshot_json: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-                tracing::info!(
-                    task_id = %task.id,
-                    execution_id = %execution.id,
-                    %dispatch_at,
-                    "all executor candidates unavailable; deferred dispatch scheduled without consuming retry budget"
-                );
-                return Ok(());
-            }
-        }
-
         if task_blocked_by_execution(&task, &execution.id) {
             return Ok(());
         }
+        let usage_limited = attempts.as_array().is_some_and(|attempts| {
+            attempts.iter().any(|attempt| {
+                attempt.get("outcome").and_then(Value::as_str) == Some("usage_exhausted")
+            })
+        });
+        let transient = retry_at.is_some() || usage_limited;
+        let retry_block_reason = if transient {
+            let current_state = workflow
+                .states
+                .iter()
+                .find(|state| state.name == task.status);
+            match self
+                .maybe_schedule_execution_retry(
+                    execution,
+                    &task,
+                    project.version,
+                    current_state.map(|state| &state.config),
+                    current_state.and_then(|state| state.gate_config.as_ref()),
+                    Some(CapacityRetry {
+                        retry_at: retry_at.as_deref(),
+                        reason: if usage_limited {
+                            "usage limit"
+                        } else {
+                            "provider capacity unavailable"
+                        },
+                    }),
+                )
+                .await?
+            {
+                ExecutionRetryDisposition::Scheduled => return Ok(()),
+                ExecutionRetryDisposition::NotScheduled(reason) => Some(reason),
+            }
+        } else {
+            None
+        };
 
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorUnavailable,
@@ -1317,10 +1295,23 @@ impl TaskService {
                 id: Some(execution.id.clone()),
                 log_path: execution.logs_path.clone(),
             }),
-            message: Some(execution.error.clone().unwrap_or_else(|| {
-                "No executor candidate is available (check CLI installs and authentication)"
-                    .to_owned()
-            })),
+            message: Some(
+                if let Some(reason) = retry_block_reason.filter(|_| execution.role != "interactive")
+                {
+                    format!(
+                        "Provider capacity {reason}: {}",
+                        execution
+                            .error
+                            .as_deref()
+                            .unwrap_or("no executor candidate available")
+                    )
+                } else {
+                    execution.error.clone().unwrap_or_else(|| {
+                        "No executor candidate is available (check CLI installs and authentication)"
+                            .to_owned()
+                    })
+                },
+            ),
             hook: None,
             recovery_actions: vec![
                 api_types::RecoveryAction::Reexecute,
@@ -1444,8 +1435,10 @@ impl TaskService {
                     project.version,
                     Some(&current_state.config),
                     current_state.gate_config.as_ref(),
+                    None,
                 )
                 .await?
+                .is_scheduled()
         {
             return Ok(());
         }
@@ -1609,13 +1602,18 @@ impl TaskService {
         project_version: i64,
         state_config: Option<&Value>,
         gate_config: Option<&api_types::GateConfig>,
-    ) -> Result<bool> {
+        capacity_retry: Option<CapacityRetry<'_>>,
+    ) -> Result<ExecutionRetryDisposition> {
         if execution.role == "interactive" {
             // Interactive runs are user-prompted and do not have a durable dispatcher target yet.
-            return Ok(false);
+            return Ok(ExecutionRetryDisposition::NotScheduled(
+                "automatic retry is unavailable for interactive executions",
+            ));
         }
         if super::super::execution_dispatch_project_version(execution) != Some(project_version) {
-            return Ok(false);
+            return Ok(ExecutionRetryDisposition::NotScheduled(
+                "automatic retry was skipped because the project version changed",
+            ));
         }
 
         let budget = crate::task_service::config::runtime_retry_budget(
@@ -1625,7 +1623,9 @@ impl TaskService {
             gate_config,
         )?;
         if budget <= 0 {
-            return Ok(false);
+            return Ok(ExecutionRetryDisposition::NotScheduled(
+                "automatic retries are disabled by the execution retry budget",
+            ));
         }
 
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
@@ -1649,7 +1649,9 @@ impl TaskService {
                 .latest_execution_authority_is_current(task, execution, project_version)
                 .await?
             {
-                return Ok(false);
+                return Ok(ExecutionRetryDisposition::NotScheduled(
+                    "automatic retry was skipped because execution authority changed",
+                ));
             }
             ExecutionRepo::update(
                 &*self.db,
@@ -1673,10 +1675,12 @@ impl TaskService {
                 },
             )
             .await?;
-            return Ok(true);
+            return Ok(ExecutionRetryDisposition::Scheduled);
         }
         if retry_count >= budget as u64 {
-            return Ok(false);
+            return Ok(ExecutionRetryDisposition::NotScheduled(
+                "retry budget exhausted",
+            ));
         }
 
         let now = now_rfc3339();
@@ -1684,14 +1688,31 @@ impl TaskService {
         let delay_seconds = (10_u64
             .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1) as u32)))
         .min(300);
-        let next_dispatch_at = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
+        let next_dispatch_at = if let Some(capacity) = &capacity_retry {
+            executor_unavailable_dispatch_time(capacity.retry_at, &task.id, delay_seconds)
+        } else {
+            chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64)
+        };
+        let reason = if let Some(capacity) = &capacity_retry {
+            format!("{}; capacity retry (attempt {attempt})", capacity.reason)
+        } else {
+            format!("execution retry (attempt {attempt})")
+        };
+        let delay_seconds = if capacity_retry.is_some() {
+            ((next_dispatch_at - chrono::Utc::now())
+                .num_milliseconds()
+                .max(0) as u64)
+                .div_ceil(1000)
+        } else {
+            delay_seconds
+        };
         if !crate::deferred_dispatch::set_with_mutations_for_latest_execution(
             &self.db,
             task,
             super::latest_execution_authority(execution, project_version),
             &task.status,
             &next_dispatch_at.to_rfc3339(),
-            &format!("execution retry (attempt {attempt})"),
+            &reason,
             vec![
                 db::TaskMetadataMutation::Increment {
                     key: "execution_retry_count".to_owned(),
@@ -1709,7 +1730,9 @@ impl TaskService {
         )
         .await?
         {
-            return Ok(false);
+            return Ok(ExecutionRetryDisposition::NotScheduled(
+                "automatic retry was skipped because execution authority changed",
+            ));
         }
         ExecutionRepo::update(
             &*self.db,
@@ -1754,7 +1777,7 @@ impl TaskService {
                 next_dispatch_at: next_dispatch_at.to_rfc3339(),
             },
         });
-        Ok(true)
+        Ok(ExecutionRetryDisposition::Scheduled)
     }
 
     async fn latest_execution_authority_is_current(
@@ -2296,8 +2319,10 @@ impl TaskService {
                 project.version,
                 current_state.map(|state| &state.config),
                 current_state.and_then(|state| state.gate_config.as_ref()),
+                None,
             )
             .await?
+            .is_scheduled()
         {
             review_details["execution_retry"] = json!({
                 "execution_id": execution.id,
@@ -2901,23 +2926,28 @@ fn append_reviewer_log_text(payload: &Value, message: &mut String) {
     }
 }
 
-/// Dispatch time for a transient executor-unavailable retry: the structured
-/// retry hint plus a small deterministic jitter, floored at ten seconds out
-/// so a stale hint cannot hot-loop.
-fn executor_unavailable_dispatch_time(retry_at: &str, task_id: &str) -> String {
+/// Retry hint plus deterministic jitter, bounded by backoff and six hours.
+fn executor_unavailable_dispatch_time(
+    retry_at: Option<&str>,
+    task_id: &str,
+    backoff_seconds: u64,
+) -> chrono::DateTime<chrono::Utc> {
     let jitter_seconds = i64::from(
         task_id
             .bytes()
             .fold(0u8, |acc, byte| acc.wrapping_add(byte))
             % 30,
     );
-    let hinted = chrono::DateTime::parse_from_rfc3339(retry_at)
+    let now = chrono::Utc::now();
+    let floor = now + chrono::Duration::seconds(backoff_seconds as i64);
+    let hinted = retry_at
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .map(|at| at.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now() + chrono::Duration::minutes(15));
-    let floor = chrono::Utc::now() + chrono::Duration::seconds(10);
+        .unwrap_or(floor)
+        .min(now + chrono::Duration::hours(6));
     (hinted + chrono::Duration::seconds(jitter_seconds))
         .max(floor)
-        .to_rfc3339()
+        .min(now + chrono::Duration::hours(6))
 }
 
 pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> bool {
