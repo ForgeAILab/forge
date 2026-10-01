@@ -337,6 +337,7 @@ Your inquiry id is {inquiry_id}."
             // An inquiry works in a scratch directory that holds no
             // repository, so it takes the configured baseline with no Project
             // to layer over it.
+            server_state_card: None,
             command_allowlist: Some(embedded_agents.effective_command_allowlist(None).await),
             cancellation: turn_cancellation.clone(),
         };

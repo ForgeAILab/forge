@@ -282,6 +282,9 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
     pub input: String,
+    /// Bounded server context, sent as a separate final user-role content part.
+    /// Never populated by user text or inferred from labels in that text.
+    pub server_state_card: Option<String>,
     /// Programs this turn's workspace commands may spawn, resolved by the
     /// caller from owner configuration and the owning Project. `None` uses
     /// the built-in set; the composition never takes this from model input.

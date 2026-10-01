@@ -846,8 +846,12 @@ pub fn render_product_genesis_prompt(
         decisions_still_required: bounded_items(&context.decisions_still_required),
         ..crate::MainOperatingSkillContext::default()
     };
-    crate::render_main_operating_skill(&operating_context)
-        .expect("discovering Product Genesis always activates the Main operating skill")
+    format!(
+        "{}\n\n{}",
+        crate::render_main_operating_skill(&operating_context)
+            .expect("discovering Product Genesis always activates the Main operating skill"),
+        crate::operating_skills::render_main_state_card(&operating_context),
+    )
 }
 
 fn bounded_text(value: &str) -> String {

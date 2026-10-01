@@ -1,0 +1,52 @@
+{
+  "manifest": {
+    "scope_type": "agent_chat",
+    "policy_revision": "forge-agent-chat-context-policy-1",
+    "domain_revision": "forge-agent-chat-server-context-1",
+    "runtime_manifest_id": null,
+    "runtime_manifest_fingerprint": null,
+    "lcm_binding_revision": null
+  },
+  "sources": [
+    {
+      "ordinal": 0,
+      "source_type": "server_operating_skill",
+      "source_id": "operating_skill:forge.project.orchestration/v1",
+      "source_revision": "forge.project.orchestration/v1@17",
+      "fragment_fingerprint": "16e9e0d2f390ef39309fb28f3266ba7920ef475fcae39ccfaa408366137efd1a",
+      "selection_reason": "server_owned_project_operating_skill",
+      "disposition": "included",
+      "retention_priority": 100
+    },
+    {
+      "ordinal": 1,
+      "source_type": "project_identity",
+      "source_id": "project_context:project_identity:11111111-1111-4111-8111-111111111111",
+      "source_revision": "v4",
+      "fragment_fingerprint": "757ce978e77f485046a3fc30462cf28cbc86c1d6c966052d00ea069135ec4629",
+      "selection_reason": "authenticated_project_identity",
+      "disposition": "included",
+      "retention_priority": 100
+    },
+    {
+      "ordinal": 2,
+      "source_type": "project_authority",
+      "source_id": "project_context:project_authority:11111111-1111-4111-8111-111111111111",
+      "source_revision": "legacy_unverified",
+      "fragment_fingerprint": "0d0526cc719ac152761a4c89fd7ab5281769828e9fd818087781cf1b1bd70bc5",
+      "selection_reason": "legacy_setup_restriction",
+      "disposition": "included",
+      "retention_priority": 100
+    },
+    {
+      "ordinal": 3,
+      "source_type": "project_setup",
+      "source_id": "project_context:project_setup:11111111-1111-4111-8111-111111111111",
+      "source_revision": "charter_adoption_required",
+      "fragment_fingerprint": "3bcc0783bc462b50f05b620a3cd0e952334d2d99c5b0e9e07d038348371bf663",
+      "selection_reason": "legacy_setup_restriction",
+      "disposition": "included",
+      "retention_priority": 100
+    }
+  ]
+}

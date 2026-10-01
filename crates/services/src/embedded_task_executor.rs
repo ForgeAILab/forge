@@ -453,6 +453,7 @@ impl EmbeddedTaskExecutor {
             system_prompt: system_prompt.clone(),
             history: Vec::new(),
             input,
+            server_state_card: None,
             command_allowlist: Some(command_allowlist.clone()),
             cancellation: cancellation.clone(),
         };
