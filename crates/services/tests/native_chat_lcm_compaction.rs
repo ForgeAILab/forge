@@ -183,6 +183,7 @@ async fn inquiry_fixture(
         system_prompt: Some("Answer this inquiry only.".to_owned()),
         history: Vec::new(),
         input: "first-inquiry-question".to_owned(),
+        server_state_card: None,
         command_allowlist: None,
         cancellation: CancellationToken::new(),
     };
@@ -549,6 +550,7 @@ async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
                     cancellation: CancellationToken::new(),
                 },
@@ -714,6 +716,7 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
                     cancellation: CancellationToken::new(),
                 },
@@ -805,6 +808,7 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                 ),
                 history: Vec::new(),
                 input: format!("turn {}: continue after compaction", compaction_turn + 1),
+                server_state_card: None,
                 command_allowlist: None,
                 cancellation: CancellationToken::new(),
             },
@@ -1011,6 +1015,7 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
                 system_prompt: Some("Implement the assigned Task.".to_owned()),
                 history,
                 input: "continue the implementation".to_owned(),
+                server_state_card: None,
                 command_allowlist: None,
                 cancellation: CancellationToken::new(),
             },
