@@ -743,8 +743,8 @@ pub fn stable_report_id(
 
 /// Structured disposition of a failed execution. `TaskFailed` keeps the
 /// existing budgeted retry semantics; `ExecutorUnavailable` means no
-/// executor candidate could run (quota, missing CLI, or auth) and must not
-/// consume task retry budget.
+/// executor candidate could run (quota, missing CLI, or auth). Transient
+/// capacity failures use the bounded task execution retry budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionFailureClass {
     TaskFailed,

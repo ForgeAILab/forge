@@ -676,8 +676,11 @@ A CLI profile's `config_json` may include an ordered `fallbacks` array of
 executor reports quota exhaustion or is unavailable, execution falls back to
 the next candidate (same CLI with a different account profile, or a
 different CLI); a task interrupted because every candidate is unavailable
-carries the `executor_unavailable` failure kind and does not consume its
-execution retry budget. Duplicate candidates and unknown executor types are
+carries the `executor_unavailable` failure kind. Usage/rate limits and HTTP 429
+advance the fallback chain. If capacity remains unavailable, Forge schedules
+a deferred retry using the provider reset hint (at most six hours) or backoff,
+within the Task's execution retry budget; budget exhaustion blocks for recovery.
+Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
 [architecture.md](architecture.md#executor-fallback-chains).
 
@@ -2411,7 +2414,9 @@ Task `workflow_health` also represents active non-agent work. A running
 interactive execution reports `kind: "running"`, label `Interactive`. A
 deferred execution retry reports `kind: "waiting_for_agent"` with label
 `Retry Scheduled` before its eligibility time and `Retry Queued` afterward;
-the latter means it is waiting for capacity, not wedged or idle.
+the latter means it is waiting for capacity, not wedged or idle. Provider
+usage-limit retries include their capacity reason and scheduled time in the
+health message, and only become blocked once execution retries are exhausted.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:

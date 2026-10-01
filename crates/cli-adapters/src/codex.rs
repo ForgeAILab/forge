@@ -922,6 +922,8 @@ impl CodexAdapter {
         let mut outcome = run.outcome.unwrap_or(ExecutionOutcome::Failed);
         let mut summary = run.summary;
         let mut usage_reports = run.usage_reports;
+        let mut provider_error = run.error;
+        let mut capacity = run.capacity;
         for report in &mut usage_reports {
             report.fill_identity(None, config.model.as_deref());
         }
@@ -964,6 +966,12 @@ impl CodexAdapter {
                     .await
                 {
                     outcome = followup.outcome.unwrap_or(outcome);
+                    if followup.error.is_some() {
+                        provider_error = followup.error;
+                    }
+                    if followup.capacity.retry_after.is_some() {
+                        capacity = followup.capacity;
+                    }
                     if let Some(s) = followup.summary {
                         summary = Some(s);
                     }
@@ -976,11 +984,18 @@ impl CodexAdapter {
         }
 
         if outcome != ExecutionOutcome::Completed {
+            if outcome == ExecutionOutcome::Failed
+                && let Some(retry_after) = capacity.retry_after
+            {
+                return Err(ExecutorError::UsageExhausted {
+                    retry_after,
+                    usage_reports,
+                });
+            }
             let error = match outcome {
                 ExecutionOutcome::Completed => None,
                 ExecutionOutcome::Cancelled => Some("codex execution cancelled".to_owned()),
-                ExecutionOutcome::Failed => run
-                    .error
+                ExecutionOutcome::Failed => provider_error
                     .or_else(|| summary.clone())
                     .or_else(|| Some("codex turn failed".to_owned())),
             };
@@ -2565,6 +2580,119 @@ mod tests {
                 .unwrap()
                 .ends_with("auth.json")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_capacity_limit_uses_fallback_chain() {
+        use executors::{AdapterRegistry, FallbackExecutor, RouteAttemptOutcome, TaskExecutor};
+
+        struct FakeCodex(CodexAdapter);
+
+        #[async_trait]
+        impl CodingExecutorAdapter for FakeCodex {
+            fn kind(&self) -> ExecutorKind {
+                ExecutorKind::Codex
+            }
+            fn check_availability(&self) -> AvailabilityInfo {
+                AvailabilityInfo {
+                    status: AvailabilityStatus::Authenticated,
+                    authenticated_at: None,
+                    config_path: None,
+                }
+            }
+            async fn discover_options(
+                &self,
+                ctx: DiscoverContext,
+            ) -> Result<DiscoveredOptions, ExecutorError> {
+                self.0.discover_options(ctx).await
+            }
+            async fn execute(
+                &self,
+                ctx: ExecutionContext,
+            ) -> Result<ExecutionResult, ExecutorError> {
+                self.0.execute(ctx).await
+            }
+            async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
+                self.0.cancel(execution_id).await
+            }
+        }
+
+        for (rpc_failure, with_fallback) in [(false, true), (true, true), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("capacity-codex.sh");
+            let error =
+                json!({"message": "You've hit your usage limit", "retry_after_seconds": 90});
+            let terminal = if rpc_failure {
+                json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32000, "message": "HTTP 429", "data": error}})
+            } else {
+                json!({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "error": error}}})
+            };
+            let turn_response = if rpc_failure {
+                ""
+            } else {
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'"
+            };
+            fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+read line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read line || exit 1
+read line || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"thread":{{"id":"thread-1"}}}}}}'
+read line || exit 1
+{turn_response}
+printf '%s\n' '{}'
+"#,
+                    terminal.to_string().replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&script).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&script, permissions).unwrap();
+            }
+            let primary = json!({"executor_type": "codex", "config": {"base_command_override": script.display().to_string(), "auto_commit": false}});
+            let mut candidates = vec![primary.clone()];
+            if with_fallback {
+                candidates.push(json!({"executor_type": "shell", "config": {}}));
+            }
+            let mut registry = AdapterRegistry::new();
+            registry.register(Box::new(FakeCodex(CodexAdapter::new())));
+            registry.register(Box::new(crate::ShellAdapter::new()));
+            let result = FallbackExecutor::new(Arc::new(registry)).execute(ExecutionContext {
+                task_id: "task-1".to_owned(), execution_id: "exec-capacity".to_owned(),
+                worktree_path: dir.path().display().to_string(), description: "printf fallback-ok".to_owned(),
+                agent_config: json!({"executor_type": "codex", "config": primary["config"], "routing": {"policy": "ordered_fallback_v1", "candidates": candidates}}),
+                logs_path: dir.path().join("capacity.jsonl").display().to_string(), heartbeat_interval_seconds: 30, max_turns: None, log_sender: None,
+            }).await.unwrap();
+            assert_eq!(
+                result.route_attempts[0].outcome,
+                RouteAttemptOutcome::UsageExhausted
+            );
+            if with_fallback {
+                assert_eq!(result.status, ExecutionOutcome::Completed);
+                assert_eq!(result.route_attempts.len(), 2);
+                assert_eq!(
+                    result.route_attempts[1].outcome,
+                    RouteAttemptOutcome::Completed
+                );
+                assert_eq!(
+                    result.resolved_candidate.unwrap().executor_type,
+                    ExecutorKind::Shell
+                );
+            } else {
+                assert_eq!(result.status, ExecutionOutcome::Failed);
+                assert_eq!(
+                    result.failure_class,
+                    Some(executors::ExecutionFailureClass::ExecutorUnavailable)
+                );
+                assert_eq!(result.retry_after, Some(std::time::Duration::from_secs(90)));
+            }
+        }
     }
 
     #[tokio::test]

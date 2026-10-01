@@ -49,6 +49,7 @@ pub struct TurnRunResult {
     pub summary: Option<String>,
     pub error: Option<String>,
     pub usage_reports: Vec<UsageReport>,
+    pub(crate) capacity: crate::capacity::CapacitySignal,
 }
 
 impl CodexClient {
@@ -228,6 +229,7 @@ impl CodexClient {
                     .await?;
                 }
                 Some(line) = stderr_rx.recv() => {
+                    result.capacity.observe(&line);
                     write_log(&writer, LogKind::Stderr, json!({ "line": line })).await?;
                 }
                 message = self.messages.recv() => {
@@ -549,6 +551,16 @@ fn is_sub_agent_event(raw: &Value, root_thread_id: &str) -> bool {
 
 fn set_error_if_present(raw: &Value, result: &mut TurnRunResult) -> Option<String> {
     let error = super::codex_event_error_message(raw)?;
+    result.capacity.observe(&error);
+    for path in [
+        "/params/turn/error",
+        "/params/error",
+        "/params/status/error",
+    ] {
+        if let Some(payload) = raw.pointer(path) {
+            result.capacity.observe(&payload.to_string());
+        }
+    }
 
     let should_replace = match result.error.as_deref() {
         None => true,
@@ -739,6 +751,45 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[test]
+    fn codex_capacity_errors_preserve_structured_reset_hints() {
+        let mut result = TurnRunResult::default();
+        set_error_if_present(
+            &json!({
+                "method": "error",
+                "params": {"error": {"message": "You've hit your usage limit", "retry_after_seconds": 90}}
+            }),
+            &mut result,
+        );
+        assert_eq!(
+            result.capacity.retry_after,
+            Some(Some(std::time::Duration::from_secs(90)))
+        );
+
+        let mut result = TurnRunResult::default();
+        set_error_if_present(
+            &json!({
+                "method": "turn/completed",
+                "params": {"turn": {"error": {"status": 429, "message": "request rejected"}}}
+            }),
+            &mut result,
+        );
+        assert_eq!(result.capacity.retry_after, Some(None));
+    }
+
+    #[test]
+    fn codex_capacity_classification_ignores_assistant_and_tool_text() {
+        let mut result = TurnRunResult::default();
+        for raw in [
+            json!({"method": "item/agentMessage/delta", "params": {"delta": "You've hit your usage limit"}}),
+            json!({"method": "item/completed", "params": {"item": {"type": "commandExecution", "error": {"message": "HTTP 429"}}}}),
+            json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+        ] {
+            assert!(set_error_if_present(&raw, &mut result).is_none());
+        }
+        assert!(result.capacity.retry_after.is_none());
+    }
 
     #[derive(Clone, Default)]
     struct TestChatToolHandler {

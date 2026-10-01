@@ -1515,7 +1515,7 @@ the Task workflow's optional `max_turns` policy and optional execution hard
 deadline. Exhausted provider attempts on a native Task are classified as
 `ExecutorUnavailable`, use the ordinary provider cooldown when no retry hint
 survives the runtime boundary, and defer every execution role (including
-planner/reviewer) without consuming the Task's execution retry budget. Model
+planner/reviewer) within the Task's execution retry budget. Model
 context/output bounds and finite failed-provider retry policy remain intrinsic
 runtime safety constraints, not productive-work turn or wall-clock budgets.
 If an explicit runtime tool/time/output policy produces a limit, the failure
@@ -2728,7 +2728,12 @@ candidate route instead of a single adapter:
   precheck (`check_candidate_availability`, defaulting to the family-level
   check). Real task failures terminate the chain immediately. Adapters
   classify only structured signals (Smith stream events / result statuses,
-  Claude Code stderr and `is_error` result events); assistant output text is
+  Codex protocol errors, Claude Code stderr and `is_error` result events,
+  and Gemini stderr/error documents). Usage/rate-limit and HTTP 429 forms
+  become `UsageExhausted`, with reset hints parsed from structured fields,
+  relative delays, epoch timestamps, RFC3339 timestamps, and CLI clock/date
+  messages (clock-only messages use the executor host's local time unless
+  they explicitly say UTC). Assistant output text is
   never an input, and unclassifiable failures stay generic (no fallback).
 - **Cooldowns** — an in-memory, process-lifetime registry keyed by
   `AccountKey` (the quota pool: Smith's resolved provider, Codex's profile,
@@ -2744,9 +2749,15 @@ candidate route instead of a single adapter:
   notifications without them degrade to generic executor-failed handling.
   The service layer maps `ExecutorUnavailable` to
   `FailureKind::ExecutorUnavailable` from these fields only — never prose.
-- **Availability recovery** — `executor_unavailable` bypasses the execution
-  retry budget entirely. Transient exhaustion (retry time known) schedules a
-  deferred dispatch at the structured `retry_at` plus deterministic jitter;
+- **Availability recovery** — transient `executor_unavailable` failures use
+  the existing finite execution retry budget. Capacity exhaustion schedules
+  a deferred dispatch at the structured `retry_at` plus deterministic jitter,
+  bounded by exponential backoff and a maximum six-hour wait. Without a reset
+  hint, CLI account cooldown defaults to 15 minutes; absent or malformed
+  terminal hints use execution backoff. Each deferred attempt consumes one
+  retry, and duplicate terminal delivery does not consume another. Exhaustion
+  blocks with explicit recovery actions. Workflow health shows `Retry Scheduled`
+  or `Retry Queued` with the capacity/usage-limit reason while waiting;
   permanent unavailability (auth/install failure everywhere) blocks the task
   for manual reconfiguration with no automatic redispatch.
 - **Sticky selection and resume** — the winner's resolved config is written

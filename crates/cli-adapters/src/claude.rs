@@ -49,16 +49,15 @@ struct StreamResult {
 /// `is_error` result events). Assistant output text is never an input.
 #[derive(Default)]
 struct AvailabilitySignals {
-    limit_retry_after: Option<Option<Duration>>,
+    capacity: crate::capacity::CapacitySignal,
     auth_failure: Option<String>,
     saw_error_result: bool,
 }
 
 impl AvailabilitySignals {
-    /// Classify one line from an error channel. Recognizes the structured
-    /// API error JSON claude-code echoes (`error.type`) and the CLI's fixed
-    /// usage-limit signature (`... usage limit reached|<epoch-seconds>`).
+    /// Classify provider error JSON and CLI error-channel diagnostics.
     fn classify_error_channel_line(&mut self, line: &str) {
+        self.capacity.observe(line);
         let structured_kind = serde_json::from_str::<serde_json::Value>(line)
             .ok()
             .and_then(|value| {
@@ -70,9 +69,6 @@ impl AvailabilitySignals {
             });
         if let Some(kind) = structured_kind {
             match kind.as_str() {
-                "rate_limit_error" => {
-                    self.limit_retry_after.get_or_insert(None);
-                }
                 "authentication_error" | "permission_error" => {
                     self.auth_failure.get_or_insert(kind);
                 }
@@ -82,22 +78,7 @@ impl AvailabilitySignals {
         }
 
         let lowered = line.to_ascii_lowercase();
-        if lowered.contains("usage limit reached") {
-            let retry_after = line.rsplit('|').next().and_then(|suffix| {
-                let epoch_seconds = suffix.trim().parse::<u64>().ok()?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()?
-                    .as_secs();
-                Some(Duration::from_secs(epoch_seconds.saturating_sub(now)))
-            });
-            // A later line with an epoch hint may upgrade an earlier bare one.
-            match &mut self.limit_retry_after {
-                Some(existing) if existing.is_none() => *existing = retry_after,
-                Some(_) => {}
-                slot @ None => *slot = Some(retry_after),
-            }
-        } else if lowered.contains("invalid api key")
+        if lowered.contains("invalid api key")
             || lowered.contains("please run /login")
             || lowered.contains("oauth token has expired")
         {
@@ -127,6 +108,7 @@ impl AvailabilitySignals {
             return;
         }
         self.saw_error_result = true;
+        self.capacity.observe(&value.to_string());
         if let Some(text) = value.get("result").and_then(|v| v.as_str()) {
             self.classify_error_channel_line(text);
         }
@@ -140,7 +122,7 @@ impl AvailabilitySignals {
         if exit_ok && !self.saw_error_result {
             return None;
         }
-        if let Some(retry_after) = self.limit_retry_after {
+        if let Some(retry_after) = self.capacity.retry_after {
             return Some(ExecutorError::UsageExhausted {
                 retry_after,
                 usage_reports,
@@ -1097,6 +1079,19 @@ mod tests {
                 retry_after: None,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn claude_capacity_error_result_preserves_retry_hint() {
+        let mut signals = AvailabilitySignals::default();
+        signals.classify_stdout_event(
+            r#"{"type":"result","is_error":true,"result":"You've hit your limit · resets in 45m"}"#,
+        );
+        assert!(matches!(
+            signals.into_availability_error(true, Vec::new()),
+            Some(ExecutorError::UsageExhausted { retry_after: Some(delay), .. })
+                if delay == Duration::from_secs(45 * 60)
         ));
     }
 
