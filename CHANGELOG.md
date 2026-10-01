@@ -21,6 +21,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   builds, existing databases and custom migration directories are unchanged.
   `libsqlite3-sys`, `sqlx-core` and `sqlx-sqlite` build at `opt-level = 3` in
   the dev profile. See `docs/ci.md`.
+- SQLite connections now use `synchronous=NORMAL` under WAL. A new database is
+  created in incremental auto-vacuum mode and Forge releases its free pages in
+  the background. An existing database keeps its mode until you convert it
+  once, with the server stopped: `forge --convert-db-to-incremental-vacuum`.
+  The conversion runs a full `VACUUM`, which locks the database and can need
+  up to twice the database's size in free disk space.
+- Operator status and the Operations page show each event consumer's lag, its
+  oldest pending event and whether it is stalled, plus the database's vacuum
+  mode and free pages. A consumer that has pending events and has not advanced
+  for `event_consumer_stall_seconds` (default 300) raises an attention issue.
+- The server holds `runtime.lock` in the data directory while it runs. A
+  second Forge server, or a database conversion, on the same data directory
+  now refuses to start.
 
 ### Fixed
 
