@@ -32,6 +32,11 @@ pub(crate) fn placement_update(placement: &WorkspacePlacement) -> UpdateWorkspac
 }
 
 pub async fn sweep_expired_reservations(db: &SqliteDb, now: &str) -> Result<u64> {
+    let expired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_placement WHERE state IN ('reserved', 'preparing') AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?))")
+        .bind(now).fetch_one(db.pool()).await?;
+    if !expired {
+        return Ok(0);
+    }
     let mut transaction = db::begin_immediate(db.pool()).await?;
     let expired = sweep_expired_reservations_in_tx(&mut transaction, now).await?;
     transaction.commit().await?;

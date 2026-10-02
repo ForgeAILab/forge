@@ -228,6 +228,7 @@ mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),

@@ -821,6 +821,7 @@ pub async fn seed_startable_execution_for_daemon(
     DaemonRepo::update_report(
         &*state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.to_owned(),
             last_report_at: report_at.clone(),
             status: DaemonStatus::Online,
@@ -1295,6 +1296,7 @@ pub async fn seed_embedded_daemon(state: &AppState) -> String {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: uuid::Uuid::new_v4().to_string(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "embedded-test-host".to_owned(),

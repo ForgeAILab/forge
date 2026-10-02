@@ -212,6 +212,7 @@ async fn seed_daemon(db: &db::SqliteDb, machine_id: &str) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: machine_id.to_owned(),
             hostname: "test-host".to_owned(),

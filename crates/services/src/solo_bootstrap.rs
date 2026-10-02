@@ -2712,6 +2712,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: db::new_uuid_v4(),
                 machine_id: "solo-test-machine".to_owned(),
                 hostname: "localhost".to_owned(),
@@ -2732,6 +2733,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon.id.clone(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,
@@ -2853,6 +2855,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: agent.daemon_id.expect("daemon id"),
                 last_report_at: db::now_rfc3339(),
                 status: DaemonStatus::Offline,
@@ -2894,6 +2897,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: db::new_uuid_v4(),
                 machine_id: "solo-registration-machine".to_owned(),
                 hostname: "localhost".to_owned(),
@@ -2914,6 +2918,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon.id.clone(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,

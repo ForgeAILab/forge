@@ -9,6 +9,8 @@ use serde::Deserialize;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    /// Unset: automatic; zero: unlimited. Computed on this daemon machine.
+    pub max_concurrent_runs: Option<u32>,
     pub workspace: DaemonWorkspaceConfig,
 }
 
@@ -50,6 +52,10 @@ impl DaemonConfig {
         serde_yaml::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
 
+    pub fn run_cap(&self, flag: Option<u32>) -> u32 {
+        config::resolved_run_cap(flag.or(self.max_concurrent_runs))
+    }
+
     pub fn run_policy(&self) -> WorkspaceRunPolicy {
         let mut allowed_purposes = Vec::new();
         for purpose in &self.workspace.run.allow {
@@ -64,6 +70,18 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_capacity_local_configuration_and_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials.json");
+        assert!(DaemonConfig::load(&credentials).unwrap().run_cap(None) >= 2);
+        fs::write(dir.path().join("daemon.yaml"), "max_concurrent_runs: 3\n").unwrap();
+        let config = DaemonConfig::load(&credentials).unwrap();
+        assert_eq!(config.run_cap(None), 3);
+        assert_eq!(config.run_cap(Some(0)), 0);
+        assert_eq!(config.run_cap(Some(2)), 2);
+    }
 
     #[test]
     fn local_run_policy_defaults_and_explicit_allow_list() {

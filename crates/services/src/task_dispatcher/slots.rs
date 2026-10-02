@@ -217,8 +217,12 @@ mod tests {
                     .map(|review| review.task_id)
                     .collect();
             for task in eligible {
+                let machine_wait = crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(|d| matches!(d.capability.as_str(), "machine_capacity" | "project_capacity"))
+                    && !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')")
+                        .bind(&task.id).fetch_one(db.pool()).await?;
                 if helpers::has_blocking_annotation(task)
                     || awaiting_human.contains(&task.id)
+                    || machine_wait
                     || db::TaskMetadata::parse(task.metadata_json.as_deref())
                         .is_ok_and(|metadata| metadata.extra.contains_key("environment_wait"))
                 {
@@ -289,6 +293,29 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_waiters_match_single_batch_and_walk() {
+        let (db, project) = fixture().await;
+        let waiter = task(&db, &project, "in_progress", None).await;
+        crate::deferred_dispatch::record_dispatch_disposition(
+            &db,
+            &waiter,
+            "machine_capacity",
+            "waiting for a machine run slot",
+        )
+        .await
+        .unwrap();
+        let slots = load_project_slots(&db, &project).await.unwrap();
+        assert_eq!((slots.active, slots.parked), (0, 1));
+        assert_eq!(slots, walk_project_slots(&db, &project).await.unwrap());
+        assert_batch_matches(&db, &project).await;
+        // Both reasons may coexist while an environment probe completes.
+        sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.environment_wait', json('{}')) WHERE id = ?").bind(&waiter.id).execute(db.pool()).await.unwrap();
+        assert_eq!(load_project_slots(&db, &project).await.unwrap(), slots);
+        assert_eq!(walk_project_slots(&db, &project).await.unwrap(), slots);
+        assert_batch_matches(&db, &project).await;
     }
 
     async fn review(db: &db::SqliteDb, task: &db::Task, attempt: i64, status: ReviewStatus) {

@@ -3,6 +3,10 @@ use super::*;
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
+tokio::task_local! {
+    static AUTOMATIC_REVIEW_RECOVERY_TASK: String;
+}
+
 struct CapacityRetry<'a> {
     retry_at: Option<&'a str>,
     reason: &'static str,
@@ -2639,7 +2643,15 @@ impl TaskService {
         }
     }
 
-    async fn try_dispatch_automatic_review_recovery(
+    /// The explicit recovery owns its state-entry dispatch. Its scoped future
+    /// supplies the configured Agent and recovery prompt after that transition.
+    pub(crate) fn automatic_review_recovery_owns_dispatch(task_id: &str) -> bool {
+        AUTOMATIC_REVIEW_RECOVERY_TASK
+            .try_with(|id| id == task_id)
+            .unwrap_or(false)
+    }
+
+    pub(in crate::task_service) async fn try_dispatch_automatic_review_recovery(
         &self,
         project: &db::Project,
         task: &Task,
@@ -2705,6 +2717,23 @@ impl TaskService {
             )));
         }
 
+        if let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? {
+            if self
+                .machine_capacity_blocked(task, &agent, Some("coder"))
+                .await?
+            {
+                self.defer_placement_refusal(task, &ServiceError::Db(DbError::MachineAtCapacity))
+                    .await?;
+                let waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
+        }
+
         let prompt = render_automatic_review_recovery_prompt(
             task,
             failure_reason,
@@ -2714,18 +2743,35 @@ impl TaskService {
             recovery_attempts + 1,
             max_attempts,
         );
-        let execution = match self
-            .dispatch_role_follow_up_with_agent(
-                &task.id,
-                crate::workflow::default_roles::CODER,
-                parent_execution_id.to_owned(),
-                agent_id.clone(),
-                prompt,
-                AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
+        let execution = match AUTOMATIC_REVIEW_RECOVERY_TASK
+            .scope(
+                task.id.clone(),
+                self.dispatch_role_follow_up_with_agent(
+                    &task.id,
+                    crate::workflow::default_roles::CODER,
+                    parent_execution_id.to_owned(),
+                    agent_id.clone(),
+                    prompt,
+                    AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
+                ),
             )
             .await
         {
             Ok(execution) => execution,
+            Err(error) if crate::placement::is_machine_capacity_refusal(&error) => {
+                let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                self.defer_placement_refusal(&current, &error).await?;
+                let mut waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                crate::deferred_dispatch::refresh_machine_wait(&self.db, &mut waiting).await?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
             Err(error) => {
                 tracing::warn!(
                     task_id = %task.id,

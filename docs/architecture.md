@@ -1824,14 +1824,42 @@ configuration, credentials, bindings, or history. Re-enabling recomputes health
 normally. Task concurrency counts Running executions plus `reserved`/`preparing`
 placements that have no Running execution yet. Assigned Tasks without a
 reservation and Main/Project Agent chat turns do not consume the identity's
-`max_concurrent_tasks` quota. A daemon may independently
-advertise a positive session cap through `labels_json` under
-`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
-`max_concurrent_tasks` key. That daemon cap counts Running Task executions on
-the daemon as identified by placement, including unpinned Agents, plus workspace
-reservations and leased/running Agent Chat turns. A ready placement without a
-Running execution holds no slot. Both caps are checked in the
-`BEGIN IMMEDIATE` reserve transaction and rechecked at execution start;
+`max_concurrent_tasks` quota. Every execution machine also has a run cap:
+`server.max_concurrent_runs` for the server host, or the daemon's typed
+`max_concurrent_runs`, limited further by its positive `run_limit` when set.
+Unset configuration resolves to `max(2, logical_cores / 2)` on that machine;
+zero means unlimited. The embedded daemon and direct server execution share
+the server setting and any admin limit on the embedded row. A daemon record with no reported cap and no admin limit
+is unlimited until it reports a value; omitted registration/report fields retain
+the last recorded cap. Labels no longer configure capacity. Migration
+`V202610020900` carries the first positive integer label cap in
+`max_concurrent_sessions`, `max_sessions`, `active_session_cap`,
+`max_concurrent_tasks` order into the typed column.
+
+Machine occupancy uses execution placement, including unpinned Agents:
+Running executions plus `reserved`/`preparing` placements without a Running
+execution for the same Workspace, plus leased/running Agent Chat turns.
+Expired reservations are excluded directly by the occupancy SQL, including
+Operations and execution-start reads; no sweep is needed to release their count.
+Server host occupancy combines placements with no execution daemon and those
+routed to this host's embedded daemon; chats of unpinned or embedded-daemon
+Agents use that same slot pool. Workspace-less executions use their frozen
+executor daemon id, falling back to the Agent pin. Ready placements use no slot. Capacity is rechecked at start; a refusal
+leaves the workspace ready and parks the Task for a later tick. Review check runs and merges do not consume slots: running checks
+currently have no durable record to count. This is a known limit pending the
+workflow refactor.
+
+The resolved server configuration initializes one shared `MachineRunCap`
+plain handle defined by `db` during runtime composition. Bare `SqliteDb::new`
+instances are unlimited. The runtime resolves the automatic default and cached
+embedded identity; `db` has no configuration/hardware-discovery dependency.
+The settings route owns its write mutex. Settings writes are serialized;
+only after the YAML write succeeds does the route update that handle.
+Placement reads the handle afresh in each reserve/start transaction rather than
+reading the startup snapshot. This setting never requires restart; other
+settings retain their existing restart behavior. Both Agent and machine caps
+are checked in the `BEGIN IMMEDIATE` reserve transaction and rechecked at
+execution start. No running work is stopped when a cap is lowered;
 dispatcher/service prechecks are only early filters. The
 transaction also rejects an identity paused or switched to a newer selected
 profile after dispatch preflight. Profile replacement covers daemon, provider,
@@ -2585,14 +2613,18 @@ unit tests also compile the constructor. Production builds omit the fixture regi
 Claim admission runs **reserve → prepare → start**:
 
 1. Under `BEGIN IMMEDIATE`, select a compatible ready location and persist a
-   `reserved` placement with `reserved_until`. It consumes Agent and daemon
+   `reserved` placement with `reserved_until`. It consumes Agent and machine
    capacity, but creates no Execution, lease, or Task status change.
 2. Outside the transaction, the owner prepares the workspace idempotently.
    Versioned updates move `reserved → preparing → ready` and record the handle
    and base SHA. Failed or expired preparation releases capacity, records
    `prepare_failed`, and spends no Task retry budget.
 3. A claim transaction checks the ready placement's version and capacity, then
-   creates the Task claim, Running Execution, and lease together.
+   creates the Task claim, Running Execution, and lease together. A ready placement
+   holds no slot. A capacity refusal leaves it ready and records an ordinary
+   parked machine waiter, without an Execution or retry-budget charge. Ready
+   reclaim, missing-worktree recreation and restart relaunch use the normal
+   version fence.
 
 Backfilled `preparing` reservations expire after ten minutes. The reservation
 sweep also reclaims crash-orphaned `reserved` or `preparing` rows without an
@@ -2649,6 +2681,40 @@ default location → server-owned → `(created_at, id)`. The selection reason r
 the winning rule and rejected candidates with filter codes. If no owner is
 eligible, claim returns structured `placement_unavailable`; there is no silent
 fallback.
+Machine saturation does not downgrade Agent availability or Project execution
+setup; the Agent availability precheck uses only its identity quota.
+
+A Task with no eligible machine and at least one candidate rejected only for
+`machine_capacity` records a `machine_capacity` queued dispatch disposition,
+without an annotation, Attention, failure or retry-budget charge. Initial
+scheduling checks fresh read-only machine counts for every candidate before the
+expensive Task gates, including runs dispatched earlier in the tick. The check
+examines all potentially usable locations, including unverified clones; unknown
+facts, a possibly free machine or another placement refusal delegate to reserve.
+It uses the placement filters and server executor availability, without clone
+verification, persisted location writes, a sweep or a writer lock.
+The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
+counts as parked until dispatch observes a different outcome; a plain edit does
+not un-park it, and its metadata change moves the Project list revision used by
+slot memos. Queued recovery checks machine capacity before claiming its marker,
+so full-machine ticks do not rewrite Tasks or publish recovery events. Automatic
+review recovery checks before its barrier claim as well. A handled capacity wait
+stops the active scan quietly. Its explicit dispatch owns the state-entry hook
+so an ordinary coder run cannot take its slot or lease first. Queued replay claims
+metadata only and checks its original queued token at Running insertion; a lost
+capacity race preserves the clear blocker and marker, emits no recovery event
+and retries next tick.
+Capacity waits are retried by the existing dispatcher tick
+(ten seconds by default); this path has no completion-event kick. Capacity
+checks count Agent Chat turns, but do not change chat admission: a new chat
+turn may still be leased/run when its machine is full, making subsequent Task
+admissions wait.
+
+There is no fairness guarantee across Projects: Projects are scanned oldest first,
+active work is scanned before `todo`, and follow-ups or chat turns can take a freed
+slot before the next dispatcher tick. Waiters resume on that tick. Review check
+runs and merges take no slot because there is no durable running-check record.
+
 Automatic dispatch keeps transient owner-unreachable, capacity, and
 `environment_probe_pending` refusals queued. Initial dispatch reads the same
 selection context before its workflow transition and defers an otherwise
@@ -3386,8 +3452,9 @@ whose children hold active slots do not consume another slot; once no child is
 active, a root's own running execution, review, or merge holds one slot.
 Planning, implementation, review, merging, and conflict repair therefore hold
 slots, even without a running execution. Agent concurrency remains a separate
-limit. Recovery and re-dispatch of already-admitted work never fail for Project
-capacity, even if un-parking temporarily exceeds the limit.
+limit. Ordinary already-admitted work retains its Project slot. A parked machine waiter
+must obtain Project room before it un-parks; a full Project replaces the machine
+reason with a parked `project_capacity` wait and retries on later ticks.
 
 The Project response exposes `{limit, active, parked, queued}` as `slots`.
 Capacity waits record `project_capacity` dispatch dispositions with
@@ -3682,7 +3749,7 @@ implementation execution, while the reviewer and auditor children point at
 that same candidate. Task/Project/workflow, role assignment, selected Agent
 identity/version, and the latest Review snapshot are rechecked at that insert
 boundary; reviewer capacity counts running executions and workspace reservations
-(plus any explicitly configured daemon session cap). The candidate must be a
+plus the machine's effective run cap. The candidate must be a
 completed implementation execution at that insert boundary. Failed or cancelled
 remediation executions do not displace the last completed candidate, but a
 newer running implementation still fences review admission. If Task/Project/workflow

@@ -822,6 +822,10 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
                         OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
@@ -873,6 +877,10 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
                         OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
@@ -2018,12 +2026,9 @@ impl TaskRepo for SqliteDb {
             Self::ensure_task_execution_admission_in_tx(transaction, &input.execution, admission)
                 .await?;
         }
-        let mut execution = Self::create_execution_in_tx(
-            transaction,
-            &input.execution,
-            execution_admission.as_ref(),
-        )
-        .await?;
+        let mut execution = self
+            .create_execution_in_tx(transaction, &input.execution, execution_admission.as_ref())
+            .await?;
         // A reviewer/auditor claim owns the selected Review attempt in the
         // same transaction as the Task mutation, Running execution, and
         // initial lease. This keeps claim admission from bypassing the

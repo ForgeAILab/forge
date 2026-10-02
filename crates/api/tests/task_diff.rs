@@ -252,6 +252,7 @@ async fn create_agent(harness: &Harness) -> String {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*harness.state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "localhost".to_owned(),
@@ -272,6 +273,7 @@ async fn create_agent(harness: &Harness) -> String {
     DaemonRepo::update_report(
         &*harness.state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id.clone(),
             last_report_at: now.clone(),
             status: DaemonStatus::Online,

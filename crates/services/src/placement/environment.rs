@@ -474,6 +474,9 @@ pub(crate) async fn handle_refusal(
     refusal: &super::PlacementUnavailable,
 ) -> Result<bool> {
     use super::PlacementFilterCode::*;
+    if super::machine_precheck::capacity_only_wait(refusal) {
+        return Ok(false);
+    }
     let unfit = super::selection::environment_pause_candidates(context);
     if !unfit.is_empty() {
         let candidate = context
@@ -585,15 +588,29 @@ pub(crate) async fn defer_refusal(
     let ServiceError::PlacementUnavailable(refusal) = error else {
         return Ok(None);
     };
+    if super::machine_precheck::capacity_only_wait(refusal) {
+        return Ok(None);
+    }
+
     if db::ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .is_some_and(|project| project.paused_at.is_some())
     {
         return Ok(Some(true));
     }
-    let pending = refusal.rejected_candidates.iter().any(|candidate| {
-        candidate.filter_codes == [super::PlacementFilterCode::EnvironmentProbePending]
-    });
+    let probe_pending = |candidate: &super::CandidateRejection| {
+        candidate
+            .filter_codes
+            .contains(&super::PlacementFilterCode::EnvironmentProbePending)
+            && candidate.filter_codes.iter().all(|code| {
+                matches!(
+                    code,
+                    super::PlacementFilterCode::EnvironmentProbePending
+                        | super::PlacementFilterCode::MachineCapacity
+                )
+            })
+    };
+    let pending = refusal.rejected_candidates.iter().any(probe_pending);
     if let Some(candidate) = refusal.rejected_candidates.iter().find(|candidate| {
         !pending
             && candidate
@@ -612,9 +629,7 @@ pub(crate) async fn defer_refusal(
         persist_machine_wait(db, task, &machine, &candidate.failing_checks).await?;
         return Ok(Some(true));
     }
-    if !refusal.rejected_candidates.iter().any(|candidate| {
-        candidate.filter_codes == [super::PlacementFilterCode::EnvironmentProbePending]
-    }) {
+    if !refusal.rejected_candidates.iter().any(probe_pending) {
         return Ok(None);
     }
     let marker = serde_json::json!({"kind":"environment_probe_pending","reason":"environment_probe_pending: server","target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});

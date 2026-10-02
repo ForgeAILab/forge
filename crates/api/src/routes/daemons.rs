@@ -38,6 +38,7 @@ pub async fn register_daemon(
     let registration = state
         .daemon_service
         .register(services::DaemonRegisterInput {
+            max_concurrent_runs: request.max_concurrent_runs,
             machine_id: request.machine_id,
             hostname: request.hostname,
             os: request.os,
@@ -79,6 +80,7 @@ pub async fn report_daemon(
         .ingest_report(
             &id,
             services::DaemonReportInput {
+                max_concurrent_runs: request.max_concurrent_runs,
                 detected_clis: request
                     .detected_clis
                     .into_iter()
@@ -102,7 +104,7 @@ pub async fn report_daemon(
         )
         .await?;
 
-    Ok(Json(daemon_response(daemon)))
+    Ok(Json(daemon_response(&state.db, daemon)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +423,9 @@ pub async fn list_daemons(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<DaemonResponse>>> {
     let page = state.daemon_service.list(page_request(&params)?).await?;
-    Ok(Json(paginated(page, daemon_response)))
+    Ok(Json(paginated(page, |daemon| {
+        daemon_response(&state.db, daemon)
+    })))
 }
 
 pub async fn get_daemon(
@@ -434,7 +438,25 @@ pub async fn get_daemon(
         .get(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("daemon", id))?;
-    Ok(Json(daemon_response(daemon)))
+    Ok(Json(daemon_response(&state.db, daemon)))
+}
+
+pub async fn update_daemon(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<api_types::UpdateDaemonRequest>,
+) -> ApiResult<Json<DaemonResponse>> {
+    if request.run_limit == Some(0) {
+        return Err(ApiError::bad_request("run_limit must be positive or null"));
+    }
+    Ok(Json(daemon_response(
+        &state.db,
+        state
+            .daemon_service
+            .update_run_limit(&id, request.version, request.run_limit)
+            .await?,
+    )))
 }
 
 fn runtime_report_input(runtime: api_types::RuntimeReport) -> RuntimeReportInput {

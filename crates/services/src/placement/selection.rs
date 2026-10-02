@@ -13,7 +13,9 @@ use db::{
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
 
-use super::capacity::{count_agent_capacity, count_daemon_capacity, AgentCapacity, DaemonCapacity};
+use super::capacity::{
+    count_agent_capacity, count_machine_capacity, AgentCapacity, MachineCapacity,
+};
 use crate::daemon_transport::DaemonConnectionRegistry;
 use crate::Result;
 
@@ -65,7 +67,7 @@ pub struct PlacementCandidate {
     /// policy. Capability facts come from that Agent's executor on this owner.
     pub executors: BTreeMap<String, ExecutorFacts>,
     pub allowed_run_purposes: Vec<WorkspaceRunPurpose>,
-    pub daemon_capacity: Option<DaemonCapacity>,
+    pub machine_capacity: Option<MachineCapacity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +128,7 @@ pub enum PlacementFilterCode {
     CapabilityMissing,
     PinMismatch,
     AgentCapacity,
-    DaemonCapacity,
+    MachineCapacity,
     NativeBackendUnsupported,
     RunPurposeDenied,
     NotVisible,
@@ -206,7 +208,7 @@ impl PlacementUnavailable {
                             code,
                             PlacementFilterCode::OwnerUnreachable
                                 | PlacementFilterCode::AgentCapacity
-                                | PlacementFilterCode::DaemonCapacity
+                                | PlacementFilterCode::MachineCapacity
                                 | PlacementFilterCode::EnvironmentProbePending
                                 | PlacementFilterCode::EnvironmentNotReady
                         )
@@ -230,7 +232,7 @@ impl PlacementUnavailable {
                         OwnerUnreachable
                             | LocationNotReady
                             | AgentCapacity
-                            | DaemonCapacity
+                            | MachineCapacity
                             | EnvironmentProbePending
                             | EnvironmentNotReady
                     ) || (handshake_missing
@@ -539,7 +541,7 @@ pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&P
                     PlacementFilterCode::EnvironmentNotReady
                         | PlacementFilterCode::EnvironmentProbePending
                         | PlacementFilterCode::AgentCapacity
-                        | PlacementFilterCode::DaemonCapacity
+                        | PlacementFilterCode::MachineCapacity
                         | PlacementFilterCode::OwnerUnreachable
                 )
             }) && codes != [PlacementFilterCode::EnvironmentNotReady]
@@ -713,12 +715,11 @@ fn filter_candidate(
     {
         filters.insert(AgentCapacity);
     }
-    if candidate.execution_daemon_id.is_some()
-        && candidate
-            .daemon_capacity
-            .is_none_or(|capacity| !capacity.has_capacity())
+    if candidate
+        .machine_capacity
+        .is_none_or(|capacity| !capacity.has_capacity())
     {
-        filters.insert(DaemonCapacity);
+        filters.insert(MachineCapacity);
     }
     if (!daemon_owned || owner_facts_known)
         && context
@@ -873,7 +874,7 @@ pub async fn load_selection_context(
             input.server.execution_daemon_id.clone()
         };
         let daemon = match execution_daemon_id.as_deref() {
-            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, labels_json, detected_clis_json FROM daemon WHERE id = ?")
+            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json FROM daemon WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&mut **transaction)
                 .await?,
@@ -883,7 +884,7 @@ pub async fn load_selection_context(
             && (execution_daemon_id.is_none()
                 || daemon.as_ref().is_some_and(|row| {
                     row.try_get::<String, _>("machine_id")
-                        .is_ok_and(|id| crate::embedded_daemon::is_embedded_daemon_machine(&id))
+                        .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
                 }));
         let remote_execution =
             daemon_owned || location.kind == RepoLocationKind::SharedMount || !embedded_execution;
@@ -992,15 +993,39 @@ pub async fn load_selection_context(
             }
             executors.insert(agent.id.clone(), facts);
         }
-        let max_sessions = daemon
-            .as_ref()
-            .map(|row| row.try_get::<String, _>("labels_json"))
-            .transpose()?
-            .and_then(|labels| crate::agent_capacity::daemon_session_cap_from_labels(&labels));
-        let daemon_capacity = match execution_daemon_id.as_deref() {
-            Some(id) => Some(count_daemon_capacity(transaction, id, max_sessions).await?),
-            None => None,
+        let machine_id = if execution_daemon_id.is_none()
+            || daemon.as_ref().is_some_and(|row| {
+                row.try_get::<String, _>("machine_id")
+                    .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
+            }) {
+            None
+        } else {
+            execution_daemon_id.as_deref()
         };
+        let cap = if machine_id.is_none() {
+            super::capacity::server_machine_cap(db, transaction).await?
+        } else {
+            let reported = daemon
+                .as_ref()
+                .map(|row| row.try_get::<Option<i64>, _>("max_concurrent_runs"))
+                .transpose()?
+                .flatten();
+            let admin = daemon
+                .as_ref()
+                .map(|row| row.try_get::<Option<u32>, _>("run_limit"))
+                .transpose()?
+                .flatten();
+            super::capacity::effective_machine_cap(reported, admin)
+        };
+        let machine_capacity = Some(
+            count_machine_capacity(
+                transaction,
+                machine_id,
+                cap,
+                &db.server_run_cap.embedded_machine_id(),
+            )
+            .await?,
+        );
         let machine = EnvironmentMachine::from_location(&location);
         let environment_readiness = readiness.iter().find(|row| row.machine == machine).cloned();
         candidates.push(PlacementCandidate {
@@ -1049,7 +1074,7 @@ pub async fn load_selection_context(
                     WorkspaceRunPurpose::CiStep,
                 ]
             },
-            daemon_capacity,
+            machine_capacity,
         });
     }
     Ok(SelectionContext {
@@ -1259,11 +1284,73 @@ mod tests {
                 .map(|role| (role.agent.id.clone(), executor()))
                 .collect(),
             allowed_run_purposes: vec![WorkspaceRunPurpose::CiStep],
-            daemon_capacity: daemon.map(|_| DaemonCapacity {
-                max_sessions: Some(2),
-                ..DaemonCapacity::default()
+            machine_capacity: Some(MachineCapacity {
+                max_concurrent_runs: Some(2),
+                ..MachineCapacity::default()
             }),
         }
+    }
+
+    #[test]
+    fn machine_capacity_full_server_selects_free_daemon_and_zero_is_unlimited() {
+        let mut context = context();
+        let mut server = candidate(&context, "server", None);
+        server.machine_capacity.as_mut().unwrap().running_executions = 2;
+        context.candidates.insert(0, server);
+        let result = selected(&context);
+        assert_eq!(result.candidate.execution_daemon_id.as_deref(), Some("mac"));
+        assert_eq!(
+            result.selection_reason.rejected_candidates[0].filter_codes,
+            vec![PlacementFilterCode::MachineCapacity]
+        );
+        context.candidates.remove(1);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .max_concurrent_runs = Some(0);
+        assert!(matches!(
+            select_placement(&context),
+            SelectionOutcome::Selected(_)
+        ));
+    }
+
+    #[test]
+    fn machine_capacity_selection_enforces_effective_caps() {
+        for (reported, admin, expected) in [
+            (Some(6), Some(2), 2),
+            (Some(3), Some(8), 3),
+            (Some(3), None, 3),
+        ] {
+            let mut context = context();
+            let cap = super::super::capacity::effective_machine_cap(reported, admin);
+            let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
+            capacity.max_concurrent_runs = cap;
+            capacity.running_executions = expected;
+            rejected(&context, PlacementFilterCode::MachineCapacity);
+            context.candidates[0]
+                .machine_capacity
+                .as_mut()
+                .unwrap()
+                .running_executions -= 1;
+            selected(&context);
+        }
+    }
+
+    #[test]
+    fn machine_capacity_start_rechecks_ready_placement() {
+        let mut context = context();
+        let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
+        capacity.max_concurrent_runs = Some(1);
+        capacity.active_chat_turns = 1;
+        context.existing_placement = Some(placement(&context.candidates[0]));
+        rejected(&context, PlacementFilterCode::MachineCapacity);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .active_chat_turns = 0;
+        selected(&context);
     }
 
     fn placement(candidate: &PlacementCandidate) -> WorkspacePlacement {
@@ -1350,6 +1437,66 @@ mod tests {
             serde_json::to_value(rejection).unwrap()["filter_codes"][0],
             "environment_not_ready"
         );
+    }
+
+    #[test]
+    fn machine_capacity_and_environment_failure_do_not_pause_project() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 2;
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert_eq!(
+            refusal.rejected_candidates[0].filter_codes,
+            vec![
+                PlacementFilterCode::MachineCapacity,
+                PlacementFilterCode::EnvironmentNotReady
+            ]
+        );
+        assert!(environment_pause_candidates(&context).is_empty());
+        assert!(!super::super::machine_precheck::capacity_only_wait(
+            &refusal
+        ));
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 0;
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
+    }
+
+    #[test]
+    fn machine_capacity_wait_ignores_environment_failed_alternative() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context
+            .candidates
+            .push(candidate(&context, "server-location", None));
+        context.candidates[1].environment_readiness =
+            Some(readiness(&context, 1, EnvironmentReadinessStatus::Ready));
+        context.candidates[1]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 2;
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(environment_pause_candidates(&context).is_empty());
+        assert!(super::super::machine_precheck::capacity_only_wait(&refusal));
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::Unknown));
+        // Remote unknown readiness is resolved at launch, so it remains a
+        // possible free candidate and cannot establish a machine wait.
+        assert!(matches!(
+            select_placement(&context),
+            SelectionOutcome::Selected(_)
+        ));
     }
 
     #[test]
@@ -1714,21 +1861,21 @@ mod tests {
     fn two_unpinned_running_placements_fill_daemon_session_cap() {
         let mut context = context();
         context.candidates[0]
-            .daemon_capacity
+            .machine_capacity
             .as_mut()
             .unwrap()
             .running_executions = 2;
         assert!(context.agents().all(|role| role.agent.daemon_id.is_none()));
-        rejected(&context, PlacementFilterCode::DaemonCapacity);
+        rejected(&context, PlacementFilterCode::MachineCapacity);
     }
 
     #[test]
     fn daemon_reservations_and_chat_turns_share_the_session_cap() {
         let mut context = context();
-        let capacity = context.candidates[0].daemon_capacity.as_mut().unwrap();
+        let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
         capacity.reservations = 1;
         capacity.active_chat_turns = 1;
-        rejected(&context, PlacementFilterCode::DaemonCapacity);
+        rejected(&context, PlacementFilterCode::MachineCapacity);
     }
 
     #[test]
@@ -1918,7 +2065,7 @@ mod tests {
         let mut context = context();
         let mut server = candidate(&context, "server", None);
         server.execution_daemon_id = Some("embedded".to_owned());
-        server.daemon_capacity = Some(DaemonCapacity::default());
+        server.machine_capacity = Some(MachineCapacity::default());
         context.candidates = vec![server];
         context.claiming_agent.agent.daemon_id = Some("embedded".to_owned());
         let selection = selected(&context);
@@ -1939,7 +2086,7 @@ mod tests {
         let mut server = candidate(&context, "server", None);
         server.execution_daemon_id = Some("mac".to_owned());
         server.embedded_execution = false;
-        server.daemon_capacity = Some(DaemonCapacity::default());
+        server.machine_capacity = Some(MachineCapacity::default());
         context.existing_placement = Some(placement(&server));
         context.candidates = vec![server];
         context.claiming_agent.agent.daemon_id = Some("mac".to_owned());
@@ -2129,12 +2276,14 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
+        db.server_run_cap
+            .set(Some(0), 0, &config::embedded_machine_id());
         sqlx::raw_sql(
             "INSERT INTO daemon (id, machine_id, hostname, os, arch, status, owner_id,
-                                 visibility, detected_clis_json, labels_json, created_at, updated_at)
+                                 visibility, detected_clis_json, labels_json, created_at, updated_at, max_concurrent_runs)
              VALUES ('mac', 'mac-machine', 'Mac', 'macos', 'aarch64', 'online', NULL,
                      'global', '[{\"kind\":\"codex\",\"availability\":\"authenticated\"}]',
-                     '{\"max_sessions\":2}', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');
+                     '{}', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z', 2);
              INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, created_at, updated_at)
              VALUES ('runtime-mac', 'mac', 'local', '/checkout', 'ready',
                      '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');",
@@ -2218,7 +2367,10 @@ mod tests {
             Some("mac")
         );
         assert_eq!(
-            loaded.candidates[0].daemon_capacity.unwrap().max_sessions,
+            loaded.candidates[0]
+                .machine_capacity
+                .unwrap()
+                .max_concurrent_runs,
             Some(2)
         );
 
@@ -2266,7 +2418,7 @@ mod tests {
             PlacementFilterCode::EnvironmentProbePending,
             PlacementFilterCode::EnvironmentNotReady,
             PlacementFilterCode::AgentCapacity,
-            PlacementFilterCode::DaemonCapacity,
+            PlacementFilterCode::MachineCapacity,
             PlacementFilterCode::OwnerUnreachable,
         ] {
             assert!(!refusal(vec![code]).is_deterministic(), "{code:?}");

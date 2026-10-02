@@ -665,3 +665,44 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod machine_capacity_tests {
+    #[tokio::test]
+    async fn machine_capacity_migration_carries_label_priority_and_preserves_null() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE daemon (id TEXT, labels_json TEXT); INSERT INTO daemon VALUES
+            ('priority', '{\"max_concurrent_sessions\":6,\"max_sessions\":2}'),
+            ('fallback', '{\"max_concurrent_sessions\":0,\"active_session_cap\":3}'),
+            ('empty', '{}'), ('invalid', 'not-json'), ('string', '{\"max_sessions\":\"5\"}'), ('oversized', '{\"max_sessions\":18446744073709551615}');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610020900__machine_run_caps.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT id, max_concurrent_runs, run_limit FROM daemon ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        for row in rows {
+            let id: String = row.get("id");
+            let cap: Option<i64> = row.get("max_concurrent_runs");
+            assert_eq!(
+                cap,
+                match id.as_str() {
+                    "priority" => Some(6),
+                    "fallback" => Some(3),
+                    _ => None,
+                }
+            );
+            assert_eq!(row.get::<Option<i64>, _>("run_limit"), None);
+        }
+    }
+}

@@ -511,6 +511,7 @@ impl From<DbError> for ApiError {
                 message: "invalid status transition".to_owned(),
                 details: None,
             },
+            DbError::MachineAtCapacity => Self::conflict_with_code("machine_capacity", "Machine has no available run capacity"),
             DbError::AgentAtCapacity => Self {
                 status: StatusCode::CONFLICT,
                 code: "agent_at_capacity",

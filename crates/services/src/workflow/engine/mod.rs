@@ -2708,6 +2708,7 @@ impl WorkflowEngine {
                 }
             }
 
+            crate::deferred_dispatch::finish_machine_wait(&self.db, &mut task, version).await?;
             let review = latest_review(&self.db, &task.id).await?;
 
             Ok(TransitionResult {

@@ -23,6 +23,9 @@ const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
     about = "Forge — local-first workflow engine for coding agents"
 )]
 struct Cli {
+    /// Maximum concurrent runs on the server host (default: automatic; 0: unlimited).
+    #[arg(long)]
+    max_concurrent_runs: Option<u32>,
     #[arg(long)]
     demo: bool,
     #[arg(long = "no-mcp")]
@@ -56,6 +59,7 @@ async fn run() {
     let config = ForgeConfig::load(
         None,
         ConfigOverrides {
+            server_max_concurrent_runs: cli.max_concurrent_runs,
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
             event_consumer_stall_seconds: cli.event_consumer_stall_seconds,

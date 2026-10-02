@@ -1296,6 +1296,19 @@ export function useExecutorTypesQuery() {
   })
 }
 
+export function useUpdateDaemonRunLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, version, run_limit }: { id: string; version: number; run_limit: number | null }) =>
+      apiFetch<Daemon>(`/daemons/${id}`, { method: 'PATCH', body: JSON.stringify({ version, run_limit }) }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: qk.daemons })
+      void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
+    onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+  })
+}
+
 export function useDaemonsQuery(enabled = true) {
   return useQuery({
     queryKey: qk.daemons,

@@ -40,8 +40,13 @@ impl TaskDispatcher {
     }
 
     pub(super) async fn clear_dispatch_disposition(&self, task: &Task) -> Result<()> {
-        let capacity_wait = deferred_dispatch::dispatch_disposition(task)
-            .is_some_and(|disposition| disposition.capability == "project_capacity");
+        let capacity_wait =
+            deferred_dispatch::dispatch_disposition(task).is_some_and(|disposition| {
+                matches!(
+                    disposition.capability.as_str(),
+                    "project_capacity" | "machine_capacity"
+                )
+            });
         if deferred_dispatch::clear_dispatch_disposition(&self.db, task).await? && capacity_wait {
             self.publish_capacity_disposition_change(task);
         }
@@ -210,6 +215,7 @@ impl TaskDispatcher {
                     .resolve_initial_schedule_target(&task_workflow, &task)
                     .await?
                 else {
+                    deferred_dispatch::clear_capacity_wait(&self.db, &task).await?;
                     return Ok(());
                 };
                 if deferred_dispatch::dispatch_disposition_is_current(&task, &target.role) {
@@ -343,19 +349,34 @@ impl TaskDispatcher {
         if helpers::has_blocking_annotation(task) {
             return Ok(false);
         }
-        // Keep dispatch admission on the same centralized Task gate used by
-        // claim/launch/lease issuance. It loads persisted capability/risk,
-        // canonical setup projection, and the exact baseline rather than
-        // reconstructing authority from Task kind or repository presence.
+        let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
+        if crate::placement::machine_precheck::wait_before_dispatch(
+            &self.db,
+            &self.task_service,
+            task,
+            &agent,
+            Some(&target.role),
+        )
+        .await?
+        {
+            if !deferred_dispatch::dispatch_disposition_is_current(task, "machine_capacity")
+                && !deferred_dispatch::dispatch_disposition_is_current(task, "project_capacity")
+            {
+                self.publish_capacity_disposition_change(task);
+            }
+            return Ok(false);
+        }
+        // Capacity-only waiters avoid the expensive gate work. Admission still
+        // runs the same Task/role gates whenever this read cannot prove a wait.
         if target.role == crate::workflow::default_roles::REVIEWER {
             self.task_service.ensure_task_reviewable(task).await?;
         } else {
             self.task_service.ensure_task_runnable(task).await?;
         }
-        let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
         if compute_effective_status(&self.db, &agent, None).await? != EffectiveStatus::Active {
+            deferred_dispatch::clear_capacity_wait(&self.db, task).await?;
             return Ok(false);
         }
         crate::ensure_execution_role_principal(

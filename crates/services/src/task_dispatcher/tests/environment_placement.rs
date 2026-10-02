@@ -434,3 +434,95 @@ async fn environment_recheck_name_edit_cas_loss_retries_the_same_pause() {
         db::EnvironmentReadinessStatus::Ready
     );
 }
+
+#[tokio::test]
+async fn machine_capacity_wait_with_ready_environment_keeps_todo_and_no_environment_wait() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent = seed_agent(&db, 8, DaemonStatus::Online, AgentStatus::Idle).await;
+    let busy = seed_task(&db, &project_id, "busy", "in_progress", 0).await;
+    seed_running_execution(&db, &busy.id, &agent, "coder").await;
+    let task = seed_task(&db, &project_id, "capacity waiter", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent).await;
+    configure(
+        &db,
+        &project_id,
+        serde_json::json!({"checks":[{"name":"disk","command":"true"}]}),
+    )
+    .await;
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings).unwrap();
+    let mut ready = crate::placement::environment::unknown_record(
+        &project_id,
+        db::EnvironmentMachine::Server,
+        &settings.environment,
+    );
+    ready.status = db::EnvironmentReadinessStatus::Ready;
+    ready.checked_at = Some(now_rfc3339());
+    ready.next_check_at = Some("2099-01-01T00:00:00Z".into());
+    db.put_readiness(ready, None).await.unwrap();
+    sqlx::query("UPDATE task SET metadata_json = json_object('environment_wait',json_object('machine',json_object('owner_kind','server')), 'deferred_dispatch',json_object('kind','environment_not_ready','not_before','2099-01-01T00:00:00Z','target_state','todo','reason','old environment failure')) WHERE id = ?").bind(&task.id).execute(db.pool()).await.unwrap();
+    db.server_run_cap
+        .set(Some(1), 1, &config::embedded_machine_id());
+    let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
+    dispatcher.check_once().await.unwrap();
+    let current = machine_capacity_task(&db, &task.id).await;
+    assert_eq!(current.status, "todo");
+    assert_eq!(current.version, task.version);
+    assert_eq!(
+        deferred_dispatch::current_dispatch_disposition(&current)
+            .unwrap()
+            .capability,
+        "machine_capacity"
+    );
+    let metadata = db::TaskMetadata::parse(current.metadata_json.as_deref()).unwrap();
+    assert!(!metadata.extra.contains_key("environment_wait"));
+    assert!(!metadata.extra.contains_key("deferred_dispatch"));
+    assert!(ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .paused_at
+        .is_none());
+    assert!(launches.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn environment_probe_pending_on_full_machine_does_not_leave_todo() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let (project, _) = seed_project_repo(&db, repo.path()).await;
+    let agent = seed_agent(&db, 8, DaemonStatus::Online, AgentStatus::Idle).await;
+    let busy = seed_task(&db, &project, "busy", "in_progress", 0).await;
+    seed_running_execution(&db, &busy.id, &agent, "coder").await;
+    let task = seed_task(&db, &project, "probe waiter", "todo", 0).await;
+    assign_role(&db, &task.id, "coder", &agent).await;
+    configure(
+        &db,
+        &project,
+        serde_json::json!({"checks":[{"name":"slow","command":"sleep 1; true"}]}),
+    )
+    .await;
+    db.server_run_cap
+        .set(Some(1), 1, &config::embedded_machine_id());
+    let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
+    dispatcher.check_once().await.unwrap();
+    let current = machine_capacity_task(&db, &task.id).await;
+    assert_eq!(current.status, "todo");
+    assert_eq!(current.version, task.version);
+    assert!(current.error_annotation.is_none());
+    assert!(deferred_dispatch::current_dispatch_disposition(&current).is_none());
+    assert!(ProjectRepo::get_by_id(&*db, &project)
+        .await
+        .unwrap()
+        .unwrap()
+        .paused_at
+        .is_none());
+    assert!(launches.try_recv().is_err());
+}

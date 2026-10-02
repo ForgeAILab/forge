@@ -274,6 +274,26 @@ async fn recovery_queue_and_project_slot_queue_count_once_and_have_distinct_comp
         response.slots,
         ProjectSlots {
             limit: 5,
+            active: 0,
+            parked: 1,
+            queued: 1
+        }
+    );
+    // A recovery with an explicit Project wait is parked. Its Agent-only
+    // queue still owns a Project slot once that separate wait is removed.
+    sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition') WHERE id = ?")
+        .bind(&recovery.id).execute(harness.state.db.pool()).await.unwrap();
+    let agent_only: ProjectResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        agent_only.slots,
+        ProjectSlots {
+            limit: 5,
             active: 1,
             parked: 0,
             queued: 1

@@ -80,7 +80,7 @@ pub async fn compute_effective_status(
             Some("degraded") => return Ok(EffectiveStatus::ConnectionDegraded),
             _ => return Ok(EffectiveStatus::ConnectionUnavailable),
         }
-        if !has_execution_capacity(db, agent, None).await? {
+        if !has_execution_capacity(db, agent).await? {
             return Ok(EffectiveStatus::Busy);
         }
         return Ok(EffectiveStatus::Active);
@@ -122,7 +122,7 @@ pub async fn compute_effective_status(
         }
     }
 
-    if !has_execution_capacity(db, agent, None).await? {
+    if !has_execution_capacity(db, agent).await? {
         return Ok(EffectiveStatus::Busy);
     }
 
@@ -507,6 +507,7 @@ mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),
@@ -539,6 +540,7 @@ mod tests {
         DaemonRepo::update_report(
             db,
             db::UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 detected_clis_json: detected_clis_json.to_owned(),
                 labels_json: None,
@@ -1038,6 +1040,7 @@ mod tests {
         DaemonRepo::update_report(
             &db,
             db::UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
                     .to_owned(),

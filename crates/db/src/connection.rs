@@ -188,6 +188,7 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
 /// replacement for `pool.begin()` at every call site, including outside the
 /// `db` crate, without changing error-conversion paths.
 pub async fn begin_immediate(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    tracing::debug!(target: "forge_db::write_transaction", "begin immediate");
     pool.begin_with("BEGIN IMMEDIATE").await
 }
 

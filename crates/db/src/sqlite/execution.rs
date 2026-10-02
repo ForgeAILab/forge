@@ -8,7 +8,9 @@ use std::collections::HashSet;
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        let execution = self
+            .create_execution_in_tx(&mut transaction, &input, None)
+            .await?;
         transaction.commit().await?;
         Ok(execution)
     }
@@ -58,7 +60,8 @@ impl ExecutionRepo for SqliteDb {
                     .to_owned(),
             ));
         }
-        Self::create_execution_in_tx(transaction, &input, admission.as_ref()).await?;
+        self.create_execution_in_tx(transaction, &input, admission.as_ref())
+            .await?;
         // Reviewer/auditor executions are durably owned by the exact Review
         // attempt selected by the admission snapshot. Keep this binding in
         // the same writer transaction as the execution row and lease

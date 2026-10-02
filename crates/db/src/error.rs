@@ -49,6 +49,8 @@ pub enum DbError {
 
     #[error("agent at capacity")]
     AgentAtCapacity,
+    #[error("machine has no available run capacity")]
+    MachineAtCapacity,
 
     #[error("agent {agent_id} is paused")]
     AgentPaused { agent_id: String },

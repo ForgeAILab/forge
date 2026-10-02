@@ -502,6 +502,8 @@ impl TaskService {
         event_bus: Arc<EventBus>,
         workspace_backend_router: Arc<WorkspaceBackendRouter>,
     ) -> Self {
+        db.server_run_cap
+            .initialize_identity(&::config::embedded_machine_id());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         let workspace_root = default_workspace_root();
         Self {
@@ -1105,7 +1107,16 @@ impl TaskService {
         let execution = match create_result {
             Ok(execution) => execution,
             Err(error) => {
-                if workspace_created_by_attempt {
+                if crate::placement::is_machine_capacity_refusal(&error) {
+                    if let Some(task) =
+                        TaskRepo::get_by_id(&*self.db, &input.task_id, false).await?
+                    {
+                        self.defer_placement_refusal(&task, &error).await?;
+                    }
+                }
+                if workspace_created_by_attempt
+                    && !crate::placement::is_machine_capacity_refusal(&error)
+                {
                     self.cleanup_fresh_execution_workspace_by_id(
                         &input.task_id,
                         input.workspace_id.as_deref(),

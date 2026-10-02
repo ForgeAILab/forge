@@ -6,6 +6,7 @@ mod connection;
 mod environment_readiness;
 mod error;
 mod ids;
+pub mod machine_capacity;
 mod migration;
 mod models;
 mod orchestration;

@@ -76,6 +76,7 @@ impl Fixture {
         DaemonRepo::upsert_by_machine_id(
             &*self.harness.state.db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: db::new_uuid_v4(),
                 hostname: "mac".to_owned(),

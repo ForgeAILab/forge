@@ -135,6 +135,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_capacity_wait_invalidates_project_slots_memo() {
+        let (db, memo) = fixture().await;
+        mutate(&db, "INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES ('wait', 'p', 'Wait', 'in_progress', 'now', 'now')").await;
+        check(&db, &memo, "p", (5, 1, 0, 0)).await;
+        mutate(&db, "UPDATE task SET metadata_json = json_object('dispatch_disposition', json_object('capability', 'machine_capacity', 'task_version', version)) WHERE id = 'wait'").await;
+        check(&db, &memo, "p", (5, 0, 1, 0)).await;
+        mutate(&db, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition') WHERE id = 'wait'").await;
+        check(&db, &memo, "p", (5, 1, 0, 0)).await;
+    }
+
+    #[tokio::test]
     async fn memo_tracks_task_hierarchy_visibility_and_holds() {
         let (db, memo) = fixture().await;
         check(&db, &memo, "p", (5, 0, 0, 0)).await;

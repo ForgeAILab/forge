@@ -217,7 +217,7 @@ pub(crate) async fn server_executor_facts<'a>(
         execution_daemon_id: sqlx::query_scalar::<_, String>(
             "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",
         )
-        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(db.server_run_cap.embedded_machine_id())
         .fetch_optional(db.pool())
         .await?,
         ..Default::default()

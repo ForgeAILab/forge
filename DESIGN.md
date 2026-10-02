@@ -566,6 +566,19 @@ and empty states remain the state harness; the healthy empty message is withheld
 while any consumer has sequence lag. No new typography, spacing, or color tokens
 are introduced.
 
+### Machine run capacity
+
+Reuse SettingsSection, Input, Label, Button and the existing machine detail cards.
+Server run-cap input is blank for automatic, zero for unlimited, or a positive
+integer. Show the automatic value in effect beside the input and explain that
+updates apply immediately. Machine detail shows reported cap, admin limit and
+effective cap together; only admins can edit the limit. Blank clears it, and
+validation rejects zero/fractions. Pending saves disable the action; errors use
+the existing toast and retain the entered value. Version conflicts require a
+refreshed row before another save. Operations displays active runs and the
+ceiling, with Unlimited as text. Server host links to Settings. Preserve the
+existing responsive wrapping, focus rings, loading/error states and tokens.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |
