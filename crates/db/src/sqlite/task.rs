@@ -822,6 +822,7 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
                            ELSE 0 END
@@ -872,6 +873,7 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
                            ELSE 0 END

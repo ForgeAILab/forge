@@ -3848,7 +3848,11 @@ candidate names its repository location, owner, daemon/runtime and `filter_codes
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
 `agent_capacity`, `daemon_capacity`, `native_backend_unsupported`,
-`run_purpose_denied`, and `not_visible`.
+`run_purpose_denied`, `not_visible`, `environment_not_ready`, and
+`environment_probe_pending`. Environment rejections carry applicable check names
+in `failing_checks`. Probe-pending defers dispatcher admission; direct/manual
+claims run the checks at launch. An environment Project pause defers dispatch
+without a `dispatch_failed` annotation.
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.

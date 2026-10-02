@@ -32,11 +32,12 @@ pub struct TaskDispatcher {
     task_service: Arc<TaskService>,
     check_interval: Duration,
     stopped: AtomicBool,
-    stop_notify: Notify,
+    stop_notify: Arc<Notify>,
     /// Primary Repo snapshots (`id@updated_at`) already verified ready by
     /// `sync_repository_pause`.
     ready_repositories: Mutex<HashSet<String>>,
     environment_rechecks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<bool>>>>,
+    environment_settings_observer: std::sync::OnceLock<tokio::task::JoinHandle<Result<bool>>>,
 }
 
 impl TaskDispatcher {
@@ -59,12 +60,13 @@ impl TaskDispatcher {
         Self {
             db,
             event_bus,
-            task_service,
+            task_service: Arc::clone(&task_service),
             check_interval,
             stopped: AtomicBool::new(false),
-            stop_notify: Notify::new(),
+            stop_notify: task_service.dispatch_notify(),
             ready_repositories: Mutex::new(HashSet::new()),
             environment_rechecks: Mutex::new(HashMap::new()),
+            environment_settings_observer: std::sync::OnceLock::new(),
         }
     }
 
@@ -106,6 +108,14 @@ impl TaskDispatcher {
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
         let mut dispatched = 0;
+        let environment_changed = match self.sync_due_environment_checks().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error,"environment readiness scan failed; continuing Project dispatch");
+                HashSet::new()
+            }
+        };
+        self.observe_environment_settings();
         for project in self.list_projects().await? {
             if self.is_stopped() {
                 break;
@@ -121,17 +131,7 @@ impl TaskDispatcher {
                     continue;
                 }
             };
-            let pause_changed = if pause_changed {
-                true
-            } else {
-                match self.sync_environment_pause(&project).await {
-                    Ok(changed) => changed,
-                    Err(error) => {
-                        tracing::warn!(project_id = %project.id, %error, "environment pause synchronization failed; continuing Project scan");
-                        false
-                    }
-                }
-            };
+            let pause_changed = pause_changed || environment_changed.contains(&project.id);
             match self.reconcile_plan_publication_claims(&project).await {
                 Ok(count) => dispatched += count,
                 Err(error) => {

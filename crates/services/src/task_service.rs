@@ -431,6 +431,7 @@ pub struct TaskService {
     completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Shared with manual checks: a Project has at most one host re-check.
     environment_rechecks: Arc<std::sync::Mutex<HashSet<String>>>,
+    dispatch_notify: Arc<tokio::sync::Notify>,
     /// Wakes completion cascades that arrived while another execution for
     /// the same Task was settling. Waiters retry the Task slot after every
     /// release, so a successor completion is never silently dropped.
@@ -523,6 +524,7 @@ impl TaskService {
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             completion_cascades: Arc::default(),
             environment_rechecks: Arc::default(),
+            dispatch_notify: Arc::default(),
             completion_cascade_released: Arc::default(),
             credential_env: None,
         }
@@ -590,6 +592,10 @@ impl TaskService {
     pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
         self.review_runner = Some(review_runner);
         self
+    }
+
+    pub(crate) fn dispatch_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.dispatch_notify)
     }
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {

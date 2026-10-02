@@ -93,6 +93,7 @@ mod daemon;
 mod domain_event;
 pub use domain_event::EventSubscription;
 mod embedded_agent;
+pub(crate) mod environment_readiness;
 mod execution;
 mod external_link;
 mod inbox;
@@ -140,6 +141,7 @@ mod workspace_placement;
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
+    readiness_decode_warnings: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
 
@@ -153,6 +155,7 @@ impl SqliteDb {
         let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
+            readiness_decode_warnings: Default::default(),
             domain_event_hooks,
         }
     }

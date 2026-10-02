@@ -366,6 +366,14 @@ impl TaskDispatcher {
         )
         .await?;
 
+        if self
+            .task_service
+            .defer_initial_environment_probe(task, &agent, &target.role)
+            .await?
+        {
+            return Ok(false);
+        }
+
         self.task_service
             .transition(
                 task.id.clone(),
