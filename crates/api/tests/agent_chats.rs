@@ -3,9 +3,10 @@
 mod common;
 
 use api_types::{
-    AgentChatMessageListResponse, AgentChatSwitcherResponse, AgentChatTurnJobResponse,
-    AgentChatTurnStatus, ConnectedEmbeddedAgentResponse, ErrorResponse, MainAgentBindingResponse,
-    ProjectAgentBindingResponse, ProjectResponse, SendAgentChatMessageResponse,
+    AgentChatDetailResponse, AgentChatMessageListResponse, AgentChatSwitcherResponse,
+    AgentChatTurnJobResponse, AgentChatTurnStatus, ConnectedEmbeddedAgentResponse, ErrorResponse,
+    MainAgentBindingResponse, ProjectAgentBindingResponse, ProjectResponse,
+    SendAgentChatMessageResponse,
 };
 use axum::{
     body::Body,
@@ -209,6 +210,32 @@ async fn project_creation_records_chat_binding_events_and_stale_binding_replacem
         .any(|value| value == "agent_chat.created"));
 }
 
+/// `pending_turn_count` as the switcher item and the chat detail report it.
+async fn pending_turn_counts(app: &axum::Router, token: &str, chat_id: &str) -> (i64, i64) {
+    let switcher: AgentChatSwitcherResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        "/api/v1/agent-chats",
+        token,
+        StatusCode::OK,
+    )
+    .await;
+    let detail: AgentChatDetailResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{chat_id}"),
+        token,
+        StatusCode::OK,
+    )
+    .await;
+    let item = switcher
+        .items
+        .iter()
+        .find(|item| item.chat_id == chat_id)
+        .expect("chat is in the switcher");
+    (item.pending_turn_count, detail.chat.pending_turn_count)
+}
+
 #[tokio::test]
 async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     let workspace = common::TestDir::new("agent-chat-turn-cancel");
@@ -283,6 +310,12 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .await;
     assert_eq!(before.items.len(), 1);
     assert_eq!(before.items[0].id, first.message.id);
+    // Both admitted turns are still queued: the switcher and the chat detail
+    // count them without loading the turn history.
+    assert_eq!(
+        pending_turn_counts(&harness.app, &token, &binding.chat_id).await,
+        (2, 2)
+    );
 
     let cancelled: AgentChatTurnJobResponse = common::json_request_with_bearer(
         &harness.app,
@@ -301,6 +334,10 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .await;
     assert_eq!(cancelled.status, AgentChatTurnStatus::Cancelled);
     assert_eq!(cancelled.version, first_turn.version + 1);
+    assert_eq!(
+        pending_turn_counts(&harness.app, &token, &binding.chat_id).await,
+        (1, 1)
+    );
     let events: Vec<String> = sqlx::query_scalar(
         "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
     )

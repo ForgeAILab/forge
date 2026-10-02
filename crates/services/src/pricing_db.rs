@@ -3463,6 +3463,29 @@ mod tests {
             api_types::CostSourceFreshness::Fresh
         );
 
+        // Operations reads the same ledger in id batches. With an applied
+        // revision next to a provider-reported event it must equal the
+        // per-invocation walk, estimate and provenance included.
+        let operations = crate::usage_projection::usage_aggregate_for_operations(&db)
+            .await
+            .expect("operations aggregate");
+        assert!(operations.cost.estimated.is_some());
+        assert!(operations.cost.provider_reported.is_some());
+        assert!(operations
+            .cost
+            .sources
+            .iter()
+            .any(|source| source.retrospective));
+        assert_eq!(
+            serde_json::to_value(
+                crate::usage_projection::per_invocation_usage_aggregate_for_operations(&db)
+                    .await
+                    .expect("per-invocation operations aggregate")
+            )
+            .unwrap(),
+            serde_json::to_value(operations).unwrap()
+        );
+
         let reported = db::UsageLedgerRepo::get_usage_event(&*db, &reported_event)
             .await
             .expect("reported event lookup")

@@ -170,10 +170,16 @@ where
         // Main Chat creation is idempotent and deliberately precedes lookup:
         // accounts created after the backfill still receive their canonical
         // timeline even before an Agent binding has been selected.
-        self.ensure_main_chat(actor_user_id).await?;
-        let chat = AgentChatRepo::get_agent_chat(&*self.db, chat_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent_chat", chat_id.to_owned()))?;
+        let main_chat = self.ensure_main_chat(actor_user_id).await?;
+        // The actor's own Main Chat was just read; a second lookup of the
+        // same row would only repeat it.
+        let chat = if main_chat.id == chat_id {
+            main_chat
+        } else {
+            AgentChatRepo::get_agent_chat(&*self.db, chat_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent_chat", chat_id.to_owned()))?
+        };
         self.authorize_chat_scope(actor_user_id, &chat).await?;
         Ok(chat)
     }
