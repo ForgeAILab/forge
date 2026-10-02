@@ -83,7 +83,7 @@ pub(crate) async fn prepare_selection(
             continue;
         }
         if let Some(id) = assignment.assignee_id.as_deref() {
-            if agent.is_some_and(|agent| agent.id == id) {
+            if assignment.role_name == role && agent.is_some_and(|agent| agent.id == id) {
                 continue;
             }
             let assigned_agent = AgentRepo::get_by_id(db, id)

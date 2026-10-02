@@ -32,104 +32,163 @@ impl TaskDispatcher {
         };
         let mut changed = HashSet::new();
         for (key, job) in finished {
-            if job
-                .await
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))??
-            {
-                changed.insert(key.split('@').next().unwrap_or(&key).to_owned());
+            match job.await {
+                Ok(Ok(true)) => {
+                    changed.insert(key.split('@').next().unwrap_or(&key).to_owned());
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%key,%error,"environment re-check job failed; continuing dispatch")
+                }
+                Err(error) => {
+                    tracing::warn!(%key,%error,"environment re-check job panicked; continuing dispatch")
+                }
             }
         }
         // Index-backed and executed once for the entire dispatcher pass.
         let due = self.db.due_readiness(&db::now_rfc3339()).await?;
         for row in due {
-            let Some(project) = ProjectRepo::get_by_id(&*self.db, &row.project_id).await? else {
-                continue;
-            };
-            let settings: ProjectSettings = match serde_json::from_str(&project.settings) {
-                Ok(settings) => settings,
-                Err(error) => {
-                    tracing::warn!(project_id=%project.id,%error,"cannot re-check malformed environment settings; rescheduling");
-                    self.db
-                        .reschedule_readiness(&row, &next_check_at(chrono::Utc::now(), 600))
-                        .await?;
-                    continue;
+            match self.schedule_environment_recheck(row.clone()).await {
+                Ok(Some(project)) => {
+                    changed.insert(project);
                 }
-            };
-            let environment = settings.environment;
-            if project.paused_at.is_some()
-                && project.system_pause_reason.as_deref() != Some(ENVIRONMENT_NOT_READY)
-            {
-                // A user/repository pause retains the base's explicit manual-check
-                // behaviour; it must not start an automatic command behind the pause.
-                self.db
-                    .reschedule_readiness(
-                        &row,
-                        &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
-                    )
-                    .await?;
-                continue;
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(project_id=%row.project_id,%error,"environment re-check setup failed; continuing dispatch");
+                    if let Err(error) = self
+                        .db
+                        .reschedule_readiness(&row, &next_check_at(chrono::Utc::now(), 600))
+                        .await
+                    {
+                        tracing::warn!(project_id=%row.project_id,%error,"could not reschedule environment row");
+                    }
+                }
             }
-            if row.checks_digest != db::environment_checks_digest(&environment) {
+        }
+        Ok(changed)
+    }
+
+    async fn schedule_environment_recheck(
+        &self,
+        row: db::ProjectMachineReadiness,
+    ) -> Result<Option<String>> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &row.project_id).await? else {
+            return Ok(None);
+        };
+        let settings: ProjectSettings = match serde_json::from_str(&project.settings) {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(project_id=%project.id,%error,"cannot re-check malformed environment settings; rescheduling");
                 self.db
-                    .reschedule_readiness(
-                        &row,
-                        &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
-                    )
+                    .reschedule_readiness(&row, &next_check_at(chrono::Utc::now(), 600))
                     .await?;
-                continue;
+                return Ok(None);
             }
-            let key = if row.machine == EnvironmentMachine::Server {
-                project.id.clone()
-            } else {
-                format!(
-                    "{}@{}",
-                    project.id,
-                    environment::machine_label(&row.machine)
+        };
+        let environment = settings.environment;
+        if project.paused_at.is_some()
+            && project.system_pause_reason.as_deref() != Some(ENVIRONMENT_NOT_READY)
+        {
+            // A user/repository pause retains the base's explicit manual-check
+            // behaviour; it must not start an automatic command behind the pause.
+            self.db
+                .reschedule_readiness(
+                    &row,
+                    &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
                 )
+                .await?;
+            return Ok(None);
+        }
+        if row.checks_digest != db::environment_checks_digest(&environment) {
+            self.db
+                .reschedule_readiness(
+                    &row,
+                    &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
+                )
+                .await?;
+            return Ok(None);
+        }
+        let key = if row.machine == EnvironmentMachine::Server {
+            project.id.clone()
+        } else {
+            format!(
+                "{}@{}",
+                project.id,
+                environment::machine_label(&row.machine)
+            )
+        };
+        if self
+            .environment_rechecks
+            .lock()
+            .expect("environment jobs lock")
+            .contains_key(&key)
+        {
+            return Ok(None);
+        }
+        let Some(guard) = environment::claim_probe(&project.id, &row.machine) else {
+            return Ok(None);
+        };
+        let manual_guard = if row.machine == EnvironmentMachine::Server {
+            let Some(guard) = self.task_service.claim_environment_recheck(&project.id) else {
+                return Ok(None);
             };
-            if self
-                .environment_rechecks
-                .lock()
-                .expect("environment jobs lock")
-                .contains_key(&key)
-            {
-                continue;
+            Some(guard)
+        } else {
+            None
+        };
+        if matches!(row.machine, EnvironmentMachine::Daemon { .. }) {
+            if let Some(workspace_id) = row.workspace_id.as_deref() {
+                if db::WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                    .await?
+                    .is_none()
+                {
+                    let mut unknown = row.clone();
+                    unknown.status = db::EnvironmentReadinessStatus::Unknown;
+                    unknown.next_check_at = None;
+                    self.db.put_readiness(unknown, Some(row.version)).await?;
+                    let current = ProjectRepo::get_by_id(&*self.db, &project.id)
+                        .await?
+                        .ok_or(db::DbError::NotFound)?;
+                    let matching = current
+                        .environment_pause_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|detail| {
+                            detail["workspace_id"].as_str() == Some(workspace_id)
+                        });
+                    let cleared = matching
+                        && !row.failing_checks.is_empty()
+                        && self.task_service.clear_environment_pause(&current).await?;
+                    self.task_service.dispatch_notify().notify_one();
+                    return Ok(cleared.then_some(project.id));
+                }
             }
-            let Some(guard) = environment::claim_probe(&project.id, &row.machine) else {
-                continue;
-            };
-            let manual_guard = if row.machine == EnvironmentMachine::Server {
-                let Some(guard) = self.task_service.claim_environment_recheck(&project.id) else {
-                    continue;
-                };
-                Some(guard)
-            } else {
-                None
-            };
-            let mut checks: Vec<_> = environment
-                .checks
-                .iter()
-                .filter(|check| {
-                    row.failing_checks
-                        .iter()
-                        .any(|failure| failure.name == check.name)
-                })
-                .cloned()
-                .collect();
-            if checks.is_empty() {
-                checks = environment
-                    .checks
+        }
+        if row.failing_checks.is_empty() {
+            self.db
+                .reschedule_readiness(
+                    &row,
+                    &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
+                )
+                .await?;
+            return Ok(None); // Unnamed setup failures require resume or Check now.
+        }
+        let checks: Vec<_> = environment
+            .checks
+            .iter()
+            .filter(|check| {
+                row.failing_checks
                     .iter()
-                    .filter(|check| row.role.as_ref().is_none_or(|role| check.applies_to(role)))
-                    .cloned()
-                    .collect();
-            }
-            let db = self.db.clone();
-            let service = self.task_service.clone();
-            let kick = self.task_service.dispatch_notify();
-            let result_events = self.event_bus.clone();
-            let job = tokio::spawn(async move {
-                let result = async {
+                    .any(|failure| failure.name == check.name)
+            })
+            .cloned()
+            .collect();
+        let db = self.db.clone();
+        let service = self.task_service.clone();
+        let kick = self.task_service.dispatch_notify();
+        let result_events = self.event_bus.clone();
+        let job = tokio::spawn(async move {
+            let result = async {
                     let next = next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds);
                     if checks.is_empty() {
                         db.reschedule_readiness(&row, &next).await?;
@@ -203,17 +262,16 @@ impl TaskDispatcher {
                     }
                     Ok::<_, ServiceError>(false)
                 }.await;
-                drop(manual_guard);
-                drop(guard);
-                kick.notify_one();
-                result
-            });
-            self.environment_rechecks
-                .lock()
-                .expect("environment jobs lock")
-                .insert(key, job);
-        }
-        Ok(changed)
+            drop(manual_guard);
+            drop(guard);
+            kick.notify_one();
+            result
+        });
+        self.environment_rechecks
+            .lock()
+            .expect("environment jobs lock")
+            .insert(key, job);
+        Ok(None)
     }
     /// Settings events invalidate rows transactionally; only host rows/locations
     /// can start a probe in this build step, independently of queued Tasks.

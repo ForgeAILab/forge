@@ -1325,6 +1325,52 @@ mod tests {
         error_server.abort();
     }
 
+    #[tokio::test]
+    async fn environment_missing_recorded_daemon_workspace_resets_fact_and_pause() {
+        use db::ProjectMachineReadinessRepo;
+        let (db, service, task, execution, workspace, responder) = fixture(false).await;
+        service
+            .prepare_execution_environment(&task, &execution, &workspace, &mut json!({}))
+            .await
+            .unwrap();
+        let machine = db::EnvironmentMachine::from_placement(&workspace.placement);
+        let mut row = db
+            .get_readiness(&task.project_id, &machine)
+            .await
+            .unwrap()
+            .unwrap();
+        let version = row.version;
+        row.next_check_at = Some("2000-01-01T00:00:00Z".into());
+        db.put_readiness(row, Some(version)).await.unwrap();
+        sqlx::query("DELETE FROM workspace WHERE id=?")
+            .bind(&workspace.placement.workspace_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let events = service.event_bus.clone();
+        let dispatcher = crate::TaskDispatcher::new(db.clone(), events, Arc::new(service));
+        dispatcher.check_once().await.unwrap();
+        let reset = db
+            .get_readiness(&task.project_id, &machine)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, db::EnvironmentReadinessStatus::Unknown);
+        assert!(ProjectRepo::get_by_id(&*db, &task.project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused_at
+            .is_none());
+        assert!(TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .error_annotation
+            .is_none());
+        responder.abort();
+    }
+
     async fn pause_with_primary_checkout(
         db: &db::SqliteDb,
         service: &TaskService,

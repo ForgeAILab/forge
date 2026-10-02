@@ -67,8 +67,16 @@ pub struct PlacementCandidate {
     pub daemon_capacity: Option<DaemonCapacity>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentAdmission {
+    Dispatcher,
+    LaunchPreflight,
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectionContext {
+    pub(crate) environment_admission: EnvironmentAdmission,
+    pub(crate) environment_has_assets: bool,
     /// None means this Project has no checks; no rows or probes are needed.
     pub environment_digest: Option<String>,
     pub environment_checks: Vec<api_types::EnvironmentCheck>,
@@ -404,16 +412,26 @@ pub(crate) fn environment_filter(
         .filter(|row| &row.checks_digest == digest);
     match current {
         Some(row) if row.status == EnvironmentReadinessStatus::Ready => None,
-        Some(row) if row.status == EnvironmentReadinessStatus::NotReady => {
+        Some(row)
+            if row.status == EnvironmentReadinessStatus::NotReady
+                && (!context.environment_has_assets
+                    || row.workspace_id.is_some()
+                    || row.role.is_some()) =>
+        {
             let unnamed_applies = row.failing_checks.is_empty()
                 && row
                     .role
                     .as_ref()
-                    .is_none_or(|role| context.agents().any(|agent| &agent.role == role));
+                    .is_none_or(|role| &context.claiming_agent.role == role);
             (unnamed_applies || !applicable_failing_checks(context, candidate).is_empty())
                 .then_some(PlacementFilterCode::EnvironmentNotReady)
         }
-        _ if candidate.location.owner_kind == RepoLocationOwnerKind::Daemon => None,
+        _ if candidate.location.owner_kind == RepoLocationOwnerKind::Daemon
+            || context.environment_has_assets
+            || context.environment_admission == EnvironmentAdmission::LaunchPreflight =>
+        {
+            None
+        }
         _ => Some(PlacementFilterCode::EnvironmentProbePending),
     }
 }
@@ -447,7 +465,7 @@ pub(crate) fn applicable_failing_checks(
                 .environment_checks
                 .iter()
                 .find(|check| check.name == *name)
-                .is_none_or(|check| context.agents().any(|role| check.applies_to(&role.role)))
+                .is_none_or(|check| check.applies_to(&context.claiming_agent.role))
         })
         .map(str::to_owned)
         .collect()
@@ -487,7 +505,7 @@ pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&P
     }
     let mut unfit = Vec::new();
     for candidate in &context.candidates {
-        if candidate.location.status != RepoLocationStatus::Ready {
+        if candidate.location.status != RepoLocationStatus::Ready || !candidate.connected {
             continue;
         }
         let codes = filter_candidate(&unrestricted, candidate);
@@ -998,11 +1016,9 @@ pub async fn load_selection_context(
             daemon_capacity,
         });
     }
-    let roles = std::iter::once(input.claiming_agent)
-        .chain(input.worktree_agents.iter())
-        .map(|agent| agent.role.as_str())
-        .collect::<Vec<_>>();
     Ok(SelectionContext {
+        environment_admission: EnvironmentAdmission::Dispatcher,
+        environment_has_assets: !environment.assets.is_empty(),
         environment_checks: environment.checks.clone(),
         environment_digest,
         task: input.task.clone(),
@@ -1015,7 +1031,7 @@ pub async fn load_selection_context(
         needed_run_purposes: needed_run_purposes(
             input.review_config,
             input.project_settings,
-            &roles,
+            &[input.claiming_agent.role.as_str()],
         ),
         agent_capacity: count_agent_capacity(transaction, &input.claiming_agent.agent.id).await?,
     })
@@ -1114,6 +1130,8 @@ mod tests {
 
     fn context() -> SelectionContext {
         let mut context = SelectionContext {
+            environment_admission: EnvironmentAdmission::Dispatcher,
+            environment_has_assets: false,
             environment_digest: None,
             environment_checks: Vec::new(),
             task: Task {
@@ -1432,7 +1450,6 @@ mod tests {
         .unwrap();
         context.candidates[0].environment_readiness =
             Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
-        context.worktree_agents.clear();
         assert_eq!(context.claiming_agent.role, "coder");
         assert!(select_placement(&context).into_result().is_ok());
         assert!(environment_pause_candidates(&context).is_empty());
@@ -1469,6 +1486,52 @@ mod tests {
             environment_pause_candidates(&context).is_empty(),
             "other Agents can run on the healthy server"
         );
+    }
+
+    #[test]
+    fn readiness_asset_projects_use_launch_facts_and_direct_claims_skip_pending() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates = vec![candidate(&context, "server", None)];
+        context.environment_admission = EnvironmentAdmission::LaunchPreflight;
+        assert!(select_placement(&context).into_result().is_ok());
+        context.environment_admission = EnvironmentAdmission::Dispatcher;
+        assert!(select_placement(&context).into_result().is_err());
+        context.environment_has_assets = true;
+        assert!(select_placement(&context).into_result().is_ok());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        assert!(
+            select_placement(&context).into_result().is_ok(),
+            "a primary checkout cannot validate staged assets"
+        );
+        context.candidates[0]
+            .environment_readiness
+            .as_mut()
+            .unwrap()
+            .role = Some("coder".into());
+        assert!(
+            select_placement(&context).into_result().is_err(),
+            "actual launch failures remain placement facts"
+        );
+    }
+
+    #[test]
+    fn readiness_offline_alternative_never_changes_pause_with_cached_handshake() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates = vec![
+            candidate(&context, "server", None),
+            candidate(&context, "offline", Some("offline")),
+        ];
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context.candidates[1].connected = false;
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
+        context.candidates[1].negotiated_revision = None;
+        context.candidates[1].workspace_v1 = false;
+        context.candidates[1].executors.clear();
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
     }
 
     fn rejected(context: &SelectionContext, code: PlacementFilterCode) -> PlacementUnavailable {

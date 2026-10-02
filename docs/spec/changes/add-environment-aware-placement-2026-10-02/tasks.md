@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T10:47:57Z
+updated_at: 2026-10-02T13:25:40Z
 completed_at:
 ---
 
@@ -36,9 +36,18 @@ completed_at:
 ### Backend build-step verification
 - Backend tasks 1.1–1.5 and 2.1–2.3 include audit corrections D-A–D-F: host-only probes, role-specific admission pause, transactional resume reset, environmental waits, parked slot projection, and preference-preserving deferral.
 - Machine key is Project/server owner or Project/daemon/runtime owner. The temporary daemon missing/unknown/stale pass is `placement::selection::environment_filter`, shared by reserve and claim; step 3 removes it.
-- Audit reproductions are permanent repo tests in `task_dispatcher/tests/environment_placement.rs`; they have no dependency on audit scratch files. The shared launch fixture no longer seeds a ready row: it configures the launch-only environment after normal claim; first-dispatch tests exercise actual probes.
+- Audit reproductions are permanent repo tests in `task_dispatcher/tests/environment_placement.rs`; they have no dependency on audit scratch files. The shared launch fixture no longer seeds a ready row: it configures the environment before ordinary claim; direct claims use launch preflight and dispatcher tests exercise real probes.
 - Daemon launch tests use `interactive`, because separate jobs own coder/planner plan I/O fixes in `workflow/dispatch/loader.rs` and `task_service/execution/runner.rs`; neither site is changed.
-- API/CLI/web, generated types, daemon operations, provisioning and CHANGELOG.md remain untouched. Broad suites and the full happy-path target remain CI work; no named environment happy-path case exists.
+- API response types, CLI, generated types, daemon operations, provisioning and CHANGELOG.md remain untouched. The second audit adds the existing filter codes to docs/api.md and two label strings to the web error map. Broad suites and the full happy-path target remain CI work; no named environment happy-path case exists.
 - Audit coverage also verifies parked waits advancing `list_revision`, exact machine-specific deferral clearing, automatic continuation after a colliding digest edit, and a settings probe clearing its matching environment pause without a Task. The integration branch's future batched slot projection is not present at this HEAD; the current aggregate and row walk are checked for identical parked counts.
-- Guard regressions cover a harmless name edit during re-check and retaining the environmental wait on offline transport. Valid digest edits with checks remaining retire the obsolete environment pause in the same transaction; otherwise an unknown daemon fact could never reach the launch that verifies it. Removing all checks preserves the existing manual-resume behavior.
+- Guard regressions cover a harmless name edit during re-check and retaining the environmental wait on offline transport. Valid digest edits with checks remaining retire the obsolete named-check environment pause in the same transaction; otherwise an unknown daemon fact could never reach the launch that verifies it. Removing all checks preserves the existing manual-resume behavior.
 - Migration contract clarification: legacy asset-only pauses are preserved without a readiness row, honoring the no-check/no-row rule; configured-check pauses carry not-ready rows, and malformed settings carry unknown rows.
+
+### Second-round audit corrections
+- [x] Asset-backed checks use launch preflight; direct/manual claims bypass probe-pending.
+- [x] Environment gating and pause use only the launching role, independently of Agent identity.
+- [x] Passing re-check re-reads the Project; bad jobs/rows are isolated and rescheduled.
+- [x] Unnamed failures require resume or Check now; pauses resolve redundant Task environment Attention.
+- [x] Offline alternatives never affect the pause decision; no-check initial dispatch returns before context assembly.
+- [x] Deleted daemon workspace resets its readiness to unknown and clears the wait.
+- [x] Ported audit parity cases, focused suites, strict validation and final crate/web checks.

@@ -81,7 +81,10 @@ pub(crate) fn start_probe(
 ) {
     // Step A is deliberately host-only. A daemon check through a live Task
     // workspace is never a readiness probe; machine.probe lands in step 3.
-    if environment.checks.is_empty() || !matches!(target, ProbeTarget::Server(_)) {
+    if environment.checks.is_empty()
+        || !environment.assets.is_empty()
+        || !matches!(target, ProbeTarget::Server(_))
+    {
         return;
     }
     let Some(guard) = claim_probe(&project, &EnvironmentMachine::Server) else {
@@ -249,10 +252,13 @@ pub(crate) async fn clear_matching_pause(
     original: &db::Project,
     result: &ProjectMachineReadiness,
 ) -> Result<bool> {
-    let Some(epoch) = original.paused_at.as_deref() else {
+    let Some(current) = db::ProjectRepo::get_by_id(db, &original.id).await? else {
         return Ok(false);
     };
-    let mut snapshot = original.clone();
+    let Some(epoch) = current.paused_at.as_deref() else {
+        return Ok(false);
+    };
+    let mut snapshot = current.clone();
     loop {
         if snapshot.system_pause_reason.as_deref()
             != Some(crate::project_environment::ENVIRONMENT_NOT_READY)
@@ -267,6 +273,33 @@ pub(crate) async fn clear_matching_pause(
             Ok(settings) => settings,
             Err(_) => return Ok(false),
         };
+        let pause: api_types::ProjectEnvironmentPause = match snapshot
+            .environment_pause_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(Some(pause)) => pause,
+            _ => return Ok(false),
+        };
+        if pause.checks.is_empty() {
+            return Ok(false);
+        } // Only resume/Check now clears unnamed setup failures.
+        if result.failing_checks.iter().any(|failure| {
+            settings
+                .environment
+                .checks
+                .iter()
+                .find(|check| check.name == failure.name)
+                .is_none_or(|check| {
+                    pause
+                        .role
+                        .as_ref()
+                        .is_none_or(|role| check.applies_to(role))
+                })
+        }) {
+            return Ok(false);
+        }
         if db::environment_checks_digest(&settings.environment) != result.checks_digest
             || db
                 .get_readiness(&snapshot.id, &result.machine)
@@ -346,7 +379,7 @@ pub(crate) async fn schedule_project_probes(
         Ok(settings) => settings,
         Err(_) => return Ok(()),
     };
-    if settings.environment.checks.is_empty() {
+    if settings.environment.checks.is_empty() || !settings.environment.assets.is_empty() {
         return Ok(());
     }
     let observed = db
@@ -465,7 +498,7 @@ pub(crate) async fn handle_refusal(
             let (kind, daemon, runtime) = row.machine.columns(); serde_json::json!({"owner_kind":kind,"daemon_id":daemon,"runtime_id":runtime,"version":row.version})
         }).collect();
         let detail = serde_json::json!({"machine":machine,"workspace_id":row.workspace_id,"checks":super::selection::applicable_failing_checks(context,candidate),
-            "role":row.role.as_ref().unwrap_or(&context.claiming_agent.role), "output":row.output_tail,
+            "role":context.claiming_agent.role, "output":row.output_tail,
             "paused_at":now,"last_checked_at":row.checked_at.as_ref().unwrap_or(&now),"next_check_at":row.next_check_at.as_ref().unwrap_or(&now),"readiness_versions":versions});
         if db::ProjectRepo::set_environment_pause_if_unchanged(
             db,

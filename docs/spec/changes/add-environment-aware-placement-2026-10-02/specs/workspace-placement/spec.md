@@ -1,5 +1,5 @@
 ---
-updated_at: 2026-10-02T10:47:57Z
+updated_at: 2026-10-02T13:25:40Z
 ---
 
 ## MODIFIED Requirements
@@ -45,12 +45,16 @@ The system SHALL record per Project and workspace-owner machine (the server
 host or daemon runtime) `ready`, `not_ready` or `unknown`, a digest of `env` and
 `checks`, per-check results, bounded output and check times. Selection SHALL
 only read this context. A current failure SHALL reject only if a named failing
-check applies to one of the Task's worktree roles through
+check applies to the role being launched through
 `EnvironmentCheck::applies_to`; an unnamed launch failure applies to its
 recorded role. Rejections SHALL include applicable failing check names.
 
 In backend build step A only the host SHALL be probed proactively. Missing,
-unknown or stale host readiness SHALL yield transient `environment_probe_pending`.
+unknown or stale host readiness SHALL yield transient `environment_probe_pending`
+only for dispatcher-initiated admission of check-only Projects. Direct/manual
+claims SHALL proceed and launch-time preflight SHALL decide. Projects with
+assets SHALL use launch preflight instead of primary-checkout probe facts,
+which cannot see staged assets; actual launch failures SHALL still reject.
 For daemon candidates, only current applicable `not_ready` rejects; missing,
 unknown and stale rows SHALL pass identically at reserve and claim. This policy
 SHALL live in one function, removed when step 3 introduces `machine.probe`.
@@ -79,15 +83,15 @@ completion SHALL wake dispatch through the in-process dispatcher kick.
 ### Requirement: Readiness probe runs the Project's checks on the machine
 A probe SHALL run on the machine it is about, outside admission with
 single-flight ownership and version/digest fences. In build step A only the
-host SHALL be probed: run every configured check with Project env in the
+host SHALL be probed for Projects without environment assets: run every configured check with Project env in the
 repository's server checkout and retain per-check results for role-aware
 selection. Commands must be read-only; output SHALL be bounded while collected
 and redacted before storage. Completion SHALL immediately wake dispatch. A
 digest-changing settings edit SHALL start host probes for existing host rows
 or ready host locations without waiting for a Task. If an edit collides with an older probe flight, completion SHALL schedule
 the current digest without requiring a queued Task. A passing probe SHALL
-compare-and-clear a matching environment pause using its pre-probe Project
-snapshot; it SHALL preserve intervening user/repository pauses. Step 3 extends probes to
+compare-and-clear a matching environment pause using the current Project
+snapshot after its result; it SHALL preserve intervening user/repository pauses. Step 3 extends probes to
 daemons through `machine.probe`, with full checks in a ready checkout or
 `scope = machine` checks in scratch space. Timeouts SHALL remain 1–300 seconds.
 
@@ -110,8 +114,17 @@ daemons through `machine.probe`, with full checks in a ready checkout or
 - **THEN** the Task stays queued until the server probe completes
 
 #### Scenario: Failure scoped to another role
-- **WHEN** only a reviewer-scoped check fails and the Task needs only a coder worktree role
+- **WHEN** only a reviewer-scoped check fails and the Task launches a coder role, regardless of the assigned reviewer Agent
 - **THEN** the candidate passes the environment filter and that failure does not pause this Task's Project
+
+
+#### Scenario: Direct claim with an unverified host
+- **WHEN** a direct or manual claim has checks and no current host readiness record
+- **THEN** it succeeds on its first attempt and launch-time preflight runs the checks
+
+#### Scenario: A check reads staged assets
+- **WHEN** configured assets are staged into the Task workspace and a check reads them
+- **THEN** primary-checkout probes do not gate placement and the check runs after staging at launch
 
 ### Requirement: Provisioning a verified machine that lacks the code
 When no candidate with a `ready` location passes the filters, the system SHALL consider provisioning candidates: daemon runtimes that have no location for the repository, where the repository has a remote URL, the daemon advertises `machine_probe.v1` and `repo_provision.v1`, its run policy allows the probe and provision purposes, the Agent's executor is installed, authenticated, and enabled, and the Project's `settings.placement.provision` is `when_verified` (the default). The system SHALL run the Project's `machine` checks on such a daemon and SHALL provision a managed clone there only when the Project declares at least one `machine` check and all of them pass. A daemon for a Project with no `machine` check SHALL be rejected with `environment_unverified`. After provisioning, the location SHALL be verified and the full checks SHALL run in the clone before the location is eligible. Provisioning SHALL run outside admission with single-flight ownership per repository and runtime; the Task SHALL wait with `environment_probe_pending`. With `settings.placement.provision = never`, no provisioning candidate SHALL be considered.

@@ -555,4 +555,42 @@ mod tests {
         assert_eq!(edited.paused_at, Some(now));
         assert!(edited.system_pause_reason.is_none());
     }
+    #[tokio::test]
+    async fn readiness_due_scan_isolates_and_reschedules_an_undecodable_row() {
+        let (db, id, environment) = fixture().await;
+        let mut bad = row(&id, &environment);
+        bad.status = EnvironmentReadinessStatus::NotReady;
+        bad.next_check_at = Some("2000-01-01T00:00:00Z".into());
+        let bad = db.put_readiness(bad, None).await.unwrap();
+        let mut good = bad.clone();
+        good.machine = EnvironmentMachine::Daemon {
+            daemon_id: "healthy".into(),
+            runtime_id: "runtime".into(),
+        };
+        let mut bad_version = good.clone();
+        bad_version.machine = EnvironmentMachine::Daemon {
+            daemon_id: "bad-version".into(),
+            runtime_id: "runtime".into(),
+        };
+        db.put_readiness(bad_version, None).await.unwrap();
+        db.put_readiness(good, None).await.unwrap();
+        sqlx::query("UPDATE project_machine_readiness SET version='invalid' WHERE project_id=? AND daemon_id='bad-version'")
+            .bind(&id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE project_machine_readiness SET failing_checks_json='[{\"name\":null}]' WHERE project_id=? AND owner_kind='server'").bind(&id).execute(db.pool()).await.unwrap();
+        let due = db.due_readiness(&crate::now_rfc3339()).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(matches!(due[0].machine, EnvironmentMachine::Daemon { .. }));
+        let (version,next):(i64,String)=sqlx::query_as("SELECT version,next_check_at FROM project_machine_readiness WHERE project_id=? AND owner_kind='server'").bind(&id).fetch_one(db.pool()).await.unwrap();
+        let next_bad_version: String = sqlx::query_scalar("SELECT next_check_at FROM project_machine_readiness WHERE project_id=? AND daemon_id='bad-version'")
+            .bind(&id).fetch_one(db.pool()).await.unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&next_bad_version).unwrap() > chrono::Utc::now()
+        );
+        assert!(version > bad.version);
+        assert!(chrono::DateTime::parse_from_rfc3339(&next).unwrap() > chrono::Utc::now());
+        assert_eq!(
+            db.due_readiness(&crate::now_rfc3339()).await.unwrap().len(),
+            1
+        );
+    }
 }

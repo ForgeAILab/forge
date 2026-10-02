@@ -424,6 +424,15 @@ impl ProjectRepo for SqliteDb {
             && after
                 .as_ref()
                 .is_some_and(|environment| !environment.checks.is_empty())
+            && project
+                .environment_pause_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|pause| {
+                    pause["checks"]
+                        .as_array()
+                        .is_some_and(|checks| !checks.is_empty())
+                })
             && project.system_pause_reason.as_deref() == Some("environment_not_ready")
         {
             // The old digest's pause cannot veto its unknown replacement facts,
@@ -697,6 +706,12 @@ impl ProjectRepo for SqliteDb {
                 .bind(id)
                 .execute(&mut *transaction)
                 .await?;
+            // The Project pause is the sole environment signal. Close any
+            // earlier capacity/environment wait in the same writer transaction.
+            sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id=?)")
+                .bind(&updated_at).bind(&updated_at).bind(id).execute(&mut *transaction).await?;
+            sqlx::query("UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL")
+                .bind(id).execute(&mut *transaction).await?;
             wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;

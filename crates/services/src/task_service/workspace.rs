@@ -43,6 +43,7 @@ const PLACEMENT_RESERVATION_SECONDS: i64 = 600;
 pub(super) struct WorkspaceAdmission {
     pub workspace: Workspace,
     claiming_task: Task,
+    environment_admission: crate::placement::selection::EnvironmentAdmission,
     pub placement: db::WorkspacePlacement,
     selection_context: Option<crate::placement::SelectionContext>,
     server_facts: crate::placement::ServerFacts,
@@ -58,6 +59,19 @@ impl TaskService {
         agent: &Agent,
         role: &str,
     ) -> Result<bool> {
+        let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+            .bind(&task.project_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
+        let environment = serde_json::from_str::<ProjectSettings>(&raw)
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!("invalid project settings: {error}"))
+            })?
+            .environment;
+        if environment.checks.is_empty() || !environment.assets.is_empty() {
+            return Ok(false);
+        }
         let prepared = crate::placement::context::prepare_selection(
             &self.db,
             task,
@@ -324,6 +338,22 @@ impl TaskService {
         agent: Option<&Agent>,
         role: &str,
     ) -> Result<WorkspaceAdmission> {
+        self.reserve_workspace_admission(
+            task,
+            agent,
+            role,
+            crate::placement::selection::EnvironmentAdmission::Dispatcher,
+        )
+        .await
+    }
+
+    pub(super) async fn reserve_workspace_admission(
+        &self,
+        task: &Task,
+        agent: Option<&Agent>,
+        role: &str,
+        environment_admission: crate::placement::selection::EnvironmentAdmission,
+    ) -> Result<WorkspaceAdmission> {
         use crate::placement::select_placement;
         if agent.is_some() {
             self.ensure_project_not_paused(task).await?;
@@ -578,6 +608,9 @@ impl TaskService {
                 None,
             )
             .await?;
+        if let Some(context) = context.as_mut() {
+            context.environment_admission = environment_admission;
+        }
         let (
             location_id,
             owner_kind,
@@ -797,6 +830,7 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
         Ok(WorkspaceAdmission {
+            environment_admission,
             claiming_task: task.clone(),
             workspace,
             placement,
@@ -1045,7 +1079,7 @@ impl TaskService {
                 .as_deref()
                 .unwrap_or(&empty_registry);
             let handshakes = connection_handshakes(registry);
-            let context = crate::placement::load_selection_context(
+            let mut context = crate::placement::load_selection_context(
                 &self.db,
                 transaction,
                 registry,
@@ -1065,6 +1099,7 @@ impl TaskService {
                 },
             )
             .await?;
+            context.environment_admission = admission.environment_admission;
             crate::placement::select_placement(&context).into_result()?;
         }
         sqlx::query(

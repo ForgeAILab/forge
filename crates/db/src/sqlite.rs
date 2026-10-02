@@ -138,6 +138,7 @@ mod workspace_placement;
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
+    readiness_decode_warnings: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +148,10 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            readiness_decode_warnings: Default::default(),
+        }
     }
 
     pub fn pool(&self) -> &SqlitePool {

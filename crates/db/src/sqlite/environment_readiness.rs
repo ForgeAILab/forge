@@ -42,8 +42,36 @@ pub(crate) fn map_readiness(row: SqliteRow) -> Result<ProjectMachineReadiness> {
 #[async_trait]
 impl ProjectMachineReadinessRepo for SqliteDb {
     async fn due_readiness(&self, now: &str) -> Result<Vec<ProjectMachineReadiness>> {
-        sqlx::query("SELECT * FROM project_machine_readiness WHERE status = 'not_ready' AND (next_check_at IS NULL OR julianday(next_check_at) <= julianday(?)) ORDER BY project_id, owner_kind, daemon_id, runtime_id")
-            .bind(now).fetch_all(self.pool()).await?.into_iter().map(map_readiness).collect()
+        let rows=sqlx::query("SELECT rowid AS readiness_row_id, CAST(version AS TEXT) AS readiness_version, * FROM project_machine_readiness WHERE status = 'not_ready' AND (next_check_at IS NULL OR julianday(next_check_at) <= julianday(?)) ORDER BY project_id, owner_kind, daemon_id, runtime_id")
+            .bind(now).fetch_all(self.pool()).await?;
+        let mut due = Vec::new();
+        for row in rows {
+            let id: i64 = row.try_get("readiness_row_id")?;
+            let version: String = row.try_get("readiness_version")?;
+            match map_readiness(row) {
+                Ok(row) => {
+                    self.readiness_decode_warnings
+                        .lock()
+                        .expect("readiness warning lock")
+                        .remove(&id);
+                    due.push(row);
+                }
+                Err(error) => {
+                    let first = self
+                        .readiness_decode_warnings
+                        .lock()
+                        .expect("readiness warning lock")
+                        .insert(id);
+                    if first {
+                        tracing::warn!(row_id=id,%error,"invalid readiness row; skipping and rescheduling");
+                    }
+                    let next = (chrono::Utc::now() + chrono::Duration::seconds(600)).to_rfc3339();
+                    sqlx::query("UPDATE project_machine_readiness SET next_check_at=?, version=version+1 WHERE rowid=? AND CAST(version AS TEXT)=?")
+                        .bind(next).bind(id).bind(version).execute(self.pool()).await?;
+                }
+            }
+        }
+        Ok(due)
     }
     async fn reschedule_readiness(
         &self,
@@ -118,14 +146,19 @@ impl ProjectMachineReadinessRepo for SqliteDb {
                 .bind(&row.project_id).bind(kind).bind(daemon).bind(runtime).bind(status).bind(&row.checks_digest).bind(&failures).bind(&results).bind(&row.output_tail).bind(&row.scope_covered).bind(&row.role).bind(&row.workspace_id).bind(&row.checked_at).bind(&row.next_check_at).fetch_optional(&mut *tx).await?
         }.ok_or(DbError::VersionConflict)?;
         let saved = map_readiness(updated)?;
-        if saved.status != EnvironmentReadinessStatus::Unknown {
+        if saved.status != EnvironmentReadinessStatus::Unknown
+            || matches!(saved.machine, EnvironmentMachine::Daemon { .. })
+        {
             // Readiness wakes do not spend another Task version on a queued
             // probe deferral. Authority edits retain the existing version fence.
             sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.deferred_dispatch') WHERE project_id = ? AND json_valid(metadata_json) AND ((? AND json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_probe_pending') OR (json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' AND json_extract(metadata_json, '$.environment_wait.machine') = json(?)))")
                 .bind(&saved.project_id).bind(saved.machine == EnvironmentMachine::Server)
                 .bind(serde_json::to_value(&saved.machine).map_err(|error|DbError::Check(error.to_string()))?.to_string()).execute(&mut *tx).await?;
         }
-        if saved.status == EnvironmentReadinessStatus::Ready {
+        if saved.status == EnvironmentReadinessStatus::Ready
+            || (saved.status == EnvironmentReadinessStatus::Unknown
+                && matches!(saved.machine, EnvironmentMachine::Daemon { .. }))
+        {
             let machine = serde_json::to_value(&saved.machine)
                 .map_err(|error| DbError::Check(error.to_string()))?
                 .to_string();

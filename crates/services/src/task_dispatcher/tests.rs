@@ -6006,30 +6006,20 @@ async fn environment_probe_three_admissions_defer_once_then_launch() {
         tasks.push(task);
     }
     let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
+    let claimant = AgentRepo::get_by_id(&*db, &agent).await.unwrap().unwrap();
     let admissions = tokio::join!(
-        Box::pin(dispatcher.task_service.claim_task(
-            tasks[0].id.clone(),
-            crate::Assignee::Agent(agent.clone()),
-            None
-        )),
-        Box::pin(dispatcher.task_service.claim_task(
-            tasks[1].id.clone(),
-            crate::Assignee::Agent(agent.clone()),
-            None
-        )),
-        Box::pin(dispatcher.task_service.claim_task(
-            tasks[2].id.clone(),
-            crate::Assignee::Agent(agent.clone()),
-            None
-        ))
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[0], &claimant, "coder"),
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[1], &claimant, "coder"),
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[2], &claimant, "coder"),
     );
     for result in [admissions.0, admissions.1, admissions.2] {
-        let Err(ServiceError::PlacementUnavailable(refusal)) = result else {
-            panic!("first admission must wait for its probe");
-        };
-        assert!(refusal.rejected_candidates.iter().any(|candidate| candidate
-            .filter_codes
-            .contains(&crate::placement::PlacementFilterCode::EnvironmentProbePending)));
+        assert!(result.unwrap());
     }
     tokio::time::timeout(Duration::from_secs(5), async {
         while !signals.path().join("starts").exists() {
@@ -6407,12 +6397,23 @@ async fn environment_recheck_without_rerunnable_checks_stays_paused() {
         .unwrap();
     assert!(results.is_empty());
     assert!(current.paused_at.is_some());
-    sqlx::query("UPDATE project SET settings = ?, version = version + 1 WHERE id = ?")
-        .bind(r#"{"environment":{"checks":[{"name":"fixed","command":"true"}]}}"#)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(
+                r#"{"environment":{"checks":[{"name":"fixed","command":"true"}]}}"#.into(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        current.version,
+        None,
+    )
+    .await
+    .unwrap();
     // The manual empty check rescheduled the detail; force it due again.
     sqlx::query("UPDATE project SET environment_pause_json = json_set(environment_pause_json, '$.next_check_at', '2026-01-01T00:00:00Z') WHERE id = ?")
         .bind(&project_id).execute(db.pool()).await.unwrap();
@@ -6447,9 +6448,14 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     let workspace = TempDir::new().unwrap();
     let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let mut repos = Vec::new();
-    for (index, corruption) in ["pause", "environment-settings", "slot-settings"]
-        .into_iter()
-        .enumerate()
+    for (index, corruption) in [
+        "pause",
+        "environment-settings",
+        "slot-settings",
+        "readiness",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let repo = TempDir::new().unwrap();
         let (project_id, _) = seed_project_repo(&db, repo.path()).await;
@@ -6457,7 +6463,7 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
             seed_environment_pause(
                 &db,
                 &project_id,
-                serde_json::json!({"checks":[{"name":"disk","command":"true"}]}),
+                serde_json::json!({"checks":[{"name":"disk","command":if corruption=="pause" {"false"} else {"true"}}]}),
                 &["disk"],
                 "2026-01-01T00:00:00Z",
             )
@@ -6472,6 +6478,8 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
                 .execute(db.pool())
                 .await
                 .unwrap();
+        } else if corruption == "readiness" {
+            sqlx::query("UPDATE project_machine_readiness SET failing_checks_json='[{\"name\":null}]' WHERE project_id=?").bind(&project_id).execute(db.pool()).await.unwrap();
         } else {
             sqlx::query("UPDATE project SET settings = 'invalid' WHERE id = ?")
                 .bind(&project_id)
@@ -6489,9 +6497,33 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     }
     let repo = TempDir::new().unwrap();
     let (healthy, _) = seed_project_repo(&db, repo.path()).await;
-    let task = seed_task(&db, &healthy, "healthy admission", "todo", 0).await;
-    assign_role(&db, &task.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if dispatcher
+                .environment_rechecks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|job| job.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let task = seed_task(
+        &db,
+        &healthy,
+        "healthy admission after failed job",
+        "todo",
+        0,
+    )
+    .await;
+    assign_role(&db, &task.id, "coder", &agent).await;
     assert_eq!(dispatcher.check_once().await.unwrap(), 1);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -6500,6 +6532,16 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
             .unwrap()
             .task_id,
         task.id
+    );
+    assert_eq!(
+        dispatcher.check_once().await.unwrap(),
+        0,
+        "subsequent ticks also isolate bad rows"
+    );
+    let overdue_bad:i64=sqlx::query_scalar("SELECT count(*) FROM project_machine_readiness WHERE failing_checks_json='[{\"name\":null}]' AND julianday(next_check_at)<=julianday(?)").bind(now_rfc3339()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        overdue_bad, 0,
+        "the undecodable row is rescheduled instead of retried each tick"
     );
 }
 
@@ -7697,3 +7739,6 @@ async fn worker_robustness_dispatcher_isolates_projects_and_tasks() {
 
 #[path = "tests/environment_placement.rs"]
 mod environment_placement;
+
+#[path = "tests/environment_parity.rs"]
+mod environment_parity;

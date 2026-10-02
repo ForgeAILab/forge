@@ -2,7 +2,7 @@
 use super::*;
 use db::ProjectMachineReadinessRepo;
 
-async fn configure(db: &db::SqliteDb, id: &str, environment: serde_json::Value) {
+pub(super) async fn configure(db: &db::SqliteDb, id: &str, environment: serde_json::Value) {
     let project = ProjectRepo::get_by_id(db, id).await.unwrap().unwrap();
     let mut settings: serde_json::Value = serde_json::from_str(&project.settings).unwrap();
     settings["environment"] = environment;
@@ -22,7 +22,7 @@ async fn configure(db: &db::SqliteDb, id: &str, environment: serde_json::Value) 
     .await
     .unwrap();
 }
-async fn drive<F, Fut>(dispatcher: &TaskDispatcher, mut done: F)
+pub(super) async fn drive<F, Fut>(dispatcher: &TaskDispatcher, mut done: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -253,38 +253,6 @@ async fn single_machine_unnamed_asset_failure_retries_after_resume() {
         .unwrap()
         .unwrap();
     assert_clean_wait(&db, &task, "in_progress").await;
-}
-#[tokio::test]
-async fn single_machine_unnamed_failure_is_scheduled_like_named_checks() {
-    let db = Arc::new(sqlite_db().await);
-    let repo = TempDir::new().unwrap();
-    let root = TempDir::new().unwrap();
-    let assets = TempDir::new().unwrap();
-    let (project, _) = seed_project_repo(&db, repo.path()).await;
-    let agent = seed_agent(&db, 2, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project, "asset repair", "todo", 0).await;
-    assign_role(&db, &task.id, "coder", &agent).await;
-    let source = assets.path().join("missing");
-    configure(&db,&project,serde_json::json!({"assets":[{"source":source,"target":"vendor"}],"checks":[{"name":"tool","command":"true"}],"recheck_interval_seconds":60})).await;
-    let (dispatcher, _) = build_dispatcher(db.clone(), root.path()).await;
-    drive(&dispatcher, || async {
-        ProjectRepo::get_by_id(&*db, &project)
-            .await
-            .unwrap()
-            .unwrap()
-            .paused_at
-            .is_some()
-    })
-    .await;
-    std::fs::create_dir(&source).unwrap();
-    sqlx::query("UPDATE project_machine_readiness SET next_check_at = '2000-01-01T00:00:00Z' WHERE project_id = ?").bind(&project).execute(db.pool()).await.unwrap();
-    drive(&dispatcher, || async {
-        !ExecutionRepo::list_running_by_task(&*db, &task.id)
-            .await
-            .unwrap()
-            .is_empty()
-    })
-    .await;
 }
 #[tokio::test]
 async fn single_machine_reviewer_check_does_not_stop_coder() {

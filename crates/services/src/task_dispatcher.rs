@@ -108,7 +108,13 @@ impl TaskDispatcher {
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
         let mut dispatched = 0;
-        let environment_changed = self.sync_due_environment_checks().await?;
+        let environment_changed = match self.sync_due_environment_checks().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error,"environment readiness scan failed; continuing Project dispatch");
+                HashSet::new()
+            }
+        };
         self.observe_environment_settings();
         for project in self.list_projects().await? {
             if self.is_stopped() {

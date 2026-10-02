@@ -1,5 +1,5 @@
 ---
-updated_at: 2026-10-02T10:47:57Z
+updated_at: 2026-10-02T13:25:40Z
 ---
 
 ## MODIFIED Requirements
@@ -9,8 +9,8 @@ A failing pre-launch check SHALL terminalize its execution before a provider
 call, record its workspace-owner machine not-ready with check results, role,
 workspace and bounded output, and leave the Task's state without a blocking
 annotation. Admission refusal and launch failure SHALL share one pause
-decision in the context of the concrete Task and its worktree roles. When all
-ready-location candidates that would otherwise be eligible are rejected only
+decision in the context of the concrete Task and the role being launched. When all
+connected ready-location candidates that would otherwise be eligible are rejected only
 for applicable `environment_not_ready`, compare-and-set the Project pause
 without overwriting a user or repository pause. This SHALL happen before any
 initial Task transition or `dispatch_failed` annotation, including a first
@@ -56,16 +56,20 @@ run first.
 ### Requirement: Periodic re-check resumes the Project automatically
 One due-row query SHALL drive scheduled re-checks of not-ready machines at
 `next_check_at`, with Project env on that machine. Named failures SHALL re-run
-recorded checks; unnamed failures SHALL run all configured checks applicable
-to the recorded role. Host checks use its repository checkout. In build step A
+recorded checks; unnamed failures SHALL NOT run on a schedule and SHALL clear only through
+manual resume or Check now. Host checks use its repository checkout. In build step A
 daemon checks SHALL use only the failure's recorded ready placement through
 existing `workspace.run`, never another Task's live workspace or a substitute
 host. Later scoped probes can use machine scratch space. Intervals SHALL remain
 600 by default, valid range 60–86400. Actual success SHALL mark ready, clear
 matching waits, wake dispatch and compare-and-clear an unchanged environment
-pause, publishing resumed. Failing results SHALL update facts and scheduling.
+pause, publishing resumed. The Project SHALL be re-read after success so a pause
+created while the check ran can be cleared. A failed job or undecodable row SHALL
+be isolated, logged once, skipped and rescheduled without delaying other Projects.
+A daemon row whose recorded workspace was deleted SHALL become unknown, clearing
+its wait so the next launch decides. Failing results SHALL update facts and scheduling.
 Every outcome SHALL advance the schedule; transport, unreachable, version-fence
-or unusable-workspace errors SHALL retain facts and never fail another Task's
+or temporarily unusable-workspace errors SHALL retain facts and never fail another Task's
 run. Version/digest fences SHALL discard stale results. A harmless Project-version change SHALL retry compare-and-clear only for the same pause epoch, digest and readiness result version; an intervening user/repository pause SHALL win.
 
 #### Scenario: Disk recovers
@@ -96,16 +100,26 @@ run. Version/digest fences SHALL discard stale results. A harmless Project-versi
 - **THEN** not-ready rows become unknown in the same transaction
 - **AND** the next host admission probes and launches if fixed, or pauses again if still broken
 
-#### Scenario: Unnamed failure is rechecked
+#### Scenario: Unnamed failure requires explicit retry
 - **WHEN** asset staging or run-purpose denial created a not-ready row with no failing check name
-- **THEN** the timer runs all applicable checks; command errors keep the row and reschedule, and resume always permits another attempt
+- **THEN** the timer leaves the Project paused with no further execution attempts
+- **AND** manual resume resets readiness or Check now explicitly verifies the checks before clearing
 
 #### Scenario: Daemon transport error during re-check
 - **WHEN** the recorded daemon workspace is unreachable or its command returns a transport or version-fence error
 - **THEN** the row's readiness, checks and output are unchanged, next-check time advances, and no other Task run fails
 
+
+#### Scenario: Re-check starts before admission pauses
+- **WHEN** a due not-ready row is rechecked and admission creates an environment pause before that result passes
+- **THEN** the passing result clears the current matching pause and dispatch resumes automatically
+
+#### Scenario: Environmental Task Attention becomes redundant
+- **WHEN** a Task has an environmental wait item and the Project is subsequently environment-paused
+- **THEN** its environment Attention and wait marker are resolved in the Project pause transaction
+
 ### Requirement: On-demand environment re-check
-The system SHALL expose `POST /api/v1/projects/{id}/environment/recheck`. It runs every configured check immediately on every machine that has a readiness record or a `ready` location for the Project, or on one machine when the request names it, and returns each check's result grouped by machine. A machine on which all checks pass SHALL become `ready`. If the Project is environment-paused and at least one machine becomes `ready`, it resumes the Project. A manual Project resume and existing clear paths intended to retry work SHALL reset not-ready rows to unknown in the same transaction as clearing the pause. A valid digest edit with checks remaining SHALL retire an obsolete environment pause during invalidation so unknown daemon facts can reach launch; removing every check retains the base manual-resume rule. The next host admission SHALL probe and launch or pause again without waiting for the old due time. Daemons SHALL retry at launch until step 3.
+The system SHALL expose `POST /api/v1/projects/{id}/environment/recheck`. It runs every configured check immediately on every machine that has a readiness record or a `ready` location for the Project, or on one machine when the request names it, and returns each check's result grouped by machine. A machine on which all checks pass SHALL become `ready`. If the Project is environment-paused and at least one machine becomes `ready`, it resumes the Project. A manual Project resume and existing clear paths intended to retry work SHALL reset not-ready rows to unknown in the same transaction as clearing the pause. A valid digest edit with checks remaining SHALL retire an obsolete named-check environment pause during invalidation so unknown daemon facts can reach launch; removing every check retains the base manual-resume rule. The next dispatcher host admission without assets SHALL probe and launch or pause again without waiting for the old due time. Direct/manual claims, asset-backed Projects and daemons SHALL retry at launch until step 3.
 
 #### Scenario: Owner checks now after freeing disk
 - **WHEN** the owner frees disk and calls the recheck endpoint
