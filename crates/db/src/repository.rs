@@ -1805,12 +1805,6 @@ pub trait MemoryRepository: Send + Sync {
 /// authorization context when it is migrated to scoped retrieval.
 #[async_trait]
 pub trait ScopedMemoryRepository: Send + Sync {
-    async fn insert_memory_item_if_source_absent(
-        &self,
-        item: &MemoryItem,
-        source_type: &str,
-        source_ref: &str,
-    ) -> std::result::Result<(MemoryItem, bool), DbError>;
     async fn get_memory_item_scoped(
         &self,
         query: MemoryGetQuery,

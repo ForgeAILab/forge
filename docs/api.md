@@ -3087,8 +3087,8 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `event_consumers[]` | Durable consumers belonging to workers started by this process. Missing expected cursors are included with sequence 0; cursors for other workers are omitted. |
 | `event_consumers[].consumer_name` | Durable consumer identity. |
 | `event_consumers[].last_sequence` | Last checkpointed sequence. |
-| `event_consumers[].lag` | `max(domain_event.sequence) - last_sequence`, clamped to zero for an empty event table. This is sequence distance, so deleted gaps count; it is not a pending-row count. |
-| `event_consumers[].oldest_unprocessed_at` | Earliest creation timestamp among remaining events beyond the cursor, or `null` when caught up. |
+| `event_consumers[].lag` | For migrated workers (currently memory), the live count of pending events beyond the checkpoint matching the worker's stored subscription; deleted gaps and ignored types do not count. Legacy consumers retain `max(domain_event.sequence) - last_sequence`, clamped to zero, so their deleted gaps count. |
+| `event_consumers[].oldest_unprocessed_at` | Creation timestamp of the first pending subscribed sequence for migrated workers; earliest creation timestamp among all remaining events for legacy consumers. Computed live, `null` when caught up. |
 | `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
 | `event_consumers[].stalled` | Remaining unprocessed events exist and the cursor has not advanced for more than `server.event_consumer_stall_seconds` (default 300). For a missing cursor, inactivity starts at the oldest pending event. Idle, caught-up consumers are never stalled. |
@@ -3096,7 +3096,13 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 A stalled consumer raises `overall_severity` to at least `attention` and appears
 in the existing `recent_errors` operator issue list with `entity_type:
 "event_consumer"`, its consumer name as `entity_id`, and `severity: "attention"`.
-This current alert clears when the cursor recovers. Existing execution failures
+This current alert clears when the cursor recovers. Migrated workers also
+report bounded causes in the existing `recent_errors` list with the same
+consumer identity. Runtime causes clear on the next successful poll cycle,
+including empty cycles; event strikes remain until the event completes or is
+quarantined. Current deferrals include their reason and since-time as an
+informational worker entry, with `attention` when stalled. Quarantined items
+appear separately as `worker_dead_letter` issues for one hour, then expire. Existing execution failures
 still raise `error`; blocked tasks still raise `blocked`. The Operations page
 shows the lag, oldest pending age, stall state, vacuum mode, and free pages and
 uses its existing 30-second status polling to notice a dead consumer.

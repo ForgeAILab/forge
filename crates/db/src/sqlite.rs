@@ -72,7 +72,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
+use tokio::sync::Notify;
 
 mod action;
 mod agent;
@@ -90,6 +91,7 @@ mod command_receipt;
 mod commitment;
 mod daemon;
 mod domain_event;
+pub use domain_event::EventSubscription;
 mod embedded_agent;
 mod execution;
 mod external_link;
@@ -103,6 +105,7 @@ mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
 mod outbox;
+pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
 mod pricing;
 mod project;
@@ -137,6 +140,7 @@ mod workspace_placement;
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
+    domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,11 +150,22 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
+        Self {
+            pool,
+            domain_event_hooks,
+        }
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Pool-scoped wakeup for workers that consume committed domain events.
+    /// Durable cursors remain authoritative; a missed notification only falls
+    /// back to the worker's bounded idle poll.
+    pub fn domain_event_notify(&self) -> Arc<Notify> {
+        self.domain_event_hooks.notify()
     }
 }
 
