@@ -21,7 +21,7 @@ async fn workspace_backend_large_ci_tail_preserves_server_placement_verdict() {
     registry.register(daemon_id.clone(), connection);
     registry.dispatch_incoming_for_connection(&daemon_id, connection_id, api_types::DaemonFrame::Notification {
         method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
-        params: json!({"protocol_revision":3,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports"]}),
+        params: json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT]}),
     });
     let responses = registry.clone();
     let response_daemon = daemon_id.clone();

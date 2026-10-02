@@ -245,13 +245,16 @@ impl HookAction for DispatchRoleAgent {
                     state_dispatch.as_ref(),
                 );
                 let dispatch_ctx = match load_agent_dispatch_context(
-                    Arc::clone(&ctx.db),
-                    &ctx.task_id,
-                    role_name,
-                    &ctx.to_state,
-                    ctx.state_config.clone(),
-                    Some(selection.execution_policy.as_str()),
-                    &ctx.workflow,
+                    crate::workflow::dispatch::loader::DispatchContextParams {
+                        db: Arc::clone(&ctx.db),
+                        router: &ctx.workspace_backend_router,
+                        task_id: &ctx.task_id,
+                        role: role_name,
+                        state_name: &ctx.to_state,
+                        state_config: ctx.state_config.clone(),
+                        execution_policy: Some(selection.execution_policy.as_str()),
+                        workflow: &ctx.workflow,
+                    },
                 )
                 .await
                 {
@@ -680,6 +683,15 @@ async fn dispatch_refusal(ctx: &HookContext, error: crate::ServiceError) -> Hook
     match result {
         Ok(true) => HookResult::Skipped { reason },
         Ok(false) => {
+            if let Ok(Some(task)) = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+                if let Err(annotation_error) = ctx
+                    .task_service
+                    .record_placement_dispatch_refusal(&task, &error)
+                    .await
+                {
+                    tracing::warn!(task_id=%ctx.task_id, %annotation_error, "failed to record placement refusal");
+                }
+            }
             if let Err(annotation_error) =
                 crate::workflow::engine::annotate_upgrade_dispatch_refusal(
                     &ctx.db,

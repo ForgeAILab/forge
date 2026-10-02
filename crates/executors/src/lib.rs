@@ -138,6 +138,34 @@ pub enum ExecutionOutboxError {
 
 /// Whether a Task role may publish or update the canonical plan artifact.
 #[must_use]
+/// Seed only implementation roles, using a valid checklist from the canonical
+/// artifact or Task fallback. Planning turns must author their own candidate.
+pub fn execution_plan_seed<'a>(
+    role: Option<&str>,
+    canonical: Option<&'a str>,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    if !matches!(role, Some("worker" | "coder" | "executor")) {
+        return None;
+    }
+    canonical
+        .or(fallback)
+        .filter(|content| plan_has_checklist(content))
+}
+
+pub fn plan_has_checklist(content: &str) -> bool {
+    content.lines().any(|line| {
+        let bytes = line.trim_start_matches(' ').as_bytes();
+        bytes.len() >= 6
+            && matches!(bytes[0], b'-' | b'*')
+            && bytes[1] == b' '
+            && bytes[2] == b'['
+            && matches!(bytes[3], b' ' | b'x' | b'X')
+            && bytes[4] == b']'
+            && bytes[5] == b' '
+    })
+}
+
 pub fn task_role_can_write_plan(role: Option<&str>) -> bool {
     matches!(role, Some("planner" | "worker" | "coder" | "executor"))
 }

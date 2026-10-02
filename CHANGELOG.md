@@ -161,6 +161,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Planner, coder and worker executions now run on daemon-owned workspaces.
+  Until now only reviewer and interactive runs worked there: a coder or
+  worker on an existing workspace was never started and showed no reason,
+  and a planner failed with "failed to prepare the remote execution plan
+  outbox", because the server read and wrote the plan at the daemon's path on
+  its own disk. The plan now travels to the daemon in `execution.start` and
+  back with the terminal report, and publishing, restoring and discarding a
+  plan go through the machine that owns the workspace.
+  - Daemons advertise the capability `execution.plan_transport`, which these
+    roles require on a daemon-owned workspace. The protocol revision stays at
+    3, so a daemon that has not been upgraded keeps reviewer, interactive,
+    shared-mount, file and terminal use. A Task whose only machine lacks the
+    capability shows a reason naming the machine and the capability, and is
+    dispatched once an eligible machine appears.
+  - An empty or unchanged plan from a planner is rejected by the planning
+    guard, as on a server-owned workspace. A plan larger than 128 KiB fails
+    the execution with the limit and the actual size. If the owning machine
+    is unreachable when a plan must be published, the Task waits with a
+    visible reason and retries with back-off.
+  - Migration V202610020800 adds `execution_plan_transport`, where a plan
+    returned by a daemon is kept. It is not part of the execution's config
+    snapshot or of the execution API.
+  - A daemon below the minimum protocol revision is reported as needing an
+    upgrade (`daemon_upgrade_required`) whatever its revision; previously
+    only revision 2 was recognised.
 - Environment readiness is recorded per Project and machine (the server host
   or a daemon) in `project_machine_readiness`. Migration V202610020600 adds
   the table and carries each environment-paused Project over as a not-ready

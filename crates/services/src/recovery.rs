@@ -5805,8 +5805,8 @@ pub(crate) mod tests {
         registry.register(daemon_id.to_owned(), connection);
         registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
             method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
-            params: json!({"protocol_revision": 3,
-                "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+            params: json!({"protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+                "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],
                 "executor_capabilities": {"shell": {"resume": resume}}, "workspace_run_policy": {"allowed_purposes": ["ci_step"]}}),
         });
         (id, outbound)

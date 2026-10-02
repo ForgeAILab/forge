@@ -68,6 +68,7 @@ impl TaskDispatcher {
             }
             let task_id = task.id.clone();
             let result: Result<()> = async {
+                task = self.task_service.refresh_placement_dispatch_refusal(task.clone()).await?;
                 if self.task_service.expire_owner_wait(&task).await? {
                     return Ok(());
                 }
@@ -113,7 +114,7 @@ impl TaskDispatcher {
                     return Ok(());
                 }
                 task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                    &self.db, &task,
+                    &self.db, &self.task_service.workspace_backend_router(), &task,
                 )
                 .await
                 {
@@ -382,6 +383,7 @@ impl TaskDispatcher {
                         }
                     }
                     Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                        if self.task_service.record_placement_dispatch_refusal(&task, &error).await? { return Ok(()); }
                         deferred_dispatch::record_dispatch_disposition(
                             &self.db,
                             &task,
@@ -990,16 +992,18 @@ impl TaskDispatcher {
             self.ensure_review_attempt_for_recovery(project, task, &state.name)
                 .await?;
         }
-        let dispatch_ctx = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &state.name,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            workflow,
-        )
-        .await?;
+        let dispatch_ctx =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.task_service.workspace_backend_router(),
+                task_id: &task.id,
+                role: role_name,
+                state_name: &state.name,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
         let (prompt, selection) =
             build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
         let reviewer_snapshot = if role_name == crate::workflow::default_roles::REVIEWER {

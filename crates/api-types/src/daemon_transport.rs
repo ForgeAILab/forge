@@ -45,13 +45,16 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 3 adds daemon-owned workspaces and the shared journal ack.
+/// Revision 3 provides workspace operations; plan transport is capability-gated.
 pub const DAEMON_PROTOCOL_REVISION: u32 = 3;
 /// Every command RPC requires revision 3.
 pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 3;
 pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 3 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
+pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
+/// Remote plans reserve room for JSON escaping and the rest of the terminal report.
+pub const MAX_EXECUTION_PLAN_BYTES: u64 = 128 * 1024;
 pub const DAEMON_CAPABILITY_WORKSPACE: &str = "workspace.v1";
 pub const DAEMON_REQUIRED_CAPABILITIES: &[&str] = &[
     DAEMON_CAPABILITY_USAGE_REPORTS,
@@ -455,7 +458,18 @@ pub struct WorkspaceReviewDiffResult {
 /// generation; only the ordinary recreation request advances it.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
 pub enum WorkspaceOwnerOperation {
+    PublishPlan {
+        execution_id: String,
+        content: String,
+    },
+    RestorePlan {
+        execution_id: String,
+    },
+    DiscardPlan {
+        execution_id: String,
+    },
     MaterializeAssets {
         environment: crate::ProjectEnvironment,
     },
@@ -638,6 +652,7 @@ pub struct WorkspaceCleanupResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ExecutionStartParams {
     pub task_id: String,
     pub execution_id: String,
@@ -648,6 +663,7 @@ pub struct ExecutionStartParams {
     #[ts(type = "unknown")]
     pub prompt: serde_json::Value,
     pub max_turns: Option<u32>,
+    pub plan_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -687,6 +703,7 @@ pub struct ExecutionLogNotification {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
 pub struct ExecutionTerminalNotification {
     // Stable identity for the complete terminal result. The daemon persists
     // this record and retains it until the authenticated server acknowledges
@@ -712,6 +729,9 @@ pub struct ExecutionTerminalNotification {
     // Harvested by the owner, retained and acknowledged with this report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbox_entries: Vec<ExecutionOutboxEntry>,
+    /// Exact bounded checklist candidate, retained with the terminal identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_text: Option<String>,
     // Structured failure disposition. Absent on older daemons — the server
     // then falls back to generic executor-failed handling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1130,6 +1150,7 @@ mod tests {
             summary: None,
             after_sha: None,
             outbox_entries: vec![],
+            plan_text: None,
             usage_reports: vec![RemoteUsageReport {
                 report_id: "report-1".to_owned(),
                 request_id: Some("request-1".to_owned()),
@@ -1466,7 +1487,16 @@ mod tests {
     }
 
     #[test]
-    fn execution_terminal_outbox_round_trips_worklog_and_evidence() {
+    fn absent_plan_preserves_retained_terminal_payload() {
+        let value = json!({"terminal_report_id":"retained", "execution_id":"execution", "exit_code":0,
+            "signal":null, "error":null, "ts":"now", "usage_reports":[]});
+        let report: ExecutionTerminalNotification = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.plan_text.is_none());
+        assert_eq!(serde_json::to_value(report).unwrap(), value);
+    }
+
+    #[test]
+    fn execution_terminal_outbox_round_trips_plan_worklog_and_evidence() {
         let value = json!({
             "terminal_report_id": "terminal-1",
             "execution_id": "execution-1",
@@ -1475,6 +1505,7 @@ mod tests {
             "error": null,
             "ts": "2026-09-29T00:00:00Z",
             "usage_reports": [],
+            "plan_text": "- [ ] transported plan\n",
             "outbox_entries": [
                 { "type": "worklog", "position": "3", "kind": "validation", "summary": "20 tests passed" },
                 { "type": "evidence", "position": "1", "kind": "log", "caption": "test log", "content": "20 tests OK\n" },
@@ -1487,6 +1518,10 @@ mod tests {
         });
         let terminal = assert_round_trip::<ExecutionTerminalNotification>(value.clone());
         assert_eq!(terminal.outbox_entries.len(), 3);
+        assert_eq!(
+            terminal.plan_text.as_deref(),
+            Some("- [ ] transported plan\n")
+        );
         assert!(matches!(
             &terminal.outbox_entries[0],
             ExecutionOutboxEntry::Worklog {

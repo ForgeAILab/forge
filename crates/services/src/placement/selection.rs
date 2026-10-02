@@ -60,6 +60,7 @@ pub struct PlacementCandidate {
     pub connected: bool,
     pub negotiated_revision: Option<u32>,
     pub workspace_v1: bool,
+    pub plan_transport: bool,
     pub runtime_ready: bool,
     pub visible: bool,
     /// Availability is resolved per Agent, including its owner-scoped enable
@@ -195,6 +196,26 @@ pub struct PlacementUnavailable {
 }
 
 impl PlacementUnavailable {
+    pub fn is_deterministic(&self) -> bool {
+        !self.rejected_candidates.is_empty()
+            && self.rejected_candidates.iter().all(|candidate| {
+                !candidate.filter_codes.is_empty()
+                    && candidate.filter_codes.iter().all(|code| {
+                        // Capacity, reachability and environment readiness all
+                        // change without the Task changing, so a refusal for
+                        // them is retried on the next scan.
+                        !matches!(
+                            code,
+                            PlacementFilterCode::OwnerUnreachable
+                                | PlacementFilterCode::AgentCapacity
+                                | PlacementFilterCode::MachineCapacity
+                                | PlacementFilterCode::EnvironmentProbePending
+                                | PlacementFilterCode::EnvironmentNotReady
+                        )
+                    })
+            })
+    }
+
     pub fn needs_daemon_upgrade(&self) -> bool {
         use PlacementFilterCode::*;
         let upgrade_only = self
@@ -627,6 +648,14 @@ fn filter_candidate(
     {
         filters.insert(WorkspaceProtocolMissing);
     }
+    if daemon_owned
+        && owner_facts_known
+        && !needs_upgrade
+        && !candidate.plan_transport
+        && executors::task_role_can_write_plan(Some(&context.claiming_agent.role))
+    {
+        filters.insert(CapabilityMissing);
+    }
     if candidate.location.status != RepoLocationStatus::Ready
         || candidate.location.repo_id != context.repo.id
         || (candidate.location.owner_kind == RepoLocationOwnerKind::Server
@@ -1018,6 +1047,13 @@ pub async fn load_selection_context(
                     .iter()
                     .any(|capability| capability == "workspace.v1")
             }),
+            plan_transport: handshake.is_some_and(|facts| {
+                facts
+                    .handshake
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT)
+            }),
             runtime_ready,
             visible,
             executors,
@@ -1238,8 +1274,9 @@ mod tests {
             execution_daemon_id: daemon.map(str::to_owned),
             embedded_execution: daemon.is_none(),
             connected: true,
-            negotiated_revision: Some(3),
+            negotiated_revision: Some(api_types::DAEMON_PROTOCOL_REVISION),
             workspace_v1: true,
+            plan_transport: true,
             runtime_ready: true,
             visible: true,
             executors: context
@@ -1913,6 +1950,24 @@ mod tests {
     }
 
     #[test]
+    fn revision_three_non_plan_roles_do_not_require_plan_transport() {
+        for role in ["reviewer", "auditor", "interactive"] {
+            let mut context = context();
+            context.candidates[0].negotiated_revision = Some(3);
+            context.candidates[0].plan_transport = false;
+            context.worktree_agents.push(context.claiming_agent.clone());
+            context.claiming_agent.role = role.into();
+            assert!(
+                select_placement(&context).into_result().is_ok(),
+                "{role} remains supported with a coder assigned"
+            );
+        }
+        let mut context = context();
+        context.candidates[0].plan_transport = false;
+        rejected(&context, PlacementFilterCode::CapabilityMissing);
+    }
+
+    #[test]
     fn offline_owner_missing_handshake_is_a_retryable_placement_refusal() {
         let mut context = context();
         let owner = &mut context.candidates[0];
@@ -1932,7 +1987,7 @@ mod tests {
         // requires intervention and must not stay queued indefinitely.
         let owner = &mut context.candidates[0];
         owner.connected = true;
-        owner.negotiated_revision = Some(3);
+        owner.negotiated_revision = Some(api_types::DAEMON_PROTOCOL_REVISION);
         owner.workspace_v1 = true;
         let refusal = select_placement(&context).into_result().unwrap_err();
         assert!(!super::super::is_retryable_admission_refusal(
@@ -1986,15 +2041,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_mount_requires_revision_three_and_a_ready_location() {
+    fn shared_mount_requires_current_revision_and_a_ready_location() {
         let mut context = context();
         context.candidates[0].location.owner_kind = RepoLocationOwnerKind::Server;
         context.candidates[0].location.kind = RepoLocationKind::SharedMount;
+        context.candidates[0].plan_transport = false;
         context.candidates[0].negotiated_revision = Some(2);
         context.candidates[0].workspace_v1 = false;
         context.candidates[0].connected = false;
         rejected(&context, PlacementFilterCode::DaemonUpgradeRequired);
-        context.candidates[0].negotiated_revision = Some(3);
+        context.candidates[0].negotiated_revision = Some(api_types::DAEMON_PROTOCOL_REVISION);
         context.candidates[0].connected = true;
         selected(&context);
         context.candidates[0].location.status = RepoLocationStatus::Unverified;
@@ -2262,11 +2318,14 @@ mod tests {
             crate::daemon_transport::DaemonConnection::new("mac".to_owned());
         registry.register("mac".to_owned(), connection.clone());
         let handshake = DaemonHandshakeNotification {
-            protocol_revision: 3,
+            protocol_revision: api_types::DAEMON_PROTOCOL_REVISION,
             capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
                 .iter()
                 .map(|name| (*name).to_owned())
-                .chain(std::iter::once("workspace.v1".to_owned()))
+                .chain([
+                    api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned(),
+                    api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
+                ])
                 .collect(),
             executor_capabilities: BTreeMap::from([("codex".to_owned(), capabilities())]),
             workspace_run_policy: api_types::WorkspaceRunPolicy {
@@ -2340,5 +2399,30 @@ mod tests {
         .await
         .unwrap();
         rejected(&loaded, PlacementFilterCode::OwnerUnreachable);
+    }
+    #[test]
+    fn environment_and_capacity_refusals_are_not_deterministic() {
+        let refusal = |codes: Vec<PlacementFilterCode>| PlacementUnavailable {
+            task_id: "task".to_owned(),
+            repo_id: "repo".to_owned(),
+            rejected_candidates: vec![CandidateRejection {
+                failing_checks: Vec::new(),
+                repo_location_id: "location".to_owned(),
+                owner_kind: "server".to_owned(),
+                daemon_id: None,
+                runtime_id: None,
+                filter_codes: codes,
+            }],
+        };
+        for code in [
+            PlacementFilterCode::EnvironmentProbePending,
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::AgentCapacity,
+            PlacementFilterCode::MachineCapacity,
+            PlacementFilterCode::OwnerUnreachable,
+        ] {
+            assert!(!refusal(vec![code]).is_deterministic(), "{code:?}");
+        }
+        assert!(refusal(vec![PlacementFilterCode::CapabilityMissing]).is_deterministic());
     }
 }

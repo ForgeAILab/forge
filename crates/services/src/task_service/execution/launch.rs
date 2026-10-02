@@ -850,13 +850,16 @@ impl TaskService {
             dispatch_intent_from_workflow_dispatch(state.and_then(|state| state.dispatch.as_ref()));
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
         let dispatch_ctx = match load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &task.status,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            &workflow,
+            crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role: role_name,
+                state_name: &task.status,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow: &workflow,
+            },
         )
         .await
         {

@@ -1805,6 +1805,18 @@ impl ExecutionRepo for SqliteDb {
             )
             .await?;
         }
+        // Late accounting may settle after cancellation; only the winning
+        // terminal update owns an execution's plan candidate.
+        if let Some(plan) = input.plan.as_ref().filter(|_| terminal_cas_won) {
+            sqlx::query("INSERT INTO execution_plan_transport (execution_id, candidate_text, candidate_error, candidate_size, terminal_report_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_id) DO UPDATE SET
+                candidate_text=excluded.candidate_text, candidate_error=excluded.candidate_error,
+                candidate_size=excluded.candidate_size, terminal_report_id=excluded.terminal_report_id,
+                updated_at=excluded.updated_at")
+                .bind(&terminal.execution_id).bind(&plan.content).bind(&plan.error).bind(plan.size)
+                .bind(&input.terminal_report_id).bind(&terminal.updated_at)
+                .execute(&mut *transaction).await?;
+        }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {
             execution: updated,

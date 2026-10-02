@@ -182,6 +182,7 @@ fn daemon_handshake() -> DaemonHandshakeNotification {
         capabilities: vec![
             DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
             DAEMON_CAPABILITY_JOURNAL_ACK.to_owned(),
+            api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
         ],
         executor_capabilities: std::collections::BTreeMap::from([(
             "shell".to_owned(),
@@ -483,6 +484,7 @@ pub async fn send_execution_terminal_completed(
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -513,6 +515,7 @@ pub async fn send_execution_terminal_failed(
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,

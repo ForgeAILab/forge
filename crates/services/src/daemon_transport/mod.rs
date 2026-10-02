@@ -1128,7 +1128,7 @@ impl DaemonConnectionRegistry {
                         "accepted daemon command protocol"
                     );
                     self.inner.reconciliation_notify.notify_one();
-                } else if handshake.protocol_revision == 2 {
+                } else if handshake.protocol_revision < api_types::DAEMON_MIN_PROTOCOL_REVISION {
                     self.send_upgrade_required(&connection);
                     self.inner.reconciliation_notify.notify_one();
                 } else {

@@ -240,13 +240,20 @@ async fn direct_prompt_for_accept_to_planning(
         state_dispatch.as_ref(),
     );
     let dispatch_ctx = load_agent_dispatch_context(
-        Arc::clone(&db),
-        task_id,
-        default_roles::PLANNER,
-        &target_state.name,
-        target_state.config.clone(),
-        Some(selection.execution_policy.as_str()),
-        &workflow,
+        services::workflow::dispatch::loader::DispatchContextParams {
+            db: Arc::clone(&db),
+            router: &services::TaskService::new_for_test(
+                db.clone(),
+                Arc::new(events::EventBus::new(16)),
+            )
+            .workspace_backend_router(),
+            task_id,
+            role: default_roles::PLANNER,
+            state_name: &target_state.name,
+            state_config: target_state.config.clone(),
+            execution_policy: Some(selection.execution_policy.as_str()),
+            workflow: &workflow,
+        },
     )
     .await
     .expect("dispatch context loads");
