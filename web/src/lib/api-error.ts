@@ -66,7 +66,7 @@ const placementFilterMessages: Record<string, string> = {
   capability_missing: 'Executor lacks required capabilities',
   pin_mismatch: 'Location does not match the Agent’s pinned daemon',
   agent_capacity: 'Agent has no available capacity',
-  daemon_capacity: 'Daemon has no available capacity',
+  machine_capacity: 'Machine has no available run capacity',
   native_backend_unsupported: 'Daemon workspaces require CLI Agents for all worktree roles',
   run_purpose_denied: 'Daemon policy denies a required hook, CI step, or environment setup',
   not_visible: 'Owner is not accessible to the Task owner',

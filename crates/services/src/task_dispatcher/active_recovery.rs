@@ -915,13 +915,7 @@ impl TaskDispatcher {
         ) {
             return Ok(false);
         }
-        if !has_execution_capacity(
-            &self.db,
-            &agent,
-            workspace.as_ref().map(|workspace| workspace.id.as_str()),
-        )
-        .await?
-        {
+        if !has_execution_capacity(&self.db, &agent).await? {
             return Ok(false);
         }
         if deferred_dispatch::pending_until(task).is_some() {

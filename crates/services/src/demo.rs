@@ -234,6 +234,7 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
     let daemon = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: "demo".to_owned(),
             hostname: "demo".to_owned(),
@@ -254,6 +255,7 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id,
             last_report_at: now.to_owned(),
             status: DaemonStatus::Online,

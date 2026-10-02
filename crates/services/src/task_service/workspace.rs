@@ -88,6 +88,16 @@ impl TaskService {
         if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await? {
             return Ok(false);
         }
+        if crate::placement::is_machine_capacity_refusal(error) {
+            crate::deferred_dispatch::record_dispatch_disposition(
+                &self.db,
+                task,
+                "machine_capacity",
+                "machine_capacity: waiting for a machine run slot",
+            )
+            .await?;
+            return Ok(true);
+        }
         let daemon_id = match error {
             ServiceError::DaemonUnavailable { daemon_id }
             | ServiceError::DaemonTimeout { daemon_id, .. } => Some(daemon_id.clone()),
@@ -234,6 +244,29 @@ impl TaskService {
         agent: Option<&Agent>,
         role: &str,
     ) -> Result<WorkspaceAdmission> {
+        self.reserve_claim_workspace_inner(task, agent, role, false)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("workspace reservation missing"))
+    }
+
+    pub(crate) async fn preflight_machine_capacity(
+        &self,
+        task: &Task,
+        agent: &Agent,
+        role: &str,
+    ) -> Result<()> {
+        self.reserve_claim_workspace_inner(task, Some(agent), role, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn reserve_claim_workspace_inner(
+        &self,
+        task: &Task,
+        agent: Option<&Agent>,
+        role: &str,
+        capacity_probe: bool,
+    ) -> Result<Option<WorkspaceAdmission>> {
         use crate::placement::{load_selection_context, select_placement, SelectionLoadInput};
         if agent.is_some() {
             self.ensure_project_not_paused(task).await?;
@@ -578,6 +611,10 @@ impl TaskService {
             reason,
         ) = if let Some(context) = context.as_ref() {
             let selection = select_placement(context).into_result()?;
+            if capacity_probe {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
             let location = selection.candidate.location;
             (
                 location.id,
@@ -764,7 +801,7 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
-        Ok(WorkspaceAdmission {
+        Ok(Some(WorkspaceAdmission {
             claiming_task: task.clone(),
             workspace,
             placement,
@@ -773,7 +810,7 @@ impl TaskService {
             review_config,
             settings,
             task_owner_id: authority.project.owner_id,
-        })
+        }))
     }
 
     pub(super) async fn prepare_claim_workspace(
@@ -2762,6 +2799,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             db::UpsertDaemon {
+                max_concurrent_runs: None,
                 id: new_uuid_v4(),
                 machine_id: crate::embedded_daemon::embedded_machine_id(),
                 hostname: "server".into(),
@@ -2782,6 +2820,7 @@ mod tests {
         db::DaemonRepo::update_report(
             &*db,
             db::UpdateDaemonReport {
+                max_concurrent_runs: None,
                 id: daemon.id,
                 detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.into(),
                 labels_json: None,
@@ -3088,6 +3127,7 @@ mod tests {
         let daemon = db::DaemonRepo::upsert_by_machine_id(
             &*db,
             db::UpsertDaemon {
+                max_concurrent_runs: None,
                 id: new_uuid_v4(),
                 machine_id: crate::embedded_daemon::embedded_machine_id(),
                 hostname: "server".into(),
@@ -3414,6 +3454,63 @@ mod tests {
         assert!(error.rejected_candidates.iter().all(|candidate| candidate
             .filter_codes
             .contains(&crate::placement::PlacementFilterCode::AgentCapacity)));
+        assert!(WorkspaceRepo::get_by_task_id(&*db, &refused.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(execution_count(&db, &refused.id).await == 0);
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_reserve_race_for_last_slot() {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().unwrap();
+        let workspace_root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let first = seed_task(&db, &project_id, None).await;
+        let second = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+            .bind(&agent.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        db.server_run_cap.set(Some(1));
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(workspace_root.path().to_path_buf());
+        let (first_result, second_result) = tokio::join!(
+            service.reserve_claim_workspace(&first, Some(&agent), "coder"),
+            service.reserve_claim_workspace(&second, Some(&agent), "coder"),
+        );
+        let (mut admission, refused, error) = match (first_result, second_result) {
+            (Ok(admission), Err(ServiceError::PlacementUnavailable(error))) => {
+                (admission, &second, error)
+            }
+            (Err(ServiceError::PlacementUnavailable(error)), Ok(admission)) => {
+                (admission, &first, error)
+            }
+            _ => panic!("only one concurrent reservation may take the last machine slot"),
+        };
+        assert!(error.rejected_candidates.iter().all(|candidate| candidate
+            .filter_codes
+            .contains(&crate::placement::PlacementFilterCode::MachineCapacity)));
+        let mut update = crate::placement::admission::placement_update(&admission.placement);
+        update.state = Some(PlacementState::Preparing);
+        admission.placement = WorkspacePlacementRepo::update(&*db, update).await.unwrap();
+        let error = match service
+            .reserve_claim_workspace(refused, Some(&agent), "coder")
+            .await
+        {
+            Err(ServiceError::PlacementUnavailable(error)) => error,
+            _ => panic!("a preparing reservation must hold the last machine slot"),
+        };
+        assert!(error.rejected_candidates.iter().all(|candidate| candidate
+            .filter_codes
+            .contains(&crate::placement::PlacementFilterCode::MachineCapacity)));
         assert!(WorkspaceRepo::get_by_task_id(&*db, &refused.id)
             .await
             .unwrap()

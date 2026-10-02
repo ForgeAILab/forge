@@ -1,115 +1,31 @@
-use sqlx::{Row, Sqlite, Transaction};
+pub use db::machine_capacity::{effective_machine_cap, AgentCapacity, MachineCapacity};
 
-use crate::Result;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AgentCapacity {
-    pub running_executions: i64,
-    pub reservations: i64,
-}
-
-impl AgentCapacity {
-    pub fn occupied_slots(self) -> i64 {
-        self.running_executions.saturating_add(self.reservations)
-    }
-
-    pub fn has_capacity(self, max_concurrent_tasks: i64) -> bool {
-        self.occupied_slots() < max_concurrent_tasks
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DaemonCapacity {
-    pub running_executions: i64,
-    pub reservations: i64,
-    pub active_chat_turns: i64,
-    pub max_sessions: Option<i64>,
-}
-
-impl DaemonCapacity {
-    pub fn occupied_sessions(self) -> i64 {
-        self.running_executions
-            .saturating_add(self.reservations)
-            .saturating_add(self.active_chat_turns)
-    }
-
-    pub fn has_capacity(self) -> bool {
-        self.max_sessions
-            .is_none_or(|limit| self.occupied_sessions() < limit)
-    }
-}
-
-/// Call before inserting the reservation, and again before inserting the
-/// Running execution, in the caller's BEGIN IMMEDIATE transaction. A ready
-/// placement between turns consumes no slot; an expired reservation releases
-/// its slot when the expiry sweep changes its state.
 pub async fn count_agent_capacity(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     agent_id: &str,
-) -> Result<AgentCapacity> {
-    let row = sqlx::query(
-        "SELECT
-            (SELECT COUNT(*) FROM execution
-             WHERE agent_id = ? AND status = 'running') AS running_executions,
-            (SELECT COUNT(*) FROM workspace_placement p
-             WHERE p.agent_id = ? AND p.state IN ('reserved', 'preparing')
-               AND NOT EXISTS (SELECT 1 FROM execution e
-                               WHERE e.workspace_id = p.workspace_id
-                                 AND e.status = 'running')) AS reservations",
-    )
-    .bind(agent_id)
-    .bind(agent_id)
-    .fetch_one(&mut **transaction)
-    .await?;
-    Ok(AgentCapacity {
-        running_executions: row.try_get("running_executions")?,
-        reservations: row.try_get("reservations")?,
-    })
+) -> crate::Result<AgentCapacity> {
+    db::machine_capacity::count_agent_capacity(transaction, agent_id)
+        .await
+        .map_err(Into::into)
 }
 
-/// Session routing comes from the placement, including unpinned Agents and
-/// server-owned shared mounts. Agent pins are used only for Agent Chat turns,
-/// which have no workspace placement. Running executions are never counted
-/// twice through a reservation for the same workspace.
-pub async fn count_daemon_capacity(
-    transaction: &mut Transaction<'_, Sqlite>,
-    daemon_id: &str,
-    max_sessions: Option<i64>,
-) -> Result<DaemonCapacity> {
-    let row = sqlx::query(
-        "SELECT
-            (SELECT COUNT(*) FROM execution e
-             LEFT JOIN workspace_placement p ON p.workspace_id = e.workspace_id
-             LEFT JOIN agent_current a ON a.id = e.agent_id
-             WHERE e.status = 'running'
-               AND CASE WHEN e.workspace_id IS NOT NULL
-                   THEN COALESCE(p.execution_daemon_id, p.daemon_id)
-                   ELSE COALESCE(
-                       CASE WHEN json_valid(e.executor_config_snapshot_json)
-                           THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END,
-                       a.daemon_id)
-                   END = ?) AS running_executions,
-            (SELECT COUNT(*) FROM workspace_placement p
-             WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = ?
-               AND p.state IN ('reserved', 'preparing')
-               AND NOT EXISTS (SELECT 1 FROM execution e
-                               WHERE e.workspace_id = p.workspace_id
-                                 AND e.status = 'running')) AS reservations,
-            (SELECT COUNT(*) FROM agent_chat_turn_job j
-             JOIN agent_current a ON a.id = j.responder_identity_id
-             WHERE a.daemon_id = ? AND j.status IN ('leased', 'running')) AS active_chat_turns",
-    )
-    .bind(daemon_id)
-    .bind(daemon_id)
-    .bind(daemon_id)
-    .fetch_one(&mut **transaction)
-    .await?;
-    Ok(DaemonCapacity {
-        running_executions: row.try_get("running_executions")?,
-        reservations: row.try_get("reservations")?,
-        active_chat_turns: row.try_get("active_chat_turns")?,
-        max_sessions,
-    })
+pub async fn count_machine_capacity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    daemon_id: Option<&str>,
+    cap: Option<i64>,
+) -> crate::Result<MachineCapacity> {
+    db::machine_capacity::count_machine_capacity(transaction, daemon_id, cap)
+        .await
+        .map_err(Into::into)
+}
+
+pub async fn server_machine_cap(
+    db: &db::SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> crate::Result<Option<i64>> {
+    db::machine_capacity::server_machine_cap(db, transaction)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -119,7 +35,8 @@ mod tests {
     async fn pool() -> db::SqlitePool {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE execution (id TEXT, agent_id TEXT, workspace_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
+            "CREATE TABLE daemon (id TEXT, machine_id TEXT);
+             CREATE TABLE execution (id TEXT, agent_id TEXT, workspace_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
              CREATE TABLE workspace_placement (
                  id TEXT, workspace_id TEXT, agent_id TEXT, daemon_id TEXT,
                  execution_daemon_id TEXT, state TEXT);
@@ -130,6 +47,55 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_server_host_counts_all_routes_without_duplicates() {
+        let pool = pool().await;
+        let mut tx = db::begin_immediate(&pool).await.unwrap();
+        sqlx::query("INSERT INTO daemon VALUES ('embedded', ?), ('remote', 'remote-machine')")
+            .bind(crate::embedded_daemon::embedded_machine_id())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO agent_current VALUES ('local', NULL), ('embedded-chat', 'embedded'), ('remote-chat', 'remote');
+            INSERT INTO workspace_placement VALUES
+                ('direct', 'direct', 'local', NULL, NULL, 'preparing'),
+                ('embedded', 'embedded', 'local', NULL, 'embedded', 'ready'),
+                ('reservation', 'reservation', 'local', NULL, NULL, 'reserved'),
+                ('embedded-reservation', 'embedded-reservation', 'local', NULL, 'embedded', 'preparing'),
+                ('remote', 'remote', 'local', 'remote', NULL, 'reserved'),
+                ('ready', 'ready', 'local', NULL, NULL, 'ready');
+            INSERT INTO execution VALUES
+                ('direct', 'local', 'direct', 'running', NULL),
+                ('embedded', 'local', 'embedded', 'running', NULL),
+                ('remote', 'local', 'remote', 'running', NULL),
+                ('no-workspace', 'local', NULL, 'running', NULL);
+            INSERT INTO agent_chat_turn_job VALUES ('local', 'leased'), ('embedded-chat', 'running'), ('remote-chat', 'running'), ('local', 'completed');")
+            .execute(&mut *tx).await.unwrap();
+        let server = count_machine_capacity(&mut tx, None, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(server.running_executions, 3);
+        assert_eq!(server.reservations, 2);
+        assert_eq!(server.active_chat_turns, 2);
+        assert_eq!(server.active_runs(), 7);
+        assert!(!server.has_capacity());
+        let remote = count_machine_capacity(&mut tx, Some("remote"), None)
+            .await
+            .unwrap();
+        assert_eq!(remote.active_runs(), 2);
+        assert_eq!(remote.reservations, 0);
+        assert!(remote.has_capacity());
+    }
+
+    #[test]
+    fn machine_capacity_effective_reported_and_admin_caps() {
+        assert_eq!(effective_machine_cap(Some(6), Some(2)), Some(2));
+        assert_eq!(effective_machine_cap(Some(3), Some(8)), Some(3));
+        assert_eq!(effective_machine_cap(Some(3), None), Some(3));
+        assert_eq!(effective_machine_cap(Some(0), Some(2)), Some(2));
+        assert_eq!(effective_machine_cap(None, None), None);
     }
 
     #[tokio::test]
@@ -176,7 +142,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_counts_unpinned_runs_reservations_shared_mounts_and_chat() {
+    async fn machine_capacity_daemon_counts_unpinned_runs_reservations_shared_mounts_and_chat() {
         let pool = pool().await;
         let mut transaction = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql(
@@ -199,13 +165,13 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        let count = count_daemon_capacity(&mut transaction, "daemon", Some(5))
+        let count = count_machine_capacity(&mut transaction, Some("daemon"), Some(5))
             .await
             .unwrap();
         assert_eq!(count.running_executions, 2);
         assert_eq!(count.reservations, 1);
         assert_eq!(count.active_chat_turns, 2);
-        assert_eq!(count.occupied_sessions(), 5);
+        assert_eq!(count.active_runs(), 5);
         assert!(!count.has_capacity());
         let agent = count_agent_capacity(&mut transaction, "unpinned")
             .await
@@ -214,7 +180,7 @@ mod tests {
         assert_eq!(agent.reservations, 1);
     }
     #[tokio::test]
-    async fn executions_without_workspaces_use_snapshot_or_agent_pin_for_daemon_capacity() {
+    async fn machine_capacity_executions_without_workspaces_use_snapshot_or_agent_pin() {
         let pool = pool().await;
         let mut transaction = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql(
@@ -226,16 +192,16 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        let count = count_daemon_capacity(&mut transaction, "daemon", Some(2))
+        let count = count_machine_capacity(&mut transaction, Some("daemon"), Some(2))
             .await
             .unwrap();
         assert_eq!(count.running_executions, 2);
         assert!(!count.has_capacity());
         assert_eq!(
-            count_daemon_capacity(&mut transaction, "other", None)
+            count_machine_capacity(&mut transaction, Some("other"), None)
                 .await
                 .unwrap()
-                .occupied_sessions(),
+                .active_runs(),
             0
         );
     }

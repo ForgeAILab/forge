@@ -5,6 +5,7 @@ mod chat_session_denials;
 mod connection;
 mod error;
 mod ids;
+pub mod machine_capacity;
 mod migration;
 mod models;
 mod orchestration;

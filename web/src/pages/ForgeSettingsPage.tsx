@@ -61,6 +61,7 @@ export function ForgeSettingsPage({
 
   const [bind, setBind] = useState('')
   const [mcpEnabled, setMcpEnabled] = useState(true)
+  const [serverRunCap, setServerRunCap] = useState('')
   const [maxConcurrent, setMaxConcurrent] = useState('')
   const [heartbeatInterval, setHeartbeatInterval] = useState('')
   const [maxMissedHeartbeats, setMaxMissedHeartbeats] = useState('')
@@ -74,6 +75,7 @@ export function ForgeSettingsPage({
     const get = (key: string) => getSetting(key)?.value
     setBind(String(get('server.bind') ?? ''))
     setMcpEnabled(get('server.mcp_enabled') !== false)
+    setServerRunCap(String(get('server.max_concurrent_runs') ?? ''))
     setMaxConcurrent(String(get('agent.max_concurrent_tasks') ?? ''))
     setHeartbeatInterval(String(get('agent.heartbeat_interval_seconds') ?? ''))
     setMaxMissedHeartbeats(String(get('agent.max_missed_heartbeats') ?? ''))
@@ -83,12 +85,17 @@ export function ForgeSettingsPage({
   const isSaving = updateSettings.isPending
 
   function saveServer() {
+    const cap = Number(serverRunCap)
+    if (serverRunCap.trim() && (!Number.isInteger(cap) || cap < 0 || cap > 4294967295)) {
+      toast.error('Max concurrent runs must be a non-negative integer')
+      return
+    }
     if (!bind.trim()) {
       toast.error('Bind address is required')
       return
     }
     updateSettings.mutate(
-      { server: { bind: bind.trim(), mcp_enabled: mcpEnabled } },
+      { server: { bind: bind.trim(), mcp_enabled: mcpEnabled, max_concurrent_runs: serverRunCap.trim() ? cap : null } },
       {
         onSuccess: () => toast.success('Server settings saved'),
         onError: (err) => toast.error(getApiErrorMessage(err, 'Failed to save server settings')),
@@ -205,6 +212,9 @@ export function ForgeSettingsPage({
               {initialTab === 'server' && (
                 <ServerTab
                   bind={bind}
+                  serverRunCap={serverRunCap}
+                  runCapSetting={getSetting('server.max_concurrent_runs')}
+                  onRunCapChange={setServerRunCap}
                   mcpEnabled={mcpEnabled}
                   isSaving={isSaving}
                   bindSetting={getSetting('server.bind')}
@@ -247,6 +257,7 @@ export function ForgeSettingsPage({
 }
 
 function ServerTab({
+  serverRunCap, runCapSetting, onRunCapChange,
   bind,
   mcpEnabled,
   isSaving,
@@ -256,6 +267,9 @@ function ServerTab({
   onMcpEnabledChange,
   onSave,
 }: {
+  serverRunCap: string
+  runCapSetting: ForgeSettingResponse | undefined
+  onRunCapChange: (v: string) => void
   bind: string
   mcpEnabled: boolean
   isSaving: boolean
@@ -273,6 +287,17 @@ function ServerTab({
           HTTP server bind address and feature flags.
         </p>
       </div>
+      <SettingsSection
+        title="Max concurrent runs"
+        description="Limits agent runs on the server host. Blank uses half the logical cores (at least 2); 0 is unlimited. Applies immediately."
+      >
+        <Label htmlFor="server-run-cap" className="sr-only">Max concurrent runs</Label>
+        <Input id="server-run-cap" type="number" min={0} step={1} className="w-24"
+          placeholder="Auto" value={serverRunCap} onChange={(e) => onRunCapChange(e.target.value)} />
+        <p className="mt-1 text-xs text-muted-foreground">
+          {runCapSetting?.value == null ? `Automatic (${runCapSetting?.effective_value ?? '—'})` : runCapSetting.effective_value == null ? 'Unlimited' : `In effect: ${runCapSetting.effective_value}`}
+        </p>
+      </SettingsSection>
       <SettingsSection
         title={
           <span className="inline-flex items-center">

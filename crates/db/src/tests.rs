@@ -702,6 +702,7 @@ async fn seed_daemon(db: &SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -9331,7 +9332,7 @@ async fn claim_rejects_stale_project_workflow_authority_without_mutation() {
 }
 
 #[tokio::test]
-async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
+async fn machine_capacity_rejects_running_execution_at_daemon_limit() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
@@ -9345,8 +9346,8 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         .execute(db.pool())
         .await
         .expect("agent task capacity expands");
-    sqlx::query("UPDATE daemon SET labels_json = ?, updated_at = ? WHERE id = ?")
-        .bind(r#"{"max_concurrent_sessions":1}"#)
+    sqlx::query("UPDATE daemon SET max_concurrent_runs = ?, updated_at = ? WHERE id = ?")
+        .bind(1_i64)
         .bind(now_rfc3339())
         .bind(&daemon_id)
         .execute(db.pool())
@@ -9428,7 +9429,7 @@ async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
         make_lease(second_id.clone()),
     )
     .await;
-    assert!(matches!(second_result, Err(DbError::AgentAtCapacity)));
+    assert!(matches!(second_result, Err(DbError::MachineAtCapacity)));
     assert!(ExecutionRepo::get_by_id(&db, &second_id)
         .await
         .expect("rejected execution lookup succeeds")

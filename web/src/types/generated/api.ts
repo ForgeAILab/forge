@@ -1234,6 +1234,9 @@ export interface Workspace {
 }
 
 export interface Daemon {
+  max_concurrent_runs: number | null
+  run_limit: number | null
+  effective_max_concurrent_runs: number | null
   id: string
   machine_id: string
   hostname: string
@@ -1640,8 +1643,8 @@ export interface ActiveExecutionSummary {
 export interface DaemonPressureSummary {
   daemon_id: string
   hostname: string | null
-  active_sessions: number
-  max_sessions: number | null
+  active_runs: number
+  max_concurrent_runs: number | null
   at_capacity: boolean
 }
 
@@ -1649,8 +1652,8 @@ export interface AgentPressureSummary {
   agent_id: string
   agent_name: string
   daemon_id: string | null
-  active_sessions: number
-  max_sessions: number
+  active_runs: number
+  max_concurrent_runs: number
   at_capacity: boolean
 }
 
@@ -1772,6 +1775,7 @@ export interface UpdateForgePathsRequest {
 }
 
 export interface UpdateServerSettingsRequest {
+  max_concurrent_runs?: number | null
   bind?: string | null
   mcp_enabled?: boolean | null
 }

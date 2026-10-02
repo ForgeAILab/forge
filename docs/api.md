@@ -182,12 +182,15 @@ ratio:
 
 `max_concurrent_tasks` is an execution cap, not an assignment or chat-turn
 cap: an assigned Task with no Running execution consumes no Task slot, and Main
-or Project Agent chat turns do not consume Task quota. Independently, a daemon
-may advertise a positive session cap in `labels_json` under
-`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
-`max_concurrent_tasks` key. That daemon cap counts its Running Task executions
-plus leased/running Agent Chat turns. Both caps are rechecked in the same
-`BEGIN IMMEDIATE` transaction that inserts a Running execution; read-side
+or Project Agent chat turns do not consume Task quota. Independently, each machine limits concurrent runs:
+`server.max_concurrent_runs` on the server host, or the daemon's typed
+`max_concurrent_runs` constrained by its administrator `run_limit`. Unset local
+configuration computes half the logical cores with a minimum of 2; zero means
+unlimited. Labels do not configure caps. Machine occupancy counts Running Task
+executions, reservations without a Running execution, and leased/running Agent
+Chat turns. The embedded daemon and direct server execution share one machine.
+Both Agent and machine caps are rechecked in the same `BEGIN IMMEDIATE`
+transaction that inserts a Running execution; read-side
 `effective_status` and capacity checks are advisory only. The same boundary
 also rejects an identity that became paused or selected a newer profile after
 dispatch preflight. Profile replacement covers daemon, provider, and executor
@@ -3805,7 +3808,7 @@ Workspace admission errors use HTTP `409`. `placement_unavailable` includes
 candidate names its repository location, owner, daemon/runtime and `filter_codes`.
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
-`agent_capacity`, `daemon_capacity`, `native_backend_unsupported`,
+`agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
 `run_purpose_denied`, and `not_visible`.
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
@@ -4603,3 +4606,36 @@ before the script. No default shell PASS is generated. Model-backed native/CLI
 reviewers receive one copy of the equivalent frozen contract in their final
 assembled prompt. Native reviewer attempts do not reuse Task conversation history,
 checkpoints, or LCM state.
+
+### Machine run caps
+
+`GET /api/v1/settings` and `PUT /api/v1/settings` remain administrator-only.
+`server.max_concurrent_runs` accepts a non-negative integer or `null`:
+`null` selects automatic half-logical-core capacity (at least 2), `0` selects
+unlimited, and positive values set a ceiling. Omit the field to leave it alone.
+The response setting has `value` for the configured value and `effective_value`
+for the cap in effect (`null` when unlimited), with `restart_required: false`.
+Updates apply to the next placement admission after the YAML write succeeds.
+
+Daemon registration and periodic report accept optional typed
+`max_concurrent_runs` (non-negative integer); omission/null preserves the last
+recorded cap. Daemon responses expose `max_concurrent_runs` (reported),
+`run_limit` (admin ceiling) and `effective_max_concurrent_runs`. Zero or missing
+reported cap contributes no ceiling. Positive reported and admin ceilings use
+the lower value; `null` effective cap means unlimited. Existing unreported
+old daemons with neither ceiling remain unlimited.
+
+`PATCH /api/v1/daemons/{id}` is administrator-only. Body:
+`{"version": 3, "run_limit": 2}`; `run_limit: null` clears the ceiling.
+Zero, negative and fractional limits are refused. Updates check the current
+row version and increment it; stale versions return HTTP 409. Reports also
+increment that version and cannot overwrite the admin limit.
+
+Operations `daemon_pressure` lists one entry per execution machine, including
+`daemon_id: "server_host"` (the embedded daemon is included in that entry).
+Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
+`null` for unlimited), and `at_capacity`. `agent_pressure` uses the renamed
+`active_runs` and `max_concurrent_runs` fields for its per-Agent Task cap.
+The placement refusal code `machine_capacity` replaces `daemon_capacity` and
+includes the server host. Machines that are full leave Tasks visibly queued;
+no running work is pre-empted.

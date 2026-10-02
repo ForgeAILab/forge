@@ -199,13 +199,18 @@ pub fn derive_workflow_health(
     // stay parked until the Task changes or something wakes it, so show that
     // distinction instead of hiding them as ordinary queueing.
     if let Some(disposition) = crate::deferred_dispatch::current_dispatch_disposition(task) {
-        if disposition.capability == "project_capacity" {
+        if matches!(
+            disposition.capability.as_str(),
+            "project_capacity" | "machine_capacity"
+        ) {
             let (reason, message) = disposition
                 .safe_message
                 .split_once(": ")
                 .unwrap_or(("project_at_capacity", &disposition.safe_message));
             let label = if reason == "project_waiting_on_owner" {
                 "Waiting on Owner"
+            } else if reason == "machine_capacity" {
+                "Waiting for a Machine Slot"
             } else {
                 "Waiting for a Slot"
             };

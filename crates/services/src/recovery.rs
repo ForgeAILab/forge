@@ -3410,6 +3410,7 @@ pub(crate) mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),
@@ -4979,6 +4980,7 @@ pub(crate) mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: machine_id.to_owned(),
                 hostname: "test-host".to_owned(),
@@ -5320,6 +5322,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),
@@ -5365,6 +5368,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),
@@ -5415,6 +5419,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),

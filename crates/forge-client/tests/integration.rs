@@ -685,6 +685,9 @@ fn canonical_phase_for_status(status: &str) -> CanonicalPhase {
 
 fn daemon_response() -> DaemonResponse {
     DaemonResponse {
+        max_concurrent_runs: None,
+        run_limit: None,
+        effective_max_concurrent_runs: None,
         id: "daemon-1".to_owned(),
         machine_id: "machine-daemon-1".to_owned(),
         hostname: "test-host".to_owned(),

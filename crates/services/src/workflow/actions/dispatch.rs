@@ -305,7 +305,7 @@ impl HookAction for DispatchRoleAgent {
                         reason: "agent paused".to_string(),
                     };
                 }
-                match has_execution_capacity(&ctx.db, &agent, ctx.workspace_id.as_deref()).await {
+                match has_execution_capacity(&ctx.db, &agent).await {
                     Ok(true) => {}
                     Ok(false) => {
                         return HookResult::Skipped {

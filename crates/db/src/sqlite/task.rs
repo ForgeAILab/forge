@@ -2016,12 +2016,9 @@ impl TaskRepo for SqliteDb {
             Self::ensure_task_execution_admission_in_tx(transaction, &input.execution, admission)
                 .await?;
         }
-        let mut execution = Self::create_execution_in_tx(
-            transaction,
-            &input.execution,
-            execution_admission.as_ref(),
-        )
-        .await?;
+        let mut execution = self
+            .create_execution_in_tx(transaction, &input.execution, execution_admission.as_ref())
+            .await?;
         // A reviewer/auditor claim owns the selected Review attempt in the
         // same transaction as the Task mutation, Running execution, and
         // initial lease. This keeps claim admission from bypassing the

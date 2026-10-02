@@ -1328,6 +1328,12 @@ pub trait DaemonRepo: Send + Sync {
     async fn list_visible(&self, user_id: Option<&str>, page: PageRequest) -> Result<Page<Daemon>>;
     async fn get_visible(&self, id: &str, user_id: Option<&str>) -> Result<Option<Daemon>>;
     async fn update_report(&self, input: UpdateDaemonReport) -> Result<Daemon>;
+    async fn update_run_limit(
+        &self,
+        id: &str,
+        version: i64,
+        run_limit: Option<u32>,
+    ) -> Result<Daemon>;
     async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon>;
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon>;
     async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>>;
@@ -2881,6 +2887,7 @@ pub struct CreateWorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpsertDaemon {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -2898,6 +2905,7 @@ pub struct UpsertDaemon {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateDaemonReport {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub last_report_at: String,
     pub status: DaemonStatus,

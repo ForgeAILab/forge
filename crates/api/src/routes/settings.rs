@@ -33,10 +33,18 @@ pub async fn update_settings(
 
     validate_update(&request)?;
 
+    let _guard = state.db.settings_update_lock.lock().await;
+    let cap_update = request
+        .server
+        .as_ref()
+        .and_then(|server| server.max_concurrent_runs);
     let path = state.config_path.as_path();
     let mut config = read_yaml_config(path).await?;
     apply_update(&mut config, request)?;
     write_yaml_config(path, &config).await?;
+    if let Some(cap) = cap_update {
+        state.db.server_run_cap.set(cap);
+    }
 
     Ok(Json(settings_response(&state).await?))
 }
@@ -46,7 +54,27 @@ async fn settings_response(state: &AppState) -> ApiResult<SettingsResponse> {
     let pending_config = load_pending_config(path)?;
     let effective_config = state.effective_config.as_ref();
 
+    let mut transaction = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .map_err(db::DbError::from)
+        .map_err(services::ServiceError::from)?;
+    let machine_cap =
+        services::placement::capacity::server_machine_cap(&state.db, &mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(db::DbError::from)
+        .map_err(services::ServiceError::from)?;
     let settings = vec![
+        ForgeSettingResponse {
+            key: "server.max_concurrent_runs".to_owned(),
+            value: serde_json::json!(state.db.server_run_cap.configured()),
+            effective_value: serde_json::json!(machine_cap),
+            restart_required: false,
+        },
         setting(
             "forge.data_dir",
             &effective_config.forge.data_dir.display().to_string(),
@@ -122,10 +150,11 @@ fn has_updates(request: &UpdateSettingsRequest) -> bool {
         .forge
         .as_ref()
         .is_some_and(|forge| forge.data_dir.is_some())
-        || request
-            .server
-            .as_ref()
-            .is_some_and(|server| server.bind.is_some() || server.mcp_enabled.is_some())
+        || request.server.as_ref().is_some_and(|server| {
+            server.bind.is_some()
+                || server.mcp_enabled.is_some()
+                || server.max_concurrent_runs.is_some()
+        })
         || request.workspace.as_ref().is_some_and(|workspace| {
             workspace.root.is_some() || workspace.cleanup_delay_seconds.is_some()
         })
@@ -214,6 +243,13 @@ fn apply_update(config: &mut Value, request: UpdateSettingsRequest) -> ApiResult
         }
     }
     if let Some(server) = request.server {
+        if let Some(cap) = server.max_concurrent_runs {
+            set_path(
+                config,
+                &["server", "max_concurrent_runs"],
+                yaml_number(cap)?,
+            )?;
+        }
         if let Some(bind) = server.bind {
             set_path(config, &["server", "bind"], Value::String(bind))?;
         }

@@ -15,7 +15,6 @@ use serde_json::Value;
 use sqlx::Row;
 
 use crate::{
-    agent_capacity::daemon_session_cap_from_labels,
     plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
     usage_projection::{usage_aggregate_for_operations, usage_aggregate_for_source_state},
     workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
@@ -473,62 +472,37 @@ impl OperatorStatusService {
     }
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT
-                d.id AS daemon_id,
-                d.hostname,
-                d.labels_json,
-                (
-                    SELECT COUNT(*)
-                    FROM execution e
-                    LEFT JOIN workspace_placement placement ON placement.workspace_id = e.workspace_id
-                    LEFT JOIN agent_current a ON a.id = e.agent_id
-                    WHERE CASE WHEN e.workspace_id IS NOT NULL
-                        THEN COALESCE(placement.execution_daemon_id, placement.daemon_id)
-                        ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
-                          THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
-                        END = d.id
-                      AND e.status = 'running'
-                ) + (
-                    SELECT COUNT(*) FROM workspace_placement p
-                    WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = d.id
-                      AND p.state IN ('reserved', 'preparing')
-                      AND NOT EXISTS (SELECT 1 FROM execution e
-                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
-                ) AS running_executions,
-                (
-                    SELECT COUNT(*)
-                    FROM agent_chat_turn_job turn_job
-                    JOIN agent_current a ON a.id = turn_job.responder_identity_id
-                    WHERE a.daemon_id = d.id
-                      AND turn_job.status IN ('leased', 'running')
-                ) AS active_agent_chat_turns
-             FROM daemon d
-             ORDER BY d.updated_at DESC, d.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
-
-        let mut pressure = Vec::new();
+        let rows = sqlx::query("SELECT id, hostname, machine_id, max_concurrent_runs, run_limit FROM daemon ORDER BY updated_at DESC, id ASC")
+            .fetch_all(self.db.pool()).await?;
+        let mut tx = self.db.pool().begin().await?;
+        let cap = crate::placement::capacity::server_machine_cap(&self.db, &mut tx).await?;
+        let server = crate::placement::capacity::count_machine_capacity(&mut tx, None, cap).await?;
+        let mut pressure = vec![DaemonPressureSummary {
+            daemon_id: "server_host".to_owned(),
+            hostname: Some("Server host".to_owned()),
+            active_runs: server.active_runs().max(0) as u32,
+            max_concurrent_runs: cap,
+            at_capacity: !server.has_capacity(),
+        }];
         for row in rows {
-            let running_executions: i64 = row.try_get("running_executions")?;
-            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
-            let active_sessions = running_executions
-                .saturating_add(active_agent_chat_turns)
-                .max(0) as u32;
-            let labels_json: String = row.try_get("labels_json")?;
-            let max_sessions = daemon_session_cap_from_labels(&labels_json)
-                .and_then(|value| u32::try_from(value).ok());
-            let at_capacity = max_sessions.is_some_and(|max| active_sessions >= max);
-            if active_sessions == 0 && max_sessions.is_none() {
+            if crate::embedded_daemon::is_embedded_daemon_machine(
+                &row.try_get::<String, _>("machine_id")?,
+            ) {
                 continue;
             }
+            let id: String = row.try_get("id")?;
+            let cap = crate::placement::capacity::effective_machine_cap(
+                row.try_get("max_concurrent_runs")?,
+                row.try_get("run_limit")?,
+            );
+            let count =
+                crate::placement::capacity::count_machine_capacity(&mut tx, Some(&id), cap).await?;
             pressure.push(DaemonPressureSummary {
-                daemon_id: row.try_get("daemon_id")?,
+                daemon_id: id,
                 hostname: row.try_get("hostname")?,
-                active_sessions,
-                max_sessions,
-                at_capacity,
+                active_runs: count.active_runs().max(0) as u32,
+                max_concurrent_runs: cap,
+                at_capacity: !count.has_capacity(),
             });
         }
         Ok(pressure)
@@ -559,25 +533,25 @@ impl OperatorStatusService {
 
         let mut pressure = Vec::new();
         for row in rows {
-            let active_sessions = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
-            let max_sessions = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
-            let at_capacity = max_sessions > 0 && active_sessions >= max_sessions;
-            if active_sessions == 0 && !at_capacity {
+            let active_runs = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
+            let max_concurrent_runs = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
+            let at_capacity = max_concurrent_runs > 0 && active_runs >= max_concurrent_runs;
+            if active_runs == 0 && !at_capacity {
                 continue;
             }
             pressure.push(AgentPressureSummary {
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
                 daemon_id: row.try_get("daemon_id")?,
-                active_sessions,
-                max_sessions,
+                active_runs,
+                max_concurrent_runs,
                 at_capacity,
             });
         }
         pressure.sort_by(|left, right| {
             right
-                .active_sessions
-                .cmp(&left.active_sessions)
+                .active_runs
+                .cmp(&left.active_runs)
                 .then_with(|| left.agent_name.cmp(&right.agent_name))
         });
         Ok(pressure)
@@ -904,6 +878,18 @@ mod tests {
 
     use db::{create_sqlite_pool, new_uuid_v4, run_migrations};
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn machine_capacity_operations_includes_server_host() {
+        let (db, service) = test_service().await;
+        db.server_run_cap.set(Some(4));
+        let pressure = service.daemon_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].daemon_id, "server_host");
+        assert_eq!(pressure[0].active_runs, 0);
+        assert_eq!(pressure[0].max_concurrent_runs, Some(4));
+        assert!(!pressure[0].at_capacity);
+    }
 
     async fn test_service() -> (Arc<SqliteDb>, OperatorStatusService) {
         let pool = create_sqlite_pool("sqlite::memory:")

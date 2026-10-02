@@ -14,7 +14,9 @@ pub use selection::{
 /// Classify selection filters; transport errors also require placement state.
 pub(crate) fn is_retryable_admission_refusal(error: &crate::ServiceError) -> bool {
     match error {
-        crate::ServiceError::Db(db::DbError::AgentAtCapacity) => true,
+        crate::ServiceError::Db(db::DbError::AgentAtCapacity | db::DbError::MachineAtCapacity) => {
+            true
+        }
         crate::ServiceError::PlacementUnavailable(refusal) => {
             refusal.rejected_candidates.iter().any(|candidate| {
                 !candidate.filter_codes.is_empty()
@@ -22,7 +24,7 @@ pub(crate) fn is_retryable_admission_refusal(error: &crate::ServiceError) -> boo
                         matches!(
                             code,
                             PlacementFilterCode::AgentCapacity
-                                | PlacementFilterCode::DaemonCapacity
+                                | PlacementFilterCode::MachineCapacity
                                 | PlacementFilterCode::OwnerUnreachable
                         ) || (candidate
                             .filter_codes
@@ -90,6 +92,14 @@ pub(crate) async fn admission_refusal_is_retryable(
     })
 }
 
+/// At least one otherwise eligible candidate was rejected solely for machine capacity.
+pub(crate) fn is_machine_capacity_refusal(error: &crate::ServiceError) -> bool {
+    matches!(
+        error,
+        crate::ServiceError::Db(db::DbError::MachineAtCapacity)
+    ) || matches!(error, crate::ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate| candidate.filter_codes == [PlacementFilterCode::MachineCapacity]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,14 +132,14 @@ mod tests {
             OwnerUnreachable,
             ExecutorUnavailable,
             AgentCapacity,
-            DaemonCapacity,
+            MachineCapacity,
         ] {
             assert!(
                 !refusal(vec![vec![DaemonUpgradeRequired, independent]]).needs_daemon_upgrade(),
                 "{independent:?}"
             );
         }
-        for retry in [LocationNotReady, AgentCapacity, DaemonCapacity] {
+        for retry in [LocationNotReady, AgentCapacity, MachineCapacity] {
             let refusal = refusal(vec![vec![DaemonUpgradeRequired], vec![retry]]);
             assert!(!refusal.needs_daemon_upgrade(), "{retry:?}");
         }
@@ -156,7 +166,7 @@ mod tests {
             PlacementFilterCode::AgentCapacity
         ])));
         assert!(is_retryable_admission_refusal(&error(vec![
-            PlacementFilterCode::DaemonCapacity
+            PlacementFilterCode::MachineCapacity
         ])));
         assert!(!is_retryable_admission_refusal(&error(vec![
             PlacementFilterCode::AgentCapacity,

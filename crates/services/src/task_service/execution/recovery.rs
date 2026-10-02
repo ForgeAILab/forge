@@ -847,7 +847,7 @@ impl TaskService {
         let agent = self
             .ensure_queued_recovery_agent_available(&agent_id)
             .await?;
-        if !crate::agent_capacity::has_execution_capacity(&self.db, &agent, None).await? {
+        if !crate::agent_capacity::has_execution_capacity(&self.db, &agent).await? {
             return Ok(false);
         }
         // The short deferral and version CAS fence scans, while the admission

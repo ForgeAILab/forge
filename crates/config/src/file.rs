@@ -51,6 +51,7 @@ pub(crate) struct FileForgePaths {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileServerConfig {
+    pub max_concurrent_runs: Option<u32>,
     pub bind: Option<String>,
     pub public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,

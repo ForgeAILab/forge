@@ -108,6 +108,7 @@ pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -128,6 +129,7 @@ pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     DaemonRepo::update_report(
         db,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
             labels_json: None,

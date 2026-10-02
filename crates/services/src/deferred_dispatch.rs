@@ -361,8 +361,8 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
 /// The disposition still in force for this Task, if any.
 ///
 /// Role dispositions wait for a Task change or explicit wake. The
-/// `project_capacity` capability instead explains temporary queueing and is
-/// rechecked each tick, since another Task can free a slot without a wake.
+/// `project_capacity` and `machine_capacity` capabilities explain temporary
+/// queueing and are rechecked each tick, since another Task can free a slot.
 pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
     dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
 }

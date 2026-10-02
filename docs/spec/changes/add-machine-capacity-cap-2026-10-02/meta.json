@@ -1,10 +1,10 @@
 {
   "id": "add-machine-capacity-cap",
   "created_at": "2026-10-02T08:55:00Z",
-  "updated_at": "2026-10-02T08:55:00Z",
+  "updated_at": "2026-10-02T10:35:49Z",
   "status": "approved",
   "change_id": "add-machine-capacity-cap",
   "change_ref": "add-machine-capacity-cap-2026-10-02",
-  "completed_at": null,
+  "completed_at": "2026-10-02T10:35:49Z",
   "implementation_started_at": "2026-10-02T08:55:00Z"
 }

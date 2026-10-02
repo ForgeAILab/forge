@@ -139,6 +139,8 @@ mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
+    pub server_run_cap: Arc<config::MachineRunCap>,
+    pub settings_update_lock: Arc<tokio::sync::Mutex<()>>,
     pool: SqlitePool,
     domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
@@ -154,6 +156,8 @@ impl SqliteDb {
         Self {
             pool,
             domain_event_hooks,
+            server_run_cap: Arc::new(config::MachineRunCap::default()),
+            settings_update_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -421,6 +425,8 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
 
 fn map_daemon(row: SqliteRow) -> Result<Daemon> {
     Ok(Daemon {
+        max_concurrent_runs: row.try_get("max_concurrent_runs")?,
+        run_limit: row.try_get("run_limit")?,
         id: row.try_get("id")?,
         machine_id: row.try_get("machine_id")?,
         hostname: row.try_get("hostname")?,
@@ -720,6 +726,7 @@ impl SqliteDb {
     }
 
     async fn create_execution_in_tx(
+        &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
         admission: Option<&ExecutionAdmission>,
@@ -909,12 +916,13 @@ impl SqliteDb {
 
             // Capacity is an insertion invariant, not a dispatcher hint.
             // Recheck the selected identity's pause/current max, its running
-            // Task executions, and any configured daemon session cap while
+            // Task executions, and the effective machine run cap while
             // this BEGIN IMMEDIATE transaction still owns SQLite's writer lock.
             // This is intentionally outside the workspace branch so Task
             // claims, which may not have a Workspace row yet, use the same
             // authoritative rule as role/recovery launches.
-            Self::ensure_agent_execution_capacity_in_tx(transaction, input, admission).await?;
+            self.ensure_agent_execution_capacity_in_tx(transaction, input, admission)
+                .await?;
         }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
@@ -1360,6 +1368,7 @@ impl SqliteDb {
     }
 
     async fn ensure_agent_execution_capacity_in_tx(
+        &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
         admission: Option<&ExecutionAdmission>,
@@ -1435,54 +1444,50 @@ impl SqliteDb {
                 })
                 .or(agent_row.try_get::<Option<String>, _>("daemon_id")?),
         };
-        let Some(daemon_id) = daemon_id else {
-            return Ok(());
+        let daemon =
+            match daemon_id.as_deref() {
+                Some(id) => sqlx::query(
+                    "SELECT machine_id, max_concurrent_runs, run_limit FROM daemon WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&mut **transaction)
+                .await?,
+                None => None,
+            };
+        let server_host = daemon_id.is_none()
+            || daemon.as_ref().is_some_and(|row| {
+                row.try_get::<String, _>("machine_id")
+                    .is_ok_and(|id| id == config::embedded_machine_id())
+            });
+        let cap = if server_host {
+            crate::machine_capacity::server_machine_cap(self, transaction).await?
+        } else {
+            crate::machine_capacity::effective_machine_cap(
+                daemon
+                    .as_ref()
+                    .map(|row| row.try_get("max_concurrent_runs"))
+                    .transpose()?
+                    .flatten(),
+                daemon
+                    .as_ref()
+                    .map(|row| row.try_get("run_limit"))
+                    .transpose()?
+                    .flatten(),
+            )
         };
-        let Some(daemon_row) = sqlx::query("SELECT labels_json FROM daemon WHERE id = ?")
-            .bind(&daemon_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-        else {
-            return Ok(());
-        };
-        let labels_json: String = daemon_row.try_get("labels_json")?;
-        let Some(session_cap) = daemon_session_cap_from_labels(&labels_json) else {
-            return Ok(());
-        };
-        let daemon_execution_count = sqlx::query_scalar::<_, i64>(
-            "SELECT
-                (SELECT COUNT(*) FROM execution e
-                 LEFT JOIN workspace_placement p ON p.workspace_id = e.workspace_id
-                 LEFT JOIN agent_current a ON a.id = e.agent_id
-                 WHERE e.status = 'running' AND
-                   CASE WHEN e.workspace_id IS NOT NULL
-                     THEN COALESCE(p.execution_daemon_id, p.daemon_id)
-                     ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
-                         THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
-                   END = ?) +
-                (SELECT COUNT(*) FROM workspace_placement p
-                 WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = ?
-                   AND p.state IN ('reserved', 'preparing')
-                   AND NOT EXISTS (SELECT 1 FROM execution e
-                       WHERE e.workspace_id = p.workspace_id AND e.status = 'running'))",
+        if !crate::machine_capacity::count_machine_capacity(
+            transaction,
+            if server_host {
+                None
+            } else {
+                daemon_id.as_deref()
+            },
+            cap,
         )
-        .bind(&daemon_id)
-        .bind(&daemon_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        let daemon_chat_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM agent_chat_turn_job
-             JOIN agent_current AS chat_agent
-               ON chat_agent.id = agent_chat_turn_job.responder_identity_id
-             WHERE chat_agent.daemon_id = ?
-               AND agent_chat_turn_job.status IN ('leased', 'running')",
-        )
-        .bind(&daemon_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if daemon_execution_count.saturating_add(daemon_chat_count) >= session_cap {
-            return Err(DbError::AgentAtCapacity);
+        .await?
+        .has_capacity()
+        {
+            return Err(DbError::MachineAtCapacity);
         }
         Ok(())
     }
@@ -1624,23 +1629,6 @@ impl SqliteDb {
         .await?;
         Ok(rows)
     }
-}
-
-fn daemon_session_cap_from_labels(labels_json: &str) -> Option<i64> {
-    let labels = serde_json::from_str::<serde_json::Value>(labels_json).ok()?;
-    [
-        "max_concurrent_sessions",
-        "max_sessions",
-        "active_session_cap",
-        "max_concurrent_tasks",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        labels
-            .get(key)
-            .and_then(serde_json::Value::as_i64)
-            .filter(|value| *value > 0)
-    })
 }
 
 fn canonical_execution_role(role: Option<&str>) -> Option<&str> {

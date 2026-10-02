@@ -249,7 +249,7 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
 
 function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
   return (
-    <Section title={`${productTerm('runtime')} Pressure`} count={items.length}>
+    <Section title="Machine Pressure" count={items.length}>
       <div className="divide-y">
         {items.map((item) => (
           <div
@@ -257,11 +257,11 @@ function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
             className="flex min-w-0 items-center justify-between gap-4 px-4 py-3 transition-colors hover:bg-muted/20"
           >
             <div className="min-w-0">
-              <EntityLink href={`/daemons/${item.daemon_id}`}>
+              <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
                 {item.hostname ?? item.daemon_id}
               </EntityLink>
               <p className="mt-1 text-xs text-muted-foreground">
-                {item.active_sessions}/{item.max_sessions ?? '-'} active sessions
+                {item.active_runs}/{item.max_concurrent_runs ?? 'Unlimited'} active runs
               </p>
             </div>
             <CapacityBadge atCapacity={item.at_capacity} />
@@ -285,10 +285,10 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
               <p className="truncate text-sm font-medium text-foreground">{item.agent_name}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span>
-                  {item.active_sessions}/{item.max_sessions} active sessions
+                  {item.active_runs}/{item.max_concurrent_runs} active runs
                 </span>
                 {item.daemon_id ? (
-                  <EntityLink href={`/daemons/${item.daemon_id}`}>
+                  <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
                     Daemon {item.daemon_id}
                   </EntityLink>
                 ) : null}

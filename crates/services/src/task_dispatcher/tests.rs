@@ -172,6 +172,7 @@ async fn seed_agent_with_executor(
     let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "host".to_owned(),
@@ -193,6 +194,7 @@ async fn seed_agent_with_executor(
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json:
                 serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])
@@ -7396,4 +7398,87 @@ async fn worker_robustness_dispatcher_isolates_projects_and_tasks() {
     assign_role(&dispatcher.db, &healthy_again.id, "coder", &agent).await;
     assert_eq!(dispatcher.check_once().await.unwrap(), 1);
     assert_eq!(rx.recv().await.unwrap().task_id, healthy_again.id);
+}
+
+#[tokio::test]
+async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let running = seed_task(&db, &project_id, "RUN", "in_progress", 0).await;
+    seed_running_execution(&db, &running.id, &agent_id, "coder").await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    db.server_run_cap.set(Some(1));
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, queued.status);
+    assert_eq!(waiting.version, queued.version);
+    let disposition = deferred_dispatch::current_dispatch_disposition(&waiting).unwrap();
+    assert_eq!(
+        disposition.capability, "machine_capacity",
+        "{}",
+        disposition.safe_message
+    );
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &waiting,
+        &workflow,
+        &[],
+        None,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+    assert_eq!(health.severity, api_types::HealthSeverity::Info);
+    assert_eq!(health.stale_reason.as_deref(), Some("machine_capacity"));
+    assert!(waiting.error_annotation.is_none());
+    assert!(waiting.failed_json.is_none());
+    let attention: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'task' AND scope_id = ?",
+    )
+    .bind(&queued.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention, 0);
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&running.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks(&project, &workflow)
+            .await
+            .unwrap(),
+        1
+    );
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.task_id, queued.id);
+    let admitted = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
 }

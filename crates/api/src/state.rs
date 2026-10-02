@@ -246,6 +246,9 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.db
+            .server_run_cap
+            .set(config.server.max_concurrent_runs);
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service

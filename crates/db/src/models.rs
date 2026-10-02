@@ -1187,6 +1187,8 @@ pub struct WorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Daemon {
+    pub run_limit: Option<u32>,
+    pub max_concurrent_runs: Option<i64>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,

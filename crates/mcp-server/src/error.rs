@@ -578,6 +578,8 @@ impl From<DbError> for McpToolError {
                 .with_data(json!({ "code": "idempotency_conflict" })),
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
+            DbError::MachineAtCapacity => Self::new(-32029, "machine at capacity")
+                .with_data(json!({ "code": "machine_capacity" })),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
             DbError::ExecutionAlreadyRunning {
                 scope,

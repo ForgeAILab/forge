@@ -40,8 +40,13 @@ impl TaskDispatcher {
     }
 
     pub(super) async fn clear_dispatch_disposition(&self, task: &Task) -> Result<()> {
-        let capacity_wait = deferred_dispatch::dispatch_disposition(task)
-            .is_some_and(|disposition| disposition.capability == "project_capacity");
+        let capacity_wait =
+            deferred_dispatch::dispatch_disposition(task).is_some_and(|disposition| {
+                matches!(
+                    disposition.capability.as_str(),
+                    "project_capacity" | "machine_capacity"
+                )
+            });
         if deferred_dispatch::clear_dispatch_disposition(&self.db, task).await? && capacity_wait {
             self.publish_capacity_disposition_change(task);
         }
@@ -363,6 +368,26 @@ impl TaskDispatcher {
             &target.agent_id,
         )
         .await?;
+
+        if let Err(error) = self
+            .task_service
+            .preflight_machine_capacity(task, &agent, &target.role)
+            .await
+        {
+            if crate::placement::is_machine_capacity_refusal(&error) {
+                if deferred_dispatch::record_dispatch_disposition(
+                    &self.db,
+                    task,
+                    "machine_capacity",
+                    "machine_capacity: waiting for a machine run slot",
+                )
+                .await?
+                {
+                    self.publish_capacity_disposition_change(task);
+                }
+                return Ok(false);
+            }
+        }
 
         self.task_service
             .transition(

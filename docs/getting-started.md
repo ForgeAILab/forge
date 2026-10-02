@@ -1366,3 +1366,19 @@ initialization failure stops the process promptly.
 - **How it's wired together** → [architecture.md](architecture.md)
 - **Run agents from your AI tooling** → [api.md#mcp-tools](api.md#mcp-tools)
 - **Contribute** → [../CONTRIBUTING.md](../CONTRIBUTING.md)
+
+### Limit concurrent machine runs
+
+Forge defaults to half the host's logical cores, with a minimum of two runs.
+In Forge Settings → Server, set **Max concurrent runs** to a positive integer,
+leave it blank for automatic, or use zero for unlimited. Saving applies
+immediately to new admissions and leaves current work running.
+
+Server YAML uses `server.max_concurrent_runs`; environment and launch overrides
+are `FORGE_SERVER_MAX_CONCURRENT_RUNS` and `--max-concurrent-runs`. Daemons use
+the top-level `max_concurrent_runs` in their local `daemon.yaml` (beside the
+credentials file), or the same flag when launched. Machines shows the daemon's
+reported cap, an admin-editable limit, and the effective lower ceiling.
+Operations includes server-host occupancy and all remote machines. Full
+machines leave Tasks queued until a dispatcher tick sees a free slot. Chat
+turns count toward occupancy but retain their current independent admission.
