@@ -321,6 +321,31 @@ pub async fn get_task_usage(
     Ok(Json(usage))
 }
 
+/// Stop one execution without cancelling its Task or another side session.
+pub async fn stop_execution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<api_types::StopExecutionRequest>,
+) -> ApiResult<Json<ExecutionResponse>> {
+    if request
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(ApiError::bad_request("reason must not be empty"));
+    }
+    let execution = state
+        .task_service
+        .stop_execution(
+            id,
+            request
+                .reason
+                .unwrap_or_else(|| "Execution stopped by user".to_owned()),
+        )
+        .await?;
+    Ok(Json(execution_response(execution)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

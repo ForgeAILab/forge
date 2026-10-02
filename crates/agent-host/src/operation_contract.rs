@@ -992,11 +992,11 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "reason": {
                 "type": ["string", "null"],
-                "description": "Task guidance is supplied in action.guidance."
+                "description": "Audit reason for operations that declare an envelope reason. task.action uses action.reason for approve/cancel/retry, and action.guidance for send_back."
             },
             "decision": {
                 "type": ["string", "null"],
-                "description": "Task decisions use an offered approve or send_back action."
+                "description": "Decision for operations that declare this envelope field. task.action requires the offered action object; send_back carries typed guidance and approve carries override and reason."
             },
             "action": {
                 "type": ["string", "object", "null"],

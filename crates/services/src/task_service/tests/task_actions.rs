@@ -31,17 +31,18 @@ async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(1024)));
     let verbs = [
         TaskAction::Start,
-        TaskAction::Hold,
-        TaskAction::Release,
+        TaskAction::Hold { reason: None },
+        TaskAction::Release { reason: None },
         TaskAction::retry(),
         TaskAction::SendBack {
             guidance: "Return for revisions.".to_owned(),
         },
         TaskAction::Approve {
+            reason: None,
             override_checks: false,
         },
-        TaskAction::Restart,
-        TaskAction::Cancel,
+        TaskAction::Restart { reason: None },
+        TaskAction::Cancel { reason: None },
     ];
     for state in [
         "backlog",
@@ -90,7 +91,11 @@ async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
             for offer in &offers {
                 let copy = fixture(&db, &project, &agent, state, kind).await;
                 match service
-                    .perform_task_action(copy.id.clone(), offer.action.clone(), copy.version)
+                    .perform_task_action(
+                        copy.id.clone(),
+                        action_with_operator_inputs(offer),
+                        copy.version,
+                    )
                     .await
                 {
                     Ok(_)
@@ -148,17 +153,18 @@ async fn unauthorized_caller_gets_no_offers_and_one_typed_error_for_each_verb() 
         .is_empty());
     for action in [
         TaskAction::Start,
-        TaskAction::Hold,
-        TaskAction::Release,
+        TaskAction::Hold { reason: None },
+        TaskAction::Release { reason: None },
         TaskAction::retry(),
         TaskAction::SendBack {
             guidance: "revision".to_owned(),
         },
         TaskAction::Approve {
+            reason: None,
             override_checks: true,
         },
-        TaskAction::Restart,
-        TaskAction::Cancel,
+        TaskAction::Restart { reason: None },
+        TaskAction::Cancel { reason: None },
     ] {
         let error = service
             .perform_task_action_as(task.id.clone(), action, task.version, actor.clone())
@@ -178,7 +184,11 @@ async fn stale_version_is_a_version_conflict_before_any_action_effect() {
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     assert!(matches!(
         service
-            .perform_task_action(&task.id, TaskAction::Cancel, task.version + 1)
+            .perform_task_action(
+                &task.id,
+                TaskAction::Cancel { reason: None },
+                task.version + 1
+            )
             .await,
         Err(ServiceError::Db(DbError::TaskVersionConflict { .. }))
     ));
@@ -455,7 +465,7 @@ async fn special_fixture(db: &SqliteDb, project: &str, agent: &str, scenario: &s
                 &task.id,
                 &execution.id,
                 1,
-                json!({"ci_steps":[{"command":"check","exit_code":1}]}),
+                json!({"ci_steps":[{"index":0,"command":"check","exit_code":1,"stderr_tail":""}]}),
             )
             .await;
         }
@@ -545,17 +555,18 @@ async fn special_snapshot_offers_apply_or_version_conflict_and_absent_verbs_are_
     let service = TaskService::new(db.clone(), Arc::new(EventBus::new(1024)));
     let verbs = [
         TaskAction::Start,
-        TaskAction::Hold,
-        TaskAction::Release,
+        TaskAction::Hold { reason: None },
+        TaskAction::Release { reason: None },
         TaskAction::retry(),
         TaskAction::SendBack {
             guidance: "Revise".to_owned(),
         },
         TaskAction::Approve {
+            reason: None,
             override_checks: false,
         },
-        TaskAction::Restart,
-        TaskAction::Cancel,
+        TaskAction::Restart { reason: None },
+        TaskAction::Cancel { reason: None },
     ];
     for scenario in [
         "failed_review",
@@ -577,7 +588,7 @@ async fn special_snapshot_offers_apply_or_version_conflict_and_absent_verbs_are_
         for offer in &offers {
             let copy = special_fixture(&db, &project, &agent, scenario).await;
             match service
-                .perform_task_action(&copy.id, offer.action.clone(), copy.version)
+                .perform_task_action(&copy.id, action_with_operator_inputs(offer), copy.version)
                 .await
             {
                 Ok(_)
@@ -632,7 +643,10 @@ async fn historical_queued_commands_preserve_payload_and_current_conditions() {
             .await
             .unwrap()
             .unwrap();
-        assert!(!service.dispatch_queued_recovery(&task).await.unwrap());
+        assert!(
+            service.dispatch_queued_recovery(&task).await.is_err(),
+            "unrepresentable legacy intents settle with an error"
+        );
         let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -646,4 +660,174 @@ async fn historical_queued_commands_preserve_payload_and_current_conditions() {
         assert_eq!(metadata["task_action_migrated_intent"], old);
         assert!(metadata.get("queued_recovery").is_none());
     }
+}
+
+#[tokio::test]
+async fn owner_advance_override_stops_the_role_and_dispatches_the_next_without_a_plan() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, repo) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo);
+    let agent = super::condition_scenarios::scenario_agent(&db).await;
+    let task = fixture(&db, &project, &agent, "planning", None).await;
+    seed_role_assignment(&db, &task.id, "planner", Some(&agent)).await;
+    let running = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent),
+        "planner",
+        ExecutionStatus::Running,
+        None,
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)))
+        .with_workspace_root(repo.path().join("workspaces"))
+        .with_task_executor(Arc::new(RecordingExecutor { started: tx }));
+    let result = service
+        .perform_task_action(
+            &task.id,
+            TaskAction::Approve {
+                override_checks: true,
+                reason: Some("Owner supplies an alternate plan".to_owned()),
+            },
+            task.version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "in_progress");
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*db, &running.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        rx.try_recv().is_err(),
+        "the command cannot launch the next role"
+    );
+    service.test_dispatch_task_action(&task.id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let rows = ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].role, "coder");
+    assert!(TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| row.trigger_reason == "Owner supplies an alternate plan" && !row.rejection));
+}
+
+#[tokio::test]
+async fn stale_role_is_restored_before_a_paused_agent_wait() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let task = fixture(
+        &db,
+        &project,
+        &agent,
+        "in_progress",
+        Some(FailureKind::ExecutorFailed),
+    )
+    .await;
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+    let queued = service
+        .perform_task_action(&task.id, TaskAction::retry(), task.version)
+        .await
+        .unwrap()
+        .task;
+    sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(&agent)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(service.dispatch_queued_recovery(&queued).await.is_err());
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_none());
+    assert!(current
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("ownership changed"));
+}
+
+#[tokio::test]
+async fn hold_stops_workflow_execution_and_records_operator_reason() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let task = fixture(&db, &project, &agent, "in_progress", None).await;
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent),
+        "coder",
+        ExecutionStatus::Running,
+        Some("held-session"),
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+    let held = service
+        .perform_task_action(
+            &task.id,
+            TaskAction::Hold {
+                reason: Some("Wait for the owner measurements".to_owned()),
+            },
+            task.version,
+        )
+        .await
+        .unwrap()
+        .task;
+    assert_eq!(held.status, "in_progress");
+    let stopped = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, ExecutionStatus::Cancelled);
+    let comments = db::TaskCommentRepo::list_comments(
+        &*db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Asc,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(comments.items.iter().any(|comment| {
+        comment.author_type == db::CommentAuthorType::System
+            && comment.content == "Task paused by user: Wait for the owner measurements"
+    }));
+    let offers = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .any(|offer| matches!(offer.action, TaskAction::Release { .. })));
 }

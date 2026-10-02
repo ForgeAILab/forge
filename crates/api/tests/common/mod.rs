@@ -639,15 +639,8 @@ pub async fn raw_json_request(
     app: &Router,
     method: Method,
     uri: &str,
-    mut body: Value,
+    body: Value,
 ) -> axum::response::Response {
-    // Commands in lifecycle fixtures still use the real versioned endpoint.
-    // Preserve an explicit version so stale-version tests exercise the CAS.
-    if method == Method::POST && uri.ends_with("/actions") && body.get("version").is_none() {
-        let response = raw_empty_request(app, Method::GET, uri).await;
-        let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
-        body["version"] = json!(offers.version);
-    }
     app.clone()
         .oneshot(
             Request::builder()
@@ -756,4 +749,12 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// Tests explicitly place this version in the command body. The transport
+/// helper never repairs missing command fields.
+pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
+    let response = raw_empty_request(app, Method::GET, uri).await;
+    let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
+    offers.version
 }

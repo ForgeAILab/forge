@@ -206,7 +206,7 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
                 .unwrap();
         } else {
             tasks
-                .cancel_execution(&execution.id, "Stop this work".to_owned())
+                .stop_execution(&execution.id, "Stop this work".to_owned())
                 .await
                 .unwrap();
         }

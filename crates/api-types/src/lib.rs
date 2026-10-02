@@ -138,6 +138,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");
+    ActionParameterRequirement::export().expect("export ActionParameterRequirement");
     ActionParameter::export().expect("export ActionParameter");
     Offer::export().expect("export Offer");
     ActionAuthority::export().expect("export ActionAuthority");
@@ -362,6 +363,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     TransitionTaskRequest::export().expect("export TransitionTaskRequest");
     AuthorType::export().expect("export AuthorType");
     TaskMediaResponse::export().expect("export TaskMediaResponse");
+    StopExecutionRequest::export().expect("export StopExecutionRequest");
     TaskActionRequest::export().expect("export TaskActionRequest");
     TestLifecycleHookRequest::export().expect("export TestLifecycleHookRequest");
     CreateCommentRequest::export().expect("export CreateCommentRequest");
@@ -663,20 +665,3 @@ fn export_typescript_to(out_dir: &std::path::Path) {
 }
 
 pub mod execution_outbox;
-
-#[test]
-fn export_bindings_remove_retired_action_types() {
-    let root = std::env::var_os("TS_RS_EXPORT_DIR").expect("binding export directory");
-    for name in [
-        "RecoveryAction",
-        "ExecutionActionKind",
-        "ExecutionAction",
-        "WorkflowExceptionAction",
-        "RecoverTaskRequest",
-    ] {
-        let path = std::path::Path::new(&root).join(format!("{name}.ts"));
-        if path.exists() {
-            std::fs::remove_file(path).expect("remove retired generated type");
-        }
-    }
-}

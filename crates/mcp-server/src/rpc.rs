@@ -388,7 +388,7 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         "forge_get_task"
         | "forge_preview_prompt"
         | "forge_assign_agent"
-        | "task.action"
+        | "forge_task_action"
         | "forge_get_task_diff"
         | "forge_list_executions"
         | "forge_update_task"

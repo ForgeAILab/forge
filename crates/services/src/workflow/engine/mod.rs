@@ -56,7 +56,7 @@ const MAX_CASCADE_DEPTH: u8 = 8;
 
 fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
     serde_json::json!({
-        "type": DISPATCH_FAILED_ANNOTATION,
+        "type": api_types::FailureKind::DispatchFailed,
         "message": message,
         "state": state,
         "detected_at": now_rfc3339(),
@@ -1942,7 +1942,7 @@ impl WorkflowEngine {
                     .hooks
                     .on_enter
                     .iter()
-                    .any(|hook| hook.action == "dispatch_role_agent");
+                    .any(|hook| matches!(hook.action.as_str(), "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor"));
             if should_defer_dispatch {
                 deferred_dispatch::set(
                     &self.db,
@@ -2282,7 +2282,7 @@ impl WorkflowEngine {
                         );
                         continue;
                     }
-                    if should_defer_dispatch && hook.action == "dispatch_role_agent" {
+                    if should_defer_dispatch && matches!(hook.action.as_str(), "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor") {
                         let result = HookResult::Skipped {
                             reason: "dispatch deferred to Task dispatcher".to_owned(),
                         };

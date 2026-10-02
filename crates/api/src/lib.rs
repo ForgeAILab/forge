@@ -1021,6 +1021,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::executions::get_execution),
         )
         .route(
+            "/api/v1/executions/{id}/stop",
+            post(routes::executions::stop_execution),
+        )
+        .route(
             "/api/v1/executions/{id}/logs",
             get(routes::executions::get_logs),
         )

@@ -126,18 +126,6 @@ pub struct TaskActionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApproveGateRequest {
-    pub reason: Option<String>,
-    pub version: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectGateRequest {
-    pub reason: String,
-    pub version: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateProjectRequest {
     pub name: String,
@@ -228,4 +216,14 @@ where
     parse_project_hooks_json(&json)
         .map(Some)
         .map_err(serde::de::Error::custom)
+}
+
+/// Stop exactly one execution, including an interactive side session.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct StopExecutionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reason: Option<String>,
 }

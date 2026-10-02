@@ -728,7 +728,7 @@ fn known_tool_version_conflict_is_an_in_band_structured_outcome() {
         scope: "repository".to_owned(),
         execution_id: "execution-2".to_owned(),
     })
-    .with_call_context("task.action", Some("project-1"), Some("user-1"))
+    .with_call_context("forge_task_action", Some("project-1"), Some("user-1"))
     .into_tool_response(json!(2));
     let db_result = db_response
         .result
@@ -2697,7 +2697,7 @@ fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
                 .unwrap();
             let result = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
             assert_eq!(result["available_actions"], json!(offers.available_actions));
-            assert_eq!(result["execution_actions"], result["available_actions"]);
+            assert!(result.get("execution_actions").is_none());
             assert_eq!(
                 result["workflow_exception"]["actions"],
                 result["available_actions"]

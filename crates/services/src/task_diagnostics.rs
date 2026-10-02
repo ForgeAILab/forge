@@ -416,20 +416,35 @@ pub fn task_exception(
     snapshot: &crate::TaskSnapshot,
     offers: Vec<api_types::Offer>,
 ) -> Option<WorkflowExceptionSummary> {
-    let task = &snapshot.task;
-    let annotation = snapshot.annotation();
-    let latest_review = snapshot.latest_review.as_ref();
-    let latest_execution = snapshot
-        .executions
+    task_exception_projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &snapshot.executions,
+        snapshot.latest_review.as_ref(),
+        offers,
+    )
+}
+
+pub fn task_exception_projection(
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    executions: &[Execution],
+    latest_review: Option<&Review>,
+    offers: Vec<api_types::Offer>,
+) -> Option<WorkflowExceptionSummary> {
+    let annotation = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok());
+    let latest_execution = executions
         .iter()
         .max_by_key(|execution| (&execution.created_at, &execution.id));
-    let kind = snapshot.condition();
+    let kind = crate::task_actions::task_condition(task);
     let failed_review = latest_failed_review(latest_review);
     if kind.is_none() && failed_review.is_none() && task.entry_barrier_json.is_none() {
         return None;
     }
-    let role = snapshot
-        .workflow
+    let role = workflow
         .states
         .iter()
         .find(|state| state.name == task.status)
@@ -651,6 +666,12 @@ pub fn entries_since_retry_window_boundary<'a>(
     boundary
         .and_then(|index| entries.get(index + 1..))
         .unwrap_or(entries)
+}
+
+/// Gate-entry enforcement. Review exhaustion is settled only on a failed
+/// verdict; entering/re-running review or deciding a human gate remains legal.
+pub fn gate_entry_retry_exhausted(state: &str, budget: i64, count: i64) -> bool {
+    state != crate::workflow::default_states::REVIEW && count >= budget
 }
 
 /// Count gate rejections in the current retry window.

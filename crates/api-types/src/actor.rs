@@ -33,7 +33,6 @@ pub enum UserActionSource {
     Action(TaskAction),
     Reassignment,
     RoleReassignment,
-    ManualAdvance,
     Transition,
     Test,
 }
@@ -133,7 +132,6 @@ impl fmt::Display for UserActionSource {
             Self::Action(action) => write!(f, "action:{action}"),
             Self::Reassignment => f.write_str("reassignment"),
             Self::RoleReassignment => f.write_str("role_reassignment"),
-            Self::ManualAdvance => f.write_str("manual_advance"),
             Self::Transition => f.write_str("transition"),
             Self::Test => f.write_str("test"),
         }

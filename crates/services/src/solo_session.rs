@@ -1068,6 +1068,7 @@ impl SoloSessionService {
         let reason = input.reason.and_then(|reason| safe_diagnostic(&reason));
         let action = match input.decision {
             SoloReviewDecision::Accept => api_types::TaskAction::Approve {
+                reason: None,
                 override_checks: false,
             },
             SoloReviewDecision::RequestChanges => api_types::TaskAction::SendBack {

@@ -409,14 +409,19 @@ pub(super) async fn forge_list_tasks(
     )
 }
 
-pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Value, McpToolError> {
+pub(super) async fn forge_get_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
+    let actor = Actor::User {
+        user_id: Some(authenticated_user(context)?.to_owned()),
+        source: api_types::UserActionSource::Api,
+    };
     let snapshot = state
         .task_service
-        .task_action_snapshot(
-            &params.task_id,
-            &Actor::user(api_types::UserActionSource::Api),
-        )
+        .task_action_snapshot(&params.task_id, &actor)
         .await?;
     task_snapshot_value(snapshot)
 }
@@ -426,7 +431,6 @@ fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToo
     let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
     let mut value = task_value(snapshot.task);
     value["available_actions"] = json!(offers);
-    value["execution_actions"] = value["available_actions"].clone();
     value["workflow_exception"] = serde_json::to_value(exception)
         .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
     Ok(value)
@@ -610,8 +614,12 @@ pub(super) async fn forge_assign_agent(
 pub(super) async fn task_action(
     state: &AppState,
     params: Value,
-    _context: &McpContext,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    let actor = Actor::User {
+        user_id: Some(authenticated_user(context)?.to_owned()),
+        source: api_types::UserActionSource::Api,
+    };
     let task_id = params
         .get("task_id")
         .and_then(Value::as_str)
@@ -620,9 +628,13 @@ pub(super) async fn task_action(
         parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
     let result = state
         .task_service
-        .perform_task_action(task_id, request.action, request.version)
+        .perform_task_action_as(task_id, request.action, request.version, actor.clone())
         .await?;
-    task_with_offers(state, result.task).await
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&result.task.id, &actor)
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_get_task_diff(

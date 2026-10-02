@@ -1,4 +1,4 @@
-use db::{AssigneeKind, ExecutionRepo, TaskRoleAssignment};
+use db::ExecutionRepo;
 use sqlx::Row;
 
 fn role_matches(role: &str, execution_role: &str) -> bool {
@@ -224,33 +224,4 @@ pub fn select_open_interactive_target<'a>(
     }
 
     latest_resumable_execution_for_role(executions, effective_role)
-}
-
-/// Mirror `TaskService::interactive_launch_agent`'s fresh-launch fallbacks
-/// using the same bounded execution authority: an assigned current-role agent,
-/// the explicitly blocked execution's agent, or the newest agent-backed
-/// execution (represented by the static agent-backed candidate).
-pub fn has_open_interactive_launch_authority(
-    executions: &[db::Execution],
-    role_assignments: &[TaskRoleAssignment],
-    effective_role: Option<&str>,
-    blocked_execution_id: Option<&str>,
-) -> bool {
-    let assigned_agent = effective_role.is_some_and(|role| {
-        role_assignments.iter().any(|assignment| {
-            assignment.role_name == role
-                && assignment.assignee_type == Some(AssigneeKind::Agent)
-                && assignment.assignee_id.is_some()
-        })
-    });
-    let blocked_agent = blocked_execution_id.is_some_and(|execution_id| {
-        executions
-            .iter()
-            .any(|execution| execution.id == execution_id && execution.agent_id.is_some())
-    });
-    let previous_agent = executions
-        .iter()
-        .any(|execution| execution.agent_id.is_some());
-
-    assigned_agent || blocked_agent || previous_agent
 }

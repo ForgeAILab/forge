@@ -103,7 +103,7 @@ async fn reject_review_bounces_to_in_progress() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"send_back","guidance":"bad code quality"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"bad code quality"}}),
         StatusCode::OK,
     )
     .await;
@@ -134,7 +134,7 @@ async fn send_back_carries_required_guidance() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"send_back","guidance":"Return for revisions"} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"Return for revisions"} }),
         StatusCode::OK,
     )
     .await;
@@ -198,6 +198,7 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
         .test_apply_action(
             task_id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: None,
                 reset_budget: Some(true),
@@ -213,7 +214,7 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"send_back","guidance":"request one more pass"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"request one more pass"}}),
         StatusCode::OK,
     )
     .await;
@@ -261,7 +262,7 @@ async fn approve_review_returns_409_when_not_awaiting_human() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"approve","override":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
     )
     .await;
 
@@ -401,7 +402,7 @@ async fn reject_review_creates_system_comment_with_reason() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"send_back","guidance":"needs refactoring"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"needs refactoring"}}),
         StatusCode::OK,
     )
     .await;
@@ -477,7 +478,7 @@ async fn approve_review_cascades_via_merge() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{seeded_task_id}/actions"),
-        json!({ "action": {"verb":"approve","override":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{seeded_task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
         StatusCode::OK,
     )
     .await;
@@ -569,7 +570,7 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({"action":{"verb":"retry"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"retry"}}),
         StatusCode::OK,
     )
     .await;
@@ -664,7 +665,7 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({"action":{"verb":"retry"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"retry"}}),
         StatusCode::OK,
     )
     .await;

@@ -734,7 +734,8 @@ async fn update_recovery_metadata_inner(
             .get("queued_recovery")
             .and_then(|queued| queued.get("id"))
             .and_then(serde_json::Value::as_str)
-            != Some(expected_id)
+            .unwrap_or_default()
+            != expected_id
         {
             return Err(DbError::VersionConflict);
         }
@@ -1221,7 +1222,7 @@ impl TaskRepo for SqliteDb {
             input.expected_version,
             input.error_annotation,
             input.blocked_json,
-            None,
+            input.failed_json,
             &input.updated_at,
             None,
             Vec::new(),

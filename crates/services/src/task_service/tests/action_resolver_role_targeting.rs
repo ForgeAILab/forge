@@ -58,6 +58,11 @@ async fn test_resolve_execution_actions_targets_current_role() {
         dependencies_satisfied: true,
         owner_supports_resume: true,
         coordination_root: false,
+        owner_disconnected: false,
+        project_paused: false,
+        action_agent_id: None,
+        planning_approval_ready: true,
+        advance_target: None,
     };
     let offers = crate::available_actions(&snapshot);
     assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
@@ -144,30 +149,6 @@ async fn test_open_interactive_target_ignores_newer_unrelated_role() {
         )
         .is_none(),
         "no resumable session should produce no follow-up target"
-    );
-    assert!(
-        crate::task_service::action_resolver::has_open_interactive_launch_authority(
-            &launch_only_executions,
-            &[],
-            Some(crate::workflow::default_roles::CODER),
-            None,
-        )
-    );
-    assert!(
-        crate::task_service::action_resolver::has_open_interactive_launch_authority(
-            &[],
-            &[db::TaskRoleAssignment {
-                id: "assignment".to_owned(),
-                task_id: task.id,
-                role_name: crate::workflow::default_roles::CODER.to_owned(),
-                assignee_type: Some(db::AssigneeKind::Agent),
-                assignee_id: Some(agent_id),
-                created_at: now_rfc3339(),
-                updated_at: now_rfc3339(),
-            }],
-            Some(crate::workflow::default_roles::CODER),
-            None,
-        )
     );
 }
 
@@ -287,6 +268,11 @@ async fn test_resolve_execution_actions_disables_resume_for_terminal_bound_revie
         dependencies_satisfied: true,
         owner_supports_resume: true,
         coordination_root: false,
+        owner_disconnected: false,
+        project_paused: false,
+        action_agent_id: None,
+        planning_approval_ready: true,
+        advance_target: None,
     };
     let offers = crate::available_actions(&snapshot);
     assert!(!offers.iter().any(|offer| matches!(

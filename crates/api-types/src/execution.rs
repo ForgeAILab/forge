@@ -45,9 +45,20 @@ pub struct ExecutionInterruptionResponse {
 #[ts(export, tag = "verb", rename_all = "snake_case")]
 pub enum TaskAction {
     Start,
-    Hold,
-    Release,
+    Hold {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Release {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
     Retry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         fresh_session: Option<bool>,
@@ -65,29 +76,41 @@ pub enum TaskAction {
         guidance: String,
     },
     Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
         #[serde(rename = "override")]
         override_checks: bool,
     },
-    Restart,
-    Cancel,
+    Restart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Cancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
 }
 
 impl TaskAction {
     pub fn verb(&self) -> &'static str {
         match self {
             Self::Start => "start",
-            Self::Hold => "hold",
-            Self::Release => "release",
+            Self::Hold { .. } => "hold",
+            Self::Release { .. } => "release",
             Self::Retry { .. } => "retry",
             Self::SendBack { .. } => "send_back",
             Self::Approve { .. } => "approve",
-            Self::Restart => "restart",
-            Self::Cancel => "cancel",
+            Self::Restart { .. } => "restart",
+            Self::Cancel { .. } => "cancel",
         }
     }
 
     pub fn retry() -> Self {
         Self::Retry {
+            reason: None,
             fresh_session: None,
             refresh_workspace: None,
             reset_budget: None,
@@ -112,6 +135,14 @@ pub enum ActionAuthority {
     Reviewer,
 }
 
+/// A parameter is required when another offered boolean has this value.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ActionParameterRequirement {
+    pub parameter: String,
+    pub value: bool,
+}
+
 /// One executable offer. Parameters name the inputs meaningful in this snapshot;
 /// `action` supplies defaults. Authority is filtered before this value is exposed.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -120,6 +151,9 @@ pub struct ActionParameter {
     pub name: String,
     pub required: bool,
     pub boolean_values: Option<Vec<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub required_when: Option<ActionParameterRequirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -131,6 +165,8 @@ pub struct Offer {
     pub reason: String,
     pub label: String,
     pub target_execution_id: Option<String>,
+    #[serde(default)]
+    pub propagates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -175,8 +211,6 @@ pub struct TaskResponse {
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
     pub remaining_retries: std::collections::HashMap<String, i64>,
-    #[serde(default)]
-    pub execution_actions: Vec<Offer>,
     #[serde(default)]
     pub available_actions: Vec<Offer>,
     pub error_annotation: Option<TaskAnnotation>,
@@ -562,11 +596,13 @@ pub struct PromptPreviewResponse {
 pub fn task_action_schema() -> serde_json::Value {
     use serde_json::json;
     let mut variants = Vec::new();
-    for verb in ["start", "hold", "release", "restart", "cancel"] {
-        variants.push(json!({"type":"object", "properties":{"verb":{"const":verb}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"start"}}, "required":["verb"], "additionalProperties":false}));
+    for verb in ["hold", "release", "restart"] {
+        variants.push(json!({"type":"object", "properties":{"verb":{"const":verb},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
     }
-    variants.push(json!({"type":"object", "properties":{"verb":{"const":"retry"}, "fresh_session":{"type":"boolean"}, "refresh_workspace":{"type":"boolean"}, "reset_budget":{"type":"boolean"}, "guidance":{"type":"string"}}, "required":["verb"], "additionalProperties":false}));
-    variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string"}}, "required":["verb","guidance"], "additionalProperties":false}));
-    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"}}, "required":["verb","override"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"cancel"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"retry"},"reason":{"type":"string","minLength":1}, "fresh_session":{"type":"boolean"}, "refresh_workspace":{"type":"boolean"}, "reset_budget":{"type":"boolean"}, "guidance":{"type":"string"}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string","minLength":1}}, "required":["verb","guidance"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb","override"], "additionalProperties":false}));
     json!({"oneOf":variants})
 }

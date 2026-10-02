@@ -3070,6 +3070,7 @@ pub struct RestoreQueuedRecovery {
     pub task_id: String,
     pub expected_version: i64,
     pub queued_recovery_id: String,
+    pub failed_json: Option<String>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub updated_at: String,

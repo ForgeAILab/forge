@@ -399,3 +399,19 @@ pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> 
     .await
     .expect("retry-exhausted metadata sets")
 }
+
+pub(super) fn action_with_operator_inputs(offer: &api_types::Offer) -> api_types::TaskAction {
+    let mut action = offer.action.clone();
+    match &mut action {
+        api_types::TaskAction::Approve { reason, .. }
+        | api_types::TaskAction::Cancel { reason }
+        | api_types::TaskAction::Retry { reason, .. } => {
+            *reason = Some("Operator fixture audit reason".to_owned())
+        }
+        api_types::TaskAction::SendBack { guidance } => {
+            *guidance = "Operator fixture requested changes".to_owned()
+        }
+        _ => {}
+    }
+    action
+}

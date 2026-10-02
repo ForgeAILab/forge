@@ -6191,6 +6191,7 @@ pub(crate) mod tests {
             .test_apply_action(
                 ready.task_id,
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,
@@ -6999,6 +7000,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .contains(&api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(false),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7011,6 +7013,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .contains(&api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(false),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7023,6 +7026,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .contains(&api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(false),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7040,6 +7044,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .contains(&api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(false),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7095,6 +7100,7 @@ pub(crate) mod tests {
             .test_apply_action(
                 &task.id,
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,
@@ -8288,7 +8294,12 @@ pub(crate) mod tests {
         };
         if task_reset {
             let recovered = service
-                .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
+                .test_apply_action(
+                    &task.id,
+                    api_types::TaskAction::Restart { reason: None },
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(recovered.status, crate::workflow::default_states::TODO);
@@ -8402,7 +8413,12 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             service
-                .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
+                .test_apply_action(
+                    &task.id,
+                    api_types::TaskAction::Restart { reason: None },
+                    None,
+                    None
+                )
                 .await,
             Err(ServiceError::Db(db::DbError::VersionConflict))
         ));
@@ -8416,7 +8432,12 @@ pub(crate) mod tests {
             1
         );
         let recovered = service
-            .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Restart { reason: None },
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert!(recovered.error_annotation.is_none());
@@ -8476,6 +8497,7 @@ pub(crate) mod tests {
             .test_apply_action(
                 &task.id,
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,
@@ -8487,7 +8509,7 @@ pub(crate) mod tests {
             .await
             .expect_err("explicit recovery preserves the base offline-agent refusal");
         assert!(
-            matches!(error, ServiceError::InvalidOperation { ref message } if message.contains("offline")),
+            matches!(error, ServiceError::TaskActionUnavailable { ref available_actions, .. } if available_actions.iter().all(|offer| offer.action.verb() != "retry")),
             "{error:?}"
         );
         let current = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -8511,19 +8533,21 @@ pub(crate) mod tests {
         assert_eq!(
             actions,
             vec![
+                api_types::TaskAction::Cancel { reason: None },
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,
                     guidance: None
                 },
-                api_types::TaskAction::Cancel
             ]
         );
         let retried = service
             .test_apply_action(
                 &task.id,
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,
@@ -8549,7 +8573,12 @@ pub(crate) mod tests {
             1
         );
         let cancelled = service
-            .test_apply_action(&task.id, api_types::TaskAction::Cancel, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Cancel { reason: None },
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");

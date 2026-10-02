@@ -47,7 +47,7 @@ async fn cancelled_task_rejects_recover() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/actions", task.id),
-        json!({ "action": {"verb":"retry","fresh_session":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"retry","fresh_session":false} }),
     )
     .await;
     let status = response.status();
@@ -847,7 +847,7 @@ async fn re_execute_endpoint_launches_replacement_execution() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/actions", task.id),
-        json!({"action":{"verb":"retry","fresh_session":true}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await,"action":{"verb":"retry","fresh_session":true}}),
         StatusCode::OK,
     )
     .await;
@@ -891,7 +891,7 @@ async fn retry_request_accepts_guidance() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/actions", task.id),
-        json!({
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await,
             "action": {"verb":"retry","fresh_session":true,"guidance":"Continue after repair"}}),
         StatusCode::OK,
     )
@@ -987,7 +987,7 @@ async fn cancel_task(harness: &common::Harness, task_id: &str) -> TaskResponse {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({"action":{"verb":"cancel"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"cancel"}}),
         StatusCode::OK,
     )
     .await
@@ -1009,15 +1009,11 @@ async fn launch_task(
 }
 
 async fn stop_execution(harness: &common::Harness, execution_id: &str) {
-    let execution = ExecutionRepo::get_by_id(&*harness.state.db, execution_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let _: TaskResponse = common::json_request(
+    let _: api_types::ExecutionResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/actions", execution.task_id),
-        json!({"action":{"verb":"hold"}}),
+        &format!("/api/v1/executions/{execution_id}/stop"),
+        json!({"reason":"Stop this execution"}),
         StatusCode::OK,
     )
     .await;
@@ -1064,4 +1060,73 @@ async fn assert_task_list_diagnostics_match(
         listed["execution_observability"]["latest_execution_id"],
         task["execution_observability"]["latest_execution_id"]
     );
+}
+
+#[tokio::test]
+async fn stop_route_stops_only_the_selected_side_session() {
+    let root = common::TestDir::new("stop-side-session");
+    let harness = common::test_app(root.path(), "stop-side-session").await;
+    let (project, _, agent) = setup(&harness, root.path()).await;
+    let task = create_task(&harness, &project, "Two independent executions").await;
+    let now = db::now_rfc3339();
+    let mut ids = Vec::new();
+    for role in ["coder", "interactive"] {
+        let execution = ExecutionRepo::create(
+            &*harness.state.db,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.clone()),
+                role: role.to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        ids.push(execution.id);
+    }
+    let before = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    stop_execution(&harness, &ids[1]).await;
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*harness.state.db, &ids[0])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Running
+    );
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*harness.state.db, &ids[1])
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Cancelled
+    );
+    let after = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.error_annotation, before.error_annotation);
+    assert_eq!(after.status, before.status);
 }

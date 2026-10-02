@@ -524,7 +524,10 @@ async fn memory_indexing_failure_does_not_fail_source_operation() {
 
     let service = TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
     service
-        .approve_review(task_id.clone())
+        .approve_review_as(
+            task_id.clone(),
+            api_types::Actor::user(api_types::UserActionSource::Test),
+        )
         .await
         .expect("source operation succeeds");
 

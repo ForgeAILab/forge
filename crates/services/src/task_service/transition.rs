@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::engine::WorkflowAuthority;
-use api_types::{Actor, SystemComponent, UserActionSource};
+use api_types::{Actor, SystemComponent};
 use db::UpdateTask;
 
 impl TaskService {
@@ -861,35 +861,42 @@ impl TaskService {
         Ok(())
     }
 
-    pub async fn advance_to_next_state(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        validate_required("task_id", &task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+    pub(crate) async fn advance_task_condition(
+        &self,
+        task: &Task,
+        workflow: &api_types::WorkflowDefinition,
+        target: String,
+        reason: String,
+        actor: Actor,
+    ) -> Result<Task> {
+        super::execution::ensure_plan_publication_transition_authority(task, None)?;
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
+            &self.db, task, workflow, &target,
+        )
+        .await?;
+        if workflow.state_kind(&target) != Some(api_types::StateKind::Terminal) {
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, task).await?;
+        }
+        let claimed = TaskRepo::mutate_metadata_and_bump_version(
+            &*self.db,
+            &task.id,
+            task.version,
+            Vec::new(),
+            &now_rfc3339(),
+        )
+        .await?;
+        self.cancel_running_executions_for_task(
+            &claimed,
+            "cancelled by manual advance",
+            actor.clone(),
+        )
+        .await?;
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::user(UserActionSource::ManualAdvance),
-        );
-        let target = next_workflow_state(&workflow, &task.status)?;
-        crate::task_hierarchy::ensure_coordination_root_target_ready(
-            &self.db, &task, &workflow, &target,
-        )
-        .await?;
-        if !matches!(
-            workflow.state_kind(&target),
-            Some(api_types::StateKind::Terminal)
-        ) {
-            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
-        }
-
-        self.cancel_running_executions_for_manual_advance(&task)
-            .await?;
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus: Arc::clone(&self.event_bus),
@@ -906,32 +913,30 @@ impl TaskService {
         };
         let result = engine
             .manual_override_transition_with_authority(
-                &task_id,
+                &task.id,
                 &target,
-                task.version,
-                &workflow,
-                Actor::user(UserActionSource::ManualAdvance),
-                "manual advance",
+                current.version,
+                workflow,
+                actor,
+                &reason,
                 false,
-                Some(crate::workflow::engine::WorkflowAuthority {
+                Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;
-        let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
-            && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+        let updated = clear_manual_advance_error_annotation(&self.db, task, result.task).await?;
+        if workflow.state_kind(&updated.status) == Some(api_types::StateKind::Terminal)
+            && workflow.cancellation_state.as_deref() != Some(updated.status.as_str())
         {
-            // Manual advance bypasses `transition()` entirely, so it needs
-            // its own success-path wake, mirroring the one added above.
-            if let Err(error) = self.wake_dependents_of_completed_task(&task).await {
-                tracing::warn!(task_id = %task.id, %error, "failed to wake dependents of completed task");
+            if let Err(error) = self.wake_dependents_of_completed_task(&updated).await {
+                tracing::warn!(task_id = %updated.id, %error, "failed to wake dependents of completed task");
             }
         }
-        self.reconcile_terminal_subtask(&task).await;
-        Ok(task)
+        self.reconcile_terminal_subtask(&updated).await;
+        Ok(updated)
     }
 
     pub async fn soft_delete(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -1081,15 +1086,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn cancel_running_executions_for_manual_advance(&self, task: &Task) -> Result<()> {
-        self.cancel_running_executions_for_task(
-            task,
-            "cancelled by manual advance",
-            Actor::user(UserActionSource::ManualAdvance),
-        )
-        .await
-    }
-
     async fn cancel_running_executions_for_task(
         &self,
         task: &Task,
@@ -1124,7 +1120,7 @@ impl TaskService {
     }
 }
 
-fn next_workflow_state(
+pub(crate) fn next_workflow_state(
     workflow: &api_types::WorkflowDefinition,
     current_status: &str,
 ) -> Result<String> {

@@ -37,7 +37,7 @@ describe('ExecutionLivenessNotice', () => {
           },
         }}
         taskVersion={3}
-        offers={[{ action: { verb: 'retry' }, parameters: [], authority: ['owner'], reason: 'role_retry', label: 'Retry run', target_execution_id: null }]}
+        offers={[{ action: { verb: 'retry' }, parameters: [], authority: ['owner'], reason: 'role_retry', label: 'Retry run', target_execution_id: null, propagates: false }]}
         nextActionLabel="Retry run"
       />,
     )

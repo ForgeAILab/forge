@@ -47,40 +47,16 @@ pub struct TaskSnapshot {
     pub dependencies_satisfied: bool,
     pub owner_supports_resume: bool,
     pub coordination_root: bool,
+    pub owner_disconnected: bool,
+    pub project_paused: bool,
+    pub action_agent_id: Option<String>,
+    pub planning_approval_ready: bool,
+    pub advance_target: Option<String>,
 }
 
 impl TaskSnapshot {
     pub fn condition(&self) -> Option<FailureKind> {
-        let task = &self.task;
-        if task.failed_json.is_some() {
-            return Some(FailureKind::ExecutorFailed);
-        }
-        let blocked_kind = task
-            .blocked_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|value| value.get("kind").cloned())
-            .and_then(|value| serde_json::from_value::<FailureKind>(value).ok());
-        if blocked_kind.is_some_and(|kind| {
-            kind.is_retry_exhausted_metadata() || kind.is_budget_exhausted_annotation()
-        }) {
-            return blocked_kind;
-        }
-        if let Some(TaskAnnotation::Blocking(annotation)) = task
-            .error_annotation
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-        {
-            if annotation.annotation_type != FailureKind::Unknown {
-                return Some(annotation.annotation_type);
-            }
-        }
-        task.blocked_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|value| value.get("kind").cloned())
-            .and_then(|value| serde_json::from_value(value).ok())
-            .or_else(|| task.error_annotation.as_ref().map(|_| FailureKind::Unknown))
+        task_condition(&self.task)
     }
 
     pub fn annotation(&self) -> Option<api_types::TaskBlockingAnnotation> {
@@ -96,10 +72,48 @@ impl TaskSnapshot {
     }
 }
 
+pub fn task_condition(task: &Task) -> Option<FailureKind> {
+    if let Some(raw) = task.failed_json.as_deref() {
+        return Some(
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| value.get("kind").cloned())
+                .and_then(|kind| serde_json::from_value(kind).ok())
+                .unwrap_or(FailureKind::ExecutorFailed),
+        );
+    }
+    let blocked_kind = task
+        .blocked_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("kind").cloned())
+        .and_then(|value| serde_json::from_value::<FailureKind>(value).ok());
+    if blocked_kind.is_some_and(|kind| {
+        kind.is_retry_exhausted_metadata() || kind.is_budget_exhausted_annotation()
+    }) {
+        return blocked_kind;
+    }
+    if let Some(TaskAnnotation::Blocking(annotation)) = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+    {
+        if annotation.annotation_type != FailureKind::Unknown {
+            return Some(annotation.annotation_type);
+        }
+    }
+    task.blocked_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| value.get("kind").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| task.error_annotation.as_ref().map(|_| FailureKind::Unknown))
+}
+
 /// The sole Task action advertiser. Every offer selects an apply path with a
 /// stable reason and defaults; handlers never re-derive state eligibility.
 pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
-    use ActionAuthority::{Owner, ProjectAgent, Reviewer};
+    use ActionAuthority::{Owner, ProjectAgent};
     let task = &snapshot.task;
     let workflow = &snapshot.workflow;
     let Some(state) = workflow
@@ -113,13 +127,6 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     let running = snapshot.executions.iter().any(|execution| {
         execution.status == ExecutionStatus::Running && execution.role != "interactive"
     });
-    let interactive = snapshot
-        .executions
-        .iter()
-        .filter(|execution| {
-            execution.status == ExecutionStatus::Running && execution.role == "interactive"
-        })
-        .max_by_key(|execution| (&execution.created_at, &execution.id));
     let role = crate::workflow::effective_role(state);
     let current_executions: Vec<_> = snapshot
         .executions
@@ -183,6 +190,18 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     let queued = metadata
         .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
         .is_some();
+    let manual_review_candidate = snapshot.latest_review.as_ref().is_some_and(|review| {
+        review.status == ReviewStatus::Failed
+            && snapshot.executions.iter().any(|execution| {
+                execution.id == review.execution_id
+                    && (execution.task_id == task.id || snapshot.coordination_root)
+                    && execution.status == ExecutionStatus::Completed
+                    && !matches!(
+                        execution.role.as_str(),
+                        "interactive" | "reviewer" | "auditor"
+                    )
+            })
+    });
     let failed_review = snapshot
         .latest_review
         .as_ref()
@@ -213,18 +232,34 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 .and_then(|config| config.max_rejections)
                 .is_some()
     });
-    let exhausted = condition.is_some_and(|kind| {
-        kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
-    }) || retry_gate.is_some_and(|gate| {
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &snapshot.transition_logs,
-            &gate.name,
-        ) >= i64::from(
+    let gate_budget = |gate: &api_types::StateDefinition| {
+        if gate.name == crate::workflow::default_states::REVIEW {
+            crate::task_service::config::runtime_retry_budget(
+                task,
+                crate::task_service::config::RetryBudgetKind::Review,
+                Some(&gate.config),
+                gate.gate_config.as_ref(),
+            )
+            .ok()
+        } else {
             gate.gate_config
                 .as_ref()
                 .and_then(|config| config.max_rejections)
-                .unwrap_or_default(),
-        )
+        }
+    };
+    let exhausted = condition.is_some_and(|kind| {
+        kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
+    }) || retry_gate.is_some_and(|gate| {
+        gate_budget(gate).is_some_and(|budget| {
+            crate::task_diagnostics::gate_entry_retry_exhausted(
+                &gate.name,
+                i64::from(budget),
+                crate::task_diagnostics::count_gate_rejections_since_boundary(
+                    &snapshot.transition_logs,
+                    &gate.name,
+                ),
+            )
+        })
     });
     let blocked_execution_id = snapshot
         .annotation()
@@ -240,6 +275,18 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 &execution.id,
             )
         });
+    let one_shot_allowed = snapshot.caller.owner
+        && retry_gate.is_some_and(|gate| {
+            gate.name == "review"
+                && (gate_budget(gate).is_some_and(|budget| {
+                    crate::task_diagnostics::count_gate_rejections_since_boundary(
+                        &snapshot.transition_logs,
+                        &gate.name,
+                    ) >= i64::from(budget)
+                }) || snapshot.annotation().is_some_and(|annotation| {
+                    crate::task_diagnostics::is_retry_budget_exhausted(&annotation)
+                }))
+        });
     let mut offer = |action: TaskAction,
                      parameters: &[&str],
                      authority: &[ActionAuthority],
@@ -250,21 +297,56 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 action: action.clone(),
                 parameters: parameters
                     .iter()
+                    .copied()
+                    .chain(
+                        matches!(
+                            action,
+                            TaskAction::Approve { .. }
+                                | TaskAction::Cancel { .. }
+                                | TaskAction::Retry { .. }
+                                | TaskAction::Hold { .. }
+                                | TaskAction::Release { .. }
+                                | TaskAction::Restart { .. }
+                        )
+                        .then_some("reason"),
+                    )
+                    .collect::<Vec<_>>()
+                    .iter()
                     .map(|name| api_types::ActionParameter {
                         name: (*name).to_owned(),
-                        required: *name == "guidance"
-                            && matches!(action, TaskAction::SendBack { .. }),
+                        required: (*name == "guidance"
+                            && matches!(action, TaskAction::SendBack { .. }))
+                            || (*name == "reason"
+                                && (matches!(
+                                    action,
+                                    TaskAction::Approve {
+                                        override_checks: true,
+                                        ..
+                                    }
+                                ) || reason == "review_needs_owner"
+                                    || (snapshot.caller.project_agent
+                                        && matches!(
+                                            action,
+                                            TaskAction::Cancel { .. }
+                                                | TaskAction::Retry { .. }
+                                                | TaskAction::Restart { .. }
+                                        )))),
+                        required_when: (*name == "reason"
+                            && reason == "retry_budget_exhausted"
+                            && one_shot_allowed)
+                            .then(|| api_types::ActionParameterRequirement {
+                                parameter: "reset_budget".to_owned(),
+                                value: false,
+                            }),
                         boolean_values: match *name {
-                            "guidance" => None,
-                            "reset_budget" => Some(
-                                if snapshot.caller.owner
-                                    && retry_gate.is_some_and(|gate| gate.name == "review")
-                                {
+                            "guidance" | "reason" => None,
+                            "reset_budget" => {
+                                Some(if reason == "retry_budget_exhausted" && one_shot_allowed {
                                     vec![false, true]
                                 } else {
                                     vec![true]
-                                },
-                            ),
+                                })
+                            }
                             "override" if reason != "review_needs_owner" => Some(vec![true]),
                             _ => Some(vec![false, true]),
                         },
@@ -273,9 +355,11 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 authority: authority.to_vec(),
                 reason: reason.to_owned(),
                 label: label.to_owned(),
+                propagates: matches!(action, TaskAction::Cancel { .. })
+                    && snapshot.coordination_root,
                 target_execution_id: if matches!(
                     action,
-                    TaskAction::Retry { .. } | TaskAction::Release
+                    TaskAction::Retry { .. } | TaskAction::Release { .. }
                 ) && resumable
                 {
                     pinned_resume.map(|execution| execution.id.clone())
@@ -286,18 +370,6 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         }
     };
     if state.kind == StateKind::Terminal || task.archived_at.is_some() {
-        if let Some(execution) = interactive {
-            offer(
-                TaskAction::Hold,
-                &[],
-                &[Owner],
-                "interactive_session_running",
-                "Stop Current Session",
-            );
-            if let Some(hold) = offers.last_mut() {
-                hold.target_execution_id = Some(execution.id.clone());
-            }
-        }
         return offers;
     }
     if workflow.cancellation_state.is_some()
@@ -307,7 +379,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             .any(|state| state.name == "cancelled" && state.kind == StateKind::Terminal)
     {
         offer(
-            TaskAction::Cancel,
+            TaskAction::Cancel { reason: None },
             &[],
             &[Owner, ProjectAgent],
             "cancellable",
@@ -321,7 +393,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             .any(|state| state.kind == StateKind::Initial)
         {
             offer(
-                TaskAction::Restart,
+                TaskAction::Restart { reason: None },
                 &[],
                 &[Owner, ProjectAgent],
                 "hard_failure",
@@ -330,39 +402,40 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         }
         return offers;
     }
-    if running || interactive.is_some() {
+    if running && !snapshot.owner_disconnected {
         offer(
-            TaskAction::Hold,
+            TaskAction::Hold { reason: None },
             &[],
             &[Owner],
-            if running {
-                "execution_running"
-            } else {
-                "interactive_session_running"
-            },
-            if running {
-                "Hold Task"
-            } else {
-                "Stop Current Session"
-            },
+            "execution_running",
+            "Hold Task",
         );
-        if !running {
-            if let Some(hold) = offers
-                .iter_mut()
-                .find(|offer| offer.action == TaskAction::Hold)
-            {
-                hold.target_execution_id = interactive.map(|execution| execution.id.clone());
-            }
-        }
+        append_owner_advance(snapshot, &mut offers);
+        return offers;
+    }
+    if snapshot.owner_disconnected && condition != Some(FailureKind::WorkspaceResetRequired) {
+        offer(
+            TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            &["guidance"],
+            &[Owner, ProjectAgent],
+            "owner_reconcile",
+            "Retry on Workspace Owner",
+        );
         return offers;
     }
     if barrier_running || queued {
         return offers;
     }
     if held {
-        if snapshot.has_agent {
+        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() {
             offer(
-                TaskAction::Release,
+                TaskAction::Release { reason: None },
                 &[],
                 &[Owner],
                 "manually_held",
@@ -370,6 +443,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             );
             offer(
                 TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(!resumable),
                     refresh_workspace: None,
                     reset_budget: None,
@@ -385,19 +459,29 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry Held Task",
             );
         }
+        offer(
+            TaskAction::Restart { reason: None },
+            &[],
+            &[Owner, ProjectAgent],
+            "interrupted_restart",
+            "Restart Task",
+        );
+        append_owner_advance(snapshot, &mut offers);
         return offers;
     }
     let retry = |fresh_session, refresh_workspace, reset_budget| TaskAction::Retry {
+        reason: None,
         fresh_session,
         refresh_workspace,
         reset_budget,
         guidance: None,
     };
-    if barrier_blocked
-        || matches!(
-            condition,
-            Some(FailureKind::BeforeWorkHookFailed | FailureKind::BeforeWorkHookTimeout)
-        )
+    if state.kind != StateKind::Backlog
+        && (barrier_blocked
+            || matches!(
+                condition,
+                Some(FailureKind::BeforeWorkHookFailed | FailureKind::BeforeWorkHookTimeout)
+            ))
     {
         offer(
             retry(None, Some(false), None),
@@ -412,6 +496,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         );
         offer(
             TaskAction::Approve {
+                reason: None,
                 override_checks: true,
             },
             &["override"],
@@ -423,57 +508,67 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             },
             "Skip Entry Checks Once",
         );
-        offer(
-            TaskAction::Restart,
-            &[],
-            &[Owner, ProjectAgent],
-            "interrupted_restart",
-            "Restart Task",
-        );
+        if restart_condition(condition) {
+            offer(
+                TaskAction::Restart { reason: None },
+                &[],
+                &[Owner, ProjectAgent],
+                "interrupted_restart",
+                "Restart Task",
+            );
+        }
         return offers;
     }
     if exhausted {
         if retry_gate.is_none()
             && !(condition == Some(FailureKind::RetryExhausted)
                 && role.is_some()
-                && snapshot.has_agent)
+                && (snapshot.has_agent && !snapshot.project_paused))
         {
-            if workflow
-                .states
-                .iter()
-                .any(|state| state.kind == StateKind::Initial)
+            if restart_condition(condition)
+                && workflow
+                    .states
+                    .iter()
+                    .any(|state| state.kind == StateKind::Initial)
             {
                 offer(
-                    TaskAction::Restart,
+                    TaskAction::Restart { reason: None },
                     &[],
                     &[Owner, ProjectAgent],
                     "interrupted_restart",
                     "Restart Task",
                 );
             }
+            append_owner_advance(snapshot, &mut offers);
             return offers;
         }
         offer(
             retry(None, None, Some(true)),
             &["reset_budget", "guidance"],
             &[Owner, ProjectAgent],
-            if condition == Some(FailureKind::RetryExhausted) {
+            if condition == Some(FailureKind::RetryExhausted)
+                && role.is_some()
+                && (snapshot.has_agent && !snapshot.project_paused)
+            {
                 "execution_retry_exhausted"
             } else {
                 "retry_budget_exhausted"
             },
             "Reset Budget and Retry",
         );
-        offer(
-            TaskAction::Restart,
-            &[],
-            &[Owner, ProjectAgent],
-            "interrupted_restart",
-            "Restart Task",
-        );
-        if task.status == "review" && failed_review {
+        if restart_condition(condition) {
+            offer(
+                TaskAction::Restart { reason: None },
+                &[],
+                &[Owner, ProjectAgent],
+                "interrupted_restart",
+                "Restart Task",
+            );
+        }
+        if task.status == "review" && failed_review && manual_review_candidate {
             offer(
                 TaskAction::Approve {
+                    reason: None,
                     override_checks: true,
                 },
                 &["override"],
@@ -482,7 +577,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Override Failed Review",
             );
         }
-        return offers;
+        if !(task.status == "review"
+            && state
+                .gate_config
+                .as_ref()
+                .is_some_and(|gate| gate.requires_user_approval())
+            && !failed_review)
+        {
+            append_owner_advance(snapshot, &mut offers);
+            return offers;
+        }
     }
     if metadata["awaiting_human_reason"] == "pull_request_merge" {
         offer(
@@ -492,19 +596,26 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "pull_request_merge_wait",
             "Retry Merge",
         );
+        append_owner_advance(snapshot, &mut offers);
         return offers;
     }
-    let review_wait = state.kind == StateKind::Gate && awaiting_human;
+    let review_wait = state.kind == StateKind::Gate
+        && awaiting_human
+        && (task.status != "planning" || snapshot.planning_approval_ready);
     let owner_gate = state
         .gate_config
         .as_ref()
         .is_some_and(|gate| gate.requires_user_approval());
-    if condition == Some(FailureKind::ReviewNeedsOwner)
-        || condition == Some(FailureKind::ReviewBlocked)
+    if task.status == "review"
+        && matches!(
+            condition,
+            Some(FailureKind::ReviewNeedsOwner | FailureKind::ReviewBlocked)
+        )
     {
-        if condition == Some(FailureKind::ReviewNeedsOwner) {
+        if manual_review_candidate && condition == Some(FailureKind::ReviewNeedsOwner) {
             offer(
                 TaskAction::Approve {
+                    reason: None,
                     override_checks: false,
                 },
                 &["override"],
@@ -512,9 +623,10 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "review_needs_owner",
                 "Defer Finding to Follow-up",
             );
-        } else {
+        } else if manual_review_candidate {
             offer(
                 TaskAction::Approve {
+                    reason: None,
                     override_checks: true,
                 },
                 &["override"],
@@ -523,7 +635,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Pass Review Manually",
             );
         }
-        if role.is_some() && snapshot.has_agent {
+        if role.is_some() && (snapshot.has_agent && !snapshot.project_paused) {
             offer(
                 retry(Some(!resumable), None, None),
                 if resumable {
@@ -545,8 +657,13 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             );
         }
     } else if review_wait
+        || ((task.status == "review"
+            || (task.status == "planning" && snapshot.planning_approval_ready))
+            && !failed_review
+            && target(WorkflowTrigger::Accept).is_some())
         || (state.kind == StateKind::Gate
             && owner_gate
+            && (task.status != "planning" || snapshot.planning_approval_ready)
             && target(WorkflowTrigger::Accept).is_some())
     {
         let authorities = if task.status == "review" && owner_gate {
@@ -556,6 +673,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         };
         offer(
             TaskAction::Approve {
+                reason: None,
                 override_checks: false,
             },
             &[],
@@ -591,8 +709,9 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Recheck Review",
             );
         }
-    } else if state.kind == StateKind::Gate && failed_review {
-        if condition.is_some() && role.is_some() && snapshot.has_agent {
+    } else if task.status == "review" && state.kind == StateKind::Gate && failed_review {
+        if condition.is_some() && role.is_some() && (snapshot.has_agent && !snapshot.project_paused)
+        {
             offer(
                 retry(Some(!resumable), None, None),
                 if resumable {
@@ -613,9 +732,10 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry Review",
             );
         }
-        if task.status == "review" {
+        if task.status == "review" && manual_review_candidate {
             offer(
                 TaskAction::Approve {
+                    reason: None,
                     override_checks: true,
                 },
                 &["override"],
@@ -646,17 +766,36 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         } else if task.status == "merge_failed" {
             "merge_fix_retry"
         } else {
-            "role_retry"
-        };
-        if condition != Some(FailureKind::Unknown)
-            && (!snapshot.coordination_root || state.kind == StateKind::Gate)
-            && (snapshot.has_agent || role.is_none())
-        {
-            let authorities = if reason == "role_retry" {
-                vec![Owner, ProjectAgent]
+            if role.is_some() {
+                "role_retry"
             } else {
-                vec![Owner]
-            };
+                "initial_retry"
+            }
+        };
+        if state.kind != StateKind::Backlog
+            && !matches!(
+                condition,
+                Some(
+                    FailureKind::BeforeWorkHookFailed
+                        | FailureKind::BeforeWorkHookTimeout
+                        | FailureKind::MaxTurnsExceeded
+                        | FailureKind::WorkspaceResetRequired
+                        | FailureKind::DependencyCancelled
+                )
+            )
+            && (!snapshot.coordination_root || state.kind == StateKind::Gate)
+            && ((role.is_some() && (snapshot.has_agent && !snapshot.project_paused))
+                || (reason != "role_retry" && reason != "initial_retry")
+                || (state.kind == StateKind::Initial
+                    && (snapshot.has_agent && !snapshot.project_paused)
+                    && task.status != "backlog"))
+        {
+            let authorities =
+                if matches!(reason, "role_retry" | "merge_fix_retry" | "initial_retry") {
+                    vec![Owner, ProjectAgent]
+                } else {
+                    vec![Owner]
+                };
             offer(
                 retry(Some(!resumable), None, None),
                 if resumable {
@@ -669,23 +808,30 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry Task",
             );
         }
-        if condition != Some(FailureKind::Unknown)
-            && workflow
-                .states
-                .iter()
-                .any(|state| state.kind == StateKind::Initial)
+        if workflow
+            .states
+            .iter()
+            .any(|state| state.kind == StateKind::Initial)
         {
             offer(
-                TaskAction::Restart,
+                TaskAction::Restart { reason: None },
                 &[],
                 &[Owner, ProjectAgent],
                 "interrupted_restart",
                 "Restart Task",
             );
         }
+    } else if task.status == "merging" {
+        offer(
+            retry(None, None, None),
+            &[],
+            &[Owner],
+            "merge_gate_retry",
+            "Retry Merge",
+        );
     } else if state.kind == StateKind::Initial
         && !snapshot.coordination_root
-        && snapshot.has_agent
+        && (snapshot.has_agent && !snapshot.project_paused)
         && snapshot.dependencies_satisfied
         && workflow
             .outgoing_trigger_targets(&task.status)
@@ -703,7 +849,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "ready_to_start",
             "Start Task",
         );
-    } else if state.kind == StateKind::Active && !snapshot.coordination_root && snapshot.has_agent {
+    } else if state.kind == StateKind::Active && !snapshot.coordination_root {
         if latest.is_some_and(|execution| {
             execution.status == ExecutionStatus::Completed
                 && snapshot
@@ -715,6 +861,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         {
             offer(
                 TaskAction::Approve {
+                    reason: None,
                     override_checks: false,
                 },
                 &[],
@@ -723,27 +870,118 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Submit Work",
             );
         }
-        offer(
-            retry(Some(!resumable), None, None),
-            if resumable {
-                &["fresh_session", "guidance"]
-            } else {
-                &["guidance"]
-            },
-            &[Owner],
-            "role_retry",
-            "Retry Task",
-        );
+        if snapshot.has_agent && !snapshot.project_paused {
+            offer(
+                retry(Some(!resumable), None, None),
+                if resumable {
+                    &["fresh_session", "guidance"]
+                } else {
+                    &["guidance"]
+                },
+                &[Owner],
+                "role_retry",
+                "Retry Task",
+            );
+        }
     }
+    if task.status == "planning"
+        && snapshot.has_agent
+        && !snapshot.project_paused
+        && role.is_some()
+        && !offers.iter().any(|offer| offer.action.verb() == "retry")
+        && snapshot.caller.owner
+    {
+        let mut parameters = vec![
+            api_types::ActionParameter {
+                name: "guidance".to_owned(),
+                required: false,
+                required_when: None,
+                boolean_values: None,
+            },
+            api_types::ActionParameter {
+                name: "reason".to_owned(),
+                required: false,
+                required_when: None,
+                boolean_values: None,
+            },
+        ];
+        if resumable {
+            parameters.push(api_types::ActionParameter {
+                name: "fresh_session".to_owned(),
+                required: false,
+                required_when: None,
+                boolean_values: Some(vec![false, true]),
+            });
+        }
+        offers.push(Offer {
+            action: retry(Some(!resumable), None, None),
+            parameters,
+            authority: vec![Owner],
+            reason: "role_retry".to_owned(),
+            label: "Retry Planning".to_owned(),
+            target_execution_id: pinned_resume.map(|execution| execution.id.clone()),
+            propagates: false,
+        });
+    }
+    if task.status == "review" && !offers.iter().any(|offer| offer.action.verb() == "retry") {
+        let mut parameters = vec![api_types::ActionParameter {
+            name: "reason".to_owned(),
+            required: false,
+            required_when: None,
+            boolean_values: None,
+        }];
+        parameters.push(api_types::ActionParameter {
+            name: "guidance".to_owned(),
+            required: false,
+            required_when: None,
+            boolean_values: None,
+        });
+        if snapshot.caller.owner {
+            offers.push(Offer {
+                action: TaskAction::retry(),
+                parameters,
+                authority: vec![Owner],
+                reason: "review_checks_retry".to_owned(),
+                label: "Re-run Review".to_owned(),
+                target_execution_id: None,
+                propagates: false,
+            });
+        }
+    }
+    let mut offer = |action: TaskAction,
+                     parameters: &[&str],
+                     authority: &[ActionAuthority],
+                     reason: &str,
+                     label: &str| {
+        if snapshot.caller.permits(authority) {
+            offers.push(Offer {
+                action,
+                parameters: parameters
+                    .iter()
+                    .map(|name| api_types::ActionParameter {
+                        name: (*name).to_owned(),
+                        required: *name == "guidance",
+                        required_when: None,
+                        boolean_values: None,
+                    })
+                    .collect(),
+                authority: authority.to_vec(),
+                reason: reason.to_owned(),
+                label: label.to_owned(),
+                target_execution_id: None,
+                propagates: false,
+            });
+        }
+    };
     if target(WorkflowTrigger::Reject).is_some() && state.kind == StateKind::Gate {
         let authorities = if owner_gate && task.status == "review" {
             vec![Owner, ProjectAgent]
         } else {
-            vec![Owner, Reviewer]
+            vec![Owner]
         };
         offer(
             TaskAction::SendBack {
-                guidance: "Return for revisions.".to_owned(),
+                guidance: String::new(),
             },
             &["guidance"],
             &authorities,
@@ -765,7 +1003,89 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 .unwrap_or("Send Back"),
         );
     }
+    append_owner_advance(snapshot, &mut offers);
     offers
+}
+
+fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
+    if !snapshot.caller.owner || snapshot.advance_target.is_none() {
+        return;
+    }
+    if let Some(approval) = offers
+        .iter_mut()
+        .find(|offer| offer.action.verb() == "approve")
+    {
+        if matches!(
+            approval.action,
+            TaskAction::Approve {
+                override_checks: false,
+                ..
+            }
+        ) && approval.reason != "review_needs_owner"
+        {
+            approval.parameters.push(api_types::ActionParameter {
+                name: "override".to_owned(),
+                required: false,
+                boolean_values: Some(vec![false, true]),
+                required_when: None,
+            });
+            if let Some(reason) = approval
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.name == "reason")
+            {
+                reason.required_when = Some(api_types::ActionParameterRequirement {
+                    parameter: "override".to_owned(),
+                    value: true,
+                });
+            }
+        }
+        return;
+    }
+    offers.push(Offer {
+        action: TaskAction::Approve {
+            override_checks: true,
+            reason: None,
+        },
+        parameters: vec![
+            api_types::ActionParameter {
+                name: "override".to_owned(),
+                required: false,
+                boolean_values: Some(vec![true]),
+                required_when: None,
+            },
+            api_types::ActionParameter {
+                name: "reason".to_owned(),
+                required: true,
+                boolean_values: None,
+                required_when: None,
+            },
+        ],
+        authority: vec![ActionAuthority::Owner],
+        reason: "state_advance_override".to_owned(),
+        label: "Advance Task".to_owned(),
+        target_execution_id: None,
+        propagates: false,
+    });
+}
+
+fn restart_condition(condition: Option<FailureKind>) -> bool {
+    matches!(
+        condition,
+        Some(
+            FailureKind::DispatchFailed
+                | FailureKind::RecoveryRequired
+                | FailureKind::ExecutorFailed
+                | FailureKind::ExecutorUnavailable
+                | FailureKind::WorkspaceFailed
+                | FailureKind::WorkspaceError
+                | FailureKind::WorkspaceResetRequired
+                | FailureKind::ManualStop
+                | FailureKind::Unknown
+                | FailureKind::RetryExhausted
+                | FailureKind::MaxTurnsExceeded
+        )
+    )
 }
 
 pub fn caller_for(
@@ -800,7 +1120,7 @@ pub async fn load_snapshot(
     connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> crate::Result<TaskSnapshot> {
     use db::{
-        AgentRepo, ExecutionRepo, ProjectAgentBindingRepo, ReviewRepo, TaskDependencyRepo,
+        ExecutionRepo, ProjectAgentBindingRepo, ReviewRepo, TaskDependencyRepo,
         TaskRoleAssignmentRepo, TransitionLogRepo,
     };
     let mut assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
@@ -851,39 +1171,48 @@ pub async fn load_snapshot(
         .await?
         .into_iter()
         .next();
+    let mut executions = executions;
+    if let Some(review) = latest_review.as_ref() {
+        if !executions
+            .iter()
+            .any(|execution| execution.id == review.execution_id)
+        {
+            if let Some(candidate) = ExecutionRepo::get_by_id(db, &review.execution_id).await? {
+                let belongs = candidate.task_id == task.id
+                    || db::TaskRepo::get_by_id(db, &candidate.task_id, false)
+                        .await?
+                        .is_some_and(|source| {
+                            source.parent_task_id.as_deref() == Some(task.id.as_str())
+                        });
+                if belongs {
+                    executions.push(candidate);
+                }
+            }
+        }
+    }
     let transition_logs = TransitionLogRepo::list_by_task(db, &task.id).await?;
     let dependencies_satisfied = TaskDependencyRepo::unsatisfied_dependencies(db, &task.id)
         .await?
         .is_empty();
-    let mut has_agent = assignments.iter().any(|assignment| {
-        assignment.assignee_type == Some(db::AssigneeKind::Agent)
-            && assignment.assignee_id.is_some()
-    }) || task.assignee_type.as_deref() == Some("agent")
-        || executions
-            .iter()
-            .any(|execution| execution.agent_id.is_some());
-    if !has_agent {
-        has_agent = !AgentRepo::list(
-            db,
-            db::AgentListQuery {
-                status: None,
-                executor_type: None,
-                capabilities: Vec::new(),
-                page: db::PageRequest {
-                    cursor: None,
-                    limit: 1,
-                    include_total: false,
-                    sort_by: db::SortBy::CreatedAt,
-                    sort_order: db::SortOrder::Asc,
-                },
-            },
-        )
+    let selected_role = role.or_else(|| {
+        workflow
+            .outgoing_trigger_targets(&task.status)
+            .filter_map(|(_, target)| {
+                workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == target)
+                    .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
+                    .and_then(crate::workflow::effective_role)
+            })
+            .next()
+    });
+    let action_agent_id = select_action_agent(db, &task, selected_role).await?;
+    let has_agent = action_agent_id.is_some();
+    let project_paused = db::ProjectRepo::get_by_id(db, &task.project_id)
         .await?
-        .items
-        .is_empty();
-    }
+        .is_some_and(|project| project.paused_at.is_some());
     let running = ExecutionRepo::list_running_by_task(db, &task.id).await?;
-    let mut executions = executions;
     for execution in running {
         if !executions.iter().any(|row| row.id == execution.id) {
             executions.push(execution);
@@ -893,6 +1222,91 @@ pub async fn load_snapshot(
         owner_supports_resume(db, &task, &executions, role, &workflow, connections).await?;
     let coordination_root =
         crate::task_hierarchy::coordination_root_has_subtasks(db, &task).await?;
+    let owner_disconnected = db::WorkspacePlacementRepo::get_for_task(db, &task.id)
+        .await?
+        .is_some_and(|placement| {
+            placement.state == db::PlacementState::Disconnected
+                || (placement.state == db::PlacementState::Failed
+                    && placement.failure_cause
+                        == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout))
+        });
+    let planning_approval_ready = if task.status != "planning" {
+        true
+    } else {
+        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref()).ok();
+        let published = metadata.as_ref().is_some_and(|metadata| {
+            metadata.extra.get("awaiting_human_reason") == Some(&serde_json::json!("plan_review"))
+        });
+        let optional_unassigned = workflow
+            .states
+            .iter()
+            .find(|state| state.name == "planning")
+            .and_then(|state| state.gate_config.as_ref())
+            .is_some_and(|gate| gate.optional_when_unassigned())
+            && !assignments.iter().any(|assignment| {
+                assignment.role_name == "planner" && assignment.assignee_id.is_some()
+            });
+        if published || optional_unassigned {
+            true
+        } else if let Some(workspace) = db::WorkspaceRepo::get_by_task_id(db, &task.id).await? {
+            let remote = db::WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id)
+                .await?
+                .is_some_and(|placement| placement.owner_kind == db::PlacementOwnerKind::Daemon);
+            let path = (!remote)
+                .then(|| {
+                    std::path::Path::new(workspace.embedded_worktree_path_for_backend())
+                        .parent()
+                        .map(|parent| parent.join("plan.md"))
+                })
+                .flatten();
+            match path {
+                Some(path) => tokio::fs::read_to_string(path)
+                    .await
+                    .ok()
+                    .is_some_and(|content| {
+                        crate::plan_artifact::to_plan_progress_summary(
+                            &crate::plan_artifact::parse_plan_markdown(&content),
+                        )
+                        .total
+                            > 0
+                    }),
+                None => false,
+            }
+        } else {
+            workflow
+                .states
+                .iter()
+                .find(|state| state.name == "planning")
+                .and_then(|state| state.gate_config.as_ref())
+                .is_some_and(|gate| gate.optional_when_unassigned())
+                && !assignments.iter().any(|assignment| {
+                    assignment.role_name == "planner" && assignment.assignee_id.is_some()
+                })
+        }
+    };
+    let advance_target =
+        if crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)
+            .is_ok()
+        {
+            match crate::task_service::next_workflow_state(&workflow, &task.status) {
+                Ok(target)
+                    if crate::task_hierarchy::ensure_coordination_root_target_ready(
+                        db, &task, &workflow, &target,
+                    )
+                    .await
+                    .is_ok()
+                        && (workflow.state_kind(&target) == Some(StateKind::Terminal)
+                            || crate::task_hierarchy::ensure_subtask_dispatch_order(db, &task)
+                                .await
+                                .is_ok()) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
     Ok(TaskSnapshot {
         task,
         workflow,
@@ -905,8 +1319,92 @@ pub async fn load_snapshot(
         dependencies_satisfied,
         owner_supports_resume,
         coordination_root,
+        owner_disconnected,
+        project_paused,
+        action_agent_id,
+        planning_approval_ready,
+        advance_target,
     })
 }
+async fn select_action_agent(
+    db: &db::SqliteDb,
+    task: &Task,
+    role: Option<&str>,
+) -> crate::Result<Option<String>> {
+    use db::{AgentRepo, ExecutionRepo};
+    let pinned = if let Some(role) = role {
+        crate::task_hierarchy::effective_role_assignment(db, task, role)
+            .await?
+            .map(|resolved| resolved.assignment)
+    } else {
+        None
+    };
+    let pinned_id = pinned
+        .as_ref()
+        .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))
+        .and_then(|assignment| assignment.assignee_id.clone())
+        .or_else(|| {
+            (task.assignee_type.as_deref() == Some("agent"))
+                .then(|| task.assignee_id.clone())
+                .flatten()
+        });
+    if pinned
+        .as_ref()
+        .is_some_and(|assignment| assignment.assignee_type == Some(db::AssigneeKind::User))
+    {
+        return Ok(None);
+    }
+    let pinned_id = match pinned_id {
+        Some(id) => Some(id),
+        None => ExecutionRepo::latest_agent_execution_by_task(db, &task.id)
+            .await?
+            .and_then(|execution| execution.agent_id),
+    };
+    if let Some(id) = pinned_id {
+        let Some(agent) = AgentRepo::get_by_id(db, &id).await? else {
+            return Ok(None);
+        };
+        return Ok(action_agent_available(db, &agent).await?.then_some(id));
+    }
+    let agents = AgentRepo::list(
+        db,
+        db::AgentListQuery {
+            status: None,
+            executor_type: None,
+            capabilities: Vec::new(),
+            page: db::PageRequest {
+                cursor: None,
+                limit: 500,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Asc,
+            },
+        },
+    )
+    .await?
+    .items;
+    for require_default in [true, false] {
+        for agent in &agents {
+            if (!require_default || agent.is_default)
+                && (agent.executor_type != "gemini" || agent.credential_ref.is_some())
+                && action_agent_available(db, agent).await?
+            {
+                return Ok(Some(agent.id.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn action_agent_available(db: &db::SqliteDb, agent: &db::Agent) -> crate::Result<bool> {
+    Ok(agent.status != db::AgentStatus::Offline
+        && matches!(
+            crate::agent_service::compute_effective_status(db, agent, None).await?,
+            crate::agent_service::EffectiveStatus::Active
+                | crate::agent_service::EffectiveStatus::Busy
+        ))
+}
+
 async fn owner_supports_resume(
     db: &db::SqliteDb,
     task: &Task,
@@ -1049,6 +1547,11 @@ mod tests {
             dependencies_satisfied: true,
             owner_supports_resume: true,
             coordination_root: false,
+            owner_disconnected: false,
+            project_paused: false,
+            action_agent_id: None,
+            planning_approval_ready: true,
+            advance_target: None,
         }
     }
 
@@ -1160,6 +1663,7 @@ mod tests {
                     assert!(!matches!(
                         offer.action,
                         TaskAction::Approve {
+                            reason: None,
                             override_checks: true
                         }
                     ));
@@ -1190,6 +1694,13 @@ mod tests {
         snapshot.task.entry_barrier_json = None;
         snapshot.task.error_annotation =
             Some(json!({"type":"review_needs_owner","blocking_reason":"finding"}).to_string());
+        snapshot.executions.push(super::condition_matrix::exec(
+            "candidate",
+            "coder",
+            ExecutionStatus::Completed,
+            false,
+        ));
+        snapshot.latest_review = Some(super::condition_matrix::review(ReviewStatus::Failed));
         let offers = available_actions(&snapshot);
         assert_eq!(
             offers
@@ -1201,5 +1712,354 @@ mod tests {
         assert!(offers
             .iter()
             .any(|offer| offer.reason == "review_needs_owner"));
+    }
+}
+
+#[cfg(test)]
+mod condition_matrix {
+    use super::*;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
+
+    fn task(state: &str) -> Task {
+        serde_json::from_value(json!({
+            "id":"task", "project_id":"project", "parent_task_id":null, "assignee_type":"agent", "assignee_id":"agent", "title":"Fixture", "description":null, "task_type":"task", "status":state, "is_automation":false, "priority":0, "board_position":0.0, "subtask_order":null, "task_state_config":null, "merge_config":null, "metadata_json":null, "plan":null, "error_annotation":null, "blocked_json":null, "failed_json":null, "entry_barrier_json":null, "review_passed_at":null, "archived_at":null, "deleted_at":null, "version":1, "created_at":"2026-10-02T00:00:00Z", "updated_at":"2026-10-02T00:00:00Z"
+        })).expect("Task fixture")
+    }
+
+    pub(super) fn exec(id: &str, role: &str, status: ExecutionStatus, session: bool) -> Execution {
+        Execution {
+            id: id.to_owned(),
+            task_id: "task".to_owned(),
+            agent_id: Some("agent".to_owned()),
+            role: role.to_owned(),
+            status,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: session.then(|| "session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            prompt: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            execution_version: 1,
+            lease_owner: None,
+            lease_expires_at: None,
+            hard_deadline_at: None,
+            last_heartbeat_at: None,
+            last_progress_at: None,
+            created_at: "2026-10-02T00:10:00Z".to_owned(),
+            updated_at: "2026-10-02T00:10:00Z".to_owned(),
+        }
+    }
+
+    pub(super) fn review(status: ReviewStatus) -> Review {
+        Review {
+            id: "review".to_owned(),
+            task_id: "task".to_owned(),
+            execution_id: "candidate".to_owned(),
+            reviewer_execution_id: None,
+            auditor_execution_id: None,
+            attempt_number: 1,
+            status,
+            step_results_json: "[]".to_owned(),
+            started_at: "2026-10-02T00:05:00Z".to_owned(),
+            finished_at: None,
+            created_at: "2026-10-02T00:05:00Z".to_owned(),
+            updated_at: "2026-10-02T00:05:00Z".to_owned(),
+        }
+    }
+
+    fn rejection(index: usize, from: &str, to: &str) -> TransitionLog {
+        serde_json::from_value(json!({
+            "id": format!("log-{index}"), "task_id":"task", "from_state":from, "to_state":to,
+            "trigger_name":"reject", "triggered_by":"user", "trigger_reason":"fixture",
+            "hook_results_json":null, "rejection":true,
+            "created_at": format!("2026-10-02T00:0{index}:00Z")
+        }))
+        .expect("log fixture")
+    }
+
+    #[test]
+    fn condition_pure_dead_end_matrix() {
+        let kinds = [
+            FailureKind::MergeConflict,
+            FailureKind::TargetRepoDirty,
+            FailureKind::DirtyWorktree,
+            FailureKind::CiFailed,
+            FailureKind::ReviewGateFailed,
+            FailureKind::ReviewBudgetExhausted,
+            FailureKind::ReviewBlocked,
+            FailureKind::ReviewNeedsOwner,
+            FailureKind::EnvironmentNotReady,
+            FailureKind::RetryExhausted,
+            FailureKind::MergeFixBudgetExhausted,
+            FailureKind::WorkflowGuardRejected,
+            FailureKind::InternalCommandFailed,
+            FailureKind::ExecutorFailed,
+            FailureKind::WorkspaceFailed,
+            FailureKind::WorkspaceResetRequired,
+            FailureKind::WorkspaceError,
+            FailureKind::BeforeWorkHookTimeout,
+            FailureKind::BeforeWorkHookFailed,
+            FailureKind::MaxTurnsExceeded,
+            FailureKind::ManualStop,
+            FailureKind::RecoveryRequired,
+            FailureKind::ExecutorUnavailable,
+            FailureKind::Unknown,
+        ];
+        let mut conditions: Vec<String> = vec!["none".to_owned()];
+        conditions.extend(kinds.iter().map(|kind| format!("ann:{kind}")));
+        for extra in [
+            "blocked:retry_exhausted",
+            "blocked:review_gate_failed",
+            "blocked:merge_fix_budget_exhausted",
+            "blocked:executor_failed",
+            "blocked:manual_stop",
+            "failed_json",
+            "legacy_annotation",
+            "barrier_blocked",
+            "barrier_running",
+            "queued",
+            "awaiting_human_meta",
+            "pr_merge_wait",
+        ] {
+            conditions.push(extra.to_owned());
+        }
+        let reviews = [
+            "none",
+            "running",
+            "awaiting",
+            "failed",
+            "passed",
+            "cancelled",
+        ];
+        let execs = [
+            "none",
+            "done_session",
+            "done_nosession",
+            "failed_session",
+            "running",
+        ];
+        let flags = [
+            "default",
+            "coordination_root",
+            "no_agent",
+            "deps_unsatisfied",
+        ];
+        let workflows = [
+            ("std", crate::workflow::default_workflow::default_workflow()),
+            (
+                "auto",
+                crate::workflow::default_autonomous_workflow::default_autonomous_workflow(),
+            ),
+        ];
+        let mut full = String::new();
+        // key -> (dead combos, total combos, example dims)
+        let mut dead: BTreeMap<String, (usize, usize, BTreeSet<String>)> = BTreeMap::new();
+        let mut summary: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (wf_name, workflow) in &workflows {
+            for state in &workflow.states {
+                let role = crate::workflow::effective_role(state).unwrap_or("coder");
+                let gate = workflow.states.iter().find(|gate| {
+                    gate.kind == StateKind::Gate
+                        && (gate.name == state.name
+                            || gate
+                                .gate_config
+                                .as_ref()
+                                .and_then(|config| config.reject_target.as_deref())
+                                == Some(state.name.as_str()))
+                        && gate
+                            .gate_config
+                            .as_ref()
+                            .and_then(|config| config.max_rejections)
+                            .is_some()
+                });
+                for condition in &conditions {
+                    for flag in flags {
+                        for review_name in reviews {
+                            for exec_name in execs {
+                                for exhausted in [false, true] {
+                                    if exhausted && gate.is_none() {
+                                        continue;
+                                    }
+                                    let mut task = task(&state.name);
+                                    let mut metadata = json!({});
+                                    if let Some(kind) = condition.strip_prefix("ann:") {
+                                        task.error_annotation = Some(json!({"type":kind,"blocking_reason":"fixture","recovery_actions":["retry_hook","return_to_implementation"]}).to_string());
+                                    } else if let Some(kind) = condition.strip_prefix("blocked:") {
+                                        task.blocked_json = Some(json!({"kind":kind,"reason":"fixture","created_at":"2026-10-02T00:00:00Z"}).to_string());
+                                    } else {
+                                        match condition.as_str() {
+                                            "failed_json" => task.failed_json = Some(json!({"kind":"executor_failed","reason":"fixture"}).to_string()),
+                                            "legacy_annotation" => task.error_annotation = Some(json!({"message":"old free-form annotation"}).to_string()),
+                                            "barrier_blocked" => task.entry_barrier_json = Some(json!({"status":"blocked","state":state.name}).to_string()),
+                                            "barrier_running" => task.entry_barrier_json = Some(json!({"status":"running","state":state.name}).to_string()),
+                                            "queued" => metadata["queued_recovery"] = json!({"id":"q"}),
+                                            "awaiting_human_meta" => metadata["awaiting_human"] = json!(true),
+                                            "pr_merge_wait" => { metadata["awaiting_human"] = json!(true); metadata["awaiting_human_reason"] = json!("pull_request_merge"); }
+                                            _ => {}
+                                        }
+                                    }
+                                    if metadata
+                                        .as_object()
+                                        .is_some_and(|object| !object.is_empty())
+                                    {
+                                        task.metadata_json = Some(metadata.to_string());
+                                    }
+                                    let mut executions = vec![];
+                                    match exec_name {
+                                        "done_session" => executions.push(exec(
+                                            "e1",
+                                            role,
+                                            ExecutionStatus::Completed,
+                                            true,
+                                        )),
+                                        "done_nosession" => executions.push(exec(
+                                            "e1",
+                                            role,
+                                            ExecutionStatus::Completed,
+                                            false,
+                                        )),
+                                        "failed_session" => executions.push(exec(
+                                            "e1",
+                                            role,
+                                            ExecutionStatus::Failed,
+                                            true,
+                                        )),
+                                        "running" => executions.push(exec(
+                                            "e1",
+                                            role,
+                                            ExecutionStatus::Running,
+                                            true,
+                                        )),
+                                        _ => {}
+                                    }
+                                    let latest_review = match review_name {
+                                        "running" => Some(review(ReviewStatus::Running)),
+                                        "awaiting" => Some(review(ReviewStatus::AwaitingHuman)),
+                                        "failed" => Some(review(ReviewStatus::Failed)),
+                                        "passed" => Some(review(ReviewStatus::Passed)),
+                                        "cancelled" => Some(review(ReviewStatus::Cancelled)),
+                                        _ => None,
+                                    };
+                                    let mut transition_logs = vec![];
+                                    if exhausted {
+                                        let gate = gate.unwrap();
+                                        let config = gate.gate_config.as_ref().unwrap();
+                                        for index in 0..config.max_rejections.unwrap() as usize {
+                                            transition_logs.push(rejection(
+                                                index,
+                                                &gate.name,
+                                                config
+                                                    .reject_target
+                                                    .as_deref()
+                                                    .unwrap_or("in_progress"),
+                                            ));
+                                        }
+                                    }
+                                    let snapshot = TaskSnapshot {
+                                        task,
+                                        workflow: workflow.clone(),
+                                        executions,
+                                        latest_review,
+                                        role_assignments: Vec::new(),
+                                        transition_logs,
+                                        caller: ActionCaller::owner(),
+                                        has_agent: flag != "no_agent",
+                                        dependencies_satisfied: flag != "deps_unsatisfied",
+                                        owner_supports_resume: true,
+                                        coordination_root: flag == "coordination_root",
+                                        owner_disconnected: false,
+                                        project_paused: false,
+                                        action_agent_id: None,
+                                        planning_approval_ready: true,
+                                        advance_target: None,
+                                    };
+                                    let offers = available_actions(&snapshot);
+                                    let verbs: Vec<String> = offers
+                                        .iter()
+                                        .map(|offer| {
+                                            format!("{}[{}]", offer.action.verb(), offer.reason)
+                                        })
+                                        .collect();
+                                    let _ = writeln!(full, "{wf_name}\t{}\t{:?}\t{condition}\t{flag}\trev={review_name}\texec={exec_name}\trej_max={exhausted}\t{}", state.name, state.kind, verbs.join(","));
+                                    let terminal = state.kind == StateKind::Terminal;
+                                    let in_flight =
+                                        exec_name == "running" || condition == "barrier_running";
+                                    let only_cancel =
+                                        offers.iter().all(|offer| offer.action.verb() == "cancel");
+                                    let key = format!(
+                                        "{wf_name}|{}|{:?}|{condition}|{flag}",
+                                        state.name, state.kind
+                                    );
+                                    let entry = dead.entry(key).or_default();
+                                    if !in_flight && !terminal {
+                                        entry.1 += 1;
+                                        if only_cancel {
+                                            entry.0 += 1;
+                                            entry.2.insert(format!("rev={review_name},exec={exec_name},rej_max={exhausted}"));
+                                        }
+                                    }
+                                    if flag == "default" && !terminal {
+                                        summary.entry(format!("{wf_name}|{}|{condition}|rev={review_name}|exec={exec_name}|rej_max={exhausted}", state.name)).or_default().extend(verbs.iter().cloned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::create_dir_all(std::env::temp_dir().join("task-actions-fixA")).unwrap();
+        std::fs::write(
+            std::env::temp_dir()
+                .join("task-actions-fixA")
+                .join("pure-matrix-full.tsv"),
+            full,
+        )
+        .unwrap();
+        let mut out = String::new();
+        for (key, (count, total, dims)) in &dead {
+            if *count == 0 {
+                continue;
+            }
+            if count == total {
+                let _ = writeln!(out, "DEAD-ALL\t{key}\t{count}/{total}");
+            } else {
+                let revs: BTreeSet<_> = dims
+                    .iter()
+                    .map(|dim| dim.split(',').next().unwrap().to_owned())
+                    .collect();
+                let execs: BTreeSet<_> = dims
+                    .iter()
+                    .map(|dim| dim.split(',').nth(1).unwrap().to_owned())
+                    .collect();
+                let rejs: BTreeSet<_> = dims
+                    .iter()
+                    .map(|dim| dim.split(',').nth(2).unwrap().to_owned())
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "DEAD-SOME\t{key}\t{count}/{total}\t{revs:?}\t{execs:?}\t{rejs:?}"
+                );
+            }
+        }
+        std::fs::write(
+            std::env::temp_dir()
+                .join("task-actions-fixA")
+                .join("pure-matrix-dead.tsv"),
+            out,
+        )
+        .unwrap();
     }
 }

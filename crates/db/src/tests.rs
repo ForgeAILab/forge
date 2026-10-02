@@ -132,9 +132,9 @@ async fn task_interruption_changes_are_atomic_and_bounded() {
         512
     );
     assert_eq!(first["interruption"]["execution_id"], "execution-1");
-    assert_eq!(
-        first["interruption"]["recovery_actions"],
-        serde_json::json!(["resume_session", "retry_execution"])
+    assert!(
+        first["interruption"].get("recovery_actions").is_none(),
+        "interruption evidence must not persist an action allowlist"
     );
     let expected_dedupe = format!("task-interruption-update:{task_id}:{}", updated.version);
     assert_eq!(
@@ -4554,6 +4554,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
             crate::RestoreQueuedRecovery {
                 task_id: task_id.clone(),
                 expected_version,
+                failed_json: None,
                 queued_recovery_id: queued_recovery_id.to_owned(),
                 error_annotation: Some("stale blocker".to_owned()),
                 blocked_json: None,

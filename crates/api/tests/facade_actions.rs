@@ -21,6 +21,12 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
         .await
         .expect("workflow templates initialize");
 
+    common::create_shell_agents(
+        &harness.app,
+        workspace_root.path(),
+        "available-action-agents",
+    )
+    .await;
     let (autonomous_project, _) =
         common::create_project_and_repo(&harness.app, "Autonomous", &repo_path).await;
     set_workflow(&harness.app, &autonomous_project, "autonomous_v1").await;
@@ -33,7 +39,7 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"approve","override":false} }),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"approve","override":false} }),
             StatusCode::CONFLICT,
         )
         .await;
@@ -43,13 +49,17 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
         assert!(details
             .get("reason")
             .and_then(Value::as_str)
-            .is_some_and(|reason| reason.contains("submit")));
+            .is_some_and(|reason| reason.contains("approve")));
         let actions = details
             .get("available_actions")
             .and_then(Value::as_array)
             .expect("available actions array");
-        assert!(actions.iter().any(|action| action == "start"));
-        assert!(actions.iter().any(|action| action == "cancel"));
+        assert!(actions
+            .iter()
+            .any(|offer| offer["action"]["verb"] == "start"));
+        assert!(actions
+            .iter()
+            .any(|offer| offer["action"]["verb"] == "cancel"));
     }
 }
 
@@ -62,6 +72,22 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
     let (project_id, _) =
         common::create_project_and_repo(&harness.app, "Recovery Actions", &repo_path).await;
     let task = create_task(&harness.app, &project_id, "closed recovery contract").await;
+    let (agent, _) =
+        common::create_shell_agents(&harness.app, workspace_root.path(), "recovery-contract").await;
+    db::TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent),
+            created_at: db::now_rfc3339(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
     let annotation = TaskAnnotation::Blocking(TaskBlockingAnnotation {
         annotation_type: api_types::FailureKind::RecoveryRequired,
         blocking_reason: "crash_recovery".to_owned(),
@@ -111,7 +137,7 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/actions", task.id),
-        json!({ "action": {"verb":"retry","fresh_session":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"retry","fresh_session":false} }),
         StatusCode::CONFLICT,
     )
     .await;
@@ -246,9 +272,9 @@ async fn task_response_action_projection_paginates_execution_history() {
         StatusCode::OK,
     )
     .await;
-    let action = response["execution_actions"]
+    let action = response["available_actions"]
         .as_array()
-        .expect("execution actions array")
+        .expect("available actions array")
         .iter()
         .find(|offer| offer["action"]["verb"] == "retry")
         .expect("session follow-up action exists");
@@ -320,7 +346,7 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
     )
     .await
     .expect("capacity occupant creates");
-    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 1, paused = 1, version = version + 1 WHERE id = ?")
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 1, paused = 0, version = version + 1 WHERE id = ?")
         .bind(&agent_id).execute(harness.state.db.pool()).await.expect("agent capacity and pause persist");
     let task = create_task(&harness.app, &project_id, "recover").await;
     db::TaskRoleAssignmentRepo::assign(
@@ -363,7 +389,7 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
         &harness.app,
         Method::POST,
         &url,
-        json!({ "action": {"verb":"retry","fresh_session":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &url).await, "action": {"verb":"retry","fresh_session":false} }),
         StatusCode::CONFLICT,
     )
     .await;
@@ -372,7 +398,7 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
         &harness.app,
         Method::POST,
         &url,
-        json!({ "action": {"verb":"retry","fresh_session":true,"guidance":"recovery guidance"} }),
+        json!({ "version": common::task_action_version(&harness.app, &url).await, "action": {"verb":"retry","fresh_session":true,"guidance":"recovery guidance"} }),
         StatusCode::OK,
     )
     .await;
@@ -393,7 +419,7 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
         &harness.app,
         Method::POST,
         &url,
-        json!({ "action": {"verb":"retry","fresh_session":true} }),
+        json!({ "version": common::task_action_version(&harness.app, &url).await, "action": {"verb":"retry","fresh_session":true} }),
         StatusCode::CONFLICT,
     )
     .await;
@@ -472,11 +498,11 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", submit_task.id),
-            json!({ "action": {"verb":"approve","override":false}}),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", submit_task.id)).await, "action": {"verb":"approve","override":false}}),
             StatusCode::OK,
         )
         .await;
-        assert_api_transition(&harness, &submit_task.id, active_state, "review").await;
+        assert_api_transition(&harness, &submit_task.id, active_state, "review", "approve").await;
 
         let gate_task = create_task(&harness.app, &project_id, "gate actions").await;
         set_status(&harness, &gate_task.id, gate_state).await;
@@ -484,33 +510,54 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", gate_task.id),
-            json!({ "action": {"verb":"send_back","guidance":"facade request changes"}}),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", gate_task.id)).await, "action": {"verb":"send_back","guidance":"facade request changes"}}),
             StatusCode::OK,
         )
         .await;
-        assert_api_transition(&harness, &gate_task.id, gate_state, request_changes_target).await;
+        assert_api_transition(
+            &harness,
+            &gate_task.id,
+            gate_state,
+            request_changes_target,
+            "send_back",
+        )
+        .await;
 
         set_status(&harness, &gate_task.id, gate_state).await;
         let _approved: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", gate_task.id),
-            json!({ "action": {"verb":"approve","override":false}}),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", gate_task.id)).await, "action": {"verb":"approve","override":false}}),
             StatusCode::OK,
         )
         .await;
-        assert_api_transition(&harness, &gate_task.id, gate_state, approval_target).await;
+        assert_api_transition(
+            &harness,
+            &gate_task.id,
+            gate_state,
+            approval_target,
+            "approve",
+        )
+        .await;
 
         let cancel_task = create_task(&harness.app, &project_id, "cancel").await;
         let _cancelled: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", cancel_task.id),
-            json!({ "action": {"verb":"cancel"} }),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", cancel_task.id)).await, "action": {"verb":"cancel"} }),
             StatusCode::OK,
         )
         .await;
-        assert_api_transition(&harness, &cancel_task.id, initial_state, "cancelled").await;
+        assert_api_transition(
+            &harness,
+            &cancel_task.id,
+            initial_state,
+            "cancelled",
+            "cancel",
+        )
+        .await;
     }
 }
 
@@ -564,7 +611,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"start"} }),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"start"} }),
             StatusCode::OK,
         )
         .await;
@@ -589,7 +636,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"hold"}}),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"hold"}}),
             StatusCode::OK,
         )
         .await;
@@ -599,7 +646,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"release"}}),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"release"}}),
             StatusCode::OK,
         )
         .await;
@@ -614,7 +661,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"hold"} }),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"hold"} }),
             StatusCode::OK,
         )
         .await;
@@ -623,7 +670,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             &harness.app,
             Method::POST,
             &format!("/api/v1/tasks/{}/actions", task.id),
-            json!({ "action": {"verb":"cancel"} }),
+            json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"cancel"} }),
             StatusCode::OK,
         )
         .await;
@@ -720,6 +767,7 @@ async fn assert_api_transition(
     task_id: &str,
     from_state: &str,
     to_state: &str,
+    verb: &str,
 ) {
     let logs = TransitionLogRepo::list_by_task(&*harness.state.db, task_id)
         .await
@@ -728,7 +776,8 @@ async fn assert_api_transition(
         logs.iter().any(|log| {
             log.from_state == from_state
                 && log.to_state == to_state
-                && log.triggered_by.starts_with("user:action:")
+                && (log.triggered_by == format!("user:action:{verb}")
+                    || log.triggered_by == format!("user:override:action:{verb}"))
         }),
         "expected {from_state} -> {to_state} by an API user, got {logs:?}"
     );
@@ -801,11 +850,39 @@ async fn task_actions_rest_diagnostics_and_execution_controls_share_one_offer_se
         )
         .await;
         assert_eq!(response.available_actions, offers.available_actions);
-        assert_eq!(response.execution_actions, offers.available_actions);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("execution_actions")
+            .is_none());
         assert_eq!(
             response.workflow_exception.unwrap().actions,
             offers.available_actions
         );
         assert_eq!(response.version, offers.version);
     }
+}
+
+#[tokio::test]
+async fn action_requests_require_an_explicit_version() {
+    let workspace = common::TestDir::new("action-version-contract");
+    let repo = common::TestDir::new("action-version-repo");
+    let path = common::setup_git_repo(repo.path());
+    let harness = common::test_app(workspace.path(), "action-version-contract").await;
+    let (project, _) =
+        common::create_project_and_repo(&harness.app, "Version contract", &path).await;
+    let task = create_task(&harness.app, &project, "Version must be supplied").await;
+    let response = common::raw_json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({"action":{"verb":"cancel"}}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.version, task.version);
+    assert_ne!(current.status, "cancelled");
 }

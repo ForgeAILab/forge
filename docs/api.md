@@ -2660,7 +2660,7 @@ relaunch a non-reviewer role while that human decision is outstanding.
 
 ## Task actions
 
-`GET /api/v1/tasks/{id}/actions` returns `{available_actions: Offer[], version}` for the caller. Offers contain the closed action object, meaningful parameter descriptors and boolean choices, authority, a stable reason, a label, and an optional pinned execution. Task responses reuse them in `available_actions`, `execution_actions`, and `workflow_exception.actions`.
+`GET /api/v1/tasks/{id}/actions` returns `{available_actions: Offer[], version}` for the caller. Offers contain the closed action object, meaningful parameter descriptors and boolean choices, authority, a stable reason, a label, and an optional pinned execution. Single-Task responses reuse them in `available_actions` and `workflow_exception.actions`. REST and MCP list rows contain no offers; load `GET /api/v1/tasks/{id}/actions` on demand. The redundant `execution_actions` field is removed.
 
 `POST /api/v1/tasks/{id}/actions` applies one offer at an exact version:
 
@@ -2668,15 +2668,21 @@ relaunch a non-reviewer role while that human decision is outstanding.
 {"action":{"verb":"retry","fresh_session":true,"guidance":"The environment is repaired."},"version":7}
 ```
 
-The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, and `guidance`. Send-back requires guidance; approval requires `override`. Only the owner may override. Copy an offered action instead of reconstructing eligibility from status.
+The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval requires `override` and accepts an optional reason; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status.
 
 Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Unknown verbs and malformed payloads are schema errors.
 
-Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. When only a side session is running, its pinned `hold` offer stops that current session and leaves the workflow condition unchanged. Workflow `hold` parks normal Task work.
+Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
-MCP and native coordination use `task.action` with `task_id`, the action object, and `version`. Task reads and task lists include caller-filtered offers; MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
+MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Single-Task reads include caller-filtered offers; Task lists omit offers and MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
+
+### Execution stop and interactive launch
+
+`POST /api/v1/executions/{id}/stop` accepts `{ "reason": "optional explanation" }` (or `{}`) and returns `ExecutionResponse`. It stops exactly that running execution, including a side session while a workflow role is also running. A workflow-role stop records its existing manual-stop condition; a side-session stop leaves the workflow condition unchanged. It does not cancel the Task or stop other executions. A terminal execution is refused. The old execution `/cancel` route remains removed.
+
+`POST /api/v1/tasks/{id}/launch` remains the separate interactive session launch; its existing agent, summary and executor overrides contract is unchanged. Session follow-ups remain on `POST /api/v1/executions/{id}/follow-up`.
 
 ## Task board snapshots and moves
 
@@ -2703,7 +2709,7 @@ reviews, execution authority/running rows, roles, retry transitions, and issue
 links for all Tasks on the page.
 
 The Project list omits `description`, `task_state_config`, `workspace`,
-`plan_progress`, `plan_artifact`, `execution_actions`, `execution_evidence`, and
+`plan_progress`, `plan_artifact`, `available_actions`, `execution_evidence`, and
 `execution_blocker`, plus usage/cost/runtime observability fields. Load the existing
 `GET /api/v1/tasks/{id}/detail` response's `task` for that content. Single-Task
 responses and `GET /api/v1/agents/{id}/tasks` retain `TaskResponse`.

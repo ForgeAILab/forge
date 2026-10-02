@@ -30,6 +30,8 @@ pub(crate) struct QueuedRecovery {
     pub target_state: String,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
+    #[serde(default)]
+    pub failed_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,6 +40,10 @@ pub(crate) struct QueuedTaskAction {
     pub offer: api_types::Offer,
     pub actor: api_types::Actor,
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub role_name: Option<String>,
+    #[serde(default)]
+    pub assignment_id: Option<String>,
 }
 
 pub(crate) fn queued_recovery(task: &Task) -> Option<QueuedRecovery> {

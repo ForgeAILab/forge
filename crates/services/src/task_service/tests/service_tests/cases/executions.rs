@@ -117,12 +117,15 @@ async fn project_pause_precedes_placement_on_every_execution_launch_path() {
             .err()
             .expect("paused Project refuses launch"),
     );
-    let accepted = service
-        .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
-        .await
-        .expect("paused Project accepts a queued retry without launching")
-        .task;
-    assert!(crate::deferred_dispatch::queued_recovery(&accepted).is_some());
+    assert!(
+        matches!(
+            service
+                .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
+                .await,
+            Err(ServiceError::TaskActionUnavailable { .. })
+        ),
+        "paused Project must not advertise a launchable retry"
+    );
     for error in errors {
         assert!(
             matches!(error, ServiceError::ProjectPaused { project_id: id } if id == project_id)
@@ -2337,8 +2340,21 @@ async fn approval_gated_planner_completion_waits_for_human() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("planner completion marks the approval gate awaiting human");
+    .await;
+    let waiting = match waiting {
+        Ok(task) => task,
+        Err(error) => {
+            let task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap();
+            panic!("planner completion must mark the gate: {error:?}; status={} annotation={:?} metadata={:?} execution_status={:?} execution_error={:?}", task.status, task.error_annotation, task.metadata_json, execution.status, execution.error);
+        }
+    };
     assert_eq!(waiting.status, crate::workflow::default_states::PLANNING);
     assert_eq!(
         waiting
@@ -3029,6 +3045,7 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: Some(true),
                 reset_budget: None,
@@ -3130,6 +3147,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
+                reason: None,
                 override_checks: true,
             },
             None,
@@ -4444,22 +4462,22 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: false,
+                reason: None,
+                override_checks: true,
             },
             None,
             None,
         )
         .await
         .expect_err("manual pass requires a reason");
-    assert!(missing_reason
-        .to_string()
-        .contains("requires a recovery reason"));
+    assert!(missing_reason.to_string().contains("reason"));
 
     let recovered = service
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: false,
+                reason: None,
+                override_checks: true,
             },
             Some("Provider check was verified manually".to_owned()),
             None,
@@ -4879,6 +4897,7 @@ async fn review_finding_routing_owner_manual_pass_clears_the_park() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
+                reason: None,
                 override_checks: false,
             },
             Some("Owner verified the hardware measurements".to_owned()),
@@ -4958,7 +4977,8 @@ async fn review_finding_routing_defer_follow_up_is_charter_dispatchable() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: true,
+                reason: None,
+                override_checks: false,
             },
             Some("Schedule the measurements separately".to_owned()),
             None,
@@ -5005,23 +5025,23 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
             .test_apply_action(
                 task.id.clone(),
                 api_types::TaskAction::Approve {
-                    override_checks: true,
+                    reason: None,
+                    override_checks: false,
                 },
                 reason,
                 None,
             )
             .await
             .expect_err("defer requires reason");
-        assert!(error
-            .to_string()
-            .contains("defer_to_follow_up requires a recovery reason"));
+        assert!(error.to_string().contains("reason"));
     }
     let mut events = service.event_bus.subscribe();
     let recovered = service
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: true,
+                reason: None,
+                override_checks: false,
             },
             Some("macOS/Windows runs need a human".to_owned()),
             None,
@@ -5062,7 +5082,7 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
     assert_eq!(reviews[0], before[0], "failed assessment remains intact");
     assert_eq!(reviews[1].status, ReviewStatus::Passed);
     let details: Value = serde_json::from_str(&reviews[1].step_results_json).unwrap();
-    assert_eq!(details["manual_override"]["action"], "defer_to_follow_up");
+    assert_eq!(details["manual_override"]["action"], "approve");
     let pass_reason = details["manual_override"]["reason"].as_str().unwrap();
     assert!(pass_reason.contains(&follow_up.id) && pass_reason.contains(&follow_up.title));
     assert!(pass_reason.contains("macOS/Windows runs need a human"));
@@ -5090,7 +5110,8 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: true
+                reason: None,
+                override_checks: false
             },
             Some("duplicate defer".to_owned()),
             None
@@ -5146,7 +5167,8 @@ async fn review_finding_routing_defer_uses_workflow_backlog_and_bounds_unicode_t
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: true,
+                reason: None,
+                override_checks: false,
             },
             Some("Collect hardware evidence separately".to_owned()),
             None,
@@ -5191,11 +5213,29 @@ async fn review_finding_routing_defer_rolls_back_follow_up_when_manual_pass_fail
         .await
         .unwrap();
     let mut events = service.event_bus.subscribe();
+    let annotation: api_types::TaskBlockingAnnotation =
+        serde_json::from_str(before.error_annotation.as_deref().unwrap()).unwrap();
+    service
+        .recover_manual_review_pass(
+            before.clone(),
+            "human follow-up required".to_owned(),
+            Some(&annotation),
+            api_types::TaskAction::Approve {
+                override_checks: false,
+                reason: Some("human follow-up required".to_owned()),
+            },
+        )
+        .await
+        .expect_err(
+            "manual-pass admission must roll back an inserted follow-up for an invalid candidate",
+        );
+
     service
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Approve {
-                override_checks: true,
+                reason: None,
+                override_checks: false,
             },
             Some("human follow-up required".to_owned()),
             None,
@@ -5606,7 +5646,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
         .await;
     assert!(matches!(
         unbound,
-        Err(ServiceError::InvalidOperation { .. })
+        Err(ServiceError::TaskActionUnavailable { .. })
     ));
 
     let reviewed = service
@@ -5623,7 +5663,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
     assert_eq!(
         reviewed.action,
         api_types::TaskAction::SendBack {
-            guidance: String::new()
+            guidance: "Please address the review feedback".to_owned()
         }
     );
     assert_eq!(
@@ -6991,20 +7031,32 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             .await
             .expect("recovery actions resolve"),
         vec![
+            api_types::TaskAction::Cancel { reason: None },
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(true),
                 refresh_workspace: None,
                 reset_budget: None,
                 guidance: None
             },
-            api_types::TaskAction::Restart,
-            api_types::TaskAction::Cancel,
+            api_types::TaskAction::Restart { reason: None },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+                reason: None
+            },
         ]
     );
 
     for unadvertised in [
-        api_types::TaskAction::retry(),
         api_types::TaskAction::Retry {
+            fresh_session: Some(false),
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+            reason: None,
+        },
+        api_types::TaskAction::Retry {
+            reason: None,
             fresh_session: None,
             refresh_workspace: None,
             reset_budget: Some(true),
@@ -7020,7 +7072,7 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             )
             .await
             .expect_err("unadvertised recovery action is rejected");
-        assert!(matches!(error, ServiceError::InvalidOperation { .. }));
+        assert!(matches!(error, ServiceError::TaskActionUnavailable { .. }));
         let still_blocked = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task reloads")
@@ -7042,6 +7094,7 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(true),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7106,6 +7159,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .expect("never-run actions resolve");
     assert!(
         !never_run_actions.contains(&api_types::TaskAction::Approve {
+            reason: None,
             override_checks: false
         }),
         "an assigned Task must not skip its first coder execution"
@@ -7117,6 +7171,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .await
         .expect("actions resolve");
     assert!(!actions.contains(&api_types::TaskAction::Approve {
+        reason: None,
         override_checks: false
     }));
 
@@ -7124,6 +7179,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .test_apply_intent(
             task.id.clone(),
             api_types::TaskAction::Approve {
+                reason: None,
                 override_checks: false,
             },
             None,
@@ -7177,6 +7233,7 @@ async fn submit_does_not_reuse_a_completed_attempt_from_before_review_remediatio
         .await
         .expect("actions resolve");
     assert!(!actions.contains(&api_types::TaskAction::Approve {
+        reason: None,
         override_checks: false
     }));
 }
@@ -7214,7 +7271,24 @@ async fn resume_is_not_offered_for_unrelated_role_history() {
         .test_action_values(task.id.clone())
         .await
         .expect("actions resolve");
-    assert!(!actions.contains(&api_types::TaskAction::Release));
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                ..
+            }
+        )),
+        "unrelated role history must never authorize a reviewer session resume"
+    );
+    let offers = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .all(|offer| offer.target_execution_id.is_none()));
 }
 
 #[tokio::test]
@@ -7242,6 +7316,7 @@ async fn submit_uses_latest_current_role_execution_not_later_interactive_history
         .await
         .expect("actions resolve");
     assert!(actions.contains(&api_types::TaskAction::Approve {
+        reason: None,
         override_checks: false
     }));
 }
@@ -7314,7 +7389,7 @@ async fn resume_without_session_clears_manual_stop_before_reexecute() {
     let result = service
         .test_apply_intent(
             task.id.clone(),
-            api_types::TaskAction::Release,
+            api_types::TaskAction::Release { reason: None },
             Some("continue after pause".to_owned()),
             Some(task.version),
         )
@@ -7423,6 +7498,7 @@ async fn reexecute_opens_a_fresh_review_attempt_when_the_last_one_settled() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: Some(true),
                 refresh_workspace: None,
                 reset_budget: None,
@@ -7491,13 +7567,15 @@ async fn hard_failed_active_task_cannot_resume_or_submit() {
         .test_action_values(task.id.clone())
         .await
         .expect("actions resolve");
-    assert!(!actions.contains(&api_types::TaskAction::Release));
+    assert!(!actions.contains(&api_types::TaskAction::Release { reason: None }));
     assert!(!actions.contains(&api_types::TaskAction::Approve {
+        reason: None,
         override_checks: false
     }));
     for action in [
-        api_types::TaskAction::Release,
+        api_types::TaskAction::Release { reason: None },
         api_types::TaskAction::Approve {
+            reason: None,
             override_checks: false,
         },
     ] {

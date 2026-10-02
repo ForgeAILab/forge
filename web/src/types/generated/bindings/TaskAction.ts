@@ -3,4 +3,4 @@
 /**
  * The closed set of Task condition commands. Session launches use the session API.
  */
-export type TaskAction = { "verb": "start" } | { "verb": "hold" } | { "verb": "release" } | { "verb": "retry", fresh_session?: boolean, refresh_workspace?: boolean, reset_budget?: boolean, guidance?: string, } | { "verb": "send_back", guidance: string, } | { "verb": "approve", override: boolean, } | { "verb": "restart" } | { "verb": "cancel" };
+export type TaskAction = { "verb": "start" } | { "verb": "hold", reason?: string, } | { "verb": "release", reason?: string, } | { "verb": "retry", reason?: string, fresh_session?: boolean, refresh_workspace?: boolean, reset_budget?: boolean, guidance?: string, } | { "verb": "send_back", guidance: string, } | { "verb": "approve", reason?: string, override: boolean, } | { "verb": "restart", reason?: string, } | { "verb": "cancel", reason?: string, };

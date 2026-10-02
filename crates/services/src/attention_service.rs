@@ -1805,7 +1805,17 @@ impl AttentionService {
                     if let Some(project) =
                         db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await?
                     {
-                        let actor = api_types::Actor::user(api_types::UserActionSource::Api);
+                        let actor = match db::ProjectAgentBindingRepo::get_active_project_binding(
+                            &*self.db,
+                            &task.project_id,
+                        )
+                        .await?
+                        .filter(|binding| binding.state == "active")
+                        .and_then(|binding| binding.identity_id)
+                        {
+                            Some(agent_id) => api_types::Actor::agent(agent_id),
+                            None => api_types::Actor::system(api_types::SystemComponent::Workflow),
+                        };
                         let workflow =
                             crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
                                 &task,

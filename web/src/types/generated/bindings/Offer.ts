@@ -3,4 +3,4 @@ import type { ActionAuthority } from "./ActionAuthority";
 import type { ActionParameter } from "./ActionParameter";
 import type { TaskAction } from "./TaskAction";
 
-export type Offer = { action: TaskAction, parameters: Array<ActionParameter>, authority: Array<ActionAuthority>, reason: string, label: string, target_execution_id: string | null, };
+export type Offer = { action: TaskAction, parameters: Array<ActionParameter>, authority: Array<ActionAuthority>, reason: string, label: string, target_execution_id: string | null, propagates: boolean, };

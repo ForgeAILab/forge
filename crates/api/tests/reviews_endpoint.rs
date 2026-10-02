@@ -125,7 +125,7 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"approve","override":false} }),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -135,7 +135,7 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{task_id}/actions"),
-        json!({ "action": {"verb":"send_back","guidance":"not ready"}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"not ready"}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -160,7 +160,7 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{failed_task_id}/actions"),
-        json!({ "action": {"verb":"approve","override":true}}),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{failed_task_id}/actions")).await, "action": {"verb":"approve","override":true,"reason":"Manual pass after investigating the review"}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;

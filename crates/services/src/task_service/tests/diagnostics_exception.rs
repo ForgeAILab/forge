@@ -1,3 +1,20 @@
+fn assert_action_set(snapshot: &crate::TaskSnapshot, expected: &[&str]) {
+    let mut actual = crate::available_actions(snapshot)
+        .iter()
+        .map(|offer| offer.action.verb())
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        actual,
+        expected,
+        "exact offers for {} {:?}",
+        snapshot.task.status,
+        snapshot.condition()
+    );
+}
+
 use super::helpers::*;
 use super::*;
 use api_types::{FailureKind, TaskAction};
@@ -9,6 +26,14 @@ async fn check_projection(
     kind: Option<FailureKind>,
     failed_review: bool,
 ) -> crate::TaskSnapshot {
+    projection_fixture(state, kind, failed_review).await.2
+}
+
+async fn projection_fixture(
+    state: &str,
+    kind: Option<FailureKind>,
+    failed_review: bool,
+) -> (Arc<SqliteDb>, TaskService, crate::TaskSnapshot) {
     let db = Arc::new(sqlite_db().await);
     let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
@@ -19,7 +44,7 @@ async fn check_projection(
         &db,
         &task.id,
         Some(&agent_id),
-        if state == "review" {
+        if state == "review" && !failed_review {
             "reviewer"
         } else {
             "coder"
@@ -49,13 +74,14 @@ async fn check_projection(
     if let Some(exception) = crate::task_diagnostics::task_exception(&snapshot, offers.clone()) {
         assert_eq!(exception.actions, offers);
     }
-    snapshot
+    (db, service, snapshot)
 }
 
 #[tokio::test]
 async fn test_derive_workflow_exception_review_failed_no_annotation() {
     let snapshot = check_projection("review", None, true).await;
     let offers = crate::available_actions(&snapshot);
+    assert_action_set(&snapshot, &["cancel", "retry", "approve", "send_back"]);
     assert!(offers.iter().any(|offer| offer.reason == "review_failed"));
     let exception = crate::task_diagnostics::task_exception(&snapshot, offers).unwrap();
     assert_eq!(exception.exception_type, "review_failed");
@@ -76,6 +102,7 @@ async fn test_derive_workflow_exception_review_failed_no_annotation() {
 #[tokio::test]
 async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annotation() {
     let snapshot = check_projection("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    assert_action_set(&snapshot, &["cancel", "retry", "approve"]);
     assert!(crate::available_actions(&snapshot)
         .iter()
         .any(|offer| matches!(
@@ -92,6 +119,11 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
     let mut snapshot = check_projection("review", Some(FailureKind::Unknown), true).await;
     snapshot.task.blocked_json =
         Some(json!({"kind":"retry_exhausted","reason":"exhausted"}).to_string());
+    assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
+    let exception =
+        crate::task_diagnostics::task_exception(&snapshot, crate::available_actions(&snapshot))
+            .unwrap();
+    assert_eq!(exception.exception_type, "retry_exhausted");
     assert!(crate::available_actions(&snapshot)
         .iter()
         .any(|offer| offer.reason == "execution_retry_exhausted"));
@@ -100,6 +132,7 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
 #[tokio::test]
 async fn stored_action_lists_do_not_control_projection() {
     let snapshot = check_projection("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    assert_action_set(&snapshot, &["cancel", "retry", "approve"]);
     let mut changed = snapshot.clone();
     let mut annotation: Value =
         serde_json::from_str(changed.task.error_annotation.as_deref().unwrap()).unwrap();
@@ -119,6 +152,7 @@ async fn stored_action_lists_do_not_control_projection() {
 #[tokio::test]
 async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
     let snapshot = check_projection("merging", Some(FailureKind::TargetRepoDirty), false).await;
+    assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
     assert!(crate::available_actions(&snapshot)
         .iter()
         .any(|offer| offer.reason == "merge_gate_retry"));
@@ -129,18 +163,54 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
     let mut snapshot = check_projection("review", None, true).await;
     snapshot.latest_review.as_mut().unwrap().step_results_json =
         json!({"execution":{"role":"reviewer","status":"failed"}}).to_string();
+    assert_action_set(&snapshot, &["cancel", "retry", "approve", "send_back"]);
     let offers = crate::available_actions(&snapshot);
     assert!(offers
         .iter()
         .any(|offer| offer.reason == "failed_review_override"));
     assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
+    let manual_pass = offers
+        .iter()
+        .find(|offer| offer.action.verb() == "approve")
+        .unwrap();
+    assert!(matches!(
+        manual_pass.action,
+        TaskAction::Approve {
+            override_checks: true,
+            ..
+        }
+    ));
+    assert!(manual_pass
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == "reason" && parameter.required));
 }
 
 #[tokio::test]
 async fn review_blocked_annotation_routes_guidance_and_offers_manual_pass() {
     let snapshot = check_projection("review", Some(FailureKind::ReviewBlocked), true).await;
     let offers = crate::available_actions(&snapshot);
+    assert_action_set(&snapshot, &["cancel", "approve", "retry", "send_back"]);
     assert!(offers.iter().any(|offer| offer.action.verb() == "approve"));
+    let approval = offers
+        .iter()
+        .find(|offer| offer.action.verb() == "approve")
+        .unwrap();
+    assert!(approval
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == "reason" && parameter.required));
+    let send_back = offers
+        .iter()
+        .find(|offer| offer.action.verb() == "send_back")
+        .unwrap();
+    assert!(
+        matches!(&send_back.action, api_types::TaskAction::SendBack { guidance } if guidance.is_empty())
+    );
+    assert!(send_back
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == "guidance" && parameter.required));
     assert!(offers.iter().any(|offer| offer
         .parameters
         .iter()
@@ -192,6 +262,7 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
 #[tokio::test]
 async fn test_reworded_reason_does_not_change_offered_actions() {
     let snapshot = check_projection("in_progress", Some(FailureKind::ExecutorFailed), false).await;
+    assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
     let mut changed = snapshot.clone();
     let mut annotation = snapshot.annotation().unwrap();
     annotation.blocking_reason = "different prose".to_owned();
@@ -203,7 +274,7 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
     if let Some(exception) =
         crate::task_diagnostics::task_exception(&changed, crate::available_actions(&changed))
     {
-        assert!(!exception.message.is_empty());
+        assert_eq!(exception.message, "different prose");
     }
 }
 
@@ -214,6 +285,16 @@ async fn test_retry_existing_thread_requires_the_execution_agent_to_own_its_role
     for execution in &mut snapshot.executions {
         execution.agent_id = Some("other-agent".to_owned());
     }
+    assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
+    assert!(!crate::available_actions(&snapshot)
+        .iter()
+        .any(|offer| matches!(
+            offer.action,
+            TaskAction::Retry {
+                fresh_session: Some(false),
+                ..
+            }
+        )));
     assert!(crate::available_actions(&snapshot)
         .iter()
         .any(|offer| matches!(
@@ -223,13 +304,46 @@ async fn test_retry_existing_thread_requires_the_execution_agent_to_own_its_role
                 ..
             }
         )));
+    for execution in &mut snapshot.executions {
+        execution.agent_id = snapshot.action_agent_id.clone();
+    }
+    assert!(crate::available_actions(&snapshot)
+        .iter()
+        .any(|offer| matches!(
+            offer.action,
+            TaskAction::Retry {
+                fresh_session: Some(false),
+                ..
+            }
+        )));
 }
 
 #[tokio::test]
 async fn test_retry_existing_thread_rejects_stale_terminal_review_without_mutating_task() {
-    let snapshot = check_projection("review", None, true).await;
+    let (db, service, snapshot) = projection_fixture("review", None, true).await;
+    let reviewer = seed_execution(
+        &db,
+        &snapshot.task.id,
+        snapshot.action_agent_id.as_deref(),
+        "reviewer",
+        ExecutionStatus::Completed,
+        Some("settled-reviewer-session"),
+        "2026-10-02T00:00:01Z",
+    )
+    .await;
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&reviewer.id)
+        .bind(&snapshot.latest_review.as_ref().unwrap().id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let snapshot = service
+        .task_action_snapshot(&snapshot.task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
     let before = snapshot.task.clone();
     let offers = crate::available_actions(&snapshot);
+    assert_action_set(&snapshot, &["cancel", "retry", "approve", "send_back"]);
     assert!(!offers.iter().any(|offer| matches!(
         offer.action,
         TaskAction::Retry {
@@ -237,18 +351,46 @@ async fn test_retry_existing_thread_rejects_stale_terminal_review_without_mutati
             ..
         }
     )));
-    assert_eq!(before, snapshot.task);
+    let error = service
+        .perform_task_action(
+            &before.id,
+            TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            before.version,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::TaskActionUnavailable { .. }));
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &before.id, false)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*db, &reviewer.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        reviewer
+    );
 }
 
 #[tokio::test]
-async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
+async fn test_unknown_kind_retains_legacy_reexecute_and_reset_authority() {
     let snapshot = check_projection("in_progress", Some(FailureKind::Unknown), false).await;
     assert_eq!(
         crate::available_actions(&snapshot)
             .into_iter()
             .map(|offer| offer.action.verb())
             .collect::<Vec<_>>(),
-        ["cancel"]
+        ["cancel", "retry", "restart", "approve"]
     );
 }
 
@@ -260,5 +402,98 @@ async fn test_recovery_actions_disabled_while_role_execution_runs() {
         .into_iter()
         .map(|offer| offer.action.verb())
         .collect::<Vec<_>>();
-    assert_eq!(verbs, ["cancel", "hold"]);
+    assert_action_set(&snapshot, &["cancel", "hold", "approve"]);
+    assert_eq!(verbs, ["cancel", "hold", "approve"]);
+}
+
+#[tokio::test]
+async fn decisions_require_operator_reason_and_guidance_and_reject_other_states() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project, "review").await;
+    seed_role_assignment(&db, &task.id, "reviewer", Some(&agent)).await;
+    let candidate = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent),
+        "coder",
+        ExecutionStatus::Completed,
+        None,
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    seed_failed_review(&db, &task.id, &candidate.id, 1, json!({"ci_steps":[]})).await;
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    for reason in [None, Some("   ".to_owned())] {
+        let error = service
+            .perform_task_action(
+                &task.id,
+                TaskAction::Approve {
+                    override_checks: true,
+                    reason,
+                },
+                task.version,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reason"));
+    }
+    for guidance in ["", " \t\n"] {
+        let error = service
+            .perform_task_action(
+                &task.id,
+                TaskAction::SendBack {
+                    guidance: guidance.to_owned(),
+                },
+                task.version,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("guidance"));
+    }
+    let unchanged = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged, task,
+        "invalid operator input must not mutate the Task"
+    );
+    let other = seed_task_with_status(&db, &project, "in_progress").await;
+    let annotated = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+        .bind(json!({"type":"review_needs_owner","blocking_reason":"needs input"}).to_string())
+        .bind(&other.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let offers = annotated
+        .task_action_offers(&other.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
+    assert!(!offers
+        .available_actions
+        .iter()
+        .any(|offer| offer.reason == "review_needs_owner"
+            || matches!(
+                offer.action,
+                TaskAction::Approve {
+                    override_checks: false,
+                    ..
+                }
+            )));
+    assert!(matches!(
+        annotated
+            .perform_task_action(
+                &other.id,
+                TaskAction::Approve {
+                    override_checks: false,
+                    reason: Some("owner decision".to_owned())
+                },
+                other.version
+            )
+            .await,
+        Err(ServiceError::TaskActionUnavailable { .. })
+    ));
 }

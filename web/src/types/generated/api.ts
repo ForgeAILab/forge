@@ -552,7 +552,6 @@ export interface Task {
   effective_coder: TaskRoleAssignmentResponse | null
   effective_coder_source: EffectiveCoderSource | null
   remaining_retries: Record<string, number>
-  execution_actions?: Offer[]
   available_actions?: Offer[]
   awaiting_human?: boolean
   error_annotation?: TaskAnnotation | null
@@ -960,14 +959,7 @@ export interface UpdateTaskRequest {
   version: number
 }
 
-export interface RejectReviewRequest {
-  reason?: string | null
-}
 
-export interface ReviewDecisionResponse {
-  task: Task
-  review: Review
-}
 
 export type AssigneeKind = 'agent' | 'user'
 

@@ -1,6 +1,6 @@
 use super::*;
 use ::review::ReviewWorkspace;
-use api_types::{Actor, UserActionSource};
+use api_types::Actor;
 
 impl TaskService {
     pub(crate) async fn annotate_review_ci_interruption(
@@ -120,11 +120,6 @@ impl TaskService {
         Ok((task, review))
     }
 
-    pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
-        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
-            .await
-    }
-
     pub async fn approve_review_as(
         &self,
         task_id: impl Into<String>,
@@ -198,15 +193,6 @@ impl TaskService {
             )
             .await?;
         Ok((transitioned.task, review))
-    }
-
-    pub async fn reject_review(
-        &self,
-        task_id: impl Into<String>,
-        reason: Option<String>,
-    ) -> Result<(Task, Review)> {
-        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
-            .await
     }
 
     pub async fn reject_review_as(

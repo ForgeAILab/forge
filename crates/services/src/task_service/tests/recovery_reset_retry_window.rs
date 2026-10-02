@@ -125,6 +125,7 @@ async fn test_retry_budget_reset_preserves_history_and_refreshes_budget() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: None,
                 reset_budget: Some(true),
@@ -270,7 +271,7 @@ async fn test_retry_budget_reset_resumes_an_exhausted_merging_gate() {
         .await
         .expect("task actions resolve");
     assert!(
-        !actions.contains(&api_types::TaskAction::Release),
+        !actions.contains(&api_types::TaskAction::Release { reason: None }),
         "a blocked gate must advertise typed recovery instead of a no-op resume"
     );
 
@@ -278,6 +279,7 @@ async fn test_retry_budget_reset_resumes_an_exhausted_merging_gate() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: None,
                 reset_budget: Some(true),
@@ -372,7 +374,7 @@ async fn restart_starts_a_fresh_merge_retry_window() {
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Restart,
+            api_types::TaskAction::Restart { reason: None },
             Some("restart from todo".to_owned()),
             None,
         )
@@ -421,6 +423,7 @@ async fn test_retry_without_reset_from_review_reject_target_preserves_exhausted_
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: None,
                 reset_budget: Some(false),

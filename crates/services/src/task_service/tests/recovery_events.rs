@@ -37,6 +37,7 @@ async fn test_retry_budget_reset_publishes_recovery_and_resume_events() {
         .test_apply_action(
             task.id.clone(),
             api_types::TaskAction::Retry {
+                reason: None,
                 fresh_session: None,
                 refresh_workspace: None,
                 reset_budget: Some(true),
@@ -158,7 +159,12 @@ async fn test_restart_clears_assignee_after_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .test_apply_action(task.id.clone(), api_types::TaskAction::Restart, None, None)
+        .test_apply_action(
+            task.id.clone(),
+            api_types::TaskAction::Restart { reason: None },
+            None,
+            None,
+        )
         .await
         .expect("task resets");
     assert_eq!(
@@ -189,7 +195,12 @@ async fn test_restart_keeps_assignee_for_non_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .test_apply_action(task.id.clone(), api_types::TaskAction::Restart, None, None)
+        .test_apply_action(
+            task.id.clone(),
+            api_types::TaskAction::Restart { reason: None },
+            None,
+            None,
+        )
         .await
         .expect("task resets");
     assert_eq!(

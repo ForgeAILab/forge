@@ -6,7 +6,7 @@ const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
 vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate, isPending: false }) }))
 vi.mock('@tanstack/react-router', () => ({ Link: ({ children }: { children: React.ReactNode }) => <a href="#evidence">{children}</a> }))
 function task(offers: Offer[]): Task { return { id: 'task', version: 7, status: 'review', workflow_exception: { type: 'review_failed', message: 'Checks failed', actions: offers, review_id: null, execution_id: null, state: 'review', role: null, target_state: null, target_role: null, failing_step: null, related_evidence: [] } } as unknown as Task }
-const retry: Offer = { action: { verb: 'retry' }, parameters: [], authority: ['owner'], reason: 'review_failed', label: 'Retry Review', target_execution_id: null }
+const retry: Offer = { action: { verb: 'retry' }, parameters: [], authority: ['owner'], reason: 'review_failed', label: 'Retry Review', target_execution_id: null, propagates: false }
 beforeEach(() => mutate.mockReset())
 describe('WorkflowExceptionPanel offers', () => {
   it('renders and applies the supplied offer at the Task version', () => { render(<WorkflowExceptionPanel task={task([retry])} />); fireEvent.click(screen.getByRole('button', { name: 'Retry Review' })); expect(mutate.mock.calls[0][0]).toEqual({ taskId: 'task', action: { verb: 'retry' }, version: 7 }) })

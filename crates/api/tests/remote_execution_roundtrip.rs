@@ -599,6 +599,7 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
             .test_apply_action(
                 recovery_task_id,
                 api_types::TaskAction::Retry {
+                    reason: None,
                     fresh_session: Some(true),
                     refresh_workspace: None,
                     reset_budget: None,

@@ -399,7 +399,7 @@ async fn task_response_inner(
         remaining_retries,
         error_annotation,
         workflow_health,
-        workflow_exception: _,
+        workflow_exception,
     } = task_projection::task_diagnostic_projection(
         &task,
         workflow,
@@ -411,7 +411,6 @@ async fn task_response_inner(
             execution_authority: &execution_authority,
             running_executions: &running_executions,
         },
-        include_actions,
         awaiting_human,
     );
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
@@ -422,17 +421,21 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
-    let snapshot = services::task_actions::load_snapshot(
-        db,
-        task.clone(),
-        workflow.clone(),
-        &api_types::Actor::user(api_types::UserActionSource::Api),
-        router.daemon_connections(),
-    )
-    .await?;
-    let offers = services::available_actions(&snapshot);
-    let workflow_exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
-    let execution_actions = offers.clone();
+    let (offers, workflow_exception) = if include_actions {
+        let snapshot = services::task_actions::load_snapshot(
+            db,
+            task.clone(),
+            workflow.clone(),
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            router.daemon_connections(),
+        )
+        .await?;
+        let offers = services::available_actions(&snapshot);
+        let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+        (offers, exception)
+    } else {
+        (Vec::new(), workflow_exception)
+    };
     Ok(TaskResponse {
         id: task.id,
         project_id: task.project_id,
@@ -452,7 +455,6 @@ async fn task_response_inner(
         effective_coder,
         effective_coder_source,
         remaining_retries,
-        execution_actions,
         available_actions: offers,
         error_annotation,
         blocked: task
@@ -610,9 +612,9 @@ mod retry_projection_tests {
             status: services::workflow::default_states::IN_PROGRESS.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::TaskAction::Cancel]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
-        let typed = annotation(vec![api_types::TaskAction::Restart]);
+        let typed = annotation(vec![api_types::TaskAction::Restart { reason: None }]);
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&typed))
             .expect("one blocker selected");
@@ -626,7 +628,7 @@ mod retry_projection_tests {
             status: services::workflow::default_states::MERGING.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::TaskAction::Cancel]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
         let mut empty_typed = annotation(Vec::new());
         empty_typed.annotation_type = api_types::FailureKind::Unknown;
@@ -643,7 +645,7 @@ mod retry_projection_tests {
     #[test]
     fn generic_legacy_blocker_does_not_override_empty_typed_annotation() {
         let task = test_task();
-        let legacy = annotation(vec![api_types::TaskAction::Cancel]);
+        let legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         let empty_typed = annotation(Vec::new());
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))

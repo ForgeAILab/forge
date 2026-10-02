@@ -71,6 +71,7 @@ mod review_config;
 mod roles;
 mod subtask;
 mod transition;
+pub(crate) use transition::next_workflow_state;
 mod update;
 mod validation;
 pub(crate) mod workspace;

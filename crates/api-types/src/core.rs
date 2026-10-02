@@ -68,8 +68,6 @@ pub enum ResumePolicy {
 pub enum ExecutionBehaviorKind {
     ManualLaunch,
     SessionFollowUp,
-    WorkflowResume,
-    ReExecute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -103,6 +101,8 @@ pub struct BlockingArtifact {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum FailureKind {
+    DispatchFailed,
+    DependencyCancelled,
     MergeConflict,
     TargetRepoDirty,
     DirtyWorktree,
