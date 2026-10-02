@@ -193,6 +193,27 @@ async fn embedded_execution_heartbeat_with_clock(
 }
 
 impl TaskService {
+    /// Freeze the candidate pricing selections exactly as `start_execution`
+    /// does before it sends `execution.start`, for fixtures outside this crate
+    /// that drive a daemon runtime directly instead of through dispatch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn admit_execution_for_test(&self, execution_id: &str) -> Result<bool> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let snapshot = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("execution missing executor config snapshot")
+            })?;
+        let snapshot = parse_json_value("executor config snapshot", snapshot)?;
+        super::ledger::ensure_task_execution_admission(&self.db, &task, &execution, &snapshot).await
+    }
+
     pub async fn start_execution(
         &self,
         execution_id: impl Into<String>,

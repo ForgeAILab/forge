@@ -812,7 +812,7 @@ async fn assert_outage_order(socket_first: bool) {
             last_heartbeat_at: Some(now.clone()),
             is_default: false,
             paused: false,
-            owner_id: None,
+            owner_id: Some(common::fake_daemon::FAKE_DAEMON_USER_ID.into()),
             visibility: "global".into(),
             prompt_template: None,
             created_at: now.clone(),
@@ -886,9 +886,18 @@ async fn assert_outage_order(socket_first: bool) {
     );
     input.agent_id = Some(agent.id);
     input.before_sha = Some(fixture.base_sha.clone());
+    // Dispatch stamps the Project revision it ran under; terminal effects from
+    // a superseded revision are ignored.
+    let project_version: i64 = sqlx::query_scalar(
+        "SELECT version FROM project WHERE id = (SELECT project_id FROM task WHERE id = ?)",
+    )
+    .bind(&placement.task_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
     input.executor_config_snapshot_json = Some(
         json!({"executor_type": "shell", "config": {},
-        "placement_id": placement.id})
+        "placement_id": placement.id, "project_version": project_version})
         .to_string(),
     );
     ExecutionRepo::create_with_lease(
@@ -908,6 +917,15 @@ async fn assert_outage_order(socket_first: bool) {
     )
     .await
     .unwrap();
+    // Dispatch freezes the candidate pricing selections before it sends
+    // `execution.start`; the owner's terminal usage report settles against them.
+    assert!(fixture
+        .harness
+        .state
+        .task_service
+        .admit_execution_for_test(&execution_id)
+        .await
+        .unwrap());
     let (workspace_path, _) = fixture.resolved.owner_paths().await.unwrap();
     fixture.runtime.start(ExecutionStartParams {
         task_id: placement.task_id.clone(), execution_id: execution_id.clone(),
@@ -1628,6 +1646,21 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
         "offline cleanup preserves workspace state: {offline_diagnostic}"
     );
     fixture.reconnect().await;
+    // The offline attempt left the scheduler's one-tick retry deadline on the
+    // workspace, and cleanup retains that backoff. Elapse it as the next
+    // scheduler tick would see it, so this retry reaches the returned owner.
+    assert!(workspace
+        .cleanup_after
+        .as_deref()
+        .and_then(|deadline| chrono::DateTime::parse_from_rfc3339(deadline).ok())
+        .is_some_and(|deadline| deadline > chrono::Utc::now()));
+    fixture
+        .harness
+        .state
+        .cleanup_scheduler
+        .schedule(&placement.workspace_id, Duration::ZERO)
+        .await
+        .unwrap();
     let cleanup_result = fixture
         .harness
         .state
