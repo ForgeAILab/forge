@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- A failing environment check no longer pauses the Project when another
+  machine can run the work. The failure marks that machine not ready for the
+  Project; placement skips it (filter code `environment_not_ready`) and a
+  Task goes to another connected machine that passes. A Task that is bound to
+  the failing machine waits there with an environment Attention item. The
+  Project is paused with `environment_not_ready` only when no machine is left
+  for the Task being placed. With a single machine the outcome is the same as
+  before: the Project pauses and the Task keeps its state without a failure
+  annotation. API response shapes are unchanged.
 - `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
   `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
   and keep-alive comments carry no id, so a reconnecting client keeps its last
@@ -152,6 +161,29 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Environment readiness is recorded per Project and machine (the server host
+  or a daemon) in `project_machine_readiness`. Migration V202610020600 adds
+  the table and carries each environment-paused Project over as a not-ready
+  record for the machine it failed on.
+  - When a Project has environment checks and no environment assets, the
+    dispatcher runs the checks on the server host before the first launch
+    there, once, and waits for the result (`environment_probe_pending`)
+    rather than sending the Task to a less preferred machine. A failure
+    pauses the Project before any execution is created; previously the first
+    launch failed and then paused it. Projects with environment assets,
+    direct claims through the API, and daemons are judged by the launch-time
+    preflight, as before.
+  - Only the checks that apply to the role being launched gate that launch.
+  - Resuming a Project clears its not-ready records, so the next dispatch
+    checks again at once instead of waiting for the scheduled re-check. A
+    failure with no named check (asset staging, a denied run purpose) is not
+    re-checked on a schedule; it waits for a manual resume or "Check now".
+  - Changing a Project's checks while it is paused for a named check ends
+    that pause and checks again with the new set.
+  - A Task waiting for a machine's environment does not hold one of the
+    Project's `max_active_tasks` slots.
+  - A dispatch refused because the Project is paused for its environment
+    waits; it no longer records a `dispatch_failed` annotation.
 - The coordination, Attention and wake-turn consumers run on the supervised
   worker runtime, like the memory indexer. Each event's effects and the cursor
   advance commit in one transaction. Idle polling backs off from 250 ms to
