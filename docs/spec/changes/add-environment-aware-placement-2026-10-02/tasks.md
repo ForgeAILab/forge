@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T19:22:11Z
+updated_at: 2026-10-02T19:57:03Z
 completed_at:
 ---
 
@@ -67,3 +67,9 @@ completed_at:
 - [x] Batch `runnable_on` facts for both Agent list routes; profile/session lists have no per-row Agent response.
 - [x] Permanent SQLx statement-count regression for 1/20 Projects (empty, server/daemon readiness, legacy pause) and batched CLI/native Agent facts; full requested modules/files, clippy and fmt.
 - Measured counts, per-Agent comparison with b34fe4c8 and final command/pass-count results: `list-query-correction.md`.
+
+### Step B live-UI correction
+- [x] Readiness uses the full content width with heading/description above its table, compact relative times with absolute titles, one-line badges/actions, and a focusable contained scroll region.
+- [x] Admin pins use the runnable machine name or an exact daemon lookup; embedded pins use Server host, absent pins display offline/unavailable/disabled status beside the name, and IDs are titles.
+- [x] A server recheck without a Project location retains 404 and identifies the missing repository location; no-repository settings empty state explains why checks cannot run.
+- Verification: full web typecheck/lint, four related Vitest files (40 tests), API environment_surfaces (5 tests), services environment_surfaces (2 tests), clippy/fmt for touched Rust crates. Browser QA uses installed Chromium in single-process mode because normal launch is sandbox-blocked; readiness screenshots at 1440/1280/768 have no horizontal overflow and fully visible actions.

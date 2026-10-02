@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProjectEnvironmentReadiness } from './ProjectEnvironmentReadiness'
 import type { ProjectEnvironmentReadiness as Readiness } from '@/types/generated/bindings/ProjectEnvironmentReadiness'
 const mutation = vi.hoisted(() => ({
@@ -27,11 +27,13 @@ const row: Readiness = {
   next_check_at: '2026-10-02T00:10:00Z',
 }
 beforeEach(() => {
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-02T00:05:00Z'))
   mutation.mutate.mockReset()
   mutation.isPending = false
   mutation.isError = false
   mutation.error = null
 })
+afterEach(() => vi.restoreAllMocks())
 describe('Machine readiness', () => {
   it('shows each machine, checks, times and a targeted action', () => {
     render(<ProjectEnvironmentReadiness projectId="project-1" rows={[row]} />)
@@ -46,6 +48,22 @@ describe('Machine readiness', () => {
     render(<ProjectEnvironmentReadiness projectId="project-1" rows={[]} />)
     expect(screen.getByText(/No environment readiness recorded/)).toBeTruthy()
     expect(screen.queryByRole('table')).toBeNull()
+  })
+  it('explains why checks cannot run without a repository', () => {
+    render(<ProjectEnvironmentReadiness projectId="project-1" rows={[]} hasRepository={false} />)
+    expect(screen.getByText(/checks cannot run until a repository is added/)).toBeTruthy()
+    expect(screen.queryByRole('table')).toBeNull()
+  })
+  it('shows compact past and future times while preserving absolute timestamps', () => {
+    render(<ProjectEnvironmentReadiness projectId="project-1" rows={[row]} />)
+    const times = document.querySelectorAll('time')
+    expect(times[0].dateTime).toBe(row.checked_at)
+    expect(times[1].dateTime).toBe(row.next_check_at)
+    expect(times[0].textContent).toContain('ago')
+    expect(times[1].textContent).toContain('in ')
+    expect(times[0].title).toBe(new Date(row.checked_at!).toLocaleString())
+    expect(times[1].title).toBe(new Date(row.next_check_at!).toLocaleString())
+    expect(screen.getByRole('region', { name: 'Machine readiness table' }).tabIndex).toBe(0)
   })
   it('names a pending machine, disables Check now and reports errors', () => {
     mutation.isPending = true

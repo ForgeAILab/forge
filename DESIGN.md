@@ -584,13 +584,21 @@ existing responsive wrapping, focus rings, loading/error states and tokens.
 Reuse SettingsSection, Badge, Button, Skeleton, the existing warning/success/destructive
 and muted tokens, and native table/disclosure elements. Readiness rows name the
 machine, status, failing checks with bounded output, and checked/next-check times.
+Use the stacked SettingsSection layout for readiness: heading/description above
+its full-width table. Keep machine names, status badges and actions on one line;
+use compact relative times with absolute-time titles. The focusable table region
+owns narrow-width horizontal scrolling; it must not clip inside the settings card.
+A Project without a repository explains that checks cannot run until one is added.
 At compact widths the table scrolls inside its own container; identifiers and output
 wrap. Loading preserves the section; empty explains that no checks have recorded
 readiness; pending disables Check now and names its machine; errors remain inline
 with role="alert". Task placement diagnostics reuse the same status rows for
 not-ready checks, pending probes and machine capacity, with text as well as color.
 Agent machine summaries show Runs on, an empty warning, and an admin-only pin and
-Clear pin action with pending/error states. Existing focus rings and button states
+Clear pin action with pending/error states. Show “Pinned to” with the machine's
+name (including Server host for an embedded pin); keep the ID in its title.
+A pin absent from runnable_on names the offline/unavailable/disabled state beside
+it, resolving its name through the existing admin-only daemon endpoint. Existing focus rings and button states
 apply. No new tokens or motion rules are introduced.
 
 ## 6. Motion & Interaction

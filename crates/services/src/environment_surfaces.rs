@@ -464,7 +464,14 @@ pub async fn recheck(
     }
     if let Some(id) = requested {
         if !targets.contains_key(id) {
-            return Err(ServiceError::not_found("machine", id.to_owned()));
+            return Err(if id == "server" {
+                ServiceError::not_found(
+                    "repository location on server for project",
+                    project_id.to_owned(),
+                )
+            } else {
+                ServiceError::not_found("machine", id.to_owned())
+            });
         }
         targets.retain(|key, _| key == id);
     }

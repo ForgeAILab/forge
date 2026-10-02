@@ -271,3 +271,47 @@ async fn grouped_recheck_never_substitutes_host_results_for_an_unavailable_daemo
         .unwrap();
     assert!(remote.error.is_some());
 }
+
+#[tokio::test]
+async fn server_recheck_without_repository_explains_missing_project_location() {
+    let root = tempfile::tempdir().unwrap();
+    let harness = common::test_app(root.path(), "server-no-repository").await;
+    let project: ProjectResponse = common::json_request(&harness.app,Method::POST,"/api/v1/projects",
+        json!({"name":"No repository","settings":{"environment":{"checks":[{"name":"cargo","command":"true"}]}}}),StatusCode::OK).await;
+    let path = format!("/api/v1/projects/{}/environment/recheck", project.id);
+    let error: api_types::ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &path,
+        json!({"machine":"server"}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(error.code, "not_found");
+    assert!(
+        error
+            .message
+            .contains("repository location on server for project"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains(&project.id));
+    assert!(!error.message.contains("machine not found"));
+    let unknown: api_types::ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &path,
+        json!({"machine":"unknown-runtime"}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(unknown.message.contains("machine not found"));
+    let current: ProjectResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(current.environment_readiness.is_empty());
+}

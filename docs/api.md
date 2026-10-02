@@ -2356,7 +2356,10 @@ checkout-only failure:
 for all targets, or `{"machine": "server"}` / `{"machine": "<runtime-id>"}` for
 one. It runs every configured check regardless of role. Targets are the union
 of readiness records and ready repository locations, including the primary
-host checkout. An unknown selector returns HTTP 404. Authority is unchanged:
+host checkout. An unknown runtime selector returns HTTP 404 `machine not found`. Selecting
+`server` without recorded readiness or a ready repository location returns HTTP 404,
+but names the missing Project repository location rather than claiming that the
+server machine does not exist. Authority is unchanged:
 authentication is required; the endpoint has no additional owner/admin gate.
 A concurrent check of a selected machine returns HTTP 409. Projects without
 checks return `machines: []`, without creating rows or clearing a pause.

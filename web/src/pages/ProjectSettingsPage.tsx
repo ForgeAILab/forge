@@ -470,6 +470,7 @@ export function ProjectSettingsPage({
               <ProjectEnvironmentReadiness
                 projectId={projectId}
                 rows={project?.environment_readiness ?? []}
+                hasRepository={Boolean(project?.primary_repo_id)}
                 isLoading={projectQuery.isLoading}
               />
               <EnvironmentTab
