@@ -579,6 +579,20 @@ refreshed row before another save. Operations displays active runs and the
 ceiling, with Unlimited as text. Server host links to Settings. Preserve the
 existing responsive wrapping, focus rings, loading/error states and tokens.
 
+### Environment readiness and Agent machines
+
+Reuse SettingsSection, Badge, Button, Skeleton, the existing warning/success/destructive
+and muted tokens, and native table/disclosure elements. Readiness rows name the
+machine, status, failing checks with bounded output, and checked/next-check times.
+At compact widths the table scrolls inside its own container; identifiers and output
+wrap. Loading preserves the section; empty explains that no checks have recorded
+readiness; pending disables Check now and names its machine; errors remain inline
+with role="alert". Task placement diagnostics reuse the same status rows for
+not-ready checks, pending probes and machine capacity, with text as well as color.
+Agent machine summaries show Runs on, an empty warning, and an admin-only pin and
+Clear pin action with pending/error states. Existing focus rings and button states
+apply. No new tokens or motion rules are introduced.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |

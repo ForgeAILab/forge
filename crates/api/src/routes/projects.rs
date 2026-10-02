@@ -196,7 +196,7 @@ pub async fn list_projects(
     let mut items = Vec::with_capacity(page.items.len());
     for read in page.items {
         let counts = slots.remove(&read.project.id).expect("requested Project");
-        items.push(super::project_response_with_slots(read.project, counts)?);
+        items.push(super::project_response_with_slots(&state.db, read.project, counts).await?);
     }
     let response = PaginatedResponse {
         items,
@@ -222,10 +222,14 @@ pub async fn get_project(
         .project_slots_memo
         .load(&state.db, std::slice::from_ref(&read))
         .await?;
-    Ok(Json(super::project_response_with_slots(
-        read.project,
-        slots.remove(&id).expect("requested Project"),
-    )?))
+    Ok(Json(
+        super::project_response_with_slots(
+            &state.db,
+            read.project,
+            slots.remove(&id).expect("requested Project"),
+        )
+        .await?,
+    ))
 }
 
 pub async fn list_project_hook_runs(
@@ -905,10 +909,19 @@ pub async fn pause_project(
 pub async fn recheck_project_environment(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    request: Option<Json<api_types::ProjectEnvironmentRecheckRequest>>,
 ) -> ApiResult<Json<api_types::ProjectEnvironmentRecheckResponse>> {
-    let (checks, project) = state.task_service.recheck_project_environment(&id).await?;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let (machines, project) = services::environment_surfaces::recheck(
+        &state.task_service,
+        &state.db,
+        &state.event_bus,
+        &id,
+        request.machine.as_deref(),
+    )
+    .await?;
     Ok(Json(api_types::ProjectEnvironmentRecheckResponse {
-        checks,
+        machines,
         project: project_response(&state.db, project).await?,
     }))
 }

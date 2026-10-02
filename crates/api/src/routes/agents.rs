@@ -207,13 +207,7 @@ pub async fn update_agent(
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_manageable(&existing, &user, &id)?;
     validate_agent_config_json(request.config_json.as_ref())?;
-    if !user.is_admin
-        && request
-            .daemon_id
-            .as_ref()
-            .and_then(|id| id.as_ref())
-            .is_some()
-    {
+    if !user.is_admin && request.daemon_id.is_some() {
         return Err(ApiError::forbidden_with_code(
             "admin_required",
             "Admin access required to pin an agent to a daemon",
@@ -498,7 +492,16 @@ async fn build_agent_response_for_user(
     active_assigned_task_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
+    let runnable_on = services::environment_surfaces::runnable_on(
+        &state.db,
+        &agent,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        user.is_admin,
+    )
+    .await?;
     let mut response = build_agent_response(state, agent, active_assigned_task_count).await?;
+    response.runnable_on = runnable_on;
     if !user.is_admin {
         response.daemon_id = None;
     }

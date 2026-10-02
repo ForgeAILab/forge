@@ -24,10 +24,16 @@ enum ProjectCmd {
         name: String,
     },
     List,
-    /// Run all Project environment checks and resume an environment pause on success.
+    /// Read recorded Project environment readiness by machine.
+    EnvStatus {
+        project: String,
+    },
+    /// Run Project environment checks and resume an environment pause on success.
     EnvRecheck {
         /// Project id.
         project: String,
+        #[arg(long)]
+        machine: Option<String>,
     },
     /// Token and cost accounting for one Project, by surface, model and agent.
     Analytics {
@@ -72,25 +78,68 @@ impl ProjectArgs {
                     }
                 }
             }
-            ProjectCmd::EnvRecheck { project } => {
+            ProjectCmd::EnvStatus { project } => {
+                let response: ProjectResponse =
+                    client.get(&format!("/api/v1/projects/{project}")).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response.environment_readiness),
+                    OutputFormat::Table => {
+                        if response.environment_readiness.is_empty() {
+                            println!("No environment readiness recorded.");
+                        }
+                        for row in &response.environment_readiness {
+                            println!(
+                                "{} ({}) · {} · {} · checked {} · next {}",
+                                row.machine.name,
+                                row.machine.id,
+                                match row.status {
+                                    api_types::EnvironmentReadinessStatus::Ready => "ready",
+                                    api_types::EnvironmentReadinessStatus::NotReady => "not_ready",
+                                    api_types::EnvironmentReadinessStatus::Unknown => "unknown",
+                                },
+                                row.failing_checks
+                                    .iter()
+                                    .map(|c| c.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                row.checked_at.as_deref().unwrap_or("-"),
+                                row.next_check_at.as_deref().unwrap_or("-")
+                            );
+                            if !row.output_tail.is_empty() {
+                                println!("{}", row.output_tail);
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            ProjectCmd::EnvRecheck { project, machine } => {
                 let response: api_types::ProjectEnvironmentRecheckResponse = client
                     .post(
                         &format!("/api/v1/projects/{project}/environment/recheck"),
-                        &api_types::ProjectEnvironmentRecheckRequest {},
+                        &api_types::ProjectEnvironmentRecheckRequest {
+                            machine: machine.clone(),
+                        },
                     )
                     .await?;
                 match output {
                     OutputFormat::Json => print_json(&response),
                     OutputFormat::Table => {
-                        for check in &response.checks {
-                            let status = if check.passed { "passed" } else { "failed" };
-                            let exit = check
-                                .exit_code
-                                .map(|code| code.to_string())
-                                .unwrap_or_else(|| "-".to_owned());
-                            println!("{}: {status} (exit {exit})", check.name);
-                            if !check.output_tail.is_empty() {
-                                println!("{}", check.output_tail);
+                        for machine in &response.machines {
+                            println!("{} ({})", machine.machine.name, machine.machine.id);
+                            if let Some(error) = &machine.error {
+                                println!("{error}");
+                            }
+                            for check in &machine.checks {
+                                let status = if check.passed { "passed" } else { "failed" };
+                                let exit = check
+                                    .exit_code
+                                    .map(|code| code.to_string())
+                                    .unwrap_or_else(|| "-".to_owned());
+                                println!("{}: {status} (exit {exit})", check.name);
+                                if !check.output_tail.is_empty() {
+                                    println!("{}", check.output_tail);
+                                }
                             }
                         }
                         print_table_projects(std::slice::from_ref(&response.project));
@@ -311,7 +360,27 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["project", "env-recheck", "project-1"]).unwrap();
         assert!(
-            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project } if project == "project-1")
+            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project, machine: None } if project == "project-1")
+        );
+    }
+
+    #[test]
+    fn environment_status_and_machine_selector_parse() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from(["project", "env-status", "project-1"]).unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvStatus { project } if project == "project-1")
+        );
+        let cli =
+            Cli::try_parse_from(["project", "env-recheck", "project-1", "--machine", "server"])
+                .unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project, machine: Some(machine) } if project == "project-1" && machine == "server")
         );
     }
 

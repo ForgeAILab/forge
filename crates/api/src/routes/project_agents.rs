@@ -39,14 +39,27 @@ pub async fn list_project_agents(
                 .to_owned();
         let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
         let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
-        responses.push(agent_response(
+        let runnable_on = services::environment_surfaces::runnable_on(
+            &state.db,
+            &agent,
+            &state.adapter_registry,
+            &state.daemon_connections,
+            user.is_admin,
+        )
+        .await?;
+        let mut response = agent_response(
             agent,
             Some(active_assigned_task_count),
             Some(running_execution_count),
             Some(effective_status),
             stats,
             usage,
-        ));
+        );
+        response.runnable_on = runnable_on;
+        if !user.is_admin {
+            response.daemon_id = None;
+        }
+        responses.push(response);
     }
 
     Ok(Json(responses))

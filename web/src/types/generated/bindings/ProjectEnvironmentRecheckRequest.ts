@@ -3,4 +3,8 @@
 /**
  * The re-check endpoint takes no options: every configured check runs.
  */
-export type ProjectEnvironmentRecheckRequest = Record<string, never>;
+export type ProjectEnvironmentRecheckRequest = { 
+/**
+ * `server` or a daemon runtime ID; omitted checks every known target.
+ */
+machine: string | null, };

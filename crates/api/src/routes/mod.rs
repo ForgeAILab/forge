@@ -176,10 +176,11 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
 
 pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
     let slots = services::task_dispatcher::slots::load_project_slots(db, &project).await?;
-    project_response_with_slots(project, slots)
+    project_response_with_slots(db, project, slots).await
 }
 
-fn project_response_with_slots(
+async fn project_response_with_slots(
+    db: &db::SqliteDb,
     project: Project,
     slots: api_types::ProjectSlots,
 ) -> ApiResult<ProjectResponse> {
@@ -194,14 +195,34 @@ fn project_response_with_slots(
             project.id
         ))
     })?;
-    let environment_pause = project
-        .environment_pause_json
-        .as_deref()
-        .map(serde_json::from_str::<api_types::ProjectEnvironmentPause>)
-        .transpose()
-        .map_err(|error| {
-            ApiError::internal(format!("invalid persisted environment pause: {error}"))
-        })?;
+    let environment_readiness = services::environment_surfaces::readiness(db, &project.id).await?;
+    let environment_pause = if let Some(raw) = project.environment_pause_json.as_deref() {
+        let detail =
+            serde_json::from_str::<api_types::ProjectEnvironmentPause>(raw).map_err(|error| {
+                ApiError::internal(format!("invalid persisted environment pause: {error}"))
+            })?;
+        let value: Value =
+            serde_json::from_str(raw).map_err(|error| ApiError::internal(error.to_string()))?;
+        let machine = if value.get("machine").is_some() {
+            serde_json::from_value::<db::EnvironmentMachine>(value["machine"].clone()).map_err(
+                |error| ApiError::internal(format!("invalid environment pause machine: {error}")),
+            )?
+        } else if let Some(workspace) = detail.workspace_id.as_deref() {
+            db::WorkspacePlacementRepo::get_by_workspace_id(db, workspace)
+                .await
+                .map_err(services::ServiceError::from)?
+                .map(|placement| db::EnvironmentMachine::from_placement(&placement))
+                .unwrap_or(db::EnvironmentMachine::Server)
+        } else {
+            db::EnvironmentMachine::Server
+        };
+        Some(api_types::EnvironmentPauseResponse {
+            detail,
+            machine: services::environment_surfaces::machine_identity(db, &machine).await?,
+        })
+    } else {
+        None
+    };
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
@@ -216,6 +237,7 @@ fn project_response_with_slots(
         paused_at: project.paused_at.clone(),
         system_pause_reason: project.system_pause_reason,
         environment_pause,
+        environment_readiness,
         slots,
         paused: project.paused_at.is_some(),
         charter_status: project.charter_status,
@@ -427,7 +449,14 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
+    let placement_diagnostics = services::environment_surfaces::task_placement_diagnostics(
+        db,
+        &task,
+        workspace.as_ref().map(|workspace| &workspace.placement),
+    )
+    .await?;
     Ok(TaskResponse {
+        placement_diagnostics,
         id: task.id,
         project_id: task.project_id,
         parent_task_id: task.parent_task_id.clone(),
@@ -959,6 +988,7 @@ pub fn agent_response(
         config_json: redact_sensitive_config(parse_json_value_or_empty_object(agent.config_json)),
         credential_handle_id: agent.credential_ref,
         daemon_id: agent.daemon_id,
+        runnable_on: Default::default(),
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status,
         active_assigned_task_count,
