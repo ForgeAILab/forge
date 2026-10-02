@@ -2,7 +2,7 @@
 mod common;
 
 use api_types::{
-    ErrorResponse, ExecutionResponse, LaunchExecutionResponse, RecoveryAction, TaskAnnotation,
+    ErrorResponse, ExecutionResponse, LaunchExecutionResponse, TaskAction, TaskAnnotation,
     TaskBlockingAnnotation, TaskResponse,
 };
 use axum::http::{Method, StatusCode};
@@ -498,7 +498,7 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
         artifact: None,
         message: None,
         hook: None,
-        recovery_actions: vec![RecoveryAction::OpenInteractive],
+
     });
     TaskRepo::update(
         &*harness.state.db,

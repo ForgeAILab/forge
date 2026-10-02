@@ -283,52 +283,7 @@ pub async fn follow_up_execution(
     }))
 }
 
-pub async fn re_execute_execution(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<LaunchExecutionResponse>> {
-    let launched = state
-        .task_service
-        .re_execute_execution(id)
-        .await
-        .map_err(map_re_execute_error)?;
 
-    let execution_id = launched.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
-
-    let execution_behavior = Some(api_types::ExecutionBehavior {
-        kind: api_types::ExecutionBehaviorKind::ReExecute,
-        propagates: true,
-        cascade_role: Some(launched.execution.role.clone()),
-        cascade_state: Some(launched.task.status.clone()),
-        description: "Re-execute — completion may auto-transition the task".to_owned(),
-    });
-
-    Ok(Json(LaunchExecutionResponse {
-        data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
-            execution: execution_response(launched.execution),
-            workspace: workspace_response(
-                &state.db,
-                &state.workspace_backend_router,
-                launched.workspace,
-            )
-            .await?,
-            execution_behavior,
-        },
-    }))
-}
-
-pub async fn cancel_execution(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ExecutionResponse>> {
-    let execution = state
-        .task_service
-        .cancel_execution(id, "cancelled by user".to_owned())
-        .await?;
-    Ok(Json(execution_response(execution)))
-}
 
 fn map_follow_up_error(error: ServiceError) -> ApiError {
     match error {
@@ -349,20 +304,7 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
     }
 }
 
-fn map_re_execute_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::InvalidOperation { message } => {
-            if message.contains("re-execute requires a completed, failed, or cancelled execution") {
-                ApiError::conflict_with_code("re_execute.execution_active", message)
-            } else if message.contains("terminal status") {
-                ApiError::conflict_with_code("task.terminal", message)
-            } else {
-                ApiError::invalid_operation_conflict(message)
-            }
-        }
-        other => ApiError::from(other),
-    }
-}
+
 
 pub async fn get_usage_breakdowns(
     State(state): State<AppState>,

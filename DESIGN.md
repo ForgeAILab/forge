@@ -595,3 +595,7 @@ Forge uses a **mixed border-and-soft-shadow** strategy. Warm tonal shifts define
 | Active ember | `shadow-ember`, ember surface/border | Current work, focus, and drag intent |
 
 New surfaces must reuse these levels. The current code contains a few legacy literal status colors, arbitrary compact measurements, and generic `shadow-sm`/`shadow-lg` utilities; they are accepted debt outside this change and should be consolidated only in separately approved work.
+
+### Task action offers
+
+Task action buttons render server labels and meaningful parameters. Use the existing small outline Button, Dialog, Label and Textarea primitives; pending disables submission, errors refresh the Task projection, and an empty offer set renders no controls. Parameter inputs keep visible labels, keyboard focus and the semantic foreground, border and ring tokens.

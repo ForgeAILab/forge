@@ -284,7 +284,7 @@ impl From<ServiceError> for ApiError {
                 available_actions,
                 reason,
             } => Self::conflict_with_code_and_details(
-                "task_action.unavailable",
+                "action_unavailable",
                 reason.clone(),
                 json!({
                     "available_actions": available_actions,

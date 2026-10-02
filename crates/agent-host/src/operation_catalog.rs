@@ -69,12 +69,6 @@ pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
-pub const TASK_REVIEW_OPERATION: &str = "task.review";
-/// Cancel a non-terminal Task in the bound Project at an exact Task version.
-/// This is a normal lifecycle command, including for a healthy queued or
-/// running Task; `task.recover` remains reserved for work that has stopped.
-pub const TASK_CANCEL_OPERATION: &str = "task.cancel";
-
 /// Add or remove one prerequisite edge between two Tasks in the bound
 /// Project.
 ///
@@ -87,7 +81,7 @@ pub const TASK_DEPENDENCY_OPERATION: &str = "task.dependency";
 /// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
 /// for, and without this the only reachable remedy is a duplicate Task.
-pub const TASK_RECOVER_OPERATION: &str = "task.recover";
+pub const TASK_ACTION_OPERATION: &str = "task.action";
 /// Write the current execution's plan candidate. Forge publishes the
 /// candidate only after the execution completes successfully; this operation
 /// never edits the Task's canonical plan directly.
@@ -536,28 +530,6 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
-        operation: TASK_REVIEW_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_CANCEL_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
         operation: TASK_DEPENDENCY_OPERATION,
         surface: OperationSurface::Coordination,
         exposure: OperationExposure::GenericProposal,
@@ -569,7 +541,7 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
-        operation: TASK_RECOVER_OPERATION,
+        operation: TASK_ACTION_OPERATION,
         surface: OperationSurface::Coordination,
         // Coordination composes GenericProposal operations into
         // `forge_scope_propose`; a TypedProposal here would leave the
@@ -937,14 +909,7 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // envelope: the doctrine directs the Agent to absorb a
         // verification-shaped Task by cancelling it and settling its checks
         // itself.
-        TASK_RECOVER_OPERATION => matches!(
-            action,
-            Some("resume_session")
-                | Some("reexecute")
-                | Some("reset_to_initial")
-                | Some("reset_retry_window")
-                | Some("cancel_task")
-        ),
+        TASK_ACTION_OPERATION => payload.get("action").and_then(|action| serde_json::from_value::<api_types::TaskAction>(action.clone()).ok()).is_some(),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It
         // must retain an AgentAction until the user-facing approval contract
@@ -1058,7 +1023,6 @@ fn leaked_operation_name(operation: &str) -> &'static str {
         "delivery.read" => "delivery.read",
         "web.search" => "web.search",
         TASK_PROPOSE_OPERATION => TASK_PROPOSE_OPERATION,
-        TASK_REVIEW_OPERATION => TASK_REVIEW_OPERATION,
         "message.propose" => "message.propose",
         "message.send" => "message.send",
         "commitment.propose" => "commitment.propose",
@@ -1101,10 +1065,8 @@ mod tests {
             vec![
                 TASK_PROPOSE_OPERATION,
                 TASK_ADAPTIVE_OPERATION,
-                TASK_REVIEW_OPERATION,
-                TASK_CANCEL_OPERATION,
                 TASK_DEPENDENCY_OPERATION,
-                TASK_RECOVER_OPERATION,
+                TASK_ACTION_OPERATION,
             ]
         );
 
@@ -1122,7 +1084,7 @@ mod tests {
 
         // The permission is part of the decision, not decoration.
         assert!(!is_coordination_direct_command(
-            TASK_CANCEL_OPERATION,
+            TASK_ACTION_OPERATION,
             "read_project"
         ));
         assert!(!is_coordination_direct_command(

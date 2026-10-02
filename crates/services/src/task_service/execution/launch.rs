@@ -619,14 +619,7 @@ impl TaskService {
             .await
     }
 
-    pub(super) async fn re_execute_execution_for_recovery(
-        &self,
-        parent_execution_id: impl Into<String>,
-        context: Option<String>,
-    ) -> Result<LaunchExecutionResult> {
-        self.re_execute_execution_with_context_inner(parent_execution_id, context, true)
-            .await
-    }
+
 
     async fn re_execute_execution_with_context_inner(
         &self,
@@ -1105,20 +1098,6 @@ impl TaskService {
             }
             return Ok(current);
         }
-        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(&task, &execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ManualStop,
             blocking_reason: blocking_reason.to_owned(),
@@ -1132,7 +1111,6 @@ impl TaskService {
             }),
             message: Some(annotation_message.to_owned()),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(

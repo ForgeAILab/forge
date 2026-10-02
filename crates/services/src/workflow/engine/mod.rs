@@ -60,7 +60,6 @@ fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
         "message": message,
         "state": state,
         "detected_at": now_rfc3339(),
-        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string()
 }
@@ -1946,8 +1945,9 @@ impl WorkflowEngine {
                 )
                 .publish_committed(&event);
             }
-            let should_defer_dispatch = defer_dispatch_until.is_some()
-                && to_state.kind != StateKind::Active
+            let action_dispatch = crate::TaskService::task_action_command_active();
+            let should_defer_dispatch = (defer_dispatch_until.is_some() || action_dispatch)
+                && (to_state.kind != StateKind::Active || action_dispatch)
                 && to_state
                     .hooks
                     .on_enter
@@ -1958,10 +1958,8 @@ impl WorkflowEngine {
                     &self.db,
                     &task,
                     &target_state,
-                    defer_dispatch_until
-                        .as_deref()
-                        .expect("deferred dispatch timestamp exists"),
-                    "board drag dispatch cooldown",
+                    defer_dispatch_until.as_deref().unwrap_or(&now_rfc3339()),
+                    if action_dispatch { "task action dispatch" } else { "board drag dispatch cooldown" },
                 )
                 .await?;
             } else if deferred_dispatch::pending_until(&task).is_some() {
@@ -2296,7 +2294,7 @@ impl WorkflowEngine {
                     }
                     if should_defer_dispatch && hook.action == "dispatch_role_agent" {
                         let result = HookResult::Skipped {
-                            reason: "dispatch deferred after board drag".to_owned(),
+                            reason: "dispatch deferred to Task dispatcher".to_owned(),
                         };
                         log_hook_result(
                             &task.id,

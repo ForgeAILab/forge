@@ -2812,6 +2812,16 @@ on the manual path. There, the recovery action creates a
 marked review-refresh transition, clears the old approval, and runs the
 repaired result through fresh checks and review before merge.
 
+### Task condition actions
+
+`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. Snapshot construction loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, and caller authority. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
+
+The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, and a pinned resumable execution. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only.
+
+Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Annotation, blocked, failed and entry-barrier columns remain separate.
+
+Recovery commits a queued intent. The dispatcher consumes it through normal admission and waits for capacity. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations.
+
 ### Root Tasks and ordered subtasks
 
 A root Task is a Task with no `parent_task_id`. Setting `parent_task_id` makes a

@@ -1,13 +1,13 @@
 use api_types::{
-    Actor, AddDependencyRequest, ApproveGateRequest, AssignRoleRequest, AuthorType, CanonicalPhase,
+    Actor, AddDependencyRequest,  AssignRoleRequest, AuthorType, CanonicalPhase,
     ClaimTaskRequest, CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope,
     HookResultEntry, LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest,
-    MoveTaskResponse, PaginatedResponse, PromptPreviewResponse, RecoverTaskRequest,
-    RejectGateRequest, RejectReviewRequest, ReorderSubtasksRequest, ReviewConfig,
-    ReviewDecisionResponse, StateKind, SystemComponent, TaskAction, TaskActionRequest,
+    MoveTaskResponse, PaginatedResponse, PromptPreviewResponse, 
+     ReorderSubtasksRequest, ReviewConfig,
+     StateKind, SystemComponent, TaskActionRequest,
     TaskDependency, TaskMediaResponse, TaskResponse, TaskRoleAssignmentResponse, TasksResponse,
     TransitionLogEntry, TransitionSource, TransitionTaskRequest, TransitionTaskResponse,
-    UpdateTaskRequest, WorkflowDefinition, WorkflowTrigger, WorkspaceResponse,
+    UpdateTaskRequest, WorkflowTrigger, WorkspaceResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -16,7 +16,7 @@ use axum::{
 };
 use db::{
     now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, PageRequest,
-    ProjectRepo, ReviewRepo, ReviewStatus, SharedMediaRepo, SortBy, SortOrder, TaskCommentRepo,
+    ProjectRepo, SharedMediaRepo, SortBy, SortOrder, TaskCommentRepo,
     TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo, TaskRoleAssignmentRepo,
     TransitionLogRepo, WorkspaceRepo,
 };
@@ -25,10 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::{
     task_service::TransitionOptions,
-    workflow::{default_states, engine::WorkflowEngine},
+    workflow::engine::WorkflowEngine,
     Assignee, DiffService, ServiceError,
 };
-use uuid::Uuid;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -47,7 +46,6 @@ mod crud;
 mod dependencies;
 mod detail;
 mod execution;
-mod gates;
 mod media;
 mod prompt_preview;
 mod reviews;
@@ -55,22 +53,18 @@ mod roles;
 mod transitions;
 mod workspace;
 
-pub use actions::{
-    approve_task, cancel_task, list_task_actions, pause_task, request_changes_task, resume_task,
-    start_task, submit_task,
-};
+pub use actions::{apply_task_action, list_task_actions};
 pub use comments::{create_comment, delete_comment, list_comments};
 pub use crud::{
-    advance_task, archive_task, create_task, delete_task, duplicate_task, get_task, list_tasks,
-    move_task, recover_task, reorder_subtasks, update_task,
+    archive_task, create_task, delete_task, duplicate_task, get_task, list_tasks,
+    move_task, reorder_subtasks, update_task,
 };
 pub use dependencies::{add_dependency, list_dependencies, list_dependents, remove_dependency};
 pub use detail::{get_task_detail, get_task_relations};
 pub use execution::{claim_task, launch_task};
-pub use gates::{approve_gate, reject_gate};
 pub use media::{delete_media, get_media, list_media, upload_media};
 pub use prompt_preview::prompt_preview;
-pub use reviews::{approve_review, list_reviews, reject_review, trigger_review};
+pub use reviews::list_reviews;
 pub use roles::{
     assign_task_role, list_task_roles, remove_task_role, RoleResetRequest,
     TaskRoleAssignmentListResponse,
@@ -118,12 +112,7 @@ fn map_diff_error(error: ServiceError) -> ApiError {
     }
 }
 
-fn map_manual_review_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::InvalidOperation { message } => ApiError::invalid_operation_conflict(message),
-        other => ApiError::from(other),
-    }
-}
+
 
 fn comment_response(comment: db::TaskComment) -> CommentResponse {
     CommentResponse {

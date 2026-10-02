@@ -85,6 +85,8 @@ pub mod shutdown;
 pub mod solo_bootstrap;
 pub mod solo_session;
 pub mod task_diagnostics;
+pub mod task_actions;
+pub use task_actions::{available_actions, ActionCaller, TaskSnapshot};
 pub mod task_dispatcher;
 pub mod task_hierarchy;
 pub mod task_service;
@@ -402,7 +404,7 @@ pub enum ServiceError {
 
     #[error("task action unavailable: {reason}")]
     TaskActionUnavailable {
-        available_actions: Vec<api_types::TaskAction>,
+        available_actions: Vec<api_types::Offer>,
         reason: String,
     },
 

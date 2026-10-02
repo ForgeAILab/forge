@@ -93,12 +93,7 @@ impl TaskDispatcher {
                     if !deferred_dispatch::is_pending(&task, chrono::Utc::now()) {
                         match self
                             .task_service
-                            .recover_task(
-                                task.id.clone(),
-                                api_types::RecoveryAction::RetryHook,
-                                Some("retry review CI infrastructure".into()),
-                                None,
-                            )
+                            .retry_entry_checks(task.clone(), Some("retry review CI infrastructure".into()))
                             .await
                         {
                             Ok(_) => dispatched += 1,

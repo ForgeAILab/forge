@@ -36,8 +36,8 @@ use forge_agent_host::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_ACTION_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -586,7 +586,7 @@ fn task_dependency_arguments(key: &str, action: &str, task_id: &str, depends_on:
 
 fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -> Value {
     json!({
-        "operation": TASK_CANCEL_OPERATION,
+        "operation": TASK_ACTION_OPERATION,
         "payload": {
             "action": "cancel",
             "task_id": task_id,
@@ -1048,18 +1048,18 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             cancellable_task_id,
             cancellable_task_version,
         ),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("task.cancel composition call");
-    assert_outcome_operation(&cancelled, TASK_CANCEL_OPERATION);
+    assert_outcome_operation(&cancelled, TASK_ACTION_OPERATION);
     assert!(
         !cancelled.is_error,
         "healthy Task cancellation should commit: {}",
         cancelled.value
     );
     assert_eq!(cancelled.value["result"]["task_status"], "cancelled");
-    covered_operations.insert(TASK_CANCEL_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let mut human_review_workflow = services::workflow::default_workflow::default_workflow();
     let review_state = human_review_workflow
@@ -1101,7 +1101,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         &project,
         "forge_scope_propose",
         json!({
-            "operation": TASK_REVIEW_OPERATION,
+            "operation": TASK_ACTION_OPERATION,
             "payload": {
                 "task_id": source_task_id,
                 "decision": "reject",
@@ -1111,18 +1111,18 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             "dedupe_key": "matrix-task-review",
             "correlation_id": "correlation-matrix-task-review"
         }),
-        TASK_REVIEW_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("task.review composition call");
-    assert_outcome_operation(&review, TASK_REVIEW_OPERATION);
+    assert_outcome_operation(&review, TASK_ACTION_OPERATION);
     assert!(
         !review.is_error,
         "Task review should commit: {}",
         review.value
     );
     assert_eq!(review.value["result"]["task_status"], "cancelled");
-    covered_operations.insert(TASK_REVIEW_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let setup = ScopeToolComposition::for_scope_with_permissions_and_project_context(
         AGENT_ID,
@@ -1207,10 +1207,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     assert!(
         project_propose_operations
             .iter()
-            .any(|value| value == TASK_RECOVER_OPERATION),
-        "Project propose composition must expose {TASK_RECOVER_OPERATION}"
+            .any(|value| value == TASK_ACTION_OPERATION),
+        "Project propose composition must expose {TASK_ACTION_OPERATION}"
     );
-    covered_operations.insert(TASK_RECOVER_OPERATION.to_owned());
+    covered_operations.insert(TASK_ACTION_OPERATION.to_owned());
 
     let task_composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
         AGENT_ID,
@@ -1575,11 +1575,11 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-stale", &task_id, original_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("stale cancellation is structured");
-    assert_structured_error(&stale, TASK_CANCEL_OPERATION, "version_conflict");
+    assert_structured_error(&stale, TASK_ACTION_OPERATION, "version_conflict");
     assert_eq!(
         stale.value["current_version_or_revision"]["resource_type"],
         "task"
@@ -1628,17 +1628,17 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-cross-project", &other_task.id, other_task.version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("cross-Project cancellation is structured");
-    assert_structured_error(&cross_project, TASK_CANCEL_OPERATION, "not_found");
+    assert_structured_error(&cross_project, TASK_ACTION_OPERATION, "not_found");
 
     let cancelled = invoke_tool(
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-current", &task_id, current_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("current cancellation");
@@ -1649,7 +1649,7 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         &project,
         "forge_scope_propose",
         cancel_task_arguments("cancel-current", &task_id, current_version),
-        TASK_CANCEL_OPERATION,
+        TASK_ACTION_OPERATION,
     )
     .await
     .expect("response-loss retry");

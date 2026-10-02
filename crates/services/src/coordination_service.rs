@@ -1657,7 +1657,7 @@ mod tests {
         CreateAgentProfile, CreateProject, CreateProjectAgentBinding, ProjectAgentBindingRepo,
         ProjectRepo, ReplaceProjectAgentBinding,
     };
-    use forge_agent_host::TASK_RECOVER_OPERATION;
+    use forge_agent_host::TASK_ACTION_OPERATION;
     use forge_agent_host::{
         MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION,
         PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
@@ -2447,7 +2447,7 @@ mod tests {
     #[test]
     fn a_direct_command_is_refused_under_the_wrong_permission() {
         assert!(!is_admitted_direct_command(
-            TASK_RECOVER_OPERATION,
+            TASK_ACTION_OPERATION,
             "read_project",
             None
         ));

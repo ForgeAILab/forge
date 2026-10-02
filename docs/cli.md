@@ -613,3 +613,9 @@ forge-ctl --output json task list --project-id <ID> | jq '.items[].title'
 Every subcommand respects `--output json` and emits the same payload structure
 the REST API does — the tables shown in the default mode are just a render of
 that JSON.
+
+## Task action commands
+
+`forge-ctl task actions <id>` prints current offers and version. `forge-ctl task action <id> <verb> [--version N] [flags]` applies one; without `--version` it reads the current version first. Verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`.
+
+Retry flags are `--fresh-session true|false`, `--refresh-workspace true|false`, `--reset-budget true|false`, and `--guidance TEXT`. Send-back uses `--guidance TEXT`; approval uses `--override` for an owner override. Meaningful flags and values come from offers. `task cancel` is removed; use `task action <id> cancel`.

@@ -60,36 +60,8 @@ export type ExecutionBehavior = {
   cascade_state: string | null
   description: string
 }
-export type ExecutionActionKind =
-  | 'manual_launch'
-  | 'session_follow_up'
-  | 'workflow_resume'
-  | 're_execute'
-  | 'stop_execution'
-  | 'cancel_task'
-export type ExecutionAction = {
-  action: ExecutionActionKind
-  label: string
-  enabled: boolean
-  propagates: boolean
-  requires_session: boolean
-  disabled_reason: string | null
-  target_execution_id: string | null
-}
-export type RecoveryAction =
-  | 'resume_session'
-  | 'reexecute'
-  | 'reset_to_initial'
-  | 'cancel_task'
-  | 'mark_reviewed'
-  | 'defer_to_follow_up'
-  | 'retry_hook'
-  | 'resume_process'
-  | 'update_workspace_and_retry_hook'
-  | 'skip_hook_once'
-  | 'reset_retry_window'
-  | 'proceed_once'
-  | 'open_interactive'
+import type { Offer } from './bindings/Offer'
+export type { Offer } from './bindings/Offer'
 export type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'
 export type ReviewStatus = 'running' | 'awaiting_human' | 'passed' | 'failed' | 'cancelled'
 export type DaemonStatus = 'online' | 'offline'
@@ -207,7 +179,6 @@ export interface TaskBlockingAnnotation {
   artifact: BlockingArtifact | null
   message: string | null
   hook?: Record<string, unknown> | null
-  recovery_actions: RecoveryAction[]
 }
 
 export type TaskAnnotation = TaskBlockingAnnotation | Record<string, unknown>
@@ -367,19 +338,6 @@ export interface RelatedEvidence {
   message: string | null
 }
 
-export interface WorkflowExceptionAction {
-  kind: RecoveryAction
-  label: string
-  enabled: boolean
-  disabled_reason: string | null
-  requires_reason: boolean
-  requires_guidance: boolean
-  propagates: boolean
-  target_state: string | null
-  target_role: string | null
-  target_execution_id: string | null
-}
-
 export interface WorkflowExceptionSummary {
   type: string
   message: string
@@ -391,7 +349,7 @@ export interface WorkflowExceptionSummary {
   target_role: string | null
   failing_step: FailingStepSummary | null
   related_evidence: RelatedEvidence[]
-  actions: WorkflowExceptionAction[]
+  actions: Offer[]
 }
 
 export interface TaskExecutionObservability {
@@ -594,7 +552,8 @@ export interface Task {
   effective_coder: TaskRoleAssignmentResponse | null
   effective_coder_source: EffectiveCoderSource | null
   remaining_retries: Record<string, number>
-  execution_actions?: ExecutionAction[]
+  execution_actions?: Offer[]
+  available_actions?: Offer[]
   awaiting_human?: boolean
   error_annotation?: TaskAnnotation | null
   blocked?: InterruptionMetadata | null
@@ -717,12 +676,6 @@ export interface ExecutionSummary {
   workspace_id: string | null
   created_at: string
   updated_at: string
-}
-
-export interface RecoverTaskRequest {
-  action: RecoveryAction
-  reason: string | null
-  context: string | null
 }
 
 export type ExecutionResponse = Execution

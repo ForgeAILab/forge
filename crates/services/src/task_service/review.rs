@@ -39,14 +39,8 @@ impl TaskService {
         barrier["interrupted_at"] = json!(now);
         barrier["infrastructure_attempts"] = json!(attempts);
         barrier["blocking_reason"] = json!(reason);
-        let actions = if reset {
-            json!(["reset_to_initial", "cancel_task"])
-        } else {
-            json!(["retry_hook", "cancel_task"])
-        };
         let annotation = json!({"type": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed },
-            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason,
-            "recovery_actions": actions});
+            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason});
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         if let Some(version) = ctx.project_version {
             let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")

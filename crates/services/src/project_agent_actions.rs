@@ -27,7 +27,7 @@ use forge_agent_host::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_ACTION_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -129,7 +129,7 @@ impl ProjectOrchestrationActionService {
                 current.version = Some(project.version);
                 Ok(Some(current))
             }
-            TASK_CANCEL_OPERATION => {
+            TASK_ACTION_OPERATION => {
                 let Some(task_id) = payload.get("task_id").and_then(Value::as_str) else {
                     return Ok(None);
                 };

@@ -410,7 +410,10 @@ pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Va
     let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
         .await?
         .ok_or_else(|| McpToolError::not_found("task", params.task_id))?;
-    Ok(task_value(task))
+    let offers = state.task_service.task_action_offers(&task.id, &api_types::Actor::user(api_types::UserActionSource::Api)).await?;
+    let mut value = task_value(task);
+    value["available_actions"] = json!(offers.available_actions);
+    Ok(value)
 }
 
 pub(super) async fn forge_preview_prompt(
@@ -580,13 +583,13 @@ pub(super) async fn forge_assign_agent(
     }))
 }
 
-pub(super) async fn forge_cancel_task(
-    state: &AppState,
-    params: Value,
-) -> Result<Value, McpToolError> {
-    let params: GetTaskParams = parse_params(params)?;
-    let task = state.task_service.cancel_task(params.task_id).await?;
-    Ok(task_value(task))
+pub(super) async fn task_action(state: &AppState, params: Value, _context: &McpContext) -> Result<Value, McpToolError> {
+    let task_id = params.get("task_id").and_then(Value::as_str).ok_or_else(|| invalid_field_error("task_id", "required", None))?;
+    let request: api_types::TaskActionRequest = parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
+    let result = state.task_service.perform_task_action(task_id, request.action, request.version).await?;
+    let mut value = task_value(result.task.clone());
+    value["available_actions"] = serde_json::to_value(state.task_service.task_action_offers(&result.task.id, &api_types::Actor::user(api_types::UserActionSource::Api)).await?.available_actions).map_err(|error| McpToolError::new(-32603, error.to_string()))?;
+    Ok(value)
 }
 
 pub(super) async fn forge_get_task_diff(

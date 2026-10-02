@@ -36,7 +36,7 @@ pub(crate) async fn dispatch_tool(
         "forge_memory_search" => handlers::forge_memory_search(state, arguments, context).await,
         "forge_memory_get" => handlers::forge_memory_get(state, arguments, context).await,
         "forge_assign_agent" => handlers::forge_assign_agent(state, arguments).await,
-        "forge_cancel_task" => handlers::forge_cancel_task(state, arguments).await,
+        "task.action" => handlers::task_action(state, arguments, context).await,
         "forge_get_task_diff" => handlers::forge_get_task_diff(state, arguments).await,
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,

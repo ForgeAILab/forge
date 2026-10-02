@@ -1,7 +1,7 @@
 mod common;
 
 use api_types::{
-    ErrorResponse, RecoveryAction, TaskAction, TaskActionsResponse, TaskAnnotation,
+    ErrorResponse, TaskAction, TaskActionsResponse, TaskAnnotation,
     TaskBlockingAnnotation, TaskResponse, WorkflowDefinition,
 };
 use axum::http::{Method, StatusCode};
@@ -71,11 +71,7 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         artifact: None,
         message: Some("Recovered after server restart".to_owned()),
         hook: None,
-        recovery_actions: vec![
-            RecoveryAction::Reexecute,
-            RecoveryAction::ResetToInitial,
-            RecoveryAction::CancelTask,
-        ],
+
     });
     TaskRepo::update(
         &*harness.state.db,
@@ -107,14 +103,7 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(
-        actions.recovery_actions,
-        vec![
-            RecoveryAction::Reexecute,
-            RecoveryAction::ResetToInitial,
-            RecoveryAction::CancelTask,
-        ]
-    );
+    assert!(actions.available_actions.iter().any(|offer| offer.action.verb() == "retry"));
 
     let error: ErrorResponse = common::json_request(
         &harness.app,
@@ -138,14 +127,7 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
     else {
         panic!("expected typed blocking annotation");
     };
-    assert_eq!(
-        current_annotation.recovery_actions,
-        vec![
-            RecoveryAction::Reexecute,
-            RecoveryAction::ResetToInitial,
-            RecoveryAction::CancelTask,
-        ]
-    );
+    assert!(serde_json::to_value(current_annotation).unwrap().get("recovery_actions").is_none());
 }
 
 #[tokio::test]
@@ -272,7 +254,7 @@ async fn task_response_action_projection_paginates_execution_history() {
     .await;
     assert!(facade_actions
         .available_actions
-        .contains(&TaskAction::Resume));
+        .iter().any(|offer| offer.action.verb() == "release"));
 }
 
 #[tokio::test]

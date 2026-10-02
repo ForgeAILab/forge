@@ -184,9 +184,9 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
     harness
         .state
         .task_service
-        .recover_task(
+        .test_apply_action(
             task_id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: None, reset_budget: Some(true), guidance: None },
             Some("start a fresh review window".to_owned()),
             None,
         )

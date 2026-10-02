@@ -110,7 +110,6 @@ impl TaskService {
                 "id": format!("before_work:{}", failure.index),
                 "log_path": failure.log_path,
             },
-            "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
         });
 
         TaskRepo::update(

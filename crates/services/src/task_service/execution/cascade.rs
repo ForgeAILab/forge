@@ -1072,16 +1072,6 @@ impl TaskService {
         if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
             return Ok(());
         }
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(task, execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::WorkflowGuardRejected,
             blocking_reason: guard.to_owned(),
@@ -1097,7 +1087,6 @@ impl TaskService {
             }),
             message: Some(reason.to_owned()),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1360,11 +1349,6 @@ impl TaskService {
                 },
             ),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1505,17 +1489,6 @@ impl TaskService {
         if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
             return Ok(());
         }
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(task, execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
@@ -1536,7 +1509,6 @@ impl TaskService {
                     .unwrap_or_else(|| "Execution failed".to_owned()),
             ),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1606,42 +1578,8 @@ impl TaskService {
     /// same identity/role checks as the WorkspaceLease it will request.  Keep
     /// impossible actions out of the durable annotation instead of inviting a
     /// coordinator to call a recovery route that is guaranteed to fail.
-    pub(super) async fn resume_session_recovery_available(
-        &self,
-        task: &Task,
-        execution: &Execution,
-    ) -> Result<bool> {
-        // A reviewer/auditor execution is part of a durable Review attempt.
-        // Once that exact attempt is terminal, its session cannot be resumed:
-        // admission only accepts a Running Review and a fresh attempt must be
-        // created instead.  Keep the impossible recovery action out of new
-        // annotations (and manual-stop annotations) at the source.
-        if terminal_review_is_bound_to_execution(&self.db, execution).await? {
-            return Ok(false);
-        }
 
-        let (Some(agent_id), Some(_session_id), Some(_snapshot)) = (
-            execution.agent_id.as_deref(),
-            execution.agent_session_id.as_deref(),
-            execution.executor_config_snapshot_json.as_deref(),
-        ) else {
-            return Ok(false);
-        };
 
-        if let Some(assignment) =
-            crate::task_hierarchy::effective_role_assignment(&self.db, task, &execution.role)
-                .await?
-                .map(|resolved| resolved.assignment)
-        {
-            return Ok(assignment.assignee_type == Some(AssigneeKind::Agent)
-                && assignment.assignee_id.as_deref() == Some(agent_id));
-        }
-
-        // Legacy Tasks may predate role-assignment rows.  Their task-level
-        // assignee remains the scheduler's authority fallback.
-        Ok(task.assignee_type.as_deref() == Some("agent")
-            && task.assignee_id.as_deref() == Some(agent_id))
-    }
 
     async fn maybe_schedule_execution_retry(
         &self,
@@ -2213,17 +2151,6 @@ impl TaskService {
         kind: api_types::FailureKind,
         message: String,
     ) -> Result<()> {
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::MarkReviewed,
-        ];
-        if kind == api_types::FailureKind::ReviewNeedsOwner {
-            recovery_actions.push(api_types::RecoveryAction::DeferToFollowUp);
-        }
-        recovery_actions.extend([
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]);
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: kind,
             blocking_reason: kind.to_string(),
@@ -2239,7 +2166,6 @@ impl TaskService {
             }),
             message: Some(message.clone()),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -2604,11 +2530,6 @@ impl TaskService {
                 "blocking_reason": reason,
                 "message": reason,
                 "detected_at": now_rfc3339(),
-                "recovery_actions": [
-                    api_types::RecoveryAction::ResetRetryWindow,
-                    api_types::RecoveryAction::ProceedOnce,
-                    api_types::RecoveryAction::OpenInteractive,
-                ],
             });
             // A stale recovery snapshot must not annotate a successor state
             // or execution. Let the caller retry from current authority.
@@ -2949,26 +2870,8 @@ pub(crate) fn exact_review_for_execution<'a>(
 /// multiple reviewer attempts may inspect the same candidate, while only the
 /// durable reviewer/auditor execution binding identifies the attempt whose
 /// session a recovery request would resume.
-pub(crate) async fn terminal_review_is_bound_to_execution(
-    db: &SqliteDb,
-    execution: &Execution,
-) -> Result<bool> {
-    if !matches!(
-        execution.role.as_str(),
-        crate::workflow::default_roles::REVIEWER | crate::workflow::default_roles::AUDITOR
-    ) {
-        return Ok(false);
-    }
-    let reviews = ReviewRepo::list_by_task(db, &execution.task_id).await?;
-    Ok(
-        exact_review_for_execution(execution, &reviews).is_some_and(|review| {
-            matches!(
-                review.status,
-                ReviewStatus::Passed | ReviewStatus::Failed | ReviewStatus::Cancelled
-            )
-        }),
-    )
-}
+
+
 
 fn exact_review_binding_matches(execution: &Execution, review: &Review) -> bool {
     if review.reviewer_execution_id.is_some() || review.auditor_execution_id.is_some() {
@@ -3201,6 +3104,8 @@ fn truncate_on_char_boundary(value: &str, limit: usize) -> &str {
     }
     &value[..end]
 }
+
+
 
 #[cfg(test)]
 mod reviewer_message_tests {

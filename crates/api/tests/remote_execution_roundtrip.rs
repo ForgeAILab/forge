@@ -596,9 +596,9 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
     let recovery_task_id = task_id.clone();
     let recovered = tokio::spawn(async move {
         task_service
-            .recover_task(
+            .test_apply_action(
                 recovery_task_id,
-                api_types::RecoveryAction::Reexecute,
+                api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
                 Some("owner reconnected".into()),
                 None,
             )

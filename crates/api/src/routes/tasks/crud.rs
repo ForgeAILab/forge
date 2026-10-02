@@ -387,37 +387,6 @@ pub async fn archive_task(
     ))
 }
 
-pub async fn advance_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TaskResponse>> {
-    let task = state.task_service.advance_to_next_state(id).await?;
-    Ok(Json(
-        task_response(&state.db, &state.workspace_backend_router, task).await?,
-    ))
-}
-
-pub async fn recover_task(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<RecoverTaskRequest>,
-) -> ApiResult<Json<TaskResponse>> {
-    // Capacity-only refusals are accepted with the queued Task snapshot.
-    let task = state
-        .task_service
-        .recover_task(id, body.action, body.reason, body.context)
-        .await
-        .map_err(|error| match &error {
-            ServiceError::InvalidOperation { message } if message.contains("terminal status") => {
-                ApiError::conflict_with_code("task.terminal", message.clone())
-            }
-            _ => ApiError::from(error),
-        })?;
-    Ok(Json(
-        task_response(&state.db, &state.workspace_backend_router, task).await?,
-    ))
-}
-
 pub async fn duplicate_task(
     State(state): State<AppState>,
     Path(id): Path<String>,

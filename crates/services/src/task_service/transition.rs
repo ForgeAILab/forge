@@ -34,9 +34,10 @@ impl TaskService {
         &self,
         task_id: String,
         new_status: TaskStatus,
-        options: TransitionOptions,
+        mut options: TransitionOptions,
         plan_publication_execution_id: Option<&str>,
     ) -> Result<TransitionResult> {
+        if Self::task_action_command_active() { options.defer_dispatch_seconds = Some(0); }
         let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?

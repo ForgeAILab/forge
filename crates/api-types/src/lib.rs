@@ -138,16 +138,16 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");
+    ActionParameter::export().expect("export ActionParameter");
+    Offer::export().expect("export Offer");
+    ActionAuthority::export().expect("export ActionAuthority");
     TaskAction::export().expect("export TaskAction");
     TaskActionsResponse::export().expect("export TaskActionsResponse");
     EffectiveCoderSource::export().expect("export EffectiveCoderSource");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
-    RecoveryAction::export().expect("export RecoveryAction");
     ExecutionBehaviorKind::export().expect("export ExecutionBehaviorKind");
     ExecutionBehavior::export().expect("export ExecutionBehavior");
-    ExecutionActionKind::export().expect("export ExecutionActionKind");
-    ExecutionAction::export().expect("export ExecutionAction");
     BlockingArtifact::export().expect("export BlockingArtifact");
     TaskBlockingAnnotation::export().expect("export TaskBlockingAnnotation");
     InterruptionMetadata::export().expect("export InterruptionMetadata");
@@ -362,7 +362,6 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     TransitionTaskRequest::export().expect("export TransitionTaskRequest");
     AuthorType::export().expect("export AuthorType");
     TaskMediaResponse::export().expect("export TaskMediaResponse");
-    RecoverTaskRequest::export().expect("export RecoverTaskRequest");
     TaskActionRequest::export().expect("export TaskActionRequest");
     TestLifecycleHookRequest::export().expect("export TestLifecycleHookRequest");
     CreateCommentRequest::export().expect("export CreateCommentRequest");
@@ -662,3 +661,12 @@ fn export_typescript_to(out_dir: &std::path::Path) {
 }
 
 pub mod execution_outbox;
+
+#[test]
+fn export_bindings_remove_retired_action_types() {
+    let root = std::env::var_os("TS_RS_EXPORT_DIR").expect("binding export directory");
+    for name in ["RecoveryAction", "ExecutionActionKind", "ExecutionAction", "WorkflowExceptionAction", "RecoverTaskRequest"] {
+        let path = std::path::Path::new(&root).join(format!("{name}.ts"));
+        if path.exists() { std::fs::remove_file(path).expect("remove retired generated type"); }
+    }
+}

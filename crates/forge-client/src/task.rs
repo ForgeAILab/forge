@@ -55,8 +55,17 @@ pub enum TaskCmd {
         status: String,
         version: i64,
     },
-    Cancel {
+    Actions { id: String },
+    Action {
         id: String,
+        #[arg(value_parser = ["start", "hold", "release", "retry", "send_back", "approve", "restart", "cancel"])]
+        verb: String,
+        #[arg(long)] version: Option<i64>,
+        #[arg(long)] fresh_session: Option<bool>,
+        #[arg(long)] refresh_workspace: Option<bool>,
+        #[arg(long)] reset_budget: Option<bool>,
+        #[arg(long)] guidance: Option<String>,
+        #[arg(long = "override")] override_checks: bool,
     },
     PromptPreview {
         task_id: String,
@@ -167,10 +176,21 @@ impl TaskArgs {
                     .await?;
                 print_task(output, &response.task)
             }
-            TaskCmd::Cancel { id } => {
-                let task: TaskResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/cancel"), &json!({}))
-                    .await?;
+            TaskCmd::Actions { id } => {
+                let response: api_types::TaskActionsResponse = client.get(&format!("/api/v1/tasks/{id}/actions")).await?;
+                print_json(&response)
+            }
+            TaskCmd::Action { id, verb, version, fresh_session, refresh_workspace, reset_budget, guidance, override_checks } => {
+                let mut action = json!({ "verb": verb });
+                if verb == "retry" {
+                    for (name, value) in [("fresh_session", fresh_session), ("refresh_workspace", refresh_workspace), ("reset_budget", reset_budget)] { if let Some(value) = value { action[name] = json!(value); } }
+                    if let Some(guidance) = guidance { action["guidance"] = json!(guidance); }
+                }
+                if verb == "send_back" { action["guidance"] = json!(guidance.as_deref().unwrap_or("")); }
+                if verb == "approve" { action["override"] = json!(override_checks); }
+                let action: api_types::TaskAction = serde_json::from_value(action)?;
+                let version = match version { Some(version) => *version, None => client.get::<api_types::TaskActionsResponse>(&format!("/api/v1/tasks/{id}/actions")).await?.version };
+                let task: TaskResponse = client.post(&format!("/api/v1/tasks/{id}/actions"), &api_types::TaskActionRequest { action, version }).await?;
                 print_task(output, &task)
             }
             TaskCmd::PromptPreview {

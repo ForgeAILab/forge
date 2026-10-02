@@ -1,6 +1,7 @@
 use super::*;
 
 mod action_resolver_role_targeting;
+mod task_actions;
 mod diagnostics_exception;
 mod diagnostics_health;
 mod helpers;

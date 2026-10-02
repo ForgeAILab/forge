@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use api::AppState;
-use api_types::RejectGateRequest;
+use api_types::TaskActionRequest;
 use axum::extract::{Json, Path, State};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AssigneeKind, CreateProject,
@@ -55,11 +55,11 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     let rejected_review = drive_to_review(&service, &rejected_task_id).await;
     let retries_before_reject = remaining_review_retries(&db, &rejected_task_id).await;
 
-    let Json(rejection) = api::routes::tasks::reject_gate(
+    let Json(rejection) = api::routes::tasks::apply_task_action(
         State(api_state),
-        Path((rejected_task_id.clone(), default_states::REVIEW.to_owned())),
-        Json(RejectGateRequest {
-            reason: "failed CI".to_owned(),
+        Path(rejected_task_id.clone()),
+        Json(TaskActionRequest {
+            action: api_types::TaskAction::SendBack { guidance: "failed CI".to_owned() },
             version: rejected_review.version,
         }),
     )
@@ -68,7 +68,7 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
 
     assert_eq!(rejection.status, default_states::IN_PROGRESS);
     let rejection_log =
-        transition_log_for_reason(&db, &rejected_task_id, "gate rejected: failed CI").await;
+        transition_log_for_reason(&db, &rejected_task_id, "failed CI").await;
     assert_eq!(rejection_log.from_state, default_states::REVIEW);
     assert_eq!(rejection_log.to_state, default_states::IN_PROGRESS);
     assert!(

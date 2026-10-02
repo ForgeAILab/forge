@@ -2461,10 +2461,6 @@ impl TaskService {
             }),
             message: Some(message.clone()),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
         };
         let blocked_meta = json!({
             "reason": message,

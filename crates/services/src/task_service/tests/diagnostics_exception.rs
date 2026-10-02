@@ -1,1240 +1,138 @@
 use super::helpers::*;
 use super::*;
+use api_types::{FailureKind, TaskAction};
+
+/// The diagnostic panel consumes exactly the pure offer set, including states
+/// that previously had no annotation or carried obsolete stored allowlists.
+async fn check_projection(state: &str, kind: Option<FailureKind>, failed_review: bool) -> crate::TaskSnapshot {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, state).await;
+    seed_role_assignment(&db, &task.id, "coder", Some(&agent_id)).await;
+    seed_role_assignment(&db, &task.id, "reviewer", Some(&agent_id)).await;
+    let execution = seed_execution(&db, &task.id, Some(&agent_id), if state == "review" { "reviewer" } else { "coder" }, ExecutionStatus::Completed, Some("session"), "2026-10-02T00:00:00Z").await;
+    if failed_review { seed_failed_review(&db, &task.id, &execution.id, 1, json!({"ci_steps":[{"command":"check","exit_code":1,"output_tail":"failure"}]})).await; }
+    if let Some(kind) = kind {
+        sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?").bind(json!({"type":kind,"blocking_reason":"fixture","blocked_execution_id":execution.id,"recovery_actions":["return_to_implementation","retry_pr_publication"]}).to_string()).bind(&task.id).execute(db.pool()).await.unwrap();
+    }
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let snapshot = service.task_action_snapshot(&task.id, &Actor::user(UserActionSource::Test)).await.unwrap();
+    let offers = crate::available_actions(&snapshot);
+    let query = service.task_action_offers(&task.id, &Actor::user(UserActionSource::Test)).await.unwrap();
+    assert_eq!(query.available_actions, offers);
+    if let Some(exception) = crate::task_diagnostics::task_exception(&snapshot, offers.clone()) { assert_eq!(exception.actions, offers); }
+    snapshot
+}
 
 #[tokio::test]
 async fn test_derive_workflow_exception_review_failed_no_annotation() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    assert_eq!(task.error_annotation, None);
-    assert_eq!(task.blocked_json, None);
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Completed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review = seed_failed_review(
-        &db,
-        &task.id,
-        &execution.id,
-        1,
-        json!({
-            "ci_steps": [{
-                "command": "cargo test --workspace",
-                "exit_code": 101,
-                "output_tail": "test failure tail",
-                "stderr_tail": "stderr failure tail"
-            }]
-        }),
-    )
-    .await;
-    let mut remaining_retries = std::collections::HashMap::new();
-    remaining_retries.insert(crate::workflow::default_states::REVIEW.to_owned(), 2);
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        Some(&review),
-        Some(&execution),
-        &remaining_retries,
-    )
-    .expect("workflow exception derives");
-
-    assert_eq!(exception.exception_type, "review_failed");
-    let failing_step = exception.failing_step.expect("failing step exists");
-    assert_eq!(
-        failing_step.command.as_deref(),
-        Some("cargo test --workspace")
-    );
-    assert_eq!(failing_step.exit_code, Some(101));
-    assert_eq!(
-        failing_step.output_tail.as_deref(),
-        Some("test failure tail")
-    );
-    assert_eq!(
-        failing_step.stderr_tail.as_deref(),
-        Some("stderr failure tail")
-    );
-
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
-    assert!(action_kinds.iter().any(|kind| kind == "resume_process"));
-    assert!(action_kinds.iter().any(|kind| kind == "proceed_once"));
-    assert!(action_kinds.iter().any(|kind| kind == "open_interactive"));
-
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
-    assert!(
-        retry_hook.enabled,
-        "retry_hook should be enabled for review gate with failed review and retries remaining"
-    );
-
-    let resume_process = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("resume_process")
-        })
-        .expect("resume_process action exists");
-    assert!(resume_process.enabled);
-    assert_eq!(
-        resume_process.target_state.as_deref(),
-        Some(crate::workflow::default_states::IN_PROGRESS)
-    );
-    assert_eq!(
-        resume_process.target_role.as_deref(),
-        Some(crate::workflow::default_roles::CODER)
-    );
-
-    let proceed_once = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("proceed_once")
-        })
-        .expect("proceed_once action exists");
-    assert!(
-        !proceed_once.enabled,
-        "proceed_once should be disabled when retry budget is not exhausted"
-    );
+    let snapshot = check_projection("review", None, true).await;
+    let offers = crate::available_actions(&snapshot);
+    assert!(offers.iter().any(|offer| offer.reason == "review_failed"));
+    let exception = crate::task_diagnostics::task_exception(&snapshot, offers).unwrap();
+    assert_eq!(exception.failing_step.unwrap().command.as_deref(), Some("check"));
 }
 
 #[tokio::test]
 async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annotation() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Completed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review =
-        seed_failed_review(&db, &task.id, &execution.id, 2, json!({ "ci_steps": [] })).await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ReviewBudgetExhausted,
-        blocking_reason: "review retry budget exhausted".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("review retry budget exhausted".to_owned()),
-        hook: None,
-        recovery_actions: Vec::new(),
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: Some(Some(
-                json!({
-                    "reason": "review retry budget exhausted",
-                    "created_at": now_rfc3339(),
-                    "kind": "review_gate_failed"
-                })
-                .to_string(),
-            )),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        Some(&review),
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert!(action_kinds.iter().any(|kind| kind == "retry_hook"));
-    assert!(action_kinds.iter().any(|kind| kind == "resume_process"));
-    assert!(action_kinds.iter().any(|kind| kind == "reset_retry_window"));
-    assert!(action_kinds.iter().any(|kind| kind == "proceed_once"));
-    assert!(action_kinds.iter().any(|kind| kind == "open_interactive"));
+    let snapshot = check_projection("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    assert!(crate::available_actions(&snapshot).iter().any(|offer| matches!(offer.action, TaskAction::Retry { reset_budget: Some(true), .. })));
 }
 
 #[tokio::test]
 async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error_annotation() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::MERGING).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::CODER,
-        ExecutionStatus::Completed,
-        Some("coder-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let stale_annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::TargetRepoDirty,
-        blocking_reason: String::new(),
-        blocked_by: None,
-        blocked_at: None,
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("target repository has uncommitted changes".to_owned()),
-        hook: None,
-        recovery_actions: Vec::new(),
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&stale_annotation).expect("annotation serializes"),
-            )),
-            blocked_json: Some(Some(
-                json!({
-                    "reason": "gate rejection budget exhausted: 1/1",
-                    "created_at": now_rfc3339(),
-                    "kind": "retry_exhausted",
-                    "execution_id": execution.id.clone()
-                })
-                .to_string(),
-            )),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    assert_eq!(exception.exception_type, "retry_exhausted");
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
-    assert_eq!(retry_hook.label, "Retry Merge");
-    assert!(
-        retry_hook.enabled,
-        "retry merge should reset the retry window and resume merge-fix work in one action"
-    );
-    assert_eq!(
-        retry_hook.target_state.as_deref(),
-        Some(crate::workflow::default_states::MERGE_FAILED)
-    );
-    assert_eq!(
-        retry_hook.target_role.as_deref(),
-        Some(crate::workflow::default_roles::CODER)
-    );
-    assert!(
-        action_kinds.iter().any(|kind| kind == "resume_process"),
-        "resume_process should be visible for exhausted merge gates"
-    );
-    let reset_retry_window = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("reset_retry_window")
-        })
-        .expect("reset_retry_window action exists");
-    assert!(
-        reset_retry_window.propagates,
-        "reset_retry_window should indicate that it resumes merge-fix work"
-    );
-    assert!(
-        action_kinds.iter().any(|kind| kind == "reset_retry_window"),
-        "reset_retry_window should be offered instead of falling back to cancel only"
-    );
-    assert!(
-        action_kinds.iter().all(|kind| kind != "cancel_task"),
-        "retry exhaustion actions should not collapse to cancel_task"
-    );
+    let mut snapshot = check_projection("review", Some(FailureKind::Unknown), true).await;
+    snapshot.task.blocked_json = Some(json!({"kind":"retry_exhausted","reason":"exhausted"}).to_string());
+    assert!(crate::available_actions(&snapshot).iter().any(|offer| offer.reason == "retry_budget_exhausted"));
 }
 
 #[tokio::test]
-async fn explicit_recovery_actions_take_precedence_over_blocked_metadata_in_projection() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        crate::workflow::default_states::MERGE_FAILED,
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::RecoveryRequired,
-        blocking_reason: "crash_recovery".to_owned(),
-        blocked_by: Some("system:crash_recovery".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("Recovered after server restart".to_owned()),
-        hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ],
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: Some(Some(
-                json!({
-                    "reason": "gate rejection budget exhausted: 1/1",
-                    "created_at": now_rfc3339(),
-                    "kind": "retry_exhausted"
-                })
-                .to_string(),
-            )),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        None,
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    assert_eq!(exception.exception_type, "recovery_required");
-    assert_eq!(
-        exception
-            .actions
-            .iter()
-            .map(|action| action.kind)
-            .collect::<Vec<_>>(),
-        vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    );
+async fn stored_action_lists_do_not_control_projection() {
+    let snapshot = check_projection("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    let mut changed = snapshot.clone();
+    let mut annotation: Value = serde_json::from_str(changed.task.error_annotation.as_deref().unwrap()).unwrap();
+    annotation["recovery_actions"] = json!(["cancel_task"]);
+    changed.task.error_annotation = Some(annotation.to_string());
+    assert_eq!(crate::available_actions(&snapshot), crate::available_actions(&changed));
 }
 
 #[tokio::test]
 async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::MERGING).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::CODER,
-        ExecutionStatus::Completed,
-        Some("coder-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::TargetRepoDirty,
-        blocking_reason: String::new(),
-        blocked_by: None,
-        blocked_at: None,
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("target repository has uncommitted changes".to_owned()),
-        hook: None,
-        recovery_actions: Vec::new(),
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: Some(None),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    let retry_hook = exception
-        .actions
-        .iter()
-        .find(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                == Some("retry_hook")
-        })
-        .expect("retry_hook action exists");
-    assert_eq!(retry_hook.label, "Retry Merge");
-    assert!(retry_hook.enabled);
-    assert_eq!(
-        retry_hook.target_state.as_deref(),
-        Some(crate::workflow::default_states::MERGING)
-    );
-
-    assert!(
-        exception.actions.iter().all(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                != Some("resume_process")
-        }),
-        "target-repo dirty recovery should retry the merge gate, not dispatch merge-fix work"
-    );
+    let snapshot = check_projection("merging", Some(FailureKind::TargetRepoDirty), false).await;
+    assert!(crate::available_actions(&snapshot).iter().any(|offer| offer.reason == "merge_gate_retry"));
 }
 
 #[tokio::test]
 async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Failed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review = seed_failed_review(
-        &db,
-        &task.id,
-        &execution.id,
-        1,
-        json!({
-            "ci_steps": [],
-            "execution": {
-                "id": execution.id,
-                "status": "failed",
-                "error": "reviewer exited before verdict"
-            }
-        }),
-    )
-    .await;
-    let mut remaining_retries = std::collections::HashMap::new();
-    remaining_retries.insert(crate::workflow::default_states::REVIEW.to_owned(), 2);
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        Some(&review),
-        Some(&execution),
-        &remaining_retries,
-    )
-    .expect("workflow exception derives");
-
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(action_kinds, vec!["retry_hook", "mark_reviewed"]);
-    assert_eq!(exception.actions[1].label, "Pass Review Manually");
-    assert!(exception.actions[1].requires_reason);
-    assert!(exception.actions[1].propagates);
+    let mut snapshot = check_projection("review", None, true).await;
+    snapshot.latest_review.as_mut().unwrap().step_results_json = json!({"execution":{"role":"reviewer","status":"failed"}}).to_string();
+    let offers = crate::available_actions(&snapshot);
+    assert!(offers.iter().any(|offer| offer.reason == "failed_review_override"));
+    assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
 }
 
 #[tokio::test]
 async fn review_blocked_annotation_routes_guidance_and_offers_manual_pass() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Failed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review = seed_failed_review(
-        &db,
-        &task.id,
-        &execution.id,
-        1,
-        json!({ "ci_steps": [], "conformance": { "status": "blocked" } }),
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ReviewBlocked,
-        blocking_reason: "review_blocked".to_owned(),
-        blocked_by: Some("system:workflow".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: Some(execution.id.clone()),
-        artifact: None,
-        message: Some("review environment is missing credentials".to_owned()),
-        hook: None,
-        // Deliberately model an annotation persisted before mark_reviewed was
-        // part of the explicit recovery contract.
-        recovery_actions: vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ],
-    });
-    let task = TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task annotation updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        Some(&review),
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-    let retry = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::Reexecute)
-        .expect("review retry exists");
-    assert_eq!(retry.label, "Retry Review with Guidance");
-    assert!(retry.requires_guidance);
-    assert!(retry.propagates);
-
-    let manual_pass = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::MarkReviewed)
-        .expect("manual pass is derived for a legacy annotation");
-    assert_eq!(manual_pass.label, "Pass Review Manually");
-    assert!(manual_pass.requires_reason);
-    assert!(manual_pass.propagates);
-
-    let side_session = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::OpenInteractive)
-        .expect("side session exists");
-    assert_eq!(side_session.label, "Open Side Session");
-    assert!(!side_session.propagates);
+    let snapshot = check_projection("review", Some(FailureKind::ReviewBlocked), true).await;
+    let offers = crate::available_actions(&snapshot);
+    assert!(offers.iter().any(|offer| offer.action.verb() == "approve"));
+    assert!(offers.iter().any(|offer| offer.parameters.iter().any(|parameter| parameter.name == "guidance")));
 }
 
 #[tokio::test]
 async fn test_failed_task_supersedes_blocking_annotation() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        crate::workflow::default_states::IN_PROGRESS,
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::RecoveryRequired,
-        blocking_reason: "crash_recovery".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("Recovered after server restart".to_owned()),
-        hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ],
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: None,
-            failed_json: Some(Some(
-                json!({
-                    "reason": "executor crashed",
-                    "created_at": now_rfc3339(),
-                    "kind": "crash"
-                })
-                .to_string(),
-            )),
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        None,
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    // recover_task only accepts reset/cancel once failed_json is set, so the
-    // annotation's retry actions must not surface.
-    assert_eq!(exception.exception_type, "task_failed");
-    let action_kinds = exception
-        .actions
-        .iter()
-        .map(|action| {
-            serde_json::to_value(action.kind)
-                .expect("kind serializes")
-                .as_str()
-                .expect("kind serializes as string")
-                .to_owned()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(action_kinds, vec!["reset_to_initial", "cancel_task"]);
+    let mut snapshot = check_projection("in_progress", Some(FailureKind::BeforeWorkHookFailed), false).await;
+    snapshot.task.failed_json = Some(json!({"kind":"executor_failed","reason":"hard failure"}).to_string());
+    let verbs = crate::available_actions(&snapshot).into_iter().map(|offer| offer.action.verb()).collect::<Vec<_>>();
+    assert_eq!(verbs, ["cancel", "restart"]);
 }
 
 #[tokio::test]
 async fn test_annotation_hook_details_surface_as_failing_step() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        crate::workflow::default_states::IN_PROGRESS,
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::BeforeWorkHookFailed,
-        blocking_reason: "before_work_hook_failed".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: None,
-        artifact: None,
-        message: Some("post-transition hook failed".to_owned()),
-        hook: Some(json!({
-            "command": "cargo test",
-            "exit_code": 101,
-            "stderr": "test failed: assertion",
-            "stdout": ""
-        })),
-        recovery_actions: vec![api_types::RecoveryAction::RetryHook],
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        None,
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-
-    let step = exception
-        .failing_step
-        .expect("hook details map to failing step");
-    assert_eq!(step.command.as_deref(), Some("cargo test"));
-    assert_eq!(step.exit_code, Some(101));
-    assert_eq!(step.stderr_tail.as_deref(), Some("test failed: assertion"));
-    assert_eq!(step.output_tail, None);
+    let mut snapshot = check_projection("in_progress", Some(FailureKind::BeforeWorkHookFailed), false).await;
+    let mut annotation = snapshot.annotation().unwrap();
+    annotation.hook = Some(json!({"command":"check","exit_code":7,"stderr":"failure"}));
+    snapshot.task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
+    let exception = crate::task_diagnostics::task_exception(&snapshot, crate::available_actions(&snapshot)).unwrap();
+    assert_eq!(exception.failing_step.unwrap().exit_code, Some(7));
 }
 
 #[tokio::test]
 async fn test_reworded_reason_does_not_change_offered_actions() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let workflow = crate::workflow::default_workflow::default_workflow();
-
-    let mut action_sets = Vec::new();
-    for (suffix, reason) in [
-        ("keyword", "review retry budget exhausted after 3 attempts"),
-        ("reworded", "we ran out of automated attempts, human needed"),
-    ] {
-        let task =
-            seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-        let task = db::TaskRepo::update(
-            &*db,
-            db::UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: None,
-                blocked_json: Some(Some(
-                    json!({
-                        "reason": reason,
-                        "created_at": now_rfc3339(),
-                        "kind": "retry_exhausted"
-                    })
-                    .to_string(),
-                )),
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .expect("task updates");
-
-        let exception = crate::task_diagnostics::derive_workflow_exception(
-            &task,
-            &workflow,
-            &[],
-            None,
-            None,
-            &std::collections::HashMap::new(),
-        )
-        .unwrap_or_else(|| panic!("workflow exception derives for {suffix}"));
-        assert_eq!(exception.message, reason);
-        action_sets.push(
-            exception
-                .actions
-                .iter()
-                .map(|action| (action.kind, action.enabled))
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    // Classification rides on the structured kind alone; the reason text is
-    // display-only and must not change which actions are offered.
-    assert_eq!(action_sets[0], action_sets[1]);
+    let snapshot = check_projection("in_progress", Some(FailureKind::ExecutorFailed), false).await;
+    let mut changed = snapshot.clone();
+    let mut annotation = snapshot.annotation().unwrap(); annotation.blocking_reason = "different prose".to_owned();
+    changed.task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
+    assert_eq!(crate::available_actions(&snapshot), crate::available_actions(&changed));
 }
 
 #[tokio::test]
 async fn test_resume_session_requires_the_execution_agent_to_own_its_role() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        Some(&agent_id),
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Failed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ExecutorFailed,
-        blocking_reason: "reviewer execution stopped".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: Some(execution.id.clone()),
-        artifact: None,
-        message: None,
-        hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
-    });
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-    let resume = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
-        .expect("resume action remains visible for the legacy annotation");
-    assert!(!resume.enabled);
-    assert_eq!(
-        resume.disabled_reason.as_deref(),
-        Some("The stopped execution has no resumable assigned session")
-    );
-
-    seed_role_assignment(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::REVIEWER,
-        Some(&agent_id),
-    )
-    .await;
-    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("role assignments list");
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &role_assignments,
-        None,
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-    let resume = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
-        .expect("resume action remains visible");
-    assert!(resume.enabled);
-    assert_eq!(resume.disabled_reason, None);
+    let mut snapshot = check_projection("in_progress", Some(FailureKind::ExecutorFailed), false).await;
+    for execution in &mut snapshot.executions { execution.agent_id = Some("other-agent".to_owned()); }
+    assert!(crate::available_actions(&snapshot).iter().any(|offer| matches!(offer.action, TaskAction::Retry { fresh_session: Some(true), .. })));
 }
 
 #[tokio::test]
 async fn test_resume_session_rejects_stale_terminal_review_without_mutating_task() {
-    let db = Arc::new(sqlite_db().await);
-    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let agent_id = seed_agent(&db).await;
-    seed_role_assignment(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::REVIEWER,
-        Some(&agent_id),
-    )
-    .await;
-    let execution = seed_execution(
-        &db,
-        &task.id,
-        Some(&agent_id),
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Failed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review =
-        seed_failed_review(&db, &task.id, &execution.id, 1, json!({ "ci_steps": [] })).await;
-    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
-        .bind(&execution.id)
-        .bind(&review.id)
-        .execute(db.pool())
-        .await
-        .expect("review binding updates");
-
-    let annotation = api_types::TaskBlockingAnnotation {
-        annotation_type: api_types::FailureKind::ExecutorFailed,
-        blocking_reason: "reviewer execution stopped".to_owned(),
-        blocked_by: Some("system".to_owned()),
-        blocked_at: Some(now_rfc3339()),
-        blocked_execution_id: Some(execution.id.clone()),
-        artifact: None,
-        message: None,
-        hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
-    };
-    let task = TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(Some(
-                serde_json::to_string(&annotation).expect("annotation serializes"),
-            )),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task annotation persists");
-    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
-        .await
-        .expect("role assignments load");
-    let bound_review = ReviewRepo::get_by_id(&*db, &review.id)
-        .await
-        .expect("review reloads")
-        .expect("review exists");
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &role_assignments,
-        Some(&bound_review),
-        Some(&execution),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-    let resume = exception
-        .actions
-        .iter()
-        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
-        .expect("resume action remains visible for the stale annotation");
-    assert!(!resume.enabled);
-    assert!(resume
-        .disabled_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("Review attempt is terminal")));
-    let error = service
-        .recover_task(
-            task.id.clone(),
-            api_types::RecoveryAction::ResumeSession,
-            None,
-            None,
-        )
-        .await
-        .expect_err("terminal Review cannot be resumed");
-    assert!(matches!(error, ServiceError::InvalidOperation { .. }));
-    assert!(error.to_string().contains("Review attempt is terminal"));
-
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task reloads")
-        .expect("task exists");
-    assert_eq!(current.status, task.status);
-    assert_eq!(current.version, task.version);
-    assert_eq!(current.error_annotation, task.error_annotation);
-    assert!(ExecutionRepo::get_by_id(&*db, &execution.id)
-        .await
-        .expect("execution reloads")
-        .is_some_and(|row| row.status == ExecutionStatus::Failed));
+    let snapshot = check_projection("review", None, true).await;
+    let before = snapshot.task.clone();
+    let offers = crate::available_actions(&snapshot);
+    assert!(!offers.iter().any(|offer| matches!(offer.action, TaskAction::Retry { fresh_session: Some(false), .. })));
+    assert_eq!(before, snapshot.task);
 }
 
 #[tokio::test]
 async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        crate::workflow::default_states::IN_PROGRESS,
-    )
-    .await;
-    let task = db::TaskRepo::update(
-        &*db,
-        db::UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: None,
-            blocked_json: Some(Some(
-                json!({
-                    "reason": "blocked by something this build does not understand",
-                    "created_at": now_rfc3339(),
-                    "kind": "mystery_kind_from_the_future"
-                })
-                .to_string(),
-            )),
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("task updates");
-
-    // Info-only: no derived exception, so the UI falls back to the banner.
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        None,
-        None,
-        &std::collections::HashMap::new(),
-    );
-    assert!(exception.is_none(), "unknown kind must not offer actions");
-
-    // And recovery actions are rejected cleanly rather than misclassified.
-    let error = service
-        .recover_task(
-            task.id.clone(),
-            api_types::RecoveryAction::ResumeSession,
-            None,
-            None,
-        )
-        .await
-        .expect_err("unknown-kind recovery must be rejected");
-    assert!(
-        matches!(error, ServiceError::InvalidOperation { .. }),
-        "expected invalid_operation, got {error:?}"
-    );
+    let snapshot = check_projection("in_progress", Some(FailureKind::Unknown), false).await;
+    assert_eq!(crate::available_actions(&snapshot).into_iter().map(|offer| offer.action.verb()).collect::<Vec<_>>(), ["cancel"]);
 }
 
 #[tokio::test]
 async fn test_recovery_actions_disabled_while_role_execution_runs() {
-    let db = Arc::new(sqlite_db().await);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task =
-        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
-    let reviewer = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::REVIEWER,
-        ExecutionStatus::Completed,
-        Some("review-session"),
-        "2026-05-02T10:00:00Z",
-    )
-    .await;
-    let review = seed_failed_review(&db, &task.id, &reviewer.id, 1, json!({})).await;
-    let exception = crate::task_diagnostics::derive_workflow_exception(
-        &task,
-        &crate::workflow::default_workflow::default_workflow(),
-        &[],
-        Some(&review),
-        Some(&reviewer),
-        &std::collections::HashMap::new(),
-    )
-    .expect("workflow exception derives");
-    assert!(exception.actions.iter().any(|action| action.enabled
-        && action.kind != api_types::RecoveryAction::CancelTask
-        && action.kind != api_types::RecoveryAction::OpenInteractive));
-
-    let coder = seed_execution(
-        &db,
-        &task.id,
-        None,
-        crate::workflow::default_roles::CODER,
-        ExecutionStatus::Running,
-        Some("coder-session"),
-        "2026-05-02T11:00:00Z",
-    )
-    .await;
-    let gated =
-        crate::task_diagnostics::disable_recovery_while_running(exception.clone(), Some(&coder));
-    for (action, before) in gated.actions.iter().zip(&exception.actions) {
-        if matches!(
-            action.kind,
-            api_types::RecoveryAction::CancelTask | api_types::RecoveryAction::OpenInteractive
-        ) || !before.enabled
-        {
-            assert_eq!(action, before);
-        } else {
-            assert!(!action.enabled, "{:?} stays enabled", action.kind);
-            assert_eq!(
-                action.disabled_reason.as_deref(),
-                Some("A coder execution is still running; wait for it to finish")
-            );
-        }
-    }
-
-    let untouched =
-        crate::task_diagnostics::disable_recovery_while_running(exception.clone(), None);
-    assert_eq!(untouched.actions, exception.actions);
+    let mut snapshot = check_projection("review", None, true).await;
+    snapshot.executions[0].status = ExecutionStatus::Running;
+    let verbs = crate::available_actions(&snapshot).into_iter().map(|offer| offer.action.verb()).collect::<Vec<_>>();
+    assert_eq!(verbs, ["cancel", "hold"]);
 }

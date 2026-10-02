@@ -1124,7 +1124,7 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
                 .unwrap_or_else(|| "blocked".to_owned()),
             headline: "Task blocked".to_owned(),
             detail,
-            retryable: !interruption.recovery_actions.is_empty(),
+            retryable: task.available_actions.iter().any(|offer| matches!(offer.action.verb(), "retry" | "restart" | "send_back")),
         })
     });
     TaskSnapshot {
@@ -1139,8 +1139,8 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
         blocker,
         retryable: task.available_actions.iter().any(|action| {
             matches!(
-                action,
-                services::solo_session::SoloTaskAction::RequestChanges
+                action.action,
+                api_types::TaskAction::SendBack { .. }
             )
         }),
     }

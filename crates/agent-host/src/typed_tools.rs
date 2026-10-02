@@ -3556,7 +3556,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_recovery_lifts_flat_provider_fields_into_payload() {
-        let operation = crate::operation_catalog::TASK_RECOVER_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3622,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_cancellation_lifts_the_versioned_payload_fields() {
-        let operation = crate::operation_catalog::TASK_CANCEL_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {

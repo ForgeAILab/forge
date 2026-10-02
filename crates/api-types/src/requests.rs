@@ -7,7 +7,7 @@ use crate::{
     LifecycleEvent,
 };
 use crate::{
-    InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
+    InitialRoleAssignment, TaskAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
     TaskType,
 };
 
@@ -118,21 +118,12 @@ pub enum TransitionSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct RecoverTaskRequest {
-    /// Applied immediately, or queued for dispatch when agent capacity is full.
-    pub action: RecoveryAction,
-    pub reason: Option<String>,
-    pub context: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct TaskActionRequest {
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub version: Option<i64>,
+    pub action: TaskAction,
+    #[ts(type = "number")]
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

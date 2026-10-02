@@ -1928,11 +1928,16 @@ impl AttentionService {
                 .get("interruption")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let recovery_actions = interruption
-                .get("recovery_actions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let available_actions = if event.entity_type == "task" {
+                if let Some(task) = db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await? {
+                    if let Some(project) = db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
+                        let actor = api_types::Actor::user(api_types::UserActionSource::Api);
+                        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+                        let snapshot = crate::task_actions::load_snapshot(&self.db, task, workflow, &actor).await?;
+                        crate::available_actions(&snapshot)
+                    } else { Vec::new() }
+                } else { Vec::new() }
+            } else { Vec::new() };
             let requires_intervention = event_payload
                 .get("requires_intervention")
                 .and_then(Value::as_bool)
@@ -1956,7 +1961,7 @@ impl AttentionService {
                 "interruption": interruption,
                 "recovery": {
                     "requires_intervention": requires_intervention,
-                    "actions": recovery_actions,
+                    "actions": available_actions,
                     "automatic_retry": false,
                 },
             }))

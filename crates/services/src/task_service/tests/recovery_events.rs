@@ -34,9 +34,9 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
     let mut rx = event_bus.subscribe();
 
     service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: None, reset_budget: Some(true), guidance: None },
             Some("reason".to_owned()),
             None,
         )
@@ -153,9 +153,9 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart,
             None,
             None,
         )
@@ -189,9 +189,9 @@ async fn test_reset_to_initial_keeps_assignee_for_non_workspace_failure() {
         .expect("task fails");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart,
             None,
             None,
         )

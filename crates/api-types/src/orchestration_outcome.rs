@@ -23,6 +23,7 @@ pub enum OutcomeCode {
     TransientFailure,
     InternalFailure,
     ValidationError,
+    ActionUnavailable,
 }
 
 impl OutcomeCode {
@@ -41,6 +42,7 @@ impl OutcomeCode {
             Self::TransientFailure => "transient_failure",
             Self::InternalFailure => "internal_failure",
             Self::ValidationError => "validation_error",
+            Self::ActionUnavailable => "action_unavailable",
         }
     }
 }
@@ -617,7 +619,8 @@ impl OrchestrationOutcome {
             | OutcomeCode::NotFound
             | OutcomeCode::TransientFailure
             | OutcomeCode::InternalFailure
-            | OutcomeCode::ValidationError => OutcomeStatus::Failed,
+            | OutcomeCode::ValidationError
+            | OutcomeCode::ActionUnavailable => OutcomeStatus::Failed,
         }
     }
 }

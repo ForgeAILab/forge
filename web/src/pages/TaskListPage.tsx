@@ -4,7 +4,7 @@ import {
   useAgentsQuery,
   useArchiveTask,
   useAssignRole,
-  useCancelTask,
+  useTaskAction,
   useMembersQuery,
   useProjectAgentsQuery,
   useRemoveRole,
@@ -97,7 +97,7 @@ export function TaskListPage({
   const agentsQuery = useAgentsQuery()
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
-  const cancelTask = useCancelTask()
+  const cancelTask = useTaskAction()
   const archiveTask = useArchiveTask()
   const assignRole = useAssignRole()
   const removeRole = useRemoveRole()
@@ -186,7 +186,7 @@ export function TaskListPage({
 
   const cancelSelected = () => {
     for (const task of cancellableSelected) {
-      cancelTask.mutate(task.id, {
+      cancelTask.mutate({ taskId: task.id, version: task.version, action: { verb: 'cancel' } }, {
         onError: (error) => toastApiError(error, 'Task cancellation failed'),
       })
     }

@@ -2668,98 +2668,25 @@ workflow whose planning gate sets `requires_user_approval` keeps the Task in
 planning with `awaiting_human = true`; the dispatcher does not start or
 relaunch a non-reviewer role while that human decision is outstanding.
 
-## Task intent actions
+## Task actions
 
-Intent endpoints accept an optional `TaskActionRequest` body:
+`GET /api/v1/tasks/{id}/actions` returns `{available_actions: Offer[], version}` for the caller. Offers contain the closed action object, meaningful parameter descriptors and boolean choices, authority, a stable reason, a label, and an optional pinned execution. Task responses reuse them in `available_actions`, `execution_actions`, and `workflow_exception.actions`.
 
-```json
-{ "reason": "ready for review", "version": 7 }
-```
-
-Both fields are optional. Successful responses are the normal `TaskResponse`.
-The action service resolves the project's workflow at request time, so clients
-do not need to encode concrete state names. `start` claims an available agent
-when needed and enters the first claimable active/gate state; `submit` follows
-the active state's `accept` trigger; `approve` and `request-changes` use the
-latest awaiting-human review when present and otherwise use gate capabilities.
-`pause` stops the running execution without a state transition and records a
-manual-stop annotation plus an audit comment. `resume` uses the existing
-session-follow-up/recovery primitives and falls back to a fresh dispatch.
-The manual-stop annotation keeps recovery controls available to the user;
-it does not itself request a Project-Agent recovery wake. A non-manual blocking
-annotation does not advertise the generic `resume` action; clients use the typed
-actions in `workflow_exception` instead, so a displayed recovery action cannot
-be a successful no-op. The `manual_stop` annotation is the exception: it keeps
-generic `resume` available so a user pause can continue the existing session
-(or fall back to a fresh dispatch). `submit` is offered only after the current
-role's agent execution has completed and no execution is running; an assigned,
-never-run Task remains on the automatic `start`/dispatch path.
-
-`GET /api/v1/tasks/{id}/actions` returns two deliberately separate authority
-sets:
+`POST /api/v1/tasks/{id}/actions` applies one offer at an exact version:
 
 ```json
-{
-  "available_actions": ["cancel"],
-  "recovery_actions": ["retry_hook", "cancel_task"]
-}
+{"action":{"verb":"retry","fresh_session":true,"guidance":"The environment is repaired."},"version":7}
 ```
 
-`available_actions` contains workflow intents. `recovery_actions` is the closed,
-typed allowlist from the current blocking annotation. When that list is
-non-empty, `POST /api/v1/tasks/{id}/recover` rejects every action outside it
-without clearing or otherwise mutating the annotation. `mark_reviewed` is the
-one state-derived exception for a Task in `review` whose latest Review is
-failed, including Tasks carrying an older `review_blocked` annotation that
-predates the action. It requires a non-empty `reason`, appends a new passed
-Review attempt with a user manual-override record, and preserves the failed
-attempt as immutable history. It is rejected while a reviewer or auditor
-execution is running.
+The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, and `guidance`. Send-back requires guidance; approval requires `override`. Only the owner may override. Copy an offered action instead of reconstructing eligibility from status.
 
-`POST /api/v1/tasks/{id}/recover` returns `200` with the normal `TaskResponse`
-when the recovery can run immediately or its only refusal is agent capacity
-(including a configured daemon session cap). A capacity-bound recovery clears
-the blocking annotation and persists the selected action, reason, and context
-for the dispatcher to apply when a slot becomes available. Its
-`workflow_health.kind` is `waiting_for_agent` with label `Retry Queued`.
-Session resumes keep their session lineage; re-execution keeps the supplied
-guidance. The dispatcher rechecks admission before launching queued recovery.
-Repeating the same recovery while it is queued returns the queued Task with
-`200` and preserves the original intent. Resume fallback launches use this
-same capacity queue and retain their session lineage and guidance. Only the
-queued replay's own execution admission consumes the intent; an unrelated
-execution preserves it for reconciliation. A permanent replay refusal restores
-the saved blocker with the refusal as its reason and removes the queue entry.
-Paused or offline Agents are refused rather than shown as waiting for capacity,
-including when availability changes while recovery is queued. Other refusals
-retain their existing errors and do not queue the action.
+Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Unknown verbs and malformed payloads are schema errors.
 
-For `review_needs_owner`, the recovery allowlist is `reexecute`,
-`mark_reviewed`, `defer_to_follow_up`, `open_interactive`, and `cancel_task`.
-`reexecute` takes guidance in `context`. `defer_to_follow_up` requires a
-non-empty `reason`, creates a linked `backlog` Task in the same Project with
-the parked finding in its description, and records a manual review pass naming
-that follow-up so the original proceeds to merge. Both effects commit atomically.
+Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate.
 
-Task `workflow_health` also represents active non-agent work. A running
-interactive execution reports `kind: "running"`, label `Interactive`. A
-deferred execution retry reports `kind: "waiting_for_agent"` with label
-`Retry Scheduled` before its eligibility time and `Retry Queued` afterward;
-the latter means it is waiting for capacity, not wedged or idle. Provider
-usage-limit retries include their capacity reason and scheduled time in the
-health message, and only become blocked once execution retries are exhausted.
+The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
-When an action is not available, the endpoint returns `409` with
-`code: "task_action.unavailable"` and structured `details`:
-
-```json
-{
-  "available_actions": ["cancel", "start"],
-  "reason": "action 'approve' is not available while task is in Active state 'working'"
-}
-```
-
-The raw `/transition` endpoint remains available for advanced workflow clients.
+MCP and native coordination use `task.action` with `task_id`, the action object, and `version`. Task reads include caller-filtered offers. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
 
 ## Task board snapshots and moves
 

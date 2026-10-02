@@ -2277,13 +2277,7 @@ async fn coordination_root_merge_conflict_becomes_manual_repair_block() {
         panic!("coordination merge block must be typed")
     };
     assert_eq!(annotation.blocked_by.as_deref(), Some("coordination_root"));
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
 }
 
 #[tokio::test]
@@ -2338,13 +2332,7 @@ async fn ordinary_merge_conflict_parks_for_manual_repair_and_invalidates_review(
         annotation.blocked_by.as_deref(),
         Some("manual_workspace_repair")
     );
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
 }
 
 /// Two sibling Tasks each add an entry to the same export list; the first

@@ -122,9 +122,9 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
     );
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: None, reset_budget: Some(true), guidance: None },
             Some("reason".to_owned()),
             None,
         )
@@ -231,7 +231,7 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
         artifact: None,
         message: Some("merge-fix retry budget exhausted".to_owned()),
         hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResetRetryWindow],
+
     });
     let task = TaskRepo::update(
         &*db,
@@ -262,18 +262,18 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
     .expect("merge budget block sets");
 
     let actions = service
-        .available_task_actions(&task.id)
+        .test_action_values(&task.id)
         .await
         .expect("task actions resolve");
     assert!(
-        !actions.contains(&api_types::TaskAction::Resume),
+        !actions.contains(&api_types::TaskAction::Release),
         "a blocked gate must advertise typed recovery instead of a no-op resume"
     );
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: None, reset_budget: Some(true), guidance: None },
             Some("retry the merge repair".to_owned()),
             None,
         )
@@ -338,7 +338,7 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
         artifact: None,
         message: Some("Recovered after server restart".to_owned()),
         hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResetToInitial],
+
     });
     TaskRepo::update(
         &*db,
@@ -362,9 +362,9 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
     .expect("recovery annotation records");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart,
             Some("restart from todo".to_owned()),
             None,
         )
@@ -410,9 +410,9 @@ async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window(
     let task = set_retry_exhausted_metadata(&db, &task).await;
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ProceedOnce,
+            api_types::TaskAction::Approve { override_checks: true },
             Some("allow one focused repair".to_owned()),
             Some("address the latest review finding".to_owned()),
         )
@@ -481,9 +481,9 @@ async fn test_resume_process_moves_failed_review_back_to_in_progress() {
     .await;
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResumeProcess,
+            api_types::TaskAction::retry(),
             Some("send failed review back to coder".to_owned()),
             None,
         )
