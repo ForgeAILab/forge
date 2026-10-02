@@ -1600,6 +1600,8 @@ pub struct AgentChatTurnJob {
     pub usage_limit_deferral_count: i64,
     pub usage_limit_first_deferred_at: Option<String>,
     /// Derived from later turns for this message or any later chat message.
+    /// Computed only for failed or cancelled turns, the ones `retry_action`
+    /// consults; `false` for every other status.
     pub retry_superseded: bool,
     pub correlation_id: String,
     pub causation_id: Option<String>,

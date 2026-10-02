@@ -1095,17 +1095,23 @@ pub async fn usage_aggregate_for_operations(db: &db::SqliteDb) -> Result<UsageAg
     )
     .fetch_all(db.pool())
     .await?;
-    let mut invocations = Vec::new();
-    let mut events_by_invocation = HashMap::new();
-    for row in source_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
-        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
-        {
-            let events = list_effective_usage_events(db, &invocation).await?;
-            events_by_invocation.insert(invocation.id.clone(), events);
-            invocations.push(invocation);
-        }
-    }
+    let source_ids = source_rows
+        .iter()
+        .map(|row| sqlx::Row::try_get(row, "source_id"))
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    // Operations is polled: read the ledger in id batches (the Task path's
+    // readers) instead of four statements per invocation.
+    let invocations = db.usage_invocations_for_sources(&source_ids).await?;
+    let mut batched_events = effective_usage_events_for_invocations(db, &invocations).await?;
+    let events_by_invocation = invocations
+        .iter()
+        .map(|invocation| {
+            (
+                invocation.id.clone(),
+                batched_events.remove(&invocation.id).unwrap_or_default(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut domain_runs = invocations
         .iter()
         .map(|invocation| UsageDomainRun {
@@ -1959,9 +1965,95 @@ async fn old_usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Resul
     aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
 }
 
+/// The per-invocation walk the Operations summary used before it was batched.
+#[cfg(test)]
+pub(crate) async fn per_invocation_usage_aggregate_for_operations(
+    db: &db::SqliteDb,
+) -> Result<UsageAggregate> {
+    let source_rows = sqlx::query(
+        "SELECT DISTINCT source_id FROM usage_invocation
+         UNION SELECT DISTINCT source_id FROM usage_event
+         ORDER BY source_id ASC",
+    )
+    .fetch_all(db.pool())
+    .await?;
+    let mut invocations = Vec::new();
+    let mut events_by_invocation = HashMap::new();
+    for row in source_rows {
+        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
+        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
+        {
+            let events = list_effective_usage_events(db, &invocation).await?;
+            events_by_invocation.insert(invocation.id.clone(), events);
+            invocations.push(invocation);
+        }
+    }
+    let mut domain_runs = invocations
+        .iter()
+        .map(|invocation| UsageDomainRun {
+            surface: invocation.surface,
+            source_id: invocation.source_id.clone(),
+            pending: false,
+        })
+        .collect::<Vec<_>>();
+    let execution_rows = sqlx::query("SELECT id, status FROM execution")
+        .fetch_all(db.pool())
+        .await?;
+    for row in execution_rows {
+        let source_id: String = sqlx::Row::try_get(&row, "id")?;
+        let status: String = sqlx::Row::try_get(&row, "status")?;
+        domain_runs.push(UsageDomainRun {
+            surface: DbUsageSurface::TaskExecution,
+            source_id,
+            pending: status == "running",
+        });
+    }
+    aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
+}
+
 #[cfg(test)]
 mod task_read_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn usage_projection_operations_batches_match_per_invocation_reference() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('usage-project', 'Usage', 'now', 'now')").execute(db.pool()).await.unwrap();
+        // 420 sources and 1,680 events cross every id-batch boundary; each
+        // source has two attempts, one execution is running, one has no usage.
+        for t in 0..210 {
+            let task = format!("task-{t:03}");
+            sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, 'usage-project', ?, 'todo', 'now', 'now')").bind(&task).bind(&task).execute(db.pool()).await.unwrap();
+            for run in 0..2 {
+                let execution = format!("execution-{t:03}-{run}");
+                let status = if t == 7 && run == 1 {
+                    "running"
+                } else {
+                    "completed"
+                };
+                sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES (?, ?, 'coder', ?, 'now', 'now')")
+                    .bind(&execution).bind(&task).bind(status).execute(db.pool()).await.unwrap();
+                crate::task_usage_fixture::seed(&db, &task, &execution, run * 2, 3).await;
+                crate::task_usage_fixture::seed(&db, &task, &execution, run * 2 + 1, 1).await;
+            }
+        }
+        sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES ('execution-unmetered', 'task-000', 'coder', 'failed', 'now', 'now')").execute(db.pool()).await.unwrap();
+
+        let reference = per_invocation_usage_aggregate_for_operations(&db)
+            .await
+            .unwrap();
+        let batched = usage_aggregate_for_operations(&db).await.unwrap();
+        assert_eq!(reference.counts.provider_attempt_count, 840);
+        assert_eq!(reference.counts.task_execution_count, 421);
+        assert_eq!(reference.tokens.input_tokens, 1_680 * 20);
+        assert_eq!(
+            serde_json::to_value(reference).unwrap(),
+            serde_json::to_value(batched).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn usage_projection_task_union_matches_reference_and_uses_indexes() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();

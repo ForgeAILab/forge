@@ -16,9 +16,16 @@ from urllib.parse import parse_qs, urlsplit
 import unittest
 import uuid
 
-from perf_fixture import (SqlBuilder, canonical_dump, fixture_id, timestamp,
-                          validate_database)
-from perf_bench import compare, cpu_seconds, distribution, idle_window, measure, scenarios
+from perf_fixture import (DEFERRED_TASKS, SqlBuilder, canonical_dump, fixture_id,
+                          seed_deferred_project, timestamp, validate_database)
+from perf_bench import (NO_VALIDATOR, VALIDATOR_OFF, compare, cpu_seconds, distribution,
+                        idle_window, measure, scenarios)
+
+# The server's own test for "this Project has deferred dispatch": the task list
+# validator is off while it matches any Task (crates/db task_list_read.rs).
+DEFERRED_DISPATCH_TASKS = ("SELECT count(*) FROM task WHERE project_id = ? AND json_valid(metadata_json) "
+                           "AND json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL "
+                           "AND deleted_at IS NULL")
 
 
 class FixtureTests(unittest.TestCase):
@@ -74,6 +81,50 @@ class FixtureTests(unittest.TestCase):
                          sample('registration-b', 'salt-b', True))
         self.assertIn('updated_at', json.loads(sample('a', 'b', False))['task']['columns'])
 
+    def test_deferred_project_is_small_paused_and_matches_the_server_predicate(self):
+        with closing(sqlite3.connect(':memory:')) as db, db:
+            db.executescript("""
+                CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT,
+                    workflow_definition TEXT, workflow_template_name TEXT, paused_at TEXT,
+                    system_pause_reason TEXT, primary_repo_id TEXT, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL);
+                CREATE TABLE repo (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                    local_path TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE project_member (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL);
+                CREATE TABLE task (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_task_id TEXT,
+                    task_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT, status TEXT NOT NULL,
+                    priority INTEGER NOT NULL, board_position REAL NOT NULL, subtask_order INTEGER,
+                    metadata_json TEXT, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE agent_chat (id TEXT PRIMARY KEY, project_id TEXT);
+                CREATE TABLE project_agent_binding (id TEXT PRIMARY KEY, project_id TEXT);
+                CREATE TRIGGER project_chat AFTER INSERT ON project BEGIN
+                    INSERT INTO agent_chat VALUES ('generated-chat', NEW.id);
+                    INSERT INTO project_agent_binding VALUES ('generated-binding', NEW.id);
+                END;
+            """)
+            workflow = {'states': [{'name': name} for name in ('backlog', 'todo', 'in_progress', 'done')]}
+            seed_deferred_project(db, SqlBuilder(db), workflow, 'owner')
+            project = fixture_id('deferred-project')
+            self.assertNotEqual(project, fixture_id('project'))
+            self.assertEqual(db.execute('SELECT id, owner_id, paused_at IS NOT NULL, primary_repo_id FROM project').fetchall(),
+                             [(project, 'owner', 1, fixture_id('deferred-repo'))])
+            self.assertEqual(db.execute('SELECT count(*) FROM task WHERE project_id = ?', (project,)).fetchone()[0],
+                             DEFERRED_TASKS)
+            deferred = db.execute(DEFERRED_DISPATCH_TASKS, (project,)).fetchone()[0]
+            self.assertEqual(deferred, 2)
+            self.assertLess(deferred, DEFERRED_TASKS)
+            # Dispatch stays deferred for the life of any run: the fixture must remain idle.
+            dates = [json.loads(row[0])['deferred_dispatch']['not_before'] for row in db.execute(
+                "SELECT metadata_json FROM task WHERE metadata_json != '{}'")]
+            self.assertTrue(all(datetime.fromisoformat(value).year > 2100 for value in dates))
+            # Trigger-created identities are normalized, as for the heavy Project.
+            self.assertEqual(db.execute('SELECT id FROM agent_chat').fetchall(),
+                             [(fixture_id('deferred-project-chat'),)])
+            self.assertEqual(db.execute('SELECT id FROM project_agent_binding').fetchall(),
+                             [(fixture_id('deferred-project-binding'),)])
+
     @unittest.skipUnless(os.environ.get('PERF_FIXTURE_A') and os.environ.get('PERF_FIXTURE_B'),
                          'set PERF_FIXTURE_A/B to compare two built baseline fixtures')
     def test_two_real_fixture_builds_have_identical_seeded_rows(self):
@@ -88,6 +139,9 @@ class FixtureTests(unittest.TestCase):
                 dump = canonical_dump(db, manifest['seeded_tables'], user)
                 self.assertEqual(hashlib.sha256(dump.encode()).hexdigest(), manifest['canonical_sha256'])
                 dumps.append(dump)
+                # The heavy Project keeps its task-list validator; only the small one switches it off.
+                self.assertEqual(db.execute(DEFERRED_DISPATCH_TASKS, (manifest['project_id'],)).fetchone()[0], 0)
+                self.assertEqual(db.execute(DEFERRED_DISPATCH_TASKS, (manifest['deferred_project_id'],)).fetchone()[0], 2)
         self.assertEqual(manifests[0]['baseline_version'], manifests[1]['baseline_version'])
         self.assertEqual(dumps[0], dumps[1])
 
@@ -163,6 +217,51 @@ class BenchmarkTests(unittest.TestCase):
             self.assertIsNotNone(start.tzinfo)
             self.assertEqual(start.isoformat(), timestamp())
             self.assertEqual((finish - start).total_seconds(), 2 * 86400)
+
+    def task_list_rows(self, manifest, etag_for):
+        class Client:
+            def request(self, path, data=None, headers=None):
+                found = {'ETag': 'W/"tasks-1"'} if '/tasks?' in path and etag_for(path) else {}
+                return 200, found, b'{}'
+        def measured(client, name, path, headers=None):
+            return {'name': name, 'path': path, 'headers': headers}
+        with patch('perf_bench.measure', side_effect=measured):
+            rows = scenarios(Client(), manifest)
+        return {row['name']: row for row in rows if row['name'].startswith('tasks')}
+
+    def test_conditional_list_is_measured_and_deferred_project_reports_validator_off(self):
+        heavy, deferred = fixture_id('project'), fixture_id('deferred-project')
+        manifest = {'project_id': heavy, 'deferred_project_id': deferred, 'chat_id': fixture_id('chat'),
+                    'task_ids': [fixture_id('task', i) for i in range(10)]}
+        rows = self.task_list_rows(manifest, lambda path: heavy in path)
+        self.assertEqual(list(rows), ['tasks limit=20', 'tasks ETag limit=20', 'tasks limit=50',
+                                      'tasks ETag limit=50', 'tasks limit=100', 'tasks ETag limit=100',
+                                      'tasks deferred limit=20', 'tasks deferred ETag limit=20'])
+        for limit in (20, 50, 100):
+            self.assertIsNone(rows[f'tasks limit={limit}']['headers'])
+            conditional = rows[f'tasks ETag limit={limit}']
+            self.assertEqual(conditional['headers'], {'If-None-Match': 'W/"tasks-1"'})
+            self.assertIn(f'/projects/{heavy}/tasks?limit={limit}', conditional['path'])
+        self.assertIn(f'/projects/{deferred}/tasks?limit=20', rows['tasks deferred limit=20']['path'])
+        self.assertIsNone(rows['tasks deferred limit=20']['headers'])
+        self.assertEqual(rows['tasks deferred ETag limit=20']['skipped'], VALIDATOR_OFF)
+
+    def test_build_without_validator_and_validator_kept_on_are_reported_as_such(self):
+        manifest = {'project_id': fixture_id('project'), 'deferred_project_id': fixture_id('deferred-project'),
+                    'chat_id': fixture_id('chat'), 'task_ids': [fixture_id('task', i) for i in range(10)]}
+        rows = self.task_list_rows(manifest, lambda path: False)
+        for name in ('tasks ETag limit=20', 'tasks ETag limit=50', 'tasks ETag limit=100',
+                     'tasks deferred ETag limit=20'):
+            self.assertEqual(rows[name]['skipped'], NO_VALIDATOR)
+        rows = self.task_list_rows(manifest, lambda path: True)
+        self.assertEqual(rows['tasks deferred ETag limit=20']['headers'], {'If-None-Match': 'W/"tasks-1"'})
+
+    def test_fixture_without_deferred_project_has_no_deferred_scenario(self):
+        manifest = {'project_id': fixture_id('project'), 'chat_id': fixture_id('chat'),
+                    'task_ids': [fixture_id('task', i) for i in range(10)]}
+        rows = self.task_list_rows(manifest, lambda path: True)
+        self.assertEqual(len(rows), 6)
+        self.assertFalse(any('deferred' in name for name in rows))
 
     def test_denied_ps_keeps_idle_commit_and_row_measurements(self):
         with tempfile.TemporaryDirectory(prefix='perf-unit-') as temporary:

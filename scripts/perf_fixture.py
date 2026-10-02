@@ -30,6 +30,10 @@ HEAVY_TRANSITIONS = 15
 HEAVY_ATTEMPTS = 3
 HEAVY_EVENTS = 50_000
 HEAVY_MESSAGES = 200
+# The heavy Project carries no deferred-dispatch metadata, so its task list keeps
+# its validator. A second, small Project carries it: there the validator is off.
+DEFERRED_TASKS = 6
+DEFERRED_EVERY = 3
 IDLE_TABLES = ('task', 'execution', 'transition_log', 'workspace',
                'agent_chat_message', 'agent_chat_turn_job', 'domain_event')
 
@@ -259,6 +263,35 @@ def normalize_bootstrap(db: sqlite3.Connection, user_id: str) -> list[dict]:
     return agents
 
 
+def seed_deferred_project(db: sqlite3.Connection, sql: SqlBuilder, workflow: dict,
+                          user_id: str) -> None:
+    """A small paused Project whose Tasks carry real deferred-dispatch metadata."""
+    project_id, repo_id = fixture_id('deferred-project'), fixture_id('deferred-repo')
+    states = [state['name'] for state in workflow['states']]
+    sql.insert('project', id=project_id, name='Synthetic deferred-dispatch Project',
+               owner_id=user_id, workflow_definition=encode(workflow), workflow_template_name='default',
+               paused_at=timestamp(), system_pause_reason=None, created_at=timestamp(), updated_at=timestamp())
+    db.execute('UPDATE agent_chat SET id=? WHERE project_id=?', (fixture_id('deferred-project-chat'), project_id))
+    db.execute('UPDATE project_agent_binding SET id=? WHERE project_id=?',
+               (fixture_id('deferred-project-binding'), project_id))
+    sql.insert('repo', id=repo_id, project_id=project_id, name='synthetic-deferred',
+               local_path='/nonexistent/forge-perf-fixture-deferred', created_at=timestamp(), updated_at=timestamp())
+    db.execute('UPDATE project SET primary_repo_id=? WHERE id=?', (repo_id, project_id))
+    sql.insert('project_member', id=fixture_id('deferred-member'), project_id=project_id, user_id=user_id,
+               role='owner', created_at=timestamp(), updated_at=timestamp())
+    for i in range(DEFERRED_TASKS):
+        state = states[i % len(states)]
+        metadata: dict[str, Any] = {}
+        if i % DEFERRED_EVERY == 1:
+            metadata['deferred_dispatch'] = {'not_before': timestamp(3_000_000_000),
+                                             'reason': 'synthetic backoff', 'target_state': state}
+        sql.insert('task', id=fixture_id('deferred-task', i), project_id=project_id, parent_task_id=None,
+                   task_type='task', title=f'Deferred-dispatch Task {i:02d}',
+                   description='Synthetic deferred dispatch. ' * 16, status=state, priority=i % 4,
+                   board_position=float(i), subtask_order=None, metadata_json=encode(metadata),
+                   created_at=timestamp(i * 1000), updated_at=timestamp(i * 1000 + 900))
+
+
 def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
     sql = SqlBuilder(db)
     agents = normalize_bootstrap(db, user_id)
@@ -284,7 +317,6 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
     for i in range(task_count):
         task_id = fixture_id('task', i)
         state = states[i % len(states)]
-        metadata: dict[str, Any] = {}
         blocked = failed = barrier = annotation = None
         interruption = {'reason': 'Synthetic review evidence needs attention', 'created_at': timestamp(i),
                         'kind': 'ci_failed', 'source': 'review', 'execution_id': fixture_id('execution', i * HEAVY_EXECUTIONS + 8)}
@@ -299,15 +331,12 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
         if i % 13 == 5:
             barrier = encode({'state': state, 'status': 'blocked', 'started_at': timestamp(i),
                               'updated_at': timestamp(i), 'blocking_reason': 'synthetic CI step failed'})
-        if i % 13 == 6:
-            metadata['deferred_dispatch'] = {'not_before': timestamp(3_000_000_000),
-                                             'reason': 'synthetic backoff', 'target_state': state}
         sql.insert('task', id=task_id, project_id=project_id,
                    parent_task_id=None if i < HEAVY_ROOTS else fixture_id('task', (i - HEAVY_ROOTS) // HEAVY_CHILDREN),
                    task_type='task' if i < HEAVY_ROOTS else 'sub_task', title=f'Performance Task {i:02d}',
                    description='Synthetic implementation and review history. ' * 16, status=state,
                    priority=i % 4, board_position=float(i), subtask_order=None if i < HEAVY_ROOTS else (i - HEAVY_ROOTS) % HEAVY_CHILDREN,
-                   metadata_json=encode(metadata), blocked_json=blocked, failed_json=failed,
+                   metadata_json=encode({}), blocked_json=blocked, failed_json=failed,
                    entry_barrier_json=barrier, error_annotation=annotation,
                    created_at=timestamp(i * 1000), updated_at=timestamp(i * 1000 + 900))
         for role in ('planner', 'coder', 'reviewer'):
@@ -376,6 +405,7 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
         for child in (1, 2):
             sql.insert('task_dependency', task_id=fixture_id('task', first + child),
                        depends_on_id=fixture_id('task', first + child - 1), created_at=timestamp())
+    seed_deferred_project(db, sql, workflow, user_id)
     sql.insert('agent_chat', id=chat_id, kind='account_main', account_id=user_id,
                status='agent_setup_required', message_count=HEAVY_MESSAGES, last_message_at=timestamp(HEAVY_MESSAGES),
                created_at=timestamp(), updated_at=timestamp(HEAVY_MESSAGES))
@@ -424,15 +454,17 @@ def build(binary: Path, out: Path, port: int) -> dict:
         digest = hashlib.sha256(canonical_dump(db, tables, user_id).encode()).hexdigest()
         counts = {table: db.execute(f'SELECT count(*) FROM {quote(table)}').fetchone()[0] for table in tables}
         db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-    report = {'schema': 'forge.perf-fixture/1', 'profile': 'heavy', 'baseline_version': version,
+    report = {'schema': 'forge.perf-fixture/2', 'profile': 'heavy', 'baseline_version': version,
               'email': EMAIL, 'project_id': fixture_id('project'), 'chat_id': fixture_id('chat'),
+              'deferred_project_id': fixture_id('deferred-project'),
               'task_ids': [fixture_id('task', i) for i in (0, 1, 2, 3, 4, 12, 13, 14, 15, 16)],
               'counts': counts, 'seeded_tables': tables, 'canonical_sha256': digest,
               'db_bytes': (out / 'forge.db').stat().st_size,
-              'idle_guards': ['manually paused Project; paused idle default agents; no live leases',
+              'idle_guards': ['manually paused Projects; paused idle default agents; no live leases',
                               'terminal executions and chat jobs; cleaned workspaces with no cleanup deadline',
                               'every baseline consumer cursor at the event head; no plan-publication claims'],
-              'notes': ['Usage uses three settled provider attempts per execution with provider-reported costs; no remote pricing catalog required.',
+              'notes': ['The heavy Project has no deferred-dispatch metadata; the small deferred Project carries it on two Tasks.',
+                        'Usage uses three settled provider attempts per execution with provider-reported costs; no remote pricing catalog required.',
                         'Some reviews await human approval; no reviewer execution is running.',
                         'Registration password is the public test constant PASSWORD in perf_fixture.py.']}
     with (out / 'perf-fixture.json').open('x', encoding='utf-8') as target:

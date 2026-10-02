@@ -3,7 +3,10 @@ use crate::RetryAgentChatTurn;
 use sha2::{Digest, Sha256};
 
 // Insertion order distinguishes retries/continuations even when timestamps tie.
-pub(super) const AGENT_CHAT_TURN_WITH_RETRY_STATE: &str = "SELECT t.*, (
+// Only a failed or cancelled turn can offer a retry, so the supersession
+// probes run for those rows alone; a chat's settled history costs nothing.
+pub(super) const AGENT_CHAT_TURN_WITH_RETRY_STATE: &str = "SELECT t.*, CASE
+    WHEN t.status IN ('failed', 'cancelled') THEN (
     EXISTS (
         SELECT 1 FROM agent_chat_turn_job newer
         WHERE newer.chat_id = t.chat_id
@@ -16,7 +19,7 @@ pub(super) const AGENT_CHAT_TURN_WITH_RETRY_STATE: &str = "SELECT t.*, (
             WHERE original.id = t.triggering_message_id
         )
     )
-) AS retry_superseded FROM agent_chat_turn_job t WHERE t.id = ?";
+) ELSE 0 END AS retry_superseded FROM agent_chat_turn_job t WHERE t.id = ?";
 
 #[async_trait]
 impl AccountMainAgentBindingRepo for SqliteDb {
@@ -845,6 +848,16 @@ impl AgentChatTurnJobRepo for SqliteDb {
         .into_iter()
         .map(map_agent_chat_turn_job)
         .collect()
+    }
+
+    async fn count_pending_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_chat_turn_job
+             WHERE chat_id = ? AND status IN ('queued', 'leased', 'retry_wait')",
+        )
+        .bind(chat_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn create_agent_chat_turn_job(

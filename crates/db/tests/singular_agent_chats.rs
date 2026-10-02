@@ -1445,3 +1445,184 @@ async fn superseded_cancel_response_and_failure_event_agree_with_get() {
         assert!(fetched.retry_action().is_none(), "{settlement}");
     }
 }
+
+/// The supersession probes the turn readers ran for every row before they were
+/// limited to failed and cancelled turns.
+const UNGATED_RETRY_STATE: &str = "SELECT t.id, t.status, (
+    EXISTS (
+        SELECT 1 FROM agent_chat_turn_job newer
+        WHERE newer.chat_id = t.chat_id
+          AND newer.triggering_message_id = t.triggering_message_id
+          AND newer.rowid > t.rowid
+    ) OR EXISTS (
+        SELECT 1 FROM agent_chat_message m
+        WHERE m.chat_id = t.chat_id AND m.sequence > (
+            SELECT original.sequence FROM agent_chat_message original
+            WHERE original.id = t.triggering_message_id
+        )
+    )
+) AS superseded FROM agent_chat_turn_job t WHERE t.chat_id = ?
+ ORDER BY t.created_at ASC, t.id ASC";
+
+#[tokio::test]
+async fn turn_list_and_pending_count_match_the_ungated_retry_state_for_every_status() {
+    let (db, account_id, project_id, identity_id, profile_id) = fixture().await;
+    let chat = AgentChatRepo::get_main_chat(&db, &account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let project_chat = AgentChatRepo::get_project_chat(&db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // (message, [(turn id, status)]): every status, a failed turn superseded
+    // by a later message, turns superseded by a newer turn for the same
+    // message (ids sort against insertion order), and one retryable turn.
+    let history: [(&str, &[(&str, &str)]); 7] = [
+        ("m1", &[("t1-succeeded", "succeeded")]),
+        ("m2", &[("t2-failed", "failed")]),
+        ("m3", &[("t3-queued", "queued")]),
+        ("m4", &[("t4-retry-wait", "retry_wait")]),
+        ("m5", &[("t5-awaiting", "awaiting_input")]),
+        (
+            "m6",
+            &[("t6-z-cancelled", "cancelled"), ("t6-a-leased", "leased")],
+        ),
+        (
+            "m7",
+            &[("t7-z-failed", "failed"), ("t7-a-cancelled", "cancelled")],
+        ),
+    ];
+    for (second, (message, turns)) in history.iter().enumerate() {
+        let now = format!("2026-08-13T00:00:{:02}.000Z", second + 1);
+        db::AgentChatMessageRepo::append_agent_chat_message(
+            &db,
+            user_message(message, &chat.id, &now),
+        )
+        .await
+        .unwrap();
+        for (id, status) in turns.iter() {
+            AgentChatTurnJobRepo::create_agent_chat_turn_job(
+                &db,
+                turn(id, &chat.id, message, &identity_id, &profile_id, id, &now),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE agent_chat_turn_job SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    let other_now = "2026-08-13T00:01:00.000Z";
+    db::AgentChatMessageRepo::append_agent_chat_message(
+        &db,
+        user_message("project-message", &project_chat.id, other_now),
+    )
+    .await
+    .unwrap();
+    AgentChatTurnJobRepo::create_agent_chat_turn_job(
+        &db,
+        turn(
+            "project-queued",
+            &project_chat.id,
+            "project-message",
+            &identity_id,
+            &profile_id,
+            "project-queued",
+            other_now,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let reference: Vec<(String, String, bool)> = sqlx::query_as(UNGATED_RETRY_STATE)
+        .bind(&chat.id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    let listed = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &chat.id)
+        .await
+        .unwrap();
+    // Same rows in the same order.
+    assert_eq!(
+        listed.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        reference
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(listed.len(), 9);
+    for (job, (id, status, superseded)) in listed.iter().zip(&reference) {
+        let terminal_failure = matches!(status.as_str(), "failed" | "cancelled");
+        assert_eq!(
+            job.retry_action().is_some(),
+            terminal_failure && !superseded,
+            "retry action for {id} ({status})"
+        );
+        assert_eq!(
+            job.retry_superseded,
+            terminal_failure && *superseded,
+            "supersession for {id} ({status})"
+        );
+        let single = AgentChatTurnJobRepo::get_agent_chat_turn_job(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&single, job, "single read of {id}");
+    }
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|job| job.retry_action().is_some())
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        ["t7-a-cancelled"]
+    );
+    // Both superseded shapes are present, so the gate is exercised either way.
+    assert_eq!(
+        reference
+            .iter()
+            .filter(|(_, _, superseded)| *superseded)
+            .count(),
+        8
+    );
+
+    let pending = |jobs: &[db::AgentChatTurnJob]| {
+        jobs.iter()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    AgentChatTurnState::Queued
+                        | AgentChatTurnState::Leased
+                        | AgentChatTurnState::RetryWait
+                )
+            })
+            .count() as i64
+    };
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, &chat.id)
+            .await
+            .unwrap(),
+        pending(&listed)
+    );
+    assert_eq!(pending(&listed), 3);
+    let project_turns = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &project_chat.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, &project_chat.id)
+            .await
+            .unwrap(),
+        pending(&project_turns)
+    );
+    assert_eq!(pending(&project_turns), 1);
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, "missing-chat")
+            .await
+            .unwrap(),
+        0
+    );
+}

@@ -73,19 +73,43 @@ def measure(client: LocalClient, name: str, path: str,
             'errors': errors, 'share_304': statuses['304'] / REQUESTS}
 
 
+NO_VALIDATOR = 'build did not return an ETag'
+VALIDATOR_OFF = 'validator off: a Task in this Project carries deferred-dispatch metadata'
+
+
+def task_list(client: LocalClient, label: str, path: str, limit: int,
+              without_etag: str) -> tuple[list[dict], bool]:
+    """Time one task list page, then its conditional request when it has a validator."""
+    rows = [measure(client, f'{label} limit={limit}', path)]
+    try:
+        status, headers, _ = client.request(path)
+    except (OSError, http.client.HTTPException):
+        status, headers = 0, {}
+    etag = next((value for key, value in headers.items() if key.lower() == 'etag'), None)
+    name = f'{label} ETag limit={limit}'
+    if 200 <= status < 300 and etag:
+        rows.append(measure(client, name, path, {'If-None-Match': etag}))
+    else:
+        rows.append({'name': name, 'path': path, 'skipped': without_etag})
+    return rows, bool(etag)
+
+
 def scenarios(client: LocalClient, manifest: dict) -> list[dict]:
     project, chat = manifest['project_id'], manifest['chat_id']
     result = []
+    validator = False
     for limit in (20, 50, 100):
-        path = f'/api/v1/projects/{project}/tasks?limit={limit}'
-        result.append(measure(client, f'tasks limit={limit}', path))
-        status, headers, _ = client.request(path)
-        etag = next((value for key, value in headers.items() if key.lower() == 'etag'), None)
-        name = f'tasks ETag limit={limit}'
-        if 200 <= status < 300 and etag:
-            result.append(measure(client, name, path, {'If-None-Match': etag}))
-        else:
-            result.append({'name': name, 'path': path, 'skipped': 'build did not return an ETag'})
+        rows, has_etag = task_list(client, 'tasks', f'/api/v1/projects/{project}/tasks?limit={limit}',
+                                   limit, NO_VALIDATOR)
+        result += rows
+        validator = validator or has_etag
+    # Fixtures since forge.perf-fixture/2 keep deferred-dispatch metadata in a
+    # second, small Project. A build with a validator switches it off there; the
+    # skip reason reports that separately from a build that has no validator.
+    deferred = manifest.get('deferred_project_id')
+    if deferred:
+        result += task_list(client, 'tasks deferred', f'/api/v1/projects/{deferred}/tasks?limit=20',
+                            20, VALIDATOR_OFF if validator else NO_VALIDATOR)[0]
     # The raw Task route exists on the baseline; next also offers a consolidated
     # detail endpoint. Measure both explicitly, without hiding the difference.
     for index, task in enumerate(manifest['task_ids']):

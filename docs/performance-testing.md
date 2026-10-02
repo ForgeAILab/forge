@@ -167,7 +167,7 @@ python3 scripts/perf_bench.py run --binary /path/to/candidate/forge --fixture /V
 python3 scripts/perf_bench.py compare /Volumes/Data/tmp/perf/heavy/baseline.json /Volumes/Data/tmp/perf/heavy/candidate.json
 ```
 
-The `heavy` profile contains one owned Project and repository, using the
+The `heavy` profile contains one owned heavy Project and repository, using the
 baseline's default workflow; 60 Tasks (12 roots, four subtasks each) across
 all nine baseline states; 600 terminal coder/reviewer executions; 180 review
 rounds with three CI step results each; 900 transitions; 180 role assignments;
@@ -177,6 +177,18 @@ each) with substantial token counts and provider-reported costs. No external
 pricing catalog or provider is required. There are 50,000 domain events,
 200 Main-Agent chat messages and 100 successful turn jobs, plus the empty
 Project chat and setup binding that baseline SQL triggers create.
+
+No Task of the heavy Project carries deferred-dispatch metadata, so a build
+with a task-list validator returns an `ETag` there and the conditional path
+is measured. That metadata lives in a second, small Project (six root Tasks
+with no history, two of them deferred until the year 2120; its own repository,
+membership, chat and setup binding). A build switches the validator off for a
+whole Project while any of its Tasks is deferred, and the benchmark reports
+that for this Project. Fixtures built before this split (manifest schema
+`forge.perf-fixture/1`) had the metadata on the heavy Project, so no build
+returned an `ETag` for them; they still run, without the second Project's
+scenario. Results from the two fixture generations have different digests and
+are not comparable.
 
 Named constants in `perf_fixture.py` control the sizes. UUID5 identifiers and
 a fixed UTC epoch control inserted identities and timestamps. Baseline-created
@@ -188,13 +200,13 @@ digest. The registered user's identity and timestamps and salted password
 hash are excluded from that digest; references to that identity are normalized.
 The password is the public test constant `PASSWORD` in the script.
 
-The fixture is deliberately idle: the Project has a manual pause, all default
+The fixture is deliberately idle: both Projects have a manual pause, all default
 agents are paused and idle, no execution is running or holds a recovery lease,
 workspaces are cleaned without cleanup deadlines, chat turn jobs have succeeded,
 and consumer cursors point to the event head. A few Tasks carry real baseline
-blocked/failed interruption shapes, blocked entry barriers and deferred dispatch
-metadata; four reviews await a human while their executions remain terminal.
-There are no plan-publication claims. The repository path intentionally does
+blocked/failed interruption shapes and blocked entry barriers; four reviews
+await a human while their executions remain terminal.
+There are no plan-publication claims. The repository paths intentionally do
 not exist; a manual Project pause prevents checkout probing/dispatch. Main and
 Project agent bindings require setup, so no autonomous work can start.
 
@@ -212,7 +224,13 @@ Requests use one persistent HTTP connection, sequentially. Every available
 scenario has ten warmups and 100 measured requests (plus an untimed availability
 probe); timings include reading the complete response. The list scenarios use
 limits 20, 50 and 100, with separate conditional requests when an ETag is
-returned. Ten fixed root/subtask IDs exercise the ordinary Task route. Additional
+returned (`tasks ETag limit=N`; expect 100% HTTP 304 and an empty body). The
+`tasks deferred limit=20` scenario lists the small deferred-dispatch Project;
+its `tasks deferred ETag limit=20` row is a measurement only if the build still
+returns an ETag there. Otherwise it is skipped with the reason: `validator off`
+when the same build returned an ETag for the heavy Project, or
+`build did not return an ETag` when it has no validator at all (v0.13.12).
+Ten fixed root/subtask IDs exercise the ordinary Task route. Additional
 GETs mirror `web/src/api/hooks.ts`, `client.ts`, board workflow/agent reads and
 the task modal: consolidated detail and relations when present, executions,
 reviews, history, comments, media, workspace, dependencies and usage. Project

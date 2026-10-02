@@ -554,18 +554,7 @@ async fn switcher_item(state: &AppState, chat: AgentChat) -> ApiResult<AgentChat
             .map(|identity| identity.name),
         None => None,
     };
-    let pending_turn_count = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat.id)
-        .await?
-        .into_iter()
-        .filter(|job| {
-            matches!(
-                job.status,
-                AgentChatTurnState::Queued
-                    | AgentChatTurnState::Leased
-                    | AgentChatTurnState::RetryWait
-            )
-        })
-        .count() as i64;
+    let pending_turn_count = pending_turn_count(state, &chat.id).await?;
     Ok(AgentChatSwitcherItem {
         chat_id: chat.id,
         kind,
@@ -630,20 +619,7 @@ async fn project_binding_response(
 }
 
 async fn pending_turn_count(state: &AppState, chat_id: &str) -> ApiResult<i64> {
-    Ok(
-        AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, chat_id)
-            .await?
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.status,
-                    AgentChatTurnState::Queued
-                        | AgentChatTurnState::Leased
-                        | AgentChatTurnState::RetryWait
-                )
-            })
-            .count() as i64,
-    )
+    Ok(AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&*state.db, chat_id).await?)
 }
 
 fn chat_response(

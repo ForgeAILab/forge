@@ -1656,6 +1656,8 @@ pub trait AgentChatMessageRepo: Send + Sync {
 pub trait AgentChatTurnJobRepo: Send + Sync {
     async fn get_agent_chat_turn_job(&self, id: &str) -> Result<Option<AgentChatTurnJob>>;
     async fn list_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<Vec<AgentChatTurnJob>>;
+    /// Turns of one chat that still owe work: `queued`, `leased` or `retry_wait`.
+    async fn count_pending_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<i64>;
     async fn create_agent_chat_turn_job(
         &self,
         input: CreateAgentChatTurnJob,
