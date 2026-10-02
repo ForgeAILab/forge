@@ -6163,8 +6163,19 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
         db::EnvironmentMachine::Server,
         &environment,
     );
-    row.status = db::EnvironmentReadinessStatus::Ready;
+    row.status = db::EnvironmentReadinessStatus::NotReady;
+    row.next_check_at = Some("2099-01-01T00:00:00Z".into());
+    row.failing_checks = vec![db::ReadinessCheckFailure {
+        name: "old".into(),
+        output_tail: "old failure".into(),
+    }];
     db.put_readiness(row, None).await.unwrap();
+    let snapshot = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::set_environment_pause_if_unchanged(&*db,&project_id,snapshot.version,&now_rfc3339(),
+        &serde_json::json!({"checks":["old"],"role":"coder","output":"old failure","paused_at":now_rfc3339(),"last_checked_at":now_rfc3339(),"next_check_at":"2099-01-01T00:00:00Z"}).to_string()).await.unwrap();
     let (dispatcher, _) = build_dispatcher(db.clone(), root.path()).await;
     dispatcher.check_once().await.unwrap();
     let current = ProjectRepo::get_by_id(&*db, &project_id)
@@ -6195,6 +6206,14 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
             .status,
         db::EnvironmentReadinessStatus::Unknown
     );
+    // Settings edits also probe an existing host row without a location row.
+    sqlx::query(
+        "DELETE FROM repo_location WHERE repo_id IN (SELECT id FROM repo WHERE project_id = ?)",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
     dispatcher.event_bus.publish(events::ForgeEvent {
         event_type: "project.updated".into(),
         entity_id: project_id.clone(),
@@ -6208,6 +6227,25 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
     })
     .await
     .unwrap();
+    let renamed = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: Some("name changed while probing".into()),
+            settings: None,
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        renamed.version,
+        None,
+    )
+    .await
+    .unwrap();
     std::fs::write(signals.path().join("release"), "go").unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -6216,6 +6254,12 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
                 .await
                 .unwrap()
                 .is_some_and(|row| row.status == db::EnvironmentReadinessStatus::Ready)
+                && ProjectRepo::get_by_id(&*db, &project_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .paused_at
+                    .is_none()
             {
                 break;
             }
@@ -6224,6 +6268,15 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
     })
     .await
     .unwrap();
+    assert!(
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused_at
+            .is_none(),
+        "a passing settings probe resumes the matching pause without a Task"
+    );
 }
 
 async fn finish_environment_recheck(dispatcher: &TaskDispatcher, project_id: &str) {
@@ -7641,3 +7694,6 @@ async fn worker_robustness_dispatcher_isolates_projects_and_tasks() {
     assert_eq!(dispatcher.check_once().await.unwrap(), 1);
     assert_eq!(rx.recv().await.unwrap().task_id, healthy_again.id);
 }
+
+#[path = "tests/environment_placement.rs"]
+mod environment_placement;

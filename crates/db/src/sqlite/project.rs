@@ -415,6 +415,23 @@ impl ProjectRepo for SqliteDb {
             project.project_hooks_json = project_hooks_json;
         }
         project.updated_at = input.updated_at;
+        let before = crate::environment_readiness::settings_environment(&original_settings).ok();
+        let after = crate::environment_readiness::settings_environment(&project.settings).ok();
+        let digest_changed = before.as_ref().map(crate::environment_checks_digest)
+            != after.as_ref().map(crate::environment_checks_digest);
+        if original_settings != project.settings
+            && digest_changed
+            && after
+                .as_ref()
+                .is_some_and(|environment| !environment.checks.is_empty())
+            && project.system_pause_reason.as_deref() == Some("environment_not_ready")
+        {
+            // The old digest's pause cannot veto its unknown replacement facts,
+            // especially on a daemon where only the next launch can check them.
+            project.paused_at = None;
+            project.system_pause_reason = None;
+            project.environment_pause_json = None;
+        }
         let result = sqlx::query(
             "UPDATE project
              SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
@@ -441,9 +458,13 @@ impl ProjectRepo for SqliteDb {
             || original_paused_at != project.paused_at
             || original_system_pause_reason != project.system_pause_reason;
         if original_settings != project.settings {
-            let before = crate::environment_readiness::settings_environment(&original_settings)?;
-            let after = crate::environment_readiness::settings_environment(&project.settings)?;
-            if after.checks.is_empty() {
+            if after.is_none() {
+                tracing::warn!(project_id=%project.id, "invalid settings on Project update; retaining unknown readiness");
+            }
+            if after
+                .as_ref()
+                .is_some_and(|environment| environment.checks.is_empty())
+            {
                 sqlx::query("DELETE FROM project_machine_readiness WHERE project_id = ?")
                     .bind(&project.id)
                     .execute(&mut *transaction)
@@ -452,13 +473,15 @@ impl ProjectRepo for SqliteDb {
                     .bind(&project.updated_at).bind(&project.updated_at).bind(&project.id).execute(&mut *transaction).await?;
                 sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
                     .bind(&project.id).execute(&mut *transaction).await?;
-            } else if crate::environment_checks_digest(&before)
-                != crate::environment_checks_digest(&after)
-            {
-                sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
-                    .bind(crate::environment_checks_digest(&after)).bind(&project.id)
+            } else if digest_changed || after.is_none() {
+                sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', check_results_json = '[]', output_tail = '', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
+                    .bind(after.as_ref().map(crate::environment_checks_digest).unwrap_or_else(|| "invalid_settings".into())).bind(&project.id)
                     .execute(&mut *transaction).await?;
             }
+        }
+        if original_paused_at.is_some() && project.paused_at.is_none() {
+            super::environment_readiness::reset_readiness_in_tx(&mut transaction, &project.id)
+                .await?;
         }
         if project_authority_changed {
             wake_dispatch_for_project_in_tx(&mut transaction, &project.id, &project.updated_at)
@@ -569,6 +592,9 @@ impl ProjectRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        if paused_at.is_none() {
+            super::environment_readiness::reset_readiness_in_tx(&mut transaction, id).await?;
+        }
         wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
         transaction.commit().await?;
         Ok(())
@@ -631,45 +657,14 @@ impl ProjectRepo for SqliteDb {
         detail_json: &str,
     ) -> Result<bool> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        if serde_json::from_str::<serde_json::Value>(detail_json)
-            .ok()
-            .is_some_and(|detail| detail.get("machine").is_some())
-        {
-            let settings: Option<String> =
-                sqlx::query_scalar("SELECT settings FROM project WHERE id = ? AND version = ?")
-                    .bind(id)
-                    .bind(expected_version)
-                    .fetch_optional(&mut *transaction)
-                    .await?;
-            if let Some(settings) = settings {
-                let environment = crate::environment_readiness::settings_environment(&settings)?;
-                if !environment.checks.is_empty() {
-                    let digest = crate::environment_checks_digest(&environment);
-                    let readiness = crate::ProjectMachineReadinessRepo::list_readiness_in_tx(
-                        self,
-                        &mut transaction,
-                        id,
-                    )
-                    .await?;
-                    let locations: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as("SELECT l.owner_kind, l.daemon_id, l.runtime_id FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.status = 'ready'")
-                        .bind(id).fetch_all(&mut *transaction).await?;
-                    if locations.iter().any(|(kind, daemon, runtime)| {
-                        !readiness.iter().any(|row| {
-                            row.machine.columns()
-                                == (
-                                    kind.as_str(),
-                                    daemon.as_deref().filter(|_| kind == "daemon").unwrap_or(""),
-                                    runtime
-                                        .as_deref()
-                                        .filter(|_| kind == "daemon")
-                                        .unwrap_or(""),
-                                )
-                                && row.status == crate::EnvironmentReadinessStatus::NotReady
-                                && row.checks_digest == digest
-                        })
-                    }) {
-                        return Ok(false);
-                    }
+        let detail: serde_json::Value =
+            serde_json::from_str(detail_json).map_err(|error| DbError::Check(error.to_string()))?;
+        if let Some(versions) = detail["readiness_versions"].as_array() {
+            for expected in versions {
+                let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM project_machine_readiness WHERE project_id = ? AND owner_kind = ? AND daemon_id = ? AND runtime_id = ?")
+                    .bind(id).bind(expected["owner_kind"].as_str()).bind(expected["daemon_id"].as_str().unwrap_or("")).bind(expected["runtime_id"].as_str().unwrap_or("")).fetch_optional(&mut *transaction).await?;
+                if actual != expected["version"].as_i64() {
+                    return Ok(false);
                 }
             }
         }
@@ -690,6 +685,18 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let paused = result.rows_affected() > 0;
         if paused {
+            let normalized = super::environment_readiness::capture_pause_in_tx(
+                &mut transaction,
+                id,
+                detail_json,
+                paused_at,
+            )
+            .await?;
+            sqlx::query("UPDATE project SET environment_pause_json = ? WHERE id = ?")
+                .bind(normalized)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
             wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
@@ -751,6 +758,7 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let cleared = result.rows_affected() > 0;
         if cleared {
+            super::environment_readiness::reset_readiness_in_tx(&mut transaction, id).await?;
             wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;

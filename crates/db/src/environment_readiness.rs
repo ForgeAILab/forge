@@ -63,6 +63,14 @@ pub struct ReadinessCheckFailure {
     pub output_tail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessCheckResult {
+    pub name: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub output_tail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMachineReadiness {
     pub project_id: String,
@@ -70,6 +78,8 @@ pub struct ProjectMachineReadiness {
     pub status: EnvironmentReadinessStatus,
     pub checks_digest: String,
     pub failing_checks: Vec<ReadinessCheckFailure>,
+    pub check_results: Vec<ReadinessCheckResult>,
+    pub output_tail: String,
     pub scope_covered: String,
     pub role: Option<String>,
     pub workspace_id: Option<String>,
@@ -92,6 +102,13 @@ pub(crate) fn settings_environment(settings: &str) -> Result<api_types::ProjectE
 
 #[async_trait]
 pub trait ProjectMachineReadinessRepo: Send + Sync {
+    async fn due_readiness(&self, now: &str) -> Result<Vec<ProjectMachineReadiness>>;
+    async fn reschedule_readiness(
+        &self,
+        row: &ProjectMachineReadiness,
+        next_check_at: &str,
+    ) -> Result<bool>;
+
     async fn list_readiness_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -147,6 +164,8 @@ mod tests {
             status: EnvironmentReadinessStatus::Ready,
             checks_digest: environment_checks_digest(environment),
             failing_checks: vec![],
+            check_results: vec![],
+            output_tail: String::new(),
             scope_covered: "full".into(),
             role: None,
             workspace_id: None,
@@ -273,19 +292,14 @@ mod tests {
             .await
             .unwrap();
         let project = ProjectRepo::get_by_id(&db, &id).await.unwrap().unwrap();
-        assert!(
-            !ProjectRepo::set_environment_pause_if_unchanged(
-                &db,
-                &id,
-                project.version,
-                &now,
-                &serde_json::json!({"machine":{"owner_kind":"server"},"checks":["cargo"]})
-                    .to_string()
-            )
+        let ready = db
+            .get_readiness(&id, &EnvironmentMachine::Server)
             .await
-            .unwrap(),
-            "a readiness result arriving before the pause write prevents a last-resort pause"
-        );
+            .unwrap()
+            .unwrap();
+        assert!(!ProjectRepo::set_environment_pause_if_unchanged(&db,&id,project.version,&now,
+            &serde_json::json!({"machine":{"owner_kind":"server"},"checks":["cargo"],"readiness_versions":[{"owner_kind":"server","daemon_id":"","runtime_id":"","version":ready.version-1}]}).to_string()).await.unwrap(),
+            "a newer readiness version fences the task-specific pause decision");
         let detail = serde_json::json!({"checks":["cargo"],"output":"missing Rust","role":"coder","workspace_id":workspace,"last_checked_at":now,"next_check_at":"2099-01-01T00:00:00Z"});
         sqlx::query("UPDATE project SET paused_at = ?, system_pause_reason = 'environment_not_ready', environment_pause_json = ? WHERE id = ?").bind(&now).bind(detail.to_string()).bind(&id).execute(db.pool()).await.unwrap();
         let before = ProjectRepo::get_by_id(&db, &id).await.unwrap().unwrap();
@@ -327,5 +341,218 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+
+        // Old details name only a workspace: migration must infer its daemon.
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('migration-daemon','migration-machine','owner','linux','aarch64','online',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO runtime (id,daemon_id,kind,workspace_root,status,created_at,updated_at) VALUES ('migration-runtime','migration-daemon','native','/owner','ready',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE workspace_placement SET owner_kind='daemon',daemon_id='migration-daemon',runtime_id='migration-runtime' WHERE id=?")
+            .bind(&placement).execute(db.pool()).await.unwrap();
+        let asset_only = crate::new_uuid_v4();
+        sqlx::query("INSERT INTO project (id,name,settings,workflow_definition,paused_at,system_pause_reason,environment_pause_json,created_at,updated_at) VALUES (?,'asset-only','{}','{}',?,'environment_not_ready','{\"checks\":[],\"output\":\"asset missing\"}',?,?)")
+            .bind(&asset_only).bind(&now).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let malformed = crate::new_uuid_v4();
+        sqlx::query("INSERT INTO project (id,name,settings,workflow_definition,paused_at,system_pause_reason,environment_pause_json,created_at,updated_at) VALUES (?,'malformed','{bad','{}',?,'environment_not_ready','{\"checks\":[\"cargo\"]}',?,?)")
+            .bind(&malformed).bind(&now).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("DROP TABLE project_machine_readiness")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _migration WHERE version=202610020600")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        crate::run_migrations(db.pool()).await.unwrap();
+        let machine = EnvironmentMachine::Daemon {
+            daemon_id: "migration-daemon".into(),
+            runtime_id: "migration-runtime".into(),
+        };
+        assert_eq!(
+            db.get_readiness(&id, &machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            EnvironmentReadinessStatus::NotReady
+        );
+        assert!(db
+            .get_readiness(&id, &EnvironmentMachine::Server)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.list_readiness(&asset_only).await.unwrap().is_empty());
+        assert!(
+            ProjectRepo::get_by_id(&db, &asset_only)
+                .await
+                .unwrap()
+                .unwrap()
+                .paused_at
+                .is_some(),
+            "asset-only legacy pause is preserved without a check cache"
+        );
+        let invalid = db
+            .get_readiness(&malformed, &EnvironmentMachine::Server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalid.status, EnvironmentReadinessStatus::Unknown);
+        assert_eq!(invalid.checks_digest, "invalid_settings");
+        crate::run_migrations(db.pool()).await.unwrap();
+        assert_eq!(
+            db.get_readiness(&malformed, &EnvironmentMachine::Server)
+                .await
+                .unwrap()
+                .unwrap(),
+            invalid,
+            "malformed row is handled only once at startup"
+        );
+        let project = ProjectRepo::get_by_id(&db, &malformed)
+            .await
+            .unwrap()
+            .unwrap();
+        ProjectRepo::update_at_version(
+            &db,
+            crate::UpdateProject {
+                id: malformed.clone(),
+                name: Some("editable".into()),
+                settings: Some("still malformed".into()),
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: now,
+            },
+            project.version,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_readiness(&malformed, &EnvironmentMachine::Server)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            EnvironmentReadinessStatus::Unknown
+        );
+    }
+    #[tokio::test]
+    async fn readiness_wakes_exact_environment_markers_only() {
+        let (db, id, environment) = fixture().await;
+        let now = crate::now_rfc3339();
+        for (task, kind) in [
+            ("probe", "environment_probe_pending"),
+            ("wait", "environment_not_ready"),
+            ("lookalike", "environmentXprobe_pending"),
+            ("other", "environment_unrelated"),
+        ] {
+            sqlx::query("INSERT INTO task (id,project_id,title,task_type,status,metadata_json,created_at,updated_at) VALUES (?,?,'Task','task','todo',?, ?,?)")
+                .bind(task).bind(&id).bind(serde_json::json!({"deferred_dispatch":{"kind":kind},"environment_wait":{"machine":{"owner_kind":"server"}}}).to_string()).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        }
+        let machine = EnvironmentMachine::Daemon {
+            daemon_id: "owner".into(),
+            runtime_id: "native".into(),
+        };
+        sqlx::query("INSERT INTO task (id,project_id,title,task_type,status,metadata_json,created_at,updated_at) VALUES ('daemon-wait',?,'Task','task','in_progress',?, ?,?)")
+            .bind(&id).bind(serde_json::json!({"deferred_dispatch":{"kind":"environment_not_ready"},"environment_wait":{"machine":machine}}).to_string()).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        db.put_readiness(row(&id, &environment), None)
+            .await
+            .unwrap();
+        for (task, cleared) in [
+            ("probe", true),
+            ("wait", true),
+            ("lookalike", false),
+            ("other", false),
+        ] {
+            let marker:Option<String>=sqlx::query_scalar("SELECT json_extract(metadata_json,'$.deferred_dispatch.kind') FROM task WHERE id=?")
+                .bind(task).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(marker.is_none(), cleared);
+        }
+        let pending:Option<String>=sqlx::query_scalar("SELECT json_extract(metadata_json,'$.deferred_dispatch.kind') FROM task WHERE id='daemon-wait'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            pending.as_deref(),
+            Some("environment_not_ready"),
+            "server completion cannot clear a daemon wait"
+        );
+        let mut ready = row(&id, &environment);
+        ready.machine = machine;
+        db.put_readiness(ready, None).await.unwrap();
+        let pending:Option<String>=sqlx::query_scalar("SELECT json_extract(metadata_json,'$.deferred_dispatch.kind') FROM task WHERE id='daemon-wait'").fetch_one(db.pool()).await.unwrap();
+        assert!(
+            pending.is_none(),
+            "canonical daemon identity clears its exact marker"
+        );
+    }
+    #[tokio::test]
+    async fn readiness_digest_edit_retires_only_an_obsolete_environment_pause() {
+        let (db, id, environment) = fixture().await;
+        let machine = EnvironmentMachine::Daemon {
+            daemon_id: "daemon".into(),
+            runtime_id: "runtime".into(),
+        };
+        let mut failure = row(&id, &environment);
+        failure.machine = machine.clone();
+        failure.status = EnvironmentReadinessStatus::NotReady;
+        failure.failing_checks = vec![ReadinessCheckFailure {
+            name: "cargo".into(),
+            output_tail: "missing".into(),
+        }];
+        db.put_readiness(failure, None).await.unwrap();
+        let original = ProjectRepo::get_by_id(&db, &id).await.unwrap().unwrap();
+        let now = crate::now_rfc3339();
+        assert!(ProjectRepo::set_environment_pause_if_unchanged(&db,&id,original.version,&now,
+            &serde_json::json!({"machine":machine,"checks":["cargo"],"role":"coder","output":"missing","paused_at":now,"last_checked_at":now,"next_check_at":"2099-01-01T00:00:00Z"}).to_string()).await.unwrap());
+        let paused = ProjectRepo::get_by_id(&db, &id).await.unwrap().unwrap();
+        let edited = ProjectRepo::update_at_version(
+            &db,
+            crate::UpdateProject {
+                id: id.clone(),
+                name: None,
+                settings: Some(
+                    r#"{"environment":{"checks":[{"name":"cargo","command":"true"}]}}"#.into(),
+                ),
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: crate::now_rfc3339(),
+            },
+            paused.version,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            edited.paused_at.is_none(),
+            "unknown daemon facts must reach a new launch without a stale Project veto"
+        );
+        assert_eq!(
+            db.get_readiness(&id, &machine)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            EnvironmentReadinessStatus::Unknown
+        );
+        ProjectRepo::set_paused_at(&db, &id, Some(now.clone()))
+            .await
+            .unwrap();
+        let user_paused = ProjectRepo::get_by_id(&db, &id).await.unwrap().unwrap();
+        let edited = ProjectRepo::update_at_version(
+            &db,
+            crate::UpdateProject {
+                id: id.clone(),
+                name: None,
+                settings: Some(
+                    r#"{"environment":{"checks":[{"name":"cargo","command":"false"}]}}"#.into(),
+                ),
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: crate::now_rfc3339(),
+            },
+            user_paused.version,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited.paused_at, Some(now));
+        assert!(edited.system_pause_reason.is_none());
     }
 }

@@ -551,29 +551,6 @@ async fn claim_shell_task_with_environment(
     let (project_id, _repo_id, repo_dir) = seed_project_repo(db).await;
     // The repository directory must outlive the test's executions.
     std::mem::forget(repo_dir);
-    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
-        .bind(json!({ "environment": environment }).to_string())
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("environment sets");
-    // These tests exercise preflight on a previously admitted machine. Initial
-    // unknown-machine admission is covered by the placement/probe tests.
-    let project = ProjectRepo::get_by_id(&**db, &project_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings).unwrap();
-    if !settings.environment.checks.is_empty() {
-        use db::ProjectMachineReadinessRepo;
-        let mut readiness = crate::placement::environment::unknown_record(
-            &project_id,
-            db::EnvironmentMachine::Server,
-            &settings.environment,
-        );
-        readiness.status = db::EnvironmentReadinessStatus::Ready;
-        db.put_readiness(readiness, None).await.unwrap();
-    }
     let agent_id = seed_agent(db).await;
     let task = service
         .create_task(
@@ -593,6 +570,14 @@ async fn claim_shell_task_with_environment(
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
         .expect("task claims");
+    // Launch tests introduce the environment after workspace admission. The
+    // first-dispatch parity tests exercise actual unknown/failing host probes.
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(json!({ "environment": environment }).to_string())
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .expect("environment sets");
     let workspace =
         WorkspaceRepo::get_by_id(&**db, claimed.execution.workspace_id.as_deref().unwrap())
             .await

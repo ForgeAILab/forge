@@ -1,134 +1,112 @@
-use api_types::ProjectSettings;
-use chrono::{DateTime, Utc};
-use db::Project;
-
+//! One due-row scan starts per-machine jobs; no per-Project readiness polling.
+use super::TaskDispatcher;
 use crate::{
+    placement::environment::{self, ProbeTarget},
     project_environment::{
-        bounded_output_tail, pause_detail, ENVIRONMENT_NOT_READY, NO_RERUNNABLE_CHECK,
+        bounded_output_tail, next_check_at, pause_detail, ENVIRONMENT_NOT_READY,
     },
     Result, ServiceError,
 };
-
-use super::TaskDispatcher;
+use api_types::ProjectSettings;
+use db::{EnvironmentMachine, ProjectMachineReadinessRepo, ProjectRepo};
+use std::collections::HashSet;
 
 impl TaskDispatcher {
-    pub(super) async fn sync_environment_pause(&self, project: &Project) -> Result<bool> {
-        self.observe_environment_settings();
-        use db::ProjectMachineReadinessRepo;
-        let mut rows = self.db.list_readiness(&project.id).await?;
-        if rows.is_empty() && project.system_pause_reason.as_deref() == Some(ENVIRONMENT_NOT_READY)
-        {
-            let Some(mut detail) = pause_detail(project)? else {
-                return Ok(false);
-            };
-            let environment = serde_json::from_str::<ProjectSettings>(&project.settings)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
-                .environment;
-            if !environment
-                .checks
+    pub(super) async fn sync_due_environment_checks(&self) -> Result<HashSet<String>> {
+        let finished: Vec<_> = {
+            let mut jobs = self
+                .environment_rechecks
+                .lock()
+                .expect("environment jobs lock");
+            let keys: Vec<_> = jobs
                 .iter()
-                .any(|check| detail.checks.contains(&check.name))
-            {
-                if !detail.output.contains(NO_RERUNNABLE_CHECK) {
-                    detail.output =
-                        bounded_output_tail(&format!("{}\n{NO_RERUNNABLE_CHECK}", detail.output));
-                    self.task_service
-                        .update_environment_pause(project, &detail)
-                        .await?;
-                }
-                return Ok(false);
-            }
-            DateTime::parse_from_rfc3339(&detail.next_check_at).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "invalid environment re-check time: {error}"
-                ))
-            })?;
-            // A pause can also be recorded directly through the repository.
-            // Give that fact the same machine record as a launch failure.
-            let mut row = crate::placement::environment::unknown_record(
-                &project.id,
-                db::EnvironmentMachine::Server,
-                &environment,
-            );
-            row.status = db::EnvironmentReadinessStatus::NotReady;
-            row.failing_checks = detail
-                .checks
-                .into_iter()
-                .map(|name| db::ReadinessCheckFailure {
-                    name,
-                    output_tail: detail.output.clone(),
-                })
+                .filter(|(_, job)| job.is_finished())
+                .map(|(key, _)| key.clone())
                 .collect();
-            row.workspace_id = detail.workspace_id;
-            row.role = detail.role;
-            row.checked_at = Some(detail.last_checked_at);
-            row.next_check_at = Some(detail.next_check_at);
-            match self.db.put_readiness(row, None).await {
-                Ok(row) => rows.push(row),
-                Err(db::DbError::VersionConflict) => {
-                    rows = self.db.list_readiness(&project.id).await?
-                }
-                Err(error) => return Err(error.into()),
+            keys.into_iter()
+                .map(|key| {
+                    let job = jobs.remove(&key).expect("finished job");
+                    (key, job)
+                })
+                .collect()
+        };
+        let mut changed = HashSet::new();
+        for (key, job) in finished {
+            if job
+                .await
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))??
+            {
+                changed.insert(key.split('@').next().unwrap_or(&key).to_owned());
             }
         }
-        crate::placement::environment::schedule_project_probes(
-            &self.db,
-            project,
-            &self.task_service.workspace_backend_router(),
-        )
-        .await?;
-        let environment = serde_json::from_str::<ProjectSettings>(&project.settings)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
-            .environment;
-        let digest = db::environment_checks_digest(&environment);
-        if project.system_pause_reason.as_deref() == Some(ENVIRONMENT_NOT_READY)
-            && pause_detail(project)?.is_some_and(|detail| !detail.checks.is_empty())
-            && rows.iter().any(|row| {
-                row.checks_digest == digest && row.status == db::EnvironmentReadinessStatus::Ready
-            })
-        {
-            return self.task_service.clear_environment_pause(project).await;
-        }
-        let mut changed = false;
-        for row in rows {
-            let key = if row.machine == db::EnvironmentMachine::Server {
+        // Index-backed and executed once for the entire dispatcher pass.
+        let due = self.db.due_readiness(&db::now_rfc3339()).await?;
+        for row in due {
+            let Some(project) = ProjectRepo::get_by_id(&*self.db, &row.project_id).await? else {
+                continue;
+            };
+            let settings: ProjectSettings = match serde_json::from_str(&project.settings) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::warn!(project_id=%project.id,%error,"cannot re-check malformed environment settings; rescheduling");
+                    self.db
+                        .reschedule_readiness(&row, &next_check_at(chrono::Utc::now(), 600))
+                        .await?;
+                    continue;
+                }
+            };
+            let environment = settings.environment;
+            if project.paused_at.is_some()
+                && project.system_pause_reason.as_deref() != Some(ENVIRONMENT_NOT_READY)
+            {
+                // A user/repository pause retains the base's explicit manual-check
+                // behaviour; it must not start an automatic command behind the pause.
+                self.db
+                    .reschedule_readiness(
+                        &row,
+                        &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
+                    )
+                    .await?;
+                continue;
+            }
+            if row.checks_digest != db::environment_checks_digest(&environment) {
+                self.db
+                    .reschedule_readiness(
+                        &row,
+                        &next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds),
+                    )
+                    .await?;
+                continue;
+            }
+            let key = if row.machine == EnvironmentMachine::Server {
                 project.id.clone()
             } else {
                 format!(
                     "{}@{}",
                     project.id,
-                    crate::placement::environment::machine_label(&row.machine)
+                    environment::machine_label(&row.machine)
                 )
             };
-            let finished = {
-                let mut jobs = self
-                    .environment_rechecks
-                    .lock()
-                    .expect("environment jobs lock");
-                match jobs.get(&key) {
-                    Some(job) if !job.is_finished() => continue,
-                    Some(_) => jobs.remove(&key),
-                    None => None,
-                }
-            };
-            if let Some(job) = finished {
-                changed |= job
-                    .await
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))??;
-                continue;
-            }
-            if row.status != db::EnvironmentReadinessStatus::NotReady || row.checks_digest != digest
+            if self
+                .environment_rechecks
+                .lock()
+                .expect("environment jobs lock")
+                .contains_key(&key)
             {
                 continue;
             }
-            let due = row
-                .next_check_at
-                .as_deref()
-                .and_then(|at| DateTime::parse_from_rfc3339(at).ok());
-            if due.is_some_and(|due| Utc::now() < due) {
+            let Some(guard) = environment::claim_probe(&project.id, &row.machine) else {
                 continue;
-            }
-            let checks: Vec<_> = environment
+            };
+            let manual_guard = if row.machine == EnvironmentMachine::Server {
+                let Some(guard) = self.task_service.claim_environment_recheck(&project.id) else {
+                    continue;
+                };
+                Some(guard)
+            } else {
+                None
+            };
+            let mut checks: Vec<_> = environment
                 .checks
                 .iter()
                 .filter(|check| {
@@ -139,109 +117,96 @@ impl TaskDispatcher {
                 .cloned()
                 .collect();
             if checks.is_empty() {
-                continue;
+                checks = environment
+                    .checks
+                    .iter()
+                    .filter(|check| row.role.as_ref().is_none_or(|role| check.applies_to(role)))
+                    .cloned()
+                    .collect();
             }
-            let Some(guard) = crate::placement::environment::claim_probe(&project.id, &row.machine)
-            else {
-                continue;
-            };
-            let legacy_guard = if row.machine == db::EnvironmentMachine::Server {
-                let Some(guard) = self.task_service.claim_environment_recheck(&project.id) else {
-                    continue;
-                };
-                Some(guard)
-            } else {
-                None
-            };
-            let service = std::sync::Arc::clone(&self.task_service);
-            let db = std::sync::Arc::clone(&self.db);
-            let project = project.clone();
-            let environment = environment.clone();
+            let db = self.db.clone();
+            let service = self.task_service.clone();
+            let kick = self.task_service.dispatch_notify();
+            let result_events = self.event_bus.clone();
             let job = tokio::spawn(async move {
-                let _guard = guard;
-                let _legacy_guard = legacy_guard;
-                let target = if row.machine == db::EnvironmentMachine::Server {
-                    service
-                        .environment_check_checkout(&project)
-                        .await
-                        .map(|path| Some(crate::placement::environment::ProbeTarget::Server(path)))
-                } else {
-                    crate::placement::environment::target_for_machine(
-                        &db,
-                        &project,
-                        &row.machine,
-                        &service.workspace_backend_router(),
-                        row.workspace_id.as_deref(),
-                    )
-                    .await
-                };
-                let results = match target {
-                    Ok(Some(target)) => {
-                        crate::placement::environment::run_checks(&target, &environment, &checks)
-                            .await
+                let result = async {
+                    let next = next_check_at(chrono::Utc::now(), environment.recheck_interval_seconds);
+                    if checks.is_empty() {
+                        db.reschedule_readiness(&row, &next).await?;
+                        return Ok(false);
                     }
-                    Ok(None) => return Ok(false), // Keep the unreachable owner's fact.
-                    Err(error) => Err(error),
-                };
-                let results = match results {
-                    Ok(results) => results,
-                    Err(
-                        ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. },
-                    ) => return Ok(false),
-                    Err(error) => checks
-                        .iter()
-                        .map(|check| api_types::ProjectEnvironmentCheckResult {
-                            name: check.name.clone(),
-                            passed: false,
-                            exit_code: None,
-                            output_tail: bounded_output_tail(&error.to_string()),
-                        })
-                        .collect(),
-                };
-                let saved = match crate::placement::environment::save_results(
-                    &db,
-                    row,
-                    &environment,
-                    results,
-                )
-                .await
-                {
-                    Ok(saved) => saved,
-                    Err(ServiceError::Db(db::DbError::VersionConflict)) => return Ok(false),
-                    Err(error) => return Err(error),
-                };
-                if saved.status == db::EnvironmentReadinessStatus::Ready {
-                    return service.clear_environment_pause(&project).await;
-                }
-                // Only the pause belonging to this machine receives its detail.
-                if let Some(mut detail) = pause_detail(&project)? {
-                    let pause: serde_json::Value = serde_json::from_str(
-                        project.environment_pause_json.as_deref().unwrap_or("{}"),
-                    )
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-                    let machine: db::EnvironmentMachine =
-                        serde_json::from_value(pause["machine"].clone())
-                            .unwrap_or(db::EnvironmentMachine::Server);
-                    if machine == saved.machine {
-                        detail.checks = saved
-                            .failing_checks
-                            .iter()
-                            .map(|check| check.name.clone())
-                            .collect();
-                        detail.output = bounded_output_tail(
-                            &saved
-                                .failing_checks
-                                .iter()
-                                .map(|check| format!("{}: {}", check.name, check.output_tail))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                        detail.last_checked_at = saved.checked_at.unwrap();
-                        detail.next_check_at = saved.next_check_at.unwrap();
-                        service.update_environment_pause(&project, &detail).await?;
+                    let target = if row.machine == EnvironmentMachine::Server {
+                        service.environment_check_checkout(&project).await
+                            .map(|path| Some(ProbeTarget::Server(path)))
+                    } else {
+                        environment::target_for_machine(&db, &project, &row.machine,
+                            &service.workspace_backend_router(), row.workspace_id.as_deref()).await
+                    };
+                    let results = match target {
+                        Ok(Some(target)) => environment::run_checks(&target, &environment, &checks).await,
+                        Ok(None) => {
+                            db.reschedule_readiness(&row, &next).await?;
+                            return Ok(false);
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let results = match results {
+                        Ok(results) => results,
+                        Err(error) => {
+                            // A transport timeout may outlast the interval. The
+                            // next attempt is due after completion, not job start.
+                            let completed = chrono::Utc::now();
+                            let next = next_check_at(completed,environment.recheck_interval_seconds);
+                            db.reschedule_readiness(&row, &next).await?;
+                            // Host Project diagnostics retain the base behaviour.
+                            // Daemon transport/fence errors never become check facts
+                            // or touch another Task's run.
+                            if row.machine == EnvironmentMachine::Server {
+                                if let Some(mut detail) = pause_detail(&project)? {
+                                    detail.output = bounded_output_tail(&error.to_string());
+                                    detail.last_checked_at = completed.to_rfc3339();
+                                    detail.next_check_at = next;
+                                    service.update_environment_pause(&project, &detail).await?;
+                                }
+                            }
+                            tracing::warn!(project_id = %project.id, %error,
+                                "environment re-check could not run; retaining readiness and rescheduling");
+                            return Ok(false);
+                        }
+                    };
+                    let passed = results.iter().all(|result| result.passed);
+                    let saved = match environment::save_results(&db, row, &environment, results).await {
+                        Ok(saved) => saved,
+                        Err(ServiceError::Db(db::DbError::VersionConflict)) => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    if passed {
+                        return environment::clear_matching_pause(&db,&result_events,&project,&saved).await;
                     }
-                }
-                Ok(false)
+                    if project.system_pause_reason.as_deref() == Some(ENVIRONMENT_NOT_READY) {
+                        if let Some(mut detail) = pause_detail(&project)? {
+                            let original: serde_json::Value = serde_json::from_str(
+                                project.environment_pause_json.as_deref().unwrap_or("{}"))
+                                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                            let machine: EnvironmentMachine = serde_json::from_value(original["machine"].clone())
+                                .unwrap_or(EnvironmentMachine::Server);
+                            if machine == saved.machine {
+                                detail.checks = saved.failing_checks.iter().map(|failure| failure.name.clone()).collect();
+                                detail.output = bounded_output_tail(&saved.failing_checks.iter()
+                                    .map(|failure| format!("{}: {}", failure.name, failure.output_tail))
+                                    .collect::<Vec<_>>().join("\n"));
+                                detail.last_checked_at = saved.checked_at.expect("completed check");
+                                detail.next_check_at = saved.next_check_at.unwrap_or(next);
+                                service.update_environment_pause(&project, &detail).await?;
+                            }
+                        }
+                    }
+                    Ok::<_, ServiceError>(false)
+                }.await;
+                drop(manual_guard);
+                drop(guard);
+                kick.notify_one();
+                result
             });
             self.environment_rechecks
                 .lock()
@@ -250,31 +215,36 @@ impl TaskDispatcher {
         }
         Ok(changed)
     }
-
-    /// Project PATCH publishes project.updated after committing settings. A
-    /// weak observer starts invalidated probes immediately, even with no Task.
-    /// Periodic scans also reconcile changes made by non-event DB callers.
-    fn observe_environment_settings(&self) {
+    /// Settings events invalidate rows transactionally; only host rows/locations
+    /// can start a probe in this build step, independently of queued Tasks.
+    pub(super) fn observe_environment_settings(&self) {
         self.environment_settings_observer.get_or_init(|| {
-        let mut events = self.event_bus.subscribe();
-        let service = std::sync::Arc::downgrade(&self.task_service);
-        let db = std::sync::Arc::downgrade(&self.db);
-        tokio::spawn(async move {
-            loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(false),
-                };
-                if event.event_type != "project.updated" { continue; }
-                let (Some(service), Some(db)) = (service.upgrade(), db.upgrade()) else { return Ok(false); };
-                if let Some(project) = db::ProjectRepo::get_by_id(&*db, &event.entity_id).await? {
-                    if let Err(error) = crate::placement::environment::schedule_project_probes(&db, &project, &service.workspace_backend_router()).await {
-                        tracing::warn!(project_id = %project.id, %error, "settings environment probes could not start");
+            let mut events = self.event_bus.subscribe();
+            let event_bus = self.event_bus.clone();
+            let service = std::sync::Arc::downgrade(&self.task_service);
+            let db = std::sync::Arc::downgrade(&self.db);
+            tokio::spawn(async move {
+                loop {
+                    let event = match events.recv().await {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(false),
+                    };
+                    if event.event_type != "project.updated" && event.event_type != "project.resumed" {
+                        continue;
+                    }
+                    let (Some(service), Some(db)) = (service.upgrade(), db.upgrade()) else {
+                        return Ok(false);
+                    };
+                    if let Some(project) = ProjectRepo::get_by_id(&*db, &event.entity_id).await? {
+                        if let Err(error) = environment::schedule_project_probes(
+                            &db, &project, service.dispatch_notify(), event_bus.clone()).await {
+                            tracing::warn!(project_id = %project.id, %error, "settings environment probe could not start");
+                        }
+                        service.dispatch_notify().notify_one();
                     }
                 }
-            }
-        })
+            })
         });
     }
 }

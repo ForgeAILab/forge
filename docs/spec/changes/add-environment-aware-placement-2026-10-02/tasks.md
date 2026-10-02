@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T06:49:52Z
+updated_at: 2026-10-02T10:47:57Z
 completed_at:
 ---
 
@@ -34,8 +34,11 @@ completed_at:
 - [ ] 4.2 `CHANGELOG.md` `### Breaking`: recheck response shape, `environment_pause` gains the machine, Project pauses only when no machine is eligible; `### Added` for the rest
 
 ### Backend build-step verification
-- Implemented 1.1–1.5 and 2.1–2.3, including the before-transition probe refusal that keeps initial Tasks queued without version churn. The public API/CLI/web and provisioning work remains unchecked.
-- Machine key: Project + server owner, or Project + daemon/runtime owner. The temporary missing-record pass for an unprobeable daemon is the explicit arm in `placement::selection::filter_candidate`; remove it with `machine.probe`.
-- Daemon failure/re-check/dispatch integration is verified with an `interactive` role on the daemon. Existing daemon coder prompt loading calls `EmbeddedWorkspaceBackend::recorded_server_path` in `workflow/dispatch/loader.rs`; coder/planner start also prepares an outbox on the server using the daemon-local path in `task_service/execution/runner.rs`. Those independent paths prevent proving coder/planner daemon launch under the refactor freeze and are follow-ups for the owning refactor; neither file was changed.
-- Existing environment-pause test assertions are unchanged. The shared launch-test fixture seeds an already-ready server record so those tests still reach preflight: an unknown machine must now be refused before claim. Existing scheduled re-check and manual fallback tests passed unchanged.
-- The unchanged interval validator and the full happy-path integration target were not run: there is no named environment happy-path case, and the focused-test restriction takes precedence. API response fields, generated bindings, web files, CLI files, daemon operations/capabilities, and CHANGELOG.md were not changed.
+- Backend tasks 1.1–1.5 and 2.1–2.3 include audit corrections D-A–D-F: host-only probes, role-specific admission pause, transactional resume reset, environmental waits, parked slot projection, and preference-preserving deferral.
+- Machine key is Project/server owner or Project/daemon/runtime owner. The temporary daemon missing/unknown/stale pass is `placement::selection::environment_filter`, shared by reserve and claim; step 3 removes it.
+- Audit reproductions are permanent repo tests in `task_dispatcher/tests/environment_placement.rs`; they have no dependency on audit scratch files. The shared launch fixture no longer seeds a ready row: it configures the launch-only environment after normal claim; first-dispatch tests exercise actual probes.
+- Daemon launch tests use `interactive`, because separate jobs own coder/planner plan I/O fixes in `workflow/dispatch/loader.rs` and `task_service/execution/runner.rs`; neither site is changed.
+- API/CLI/web, generated types, daemon operations, provisioning and CHANGELOG.md remain untouched. Broad suites and the full happy-path target remain CI work; no named environment happy-path case exists.
+- Audit coverage also verifies parked waits advancing `list_revision`, exact machine-specific deferral clearing, automatic continuation after a colliding digest edit, and a settings probe clearing its matching environment pause without a Task. The integration branch's future batched slot projection is not present at this HEAD; the current aggregate and row walk are checked for identical parked counts.
+- Guard regressions cover a harmless name edit during re-check and retaining the environmental wait on offline transport. Valid digest edits with checks remaining retire the obsolete environment pause in the same transaction; otherwise an unknown daemon fact could never reach the launch that verifies it. Removing all checks preserves the existing manual-resume behavior.
+- Migration contract clarification: legacy asset-only pauses are preserved without a readiness row, honoring the no-check/no-row rule; configured-check pauses carry not-ready rows, and malformed settings carry unknown rows.

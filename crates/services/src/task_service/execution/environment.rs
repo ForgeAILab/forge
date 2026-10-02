@@ -29,7 +29,8 @@ impl TaskService {
 
     /// Stamp the environment, copy assets and run the checks gating this role.
     /// A failed preflight terminalizes the execution before any provider call
-    /// and pauses the Project, leaving the Task in its current workflow state.
+    /// and records the owner failure. Task-aware admission decides whether to
+    /// pause the Project or wait on that owner without changing workflow state.
     pub(super) async fn prepare_execution_environment(
         &self,
         task: &Task,
@@ -100,70 +101,60 @@ impl TaskService {
             },
         )
         .await?;
-        let should_pause = environment.checks.is_empty()
-            || crate::placement::environment::every_machine_not_ready(
-                &self.db,
-                &project,
-                &db::environment_checks_digest(&environment),
-            )
-            .await?;
-        if !should_pause {
-            let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                .await?
-                .ok_or(DbError::NotFound)?;
-            crate::placement::environment::persist_machine_wait(
-                &self.db, &current, &machine, &checks,
-            )
-            .await?;
-            return Ok(Some(failed));
-        }
-        let now = chrono::Utc::now();
-        let paused_at = now.to_rfc3339();
-        let detail = api_types::ProjectEnvironmentPause {
-            workspace_id: Some(workspace.placement.workspace_id.clone()),
-            checks,
-            role: Some(execution.role.clone()),
-            output,
-            paused_at: paused_at.clone(),
-            last_checked_at: paused_at.clone(),
-            next_check_at: next_check_at(now, environment.recheck_interval_seconds),
-        };
-        let mut detail_json = serde_json::to_value(&detail).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "failed to serialize environment pause: {error}"
-            ))
-        })?;
-        // Internal detail retains the owner now; the public pause response
-        // keeps its existing shape until the API step of this change.
-        detail_json["machine"] = serde_json::to_value(&machine).expect("machine is serializable");
-        let detail_json = detail_json.to_string();
-        if ProjectRepo::set_environment_pause_if_unchanged(
+        let agent = AgentRepo::get_by_id(
             &*self.db,
-            &project.id,
-            project.version,
-            &paused_at,
-            &detail_json,
+            execution.agent_id.as_deref().ok_or(DbError::NotFound)?,
         )
         .await?
-        {
-            self.publish(ForgeEvent {
-                event_type: "project.paused".to_owned(),
-                entity_id: project.id,
-                timestamp: event_timestamp(),
-                context: EventContext::ProjectPaused { paused_at },
-            });
-        }
-        if !environment.checks.is_empty() {
+        .ok_or(DbError::NotFound)?;
+        let prepared = crate::placement::context::prepare_selection(
+            &self.db,
+            task,
+            Some(&agent),
+            &execution.role,
+            self.placement_adapter_registry.as_deref(),
+        )
+        .await?;
+        if environment.checks.is_empty() {
+            // Asset-only Projects retain the base's global failure signal.
+            let now = chrono::Utc::now();
+            let detail = serde_json::json!({"machine":machine,"workspace_id":workspace.placement.workspace_id,"checks":checks,"role":execution.role,"output":output,"paused_at":now.to_rfc3339(),"last_checked_at":now.to_rfc3339(),"next_check_at":next_check_at(now,environment.recheck_interval_seconds)});
+            if ProjectRepo::set_environment_pause_if_unchanged(
+                &*self.db,
+                &project.id,
+                project.version,
+                &now.to_rfc3339(),
+                &detail.to_string(),
+            )
+            .await?
+            {
+                self.publish(ForgeEvent {
+                    event_type: "project.paused".into(),
+                    entity_id: project.id,
+                    timestamp: event_timestamp(),
+                    context: EventContext::ProjectPaused {
+                        paused_at: now.to_rfc3339(),
+                    },
+                });
+            }
+        } else {
             let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
                 .ok_or(DbError::NotFound)?;
-            crate::placement::environment::persist_machine_wait(
-                &self.db,
-                &current,
-                &machine,
-                &detail.checks,
-            )
-            .await?;
+            let context = self
+                .environment_selection_context(&current, &prepared)
+                .await?;
+            if let Err(refusal) = crate::placement::select_placement(&context).into_result() {
+                crate::placement::environment::handle_refusal(
+                    &self.db,
+                    &self.event_bus,
+                    &current,
+                    &prepared.project,
+                    &context,
+                    &refusal,
+                )
+                .await?;
+            }
         }
         Ok(Some(failed))
     }
@@ -601,6 +592,17 @@ mod tests {
         let daemon_id = placement.daemon_id.unwrap();
         let (connection_id, mut outbound) =
             crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        // These launch fixtures must advertise the actual executor and policy
+        // facts a real admitted daemon supplies; no readiness row is fabricated.
+        registry.dispatch_incoming_for_connection(&daemon_id,connection_id,api_types::DaemonFrame::Notification {
+            method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params:json!({"protocol_revision":3,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
+        sqlx::query("UPDATE daemon SET detected_clis_json=? WHERE id=?")
+            .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
+            .bind(&daemon_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
         let responder_registry = registry.clone();
         let responder = tokio::spawn(async move {
             let mut runs = 0;
@@ -693,61 +695,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn environment_daemon_probe_records_cargo_failure() {
+    async fn environment_daemon_launch_records_role_scoped_cargo_failure() {
         use db::ProjectMachineReadinessRepo;
-        let (db, _service, task, _execution, workspace, responder) = fixture(false).await;
-        let environment: api_types::ProjectEnvironment =
-            serde_json::from_value(json!({"env":{"SECRET":"redact-me"},"checks":[
-            {"name":"cargo","command":"cargo --version","roles":["reviewer"],"timeout_seconds":1},
-            {"name":"disk","command":"disk-check","timeout_seconds":1}]}))
-            .unwrap();
+        let (db, service, task, mut execution, workspace, responder) = fixture(false).await;
+        let environment: api_types::ProjectEnvironment = serde_json::from_value(json!({"env":{"SECRET":"redact-me"},"checks":[{"name":"cargo","command":"cargo --version","roles":["reviewer"],"timeout_seconds":1}]})).unwrap();
         sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
             .bind(json!({"environment":environment}).to_string())
             .bind(&task.project_id)
             .execute(db.pool())
             .await
             .unwrap();
-        let machine = db::EnvironmentMachine::from_placement(&workspace.placement);
-        crate::placement::environment::start_probe(
-            (*db).clone(),
-            task.project_id.clone(),
-            machine.clone(),
-            environment,
-            None,
-            crate::placement::environment::ProbeTarget::Daemon {
-                placement: Box::new(workspace.placement),
-                backend: workspace.backend,
-            },
+        assert!(
+            service
+                .prepare_execution_environment(&task, &execution, &workspace, &mut json!({}))
+                .await
+                .unwrap()
+                .is_none(),
+            "reviewer check must not run for coder"
         );
-        let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(row) = db
-                    .get_readiness(&task.project_id, &machine)
-                    .await
-                    .unwrap()
-                    .filter(|row| row.status == db::EnvironmentReadinessStatus::NotReady)
-                {
-                    break row;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            row.failing_checks.len(),
-            1,
-            "every configured check ran, including the passing disk check"
+        assert!(
+            db.list_readiness(&task.project_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no daemon probe or synthetic fact"
         );
+        execution.role = "reviewer".into();
+        assert!(service
+            .prepare_execution_environment(&task, &execution, &workspace, &mut json!({}))
+            .await
+            .unwrap()
+            .is_some());
+        let row = db
+            .get_readiness(
+                &task.project_id,
+                &db::EnvironmentMachine::from_placement(&workspace.placement),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.failing_checks[0].name, "cargo");
+        assert_eq!(row.role.as_deref(), Some("reviewer"));
         assert!(row.failing_checks[0]
             .output_tail
             .contains("command not found"));
         assert!(!row.failing_checks[0].output_tail.contains("redact-me"));
-        assert!(row.failing_checks[0].output_tail.chars().count() <= 1500);
-        assert_eq!(row.scope_covered, "full");
-        assert!(row.checked_at.is_some());
-        assert!(row.next_check_at.is_some());
         responder.abort();
     }
 
@@ -928,6 +920,59 @@ mod tests {
         .unwrap();
         assert!(attention.contains(daemon_id));
         assert!(attention.contains("owner-probe"));
+
+        let (kind, action): (String, String) = sqlx::query_as(
+            "SELECT attention_type,recommended_action FROM attention_projection WHERE dedupe_key=?",
+        )
+        .bind(format!("task-environment-wait:{}", task.id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kind, "environment_not_ready");
+        assert_eq!(action, "wait");
+        let execution_failed:i64=sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE entity_id=? AND event_type='task.execution_failed'")
+            .bind(&task.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            execution_failed, 0,
+            "waiting is not a Task execution failure"
+        );
+        let pinned = original_service
+            .create_task(
+                project.id.clone(),
+                "Pinned wait",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let pinned_agent = AgentRepo::get_by_id(&*db, execution.agent_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        // No placement yet: an Agent pin uses exactly the same durable wait.
+        assert!(service
+            .defer_initial_environment_probe(&pinned, &pinned_agent, "interactive")
+            .await
+            .unwrap());
+        let kind: String = sqlx::query_scalar(
+            "SELECT attention_type FROM attention_projection WHERE dedupe_key=? AND status='open'",
+        )
+        .bind(format!("task-environment-wait:{}", pinned.id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kind, "environment_not_ready");
+        assert!(ProjectRepo::get_by_id(&*db, &project.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused_at
+            .is_none());
         let agent = db::AgentRepo::create(
             &*db,
             db::CreateAgent {
@@ -1050,8 +1095,8 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            db::EnvironmentReadinessStatus::NotReady,
-            "the daemon's successful recheck did not run on the server"
+            db::EnvironmentReadinessStatus::Unknown,
+            "clearing the pause resets other failed rows so resumed work can try again"
         );
         let status: String =
             sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key = ?")
@@ -1163,13 +1208,15 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            db.get_readiness(&task.project_id, &machine)
-                .await
-                .unwrap()
-                .unwrap(),
-            row
-        );
+        let rechecked = db
+            .get_readiness(&task.project_id, &machine)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rechecked.status, row.status);
+        assert_eq!(rechecked.failing_checks, row.failing_checks);
+        assert_eq!(rechecked.checked_at, row.checked_at);
+        assert!(rechecked.next_check_at > row.next_check_at);
         assert!(ProjectRepo::get_by_id(&*db, &task.project_id)
             .await
             .unwrap()
@@ -1177,6 +1224,105 @@ mod tests {
             .paused_at
             .is_some());
         responder.abort();
+    }
+
+    #[tokio::test]
+    async fn environment_daemon_recheck_version_error_preserves_facts_and_reschedules() {
+        use db::ProjectMachineReadinessRepo;
+        let (db, service, task, execution, workspace, responder) = fixture(false).await;
+        service
+            .prepare_execution_environment(&task, &execution, &workspace, &mut json!({}))
+            .await
+            .unwrap();
+        responder.abort();
+        let machine = db::EnvironmentMachine::from_placement(&workspace.placement);
+        let mut row = db
+            .get_readiness(&task.project_id, &machine)
+            .await
+            .unwrap()
+            .unwrap();
+        let version = row.version;
+        row.next_check_at = Some("2000-01-01T00:00:00Z".into());
+        let before = db.put_readiness(row, Some(version)).await.unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let daemon = workspace
+            .placement
+            .daemon_id
+            .as_deref()
+            .unwrap()
+            .to_string();
+        let (connection, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon, false);
+        let responding = registry.clone();
+        let recorded_handle = workspace.placement.workspace_handle.clone().unwrap();
+        let error_server = tokio::spawn(async move {
+            while let Some(api_types::DaemonFrame::Request { id, method, params }) =
+                outbound.recv().await
+            {
+                assert_eq!(
+                    params["workspace_handle"], recorded_handle,
+                    "only the failure's workspace is used"
+                );
+                let frame = match method.as_str() {
+                    api_types::METHOD_WORKSPACE_DESCRIBE => api_types::DaemonFrame::Response {
+                        id,
+                        result: json!({"workspace_handle":recorded_handle,"generation":1,"exists":true,"head_sha":"head","dirty":false,"branch":"task/remote","locked":false,"active_execution_ids":[],"journaled_execution_ids":[]}),
+                    },
+                    api_types::METHOD_WORKSPACE_RUN => api_types::DaemonFrame::Error {
+                        id: Some(id),
+                        error: api_types::DaemonErrorPayload {
+                            code: "stale_generation".into(),
+                            message: "owner version fence".into(),
+                            details: None,
+                        },
+                    },
+                    _ => panic!("unexpected re-check operation {method}"),
+                };
+                responding.dispatch_incoming_for_connection(&daemon, connection, frame);
+            }
+        });
+        let router = (*service.workspace_backend_router())
+            .clone()
+            .with_daemon(Arc::new(DaemonWorkspaceBackend::new(db.clone(), registry)));
+        let service = Arc::new(service.with_workspace_backend_router(Arc::new(router)));
+        let dispatcher = crate::TaskDispatcher::new(db.clone(), service.event_bus.clone(), service);
+        dispatcher.check_once().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if db
+                    .get_readiness(&task.project_id, &machine)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .version
+                    > before.version
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = db
+            .get_readiness(&task.project_id, &machine)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.failing_checks, before.failing_checks);
+        assert_eq!(after.check_results, before.check_results);
+        assert_eq!(after.output_tail, before.output_tail);
+        assert_eq!(after.checked_at, before.checked_at);
+        assert!(after.next_check_at > before.next_check_at);
+        assert!(TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .error_annotation
+            .is_none());
+        error_server.abort();
     }
 
     async fn pause_with_primary_checkout(

@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod capacity;
+pub(crate) mod context;
 pub(crate) mod environment;
 pub mod selection;
 
@@ -12,31 +13,32 @@ pub use selection::{
     SelectionOutcome, SelectionReason, SelectionRule, ServerFacts, WorktreeAgent,
 };
 
+pub(crate) fn retryable_filter_codes(codes: &[PlacementFilterCode]) -> bool {
+    !codes.is_empty()
+        && codes.iter().all(|code| {
+            matches!(
+                code,
+                PlacementFilterCode::AgentCapacity
+                    | PlacementFilterCode::DaemonCapacity
+                    | PlacementFilterCode::OwnerUnreachable
+                    | PlacementFilterCode::EnvironmentProbePending
+                    | PlacementFilterCode::EnvironmentNotReady
+            ) || (codes.contains(&PlacementFilterCode::OwnerUnreachable)
+                && matches!(
+                    code,
+                    PlacementFilterCode::WorkspaceProtocolMissing
+                        | PlacementFilterCode::ExecutorUnavailable
+                ))
+        })
+}
 /// Classify selection filters; transport errors also require placement state.
 pub(crate) fn is_retryable_admission_refusal(error: &crate::ServiceError) -> bool {
     match error {
         crate::ServiceError::Db(db::DbError::AgentAtCapacity) => true,
-        crate::ServiceError::PlacementUnavailable(refusal) => {
-            refusal.rejected_candidates.iter().any(|candidate| {
-                !candidate.filter_codes.is_empty()
-                    && candidate.filter_codes.iter().all(|code| {
-                        matches!(
-                            code,
-                            PlacementFilterCode::AgentCapacity
-                                | PlacementFilterCode::DaemonCapacity
-                                | PlacementFilterCode::OwnerUnreachable
-                                | PlacementFilterCode::EnvironmentProbePending
-                        ) || (candidate
-                            .filter_codes
-                            .contains(&PlacementFilterCode::OwnerUnreachable)
-                            && matches!(
-                                code,
-                                PlacementFilterCode::WorkspaceProtocolMissing
-                                    | PlacementFilterCode::ExecutorUnavailable
-                            ))
-                    })
-            })
-        }
+        crate::ServiceError::PlacementUnavailable(refusal) => refusal
+            .rejected_candidates
+            .iter()
+            .any(|candidate| retryable_filter_codes(&candidate.filter_codes)),
         _ => false,
     }
 }
@@ -47,18 +49,6 @@ pub(crate) async fn admission_refusal_is_retryable(
     error: &crate::ServiceError,
 ) -> crate::Result<bool> {
     let placement = db::WorkspacePlacementRepo::get_for_task(db, task_id).await?;
-    if let crate::ServiceError::PlacementUnavailable(refusal) = error {
-        if placement.as_ref().is_some_and(|placement| {
-            refusal.rejected_candidates.iter().any(|candidate| {
-                candidate.repo_location_id == placement.repo_location_id
-                    && candidate
-                        .filter_codes
-                        .contains(&PlacementFilterCode::EnvironmentNotReady)
-            })
-        }) {
-            return Ok(true);
-        }
-    }
     if matches!(
         error,
         crate::ServiceError::DaemonUnavailable { .. }
@@ -179,6 +169,21 @@ mod tests {
             PlacementFilterCode::ExecutorUnavailable
         ])));
         assert!(!is_retryable_admission_refusal(&error(vec![])));
+        assert!(is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::AgentCapacity
+        ])));
+        assert!(is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::OwnerUnreachable,
+            PlacementFilterCode::WorkspaceProtocolMissing,
+            PlacementFilterCode::ExecutorUnavailable
+        ])));
+        assert!(!is_retryable_admission_refusal(&error(vec![
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::NativeBackendUnsupported
+        ])));
+
         assert!(is_retryable_admission_refusal(&error(vec![
             PlacementFilterCode::OwnerUnreachable
         ])));

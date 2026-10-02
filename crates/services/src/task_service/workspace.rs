@@ -1,5 +1,6 @@
 use super::project_agent_workspace::{cleanup_repo_cache_if_authority_gone, resolve_repo_source};
 use super::*;
+use crate::placement::context::connection_handshakes;
 use db::{
     CreateWorkspacePlacement, PlacementOwnerKind, PlacementSelectedBy, PlacementState,
     RepoLocationKind, UpdateWorkspacePlacement, WorkspacePlacementRepo,
@@ -51,140 +52,77 @@ pub(super) struct WorkspaceAdmission {
 }
 
 impl TaskService {
-    /// The sole new initial-dispatch refusal: unknown environment readiness
-    /// parks the Task before the workflow enters its target state.
     pub(crate) async fn defer_initial_environment_probe(
         &self,
         task: &Task,
         agent: &Agent,
         role: &str,
     ) -> Result<bool> {
-        let authority = resolve_task_repository_authority(&self.db, task).await?;
-        let settings: ProjectSettings = serde_json::from_str(&authority.project.settings)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        if settings.environment.checks.is_empty() {
-            return Ok(false);
-        }
-        let claiming = worktree_agent(role, agent.clone());
-        let agents =
-            crate::placement::environment::dispatch_worktree_agents(&self.db, task, &agent.id)
-                .await?
-                .into_iter()
-                .map(|(role, agent)| worktree_agent(&role, agent))
-                .collect::<Vec<_>>();
-        let server = server_executor_facts(
+        let prepared = crate::placement::context::prepare_selection(
             &self.db,
-            std::iter::once(&claiming).chain(agents.iter()),
+            task,
+            Some(agent),
+            role,
             self.placement_adapter_registry.as_deref(),
         )
         .await?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &authority.project.workflow_definition,
-            &Actor::system(api_types::SystemComponent::General),
-        );
-        let source = json!({"workflow":workflow, "project_settings":parse_json_value("project settings", &authority.project.settings)?,
-            "task_scope":{"task_type":task.task_type,"config":task.task_state_config.as_deref().map(|raw| parse_json_value("task state config", raw)).transpose()?}});
-        let review = serde_json::from_value(
-            api_types::effective_review_config(&source).map_err(ServiceError::invalid_operation)?,
-        )
-        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let empty = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
-        let registry = self.daemon_connections.as_deref().unwrap_or(&empty);
-        let handshakes = connection_handshakes(registry);
-        let workspace = WorkspaceRepo::get_by_task_id(
-            &*self.db,
-            task.parent_task_id.as_deref().unwrap_or(&task.id),
-        )
-        .await?;
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let (version, paused_at): (i64, Option<String>) =
-            sqlx::query_as("SELECT version, paused_at FROM project WHERE id = ?")
-                .bind(&task.project_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if paused_at.is_some() {
-            return Err(ServiceError::ProjectPaused {
-                project_id: task.project_id.clone(),
-            });
+        if prepared.settings.environment.checks.is_empty() {
+            return Ok(false);
         }
-        if version != authority.project.version {
-            return Err(DbError::VersionConflict.into());
-        }
-        for role in std::iter::once(&claiming).chain(agents.iter()) {
-            let version: Option<i64> =
-                sqlx::query_scalar("SELECT version FROM agent_current WHERE id = ?")
-                    .bind(&role.agent.id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if version != Some(role.agent.version) {
-                return Err(DbError::VersionConflict.into());
-            }
-        }
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_location WHERE repo_id = ?")
-            .bind(&authority.repo.id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if count == 0 {
-            let path = authority
-                .repo
-                .local_path
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.workspace_root.join(".repos").join(&authority.repo.id));
-            // The dispatcher has verified checkout readiness already. As in
-            // ordinary admission, register its location without a workspace.
-            if path.is_dir() {
-                server_repo_location_in_tx(
-                    &mut tx,
-                    &authority.repo,
-                    &path.to_string_lossy(),
-                    &now_rfc3339(),
-                )
-                .await?;
-            }
-        }
-        let context = crate::placement::load_selection_context(
+        let context = self.environment_selection_context(task, &prepared).await?;
+        crate::placement::environment::start_context_probes(
             &self.db,
-            &mut tx,
-            registry,
-            crate::placement::SelectionLoadInput {
-                task,
-                repo: &authority.repo,
-                claiming_agent: &claiming,
-                worktree_agents: &agents,
-                task_owner_id: authority.project.owner_id.as_deref(),
-                workspace_id: workspace
-                    .as_ref()
-                    .filter(|_| task.parent_task_id.is_none())
-                    .map(|workspace| workspace.id.as_str()),
-                inherited_root_workspace_id: workspace
-                    .as_ref()
-                    .filter(|_| task.parent_task_id.is_some())
-                    .map(|workspace| workspace.id.as_str()),
-                review_config: &review,
-                project_settings: &settings,
-                server: &server,
-                handshakes: &handshakes,
-            },
+            &context,
+            &self.event_bus,
+            self.dispatch_notify(),
         )
         .await?;
-        tx.commit().await?;
         let Err(refusal) = crate::placement::select_placement(&context).into_result() else {
             return Ok(false);
         };
-        if !refusal.rejected_candidates.iter().any(|candidate| {
-            candidate
-                .filter_codes
-                .contains(&crate::placement::PlacementFilterCode::EnvironmentProbePending)
-        }) {
-            return Ok(false);
-        }
-        let error = ServiceError::PlacementUnavailable(refusal);
-        if !crate::placement::is_retryable_admission_refusal(&error) {
-            return Ok(false);
-        }
-        self.defer_placement_refusal(task, &error).await
+        crate::placement::environment::handle_refusal(
+            &self.db,
+            &self.event_bus,
+            task,
+            &prepared.project,
+            &context,
+            &refusal,
+        )
+        .await
+    }
+
+    pub(crate) async fn environment_selection_context(
+        &self,
+        task: &Task,
+        prepared: &crate::placement::context::PreparedSelection,
+    ) -> Result<crate::placement::SelectionContext> {
+        let empty = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
+        let registry = self.daemon_connections.as_deref().unwrap_or(&empty);
+        let mut tx = self.db.pool().begin().await?;
+        let workspace_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM workspace WHERE task_id = ?")
+                .bind(task.parent_task_id.as_deref().unwrap_or(&task.id))
+                .fetch_optional(&mut *tx)
+                .await?;
+        let path = prepared
+            .repo
+            .local_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.workspace_root.join(".repos").join(&prepared.repo.id));
+        let context = prepared
+            .load_context(
+                &self.db,
+                &mut tx,
+                registry,
+                task,
+                workspace_id.as_deref(),
+                Some(&path),
+            )
+            .await?
+            .expect("environment selection has a claiming Agent");
+        tx.rollback().await?;
+        Ok(context)
     }
 
     pub(super) fn check_placement_lease_owner(
@@ -221,6 +159,16 @@ impl TaskService {
         task: &Task,
         error: &ServiceError,
     ) -> Result<bool> {
+        if let ServiceError::ProjectPaused { .. } = error {
+            if ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .is_some_and(|project| {
+                    project.system_pause_reason.as_deref() == Some("environment_not_ready")
+                })
+            {
+                return Ok(true);
+            }
+        }
         if let Some(deferred) =
             crate::placement::environment::defer_refusal(&self.db, task, error).await?
         {
@@ -363,8 +311,9 @@ impl TaskService {
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
             .bind(&task.id).bind(current.version).execute(&mut *tx).await?;
-        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key = ? AND status <> 'resolved'")
-            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id)).execute(&mut *tx).await?;
+        sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
+            .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
+            .bind(format!("task-environment-wait:{}", task.id)).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(false)
     }
@@ -375,81 +324,24 @@ impl TaskService {
         agent: Option<&Agent>,
         role: &str,
     ) -> Result<WorkspaceAdmission> {
-        use crate::placement::{load_selection_context, select_placement, SelectionLoadInput};
+        use crate::placement::select_placement;
         if agent.is_some() {
             self.ensure_project_not_paused(task).await?;
         }
-        let authority = resolve_task_repository_authority(&self.db, task).await?;
-        let repo = &authority.repo;
-        let settings: ProjectSettings =
-            serde_json::from_str(&authority.project.settings).map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid project settings: {error}"))
-            })?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &authority.project.workflow_definition,
-            &Actor::system(api_types::SystemComponent::General),
-        );
-        let review_source = json!({
-            "workflow": workflow,
-            "project_settings": parse_json_value("project settings", &authority.project.settings)?,
-            "task_scope": { "task_type": task.task_type,
-                "config": task.task_state_config.as_deref().map(|raw| parse_json_value("task state config", raw)).transpose()? },
-        });
-        let review_config: api_types::ReviewConfig = serde_json::from_value(
-            api_types::effective_review_config(&review_source)
-                .map_err(ServiceError::invalid_operation)?,
-        )
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!("invalid review config: {error}"))
-        })?;
-        let claiming_agent = agent.map(|agent| worktree_agent(role, agent.clone()));
-        let mut worktree_agents = Vec::new();
-        let mut assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
-        // Root roles also constrain the owner of their shared workspace, even
-        // though only coder is an inherited child execution assignment.
-        if let Some(root_id) = task.parent_task_id.as_deref() {
-            for assignment in TaskRoleAssignmentRepo::list_by_task(&*self.db, root_id).await? {
-                if assignment.role_name != "coder"
-                    && !assignments
-                        .iter()
-                        .any(|existing| existing.role_name == assignment.role_name)
-                {
-                    assignments.push(assignment);
-                }
-            }
-        }
-        // An explicit empty child coder row overrides the root default.
-        assignments.retain(|assignment| assignment.role_name != "coder");
-        if let Some(coder) =
-            crate::task_hierarchy::effective_coder_assignment(&self.db, task).await?
-        {
-            assignments.push(coder.assignment);
-        }
-        for assignment in assignments {
-            if !matches!(
-                assignment.role_name.as_str(),
-                "coder" | "executor" | "reviewer" | "planner" | "auditor"
-            ) || assignment.assignee_type != Some(AssigneeKind::Agent)
-            {
-                continue;
-            }
-            if let Some(id) = assignment.assignee_id.as_deref() {
-                if agent.is_some_and(|agent| agent.id == id) {
-                    continue;
-                }
-                let assigned_agent = AgentRepo::get_by_id(&*self.db, id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("agent", id.to_owned()))?;
-                worktree_agents.push(worktree_agent(&assignment.role_name, assigned_agent));
-            }
-        }
-        let server_facts = server_executor_facts(
+        let authority = crate::placement::context::prepare_selection(
             &self.db,
-            claiming_agent.iter().chain(worktree_agents.iter()),
+            task,
+            agent,
+            role,
             self.placement_adapter_registry.as_deref(),
         )
         .await?;
+        let repo = &authority.repo;
+        let settings = authority.settings.clone();
+        let review_config = authority.review_config.clone();
+        let claiming_agent = authority.claiming_agent.clone();
+        let worktree_agents = authority.worktree_agents.clone();
+        let server_facts = authority.server_facts.clone();
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
         // Verify an upgraded managed clone only when this admission can use
         // the embedded owner. An existing daemon placement stays on its owner.
@@ -576,7 +468,6 @@ impl TaskService {
             .daemon_connections
             .as_deref()
             .unwrap_or(&empty_registry);
-        let handshakes = connection_handshakes(registry);
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         crate::placement::admission::sweep_expired_reservations_in_tx(
             &mut transaction,
@@ -677,38 +568,16 @@ impl TaskService {
                 });
             server_repo_location_in_tx(&mut transaction, repo, &source, &now_rfc3339()).await?;
         }
-        let mut context = match claiming_agent.as_ref() {
-            Some(claiming_agent) => Some(
-                load_selection_context(
-                    &self.db,
-                    &mut transaction,
-                    registry,
-                    SelectionLoadInput {
-                        task,
-                        repo,
-                        claiming_agent,
-                        worktree_agents: &worktree_agents,
-                        task_owner_id: authority.project.owner_id.as_deref(),
-                        workspace_id: if task.parent_task_id.is_none() {
-                            workspace_id.as_deref()
-                        } else {
-                            None
-                        },
-                        inherited_root_workspace_id: if task.parent_task_id.is_some() {
-                            workspace_id.as_deref()
-                        } else {
-                            None
-                        },
-                        review_config: &review_config,
-                        project_settings: &settings,
-                        server: &server_facts,
-                        handshakes: &handshakes,
-                    },
-                )
-                .await?,
-            ),
-            None => None,
-        };
+        let mut context = authority
+            .load_context(
+                &self.db,
+                &mut transaction,
+                registry,
+                task,
+                workspace_id.as_deref(),
+                None,
+            )
+            .await?;
         let (
             location_id,
             owner_kind,
@@ -718,7 +587,29 @@ impl TaskService {
             selected_by,
             reason,
         ) = if let Some(context) = context.as_ref() {
-            let selection = select_placement(context).into_result()?;
+            let selection = match select_placement(context).into_result() {
+                Ok(selection) => selection,
+                Err(refusal) => {
+                    transaction.rollback().await?;
+                    crate::placement::environment::start_context_probes(
+                        &self.db,
+                        context,
+                        &self.event_bus,
+                        self.dispatch_notify(),
+                    )
+                    .await?;
+                    crate::placement::environment::handle_refusal(
+                        &self.db,
+                        &self.event_bus,
+                        task,
+                        &authority.project,
+                        context,
+                        &refusal,
+                    )
+                    .await?;
+                    return Err(ServiceError::PlacementUnavailable(refusal));
+                }
+            };
             let location = selection.candidate.location;
             (
                 location.id,
@@ -1170,111 +1061,27 @@ impl TaskService {
                     project_settings: &admission.settings,
                     server: &admission.server_facts,
                     handshakes: &handshakes,
+                    fallback_server_location: None,
                 },
             )
             .await?;
             crate::placement::select_placement(&context).into_result()?;
         }
         sqlx::query(
-            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait')
-            WHERE id = ? AND json_type(metadata_json, '$.owner_wait') IS NOT NULL",
+            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
+            WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
+            OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)",
         )
         .bind(&task.id)
         .execute(&mut **transaction)
         .await?;
         sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
-            WHERE dedupe_key = ? AND status <> 'resolved'")
+            WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
             .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
+            .bind(format!("task-environment-wait:{}", task.id))
             .execute(&mut **transaction).await?;
         Ok(())
     }
-}
-
-fn worktree_agent(role: &str, agent: Agent) -> crate::placement::WorktreeAgent {
-    crate::placement::WorktreeAgent {
-        role: role.to_owned(),
-        agent,
-        required_capabilities: api_types::ExecutorAdapterCapabilityFacts {
-            cancel_ack: true,
-            terminal_observed: true,
-            ..Default::default()
-        },
-    }
-}
-
-fn connection_handshakes(
-    registry: &crate::daemon_transport::DaemonConnectionRegistry,
-) -> std::collections::BTreeMap<String, crate::placement::ConnectionHandshake> {
-    registry
-        .connection_snapshots()
-        .into_iter()
-        .map(|(id, facts)| {
-            (
-                id,
-                crate::placement::ConnectionHandshake {
-                    connection_id: facts.connection_id,
-                    handshake: facts.handshake,
-                },
-            )
-        })
-        .collect()
-}
-
-async fn server_executor_facts<'a>(
-    db: &SqliteDb,
-    agents: impl Iterator<Item = &'a crate::placement::WorktreeAgent>,
-    registry: Option<&executors::AdapterRegistry>,
-) -> Result<crate::placement::ServerFacts> {
-    let default_registry;
-    let registry = match registry {
-        Some(registry) => registry,
-        None => {
-            default_registry = cli_adapters::default_registry();
-            &default_registry
-        }
-    };
-    let mut server = crate::placement::ServerFacts {
-        execution_daemon_id: sqlx::query_scalar::<_, String>(
-            "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",
-        )
-        .bind(crate::embedded_daemon::embedded_machine_id())
-        .fetch_optional(db.pool())
-        .await?,
-        ..Default::default()
-    };
-    for role in agents {
-        let agent = &role.agent;
-        let available = if agent.backend_kind == "native" {
-            db::AgentConnectionHealthRepo::get_connection_health(db, &agent.profile_id)
-                .await?
-                .is_some_and(|health| health.status == "healthy")
-        } else {
-            agent
-                .executor_type
-                .parse::<ExecutorKind>()
-                .ok()
-                .and_then(|kind| registry.get(&kind))
-                .is_some_and(|adapter| {
-                    matches!(
-                        adapter.check_availability().status,
-                        executors::AvailabilityStatus::Authenticated
-                    )
-                })
-        };
-        server.executors.insert(
-            agent.id.clone(),
-            crate::placement::ExecutorFacts {
-                installed: available,
-                authenticated: available,
-                enabled: !agent.paused,
-                capabilities:
-                    crate::daemon_transport::EmbeddedExecutionProvider::adapter_capabilities(
-                        &agent.executor_type,
-                    ),
-            },
-        );
-    }
-    Ok(server)
 }
 
 #[cfg(test)]
@@ -4818,5 +4625,120 @@ mod tests {
             responder.await.unwrap().try_recv().is_err(),
             "describe failure must not send prepare"
         );
+    }
+    #[tokio::test]
+    async fn environment_daemon_readiness_bridge_is_identical_at_reserve_and_claim() {
+        use db::ProjectMachineReadinessRepo;
+        let db = Arc::new(sqlite_db().await);
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        sqlx::query("DELETE FROM execution WHERE id=?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_placement SET state='ready' WHERE id=?")
+            .bind(&placement.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(
+                json!({"environment":{"checks":[{"name":"cargo","command":"cargo --version"}]}})
+                    .to_string(),
+            )
+            .bind(&task.project_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, placement.agent_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        sqlx::query("UPDATE daemon SET detected_clis_json=? WHERE id=?")
+            .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
+            .bind(daemon_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, mut outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id,id,api_types::DaemonFrame::Notification{
+            method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params:json!({"protocol_revision":3,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry);
+        let environment: api_types::ProjectEnvironment = serde_json::from_value(
+            json!({"checks":[{"name":"cargo","command":"cargo --version"}]}),
+        )
+        .unwrap();
+        let machine = db::EnvironmentMachine::from_placement(&placement);
+        for state in ["missing", "unknown", "stale"] {
+            sqlx::query("DELETE FROM project_machine_readiness WHERE project_id=?")
+                .bind(&task.project_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            if state != "missing" {
+                let row = crate::placement::environment::unknown_record(
+                    &task.project_id,
+                    machine.clone(),
+                    &environment,
+                );
+                db.put_readiness(row, None).await.unwrap();
+                if state == "stale" {
+                    sqlx::query("UPDATE project_machine_readiness SET status='not_ready', checks_digest='old' WHERE project_id=?").bind(&task.project_id).execute(db.pool()).await.unwrap();
+                }
+            }
+            let admission = service
+                .reserve_claim_workspace(&task, Some(&agent), "interactive")
+                .await
+                .unwrap();
+            let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+            service
+                .check_claim_placement_in_tx(&mut tx, &task, &admission)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            assert!(
+                outbound.try_recv().is_err(),
+                "{state}: daemon admission never proactively probes or runs another workspace"
+            );
+        }
+        sqlx::query("DELETE FROM project_machine_readiness WHERE project_id=?")
+            .bind(&task.project_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "interactive")
+            .await
+            .unwrap();
+        let mut failed =
+            crate::placement::environment::unknown_record(&task.project_id, machine, &environment);
+        failed.status = db::EnvironmentReadinessStatus::NotReady;
+        failed.failing_checks = vec![db::ReadinessCheckFailure {
+            name: "cargo".into(),
+            output_tail: "missing".into(),
+        }];
+        db.put_readiness(failed, None).await.unwrap();
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        assert!(matches!(
+            service
+                .check_claim_placement_in_tx(&mut tx, &task, &admission)
+                .await,
+            Err(ServiceError::PlacementUnavailable(_))
+        ));
+        tx.rollback().await.unwrap();
+        assert!(matches!(
+            service
+                .reserve_claim_workspace(&task, Some(&agent), "interactive")
+                .await,
+            Err(ServiceError::PlacementUnavailable(_))
+        ));
     }
 }

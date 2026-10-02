@@ -1,7 +1,32 @@
+---
+updated_at: 2026-10-02T10:47:57Z
+---
+
 ## MODIFIED Requirements
 
 ### Requirement: Environment check failure pauses the Project
-When a Project environment check fails immediately before an execution launches, the system SHALL fail that execution before any provider call and SHALL record the machine that ran the check as `not_ready` for the Project, with the failing check names, the role that triggered them, and the bounded output tail. It SHALL NOT add a blocking annotation to the Task. The Task SHALL keep its workflow state. The system SHALL pause the Project with `system_pause_reason = "environment_not_ready"` only when no machine remains eligible for the Project's work: every machine that has a `ready` location for its repository, or that could be provisioned, is `not_ready`. When it pauses, it SHALL record the pause detail (the machine, failing check names, the role that triggered them, the bounded output tail, `paused_at`, `last_checked_at`, `next_check_at`) and return it on the Project response as `environment_pause`. A Task whose workspace is already placed on a `not_ready` machine SHALL wait on that machine with a Task-scoped Attention item naming the machine and the checks, and SHALL be re-dispatched when that machine becomes `ready`. A Task with no placement SHALL be placed on another eligible machine.
+A failing pre-launch check SHALL terminalize its execution before a provider
+call, record its workspace-owner machine not-ready with check results, role,
+workspace and bounded output, and leave the Task's state without a blocking
+annotation. Admission refusal and launch failure SHALL share one pause
+decision in the context of the concrete Task and its worktree roles. When all
+ready-location candidates that would otherwise be eligible are rejected only
+for applicable `environment_not_ready`, compare-and-set the Project pause
+without overwriting a user or repository pause. This SHALL happen before any
+initial Task transition or `dispatch_failed` annotation, including a first
+failing probe. The detail SHALL name the machine, checks, role, bounded output
+and pause/check times; the existing public response shape stays unchanged in
+build step A. Step 3 later adds provisioning candidates to eligibility.
+
+Other eligible owners SHALL allow new Tasks to run there. A Task pinned by an
+Agent or existing/inherited placement to the failed machine SHALL wait there
+when another owner is healthy for other Tasks, including Tasks using another Agent or executor, without pausing the Project. The wait
+SHALL have Task-linked Attention of an environment kind naming machine/checks,
+no `task.execution_failed` event or `recover_task` recommendation, and count as
+parked for Project slots. Readiness success or moving on SHALL clear it. A
+single-machine Project pause SHALL be the sole signal with no additional Task
+Attention. Single-machine behaviour SHALL match the base except a probe may
+run first.
 
 #### Scenario: Disk check fails before a coder launch
 - **WHEN** NovelKit runs on one machine and its `disk` check exits 1 with "root free: 7G" before a coder execution for NK-24
@@ -29,7 +54,19 @@ When a Project environment check fails immediately before an execution launches,
 - **THEN** the Project is paused with `environment_not_ready` and `environment_pause` names the server
 
 ### Requirement: Periodic re-check resumes the Project automatically
-While a machine is `not_ready` for a Project, the dispatcher SHALL re-run that machine's recorded failing checks, with the Project `env`, on that machine (in its repository location's checkout, or in the scratch directory when it has none), once the machine's `next_check_at` is reached. The interval SHALL be `settings.environment.recheck_interval_seconds`, default 600, valid range 60–86400. When every recorded check passes, the system SHALL mark the machine `ready`, wake dispatch, and, if the Project is paused for `environment_not_ready`, clear the pause using the same compare-and-clear guard as the repository pause and publish a Project resumed event. When a check still fails, it SHALL update `last_checked_at`, `next_check_at`, and the output tail. A machine that is unreachable SHALL keep its record and be re-checked when it is reachable.
+One due-row query SHALL drive scheduled re-checks of not-ready machines at
+`next_check_at`, with Project env on that machine. Named failures SHALL re-run
+recorded checks; unnamed failures SHALL run all configured checks applicable
+to the recorded role. Host checks use its repository checkout. In build step A
+daemon checks SHALL use only the failure's recorded ready placement through
+existing `workspace.run`, never another Task's live workspace or a substitute
+host. Later scoped probes can use machine scratch space. Intervals SHALL remain
+600 by default, valid range 60–86400. Actual success SHALL mark ready, clear
+matching waits, wake dispatch and compare-and-clear an unchanged environment
+pause, publishing resumed. Failing results SHALL update facts and scheduling.
+Every outcome SHALL advance the schedule; transport, unreachable, version-fence
+or unusable-workspace errors SHALL retain facts and never fail another Task's
+run. Version/digest fences SHALL discard stale results. A harmless Project-version change SHALL retry compare-and-clear only for the same pause epoch, digest and readiness result version; an intervening user/repository pause SHALL win.
 
 #### Scenario: Disk recovers
 - **WHEN** the Project was paused for `disk` and the next scheduled re-check reports "root free: 17G"
@@ -49,8 +86,26 @@ While a machine is `not_ready` for a Project, the dispatcher SHALL re-run that m
 - **THEN** the scheduled re-check runs `cargo` on D, not on the server
 - **AND** when it passes, the Task waiting on D is re-dispatched
 
+#### Scenario: First failing host probe preserves the single-machine pause signal
+- **WHEN** the only machine's first dispatch probe fails disk
+- **THEN** the Project pauses, the Task retains its queued state with no annotation or Task Attention
+- **AND** a passing scheduled re-check resumes and launches it automatically
+
+#### Scenario: Manual resume retries immediately
+- **WHEN** the owner resumes after a named or unnamed launch failure with a future next-check time
+- **THEN** not-ready rows become unknown in the same transaction
+- **AND** the next host admission probes and launches if fixed, or pauses again if still broken
+
+#### Scenario: Unnamed failure is rechecked
+- **WHEN** asset staging or run-purpose denial created a not-ready row with no failing check name
+- **THEN** the timer runs all applicable checks; command errors keep the row and reschedule, and resume always permits another attempt
+
+#### Scenario: Daemon transport error during re-check
+- **WHEN** the recorded daemon workspace is unreachable or its command returns a transport or version-fence error
+- **THEN** the row's readiness, checks and output are unchanged, next-check time advances, and no other Task run fails
+
 ### Requirement: On-demand environment re-check
-The system SHALL expose `POST /api/v1/projects/{id}/environment/recheck`. It runs every configured check immediately on every machine that has a readiness record or a `ready` location for the Project, or on one machine when the request names it, and returns each check's result grouped by machine. A machine on which all checks pass SHALL become `ready`. If the Project is environment-paused and at least one machine becomes `ready`, it resumes the Project. A manual Project resume SHALL also clear an environment pause. If the environment is still broken, the next launch marks the machine `not_ready` again.
+The system SHALL expose `POST /api/v1/projects/{id}/environment/recheck`. It runs every configured check immediately on every machine that has a readiness record or a `ready` location for the Project, or on one machine when the request names it, and returns each check's result grouped by machine. A machine on which all checks pass SHALL become `ready`. If the Project is environment-paused and at least one machine becomes `ready`, it resumes the Project. A manual Project resume and existing clear paths intended to retry work SHALL reset not-ready rows to unknown in the same transaction as clearing the pause. A valid digest edit with checks remaining SHALL retire an obsolete environment pause during invalidation so unknown daemon facts can reach launch; removing every check retains the base manual-resume rule. The next host admission SHALL probe and launch or pause again without waiting for the old due time. Daemons SHALL retry at launch until step 3.
 
 #### Scenario: Owner checks now after freeing disk
 - **WHEN** the owner frees disk and calls the recheck endpoint
@@ -85,7 +140,7 @@ The Project response SHALL include `environment_readiness`: for each machine wit
 - **THEN** the table shows "D · not ready · cargo · command not found · next check in 8m" and the server as ready
 
 ### Requirement: Existing environment pauses carry over
-The upgrade migration SHALL create a `not_ready` readiness record for each Project that is paused for `environment_not_ready`, for the machine recorded in its pause detail, or for the server when none is recorded, with the recorded failing checks and `next_check_at`. The Project SHALL stay paused until a re-check passes or the owner resumes it.
+The upgrade migration SHALL create a `not_ready` readiness record for each Project with checks that is paused for `environment_not_ready`, for the machine recorded in its pause detail, or inferred from the old `workspace_id` placement, falling back to the server only when neither identifies a machine, with the recorded failing checks and `next_check_at`. An asset-only Project with no checks SHALL retain its pause without a readiness row. Malformed Project settings SHALL leave its readiness unknown and log once rather than fail startup. Existing Project and placement data SHALL be preserved. The Project SHALL stay paused until a re-check passes or the owner resumes it.
 
 #### Scenario: Upgrade while paused
 - **WHEN** a database with NovelKit environment-paused for `disk` is migrated
