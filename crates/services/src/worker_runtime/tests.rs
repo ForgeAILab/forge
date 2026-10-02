@@ -8,6 +8,18 @@ use std::sync::{
     Arc, Mutex,
 };
 
+/// Spends one unit of a test fault budget; false once it is used up.
+fn take_one(budget: &AtomicUsize) -> bool {
+    let mut current = budget.load(Ordering::SeqCst);
+    while current > 0 {
+        match budget.compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 struct TinyWorker {
     name: &'static str,
     seen: Mutex<Vec<i64>>,
@@ -64,11 +76,7 @@ impl Worker for TinyWorker {
         self.timeout
     }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
-        if self
-            .tick_panics
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&self.tick_panics) {
             panic!("runtime hook panic");
         }
         Ok(())
@@ -122,11 +130,7 @@ impl Worker for TinyWorker {
         if event.entity_id == "commit-panic" {
             panic!("poison commit");
         }
-        if self
-            .commit_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_one(&self.commit_failures) {
             return Err(WorkerError::new("failure after effect write"));
         }
         if self.append_in_commit {
