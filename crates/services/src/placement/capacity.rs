@@ -13,15 +13,11 @@ pub async fn count_machine_capacity(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     daemon_id: Option<&str>,
     cap: Option<i64>,
+    embedded_machine_id: &str,
 ) -> crate::Result<MachineCapacity> {
-    db::machine_capacity::count_machine_capacity(
-        transaction,
-        daemon_id,
-        cap,
-        &config::embedded_machine_id(),
-    )
-    .await
-    .map_err(Into::into)
+    db::machine_capacity::count_machine_capacity(transaction, daemon_id, cap, embedded_machine_id)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn server_machine_cap(
@@ -78,7 +74,7 @@ mod tests {
                 ('no-workspace', 'local', NULL, 'running', NULL);
             INSERT INTO agent_chat_turn_job VALUES ('local', 'leased'), ('embedded-chat', 'running'), ('remote-chat', 'running'), ('local', 'completed');")
             .execute(&mut *tx).await.unwrap();
-        let server = count_machine_capacity(&mut tx, None, Some(7))
+        let server = count_machine_capacity(&mut tx, None, Some(7), &config::embedded_machine_id())
             .await
             .unwrap();
         assert_eq!(server.running_executions, 3);
@@ -86,16 +82,21 @@ mod tests {
         assert_eq!(server.active_chat_turns, 2);
         assert_eq!(server.active_runs(), 7);
         assert!(!server.has_capacity());
-        let remote = count_machine_capacity(&mut tx, Some("remote"), None)
-            .await
-            .unwrap();
+        let remote = count_machine_capacity(
+            &mut tx,
+            Some("remote"),
+            None,
+            &config::embedded_machine_id(),
+        )
+        .await
+        .unwrap();
         assert_eq!(remote.active_runs(), 2);
         assert_eq!(remote.reservations, 0);
         assert!(remote.has_capacity());
     }
 
     #[tokio::test]
-    async fn machine_capacity_ready_launch_and_expired_reservations() {
+    async fn machine_capacity_ready_is_idle_and_expired_reservations_are_excluded() {
         let pool = pool().await;
         let mut tx = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql("INSERT INTO workspace_placement VALUES
@@ -104,21 +105,11 @@ mod tests {
             ('expired','three','agent',NULL,NULL,'preparing','2020-01-01T00:00:00Z',CURRENT_TIMESTAMP),
             ('orphan','four','agent',NULL,NULL,'reserved',NULL,'2020-01-01T00:00:00Z');")
             .execute(&mut *tx).await.unwrap();
-        let count = count_machine_capacity(&mut tx, None, Some(1))
+        let count = count_machine_capacity(&mut tx, None, Some(1), &config::embedded_machine_id())
             .await
             .unwrap();
-        assert_eq!(count.reservations, 1);
-        assert!(!count.has_capacity());
-        assert!(
-            db::machine_capacity::launch_holds_slot(&mut tx, Some("one"), Some("agent"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            !db::machine_capacity::launch_holds_slot(&mut tx, Some("two"), Some("agent"))
-                .await
-                .unwrap()
-        );
+        assert_eq!(count.reservations, 0);
+        assert!(count.has_capacity());
         assert_eq!(
             count_agent_capacity(&mut tx, "agent")
                 .await
@@ -130,7 +121,7 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        let count = count_machine_capacity(&mut tx, None, Some(1))
+        let count = count_machine_capacity(&mut tx, None, Some(1), &config::embedded_machine_id())
             .await
             .unwrap();
         assert_eq!((count.running_executions, count.reservations), (1, 0));
@@ -212,9 +203,14 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        let count = count_machine_capacity(&mut transaction, Some("daemon"), Some(5))
-            .await
-            .unwrap();
+        let count = count_machine_capacity(
+            &mut transaction,
+            Some("daemon"),
+            Some(5),
+            &config::embedded_machine_id(),
+        )
+        .await
+        .unwrap();
         assert_eq!(count.running_executions, 2);
         assert_eq!(count.reservations, 1);
         assert_eq!(count.active_chat_turns, 2);
@@ -239,16 +235,26 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
-        let count = count_machine_capacity(&mut transaction, Some("daemon"), Some(2))
-            .await
-            .unwrap();
+        let count = count_machine_capacity(
+            &mut transaction,
+            Some("daemon"),
+            Some(2),
+            &config::embedded_machine_id(),
+        )
+        .await
+        .unwrap();
         assert_eq!(count.running_executions, 2);
         assert!(!count.has_capacity());
         assert_eq!(
-            count_machine_capacity(&mut transaction, Some("other"), None)
-                .await
-                .unwrap()
-                .active_runs(),
+            count_machine_capacity(
+                &mut transaction,
+                Some("other"),
+                None,
+                &config::embedded_machine_id()
+            )
+            .await
+            .unwrap()
+            .active_runs(),
             0
         );
     }

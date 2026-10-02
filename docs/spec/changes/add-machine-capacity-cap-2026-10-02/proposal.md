@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T08:55:00Z
-updated_at: 2026-10-02T12:39:32Z
+updated_at: 2026-10-02T14:47:10Z
 ---
 
 ## Why
@@ -12,7 +12,7 @@ Nothing limits how much agent work one machine runs at once. The per-Agent cap (
 - **Daemon cap is a typed field.** A daemon has the same setting in its own configuration with the same automatic default, computed on that machine, and reports it at registration and in status reports. **BREAKING**: the cap is no longer read from `labels_json` (`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, `max_concurrent_tasks`); the migration carries an existing label value over.
 - **Admin limit per machine.** An administrator can set a limit for any daemon from the Machines page. The effective cap is the lower of the daemon's own cap and the admin limit.
 - **Default changes from unlimited to automatic.** **BREAKING**: a server host or daemon that had no cap now gets the automatic one.
-- **Enforced at placement.** A machine at its cap is rejected at admission and again at execution start with `machine_capacity` (**BREAKING**: replaces the filter code `daemon_capacity`, and now applies to the server host too). A launch holds its slot through preparation until Running insertion or abandonment. A Task with no machine left waits in its state with a visible reason, holds no active Project slot, and resumes on the dispatcher tick after a run ends. Queued recoveries preserve their marker and Task version while full. Nothing running is ever stopped.
+- **Enforced at placement.** A machine at its cap is rejected at admission and again at execution start with `machine_capacity` (**BREAKING**: replaces the filter code `daemon_capacity`, and now applies to the server host too). Ready placements hold no capacity. A start that loses a slot after preparation waits with its ready workspace and retries on a later tick. A Task with no machine left waits in its state with a visible reason, holds no active Project slot, and resumes on the dispatcher tick after a run ends. Queued recoveries preserve their marker and Task version while full. Nothing running is ever stopped.
 - **Visible.** Operations status lists every machine, including the server host, with occupied runs and the effective cap.
 
 Not in this change: review check runs and merges do not take a slot (a running check has no durable record to count; follow-up after refactor item 2.3), no load-average guard, no pre-emption.

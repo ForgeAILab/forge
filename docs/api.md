@@ -3881,18 +3881,21 @@ A new reservation after `prepare_failed` advances the unprepared placement's
 generation, giving the new prepare attempt a fresh operation ID. Retransmission
 within one attempt keeps its operation ID and replays the owner's retained result.
 
-### Machine capacity and launch slots
+### Machine capacity at execution start
 
-Each machine counts Running executions, live reservations (including a ready
-placement with a launch in flight), and leased/running chat turns. Expired
-reservations and idle ready placements count nothing. A launch retains its slot
-until its Running execution is inserted or it is abandoned; chat arrivals or a
-lower ceiling do not revoke an already-held slot. Ordinary new admissions still
-reject full machines with `machine_capacity`.
+Each machine counts Running executions, live `reserved` / `preparing` placements
+without a Running execution, and leased/running chat turns. Ready placements and
+expired reservations hold nothing. Admission is rechecked at execution start.
+A start refused only for machine capacity leaves its workspace ready and waits
+visibly, without a failed Execution, blocking annotation, Attention item or
+retry-budget charge. It retries on a later tick when machine and Project room
+are available. A restart between prepare and start reclaims ready work normally.
 
-Machine-capacity waiters use a current-version queued disposition and are parked
-in Project slot accounting, rather than holding an active Project slot. Repeated
-full-machine recovery ticks retain the marker, Task version and event stream.
+Capacity waits are parked in both Project slot projections. Plain edits preserve
+that projection until the next dispatch observation. A different refusal or skip
+clears the machine reason; a full Project during un-parking produces a
+`project_capacity` wait. Recovery ticks at a full machine and capacity races
+preserve queued intent without recovery events or a thirty-second retry delay.
 
 Every launch, follow-up, and resume uses reserve → prepare → start admission.
 The start transaction rechecks the prepared placement version and capacity before

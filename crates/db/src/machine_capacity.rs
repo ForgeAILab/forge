@@ -13,6 +13,13 @@ struct RunCapState {
     embedded_machine_id: String,
 }
 impl MachineRunCap {
+    /// Runtime composition supplies identity without changing a bare DB's policy.
+    pub fn initialize_identity(&self, id: &str) {
+        let mut state = self.0.write().unwrap_or_else(|poison| poison.into_inner());
+        if state.embedded_machine_id.is_empty() {
+            state.embedded_machine_id = id.to_owned();
+        }
+    }
     pub fn set(&self, configured: Option<u32>, resolved: u32, embedded_machine_id: &str) {
         *self.0.write().unwrap_or_else(|poison| poison.into_inner()) = RunCapState {
             configured,
@@ -205,21 +212,6 @@ pub async fn list_machine_capacity(
             })
         })
         .collect()
-}
-
-/// A launch consumes its own admitted slot, even if chat or a lower cap fills
-/// the machine during preparation. Expired and idle-ready placements own none.
-pub async fn launch_holds_slot(
-    tx: &mut Transaction<'_, Sqlite>,
-    workspace_id: Option<&str>,
-    agent_id: Option<&str>,
-) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_placement p
-        WHERE p.workspace_id = ? AND p.agent_id = ?
-        AND (p.state IN ('reserved', 'preparing') OR (p.state = 'ready' AND p.reserved_until IS NOT NULL))
-        AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
-        AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.workspace_id = p.workspace_id AND e.status = 'running'))")
-        .bind(workspace_id).bind(agent_id).fetch_one(&mut **tx).await?)
 }
 
 #[cfg(test)]

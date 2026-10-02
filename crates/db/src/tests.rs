@@ -11788,7 +11788,7 @@ async fn unbounded_execution_records_progress_and_progress_warnings() {
 }
 
 #[tokio::test]
-async fn machine_capacity_launch_keeps_slot_through_chat_and_start() {
+async fn machine_capacity_ready_start_is_rechecked_after_chat_arrives() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
@@ -11899,17 +11899,24 @@ async fn machine_capacity_launch_keeps_slot_through_chat_and_start() {
         .await
         .unwrap();
     let (execution, lease) = attempt(new_uuid_v4());
-    let running = ExecutionRepo::create_with_lease(&db, execution, lease)
-        .await
-        .unwrap();
-    assert_eq!(running.status, ExecutionStatus::Running);
+    assert!(matches!(
+        ExecutionRepo::create_with_lease(&db, execution, lease).await,
+        Err(DbError::MachineAtCapacity)
+    ));
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM workspace_placement WHERE workspace_id = ?")
+            .bind(&ws_a)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "ready");
     let marker: Option<String> =
         sqlx::query_scalar("SELECT reserved_until FROM workspace_placement WHERE workspace_id = ?")
             .bind(&ws_a)
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(marker, None);
+    assert!(marker.is_some()); // Legacy deadlines on Ready do not hold capacity.
     let mut tx = db.pool().begin().await.unwrap();
     let count =
         crate::machine_capacity::count_machine_capacity(&mut tx, None, Some(1), "db-test-host")
@@ -11921,7 +11928,7 @@ async fn machine_capacity_launch_keeps_slot_through_chat_and_start() {
             count.reservations,
             count.active_chat_turns
         ),
-        (1, 1, 1)
+        (0, 1, 1)
     );
     assert!(!count.has_capacity());
 }

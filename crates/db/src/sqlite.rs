@@ -957,15 +957,9 @@ impl SqliteDb {
             sqlx::query(
                 "UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition')
                  WHERE id = ? AND json_valid(metadata_json)
-                   AND json_extract(metadata_json, '$.dispatch_disposition.capability') = 'machine_capacity'",
+                   AND json_extract(metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')",
             )
             .bind(&input.task_id)
-            .execute(&mut **transaction)
-            .await?;
-            sqlx::query(
-                "UPDATE workspace_placement SET reserved_until = NULL WHERE workspace_id = ?",
-            )
-            .bind(&input.workspace_id)
             .execute(&mut **transaction)
             .await?;
         }
@@ -1428,15 +1422,6 @@ impl SqliteDb {
             return Err(DbError::AgentAtCapacity);
         }
 
-        if crate::machine_capacity::launch_holds_slot(
-            transaction,
-            input.workspace_id.as_deref(),
-            Some(agent_id),
-        )
-        .await?
-        {
-            return Ok(());
-        }
         let daemon_id = match input.workspace_id.as_deref() {
             Some(workspace_id) => sqlx::query_scalar::<_, Option<String>>(
                 "SELECT COALESCE(execution_daemon_id, daemon_id)

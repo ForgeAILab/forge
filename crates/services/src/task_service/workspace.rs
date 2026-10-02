@@ -40,7 +40,6 @@ async fn resolve_workspace_backend(
 const PLACEMENT_RESERVATION_SECONDS: i64 = 600;
 
 pub(super) struct WorkspaceAdmission {
-    _launch_slot: crate::placement::launch_slot::LaunchSlot,
     pub workspace: Workspace,
     claiming_task: Task,
     pub placement: db::WorkspacePlacement,
@@ -86,6 +85,9 @@ impl TaskService {
         task: &Task,
         error: &ServiceError,
     ) -> Result<bool> {
+        if !crate::placement::is_machine_capacity_refusal(error) {
+            crate::deferred_dispatch::clear_capacity_wait(&self.db, task).await?;
+        }
         if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await? {
             return Ok(false);
         }
@@ -249,6 +251,7 @@ impl TaskService {
             task,
             agent,
             self.daemon_connections.as_deref(),
+            self.placement_adapter_registry.as_deref(),
         )
         .await
     }
@@ -521,12 +524,7 @@ impl TaskService {
             matches!(
                 placement.state,
                 PlacementState::Reserved | PlacementState::Preparing
-            ) || (placement.state == PlacementState::Ready
-                && placement
-                    .reserved_until
-                    .as_deref()
-                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-                    .is_some_and(|at| at > Utc::now()))
+            )
         }) {
             return Err(ServiceError::conflict(
                 "workspace preparation is already reserved",
@@ -592,7 +590,6 @@ impl TaskService {
                         project_settings: &settings,
                         server: &server_facts,
                         handshakes: &handshakes,
-                        starting_launch: false,
                     },
                 )
                 .await?,
@@ -712,10 +709,6 @@ impl TaskService {
             update.agent_id = Some(agent.map(|agent| agent.id.clone()));
             update.selected_by = Some(selected_by);
             update.selection_reason = Some(reason);
-            update.reserved_until = Some(Some(super::execution::rfc3339_after(
-                &now,
-                PLACEMENT_RESERVATION_SECONDS,
-            )));
             if prepared
                 && placement.owner_kind == PlacementOwnerKind::Server
                 && placement.execution_daemon_id.is_none()
@@ -800,10 +793,6 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
         Ok(WorkspaceAdmission {
-            _launch_slot: crate::placement::launch_slot::LaunchSlot::new(
-                self.db.clone(),
-                &placement,
-            ),
             claiming_task: task.clone(),
             workspace,
             placement,
@@ -999,6 +988,7 @@ impl TaskService {
         let mut update = crate::placement::admission::placement_update(&admission.placement);
         update.state = Some(PlacementState::Ready);
         update.workspace_handle = Some(Some(prepared.handle.clone()));
+        update.reserved_until = Some(None);
         admission.placement =
             WorkspacePlacementRepo::update_in_tx(&*self.db, &mut transaction, update).await?;
         sqlx::query("UPDATE workspace SET status = 'ready', branch = ?, before_sha = COALESCE(before_sha, ?),
@@ -1067,7 +1057,6 @@ impl TaskService {
                     project_settings: &admission.settings,
                     server: &admission.server_facts,
                     handshakes: &handshakes,
-                    starting_launch: true,
                 },
             )
             .await?;
@@ -1085,6 +1074,21 @@ impl TaskService {
             .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
             .execute(&mut **transaction).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl TaskService {
+    pub(crate) async fn ready_workspace_for_capacity_test(
+        &self,
+        task: &Task,
+        agent: &Agent,
+    ) -> Result<String> {
+        let reserved = self
+            .reserve_claim_workspace(task, Some(agent), "coder")
+            .await?;
+        let ready = self.prepare_claim_workspace(reserved).await?;
+        Ok(ready.placement.id)
     }
 }
 
@@ -1135,7 +1139,7 @@ async fn server_executor_facts<'a>(
         execution_daemon_id: sqlx::query_scalar::<_, String>(
             "SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'",
         )
-        .bind(crate::embedded_daemon::embedded_machine_id())
+        .bind(db.server_run_cap.embedded_machine_id())
         .fetch_optional(db.pool())
         .await?,
         ..Default::default()
@@ -3339,51 +3343,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn machine_capacity_abandoned_ready_launch_releases_slot() {
+    async fn machine_capacity_precheck_does_not_hide_unavailable_server_executor() {
         let db = Arc::new(sqlite_db().await);
         let repo = TempDir::new().unwrap();
-        let workspaces = TempDir::new().unwrap();
         let (project, _) = seed_project_with_real_repo(&db, repo.path()).await;
-        let first = seed_task(&db, &project, None).await;
-        let second = seed_task(&db, &project, None).await;
+        let task = seed_task(&db, &project, None).await;
         let agent = seed_unpinned_claim_agent(&db).await;
+        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 8 WHERE id = ?")
+            .bind(&agent.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .unwrap()
+            .unwrap();
         db.server_run_cap
             .set(Some(1), 1, &::config::embedded_machine_id());
+        let busy = seed_task(&db, &project, None).await;
+        sqlx::query("INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at) VALUES (?, ?, ?, 'coder', 'running', ?, ?)")
+            .bind(new_uuid_v4()).bind(&busy.id).bind(&agent.id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
-            .with_workspace_root(workspaces.path().to_path_buf());
-        let reservation = service
-            .reserve_claim_workspace(&first, Some(&agent), "coder")
+            .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new()));
+        assert!(!service
+            .machine_capacity_blocked(&task, &agent)
+            .await
+            .unwrap());
+        let refusal = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(refusal, ServiceError::PlacementUnavailable(ref e) if e.rejected_candidates.iter().all(|r| r.filter_codes.contains(&crate::placement::PlacementFilterCode::ExecutorUnavailable)))
+        );
+        assert!(!crate::placement::is_machine_capacity_refusal(&refusal));
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_precheck_allows_verification_of_unverified_server_clone() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let clone = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project, repo_id) = seed_project_with_real_repo(&db, repo.path()).await;
+        let status = std::process::Command::new("git")
+            .arg("clone")
+            .arg(repo.path())
+            .arg(clone.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let task = seed_task(&db, &project, None).await;
+        let busy = seed_task(&db, &project, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 8 WHERE id = ?")
+            .bind(&agent.id)
+            .execute(db.pool())
             .await
             .unwrap();
-        let ready = service.prepare_claim_workspace(reservation).await.unwrap();
-        let placement_id = ready.placement.id.clone();
-        assert!(ready.placement.reserved_until.is_some());
-        assert!(matches!(
-            service
-                .reserve_claim_workspace(&second, Some(&agent), "coder")
-                .await,
-            Err(ServiceError::PlacementUnavailable(_))
-        ));
-        drop(ready);
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let placement = WorkspacePlacementRepo::get_by_id(&*db, &placement_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if placement.reserved_until.is_none() {
-                    assert_eq!(placement.state, PlacementState::Ready);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        service
-            .reserve_claim_workspace(&second, Some(&agent), "coder")
+        let agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("DELETE FROM repo_location WHERE repo_id = ?")
+            .bind(&repo_id)
+            .execute(db.pool())
             .await
             .unwrap();
+        sqlx::query(r#"INSERT INTO daemon (id,machine_id,hostname,os,arch,status,visibility,detected_clis_json,labels_json,max_concurrent_runs,created_at,updated_at) VALUES ('capacity-remote','capacity-remote','remote','linux','x86_64','online','global','[{"kind":"shell","availability":"authenticated"}]','{}',1,?,?)"#)
+            .bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO runtime (id,daemon_id,kind,workspace_root,status,created_at,updated_at) VALUES ('capacity-runtime','capacity-remote','local',?,'ready',?,?)")
+            .bind(root.path().to_string_lossy().as_ref()).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        for (id, owner, daemon, runtime, path, kind, state, default) in [
+            (
+                "capacity-clone",
+                "server",
+                None,
+                None,
+                clone.path(),
+                "managed_clone",
+                "unverified",
+                1,
+            ),
+            (
+                "capacity-checkout",
+                "daemon",
+                Some("capacity-remote"),
+                Some("capacity-runtime"),
+                root.path(),
+                "primary_checkout",
+                "ready",
+                0,
+            ),
+        ] {
+            sqlx::query("INSERT INTO repo_location (id,repo_id,owner_kind,daemon_id,runtime_id,path,kind,is_default,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(id).bind(&repo_id).bind(owner).bind(daemon).bind(runtime).bind(path.to_string_lossy().as_ref()).bind(kind).bind(default).bind(state).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        }
+        sqlx::query(r#"INSERT INTO execution (id,task_id,agent_id,role,status,executor_config_snapshot_json,created_at,updated_at) VALUES (?, ?, ?, 'coder','running','{"daemon_id":"capacity-remote"}',?,?)"#)
+            .bind(new_uuid_v4()).bind(&busy.id).bind(&agent.id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, _outgoing) =
+            crate::daemon_transport::DaemonConnection::new("capacity-remote".to_owned());
+        registry.register("capacity-remote".to_owned(), connection.clone());
+        let handshake = api_types::DaemonHandshakeNotification {
+            protocol_revision: api_types::DAEMON_PROTOCOL_REVISION,
+            capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .chain(std::iter::once("workspace.v1".to_owned()))
+                .collect(),
+            executor_capabilities: std::collections::BTreeMap::from([(
+                "shell".to_owned(),
+                crate::daemon_transport::EmbeddedExecutionProvider::adapter_capabilities("shell"),
+            )]),
+            workspace_run_policy: api_types::WorkspaceRunPolicy {
+                allowed_purposes: vec![
+                    api_types::WorkspaceRunPurpose::EnvironmentSetup,
+                    api_types::WorkspaceRunPurpose::Hook,
+                    api_types::WorkspaceRunPurpose::CiStep,
+                ],
+            },
+        };
+        registry.dispatch_incoming_for_connection(
+            "capacity-remote",
+            connection.id(),
+            api_types::DaemonFrame::Notification {
+                method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+                params: serde_json::to_value(handshake).unwrap(),
+            },
+        );
+        db.server_run_cap
+            .set(Some(0), 0, &::config::embedded_machine_id());
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf())
+            .with_daemon_connections(registry);
+        assert!(!service
+            .machine_capacity_blocked(&task, &agent)
+            .await
+            .unwrap());
+        let reserved = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        assert_eq!(reserved.placement.repo_location_id, "capacity-clone");
+        let state: String =
+            sqlx::query_scalar("SELECT status FROM repo_location WHERE id = 'capacity-clone'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, "ready");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -823,8 +823,7 @@ impl TaskRepo for SqliteDb {
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
                         OR CASE WHEN json_valid(t.metadata_json) THEN
-                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') = 'machine_capacity'
-                            AND json_extract(t.metadata_json, '$.dispatch_disposition.task_version') = t.version
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
                             AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
                            ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
@@ -878,8 +877,7 @@ impl TaskRepo for SqliteDb {
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
                         OR CASE WHEN json_valid(t.metadata_json) THEN
-                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') = 'machine_capacity'
-                            AND json_extract(t.metadata_json, '$.dispatch_disposition.task_version') = t.version
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
                             AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
                            ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN

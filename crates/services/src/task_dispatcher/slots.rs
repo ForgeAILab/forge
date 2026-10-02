@@ -217,7 +217,7 @@ mod tests {
                     .map(|review| review.task_id)
                     .collect();
             for task in eligible {
-                let machine_wait = crate::deferred_dispatch::dispatch_disposition_is_current(task, "machine_capacity")
+                let machine_wait = crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(|d| matches!(d.capability.as_str(), "machine_capacity" | "project_capacity"))
                     && !sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')")
                         .bind(&task.id).fetch_one(db.pool()).await?;
                 if helpers::has_blocking_annotation(task)

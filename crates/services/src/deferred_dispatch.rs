@@ -354,7 +354,12 @@ pub(crate) fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
 /// changed since. Callers skip the repeat attempt and its warning entirely.
 pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> bool {
     dispatch_disposition(task).is_some_and(|disposition| {
-        disposition.task_version == task.version && disposition.capability == capability
+        (disposition.task_version == task.version
+            || matches!(
+                disposition.capability.as_str(),
+                "machine_capacity" | "project_capacity"
+            ))
+            && disposition.capability == capability
     })
 }
 
@@ -364,7 +369,13 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
 /// `project_capacity` and `machine_capacity` capabilities explain temporary
 /// queueing and are rechecked each tick, since another Task can free a slot.
 pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
-    dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
+    dispatch_disposition(task).filter(|disposition| {
+        disposition.task_version == task.version
+            || matches!(
+                disposition.capability.as_str(),
+                "machine_capacity" | "project_capacity"
+            )
+    })
 }
 
 /// Persist the disposition observed for a dispatch attempt that just failed
@@ -483,31 +494,48 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
     Ok(())
 }
 
+/// Only real dispatch observations replace capacity waits. Ordinary edits keep
+/// the parked projection until the dispatcher observes another outcome.
+pub(crate) async fn clear_capacity_wait(db: &db::SqliteDb, task: &Task) -> Result<()> {
+    if dispatch_disposition(task).is_some_and(|d| {
+        matches!(
+            d.capability.as_str(),
+            "machine_capacity" | "project_capacity"
+        )
+    }) {
+        clear_dispatch_disposition(db, task).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn refresh_machine_wait(db: &db::SqliteDb, task: &mut Task) -> Result<()> {
-    if !dispatch_disposition(task).is_some_and(|d| d.capability == "machine_capacity") {
-        return Ok(());
-    }
-    let current = TaskRepo::get_by_id(db, &task.id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
-    let running: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')",
-    )
-    .bind(&task.id)
-    .fetch_one(db.pool())
-    .await?;
-    if running {
-        if dispatch_disposition(&current).is_some_and(|d| d.capability == "machine_capacity") {
-            clear_dispatch_disposition(db, &current).await?;
-        }
-    } else if let Some(disposition) = dispatch_disposition(&current)
-        .filter(|d| d.capability == "machine_capacity" && d.task_version != current.version)
-    {
-        record_dispatch_disposition(db, &current, "machine_capacity", &disposition.safe_message)
-            .await?;
-    }
     *task = TaskRepo::get_by_id(db, &task.id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+    Ok(())
+}
+
+/// A marker older than this transition was not a refusal by its dispatch.
+/// A new refusal may be stamped at the final barrier version without trusting
+/// an old wait as evidence of current capacity.
+pub(crate) async fn finish_machine_wait(
+    db: &db::SqliteDb,
+    task: &mut Task,
+    previous_version: i64,
+) -> Result<()> {
+    refresh_machine_wait(db, task).await?;
+    if let Some(d) = dispatch_disposition(task).filter(|d| {
+        matches!(
+            d.capability.as_str(),
+            "machine_capacity" | "project_capacity"
+        )
+    }) {
+        if d.task_version <= previous_version {
+            crate::placement::machine_precheck::retire_wait(db, task).await?;
+        } else if d.task_version != task.version {
+            record_dispatch_disposition(db, task, &d.capability, &d.safe_message).await?;
+        }
+        refresh_machine_wait(db, task).await?;
+    }
     Ok(())
 }

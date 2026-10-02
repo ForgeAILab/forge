@@ -32,7 +32,6 @@ pub struct TaskDispatcher {
     task_service: Arc<TaskService>,
     check_interval: Duration,
     stopped: AtomicBool,
-    machine_at_capacity: AtomicBool,
     stop_notify: Notify,
     /// Primary Repo snapshots (`id@updated_at`) already verified ready by
     /// `sync_repository_pause`.
@@ -63,7 +62,6 @@ impl TaskDispatcher {
             task_service,
             check_interval,
             stopped: AtomicBool::new(false),
-            machine_at_capacity: AtomicBool::new(true),
             stop_notify: Notify::new(),
             ready_repositories: Mutex::new(HashSet::new()),
             environment_rechecks: Mutex::new(HashMap::new()),
@@ -107,10 +105,6 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        self.machine_at_capacity.store(
-            crate::placement::machine_precheck::any_full(&self.db).await?,
-            Ordering::Relaxed,
-        );
         let mut dispatched = 0;
         for project in self.list_projects().await? {
             if self.is_stopped() {

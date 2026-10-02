@@ -1746,10 +1746,8 @@ Operations and execution-start reads; no sweep is needed to release their count.
 Server host occupancy combines placements with no execution daemon and those
 routed to this host's embedded daemon; chats of unpinned or embedded-daemon
 Agents use that same slot pool. Workspace-less executions use their frozen
-executor daemon id, falling back to the Agent pin. A ready placement with a
-launch in flight retains its reserved slot until Running insertion or abandonment;
-chat arrivals or a lowered ceiling cannot revoke it. Ready idle placements use
-no slot. Review check runs and merges do not consume slots: running checks
+executor daemon id, falling back to the Agent pin. Ready placements use no slot. Capacity is rechecked at start; a refusal
+leaves the workspace ready and parks the Task for a later tick. Review check runs and merges do not consume slots: running checks
 currently have no durable record to count. This is a known limit pending the
 workflow refactor.
 
@@ -2452,10 +2450,11 @@ Claim admission runs **reserve → prepare → start**:
    and base SHA. Failed or expired preparation releases capacity, records
    `prepare_failed`, and spends no Task retry budget.
 3. A claim transaction checks the ready placement's version and capacity, then
-   creates the Task claim, Running Execution, and lease together. A live launch
-   consumes its already-reserved machine slot; insertion clears the launch hold
-   in that transaction. An abandoned launch releases its hold, leaving an idle
-   ready placement without a slot.
+   creates the Task claim, Running Execution, and lease together. A ready placement
+   holds no slot. A capacity refusal leaves it ready and records an ordinary
+   parked machine waiter, without an Execution or retry-budget charge. Ready
+   reclaim, missing-worktree recreation and restart relaunch use the normal
+   version fence.
 
 Backfilled `preparing` reservations expire after ten minutes. The reservation
 sweep also reclaims crash-orphaned `reserved` or `preparing` rows without an
@@ -2479,13 +2478,23 @@ setup; the Agent availability precheck uses only its identity quota.
 A Task with no eligible machine and at least one candidate rejected only for
 `machine_capacity` records a `machine_capacity` queued dispatch disposition,
 without an annotation, Attention, failure or retry-budget charge. Initial
-scheduling first checks a read-only machine snapshot once per tick. Only when a
-machine is full does it consult recorded eligible routing and counts for a Task,
-without clone verification, persisted location writes, a sweep or a writer lock.
-The durable reserve/start transactions still fence races. A current-version machine waiter in an active/gate state
-counts as parked, and its metadata change moves the Project list revision used by
+scheduling checks fresh read-only machine counts for every candidate before the
+expensive Task gates, including runs dispatched earlier in the tick. The check
+examines all potentially usable locations, including unverified clones; unknown
+facts, a possibly free machine or another placement refusal delegate to reserve.
+It uses the placement filters and server executor availability, without clone
+verification, persisted location writes, a sweep or a writer lock.
+The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
+counts as parked until dispatch observes a different outcome; a plain edit does
+not un-park it, and its metadata change moves the Project list revision used by
 slot memos. Queued recovery checks machine capacity before claiming its marker,
-so full-machine ticks do not rewrite Tasks or publish recovery events.
+so full-machine ticks do not rewrite Tasks or publish recovery events. Automatic
+review recovery checks before its barrier claim as well. A handled capacity wait
+stops the active scan quietly. Its explicit dispatch owns the state-entry hook
+so an ordinary coder run cannot take its slot or lease first. Queued replay claims
+metadata only and checks its original queued token at Running insertion; a lost
+capacity race preserves the clear blocker and marker, emits no recovery event
+and retries next tick.
 Capacity waits are retried by the existing dispatcher tick
 (ten seconds by default); this path has no completion-event kick. Capacity
 checks count Agent Chat turns, but do not change chat admission: a new chat
@@ -3215,8 +3224,9 @@ whose children hold active slots do not consume another slot; once no child is
 active, a root's own running execution, review, or merge holds one slot.
 Planning, implementation, review, merging, and conflict repair therefore hold
 slots, even without a running execution. Agent concurrency remains a separate
-limit. Recovery and re-dispatch of already-admitted work never fail for Project
-capacity, even if un-parking temporarily exceeds the limit.
+limit. Ordinary already-admitted work retains its Project slot. A parked machine waiter
+must obtain Project room before it un-parks; a full Project replaces the machine
+reason with a parked `project_capacity` wait and retries on later ticks.
 
 The Project response exposes `{limit, active, parked, queued}` as `slots`.
 Capacity waits record `project_capacity` dispatch dispositions with

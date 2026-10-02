@@ -12,7 +12,7 @@ runs AS (
     UNION ALL
     SELECT COALESCE(p.execution_daemon_id, p.daemon_id), 0, 1, 0
     FROM workspace_placement p
-    WHERE (p.state IN ('reserved', 'preparing') OR (p.state = 'ready' AND p.reserved_until IS NOT NULL))
+    WHERE p.state IN ('reserved', 'preparing')
       AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
       AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
     UNION ALL

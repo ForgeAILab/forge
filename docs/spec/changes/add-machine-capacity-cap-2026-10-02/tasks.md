@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-02T08:55:00Z
-updated_at: 2026-10-02T12:39:32Z
-completed_at: 2026-10-02T12:39:32Z
+updated_at: 2026-10-02T14:47:10Z
+completed_at: 2026-10-02T14:47:10Z
 ---
 
 ## 1. Server host cap
@@ -24,6 +24,13 @@ Changelog text is delivered in the final implementation report and reply, per th
 ## 4. Independent audit follow-up
 - [x] 4.1 Quiet, read-only recovery capacity precheck and equivalent-marker reuse
 - [x] 4.2 Current-version parked machine waits, Project memo invalidation and automatic review recovery
-- [x] 4.3 Hold launch slots through start/abandonment; exclude expired reservations
+- [x] 4.3 Execution-start capacity recheck and ready-workspace waiting; exclude expired reservations
 - [x] 4.4 Replace reserve probe with read-only routing/count prechecks; remove db/config coupling and cache identity
 - [x] 4.5 Port file-backed race/reproductions, correct names/docs, regenerate types and focused validation
+
+## 5. Second audit corrections
+- [x] 5.1 Remove launch holds and restore base reservation, ready reclaim and recreation behavior
+- [x] 5.2 Recheck every candidate before expensive gates; preserve todo state and quiet steady ticks
+- [x] 5.3 Tie capacity reasons to actual outcomes; stable edit projection and Project cap on un-parking
+- [x] 5.4 Quiet automatic-review recovery and lost-race queued replay, with next-tick resumption
+- [x] 5.5 Conservative precheck, shared handle identity, expired Agent pressure and full requested module checks

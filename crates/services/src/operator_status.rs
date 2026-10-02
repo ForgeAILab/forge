@@ -56,6 +56,8 @@ impl OperatorStatusService {
 
     /// Embedded-only fixture constructor.
     pub fn new_for_test(db: Arc<SqliteDb>) -> Self {
+        db.server_run_cap
+            .initialize_identity(&config::embedded_machine_id());
         Self {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
@@ -499,6 +501,7 @@ impl OperatorStatusService {
                 ) + (
                     SELECT COUNT(*) FROM workspace_placement p
                     WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
+                       AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
                       AND NOT EXISTS (SELECT 1 FROM execution e
                           WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions
@@ -881,6 +884,46 @@ mod tests {
         let service = OperatorStatusService::new(Arc::clone(&db));
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_agent_pressure_excludes_expired_reservations() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE agent_current (id TEXT, name TEXT, daemon_id TEXT, max_concurrent_tasks INTEGER);
+            CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
+            CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT);
+            INSERT INTO agent_current VALUES ('agent','Agent',NULL,2);
+            INSERT INTO workspace_placement VALUES ('expired','agent','reserved','2020-01-01T00:00:00Z',CURRENT_TIMESTAMP),
+              ('orphan','agent','preparing',NULL,'2020-01-01T00:00:00Z'),
+              ('live','agent','reserved','2099-01-01T00:00:00Z',CURRENT_TIMESTAMP);")
+            .execute(&pool).await.unwrap();
+        let service = OperatorStatusService::new_for_test(Arc::new(SqliteDb::new(pool)));
+        let pressure = service.agent_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].active_tasks, 1);
+        assert!(!pressure[0].at_capacity);
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_operations_uses_handle_identity() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(r#"CREATE TABLE daemon (id TEXT, hostname TEXT, machine_id TEXT, max_concurrent_runs INTEGER, run_limit INTEGER);
+            CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, daemon_id TEXT, execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
+            CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
+            CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
+            CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
+            INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL);
+            INSERT INTO execution VALUES (NULL,NULL,'running','{"daemon_id":"provider"}');"#)
+            .execute(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        db.server_run_cap.set(Some(1), 1, "capacity-test-host");
+        let service = OperatorStatusService::new_for_test(db.clone());
+        let pressure = service.daemon_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].daemon_id, "server_host");
+        assert_eq!(pressure[0].active_runs, 1);
+        assert_eq!(pressure[0].max_concurrent_runs, Some(1));
+        assert!(pressure[0].at_capacity);
     }
 
     async fn seed_project_repo(db: &SqliteDb) -> (String, String) {

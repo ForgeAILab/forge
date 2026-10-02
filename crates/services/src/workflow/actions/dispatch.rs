@@ -103,6 +103,24 @@ impl HookAction for DispatchRoleAgent {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        match crate::placement::machine_precheck::retire_wait(&ctx.db, &current_task).await {
+            Ok(true) => {
+                return HookResult::Skipped {
+                    reason: "project capacity".to_owned(),
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        }
+        if crate::TaskService::automatic_review_recovery_owns_dispatch(&ctx.task_id) {
+            return HookResult::Skipped {
+                reason: "explicit automatic review recovery owns dispatch".to_owned(),
+            };
+        }
         if current_task.blocked_json.is_some() {
             return HookResult::Skipped {
                 reason: "task is blocked".to_string(),
