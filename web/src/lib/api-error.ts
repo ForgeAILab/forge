@@ -70,6 +70,8 @@ const placementFilterMessages: Record<string, string> = {
   native_backend_unsupported: 'Daemon workspaces require CLI Agents for all worktree roles',
   run_purpose_denied: 'Daemon policy denies a required hook, CI step, or environment setup',
   not_visible: 'Owner is not accessible to the Task owner',
+  environment_not_ready: 'Project environment checks failed on this machine',
+  environment_probe_pending: 'Project environment checks are pending on this machine',
 }
 
 function getPlacementRejectionMessage(error: ApiError): string | undefined {

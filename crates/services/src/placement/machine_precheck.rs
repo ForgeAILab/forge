@@ -1,19 +1,12 @@
 //! Advisory reads only; the reserve/start transactions decide admission.
-use super::{
-    load_selection_context, select_placement, ConnectionHandshake, ExecutorFacts,
-    PlacementCandidate, PlacementFilterCode, SelectionLoadInput, SelectionOutcome, ServerFacts,
-    WorktreeAgent,
-};
+use super::{select_placement, PlacementFilterCode, SelectionOutcome};
 use crate::{
     daemon_transport::DaemonConnectionRegistry, workflow::engine::WorkflowEngine, Result,
     ServiceError,
 };
-use api_types::{Actor, ProjectSettings, WorkspaceRunPurpose};
-use db::{
-    Agent, AgentConnectionHealthRepo, AgentRepo, PlacementState, ProjectRepo, RepoLocation,
-    RepoLocationKind, RepoLocationOwnerKind, RepoLocationStatus, RepoRepo, Task,
-    TaskRoleAssignmentRepo, WorkspacePlacementRepo,
-};
+use api_types::Actor;
+use db::{Agent, PlacementState, ProjectRepo, Task, WorkspacePlacementRepo};
+use std::path::Path;
 
 pub(crate) async fn snapshot(
     db: &db::SqliteDb,
@@ -27,31 +20,48 @@ pub(crate) async fn snapshot(
     .await?)
 }
 
-/// False includes unknown facts and candidates reserve could verify. Never
-/// claim capacity is the reason when another outcome might be possible.
+/// False includes unknown verification/probe facts and non-capacity refusals.
+/// Current environment failures exclude a machine from the usable set.
 pub(crate) async fn task_blocked(
     db: &db::SqliteDb,
     task: &Task,
     agent: &Agent,
     connections: Option<&DaemonConnectionRegistry>,
     adapters: Option<&executors::AdapterRegistry>,
+    workspace_root: &Path,
+    role: Option<&str>,
 ) -> Result<bool> {
     if agent.paused || agent.status == db::AgentStatus::Error {
         return Ok(false);
     }
-    let capacities = snapshot(db).await?;
-    if capacities.iter().all(|row| row.capacity.has_capacity()) {
+    if snapshot(db)
+        .await?
+        .iter()
+        .all(|row| row.capacity.has_capacity())
+    {
         return Ok(false);
     }
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
-    let Some(repo_id) = project.primary_repo_id.as_deref() else {
+    if project.primary_repo_id.is_none() {
         return Ok(false);
-    };
-    let repo = RepoRepo::get_by_id(db, repo_id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("repository", repo_id))?;
+    }
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        task,
+        &project.workflow_definition,
+        &Actor::system(api_types::SystemComponent::General),
+    );
+    let role = role
+        .or_else(|| {
+            workflow
+                .states
+                .iter()
+                .find(|s| s.name == task.status)
+                .and_then(crate::workflow::effective_role)
+        })
+        .unwrap_or("coder");
+    let prepared = super::context::prepare_selection(db, task, Some(agent), role, adapters).await?;
     let binding = WorkspacePlacementRepo::get_for_task(db, &task.id).await?;
     if binding
         .as_ref()
@@ -59,228 +69,66 @@ pub(crate) async fn task_blocked(
     {
         return Ok(false);
     }
-    let locations: Vec<(String, Option<String>, String)> =
-        sqlx::query_as("SELECT id, daemon_id, status FROM repo_location WHERE repo_id = ?")
-            .bind(repo_id)
+    let locations: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM repo_location WHERE repo_id = ?")
+            .bind(&prepared.repo.id)
             .fetch_all(db.pool())
             .await?;
-    // Any possibly usable free or unverified location delegates to reserve.
-    // In particular, an unverified managed clone must not be hidden behind a
-    // full ready daemon location.
-    for (id, daemon, status) in &locations {
+    for (id, status) in &locations {
         if binding
             .as_ref()
             .is_some_and(|p| p.state != PlacementState::Cleaned && &p.repo_location_id != id)
         {
             continue;
         }
-        let route = binding
-            .as_ref()
-            .and_then(|p| p.execution_daemon_id.as_ref().or(p.daemon_id.as_ref()))
-            .or(daemon.as_ref());
-        let row = capacities
-            .iter()
-            .find(|r| r.daemon_id.as_ref() == route)
-            .or_else(|| capacities.iter().find(|r| r.daemon_id.is_none()));
-        if status != "ready" || row.is_none_or(|r| r.capacity.has_capacity()) {
+        if status != "ready" {
             return Ok(false);
-        }
+        } // Reserve may verify it first.
     }
-    if locations.is_empty()
-        && capacities
-            .iter()
-            .any(|r| r.daemon_id.is_none() && r.capacity.has_capacity())
-    {
-        return Ok(false);
-    }
-
-    let settings: ProjectSettings = serde_json::from_str(&project.settings)
-        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-    let workflow = WorkflowEngine::resolve_workflow_for_task(
-        task,
-        &project.workflow_definition,
-        &Actor::system(api_types::SystemComponent::General),
-    );
-    let source = serde_json::json!({"workflow": workflow, "project_settings": settings,
-        "task_scope": {"task_type": task.task_type, "config": task.task_state_config.as_deref().map(serde_json::from_str::<serde_json::Value>).transpose().map_err(|e| ServiceError::invalid_operation(e.to_string()))?}});
-    let review = serde_json::from_value(
-        api_types::effective_review_config(&source).map_err(ServiceError::invalid_operation)?,
-    )
-    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-    let claiming = worktree_agent("coder", agent.clone());
-    let mut assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
-    if let Some(parent) = task.parent_task_id.as_deref() {
-        for assignment in TaskRoleAssignmentRepo::list_by_task(db, parent).await? {
-            if assignment.role_name != "coder"
-                && !assignments
-                    .iter()
-                    .any(|a| a.role_name == assignment.role_name)
-            {
-                assignments.push(assignment);
-            }
-        }
-    }
-    assignments.retain(|a| a.role_name != "coder");
-    if let Some(coder) = crate::task_hierarchy::effective_coder_assignment(db, task).await? {
-        assignments.push(coder.assignment);
-    }
-    let mut others = Vec::new();
-    for assignment in assignments {
-        if !matches!(
-            assignment.role_name.as_str(),
-            "coder" | "executor" | "reviewer" | "planner" | "auditor"
-        ) || assignment.assignee_type != Some(db::AssigneeKind::Agent)
-        {
-            continue;
-        }
-        if let Some(id) = assignment
-            .assignee_id
-            .as_deref()
-            .filter(|id| *id != agent.id)
-        {
-            let Some(assigned) = AgentRepo::get_by_id(db, id).await? else {
-                return Ok(false);
-            };
-            others.push(worktree_agent(&assignment.role_name, assigned));
-        }
-    }
-    let embedded: Option<String> =
-        sqlx::query_scalar("SELECT id FROM daemon WHERE machine_id = ? AND status <> 'offline'")
-            .bind(db.server_run_cap.embedded_machine_id())
-            .fetch_optional(db.pool())
-            .await?;
-    let default_adapters;
-    let adapters = match adapters {
-        Some(adapters) => adapters,
-        None => {
-            default_adapters = cli_adapters::default_registry();
-            &default_adapters
-        }
-    };
-    let mut server = ServerFacts {
-        execution_daemon_id: embedded,
-        ..Default::default()
-    };
-    for role in std::iter::once(&claiming).chain(others.iter()) {
-        let agent = &role.agent;
-        let available = if agent.backend_kind == "native" {
-            AgentConnectionHealthRepo::get_connection_health(db, &agent.profile_id)
-                .await?
-                .is_some_and(|h| h.status == "healthy")
-        } else {
-            agent
-                .executor_type
-                .parse::<executors::ExecutorKind>()
-                .ok()
-                .and_then(|kind| adapters.get(&kind))
-                .is_some_and(|a| {
-                    matches!(
-                        a.check_availability().status,
-                        executors::AvailabilityStatus::Authenticated
-                    )
-                })
-        };
-        server.executors.insert(
-            agent.id.clone(),
-            ExecutorFacts {
-                installed: available,
-                authenticated: available,
-                enabled: !agent.paused && agent.status != db::AgentStatus::Error,
-                capabilities:
-                    crate::daemon_transport::EmbeddedExecutionProvider::adapter_capabilities(
-                        &agent.executor_type,
-                    ),
-            },
-        );
-    }
-    let default_connections = DaemonConnectionRegistry::default();
-    let connections = connections.unwrap_or(&default_connections);
-    let handshakes = connections
-        .connection_snapshots()
-        .into_iter()
-        .map(|(id, facts)| {
-            (
-                id,
-                ConnectionHandshake {
-                    connection_id: facts.connection_id,
-                    handshake: facts.handshake,
-                },
-            )
-        })
-        .collect();
+    let empty = DaemonConnectionRegistry::without_handlers();
+    let connections = connections.unwrap_or(&empty);
+    let path = prepared
+        .repo
+        .local_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join(".repos").join(&prepared.repo.id));
     let mut tx = db.pool().begin().await?;
-    let mut context = load_selection_context(
-        db,
-        &mut tx,
-        connections,
-        SelectionLoadInput {
+    let Some(context) = prepared
+        .load_context(
+            db,
+            &mut tx,
+            connections,
             task,
-            repo: &repo,
-            claiming_agent: &claiming,
-            worktree_agents: &others,
-            task_owner_id: project.owner_id.as_deref(),
-            workspace_id: binding.as_ref().map(|p| p.workspace_id.as_str()),
-            inherited_root_workspace_id: None,
-            review_config: &review,
-            project_settings: &settings,
-            server: &server,
-            handshakes: &handshakes,
-        },
-    )
-    .await?;
-    if locations.is_empty() && binding.is_none() && repo.local_path.is_some() {
-        context.candidates.push(PlacementCandidate {
-            location: RepoLocation {
-                id: String::new(),
-                repo_id: repo.id.clone(),
-                owner_kind: RepoLocationOwnerKind::Server,
-                daemon_id: None,
-                runtime_id: None,
-                path: repo.local_path.clone().unwrap_or_default(),
-                kind: RepoLocationKind::PrimaryCheckout,
-                is_default: true,
-                status: RepoLocationStatus::Ready,
-                last_verified_at: None,
-                last_error: None,
-                version: 1,
-                created_at: String::new(),
-                updated_at: String::new(),
-            },
-            execution_daemon_id: server.execution_daemon_id.clone(),
-            embedded_execution: true,
-            connected: true,
-            negotiated_revision: Some(api_types::DAEMON_MIN_PROTOCOL_REVISION),
-            workspace_v1: true,
-            runtime_ready: true,
-            visible: true,
-            executors: server.executors,
-            allowed_run_purposes: vec![
-                WorkspaceRunPurpose::EnvironmentSetup,
-                WorkspaceRunPurpose::Hook,
-                WorkspaceRunPurpose::CiStep,
-            ],
-            machine_capacity: capacities
-                .iter()
-                .find(|r| r.daemon_id.is_none())
-                .map(|r| r.capacity),
-        });
-    }
+            binding.as_ref().map(|p| p.workspace_id.as_str()),
+            Some(&path),
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
     Ok(
         matches!(select_placement(&context), SelectionOutcome::Unavailable(refusal)
-        if !refusal.rejected_candidates.is_empty() && refusal.rejected_candidates.iter().all(|r| r.filter_codes == [PlacementFilterCode::MachineCapacity])),
+        if capacity_only_wait(&refusal)),
     )
 }
 
-fn worktree_agent(role: &str, agent: Agent) -> WorktreeAgent {
-    WorktreeAgent {
-        role: role.to_owned(),
-        agent,
-        required_capabilities: api_types::ExecutorAdapterCapabilityFacts {
-            cancel_ack: true,
-            terminal_observed: true,
-            ..Default::default()
-        },
-    }
+/// A known environment-failed machine is not an alternative to a full,
+/// environment-ready machine. A pending probe remains unknown and wins no
+/// capacity-only conclusion. Mixed failures alone never establish a wait.
+pub(crate) fn capacity_only_wait(refusal: &super::PlacementUnavailable) -> bool {
+    use PlacementFilterCode::*;
+    refusal
+        .rejected_candidates
+        .iter()
+        .any(|r| r.filter_codes == [MachineCapacity])
+        && refusal.rejected_candidates.iter().all(|r| {
+            r.filter_codes == [MachineCapacity]
+                || (r.filter_codes.contains(&EnvironmentNotReady)
+                    && r.filter_codes
+                        .iter()
+                        .all(|c| matches!(c, MachineCapacity | EnvironmentNotReady)))
+        })
 }
 
 /// Re-admitting a parked Task needs both machine and Project room. This uses
@@ -290,8 +138,9 @@ pub(crate) async fn wait_before_dispatch(
     service: &crate::TaskService,
     task: &Task,
     agent: &Agent,
+    role: Option<&str>,
 ) -> Result<bool> {
-    if service.machine_capacity_blocked(task, agent).await? {
+    if service.machine_capacity_blocked(task, agent, role).await? {
         crate::deferred_dispatch::record_dispatch_disposition(
             db,
             task,

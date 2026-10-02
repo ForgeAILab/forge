@@ -95,76 +95,10 @@ impl AttentionRepo for SqliteDb {
         &self,
         input: CreateAttentionProjection,
     ) -> Result<AttentionProjection> {
-        sqlx::query(
-            "INSERT INTO attention_projection (
-                id, attention_type, scope_type, scope_id, identity_id,
-                source_event_id, priority, status, summary, details_json,
-                dedupe_key, occurred_at, updated_at, acknowledged_at,
-                snoozed_until, resolved_at, updated_by_user_id,
-                recommended_action, source_sequence
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(dedupe_key) DO UPDATE SET
-                attention_type = excluded.attention_type,
-                scope_type = excluded.scope_type,
-                scope_id = excluded.scope_id,
-                identity_id = COALESCE(excluded.identity_id, attention_projection.identity_id),
-                source_event_id = excluded.source_event_id,
-                priority = excluded.priority,
-                summary = excluded.summary,
-                details_json = excluded.details_json,
-                occurred_at = excluded.occurred_at,
-                recommended_action = excluded.recommended_action,
-                source_sequence = excluded.source_sequence,
-                status = CASE
-                    WHEN attention_projection.status = 'resolved'
-                     AND attention_projection.source_event_id <> excluded.source_event_id
-                    THEN excluded.status
-                    ELSE attention_projection.status
-                END,
-                resolved_at = CASE
-                    WHEN attention_projection.status = 'resolved'
-                     AND attention_projection.source_event_id <> excluded.source_event_id
-                    THEN NULL
-                    ELSE attention_projection.resolved_at
-                END,
-                snoozed_until = CASE
-                    WHEN attention_projection.status = 'resolved'
-                     AND attention_projection.source_event_id <> excluded.source_event_id
-                    THEN NULL
-                    ELSE attention_projection.snoozed_until
-                END,
-                version = attention_projection.version + 1,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&input.id)
-        .bind(&input.attention_type)
-        .bind(&input.scope_type)
-        .bind(&input.scope_id)
-        .bind(input.identity_id.as_deref())
-        .bind(&input.source_event_id)
-        .bind(input.priority)
-        .bind(&input.status)
-        .bind(&input.summary)
-        .bind(&input.details_json)
-        .bind(&input.dedupe_key)
-        .bind(&input.occurred_at)
-        .bind(&input.updated_at)
-        .bind(input.acknowledged_at.as_deref())
-        .bind(input.snoozed_until.as_deref())
-        .bind(input.resolved_at.as_deref())
-        .bind(input.updated_by_user_id.as_deref())
-        .bind(&input.recommended_action)
-        .bind(input.source_sequence)
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
-            .bind(&input.dedupe_key)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_attention_projection)
-            .transpose()?
-            .ok_or(DbError::NotFound)
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let result = self.insert_attention_in_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn update_attention_lifecycle(
@@ -229,77 +163,12 @@ impl AttentionRepo for SqliteDb {
         source_event_id: &str,
         updated_at: &str,
     ) -> Result<Option<AttentionProjection>> {
-        sqlx::query(
-            "UPDATE attention_projection
-             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                 source_event_id = ?, updated_at = ?, version = version + 1
-             WHERE dedupe_key = ? AND status <> 'resolved'",
-        )
-        .bind(updated_at)
-        .bind(source_event_id)
-        .bind(updated_at)
-        .bind(dedupe_key)
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
-            .bind(dedupe_key)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_attention_projection)
-            .transpose()
-    }
-
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>> {
-        sqlx::query("SELECT * FROM attention_consumer_health WHERE consumer_name = ?")
-            .bind(consumer_name)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_attention_consumer_health)
-            .transpose()
-    }
-
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth> {
-        sqlx::query(
-            "INSERT INTO attention_consumer_health (
-                consumer_name, last_sequence, last_started_at, last_success_at,
-                last_error_at, last_error_code, last_error_message, lease_owner,
-                lease_until, processed_events, version, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(consumer_name) DO UPDATE SET
-                last_sequence = MAX(attention_consumer_health.last_sequence, excluded.last_sequence),
-                last_started_at = COALESCE(excluded.last_started_at, attention_consumer_health.last_started_at),
-                last_success_at = COALESCE(excluded.last_success_at, attention_consumer_health.last_success_at),
-                last_error_at = excluded.last_error_at,
-                last_error_code = excluded.last_error_code,
-                last_error_message = excluded.last_error_message,
-                lease_owner = excluded.lease_owner,
-                lease_until = excluded.lease_until,
-                processed_events = attention_consumer_health.processed_events + excluded.processed_events,
-                version = attention_consumer_health.version + 1,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.last_sequence)
-        .bind(input.last_started_at.as_deref())
-        .bind(input.last_success_at.as_deref())
-        .bind(input.last_error_at.as_deref())
-        .bind(input.last_error_code.as_deref())
-        .bind(input.last_error_message.as_deref())
-        .bind(input.lease_owner.as_deref())
-        .bind(input.lease_until.as_deref())
-        .bind(input.processed_events_delta)
-        .bind(&input.updated_at)
-        .execute(&self.pool)
-        .await?;
-        self.get_attention_consumer_health(&input.consumer_name)
-            .await?
-            .ok_or(DbError::NotFound)
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let result = self
+            .resolve_attention_by_dedupe_in_tx(&mut tx, dedupe_key, source_event_id, updated_at)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
     }
 }
 
@@ -328,19 +197,107 @@ fn map_attention_projection(row: SqliteRow) -> Result<AttentionProjection> {
     })
 }
 
-fn map_attention_consumer_health(row: SqliteRow) -> Result<AttentionConsumerHealth> {
-    Ok(AttentionConsumerHealth {
-        consumer_name: row.try_get("consumer_name")?,
-        last_sequence: row.try_get("last_sequence")?,
-        last_started_at: row.try_get("last_started_at")?,
-        last_success_at: row.try_get("last_success_at")?,
-        last_error_at: row.try_get("last_error_at")?,
-        last_error_code: row.try_get("last_error_code")?,
-        last_error_message: row.try_get("last_error_message")?,
-        lease_owner: row.try_get("lease_owner")?,
-        lease_until: row.try_get("lease_until")?,
-        processed_events: row.try_get("processed_events")?,
-        version: row.try_get("version")?,
-        updated_at: row.try_get("updated_at")?,
-    })
+impl SqliteDb {
+    pub async fn insert_attention_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateAttentionProjection,
+    ) -> Result<AttentionProjection> {
+        sqlx::query(
+            "INSERT INTO attention_projection (
+                id, attention_type, scope_type, scope_id, identity_id,
+                source_event_id, priority, status, summary, details_json,
+                dedupe_key, occurred_at, updated_at, acknowledged_at,
+                snoozed_until, resolved_at, updated_by_user_id,
+                recommended_action, source_sequence
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(dedupe_key) DO UPDATE SET
+                attention_type = excluded.attention_type,
+                scope_type = excluded.scope_type,
+                scope_id = excluded.scope_id,
+                identity_id = COALESCE(excluded.identity_id, attention_projection.identity_id),
+                source_event_id = excluded.source_event_id,
+                priority = excluded.priority,
+                summary = excluded.summary,
+                details_json = excluded.details_json,
+                occurred_at = excluded.occurred_at,
+                recommended_action = excluded.recommended_action,
+                source_sequence = excluded.source_sequence,
+                status = CASE
+                    WHEN attention_projection.status = 'resolved'
+                     AND attention_projection.source_event_id <> excluded.source_event_id
+                    THEN excluded.status
+                    ELSE attention_projection.status
+                END,
+                resolved_at = CASE
+                    WHEN attention_projection.status = 'resolved'
+                     AND attention_projection.source_event_id <> excluded.source_event_id
+                    THEN NULL
+                    ELSE attention_projection.resolved_at
+                END,
+                snoozed_until = CASE
+                    WHEN attention_projection.status = 'resolved'
+                     AND attention_projection.source_event_id <> excluded.source_event_id
+                    THEN NULL
+                    ELSE attention_projection.snoozed_until
+                END,
+                version = attention_projection.version + 1,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&input.id)
+        .bind(&input.attention_type)
+        .bind(&input.scope_type)
+        .bind(&input.scope_id)
+        .bind(input.identity_id.as_deref())
+        .bind(&input.source_event_id)
+        .bind(input.priority)
+        .bind(&input.status)
+        .bind(&input.summary)
+        .bind(&input.details_json)
+        .bind(&input.dedupe_key)
+        .bind(&input.occurred_at)
+        .bind(&input.updated_at)
+        .bind(input.acknowledged_at.as_deref())
+        .bind(input.snoozed_until.as_deref())
+        .bind(input.resolved_at.as_deref())
+        .bind(input.updated_by_user_id.as_deref())
+        .bind(&input.recommended_action)
+        .bind(input.source_sequence)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
+            .bind(&input.dedupe_key)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_attention_projection)
+            .transpose()?
+            .ok_or(DbError::NotFound)
+    }
+    pub async fn resolve_attention_by_dedupe_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        dedupe_key: &str,
+        source_event_id: &str,
+        updated_at: &str,
+    ) -> Result<Option<AttentionProjection>> {
+        sqlx::query(
+            "UPDATE attention_projection
+             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                 source_event_id = ?, updated_at = ?, version = version + 1
+             WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(updated_at)
+        .bind(source_event_id)
+        .bind(updated_at)
+        .bind(dedupe_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
+            .bind(dedupe_key)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_attention_projection)
+            .transpose()
+    }
 }

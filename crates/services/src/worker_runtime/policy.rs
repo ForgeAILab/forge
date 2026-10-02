@@ -19,6 +19,8 @@ pub enum Outcome<T> {
 pub enum WorkerErrorKind {
     Failure,
     Transient,
+    /// Deterministic rejection discovered at the transaction boundary.
+    Terminal,
 }
 
 /// Messages must exclude payloads, credentials and other secret material.
@@ -37,6 +39,12 @@ impl WorkerError {
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: WorkerErrorKind::Transient,
+            message: bounded_error(&message.into()),
+        }
+    }
+    pub fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            kind: WorkerErrorKind::Terminal,
             message: bounded_error(&message.into()),
         }
     }
@@ -65,4 +73,48 @@ pub(super) fn bounded_error(value: &str) -> String {
         .filter(|c| !c.is_control())
         .take(1_024)
         .collect()
+}
+
+impl WorkerErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Transient => "transient",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+/// Classification shared by the durable projections. Domain refusals cannot
+/// become valid by repeating the same event; availability and CAS races can.
+pub fn consumer_error(error: crate::ServiceError) -> WorkerError {
+    let kind = consumer_error_kind(&error);
+    WorkerError {
+        kind,
+        message: bounded_error(&error.to_string()),
+    }
+}
+pub fn consumer_error_kind(error: &crate::ServiceError) -> WorkerErrorKind {
+    use crate::ServiceError as S;
+    use db::DbError as D;
+    match error {
+        S::Db(e) if e.is_transient() => WorkerErrorKind::Transient,
+        S::Db(
+            D::NotFound
+            | D::Check(_)
+            | D::IdempotencyConflict
+            | D::InvalidTransition
+            | D::InvalidTaskMove(_)
+            | D::TurnNotRetryable
+            | D::InvalidCursor,
+        )
+        | S::InvalidOperation { .. }
+        | S::NotFound { .. }
+        | S::AuthorizationDenied { .. } => WorkerErrorKind::Terminal,
+        S::ExecutionAlreadyRunning { .. }
+        | S::RateLimited { .. }
+        | S::DaemonUnavailable { .. }
+        | S::DaemonNotReady { .. }
+        | S::DaemonTimeout { .. } => WorkerErrorKind::Transient,
+        _ => WorkerErrorKind::Failure,
+    }
 }

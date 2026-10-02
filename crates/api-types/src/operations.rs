@@ -79,6 +79,7 @@ pub struct OperatorStatusResponse {
     pub usage_summary: Option<UsageSummary>,
     pub recent_errors: Vec<RecentErrorSummary>,
     pub event_consumers: Vec<EventConsumerStatus>,
+    pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
 }
@@ -254,7 +255,7 @@ pub struct EventConsumerStatus {
     pub consumer_name: String,
     #[ts(type = "number")]
     pub last_sequence: i64,
-    /// Sequence distance, including gaps left by deleted events.
+    /// Pending events matching the worker subscription.
     #[ts(type = "number")]
     pub lag: i64,
     pub oldest_unprocessed_at: Option<String>,
@@ -262,6 +263,32 @@ pub struct EventConsumerStatus {
     /// Null when an expected consumer has never established its cursor.
     pub last_advanced_at: Option<String>,
     pub stalled: bool,
+    #[ts(type = "number")]
+    pub dead_letter_count: i64,
+    pub recent_dead_letters: Vec<WorkerDeadLetterSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkerDeadLetterSummary {
+    pub id: String,
+    pub item_key: String,
+    #[ts(type = "number | null")]
+    pub event_sequence: Option<i64>,
+    pub reason: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventRelayStatus {
+    pub running: bool,
+    #[ts(type = "number | null")]
+    pub position: Option<i64>,
+    #[ts(type = "number | null")]
+    pub head: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

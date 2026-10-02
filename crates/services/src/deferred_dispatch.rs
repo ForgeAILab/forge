@@ -387,19 +387,21 @@ pub(crate) async fn record_dispatch_disposition(
     capability: &str,
     safe_message: &str,
 ) -> Result<bool> {
-    let blocker_digest = dispatch_blocker_digest(safe_message);
-    let safe_message = bounded_safe_message(safe_message);
-    if dispatch_disposition(task).is_some_and(|disposition| {
-        disposition.task_version == task.version
-            && disposition.capability == capability
-            && disposition.blocker_digest == blocker_digest
-            && disposition.safe_message == safe_message
-    }) {
-        return Ok(false);
-    }
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
+    let blocker_digest = dispatch_blocker_digest(safe_message);
+    let safe_message = bounded_safe_message(safe_message);
+    if !(capability == "machine_capacity" && metadata.extra.contains_key("environment_wait"))
+        && dispatch_disposition(task).is_some_and(|disposition| {
+            disposition.task_version == task.version
+                && disposition.capability == capability
+                && disposition.blocker_digest == blocker_digest
+                && disposition.safe_message == safe_message
+        })
+    {
+        return Ok(false);
+    }
     let value = json!({
         "task_version": task.version,
         "capability": capability,
@@ -418,11 +420,30 @@ pub(crate) async fn record_dispatch_disposition(
             value,
         },
     };
+    let mut mutations = vec![mutation];
+    if capability == "machine_capacity" {
+        if let Some(wait) = metadata.extra.get("environment_wait") {
+            mutations.push(TaskMetadataMutation::RemoveIf {
+                key: "environment_wait".to_owned(),
+                expected: wait.clone(),
+            });
+        }
+        if let Some(deferred) = metadata.extra.get("deferred_dispatch").filter(|d| {
+            d["kind"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("environment_"))
+        }) {
+            mutations.push(TaskMetadataMutation::RemoveIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: deferred.clone(),
+            });
+        }
+    }
     let (_, changed) = TaskRepo::mutate_metadata_with_change(
         db,
         &task.id,
         Some(task.version),
-        vec![mutation],
+        mutations,
         &now_rfc3339(),
     )
     .await?;

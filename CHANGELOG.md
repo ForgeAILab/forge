@@ -8,6 +8,40 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- A failing environment check no longer pauses the Project when another
+  machine can run the work. The failure marks that machine not ready for the
+  Project; placement skips it (filter code `environment_not_ready`) and a
+  Task goes to another connected machine that passes. A Task that is bound to
+  the failing machine waits there with an environment Attention item. The
+  Project is paused with `environment_not_ready` only when no machine is left
+  for the Task being placed. With a single machine the outcome is the same as
+  before: the Project pauses and the Task keeps its state without a failure
+  annotation. API response shapes are unchanged.
+- `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
+  `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
+  and keep-alive comments carry no id, so a reconnecting client keeps its last
+  durable cursor. A connection without `Last-Event-ID`, or with one that is not
+  a durable cursor, is live only. Resuming from a durable cursor replays at most
+  1,000 missed events, in pages of 100; a larger gap, a failed read or a cursor
+  beyond the ledger head gets one `events.resync_required` frame instead (for a
+  cursor beyond the head that frame carries `id: domain-event:<head>`).
+  Frame ids were previously the entity id.
+- Operator status `event_consumers` lists four workers (memory, coordination,
+  attention, wake-turn) and no longer lists `sse-broadcast`. For all four,
+  `lag` and `oldest_unprocessed_at` describe pending events of the types the
+  worker subscribes to, not the distance between its cursor and the newest
+  event.
+- Mission Control `consumer_health`: `processed_events` is removed;
+  `last_error_code` is now `failure`, `transient` or `terminal` (was
+  `version_conflict`, `not_found`, `database_error`, `projection_error`) and
+  `last_error_message` is added; `stale` now means subscribed events have been
+  pending for longer than the threshold with no checkpoint progress, so an
+  idle or newly started consumer is healthy.
+- Migration V202610020700 drops `event_processing_lease`,
+  `event_projection_receipt` and `attention_consumer_health` and deletes the
+  `sse-broadcast` cursor. These are delivery metadata, not user data: consumer
+  cursors, wake dispositions, Attention incidents and coordination records are
+  kept, and no event is processed twice or skipped on upgrade.
 - Assigning `coder` on a coordination root now sets the default worker for
   subtasks instead of returning an error; converting a Task into a
   coordination root keeps its `coder` assignment instead of deleting it.
@@ -127,6 +161,43 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Environment readiness is recorded per Project and machine (the server host
+  or a daemon) in `project_machine_readiness`. Migration V202610020600 adds
+  the table and carries each environment-paused Project over as a not-ready
+  record for the machine it failed on.
+  - When a Project has environment checks and no environment assets, the
+    dispatcher runs the checks on the server host before the first launch
+    there, once, and waits for the result (`environment_probe_pending`)
+    rather than sending the Task to a less preferred machine. A failure
+    pauses the Project before any execution is created; previously the first
+    launch failed and then paused it. Projects with environment assets,
+    direct claims through the API, and daemons are judged by the launch-time
+    preflight, as before.
+  - Only the checks that apply to the role being launched gate that launch.
+  - Resuming a Project clears its not-ready records, so the next dispatch
+    checks again at once instead of waiting for the scheduled re-check. A
+    failure with no named check (asset staging, a denied run purpose) is not
+    re-checked on a schedule; it waits for a manual resume or "Check now".
+  - Changing a Project's checks while it is paused for a named check ends
+    that pause and checks again with the new set.
+  - A Task waiting for a machine's environment does not hold one of the
+    Project's `max_active_tasks` slots.
+  - A dispatch refused because the Project is paused for its environment
+    waits; it no longer records a `dispatch_failed` annotation.
+- The coordination, Attention and wake-turn consumers run on the supervised
+  worker runtime, like the memory indexer. Each event's effects and the cursor
+  advance commit in one transaction. Idle polling backs off from 250 ms to
+  5 s and is woken by committed events (it was a fixed 1 s). An unexpected
+  failure, a panic or a handle timeout counts a strike against the event, and
+  the event is quarantined after eight. A worker's periodic `tick` has its own
+  30 s timeout and its own back-off (1 s to 5 min); while a tick is backing
+  off, events are still handled every cycle.
+- The SSE relay is the only publisher of durable event frames. Services no
+  longer publish a durable event directly after their own commit; the relay
+  reads the ledger in order and is woken by the commit hook (measured: 72 µs
+  median from commit to broadcast, was 9 µs). It runs under the supervisor,
+  keeps its position across restarts of the task, and never broadcasts
+  historical events when its first read of the ledger head fails.
 - Operator status `event_consumers[].lag` for the Agent Chat memory indexer is
   now the live count of pending events of the types it subscribes to, not the
   distance between its cursor and the newest event. `recent_errors` gains
@@ -270,6 +341,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Operator status exposes the SSE relay as `event_relay { running, position,
+  head, last_error, last_error_at }`, and each worker's dead letters as a
+  total plus the five most recent (`id`, item key, event sequence, reason,
+  time). The list does not expire; the degraded-health signal still covers
+  only the last hour. Migrations V202610020859 and V202610021051 add the error
+  kind, per-item retry state and a stable id to the worker tables. Replay and
+  dismiss actions for dead letters are not available yet.
 - Persisted Project environment pause detail, automatic re-check and resume,
   `POST /api/v1/projects/{id}/environment/recheck`, and
   `forge-ctl project env-recheck`. Project cards/list and headers show the
@@ -301,6 +379,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An event that a consumer can never apply no longer blocks every later event
+  for that consumer. Previously a Task outcome for a commitment that had been
+  cancelled was retried forever, and every later outcome for every Agent
+  waited behind it. Now a cancelled commitment needs
+  no outcome; a commitment or inbox delivery that is rejected is recorded as
+  a dead letter on its own while the other commitments and inbox items of the
+  same event are applied; and a rejection at commit time is retried once with
+  fresh data before the event is quarantined.
+- Wake retries: one retry row that keeps failing no longer stops the retries
+  behind it. Database-busy failures back off without counting against the
+  row, rows that are still waiting are skipped in the query, and a row that
+  exhausts its attempts ends with a `wake_retry_failed` disposition and a
+  dead letter. Resolving the "decision recorded" Attention item now commits
+  with the wake's admission instead of after it.
 - Token and cost figures for embedded Agents were too high. Each chat turn
   recorded its own provider calls and, again, every earlier call of the same
   chat session, so a chat of `n` single-call turns was counted as

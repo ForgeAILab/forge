@@ -774,40 +774,106 @@ executor set it on the child process before Forge's own variables. Assets are
 copied through a sibling staging path and atomically renamed only when the
 target is absent; symlink traversal and recursive/overlapping declarations are
 refused. A failing check terminalizes the execution through the dedicated
-pre-dispatch environment failure path and pauses the Project with
-`system_pause_reason = "environment_not_ready"`, without changing the Task's
-workflow state or adding a Task annotation. No provider call or retry budget
-is spent. The stopped execution is tagged as an environment pre-dispatch
-failure so it does not block re-dispatch after resume. User and repository
-pauses are never overwritten. Pause detail (workspace ID, check names, triggering role,
-bounded output, pause/last-check/next-check times) persists in
-`project.environment_pause_json` and is returned as `environment_pause`.
-Migration V202610010410 clears legacy Task environment annotations without deleting
-Tasks or their execution history.
+pre-dispatch environment failure path. No provider call or retry budget is
+spent, and the Task keeps its workflow state with no blocking annotation. The
+workspace owner is recorded `not_ready` in `project_machine_readiness`, with
+its current checks digest, failing check names, role, bounded redacted output,
+and next-check time. The key is the Project plus the server host, or the daemon
+and runtime IDs of a daemon-owned placement. An embedded execution daemon or a
+shared-mount execution provider does not change a server workspace's owner key.
 
-`environment_pause_sync` starts a background job for recorded failing checks
-when due on the recorded ready daemon placement, with Project `env` and without
-assets. Embedded work, missing or unresolved workspaces, and daemon placements
-that are not ready or whose owner is unreachable use the primary checkout. The tick
-only starts or observes a job; operations refresh does not wait for host checks.
-Scheduled and manual re-checks share single-flight ownership per Project. Results
-use the original Project version and pause timestamp in the existing CAS, so a
-new pause, settings edit, or user pause wins over stale results. Check timeouts
-accept 1–300 seconds (default 120); execution clamps legacy stored values too.
-The interval defaults to 600 seconds (60–86400). Failure, including a re-check
-error, refreshes detail and schedules another check; an error is logged once at
-warn and does not skip the Project's plan-publication reconciliation;
-success compare-and-clears only the environment pause and publishes a Project
-resumed event. The next tick re-dispatches Tasks in their current states.
+Admission and launch failure share a last-resort pause decision for the concrete
+Task and the role being launched. A failed check filters only the launching role to which
+`EnvironmentCheck::applies_to` applies. If every otherwise eligible connected ready
+location is rejected only for `environment_not_ready`, Forge compare-and-sets
+an environment pause before initial state entry. The Task retains its state
+without a `dispatch_failed` annotation or transition. The same decision follows
+a launch failure; readiness versions fence concurrent results and user or
+repository pauses are never overwritten. Other eligible owners allow new work.
+An Agent pin or existing/inherited placement on an unfit owner instead waits
+there when another owner is healthy for other Tasks, even if those Tasks use
+another Agent or executor.
+
+Offline transport retains an existing environment-owned wait while its current
+not-ready fact still applies, without creating a recovery incident.
+
+Machine-specific waits live in `metadata_json.environment_wait` and
+`deferred_dispatch`, with Task-linked Attention of kind `environment_not_ready`
+naming the machine and checks. They use the existing runtime-offline category
+and recommend waiting, emit no `task.execution_failed` event, and clear when the
+machine becomes ready or admission moves on. Waiting Tasks count as parked for
+Project slots. Changes to `metadata_json` already advance `list_revision`, so
+Project slot caches observe both setting and clearing the marker. On a
+single-machine paused Project there is no additional Task Attention: existing
+environment Task Attention and wait markers are resolved in the pause transaction.
+The Project pause remains the sole signal. An environment Project pause defers
+dispatch rather than adding a `dispatch_failed` annotation.
+
+Internal `project.environment_pause_json` records the machine, workspace,
+checks, role, bounded output, and pause/last-check/next-check times. The public
+response keeps its shape in this build step. Migration V202610020600 infers an
+older pause's machine from its recorded workspace placement before falling
+back to the server; it preserves Projects and placements. The runner fills the
+canonical digest. Malformed settings leave rows `unknown` and produce one
+startup diagnostic instead of preventing startup. Asset-only Projects with no checks keep their
+pause without a readiness row. Migration V202610010410
+clears legacy Task environment annotations without deleting history.
+
+`environment_pause_sync` starts independent jobs from one query for due
+`not_ready` rows per dispatcher pass. Named failures re-run their recorded
+checks. Rows with no named failing check
+are never rechecked on a schedule: they require manual resume or Check now,
+because passing checks do not verify asset staging or run-policy repair. Project env is applied without
+asset staging. Host checks use the repository's primary or managed server
+checkout. Daemon re-checks use only the ready workspace recorded with that
+failure through `workspace.run`, never another Task's workspace or the server
+as a substitute. These commands must be read-only: like the base's scheduled
+re-check, host checks run in the primary checkout and are not filesystem
+sandboxed against writes. Output is bounded while collecting both streams,
+then redacted before storage.
+
+Every completed attempt advances `next_check_at`, including missing workspaces,
+unreachable owners, transport/policy errors and version conflicts in command
+execution. Such errors preserve the machine's check facts and never fail
+another Task's run. Actual failing check results update output and check times.
+Success marks the machine ready, clears its waits, re-reads the Project and
+compare-and-clears the matching current environment pause and publishes `project.resumed`. Readiness writes
+compare both the row version and current digest. A harmless Project-version
+change retries the pause clear only for the same pause epoch, digest and result
+version; intervening user/repository pauses or newer facts win. The tick never waits for
+command I/O. Jobs are single-flight per Project/machine; host scheduled checks
+also share the manual-check guard. Completion releases the guard and wakes the
+in-process dispatcher `Notify`, without waiting for its ten-second timer.
+Finished job errors and undecodable rows are logged once and rescheduled
+individually; they do not abort dispatch for healthy Projects. A daemon whose
+recorded workspace was deleted becomes unknown and its wait clears, allowing
+a new launch to decide. Check timeouts remain 1–300 seconds (default 120), and re-check intervals remain
+60–86400 seconds (default 600).
+
+Readiness success removes the machine wait and wakes dispatch; independent
+execution blockers still apply. Current daemon coder prompt loading uses a
+server-only canonical-plan accessor in `workflow/dispatch/loader.rs`, and
+coder/planner start prepares plan outboxes on the server using daemon-local
+paths in `task_service/execution/runner.rs`. These existing plan I/O paths are
+owned by the workflow/runtime refactor; this backend step verifies daemon
+re-dispatch through the execution path without plan I/O.
+
 `POST /projects/{id}/environment/recheck` runs every configured check immediately
 and returns per-check results plus the Project; all passing clears a matching
 environment pause. A manual check returns HTTP 409 immediately if another
 re-check is running. An empty check list never resumes automatically: asset-copy
 failures and removed probes stay paused with an explicit manual-resume message.
-Checks that were already passing do not resume such a pause on a timer; the
-owner's own "Check now" runs every configured check and resumes when all pass.
-Manual resume clears the pause too; another failing launch pauses the Project
-again. Running executions are left to finish.
+Unnamed failures stay paused until manual resume or Check now; timers never
+relaunch an unfixed setup failure.
+The manual endpoint retains its existing primary-checkout fallback when its
+recorded daemon workspace is unavailable; scheduled re-checks do not use that
+fallback. Manual resume and the existing compare-and-clear paths reset that
+Project's `not_ready` rows to `unknown` in the same transaction. The next
+dispatcher host admission without assets probes immediately, then launches or
+pauses again without waiting for the old `next_check_at`. Direct/manual claims,
+asset-backed Projects and daemon unknown rows proceed to launch preflight. Digest edits with checks remaining also retire an obsolete named-check
+environment pause transactionally, so the old pause cannot veto the new unknown
+facts. Removing all checks retains the existing manual-resume rule. Running executions are left to finish.
 
 Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks
@@ -1984,9 +2050,9 @@ SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
 Durable consumers checkpoint only after their projection is safe to commit, so
 lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
-memory indexing, or commitment reconciliation. The memory consumer uses the
-single-process worker runtime described below; the other four consumers still
-use the legacy cursor/lease/receipt protocol.
+memory indexing, or commitment reconciliation. Four durable consumers use the
+single-process worker runtime described below. SSE uses a read-only in-memory
+tail and connection-time ledger replay.
 
 `domain_event` rows are not pruned. The table also serves as an idempotency
 ledger (including lookups by `dedupe_key`) and as history for lease, execution,
@@ -2011,8 +2077,7 @@ or `All`, per-worker retry policy and handle timeout. Subscription changes are
 compared with persisted health on initialization and refreshed before handling.
 The existing `event_consumer_cursor` is the sole checkpoint authority; health
 has no cursor copy. SQL filtering, indexed lookups, mapping, validation and
-checkpoint writes live in `db`, with cursor creation/update shared by legacy
-delivery. Exact subscriptions seek each type's `(event_type, sequence)` index;
+checkpoint writes live in `db`. Exact subscriptions seek each type's `(event_type, sequence)` index;
 prefix subscriptions use disjoint binary type ranges on that index. Live lag
 counts matching ranges. The oldest pending wanted event is the lowest matching
 sequence, whose creation time supplies its age.
@@ -2037,20 +2102,35 @@ persistence. Deferral reason and first deferral time are retained. A malformed
 stored wait is logged once per runtime and treated as due; the next state change
 rewrites it. All deadline arithmetic is checked.
 
-Only failures/panics in `handle` or `commit`, and handle timeout, add a strike.
+`WorkerErrorKind` has three deliberate meanings:
+
+| Kind | Use | Event handling |
+| --- | --- | --- |
+| `Failure` (strike) | Unexpected item failures returned by `WorkerError::new` or non-transient `WorkerError::database`; caught handle/commit panics and handle timeouts also take this path | Add a strike, retry under the worker's finite policy, and quarantine when the cap is reached |
+| `Transient` | Retryable availability/concurrency failures | Never add a strike or quarantine; retry independently with waits from one second to the five-second idle maximum |
+| `Terminal` | A deterministic semantic rejection, such as Attention's `DbError::Check` | A terminal commit first rolls back and repeats handle/commit once with a fresh snapshot; a repeated terminal rejection quarantines and advances without a strike. Handle-time terminal outcomes quarantine directly. |
+
+`Terminal` was added because `commit` returns a commit result or an error, not
+`Outcome::DeadLetter`. Attention can discover a `Check` only after its first write;
+it must roll back that write and quarantine if fresh preparation still rejects it. Expressing this with a
+one-strike policy would also quarantine unrelated panics and timeouts. An explicit
+terminal error preserves immediate Check quarantine without changing scheduling,
+supervision or health persistence.
+
 Default policy is eight attempts, waits exponential from one second capped at
 five minutes, and five-minute handle timeout. Policy waits have a one-second
 floor, respect their representable cap, and an unrepresentable cap falls back
 to five minutes. A capped or explicit `DeadLetter` moves the cursor and inserts
 the quarantine record together. Runtime infrastructure failures never strike.
-Memory classifies only SQLite busy/locked, pool failures and version conflicts
-as transient; other database failures strike. Transient worker retries back off
-independently from one second to the five-second idle maximum.
+Memory classifies SQLite busy/locked/IO, pool failures and version conflicts
+as transient; other database failures strike.
 
-`tick` defaults to no-op and runs once per bounded poll cycle, not once per
-backlogged event. It runs again on wakes during retry/deferral waits; individual
-sleeps are capped at five seconds. Tick errors do not gate event handling. They
-have their own exponential schedule and health error scope. Identical runtime
+`tick` defaults to no-op and has an independent `tick_timeout()` (30 seconds).
+A failure or timeout is recorded and logged. Its independent retry schedule doubles
+from one second to five minutes and resets on success; cycles during this backoff
+skip tick and proceed directly to events. It runs at most once per due cycle,
+never once per backlogged event. Event-loop sleeps remain capped at five seconds.
+Tick has its own health error scope. Identical runtime
 and tick errors are deduplicated. Successful cycles clear runtime errors even
 when empty; successful ticks clear tick errors. An item error survives unrelated
 recovery until that item completes or is quarantined. Health's generated
@@ -2060,8 +2140,11 @@ Operator status computes lag/age/stalls live from the cursor table and current
 subscription, without scanning ignored event rows through `json_each`. Existing
 `recent_errors` entries carry bounded worker causes and deferral reason/since;
 readiness alone is informational, while errors and stalls raise attention.
-Dead letters are separate issues in the same one-hour window as ordinary errors,
-not permanent health errors. The response shape is unchanged.
+Dead letters degrade health for the same one-hour window as ordinary errors.
+Each worker also exposes its retained total and five most recent quarantines with
+stable IDs, item keys/sequence, reason and time, without expiry. The table retains
+worker/source identity for later replay/dismiss actions; those actions are outside
+this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
 
 Each standard SQLite pool connection has an insert hook, commit marker and
 rollback handling. Pool-scoped `Notify` is delivered on connection release
@@ -2075,33 +2158,76 @@ register before polling; notification hints never replace durable reads.
 The supervisor counts loop exits/runtime panics, including failed initialization,
 resets restart back-off after a healthy period, and aborts/awaits its existing
 child on shutdown. False watch changes cannot create another loop. Missing health
-rows are recreated. Only `scoped-memory-agent-chat-indexer` uses this library;
-the other four consumers remain on their current loops. Migration
-`V202610012200` removes only memory's retired delivery leases/receipts and
-preserves cursors, projection/source receipts and other consumers' metadata.
-The still-unmerged migration is edited in place.
+rows are recreated. The consumer placements are:
 
-The next consumer placements are:
+| Worker | Subscription | `handle` / `commit` | `tick` | `after_commit` |
+| --- | --- | --- | --- | --- |
+| `scoped-memory-agent-chat-indexer` | Exact `agent_chat.message.admitted`, `agent_chat.response.completed`, `agent_chat.message.completed` | Prepare semantic memory / insert source-idempotent memory | None | None |
+| `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
+| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
+| `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
 
-- Attention subscribes to `All`: its classification is case-insensitive and
-  substring-based. Move `resolve_superseded_turn_incidents` to `tick`, split
-  `project_event` into preparation and transaction-owned projection writes,
-  and return `Skip` for irrelevant events. Express `DbError::Check` as immediate
-  `DeadLetter`; other errors use `WorkerError::transient` and retry forever.
-  A whole-stream `ProjectionOutcome::Deferred` can use runtime `Defer`.
-- Wake-turn subscribes to `Prefix(["agent.wake."])`. Move `plan_event` to handle,
-  the admission/disposition portion of `process_claimed_event` into commit, and
-  `settle_decision_incident` into after_commit, conditioned on the committed
-  admission result. A deferred wake is `Done` with a persisted `Deferred`
-  disposition and an advanced cursor; it does not use runtime `Defer`, which
-  would block other Agents' wakes. Reconsiderable-disposition lookup and
-  `process_retry` belong in tick. Split `complete_claimed_agent_wake` persistence
-  from its legacy lease/receipt completion.
-- Coordination prepares `reconcile_event` reads/planning in handle and moves
-  `acknowledge_originating_inbox`, `reconcile_commitment` and `deliver_outcome`
-  into transaction-owned variants called by commit.
-- SSE becomes a non-durable tail outside this cursor runtime; no batching is
-  added here.
+The three migrated consumers use the standard eight-strike policy for unexpected
+hook faults and a five-minute handle timeout. Preparation performs local database
+and policy work, never a provider/model call. Busy/locked/IO database failures and resolvable version conflicts are transient.
+Deterministic domain rejections are terminal; unexpected failures take strikes.
+Cancelled commitments need no outcome and are skipped.
+Independent commitment and inbox effects use savepoints. A rejected item is left
+unchanged and recorded with its identity/reason, while siblings and inbox delivery
+continue. Non-item failures roll back the event; terminal commit failures refresh
+preparation once before quarantine. Attention resolvers are conditional/idempotent
+updates without per-row semantic refusals; a wake's message/turn/disposition and
+incident resolution are one dependent atomic effect. A rejected transition
+(such as blocked to completed) does not change the commitment state machine. Attention's deterministic
+`DbError::Check` rejection quarantines immediately, including a check discovered
+after the first effect write. Memory retains its existing poison policy.
+
+Attention's terminal-execution settlement wait is whole-stream `Defer`, preserving
+its previous ordering barrier. A deferred wake is `Done` with a durable `Deferred`
+disposition and an advanced cursor: one unavailable Agent cannot block another
+Agent's wake. Admission fallback uses a savepoint so rejected admission writes
+cannot leak into the fallback disposition. Semantic wake retry attempts keep their
+immutable lineage and finite budget separately from runtime retries.
+
+Migration `V202610020700` drops `event_processing_lease` and
+`event_projection_receipt` and the unused `attention_consumer_health` table.
+These contained only delivery metadata and operational counters, timestamps,
+bounded error diagnostics and lease details, not user data. Runtime health
+replaces the old attention-health storage and accessors.
+All durable consumer cursors and all domain/projection records survive unchanged;
+only the retired `sse-broadcast` cursor is removed. Live legacy claims do not block
+restart: each worker resumes strictly after its retained checkpoint.
+
+The SSE relay is an ordered tail outside `WorkerRuntime`, owned by `WorkerSupervisor`.
+Task death or unexpected exit restarts with backoff and bounded shutdown; its shared
+in-memory position survives child restart, preventing gaps or duplicate broadcast.
+Read errors and restart state are visible in operator status.
+Its optional in-memory position is initialized from the ledger head in its loop;
+a failed read leaves it uninitialized and retries without replaying history; serial drains read ascending event sequences,
+publish their committed envelopes, and advance only memory. It uses the same
+committed-event `Notify`, registered before polling, and the same 250 ms to
+five-second idle fallback. It writes no cursor, lease or receipt; supervisor/error health writes occur only on
+faults and recovery, with no steady-state idle writes.
+
+SSE plain connects remain live-only. A connection reads the ledger only when
+`Last-Event-ID` has the durable form `domain-event:<sequence>`; entity IDs, missing
+headers and malformed IDs do not request replay. Bus-only and ordinary resync frames omit
+the SSE `id` field, preserving the client's last durable cursor across reconnects.
+A beyond-head resync alone sets `domain-event:<head>` to reset an invalid cursor.
+Keep-alive comments also have no ID. Only durable frames set an SSE ID.
+The payload's `entity_id` remains unchanged. Neither the web client nor forge-ctl
+uses frame IDs for routing; MCP uses a separate stream. The web client recreates
+`EventSource` on reconnect and refreshes active queries after a stable open.
+
+For durable resume, subscribe before capturing the ledger head, then check the
+bounded sequence range for at most 1,001 keys. At most 1,000 missed rows replay in
+ascending sequence order through that snapshot, using 100-row pages. A larger
+backlog produces one `events.resync_required` frame and no replay. Snapshot-covered
+durable live frames are filtered, so delayed relay frames cannot duplicate replay;
+appends beyond the captured head remain live. Bus-only events remain live-only,
+and bus overflow still requests resync. The relay is the only publisher of durable frames. Composite and standalone
+commits are delivered in sequence order, so a resume cursor cannot jump past
+undelivered events.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
@@ -2117,9 +2243,10 @@ Server and Solo data-root process locking excludes that conversion from a
 running runtime. Operator status reports free pages, incremental mode, consumer
 lag and oldest pending age. Its expected consumers are derived from the
 workers the supervisor starts; persisted cursors for workers outside that set
-are omitted. Migrated workers use the cursor table and `worker_health` subscriptions with
-live event queries; legacy consumers derive lag from the cursor and global head. All five durable
-consumers currently start unconditionally in both
+are omitted. All four durable workers use the cursor table and `worker_health` subscriptions
+with live event queries. The SSE tail is omitted from `event_consumers` because it
+has no durable backlog or checkpoint. All four workers and the SSE tail start
+unconditionally in both
 Server and Solo, including when MCP or the embedded daemon is disabled. A cursor
 is stalled only when unprocessed events exist and it has not advanced for longer
 than the configured threshold; an idle consumer with zero lag is never stalled.
@@ -2130,21 +2257,19 @@ The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
 terminal Task transition events into one task-outcome inbox item and, for a
 scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
-and receipt checkpoint safe to replay.
+and cursor checkpoint safe to replay.
 
 The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
 loop. Migration `V088` records an install-time cutover cursor, so events that
 commit after installation are evaluated even when the process has not polled
 yet; startup never derives a cursor from the runtime event maximum. Each
-claimed `agent.wake.*` candidate receives one durable current disposition:
+`agent.wake.*` candidate receives one durable current disposition:
 `turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. The disposition, projection receipt, cursor advancement,
-lease release, and optional Agent Chat message/turn admission commit in one
-transaction. Deferred and setup-required incidents retain bounded retry or
+`setup_required`. The disposition, cursor advancement and optional Agent Chat message/turn
+admission commit in one transaction. Deferred and setup-required incidents retain bounded retry or
 authoritative-state reconsideration lineage instead of disappearing as
-completed delivery. Claims and checkpoints are ordered by ascending
-`domain_event.sequence`; a live lease at the head is an ordering barrier, and
-the cursor cannot skip an undisposed sequence. A disposition replay is
+completed delivery. Checkpointed candidates are ordered by ascending subscribed
+`domain_event.sequence`; the cursor cannot skip an undisposed wake sequence. A disposition replay is
 idempotent and advances the cursor at most once, only after its disposition
 and any admitted turn/message commit.
 
@@ -2365,16 +2490,25 @@ commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
-Attention consumer health buffers successful progress, flushing at an event
-boundary after five seconds or 100 processed events, and immediately on errors.
-Batch release flushes remaining progress and clears any published processing
-lease. New batch owners and lease renewals are buffered; empty polls write health
-at most once every five seconds. Buffered deltas and the latest successful
-sequence/time are preserved when flushing; a published lease expiry remains visible
-during processing. Each event's authoritative cursor and receipt still commit
-individually. Health counters are diagnostic: a crash may lose up to 99 buffered
-increments, without losing event delivery. The stale threshold remains 90
-seconds since the last successfully processed event.
+Attention consumer health uses live subscribed backlog and checkpoint progress.
+A caught-up or newly initialized consumer is not stale; both the oldest pending
+event and the progress/initialization baseline must exceed 90 seconds to be stale.
+No ledger-prefix count is performed per request; the processed-event field was
+removed. Error kind (`failure`, `transient`, `terminal`) and bounded message come
+from worker health or recent quarantine records. The same health result supplies
+Mission Control's capacity status.
+
+Wake semantic retry errors are isolated by disposition ID. A failing row cannot
+abort later rows. Transient failures back off without strikes; waiting rows are
+filtered before the SQL limit and waiting is not a tick error. Unexpected failures
+have an independent eight-strike cap in `worker_item_failure`; a terminal storage
+rejection or cap exhaustion commits a terminal `wake_retry_failed` disposition
+and a dead letter together. Evaluation/admission rejections that have a typed wake
+outcome retain `wake_evaluation_invalid` / `turn_admission_rejected`; commit-time
+missing authority defers as before. Initial and retry
+admission, disposition and decision-incident resolution commit together. Consumer
+`after_commit` hooks hold no durable effect; Attention only emits its budget-stall
+bus notification for the zero configured-budget branch, using the budget scope.
 
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,
@@ -2462,7 +2596,46 @@ explicit expiry after ten minutes from their last update.
 
 Candidates must pass reachability and visibility, executor availability and
 adapter capability facts, daemon `workspace.v1` support, run policy, Agent pin,
-capacity, and the daemon placement limits. Missing adapter facts mean unsupported.
+capacity, the daemon placement limits, and Project environment readiness.
+Missing adapter facts mean unsupported. Readiness is a fact per Project and
+workspace-owner machine, with a SHA-256 digest covering only `environment.env`
+and `environment.checks`; asset and interval edits do not invalidate it. Pure
+selection reads the candidate's readiness and per-check results for the Task's
+launching role. Current `ready` passes; a current `not_ready` row rejects only
+when a failing check applies to that launching role (an unnamed launch failure applies
+to its recorded role). Host missing, unknown or stale records return transient
+`environment_probe_pending`. Daemon missing, unknown or stale records pass:
+only current applicable launch-time failures reject daemon admission. This
+single temporary policy lives in `placement/selection.rs::environment_filter`
+and is removed by step 3's `machine.probe`. It applies identically at reserve
+and claim, regardless of whether a workspace has just been prepared.
+Projects with no checks ignore readiness, never probe and write no new rows;
+removing checks deletes existing rows and resolves machine waits.
+
+Only check-only Projects on the server are proactively probed in this build step.
+When assets are configured, a primary-checkout probe cannot see staged assets:
+admission uses launch-time preflight and ignores primary-checkout probe facts.
+Actual launch-time not-ready facts still filter the machine. Direct/manual
+claims also bypass probe-pending and check at launch; dispatcher admissions
+retain probe deferral. Probes run every
+configured check with Project env in the server repository checkout, outside
+admission's transaction, without assets or workspace preparation. Each result
+retains its check name and pass/fail status; role applicability is evaluated by
+pure selection rather than by collapsing the result into a Project-wide fact.
+Probes are single-flight per Project/server and write with a digest/version
+fence, then wake dispatch through the in-process dispatcher `Notify`. Settings
+edits invalidate rows transactionally; the Project event observer starts host
+probes for existing host rows or ready host locations without waiting for a
+Task. A digest edit colliding with an older flight is re-probed on completion,
+even without a queued Task; retained host rows can use the server checkout
+without a location row. A passing host probe compare-and-clears a matching
+environment pause against the current Project snapshot after its result, so a settings edit
+cannot leave a ready host behind an old pause. Daemon facts come only from launch-time results; there is no proactive
+`workspace.run` through a live Task. Initial dispatch returns early before assembly when there are no checks, and
+otherwise uses the same shared, read-only admission context builder as reservation. An environment refusal
+keeps the Task queued with at most one version change. A preferred candidate
+that is only probe-pending defers selection rather than diverting work to a
+lower-preference passing owner; existing placement order is preserved.
 The embedded provider supplies the server host's adapter facts, including session
 resume for its session-capable executors. Recovery uses those facts for embedded
 execution and the current owner's handshake for daemon execution; no command
@@ -2506,8 +2679,14 @@ active work is scanned before `todo`, and follow-ups or chat turns can take a fr
 slot before the next dispatcher tick. Waiters resume on that tick. Review check
 runs and merges take no slot because there is no durable running-check record.
 
-Automatic dispatch keeps transient owner-unreachable or capacity refusals queued
-on the same owner. Before the first placement exists, an offline owner creates
+Automatic dispatch keeps transient owner-unreachable, capacity, and
+`environment_probe_pending` refusals queued. Initial dispatch reads the same
+selection context before its workflow transition and defers an otherwise
+viable probe refusal without entering the target state. The queued marker
+creates no Execution or Task version change. Repeated probe waits refresh
+only their retry time. Probe completion clears the delay without another Task
+version change, so the next tick can enter the target state and launch.
+Before the first placement exists, an offline owner creates
 Task-scoped `runtime_offline` Attention and a durable wait bounded by
 `workspace.max_disconnect_seconds`; expiry blocks the Task visibly. Repeated
 identical waits update only their retry time; events, Attention, and Task version
@@ -2519,7 +2698,7 @@ uses `queued_recovery`; permanent replay refusals restore its original blocker.
 The active scan retries structural placement refusals, because location,
 executor, handshake, and run-policy changes can fix them without editing a Task.
 On state entry, a structural refusal still rolls the transition back with
-`dispatch_failed`; only retryable owner/capacity refusals defer dispatch.
+`dispatch_failed`; retryable owner, capacity, and environment-probe refusals defer dispatch.
 Stable governance refusals use `metadata.dispatch_disposition` with the safe
 reason, and remain parked until their authority changes or dispatch is woken.
 

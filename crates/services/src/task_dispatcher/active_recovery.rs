@@ -504,6 +504,7 @@ impl TaskDispatcher {
                     &self.task_service,
                     task,
                     &agent,
+                    Some("coder"),
                 )
                 .await?
                 {
@@ -912,6 +913,7 @@ impl TaskDispatcher {
             &self.task_service,
             task,
             &wait_agent,
+            Some(role_name),
         )
         .await?
         {

@@ -130,12 +130,15 @@ impl DbError {
             | Self::TaskVersionConflict { .. }
             | Self::BoardRevisionConflict { .. } => true,
             Self::Sqlx(
-                sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::WorkerCrashed,
+                sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed
+                | sqlx::Error::Io(_),
             ) => true,
             Self::Sqlx(sqlx::Error::Database(error)) => error
                 .code()
                 .and_then(|code| code.parse::<i32>().ok())
-                .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6 | 10 | 14)),
             _ => false,
         }
     }

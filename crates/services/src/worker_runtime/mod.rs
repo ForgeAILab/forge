@@ -7,7 +7,7 @@ mod supervisor;
 pub use db::EventSubscription as Subscription;
 pub use db::{FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem, WorkerHealth};
 pub use event_source::DurableEventSource;
-pub use policy::{Outcome, WorkerError, WorkerErrorKind};
+pub use policy::{consumer_error, consumer_error_kind, Outcome, WorkerError, WorkerErrorKind};
 pub use supervisor::{SupervisorPolicy, WorkerSupervisor};
 
 use crate::{Result, ServiceError};
@@ -34,6 +34,7 @@ const MIN_IDLE: Duration = Duration::from_millis(250);
 const MAX_IDLE: Duration = Duration::from_secs(5);
 const MIN_RETRY: Duration = Duration::from_secs(1);
 const CYCLE_LIMIT: usize = 100;
+const MAX_TICK_RETRY: Duration = Duration::from_secs(300);
 
 /// Stable Rust does not support associated type defaults. The commit-result
 /// parameter therefore defaults to (), preserving the no-result worker form.
@@ -48,6 +49,9 @@ pub trait Worker<C: Send + Sync + 'static = ()>: Send + Sync + 'static {
     }
     fn handle_timeout(&self) -> Duration {
         Duration::from_secs(300)
+    }
+    fn tick_timeout(&self) -> Duration {
+        Duration::from_secs(30)
     }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
         Ok(())
@@ -83,11 +87,14 @@ struct Schedule {
 }
 impl Schedule {
     fn failed(&mut self) -> Duration {
+        self.failed_with_cap(MAX_IDLE)
+    }
+    fn failed_with_cap(&mut self, cap: Duration) -> Duration {
         self.failures = self.failures.saturating_add(1);
         let delay = MIN_RETRY
             .checked_mul(1 << self.failures.saturating_sub(1).min(10))
-            .unwrap_or(MAX_IDLE)
-            .min(MAX_IDLE);
+            .unwrap_or(cap)
+            .min(cap);
         self.due = Instant::now().checked_add(delay);
         delay
     }
@@ -221,7 +228,16 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
         {
             return;
         }
-        match catch_worker(async { self.worker.tick().await }, "worker tick panicked").await {
+        match catch_worker(
+            async {
+                tokio::time::timeout(self.worker.tick_timeout(), self.worker.tick())
+                    .await
+                    .unwrap_or_else(|_| Err(WorkerError::new("worker tick timed out")))
+            },
+            "worker tick panicked",
+        )
+        .await
+        {
             Ok(()) => {
                 self.tick_schedule
                     .lock()
@@ -235,11 +251,15 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                 self.tick_schedule
                     .lock()
                     .expect("tick schedule lock")
-                    .failed();
+                    .failed_with_cap(MAX_TICK_RETRY);
                 tracing::warn!(worker = self.worker.name(), %error, "worker tick failed");
                 if let Err(report) = self
                     .health
-                    .report_error_kind(HealthErrorKind::Tick, error.message())
+                    .report_classified_error(
+                        HealthErrorKind::Tick,
+                        error.kind.as_str(),
+                        error.message(),
+                    )
                     .await
                 {
                     tracing::warn!(worker = self.worker.name(), %report, "failed to report tick error");
@@ -324,84 +344,98 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                 PollResult::Retry(delay)
             });
         }
-        let outcome = catch_worker(
-            async {
-                tokio::time::timeout(self.worker.handle_timeout(), self.worker.handle(&event))
+        for refresh in 0..2 {
+            let outcome = catch_worker(
+                async {
+                    tokio::time::timeout(self.worker.handle_timeout(), self.worker.handle(&event))
+                        .await
+                        .unwrap_or_else(|_| Err(WorkerError::new("worker handle timed out")))
+                },
+                "worker handle panicked",
+            )
+            .await;
+            return match outcome {
+                Ok(Outcome::Done(prepared)) => {
+                    let mut tx = self.begin_write().await?;
+                    self.source
+                        .validate_in_tx(&mut tx, cursor, event.sequence)
+                        .await?;
+                    self.health.ensure_in_tx(&mut tx).await?;
+                    let committed = match catch_worker(
+                        async { self.worker.commit(&mut tx, &event, &prepared).await },
+                        "worker commit panicked",
+                    )
                     .await
-                    .unwrap_or_else(|_| Err(WorkerError::new("worker handle timed out")))
-            },
-            "worker handle panicked",
-        )
-        .await;
-        match outcome {
-            Ok(Outcome::Done(prepared)) => {
-                let mut tx = self.begin_write().await?;
-                self.source
-                    .validate_in_tx(&mut tx, cursor, event.sequence)
-                    .await?;
-                self.health.ensure_in_tx(&mut tx).await?;
-                let committed = match catch_worker(
-                    async { self.worker.commit(&mut tx, &event, &prepared).await },
-                    "worker commit panicked",
-                )
-                .await
-                {
-                    Ok(committed) => committed,
-                    Err(error) => {
-                        tx.rollback().await?;
-                        return self.worker_failure(cursor, &event, error).await;
+                    {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            tx.rollback().await?;
+                            if error.kind == WorkerErrorKind::Terminal && refresh == 0 {
+                                // A terminal-looking failure can come from a stale
+                                // preparation snapshot. Re-read once after rollback.
+                                continue;
+                            }
+                            return self.worker_failure(cursor, &event, error).await;
+                        }
+                    };
+                    self.source
+                        .acknowledge_in_tx(&mut tx, cursor, event.sequence)
+                        .await?;
+                    self.health.success_in_tx(&mut tx, &key).await?;
+                    tx.commit().await?;
+                    self.clear_wait();
+                    self.source.flushed();
+                    if let Err(error) = catch_worker(
+                        async {
+                            self.worker
+                                .after_commit(&event, &prepared, &committed)
+                                .await
+                        },
+                        "worker after_commit panicked",
+                    )
+                    .await
+                    {
+                        tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
+                        let _ = self
+                            .health
+                            .report_classified_error(
+                                HealthErrorKind::AfterCommit,
+                                error.kind.as_str(),
+                                error.message(),
+                            )
+                            .await;
                     }
-                };
-                self.source
-                    .acknowledge_in_tx(&mut tx, cursor, event.sequence)
-                    .await?;
-                self.health.success_in_tx(&mut tx, &key).await?;
-                tx.commit().await?;
-                self.clear_wait();
-                self.source.flushed();
-                if let Err(error) = catch_worker(
-                    async {
-                        self.worker
-                            .after_commit(&event, &prepared, &committed)
-                            .await
-                    },
-                    "worker after_commit panicked",
-                )
-                .await
-                {
-                    tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
-                    let _ = self
-                        .health
-                        .report_error_kind(HealthErrorKind::AfterCommit, error.message())
-                        .await;
+                    Ok(PollResult::Progress)
                 }
-                Ok(PollResult::Progress)
-            }
-            Ok(Outcome::Skip) => {
-                self.source.skip(event.sequence);
-                self.clear_wait();
-                Ok(PollResult::Scanned)
-            }
-            Ok(Outcome::Defer { after, reason }) => {
-                self.transient_schedule
-                    .lock()
-                    .expect("transient schedule lock")
-                    .reset();
-                let after = db::clamp_worker_deferral(after);
-                let mut tx = self.begin_write().await?;
-                self.source
-                    .validate_in_tx(&mut tx, cursor, event.sequence)
-                    .await?;
-                self.health
-                    .defer_in_tx(&mut tx, &key, after, &reason)
-                    .await?;
-                tx.commit().await?;
-                self.set_wait(key, after, false);
-                Ok(PollResult::Retry(after))
-            }
-            Ok(Outcome::DeadLetter { reason }) => self.failure(cursor, &event, &reason, true).await,
-            Err(error) => self.worker_failure(cursor, &event, error).await,
+                Ok(Outcome::Skip) => {
+                    self.source.skip(event.sequence);
+                    self.clear_wait();
+                    Ok(PollResult::Scanned)
+                }
+                Ok(Outcome::Defer { after, reason }) => {
+                    self.transient_schedule
+                        .lock()
+                        .expect("transient schedule lock")
+                        .reset();
+                    let after = db::clamp_worker_deferral(after);
+                    let mut tx = self.begin_write().await?;
+                    self.source
+                        .validate_in_tx(&mut tx, cursor, event.sequence)
+                        .await?;
+                    self.health
+                        .defer_in_tx(&mut tx, &key, after, &reason)
+                        .await?;
+                    tx.commit().await?;
+                    self.set_wait(key, after, false);
+                    Ok(PollResult::Retry(after))
+                }
+                Ok(Outcome::DeadLetter { reason }) => {
+                    self.failure(cursor, &event, &reason, true).await
+                }
+                Err(error) => self.worker_failure(cursor, &event, error).await,
+            };
         }
+        unreachable!("fresh preparation returns a result")
     }
     async fn worker_failure(
         &self,
@@ -409,6 +443,9 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
         event: &DomainEvent,
         error: WorkerError,
     ) -> Result<PollResult> {
+        if error.kind == WorkerErrorKind::Terminal {
+            return self.failure(cursor, event, error.message(), true).await;
+        }
         if error.kind == WorkerErrorKind::Transient {
             self.health.report_error(error.message()).await?;
             let delay = self

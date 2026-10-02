@@ -1,8 +1,5 @@
 use super::*;
-use db::{
-    create_sqlite_pool, new_uuid_v4, run_migrations, ClaimDomainEvents, CreateDomainEvent,
-    DomainEventRepo,
-};
+use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -26,9 +23,15 @@ struct TinyWorker {
     commit_failures: AtomicUsize,
     transient: AtomicBool,
     commit_transient: AtomicBool,
+    commit_terminal_once: AtomicBool,
+    commit_terminal_always: bool,
+    skip_on_refresh: bool,
+    ticks: AtomicUsize,
+    tick_timeout: Duration,
     active: AtomicUsize,
     after_failure: bool,
     tick_panics: AtomicUsize,
+    tick_hangs: AtomicBool,
     defer_for: Duration,
     policy: RetryPolicy,
     timeout: Duration,
@@ -44,9 +47,15 @@ impl TinyWorker {
             commit_failures: AtomicUsize::new(0),
             transient: AtomicBool::new(false),
             commit_transient: AtomicBool::new(false),
+            commit_terminal_once: AtomicBool::new(false),
+            commit_terminal_always: false,
+            skip_on_refresh: false,
+            ticks: AtomicUsize::new(0),
+            tick_timeout: Duration::from_secs(30),
             active: AtomicUsize::new(0),
             after_failure: false,
             tick_panics: AtomicUsize::new(0),
+            tick_hangs: AtomicBool::new(false),
             defer_for: Duration::ZERO,
             policy: RetryPolicy {
                 max_attempts: 3,
@@ -75,7 +84,14 @@ impl Worker for TinyWorker {
     fn handle_timeout(&self) -> Duration {
         self.timeout
     }
+    fn tick_timeout(&self) -> Duration {
+        self.tick_timeout
+    }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        self.ticks.fetch_add(1, Ordering::SeqCst);
+        if self.tick_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if take_one(&self.tick_panics) {
             panic!("runtime hook panic");
         }
@@ -84,6 +100,9 @@ impl Worker for TinyWorker {
     async fn handle(&self, event: &DomainEvent) -> std::result::Result<Outcome<i64>, WorkerError> {
         self.seen.lock().unwrap().push(event.sequence);
         self.entered.notify_one();
+        if self.skip_on_refresh && !self.commit_terminal_once.load(Ordering::SeqCst) {
+            return Ok(Outcome::Skip);
+        }
         if self.transient.load(Ordering::SeqCst) {
             return Err(WorkerError::transient("database unavailable"));
         }
@@ -124,6 +143,9 @@ impl Worker for TinyWorker {
             .execute(&mut **tx)
             .await
             .map_err(|e| WorkerError::transient(e.to_string()))?;
+        if self.commit_terminal_once.swap(false, Ordering::SeqCst) || self.commit_terminal_always {
+            return Err(WorkerError::terminal("stale or rejected domain snapshot"));
+        }
         if self.commit_transient.load(Ordering::SeqCst) {
             return Err(WorkerError::transient("commit concurrency conflict"));
         }
@@ -279,22 +301,6 @@ async fn strict_order_sql_filter_and_no_per_ignored_event_writes() {
     );
     assert_eq!(runtime.write_transaction_count() - before, 2);
     assert_eq!(runtime.source.cursor().await.unwrap(), second.sequence);
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = 'filtered'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM event_projection_receipt WHERE consumer_name = 'filtered'"
-        )
-        .await,
-        0
-    );
 }
 
 // P4. Advance explicit Tokio time while each ignored append is observed.
@@ -777,17 +783,7 @@ async fn upgrade_reuses_cursor_ignores_legacy_leases_and_handles_once() {
     let next = append(&db, "wanted", "new").await;
     sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('upgrade', ?, ?)")
         .bind(old.sequence).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
-    let claimed = db
-        .claim_event_batch(ClaimDomainEvents {
-            consumer_name: "upgrade".into(),
-            lease_owner: "legacy".into(),
-            now: db::now_rfc3339(),
-            leased_until: "2999-01-01T00:00:00Z".into(),
-            limit: 10,
-        })
-        .await
-        .unwrap();
-    assert_eq!(claimed.len(), 1);
+    legacy_delivery(&db, "upgrade").await;
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("upgrade")));
     assert_eq!(runtime.run_once(10).await.unwrap(), 1);
     assert_eq!(runtime.run_once(10).await.unwrap(), 0);
@@ -1059,15 +1055,7 @@ async fn worker_runtime_migration_removes_only_memory_delivery_metadata() {
     let db = database().await;
     let event = append(&db, "wanted", "legacy").await;
     for name in [crate::memory_consumer_name(), "unmigrated"] {
-        db.claim_event_batch(ClaimDomainEvents {
-            consumer_name: name.into(),
-            lease_owner: "legacy".into(),
-            now: db::now_rfc3339(),
-            leased_until: "2999-01-01T00:00:00Z".into(),
-            limit: 10,
-        })
-        .await
-        .unwrap();
+        legacy_delivery(&db, name).await;
         sqlx::query("INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at) VALUES (?, ?, ?, ?)")
             .bind(name).bind(&event.id).bind(&event.id).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
     }
@@ -1196,3 +1184,110 @@ async fn invalid_retry_timestamp_is_due_and_recovers_without_resetting_strikes()
 
 #[path = "regressions.rs"]
 mod regressions;
+
+async fn legacy_delivery(db: &SqliteDb, name: &str) {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_processing_lease'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    if exists == 0 {
+        sqlx::raw_sql(include_str!(
+            "../../../db/tests/fixtures/event_delivery.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?) ON CONFLICT DO NOTHING").bind(name).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) SELECT ?, sequence, 'legacy', '2999-01-01T00:00:00Z', 1, ? FROM domain_event WHERE sequence > (SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?)")
+        .bind(name).bind(db::now_rfc3339()).bind(name).execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_timed_out_tick_is_reported_and_does_not_gate_events() {
+    let db = database().await;
+    let mut worker = TinyWorker::new("hung-tick");
+    worker.tick_hangs.store(true, Ordering::SeqCst);
+    worker.tick_timeout = Duration::from_millis(10);
+    let event = append(&db, "wanted", "good").await;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 1);
+    assert_eq!(effects(&db).await, vec![event.sequence]);
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT tick_error FROM worker_health WHERE worker_name = 'hung-tick'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(error.as_deref(), Some("worker tick timed out"));
+}
+
+#[tokio::test]
+async fn audit2_terminal_commit_refreshes_preparation_once_before_quarantine() {
+    for (skip, always_terminal) in [(false, false), (true, false), (false, true)] {
+        let db = database().await;
+        let mut worker = TinyWorker::new("fresh-terminal");
+        worker.commit_terminal_once.store(true, Ordering::SeqCst);
+        worker.skip_on_refresh = skip;
+        worker.commit_terminal_always = always_terminal;
+        let worker = Arc::new(worker);
+        let event = append(&db, "wanted", "good").await;
+        let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+        runtime.run_once(10).await.unwrap();
+        assert_eq!(
+            worker.seen.lock().unwrap().as_slice(),
+            &[event.sequence, event.sequence]
+        );
+        assert_eq!(
+            effects(&db).await,
+            if skip || always_terminal {
+                vec![]
+            } else {
+                vec![event.sequence]
+            }
+        );
+        let count = scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await;
+        assert_eq!(count, i64::from(always_terminal));
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT retry_attempts FROM worker_health WHERE worker_name = 'fresh-terminal'"
+            )
+            .await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit2_hung_tick_does_not_repeat_during_failure_backoff() {
+    let db = database().await;
+    let mut worker = TinyWorker::new("tick-backoff");
+    worker.tick_hangs.store(true, Ordering::SeqCst);
+    worker.tick_timeout = Duration::from_millis(10);
+    let worker = Arc::new(worker);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    // Exercise the long failure backoff without spending minutes in test sleeps.
+    runtime.tick_schedule.lock().unwrap().failures = 9;
+    let mut wanted = Vec::new();
+    for n in 0..20 {
+        wanted.push(append(&db, "wanted", &format!("good-{n}")).await.sequence);
+        runtime.run_once(1).await.unwrap();
+    }
+    assert_eq!(effects(&db).await, wanted);
+    assert_eq!(
+        worker.ticks.load(Ordering::SeqCst),
+        1,
+        "only one tick timeout across twenty event cycles"
+    );
+    let mut schedule = Schedule::default();
+    for seconds in [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
+        assert_eq!(
+            schedule.failed_with_cap(MAX_TICK_RETRY),
+            Duration::from_secs(seconds)
+        );
+    }
+    schedule.reset();
+    assert!(schedule.ready());
+}

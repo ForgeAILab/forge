@@ -1,14 +1,6 @@
 use super::*;
 use crate::WorkerHealth;
 
-/// Gap-tolerant legacy lookup; sequence numbers need not be contiguous.
-pub(super) async fn next_existing_sequence(
-    tx: &mut Transaction<'_, Sqlite>,
-    cursor: i64,
-) -> Result<Option<i64>> {
-    next_subscribed_sequence(tx, cursor, &EventSubscription::All).await
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
 pub enum EventSubscription {
@@ -128,6 +120,18 @@ async fn next_subscribed_sequence(
 }
 
 impl SqliteDb {
+    /// Check the replay cap using the sequence primary key. OFFSET visits at
+    /// most limit + 1 matching rows, without reading event payloads or counting
+    /// the rest of a potentially unbounded ledger.
+    pub async fn domain_event_replay_exceeds_limit(
+        &self,
+        after: i64,
+        through: i64,
+        limit: i64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM domain_event WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT 1 OFFSET ?)")
+            .bind(after).bind(through).bind(limit.max(0)).fetch_one(&self.pool).await? != 0)
+    }
     pub async fn domain_event_head(&self) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM domain_event")
@@ -488,218 +492,6 @@ impl DomainEventRepo for SqliteDb {
             .await?
             .map(|row| map_event_consumer_cutover(row).map_err(DbError::from))
             .transpose()
-    }
-
-    async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>> {
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        self.ensure_domain_event_cursor_in_tx(&mut transaction, &input.consumer_name, &input.now)
-            .await?;
-
-        // Repair a cursor that may lag behind a receipt after a crash in an
-        // older consumer implementation.  Advance only over a contiguous
-        // prefix of receipts; an unprocessed gap remains authoritative and is
-        // still claimed in sequence order below.
-        let mut last_sequence = sqlx::query_scalar::<_, i64>(
-            "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
-        )
-        .bind(&input.consumer_name)
-        .fetch_one(&mut *transaction)
-        .await?;
-        loop {
-            let Some(next_sequence) =
-                next_existing_sequence(&mut transaction, last_sequence).await?
-            else {
-                break;
-            };
-            let next_id =
-                sqlx::query_scalar::<_, String>("SELECT id FROM domain_event WHERE sequence = ?")
-                    .bind(next_sequence)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            let has_receipt = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM event_projection_receipt
-                 WHERE consumer_name = ? AND event_id = ?",
-            )
-            .bind(&input.consumer_name)
-            .bind(&next_id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
-            if !has_receipt {
-                break;
-            }
-            self.advance_domain_event_cursor_in_tx(
-                &mut transaction,
-                &input.consumer_name,
-                last_sequence,
-                next_sequence,
-                &input.now,
-            )
-            .await?;
-            last_sequence = next_sequence;
-        }
-
-        let rows = sqlx::query(
-            "SELECT event.*
-             FROM domain_event AS event
-             JOIN event_consumer_cursor AS cursor
-               ON cursor.consumer_name = ?
-             LEFT JOIN event_projection_receipt AS receipt
-               ON receipt.consumer_name = cursor.consumer_name
-              AND receipt.event_id = event.id
-             WHERE event.sequence > cursor.last_sequence
-               AND receipt.event_id IS NULL
-             ORDER BY event.sequence ASC
-             LIMIT ?",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.limit.clamp(1, 100))
-        .fetch_all(&mut *transaction)
-        .await?;
-
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let event = map_domain_event(row)?;
-            let result = sqlx::query(
-                "INSERT INTO event_processing_lease (
-                    consumer_name, event_sequence, lease_owner, leased_until,
-                    attempts, updated_at
-                 ) VALUES (?, ?, ?, ?, 1, ?)
-                 ON CONFLICT(consumer_name, event_sequence) DO UPDATE SET
-                    lease_owner = excluded.lease_owner,
-                    leased_until = excluded.leased_until,
-                    attempts = event_processing_lease.attempts + 1,
-                    updated_at = excluded.updated_at
-                 WHERE event_processing_lease.leased_until <= ?
-                    OR event_processing_lease.lease_owner = excluded.lease_owner",
-            )
-            .bind(&input.consumer_name)
-            .bind(event.sequence)
-            .bind(&input.lease_owner)
-            .bind(&input.leased_until)
-            .bind(&input.now)
-            .bind(&input.now)
-            .execute(&mut *transaction)
-            .await?;
-            if result.rows_affected() == 1 {
-                events.push(event);
-            } else {
-                // A live lease held by another worker at the head of this
-                // consumer's sequence creates a hard ordering barrier. Do
-                // not hand out later rows that could never be checkpointed.
-                break;
-            }
-        }
-
-        transaction.commit().await?;
-        Ok(events)
-    }
-
-    async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool> {
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let cursor = sqlx::query_scalar::<_, i64>(
-            "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
-        )
-        .bind(&input.consumer_name)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-
-        if input.event_sequence
-            > next_existing_sequence(&mut transaction, cursor)
-                .await?
-                .unwrap_or(i64::MAX)
-        {
-            return Err(DbError::Check(
-                "domain events must be checkpointed in sequence order".to_owned(),
-            ));
-        }
-
-        let event = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT id, dedupe_key FROM domain_event WHERE sequence = ?",
-        )
-        .bind(input.event_sequence)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if event.0 != input.event_id {
-            return Err(DbError::Check(
-                "event id does not match the claimed sequence".to_owned(),
-            ));
-        }
-        let expected_dedupe = event.1.unwrap_or_else(|| event.0.clone());
-        if expected_dedupe != input.dedupe_key {
-            return Err(DbError::Check(
-                "event dedupe key does not match the claimed event".to_owned(),
-            ));
-        }
-
-        // A receipt may exist after a worker was interrupted between the
-        // projection write and cursor checkpoint in an older implementation.
-        // Such a receipt is safe to use for cursor repair.  Otherwise only the
-        // current lease owner may complete the event; a stale worker must not
-        // acknowledge work leased to another worker.
-        let receipt_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM event_projection_receipt
-             WHERE consumer_name = ? AND event_id = ?",
-        )
-        .bind(&input.consumer_name)
-        .bind(&input.event_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .is_some();
-        if !receipt_exists {
-            let lease_owner = sqlx::query_scalar::<_, String>(
-                "SELECT lease_owner FROM event_processing_lease
-                 WHERE consumer_name = ? AND event_sequence = ?",
-            )
-            .bind(&input.consumer_name)
-            .bind(input.event_sequence)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
-            if lease_owner != input.lease_owner {
-                return Err(DbError::VersionConflict);
-            }
-        }
-
-        let inserted = sqlx::query(
-            "INSERT INTO event_projection_receipt (
-                consumer_name, event_id, dedupe_key, processed_at
-             ) VALUES (?, ?, ?, ?)
-             ON CONFLICT(consumer_name, event_id) DO NOTHING",
-        )
-        .bind(&input.consumer_name)
-        .bind(&input.event_id)
-        .bind(&input.dedupe_key)
-        .bind(&input.completed_at)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected()
-            == 1;
-
-        if Some(input.event_sequence) == next_existing_sequence(&mut transaction, cursor).await? {
-            self.advance_domain_event_cursor_in_tx(
-                &mut transaction,
-                &input.consumer_name,
-                cursor,
-                input.event_sequence,
-                &input.completed_at,
-            )
-            .await?;
-        }
-
-        sqlx::query(
-            "DELETE FROM event_processing_lease
-             WHERE consumer_name = ? AND event_sequence = ? AND lease_owner = ?",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.event_sequence)
-        .bind(&input.lease_owner)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        Ok(inserted)
     }
 }
 

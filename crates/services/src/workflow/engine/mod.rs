@@ -1936,16 +1936,6 @@ impl WorkflowEngine {
                 };
             drop(cleanup_guard);
 
-            // The authoritative event was committed with the task mutation.
-            // Fetching by the transition-log/event id also makes replayed board
-            // moves publish at most the already-committed event.
-            if let Some(event) = DomainEventRepo::get_event(&*self.db, &transition_log.id).await? {
-                crate::DomainEventService::new(
-                    Arc::clone(&self.db),
-                    Arc::clone(&self.event_bus),
-                )
-                .publish_committed(&event);
-            }
             let should_defer_dispatch = defer_dispatch_until.is_some()
                 && to_state.kind != StateKind::Active
                 && to_state

@@ -265,7 +265,7 @@ export interface AttentionConsumerHealth {
   last_success_at: string | null
   last_error_code: string | null
   stale: boolean
-  processed_events: number
+  last_error_message: string | null
   updated_at: string
 }
 

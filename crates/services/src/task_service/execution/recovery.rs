@@ -484,7 +484,7 @@ impl TaskService {
         let agent = self
             .ensure_queued_recovery_agent_available(&agent_id)
             .await?;
-        let machine_wait = self.machine_capacity_blocked(&task, &agent).await?;
+        let machine_wait = self.machine_capacity_blocked(&task, &agent, None).await?;
         let queued = crate::deferred_dispatch::QueuedRecovery {
             id: new_uuid_v4(),
             request,
@@ -872,8 +872,10 @@ impl TaskService {
         let agent = self
             .ensure_queued_recovery_agent_available(&agent_id)
             .await?;
-        if crate::placement::machine_precheck::wait_before_dispatch(&self.db, self, task, &agent)
-            .await?
+        if crate::placement::machine_precheck::wait_before_dispatch(
+            &self.db, self, task, &agent, None,
+        )
+        .await?
             || !crate::agent_capacity::has_execution_capacity(&self.db, &agent).await?
         {
             return Ok(false);
@@ -2620,11 +2622,7 @@ impl TaskService {
                 Some(boundary_id),
             );
         }
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            recovered.id, recovered.version
-        ))
-        .await;
+
         super::clear_execution_retry_metadata(&self.db, &recovered).await?;
         if task.blocked_json.is_some() {
             self.publish(ForgeEvent {
@@ -2911,11 +2909,7 @@ impl TaskService {
         } else {
             ReviewRepo::create_manual_pass_with_task_authority(&*self.db, manual_pass).await?
         };
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)

@@ -826,6 +826,7 @@ impl TaskRepo for SqliteDb {
                             json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
                             AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
                            ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
                            ELSE 0 END
@@ -880,6 +881,7 @@ impl TaskRepo for SqliteDb {
                             json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
                             AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
                            ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
                            ELSE 0 END

@@ -172,6 +172,7 @@ async fn agent_chat_message_send_is_durable_and_broadcasts_after_drain() {
     let consumer = DomainEventBroadcastConsumer::new(
         std::sync::Arc::clone(&harness.state.db),
         std::sync::Arc::clone(&harness.state.event_bus),
+        Some(0),
     );
     // Connecting and binding the agent may itself have written unrelated
     // domain events (e.g. the binding's own admission). Advance the
@@ -239,6 +240,7 @@ async fn domain_event_broadcast_audit() {
     let consumer = DomainEventBroadcastConsumer::new(
         std::sync::Arc::clone(&harness.state.db),
         std::sync::Arc::clone(&harness.state.event_bus),
+        Some(0),
     );
 
     struct Case {

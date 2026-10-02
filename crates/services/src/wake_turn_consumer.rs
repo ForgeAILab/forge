@@ -13,18 +13,18 @@
 //! Every admission is idempotent: the turn job dedupe key is derived from the
 //! source event, so crash-replay after projection never queues a second turn.
 
+use async_trait::async_trait;
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, AdmitAgentChatTurn, AgentChat, AgentChatMessageAuthorType,
-    AgentChatMessageStatus, AgentChatRepo, AgentWakeDisposition, AgentWakeDispositionKind,
-    AgentWakeDispositionRepo, AttentionRepo, ClaimDomainEvents, CompleteClaimedWake,
-    CompleteDomainEvent, CreateAgentChatMessage, CreateAgentChatTurnJob,
-    CreateAgentWakeDisposition, DomainEvent, DomainEventRepo, RetryAgentWakeDisposition, SqliteDb,
+    now_rfc3339, AdmitAgentChatTurn, AgentChat, AgentChatMessageAuthorType, AgentChatMessageStatus,
+    AgentChatRepo, AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo,
+    AttentionRepo, CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentWakeDisposition,
+    DomainEvent, DomainEventRepo, PersistAgentWake, RetryAgentWakeDisposition, SqliteDb,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
-use tokio::{sync::watch, task::JoinHandle, time::Duration as TokioDuration};
+use sqlx::{Acquire, Row, Sqlite, Transaction};
+use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -33,12 +33,11 @@ use crate::{
         AgentTurnTrigger, PreparedAgentTurnAdmission, ResolvedAgentResponder,
     },
     attention_service::{wake_attention_incident_digest, MAX_WAKE_REACTION_DEPTH},
+    worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result, ServiceError,
 };
 
 const CONSUMER_NAME: &str = "agent-wake-turns";
-const LEASE_SECONDS: i64 = 60;
-const POLL_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
 const MAX_TURN_ATTEMPTS: i64 = 3;
 const MAX_DETAIL_CHARS: usize = 2_000;
 
@@ -178,13 +177,12 @@ pub(crate) fn delivery_followup_directive(state: &DeliveryFollowupState) -> Stri
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTurnRun {
     pub claimed_events: usize,
-    pub delivered_turns: usize,
     pub processed_events: usize,
     pub last_sequence: i64,
 }
 
 #[derive(Debug)]
-enum WakeDeliveryPlan {
+pub enum WakeDeliveryPlan {
     Admitted {
         disposition: CreateAgentWakeDisposition,
         admission: Box<AdmitAgentChatTurn>,
@@ -247,15 +245,13 @@ struct DeferredDispositionSpec<'a> {
 pub struct WakeTurnConsumer {
     db: Arc<SqliteDb>,
     consumer_name: String,
-    lease_owner: String,
 }
 
 impl WakeTurnConsumer {
-    pub fn new(db: Arc<SqliteDb>, lease_owner: impl Into<String>) -> Self {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         Self {
             db,
             consumer_name: CONSUMER_NAME.to_owned(),
-            lease_owner: lease_owner.into(),
         }
     }
 
@@ -264,99 +260,40 @@ impl WakeTurnConsumer {
         self
     }
 
-    /// Start the restart-safe wake deliverer.  The cursor and receipts live
-    /// in SQLite; the in-memory lease owner is only a holder identity.
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(POLL_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Err(error) = self.run_once(100).await {
-                            tracing::warn!(
-                                consumer = %self.consumer_name,
-                                %error,
-                                "wake turn delivery poll failed"
-                            );
-                        }
-                    }
-                }
-            }
-        })
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        Arc::new(WorkerRuntime::new(Arc::clone(&self.db), self)).start(shutdown)
     }
 
-    /// Claim and deliver a bounded batch. Every wake decision is checkpointed
-    /// with exactly one durable disposition. Deferred/setup rows are retried
-    /// from their immutable lineage on later polls.
     pub async fn run_once(&self, limit: i64) -> Result<WakeTurnRun> {
-        let now = now_rfc3339();
-        let leased_until = lease_until(&now);
-        let events = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: self.consumer_name.clone(),
-                lease_owner: self.lease_owner.clone(),
-                now,
-                leased_until,
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
-        let mut delivered_turns = 0;
-        let mut processed_events = 0;
-        for event in &events {
-            if is_delivery_event(event) {
-                if self.process_claimed_event(event).await? {
-                    delivered_turns += 1;
-                }
-            } else {
-                DomainEventRepo::complete_claimed_event(
-                    &*self.db,
-                    completion_for(&self.consumer_name, &self.lease_owner, event),
-                )
-                .await?;
-            }
-            processed_events += 1;
-        }
-
-        let retry_rows = AgentWakeDispositionRepo::list_reconsiderable_agent_wake_dispositions(
-            &*self.db,
-            &self.consumer_name,
-            &now_rfc3339(),
-            limit.clamp(1, 100),
-        )
-        .await?;
-        for current in retry_rows {
-            if self.process_retry(&current).await? {
-                delivered_turns += 1;
-            }
-        }
-
-        let last_sequence = DomainEventRepo::get_consumer_cursor(&*self.db, &self.consumer_name)
+        let processed_events = WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
+            .run_once(limit.clamp(1, 100) as usize)
+            .await?;
+        let last_sequence = self
+            .db
+            .get_consumer_cursor(&self.consumer_name)
             .await?
-            .map(|cursor| cursor.last_sequence)
-            .unwrap_or(0);
-
+            .map_or(0, |cursor| cursor.last_sequence);
         Ok(WakeTurnRun {
-            claimed_events: events.len(),
-            delivered_turns,
+            claimed_events: processed_events,
             processed_events,
             last_sequence,
         })
     }
 
-    async fn process_claimed_event(&self, event: &DomainEvent) -> Result<bool> {
-        let plan = match self.plan_event(event, 1, None).await {
-            Ok(plan) => plan,
-            Err(error) if transient_service_error(&error) => {
-                tracing::debug!(event_id = %event.id, %error, "wake evaluation deferred");
-                WakeDeliveryPlan::Deferred(deferred_disposition(DeferredDispositionSpec {
+    async fn prepare_event(&self, event: &DomainEvent) -> Result<WakeDeliveryPlan> {
+        self.evaluation_result(event, None, self.plan_event(event, 1, None).await)
+    }
+    fn evaluation_result(
+        &self,
+        event: &DomainEvent,
+        parent: Option<&AgentWakeDisposition>,
+        result: Result<WakeDeliveryPlan>,
+    ) -> Result<WakeDeliveryPlan> {
+        match result {
+            Ok(plan) => Ok(plan),
+            Err(error) if transient_evaluation_error(&error) && parent.is_some() => Err(error),
+            Err(error) if transient_evaluation_error(&error) => Ok(WakeDeliveryPlan::Deferred(
+                deferred_disposition(DeferredDispositionSpec {
                     consumer_name: &self.consumer_name,
                     event,
                     attempt: 1,
@@ -366,124 +303,104 @@ impl WakeTurnConsumer {
                     reason: "wake_evaluation_unavailable",
                     retry_at_value: retry_at(&event.created_at, 1),
                     attention_id: None,
-                }))
-            }
-            Err(error) => {
-                tracing::debug!(event_id = %event.id, %error, "wake evaluation suppressed");
-                WakeDeliveryPlan::Suppressed(self.disposition(DispositionSpec {
-                    event,
-                    attempt: 1,
-                    max_attempts: MAX_TURN_ATTEMPTS,
-                    kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                    reason: "wake_evaluation_invalid",
-                    incident_key: None,
-                    incident_digest: None,
-                    attention_id: None,
-                    responder: None,
-                    parent_disposition_id: None,
-                }))
-            }
-        };
-        let delivered = matches!(plan, WakeDeliveryPlan::Admitted { .. });
-        let disposition = plan.disposition().clone();
-        let (admission, expected_attention) = match plan {
-            WakeDeliveryPlan::Admitted {
-                admission,
-                expected_attention,
-                ..
-            } => (Some(*admission), expected_attention),
-            WakeDeliveryPlan::Suppressed(_)
-            | WakeDeliveryPlan::Deferred(_)
-            | WakeDeliveryPlan::SetupRequired(_) => (None, None),
-        };
-        let completion = completion_for(&self.consumer_name, &self.lease_owner, event);
-        if let Some(admission) = admission {
-            match AgentWakeDispositionRepo::complete_claimed_agent_wake(
-                &*self.db,
-                CompleteClaimedWake {
-                    disposition: disposition.clone(),
-                    completion: completion.clone(),
-                    admission: Some(admission),
-                    expected_attention: expected_attention.clone(),
-                },
-            )
-            .await
-            {
-                Ok(_) => {
-                    self.settle_decision_incident(expected_attention.as_ref(), event)
-                        .await;
-                    return Ok(delivered);
-                }
-                Err(error) if transient_db_error(&error) => {
-                    tracing::debug!(event_id = %event.id, %error,
-                        "wake admission raced current authority; deferring");
-                    let deferred = deferred_disposition(DeferredDispositionSpec {
-                        consumer_name: &self.consumer_name,
-                        event,
-                        attempt: 1,
-                        max_attempts: MAX_TURN_ATTEMPTS,
-                        incident_key: disposition.incident_key.clone(),
-                        incident_digest: disposition.incident_digest.clone(),
-                        reason: "turn_admission_unavailable",
-                        retry_at_value: retry_at(&event.created_at, 1),
-                        attention_id: attention_id_from_provenance(
-                            disposition.provenance_json.as_deref(),
-                        ),
-                    });
-                    AgentWakeDispositionRepo::complete_claimed_agent_wake(
-                        &*self.db,
-                        CompleteClaimedWake {
-                            disposition: deferred,
-                            completion,
-                            admission: None,
-                            expected_attention: None,
-                        },
-                    )
-                    .await?;
-                    return Ok(false);
-                }
-                Err(error) => {
-                    tracing::debug!(event_id = %event.id, %error,
-                        "wake admission rejected deterministically");
-                    let suppressed = self.disposition(DispositionSpec {
-                        event,
-                        attempt: 1,
-                        max_attempts: MAX_TURN_ATTEMPTS,
-                        kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                        reason: "turn_admission_rejected",
-                        incident_key: disposition.incident_key.clone(),
-                        incident_digest: disposition.incident_digest.clone(),
-                        attention_id: None,
-                        responder: None,
-                        parent_disposition_id: None,
-                    });
-                    AgentWakeDispositionRepo::complete_claimed_agent_wake(
-                        &*self.db,
-                        CompleteClaimedWake {
-                            disposition: suppressed,
-                            completion,
-                            admission: None,
-                            expected_attention: None,
-                        },
-                    )
-                    .await?;
-                    return Ok(false);
-                }
-            }
+                }),
+            )),
+            Err(_) => Ok(WakeDeliveryPlan::Suppressed(self.evaluation_suppression(
+                event,
+                parent,
+                "wake_evaluation_invalid",
+            ))),
         }
-        AgentWakeDispositionRepo::complete_claimed_agent_wake(
-            &*self.db,
-            CompleteClaimedWake {
-                disposition,
-                completion,
-                admission: None,
-                expected_attention: None,
-            },
-        )
-        .await?;
-        Ok(false)
     }
-
+    fn evaluation_suppression(
+        &self,
+        event: &DomainEvent,
+        parent: Option<&AgentWakeDisposition>,
+        reason: &str,
+    ) -> CreateAgentWakeDisposition {
+        self.disposition(DispositionSpec {
+            event,
+            attempt: parent.map_or(1, |p| p.attempt_number + 1),
+            max_attempts: parent.map_or(MAX_TURN_ATTEMPTS, |p| p.max_attempts),
+            kind: AgentWakeDispositionKind::DeterministicallySuppressed,
+            reason,
+            incident_key: parent.and_then(|p| p.incident_key.clone()),
+            incident_digest: parent.and_then(|p| p.incident_digest.clone()),
+            attention_id: None,
+            responder: None,
+            parent_disposition_id: parent.map(|p| p.id.clone()),
+        })
+    }
+    async fn record_retry_error(
+        &self,
+        row: &AgentWakeDisposition,
+        error: &WorkerError,
+    ) -> Result<()> {
+        let health =
+            crate::worker_runtime::WorkerHealth::new(Arc::clone(&self.db), &self.consumer_name);
+        let key = format!("wake-retry:{}", row.id);
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let current: Option<String> = sqlx::query_scalar("SELECT disposition_id FROM agent_wake_disposition_current WHERE consumer_name = ? AND source_event_id = ?")
+            .bind(&self.consumer_name).bind(&row.source_event_id).fetch_optional(&mut *tx).await?;
+        if current.as_deref() != Some(&row.id) {
+            return Ok(());
+        }
+        let decision = health
+            .isolated_item_failed_in_tx(
+                &mut tx,
+                crate::worker_runtime::WorkItem {
+                    source_key: &key,
+                    item_type: "agent_wake_retry",
+                },
+                db::RetryPolicy::default(),
+                error.kind.as_str(),
+                error.message(),
+            )
+            .await?;
+        if matches!(decision, db::PoisonDecision::DeadLettered) {
+            let now = now_rfc3339();
+            let terminal = CreateAgentWakeDisposition {
+                id: deterministic_uuid(&format!("wake-retry-failed:{}", row.id)),
+                consumer_name: row.consumer_name.clone(),
+                source_event_id: row.source_event_id.clone(),
+                source_event_sequence: row.source_event_sequence,
+                attempt_number: row.attempt_number + 1,
+                max_attempts: row.max_attempts,
+                disposition: AgentWakeDispositionKind::DeterministicallySuppressed,
+                reason: "wake_retry_failed".into(),
+                turn_job_id: None,
+                attention_id: None,
+                retry_at: None,
+                incident_key: row.incident_key.clone(),
+                incident_digest: row.incident_digest.clone(),
+                binding_id: None,
+                binding_version: None,
+                profile_id: None,
+                profile_version: None,
+                provenance_json: Some(
+                    json!({"failure": error.message(), "error_kind": error.kind.as_str()})
+                        .to_string(),
+                ),
+                parent_disposition_id: Some(row.id.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            self.db
+                .retry_agent_wake_in_tx(
+                    &mut tx,
+                    RetryAgentWakeDisposition {
+                        disposition: terminal,
+                        expected_parent_id: row.id.clone(),
+                        now,
+                        admission: None,
+                        expected_attention: None,
+                    },
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
     async fn process_retry(&self, current: &AgentWakeDisposition) -> Result<bool> {
         let Some(event) = DomainEventRepo::get_event(&*self.db, &current.source_event_id).await?
         else {
@@ -493,28 +410,11 @@ impl WakeTurnConsumer {
             ));
         };
         let attempt = current.attempt_number + 1;
-        let plan = match self.plan_event(&event, attempt, Some(current)).await {
-            Ok(plan) => plan,
-            Err(error) if transient_service_error(&error) => {
-                tracing::debug!(event_id = %event.id, attempt, %error, "wake retry evaluation deferred");
-                retry_failure_plan(&self.consumer_name, &event, current, attempt)
-            }
-            Err(error) => {
-                tracing::debug!(event_id = %event.id, attempt, %error, "wake retry evaluation suppressed");
-                WakeDeliveryPlan::Suppressed(self.disposition(DispositionSpec {
-                    event: &event,
-                    attempt,
-                    max_attempts: current.max_attempts,
-                    kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                    reason: "wake_evaluation_invalid",
-                    incident_key: current.incident_key.clone(),
-                    incident_digest: current.incident_digest.clone(),
-                    attention_id: None,
-                    responder: None,
-                    parent_disposition_id: Some(current.id.clone()),
-                }))
-            }
-        };
+        let plan = self.evaluation_result(
+            &event,
+            Some(current),
+            self.plan_event(&event, attempt, Some(current)).await,
+        )?;
         let delivered = matches!(plan, WakeDeliveryPlan::Admitted { .. });
         let disposition = plan.disposition().clone();
         let (admission, expected_attention) = match plan {
@@ -542,10 +442,9 @@ impl WakeTurnConsumer {
             .await
             {
                 Ok(_) => {
-                    self.settle_decision_incident(expected_attention.as_ref(), &event)
-                        .await;
                     return Ok(delivered);
                 }
+                Err(error) if error.is_transient() => return Err(error.into()),
                 Err(error) if transient_db_error(&error) => {
                     tracing::debug!(event_id = %event.id, attempt, %error,
                         "wake retry admission raced current authority");
@@ -569,36 +468,22 @@ impl WakeTurnConsumer {
                     .await?;
                     return Ok(false);
                 }
-                Err(error) => {
-                    tracing::debug!(event_id = %event.id, attempt, %error,
-                        "wake retry admission rejected deterministically");
-                    let suppressed = self.disposition(DispositionSpec {
-                        event: &event,
-                        attempt,
-                        max_attempts: current.max_attempts,
-                        kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                        reason: "turn_admission_rejected",
-                        incident_key: current.incident_key.clone(),
-                        incident_digest: current.incident_digest.clone(),
-                        attention_id: None,
-                        responder: None,
-                        parent_disposition_id: Some(current.id.clone()),
-                    });
-                    match AgentWakeDispositionRepo::retry_agent_wake(
-                        &*self.db,
-                        RetryAgentWakeDisposition {
+                Err(_) => {
+                    let suppressed = self.evaluation_suppression(
+                        &event,
+                        Some(current),
+                        "turn_admission_rejected",
+                    );
+                    self.db
+                        .retry_agent_wake(RetryAgentWakeDisposition {
                             disposition: suppressed,
                             expected_parent_id: current.id.clone(),
                             now,
                             admission: None,
                             expected_attention: None,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(_) | Err(db::DbError::VersionConflict) => return Ok(false),
-                        Err(error) => return Err(error.into()),
-                    }
+                        })
+                        .await?;
+                    return Ok(false);
                 }
             }
         }
@@ -1294,41 +1179,6 @@ impl WakeTurnConsumer {
         Ok(AdmitAgentChatTurn { message, turn })
     }
 
-    /// A `decision_recorded` incident exists only to hand the user's decision
-    /// to the Agent. Once the wake turn is durably admitted it has done its
-    /// job; resolving it keeps Mission Control from listing a settled
-    /// decision as outstanding attention. The admission is already committed,
-    /// so a failure here is logged rather than retried.
-    async fn settle_decision_incident(
-        &self,
-        expected_attention: Option<&db::ExpectedAttentionSnapshot>,
-        event: &DomainEvent,
-    ) {
-        let Some(snapshot) = expected_attention else {
-            return;
-        };
-        if crate::attention_service::incident_key_category(&snapshot.dedupe_key)
-            != Some(crate::attention_service::DECISION_RECORDED_CATEGORY)
-        {
-            return;
-        }
-        if let Err(error) = AttentionRepo::resolve_attention_by_dedupe(
-            &*self.db,
-            &snapshot.dedupe_key,
-            &event.id,
-            &now_rfc3339(),
-        )
-        .await
-        {
-            tracing::warn!(
-                event_id = %event.id,
-                incident_key = %snapshot.dedupe_key,
-                %error,
-                "decision_recorded incident stayed open after its wake was admitted"
-            );
-        }
-    }
-
     fn disposition(&self, spec: DispositionSpec<'_>) -> CreateAgentWakeDisposition {
         let DispositionSpec {
             event,
@@ -1484,6 +1334,154 @@ impl WakeTurnConsumer {
     }
 }
 
+#[async_trait]
+impl Worker for WakeTurnConsumer {
+    type Prepared = WakeDeliveryPlan;
+    fn name(&self) -> &str {
+        &self.consumer_name
+    }
+    fn subscription(&self) -> Subscription {
+        Subscription::Prefix(vec!["agent.wake.".to_owned()])
+    }
+    async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        let rows = self
+            .db
+            .list_reconsiderable_agent_wake_dispositions(&self.consumer_name, &now_rfc3339(), 100)
+            .await
+            .map_err(|e| crate::worker_runtime::consumer_error(e.into()))?;
+        let health =
+            crate::worker_runtime::WorkerHealth::new(Arc::clone(&self.db), &self.consumer_name);
+        let mut last_error = None;
+        for row in rows {
+            let key = format!("wake-retry:{}", row.id);
+            match self.process_retry(&row).await {
+                Ok(_) => {
+                    if let Err(error) = health.isolated_item_succeeded(&key).await {
+                        last_error = Some(crate::worker_runtime::consumer_error(error.into()));
+                    }
+                }
+                Err(error) => {
+                    let error = crate::worker_runtime::consumer_error(error);
+                    tracing::warn!(disposition_id = %row.id, %error, "wake retry row failed");
+                    if let Err(report) = self.record_retry_error(&row, &error).await {
+                        tracing::warn!(disposition_id = %row.id, %report, "failed to record wake retry error");
+                        last_error = Some(crate::worker_runtime::consumer_error(report));
+                    } else {
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+    async fn handle(
+        &self,
+        event: &DomainEvent,
+    ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
+        self.prepare_event(event)
+            .await
+            .map(Outcome::Done)
+            .map_err(crate::worker_runtime::consumer_error)
+    }
+    async fn commit(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        plan: &Self::Prepared,
+    ) -> std::result::Result<(), WorkerError> {
+        let disposition = plan.disposition().clone();
+        if let WakeDeliveryPlan::Admitted {
+            admission,
+            expected_attention,
+            ..
+        } = plan
+        {
+            // Admission can write before its final authority check rejects. Undo
+            // that attempt before persisting the fallback in the outer transaction.
+            let mut savepoint = tx
+                .begin()
+                .await
+                .map_err(|e| crate::worker_runtime::consumer_error(db::DbError::Sqlx(e).into()))?;
+            let result = self
+                .db
+                .persist_agent_wake_in_tx(
+                    &mut savepoint,
+                    event,
+                    PersistAgentWake {
+                        disposition: disposition.clone(),
+                        admission: Some(*admission.clone()),
+                        expected_attention: expected_attention.clone(),
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    savepoint.commit().await.map_err(|e| {
+                        crate::worker_runtime::consumer_error(db::DbError::Sqlx(e).into())
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    savepoint.rollback().await.map_err(|e| {
+                        crate::worker_runtime::consumer_error(db::DbError::Sqlx(e).into())
+                    })?;
+                    let fallback = if transient_db_error(&error) {
+                        deferred_disposition(DeferredDispositionSpec {
+                            consumer_name: &self.consumer_name,
+                            event,
+                            attempt: 1,
+                            max_attempts: MAX_TURN_ATTEMPTS,
+                            incident_key: disposition.incident_key.clone(),
+                            incident_digest: disposition.incident_digest.clone(),
+                            reason: "turn_admission_unavailable",
+                            retry_at_value: retry_at(&event.created_at, 1),
+                            attention_id: attention_id_from_provenance(
+                                disposition.provenance_json.as_deref(),
+                            ),
+                        })
+                    } else {
+                        let mut suppressed =
+                            self.evaluation_suppression(event, None, "turn_admission_rejected");
+                        suppressed.incident_key = disposition.incident_key.clone();
+                        suppressed.incident_digest = disposition.incident_digest.clone();
+                        suppressed
+                    };
+                    self.db
+                        .persist_agent_wake_in_tx(
+                            tx,
+                            event,
+                            PersistAgentWake {
+                                disposition: fallback,
+                                admission: None,
+                                expected_attention: None,
+                            },
+                        )
+                        .await
+                        .map_err(|e| crate::worker_runtime::consumer_error(e.into()))?;
+                    return Ok(());
+                }
+            }
+        }
+        self.db
+            .persist_agent_wake_in_tx(
+                tx,
+                event,
+                PersistAgentWake {
+                    disposition,
+                    admission: None,
+                    expected_attention: None,
+                },
+            )
+            .await
+            .map_err(|e| crate::worker_runtime::consumer_error(e.into()))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct WakeFields {
     scope_type: String,
@@ -1493,25 +1491,6 @@ struct WakeFields {
     attention_id: Option<String>,
     identity_id: Option<String>,
     reaction_depth: i64,
-}
-
-fn is_delivery_event(event: &DomainEvent) -> bool {
-    event.event_type.starts_with("agent.wake.")
-}
-
-fn completion_for(
-    consumer_name: &str,
-    lease_owner: &str,
-    event: &DomainEvent,
-) -> CompleteDomainEvent {
-    CompleteDomainEvent {
-        consumer_name: consumer_name.to_owned(),
-        lease_owner: lease_owner.to_owned(),
-        event_sequence: event.sequence,
-        event_id: event.id.clone(),
-        dedupe_key: crate::domain_event_service::event_completion_dedupe_key(event),
-        completed_at: now_rfc3339(),
-    }
 }
 
 fn expected_attention_snapshot(
@@ -1856,46 +1835,17 @@ fn retry_failure_disposition(
     result
 }
 
-fn retry_failure_plan(
-    consumer_name: &str,
-    event: &DomainEvent,
-    current: &AgentWakeDisposition,
-    attempt: i64,
-) -> WakeDeliveryPlan {
-    let disposition = retry_failure_disposition(consumer_name, event, current, attempt, "");
-    match disposition.disposition {
-        AgentWakeDispositionKind::Deferred => WakeDeliveryPlan::Deferred(disposition),
-        AgentWakeDispositionKind::DeterministicallySuppressed => {
-            WakeDeliveryPlan::Suppressed(disposition)
-        }
-        AgentWakeDispositionKind::TurnAdmitted | AgentWakeDispositionKind::SetupRequired => {
-            WakeDeliveryPlan::Suppressed(CreateAgentWakeDisposition {
-                disposition: AgentWakeDispositionKind::DeterministicallySuppressed,
-                reason: "wake_retry_invalid".to_owned(),
-                ..disposition
-            })
-        }
-    }
-}
-
-fn transient_service_error(error: &ServiceError) -> bool {
+fn transient_evaluation_error(error: &ServiceError) -> bool {
     matches!(
         error,
         ServiceError::DependencyGate
             | ServiceError::Db(
-                db::DbError::Sqlx(_) | db::DbError::VersionConflict | db::DbError::NotFound
+                db::DbError::Sqlx(_) | db::DbError::NotFound | db::DbError::VersionConflict
             )
     )
 }
-
 fn transient_db_error(error: &db::DbError) -> bool {
-    matches!(
-        error,
-        db::DbError::Sqlx(_)
-            | db::DbError::VersionConflict
-            | db::DbError::NotFound
-            | db::DbError::DependencyGate
-    )
+    error.is_transient() || matches!(error, db::DbError::NotFound | db::DbError::DependencyGate)
 }
 
 /// Stable UUID derived from a dedupe key so replays reuse identical row ids.
@@ -1903,20 +1853,8 @@ fn deterministic_uuid(seed: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
-fn lease_until(now: &str) -> String {
-    use chrono::{DateTime, Duration, Utc};
-    DateTime::parse_from_rfc3339(now)
-        .map(|now| now.with_timezone(&Utc) + Duration::seconds(LEASE_SECONDS))
-        .map(|until| until.to_rfc3339())
-        .unwrap_or_else(|_| now.to_owned())
-}
-
 pub fn wake_turn_consumer_name() -> &'static str {
     CONSUMER_NAME
-}
-
-pub fn wake_turn_consumer_lease_owner() -> String {
-    format!("wake-turn-consumer-{}", new_uuid_v4())
 }
 
 #[cfg(test)]
@@ -2045,5 +1983,106 @@ mod tests {
 
         assert!(content.contains("Attention snapshot actions (context only): reexecute"));
         assert!(content.contains("Use only a recovery action currently advertised"));
+    }
+    #[tokio::test]
+    async fn audit2_evaluation_failures_commit_typed_outcomes_without_quarantine() {
+        struct EvaluationFault(WakeTurnConsumer, bool);
+        #[async_trait]
+        impl Worker for EvaluationFault {
+            type Prepared = WakeDeliveryPlan;
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            fn subscription(&self) -> Subscription {
+                self.0.subscription()
+            }
+            async fn handle(
+                &self,
+                event: &DomainEvent,
+            ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
+                let error = if self.1 {
+                    ServiceError::Db(db::DbError::NotFound)
+                } else {
+                    ServiceError::invalid_operation("invalid evaluation")
+                };
+                self.0
+                    .evaluation_result(event, None, Err(error))
+                    .map(Outcome::Done)
+                    .map_err(crate::worker_runtime::consumer_error)
+            }
+            async fn commit(
+                &self,
+                tx: &mut Transaction<'_, Sqlite>,
+                event: &DomainEvent,
+                p: &Self::Prepared,
+            ) -> std::result::Result<(), WorkerError> {
+                self.0.commit(tx, event, p).await
+            }
+        }
+        for unavailable in [false, true] {
+            let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+            db::run_migrations(&pool).await.unwrap();
+            let db = Arc::new(SqliteDb::new(pool));
+            let now = now_rfc3339();
+            let event = db
+                .append_event(db::CreateDomainEvent {
+                    id: db::new_uuid_v4(),
+                    event_type: "agent.wake.admitted".into(),
+                    entity_type: "project".into(),
+                    entity_id: "p".into(),
+                    actor_type: "system".into(),
+                    actor_id: None,
+                    scope_type: "project".into(),
+                    scope_id: "p".into(),
+                    correlation_id: "test".into(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    dedupe_key: None,
+                    payload_json: "{}".into(),
+                    created_at: now,
+                })
+                .await
+                .unwrap();
+            let worker = Arc::new(EvaluationFault(
+                WakeTurnConsumer::new(Arc::clone(&db)),
+                unavailable,
+            ));
+            let runtime = WorkerRuntime::new(Arc::clone(&db), worker);
+            runtime.run_once(100).await.unwrap();
+            let row = db
+                .get_current_agent_wake_disposition(CONSUMER_NAME, &event.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.reason,
+                if unavailable {
+                    "wake_evaluation_unavailable"
+                } else {
+                    "wake_evaluation_invalid"
+                }
+            );
+            assert_eq!(
+                row.disposition,
+                if unavailable {
+                    AgentWakeDispositionKind::Deferred
+                } else {
+                    AgentWakeDispositionKind::DeterministicallySuppressed
+                }
+            );
+            assert_eq!(
+                db.get_consumer_cursor(CONSUMER_NAME)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_sequence,
+                event.sequence
+            );
+            let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(dead, 0);
+        }
     }
 }

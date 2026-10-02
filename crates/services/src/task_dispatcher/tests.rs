@@ -5991,6 +5991,293 @@ async fn seed_environment_pause(
         .unwrap()
 }
 
+#[tokio::test]
+async fn environment_probe_three_admissions_defer_once_then_launch() {
+    use db::ProjectMachineReadinessRepo;
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let signals = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let environment = serde_json::json!({"env":{"COUNT":signals.path().join("starts"),"RELEASE":signals.path().join("release")},
+        "checks":[{"name":"toolchain","command":"printf 'start\\n' >> \"$COUNT\"; while ! test -f \"$RELEASE\"; do sleep 0.05; done", "timeout_seconds":10}]});
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(serde_json::json!({"environment":environment}).to_string())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let agent = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let task = seed_task(&db, &project_id, &format!("Task {index}"), "todo", index).await;
+        assign_role(&db, &task.id, "coder", &agent).await;
+        tasks.push(task);
+    }
+    let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
+    let claimant = AgentRepo::get_by_id(&*db, &agent).await.unwrap().unwrap();
+    let admissions = tokio::join!(
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[0], &claimant, "coder"),
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[1], &claimant, "coder"),
+        dispatcher
+            .task_service
+            .defer_initial_environment_probe(&tasks[2], &claimant, "coder"),
+    );
+    for result in [admissions.0, admissions.1, admissions.2] {
+        assert!(result.unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !signals.path().join("starts").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let initial_versions = task_versions(&db, &tasks).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    let before: Vec<_> = task_versions(&db, &tasks).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(
+        task_versions(&db, &tasks).await,
+        before,
+        "repeated deferral does not change versions"
+    );
+    for (task, initial_version) in tasks.iter().zip(initial_versions) {
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, "todo");
+        assert!(deferred_dispatch::pending_until(&current)
+            .unwrap()
+            .reason
+            .starts_with("environment_probe_pending:"));
+        assert!(current.error_annotation.is_none());
+        assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            current.version <= initial_version + 1,
+            "first deferral spends at most one version: {} -> {}",
+            initial_version,
+            current.version
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(signals.path().join("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::write(signals.path().join("release"), "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if db
+                .get_readiness(&project_id, &db::EnvironmentMachine::Server)
+                .await
+                .unwrap()
+                .is_some_and(|row| row.status == db::EnvironmentReadinessStatus::Ready)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        task_versions(&db, &tasks).await,
+        before,
+        "probe completion wakes without another version change"
+    );
+    assert_eq!(dispatcher.check_once().await.unwrap(), 3);
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(5), launches.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+async fn task_versions(db: &db::SqliteDb, tasks: &[Task]) -> Vec<i64> {
+    let mut versions = Vec::new();
+    for task in tasks {
+        versions.push(
+            TaskRepo::get_by_id(db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+        );
+    }
+    versions
+}
+
+#[tokio::test]
+async fn environment_settings_edit_starts_probe_without_a_task() {
+    use db::ProjectMachineReadinessRepo;
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let signals = TempDir::new().unwrap();
+    let (project_id, repo_id) = seed_project_repo(&db, repo.path()).await;
+    let environment: api_types::ProjectEnvironment =
+        serde_json::from_value(serde_json::json!({"checks":[{"name":"old","command":"true"}]}))
+            .unwrap();
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(serde_json::json!({"environment":environment}).to_string())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    db::RepoLocationRepo::create(
+        &*db,
+        db::CreateRepoLocation {
+            id: new_uuid_v4(),
+            repo_id,
+            owner_kind: db::RepoLocationOwnerKind::Server,
+            daemon_id: None,
+            runtime_id: None,
+            path: repo.path().to_string_lossy().into_owned(),
+            kind: db::RepoLocationKind::PrimaryCheckout,
+            is_default: true,
+            status: db::RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let mut row = crate::placement::environment::unknown_record(
+        &project_id,
+        db::EnvironmentMachine::Server,
+        &environment,
+    );
+    row.status = db::EnvironmentReadinessStatus::NotReady;
+    row.next_check_at = Some("2099-01-01T00:00:00Z".into());
+    row.failing_checks = vec![db::ReadinessCheckFailure {
+        name: "old".into(),
+        output_tail: "old failure".into(),
+    }];
+    db.put_readiness(row, None).await.unwrap();
+    let snapshot = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::set_environment_pause_if_unchanged(&*db,&project_id,snapshot.version,&now_rfc3339(),
+        &serde_json::json!({"checks":["old"],"role":"coder","output":"old failure","paused_at":now_rfc3339(),"last_checked_at":now_rfc3339(),"next_check_at":"2099-01-01T00:00:00Z"}).to_string()).await.unwrap();
+    let (dispatcher, _) = build_dispatcher(db.clone(), root.path()).await;
+    dispatcher.check_once().await.unwrap();
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_environment = serde_json::json!({"env":{"COUNT":signals.path().join("starts"),"RELEASE":signals.path().join("release")}, "checks":[{"name":"old","command":"true"},{"name":"new","command":"echo started > \"$COUNT\"; while ! test -f \"$RELEASE\"; do sleep 0.05; done", "timeout_seconds":10}]});
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(serde_json::json!({"environment":new_environment}).to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        current.version,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_readiness(&project_id, &db::EnvironmentMachine::Server)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        db::EnvironmentReadinessStatus::Unknown
+    );
+    // Settings edits also probe an existing host row without a location row.
+    sqlx::query(
+        "DELETE FROM repo_location WHERE repo_id IN (SELECT id FROM repo WHERE project_id = ?)",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    dispatcher.event_bus.publish(events::ForgeEvent {
+        event_type: "project.updated".into(),
+        entity_id: project_id.clone(),
+        timestamp: events::event_timestamp(),
+        context: events::EventContext::ProjectUpdated {},
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !signals.path().join("starts").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let renamed = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: Some("name changed while probing".into()),
+            settings: None,
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        renamed.version,
+        None,
+    )
+    .await
+    .unwrap();
+    std::fs::write(signals.path().join("release"), "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if db
+                .get_readiness(&project_id, &db::EnvironmentMachine::Server)
+                .await
+                .unwrap()
+                .is_some_and(|row| row.status == db::EnvironmentReadinessStatus::Ready)
+                && ProjectRepo::get_by_id(&*db, &project_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .paused_at
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused_at
+            .is_none(),
+        "a passing settings probe resumes the matching pause without a Task"
+    );
+}
+
 async fn finish_environment_recheck(dispatcher: &TaskDispatcher, project_id: &str) {
     let job = dispatcher
         .environment_rechecks
@@ -6119,12 +6406,23 @@ async fn environment_recheck_without_rerunnable_checks_stays_paused() {
         .unwrap();
     assert!(results.is_empty());
     assert!(current.paused_at.is_some());
-    sqlx::query("UPDATE project SET settings = ?, version = version + 1 WHERE id = ?")
-        .bind(r#"{"environment":{"checks":[{"name":"fixed","command":"true"}]}}"#)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(
+                r#"{"environment":{"checks":[{"name":"fixed","command":"true"}]}}"#.into(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        current.version,
+        None,
+    )
+    .await
+    .unwrap();
     // The manual empty check rescheduled the detail; force it due again.
     sqlx::query("UPDATE project SET environment_pause_json = json_set(environment_pause_json, '$.next_check_at', '2026-01-01T00:00:00Z') WHERE id = ?")
         .bind(&project_id).execute(db.pool()).await.unwrap();
@@ -6159,9 +6457,14 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     let workspace = TempDir::new().unwrap();
     let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let mut repos = Vec::new();
-    for (index, corruption) in ["pause", "environment-settings", "slot-settings"]
-        .into_iter()
-        .enumerate()
+    for (index, corruption) in [
+        "pause",
+        "environment-settings",
+        "slot-settings",
+        "readiness",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let repo = TempDir::new().unwrap();
         let (project_id, _) = seed_project_repo(&db, repo.path()).await;
@@ -6169,7 +6472,7 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
             seed_environment_pause(
                 &db,
                 &project_id,
-                serde_json::json!({"checks":[{"name":"disk","command":"true"}]}),
+                serde_json::json!({"checks":[{"name":"disk","command":if corruption=="pause" {"false"} else {"true"}}]}),
                 &["disk"],
                 "2026-01-01T00:00:00Z",
             )
@@ -6184,6 +6487,8 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
                 .execute(db.pool())
                 .await
                 .unwrap();
+        } else if corruption == "readiness" {
+            sqlx::query("UPDATE project_machine_readiness SET failing_checks_json='[{\"name\":null}]' WHERE project_id=?").bind(&project_id).execute(db.pool()).await.unwrap();
         } else {
             sqlx::query("UPDATE project SET settings = 'invalid' WHERE id = ?")
                 .bind(&project_id)
@@ -6201,9 +6506,33 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     }
     let repo = TempDir::new().unwrap();
     let (healthy, _) = seed_project_repo(&db, repo.path()).await;
-    let task = seed_task(&db, &healthy, "healthy admission", "todo", 0).await;
-    assign_role(&db, &task.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if dispatcher
+                .environment_rechecks
+                .lock()
+                .unwrap()
+                .values()
+                .all(|job| job.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let task = seed_task(
+        &db,
+        &healthy,
+        "healthy admission after failed job",
+        "todo",
+        0,
+    )
+    .await;
+    assign_role(&db, &task.id, "coder", &agent).await;
     assert_eq!(dispatcher.check_once().await.unwrap(), 1);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -6212,6 +6541,16 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
             .unwrap()
             .task_id,
         task.id
+    );
+    assert_eq!(
+        dispatcher.check_once().await.unwrap(),
+        0,
+        "subsequent ticks also isolate bad rows"
+    );
+    let overdue_bad:i64=sqlx::query_scalar("SELECT count(*) FROM project_machine_readiness WHERE failing_checks_json='[{\"name\":null}]' AND julianday(next_check_at)<=julianday(?)").bind(now_rfc3339()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        overdue_bad, 0,
+        "the undecodable row is rescheduled instead of retried each tick"
     );
 }
 
@@ -8422,3 +8761,8 @@ async fn machine_capacity_restart_between_prepare_and_start_relaunches_ready() {
         placement_id
     );
 }
+#[path = "tests/environment_placement.rs"]
+mod environment_placement;
+
+#[path = "tests/environment_parity.rs"]
+mod environment_parity;

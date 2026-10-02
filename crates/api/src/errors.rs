@@ -631,6 +631,7 @@ mod placement_tests {
                 task_id: "task".into(),
                 repo_id: "repo".into(),
                 rejected_candidates: vec![services::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
                     repo_location_id: "location".into(),
                     owner_kind: "daemon".into(),
                     daemon_id: Some("old".into()),
@@ -652,6 +653,7 @@ mod placement_tests {
                 task_id: "task".to_owned(),
                 repo_id: "repo".to_owned(),
                 rejected_candidates: vec![services::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
                     repo_location_id: "location".to_owned(),
                     owner_kind: "daemon".to_owned(),
                     daemon_id: Some("daemon".to_owned()),

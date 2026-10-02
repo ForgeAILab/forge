@@ -96,6 +96,30 @@ impl SqliteDb {
             })
             .collect()
     }
+    pub async fn worker_dead_letter_history(
+        &self,
+        name: &str,
+    ) -> Result<(i64, Vec<crate::WorkerDeadLetterRecord>)> {
+        let count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter WHERE worker_name = ?")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
+        let rows = sqlx::query("SELECT id, source_key, last_error, dead_lettered_at FROM worker_dead_letter WHERE worker_name = ? ORDER BY dead_lettered_at DESC, id DESC LIMIT 5")
+            .bind(name).fetch_all(&self.pool).await?;
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                Ok(crate::WorkerDeadLetterRecord {
+                    id: row.try_get("id")?,
+                    source_key: row.try_get("source_key")?,
+                    reason: row.try_get("last_error")?,
+                    occurred_at: row.try_get("dead_lettered_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((count, records))
+    }
     pub async fn domain_event_consumer_lag(
         &self,
         expected_consumers: &[&str],
@@ -107,28 +131,27 @@ impl SqliteDb {
             query.push(" UNION SELECT ").push_bind(*name);
         }
         query.push(") SELECT consumers.consumer_name, COALESCE(cursor.last_sequence, 0) AS last_sequence,
-            cursor.updated_at, health.subscription_json FROM consumers
+            cursor.updated_at, health.subscription_json, health.created_at AS initialized_at FROM consumers
             LEFT JOIN event_consumer_cursor AS cursor USING (consumer_name)
             LEFT JOIN worker_health AS health ON health.worker_name = consumers.consumer_name ORDER BY consumer_name");
         let rows = query.build().fetch_all(&self.pool).await?;
         let mut result = Vec::with_capacity(rows.len());
-        // Legacy consumers retain their global sequence-distance metric.
-        let head = self.domain_event_head().await?;
         for row in rows {
             let cursor: i64 = row.try_get("last_sequence")?;
             let subscription: Option<String> = row.try_get("subscription_json")?;
-            let (lag, oldest_unprocessed_at) = if let Some(subscription) = subscription {
-                let subscription = serde_json::from_str(&subscription)
-                    .map_err(|_| DbError::Check("invalid worker subscription".into()))?;
-                self.subscribed_backlog(cursor, &subscription).await?
-            } else {
-                let oldest = sqlx::query_scalar("SELECT created_at FROM domain_event WHERE sequence > ? ORDER BY julianday(created_at), sequence LIMIT 1")
-                    .bind(cursor).fetch_optional(&self.pool).await?;
-                ((head - cursor).max(0), oldest)
-            };
+            let subscription = subscription
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|_| DbError::Check("invalid worker subscription".into()))
+                })
+                .transpose()?
+                .unwrap_or(EventSubscription::All);
+            let (lag, oldest_unprocessed_at) =
+                self.subscribed_backlog(cursor, &subscription).await?;
             result.push(DomainEventConsumerLag {
                 consumer_name: row.try_get("consumer_name")?,
                 last_sequence: cursor,
+                initialized_at: row.try_get("initialized_at")?,
                 lag,
                 last_advanced_at: row.try_get("updated_at")?,
                 oldest_unprocessed_at,

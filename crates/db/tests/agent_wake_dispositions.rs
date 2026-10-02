@@ -2,11 +2,11 @@ use db::{
     canonical_attention_incident_digest, create_sqlite_pool, run_migrations,
     AgentChatMessageAuthorType, AgentChatMessageStatus, AgentChatRepo, AgentProfileRepo, AgentRepo,
     AgentStatus, AgentWakeDispositionKind, AgentWakeDispositionRepo, AttentionRepo,
-    ClaimDomainEvents, CompleteClaimedWake, CompleteDomainEvent, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, CreateAgentIdentity, CreateAgentProfile, CreateAgentWakeDisposition,
-    CreateAttentionProjection, CreateDomainEvent, CreateProject, CreateProjectAgentBinding,
-    DomainEventRepo, ExpectedAttentionSnapshot, ProjectAgentBindingRepo, ProjectRepo,
-    ReplaceProjectAgentBinding, RetryAgentWakeDisposition, SqliteDb, User, UserRepo,
+    CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentIdentity, CreateAgentProfile,
+    CreateAgentWakeDisposition, CreateAttentionProjection, CreateDomainEvent, CreateProject,
+    CreateProjectAgentBinding, DomainEventRepo, ExpectedAttentionSnapshot, PersistAgentWake,
+    ProjectAgentBindingRepo, ProjectRepo, ReplaceProjectAgentBinding, RetryAgentWakeDisposition,
+    SqliteDb, User, UserRepo,
 };
 
 async fn database() -> SqliteDb {
@@ -77,70 +77,87 @@ fn source_event(id: &str, created_at: &str) -> CreateDomainEvent {
     }
 }
 
-async fn append_and_claim(db: &SqliteDb, id: &str) -> (db::DomainEvent, String) {
-    let now = "2026-08-21T00:00:00Z";
-    let event = DomainEventRepo::append_event(db, source_event(id, now))
+async fn append_source(db: &SqliteDb, id: &str) -> (db::DomainEvent, String) {
+    let event = db
+        .append_event(source_event(id, "2026-08-21T00:00:00Z"))
         .await
-        .expect("event appends");
-    let claimed = DomainEventRepo::claim_event_batch(
-        db,
-        ClaimDomainEvents {
-            consumer_name: "agent-wake-turns".to_owned(),
-            lease_owner: "wake-test".to_owned(),
-            now: now.to_owned(),
-            leased_until: "2026-08-21T00:01:00Z".to_owned(),
-            limit: 10,
-        },
-    )
-    .await
-    .expect("event claims");
-    assert_eq!(claimed, vec![event.clone()]);
-    (event, "wake-test".to_owned())
+        .unwrap();
+    (event, "unused-holder".to_owned())
 }
 
-async fn drain_existing_events(db: &SqliteDb) {
-    let now = "2026-08-21T00:00:00Z";
-    let owner = "wake-drain";
-    let events = DomainEventRepo::claim_event_batch(
-        db,
-        ClaimDomainEvents {
-            consumer_name: "agent-wake-turns".to_owned(),
-            lease_owner: owner.to_owned(),
-            now: now.to_owned(),
-            leased_until: "2026-08-21T00:01:00Z".to_owned(),
-            limit: 100,
-        },
+async fn persist_wake(
+    db: &SqliteDb,
+    input: PersistAgentWake,
+) -> db::Result<db::AgentWakeDisposition> {
+    let event = db
+        .get_event(&input.disposition.source_event_id)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    db.ensure_domain_event_cursor_in_tx(
+        &mut tx,
+        &input.disposition.consumer_name,
+        &db::now_rfc3339(),
     )
-    .await
-    .expect("existing events claim");
-    for event in events {
-        AgentWakeDispositionRepo::complete_claimed_agent_wake(
-            db,
-            CompleteClaimedWake {
-                disposition: disposition(
-                    &event,
-                    AgentWakeDispositionKind::DeterministicallySuppressed,
-                    "preexisting_event",
-                    "2026-08-21T00:00:01Z",
-                ),
-                completion: completion(&event, owner),
-                admission: None,
-                expected_attention: None,
-            },
+    .await?;
+    let cursor = sqlx::query_scalar(
+        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
+    )
+    .bind(&input.disposition.consumer_name)
+    .fetch_one(&mut *tx)
+    .await?;
+    if event.sequence > cursor {
+        db.validate_event_worker_in_tx(
+            &mut tx,
+            &input.disposition.consumer_name,
+            cursor,
+            cursor,
+            event.sequence,
+            &db::EventSubscription::Prefix(vec!["agent.wake.".into()]),
         )
-        .await
-        .expect("existing event completion");
+        .await?;
     }
+    let result = db
+        .persist_agent_wake_in_tx(&mut tx, &event, input.clone())
+        .await?;
+    if event.sequence > cursor {
+        db.advance_domain_event_cursor_in_tx(
+            &mut tx,
+            &input.disposition.consumer_name,
+            cursor,
+            event.sequence,
+            &db::now_rfc3339(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(result)
 }
-
-fn completion(event: &db::DomainEvent, lease_owner: &str) -> CompleteDomainEvent {
-    CompleteDomainEvent {
-        consumer_name: "agent-wake-turns".to_owned(),
-        lease_owner: lease_owner.to_owned(),
-        event_sequence: event.sequence,
-        event_id: event.id.clone(),
-        dedupe_key: event.dedupe_key.clone().expect("test event dedupe key"),
-        completed_at: "2026-08-21T00:00:01Z".to_owned(),
+async fn drain_existing_events(db: &SqliteDb) {
+    let cursor = db
+        .get_consumer_cursor("agent-wake-turns")
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    for event in db.list_events_after(cursor, 100).await.unwrap() {
+        if event.event_type.starts_with("agent.wake.") {
+            persist_wake(
+                db,
+                PersistAgentWake {
+                    disposition: disposition(
+                        &event,
+                        AgentWakeDispositionKind::DeterministicallySuppressed,
+                        "preexisting_event",
+                        "2026-08-21T00:00:01Z",
+                    ),
+                    admission: None,
+                    expected_attention: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
     }
 }
 
@@ -199,7 +216,7 @@ async fn install_cutover_records_reason_and_preserves_post_cutover_events() {
         .expect("event max");
     assert_eq!(cutover_sequence, max_at_install);
 
-    let (_event, _owner) = append_and_claim(&db, "cutover-event").await;
+    let (_event, _owner) = append_source(&db, "cutover-event").await;
 }
 
 #[tokio::test]
@@ -252,20 +269,20 @@ async fn wake_lease_renewal_is_allowed_but_rebinding_cannot_parallelize_incident
 }
 
 #[tokio::test]
-async fn disposition_cursor_receipt_and_lease_commit_atomically() {
+async fn disposition_and_cursor_commit_atomically() {
     let db = database().await;
-    let (event, owner) = append_and_claim(&db, "atomic-event").await;
+    let (event, _owner) = append_source(&db, "atomic-event").await;
     let input = disposition(
         &event,
         AgentWakeDispositionKind::DeterministicallySuppressed,
         "unchanged_incident",
         "2026-08-21T00:00:01Z",
     );
-    let recorded = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let recorded = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: input.clone(),
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
@@ -291,26 +308,10 @@ async fn disposition_cursor_receipt_and_lease_commit_atomically() {
         .expect("cursor lookup")
         .expect("cursor");
     assert_eq!(cursor.last_sequence, event.sequence);
-    let receipt_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_projection_receipt
-         WHERE consumer_name = 'agent-wake-turns' AND event_id = ?",
-    )
-    .bind(&event.id)
-    .fetch_one(db.pool())
-    .await
-    .expect("receipt count");
-    assert_eq!(receipt_count, 1);
-    let lease_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_processing_lease
-         WHERE consumer_name = 'agent-wake-turns' AND event_sequence = ?",
-    )
-    .bind(event.sequence)
-    .fetch_one(db.pool())
-    .await
-    .expect("lease count");
-    assert_eq!(lease_count, 0);
+    let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('event_projection_receipt', 'event_processing_lease')").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(retired, 0);
 
-    let (rollback_event, rollback_owner) = append_and_claim(&db, "atomic-rollback-event").await;
+    let (rollback_event, _rollback_owner) = append_source(&db, "atomic-rollback-event").await;
     let mut invalid = disposition(
         &rollback_event,
         AgentWakeDispositionKind::TurnAdmitted,
@@ -320,15 +321,11 @@ async fn disposition_cursor_receipt_and_lease_commit_atomically() {
     invalid.source_event_id = "atomic-rollback-event".to_owned();
     invalid.source_event_sequence = rollback_event.sequence;
     invalid.turn_job_id = Some("missing-turn".to_owned());
-    let error = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let error = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: invalid,
-            completion: CompleteDomainEvent {
-                event_id: "atomic-rollback-event".to_owned(),
-                event_sequence: rollback_event.sequence,
-                ..completion(&rollback_event, &rollback_owner)
-            },
+
             admission: None,
             expected_attention: None,
         },
@@ -349,29 +346,29 @@ async fn disposition_cursor_receipt_and_lease_commit_atomically() {
 #[tokio::test]
 async fn replay_is_idempotent_but_changed_disposition_conflicts() {
     let db = database().await;
-    let (event, owner) = append_and_claim(&db, "replay-event").await;
+    let (event, _owner) = append_source(&db, "replay-event").await;
     let input = disposition(
         &event,
         AgentWakeDispositionKind::DeterministicallySuppressed,
         "self_causation",
         "2026-08-21T00:00:01Z",
     );
-    let first = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let first = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: input.clone(),
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
     )
     .await
     .expect("first disposition");
-    let replay = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let replay = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: input.clone(),
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
@@ -381,11 +378,11 @@ async fn replay_is_idempotent_but_changed_disposition_conflicts() {
     assert_eq!(first, replay);
     let mut changed = input;
     changed.reason = "resolved_incident".to_owned();
-    let error = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let error = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: changed,
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
@@ -407,18 +404,18 @@ async fn replay_is_idempotent_but_changed_disposition_conflicts() {
 #[tokio::test]
 async fn deferred_retry_appends_attempt_and_moves_current_pointer() {
     let db = database().await;
-    let (event, owner) = append_and_claim(&db, "deferred-event").await;
+    let (event, _owner) = append_source(&db, "deferred-event").await;
     let first = disposition(
         &event,
         AgentWakeDispositionKind::Deferred,
         "chat_temporarily_unavailable",
         "2026-08-21T00:00:01Z",
     );
-    AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: first.clone(),
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
@@ -492,7 +489,7 @@ async fn deferred_retry_appends_attempt_and_moves_current_pointer() {
 async fn setup_required_reconsideration_is_attention_change_driven() {
     let db = database().await;
     seed_lease_identity(&db, "setup-identity", "setup-profile").await;
-    let (event, owner) = append_and_claim(&db, "setup-event").await;
+    let (event, _owner) = append_source(&db, "setup-event").await;
     let attention = AttentionRepo::insert_attention(
         &db,
         CreateAttentionProjection {
@@ -529,11 +526,11 @@ async fn setup_required_reconsideration_is_attention_change_driven() {
     setup.attention_id = Some(attention.id.clone());
     setup.profile_id = Some("setup-profile".to_owned());
     setup.profile_version = Some(1);
-    AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: setup,
-            completion: completion(&event, &owner),
+
             admission: None,
             expected_attention: None,
         },
@@ -787,7 +784,7 @@ async fn turn_admission_is_committed_with_wake_disposition() {
     .await
     .expect("chat ready");
     drain_existing_events(&db).await;
-    let (event, owner) = append_and_claim(&db, "admitted-event").await;
+    let (event, _owner) = append_source(&db, "admitted-event").await;
     let attention = AttentionRepo::insert_attention(
         &db,
         CreateAttentionProjection {
@@ -919,11 +916,11 @@ async fn turn_admission_is_committed_with_wake_disposition() {
     );
     admitted.id = "admitted-disposition".to_owned();
     admitted.turn_job_id = Some(turn_id.to_owned());
-    let stale_error = AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    let stale_error = persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: admitted.clone(),
-            completion: completion(&event, &owner),
+
             admission: Some(db::AdmitAgentChatTurn {
                 message: message.clone(),
                 turn: turn.clone(),
@@ -953,11 +950,11 @@ async fn turn_admission_is_committed_with_wake_disposition() {
         digest: Some(canonical_attention_incident_digest(&changed_attention)),
         ..expected_attention
     };
-    AgentWakeDispositionRepo::complete_claimed_agent_wake(
+    persist_wake(
         &db,
-        CompleteClaimedWake {
+        PersistAgentWake {
             disposition: admitted,
-            completion: completion(&event, &owner),
+
             admission: Some(db::AdmitAgentChatTurn { message, turn }),
             expected_attention: Some(current_attention),
         },
@@ -980,30 +977,41 @@ async fn turn_admission_is_committed_with_wake_disposition() {
     assert_eq!(event_count, 1);
 }
 
-async fn claim_all(db: &SqliteDb, consumer: &str, owner: &str) -> Vec<db::DomainEvent> {
-    DomainEventRepo::claim_event_batch(
-        db,
-        ClaimDomainEvents {
-            consumer_name: consumer.to_owned(),
-            lease_owner: owner.to_owned(),
-            now: "2026-08-21T00:00:00Z".to_owned(),
-            leased_until: "2026-08-21T00:01:00Z".to_owned(),
-            limit: 100,
-        },
-    )
-    .await
-    .expect("events claim")
+async fn pending_events(db: &SqliteDb, consumer: &str) -> Vec<db::DomainEvent> {
+    let cursor = db
+        .get_consumer_cursor(consumer)
+        .await
+        .unwrap()
+        .map_or(0, |c| c.last_sequence);
+    db.list_events_after(cursor, 100).await.unwrap()
 }
-
-fn plain_completion(consumer: &str, owner: &str, event: &db::DomainEvent) -> CompleteDomainEvent {
-    CompleteDomainEvent {
-        consumer_name: consumer.to_owned(),
-        lease_owner: owner.to_owned(),
-        event_sequence: event.sequence,
-        event_id: event.id.clone(),
-        dedupe_key: event.dedupe_key.clone().expect("dedupe key"),
-        completed_at: "2026-08-21T00:00:01Z".to_owned(),
-    }
+async fn checkpoint(db: &SqliteDb, consumer: &str, event: &db::DomainEvent) -> db::Result<bool> {
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let cursor = sqlx::query_scalar(
+        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
+    )
+    .bind(consumer)
+    .fetch_one(&mut *tx)
+    .await?;
+    db.validate_event_worker_in_tx(
+        &mut tx,
+        consumer,
+        cursor,
+        cursor,
+        event.sequence,
+        &db::EventSubscription::All,
+    )
+    .await?;
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        consumer,
+        cursor,
+        event.sequence,
+        &db::now_rfc3339(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn append_events(db: &SqliteDb, ids: &[&str]) -> Vec<db::DomainEvent> {
@@ -1036,14 +1044,11 @@ async fn domain_event_consumer_completes_across_pruned_gap() {
         .await
         .expect("prune");
 
-    let claimed = claim_all(&db, "gap-consumer", "worker").await;
+    let claimed = pending_events(&db, "gap-consumer").await;
     assert_eq!(claimed, vec![events[3].clone()]);
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        plain_completion("gap-consumer", "worker", &events[3]),
-    )
-    .await
-    .expect("event after the gap completes"));
+    assert!(checkpoint(&db, "gap-consumer", &events[3])
+        .await
+        .expect("event after the gap completes"));
     let cursor = DomainEventRepo::get_consumer_cursor(&db, "gap-consumer")
         .await
         .unwrap()
@@ -1052,7 +1057,7 @@ async fn domain_event_consumer_completes_across_pruned_gap() {
 }
 
 #[tokio::test]
-async fn domain_event_catch_up_skips_pruned_gap_over_receipts() {
+async fn domain_event_checkpoint_skips_pruned_gap() {
     let db = database().await;
     let events = append_events(&db, &["cu-a", "cu-b", "cu-c"]).await;
     sqlx::query(
@@ -1063,19 +1068,19 @@ async fn domain_event_catch_up_skips_pruned_gap_over_receipts() {
     .execute(db.pool())
     .await
     .expect("cursor seeds");
-    // Receipt exists for the first event but the cursor never checkpointed it.
+    // The existing checkpoint is the sole restart authority.
     sqlx::query(
-        "INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
-         VALUES ('cu-consumer', 'cu-a', 'wake-event-cu-a', '2026-08-21T00:00:00Z')",
+        "UPDATE event_consumer_cursor SET last_sequence = ? WHERE consumer_name = 'cu-consumer'",
     )
+    .bind(events[0].sequence)
     .execute(db.pool())
     .await
-    .expect("receipt seeds");
+    .unwrap();
     sqlx::query("DELETE FROM domain_event WHERE id = 'cu-b'")
         .execute(db.pool())
         .await
         .expect("prune");
-    let claimed = claim_all(&db, "cu-consumer", "worker").await;
+    let claimed = pending_events(&db, "cu-consumer").await;
     assert_eq!(claimed, vec![events[2].clone()]);
     let cursor = DomainEventRepo::get_consumer_cursor(&db, "cu-consumer")
         .await
@@ -1101,27 +1106,18 @@ async fn domain_event_completion_still_rejects_out_of_order_with_existing_earlie
         .execute(db.pool())
         .await
         .expect("prune");
-    let claimed = claim_all(&db, "ooo-consumer", "worker").await;
+    let claimed = pending_events(&db, "ooo-consumer").await;
     assert_eq!(claimed.len(), 2);
-    let error = DomainEventRepo::complete_claimed_event(
-        &db,
-        plain_completion("ooo-consumer", "worker", &events[2]),
-    )
-    .await
-    .expect_err("later event must wait for the earlier existing one");
-    assert!(matches!(error, db::DbError::Check(_)), "{error:?}");
-    DomainEventRepo::complete_claimed_event(
-        &db,
-        plain_completion("ooo-consumer", "worker", &events[0]),
-    )
-    .await
-    .expect("head completes");
-    DomainEventRepo::complete_claimed_event(
-        &db,
-        plain_completion("ooo-consumer", "worker", &events[2]),
-    )
-    .await
-    .expect("tail completes across the gap");
+    let error = checkpoint(&db, "ooo-consumer", &events[2])
+        .await
+        .expect_err("later event must wait for the earlier existing one");
+    assert!(matches!(error, db::DbError::VersionConflict), "{error:?}");
+    checkpoint(&db, "ooo-consumer", &events[0])
+        .await
+        .expect("head completes");
+    checkpoint(&db, "ooo-consumer", &events[2])
+        .await
+        .expect("tail completes across the gap");
     let cursor = DomainEventRepo::get_consumer_cursor(&db, "ooo-consumer")
         .await
         .unwrap()
@@ -1142,28 +1138,28 @@ async fn wake_completion_crosses_pruned_gap_but_rejects_existing_earlier_event()
         .execute(db.pool())
         .await
         .expect("prune");
-    let claimed = claim_all(&db, "agent-wake-turns", "wake-test").await;
+    let claimed = pending_events(&db, "agent-wake-turns").await;
     assert_eq!(claimed.len(), 2);
 
-    let complete = |event: &db::DomainEvent| CompleteClaimedWake {
+    let complete = |event: &db::DomainEvent| PersistAgentWake {
         disposition: disposition(
             event,
             AgentWakeDispositionKind::DeterministicallySuppressed,
             "gap_test",
             "2026-08-21T00:00:01Z",
         ),
-        completion: completion(event, "wake-test"),
+
         admission: None,
         expected_attention: None,
     };
-    let error = AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[3]))
+    let error = persist_wake(&db, complete(&events[3]))
         .await
         .expect_err("tail must wait for the existing head");
-    assert!(matches!(error, db::DbError::Check(_)), "{error:?}");
-    AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[0]))
+    assert!(matches!(error, db::DbError::VersionConflict), "{error:?}");
+    persist_wake(&db, complete(&events[0]))
         .await
         .expect("head completes");
-    AgentWakeDispositionRepo::complete_claimed_agent_wake(&db, complete(&events[3]))
+    persist_wake(&db, complete(&events[3]))
         .await
         .expect("tail completes across the gap");
     let cursor = DomainEventRepo::get_consumer_cursor(&db, "agent-wake-turns")
