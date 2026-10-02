@@ -240,6 +240,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unchanged.
 - A malformed repo create or update body returns `400` with the standard
   error envelope instead of `422`.
+- Operations status reads the usage ledger in batches (about 5× faster on a
+  large ledger). The chat switcher and chat detail count pending turns without
+  loading the turn history.
 
 ### Added
 
