@@ -319,26 +319,86 @@ changed run contributions; requests never fold all historical runs. Overall
 coverage, cost kind, known subtotal and complete total are derived from those
 totals, preserving optional zero versus unknown amounts.
 
-`sources` is the non-additive field: the existing projection keeps the last
-source reference for a key in source/attempt/event order. Reported provenance
-is invariant and needs only a reference count. Estimated provenance retains
-compact ordering citations and frozen source references so a revision can
-remove the current winner and expose its predecessor. Invocation/event rows
-are never retained. Cross-Agent attribution preserves the original filter:
-an Agent-owned invocation includes all its events; another Agent includes only
-its matching events. An append changes the owning/matching Agent scopes and
-Operations, leaving every unrelated Agent's cached result intact.
+`sources` is the non-additive field: the projection keeps the last source
+reference for a key in source/attempt-ordinal/invocation/occurred-at/event-id
+order. Each scope retains a count and winning order per distinct frozen
+`CostSourceRef`, with an ordered map of variant winners. It retains no citation
+per event. Removing a winner during repricing stages a database lookup for its
+replacement in the same snapshot; ordinary appends do no historical lookup.
+Removing a sole citation needs no replacement. Amount-only repricing preserves
+the same event's provenance/order, so it retains that known winner without a
+database search; newer events in the same delta can still supersede it.
+Cross-Agent attribution keeps the original filter: an Agent-owned invocation
+includes all its events; another Agent includes only matching events. Appends
+invalidate only those Agent scopes and Operations.
 
-The index has a 128 MiB charged summary/citation budget, including conservative
-node/string allowances. A three-attempt, three-event execution with UUID-sized
-IDs and reported costs charges roughly 4.5 KiB across its attempt summaries,
-Operations/Agent run summaries and execution identity; estimated provenance
-citations cost extra. At the bound it discards index state and uses the fresh
-references until a deletion generation permits a smaller rebuild. This bound
-preserves correctness but gives up the incremental performance guarantee above
-capacity. The response's distinct source list is necessarily proportional to
-output size. Cold/delta payload reads are in 400-row slices, with 150-event
-provenance joins.
+A warm sync first reads its complete delta into private storage. A separate
+synchronous function applies the delta and advances its watermarks together;
+there is no await in that publication function. A cancelled request cannot
+publish part of an event or reprice delta. Cold/reset builds use a private state
+and publish it only when complete, skip historical changed-row markers, and
+check the singleton's maxima against `MAX(rowid)` before building. A mismatch
+logs an error and rebuilds from the actual rowids.
+
+The summary index has a 128 MiB charged budget. Hash-table capacity, owned
+strings/reason vectors, distinct provenance variants, ordered winners, and
+public caches, a 50% allowance for allocator retention, and an 8 MiB reserve
+for retained read batches/driver caches are charged. Capacity growth is checked before insertion, and
+cold/delta payloads use 400-row slices and 150-event provenance joins. Oversized
+staged deltas are discarded too; a build can exceed its budget only by its
+current read batch. A reset releases the invalid state before building its
+replacement. Discards log the charge, bound and four ledger row counts. Trigger-maintained
+owned-execution counts also let cold reads reject a state whose minimum table
+allocation cannot fit, without allocating a trial index.
+
+Above the bound, a fresh computation folds 128-source batches instead of
+retaining the whole ledger's rows. It runs outside the index and cache mutexes.
+Separate Operations and Agent fill gates coalesce concurrent cache misses;
+cache hits bypass those gates. A separate 32 MiB/256-Agent fallback memo is keyed by the snapshot's
+revision header and deletion generation; unchanged polls read only constant
+size metadata. Event/reprice deltas invalidate just their affected Agent
+responses, while execution statistics survive unrelated ledger appends. The
+index remembers a failed fit and retries only after the trigger-maintained row
+counts shrink by at least 25%, or after process restart. A successful retry is
+logged. Internal invariant failures log an error and use the fresh reference.
+Public response size still determines the cost of copying distinct sources.
+
+The release RSS probes on this machine charged approximately 99.2 MiB for
+12,000 runs/36,000 attempts, against 109–112 MiB of server RSS growth. At
+13,800 runs/41,400 attempts the charge was approximately 102.3 MiB against
+111–113 MiB growth, for both reported and estimated cost. With three attempts
+and events per run, both fixtures fit at 41,400 events and discard at 43,200
+when the run map grows; this is a capacity boundary, not an event-count limit.
+The charged cost averages roughly 7–8 KiB per run after subtracting the fixed
+8 MiB reserve, and varies with map capacity/Agent attribution. Adding 500
+events with the same invocation/provenance in the focused test adds under
+4 KiB. The 24× trial is stopped before the expensive capacity growth; the
+55× fixture is rejected by the minimum-allocation probe before building an
+index. Discarded indexes retain zero summaries.
+
+The active/scale/RSS runner lives in `scripts/perf_usage_reads.py`; its fixture
+helpers are in `scripts/perf_usage_fixture.py`. The pinned `heavy` profile is
+unchanged. `usage-estimated` is a separate deterministic profile with the same
+run counts, applied cost-estimate revisions and usage spread over three Agents.
+Preparation and measurement write only copies, with all production triggers
+and foreign keys enabled. Active requests append one event to rotating
+invocations; estimated appends also receive an applied estimate, and an old
+event is repriced every 50 requests. Write time is excluded from read latency.
+Each route starts a fresh server for its cold request, then measures idle and
+active p50/p95 with either one or four persistent clients. Concurrent active
+rounds commit one event per client before the clients read together, so raw-SQL
+write-lock waits are excluded. RSS is sampled with
+`proc_pidinfo` on macOS and `/proc` on Linux.
+
+```sh
+export TMPDIR=/Volumes/Data/tmp CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
+python3 scripts/perf_usage_reads.py prepare --binary "$PWD/target/release/forge" \
+  --fixture /Volumes/Data/tmp/perf/heavy/fixture-v2 --scale 20 --estimated \
+  --out /Volumes/Data/tmp/perf/usage-estimated20
+python3 scripts/perf_usage_reads.py run --binary "$PWD/target/release/forge" \
+  --fixture /Volumes/Data/tmp/perf/usage-estimated20 --clients 4 --requests 100 \
+  --out /Volumes/Data/tmp/perf/usage-estimated20-4clients.json
+```
 
 Agent page execution counts/success rates and running occupancy use the same
 execution deltas; active task/turn assignments remain live and workflow states
@@ -352,24 +412,38 @@ aggregation never does so during ordinary deltas. Other Operations diagnostics
 and `active_execution_count` remain live. Empty source breakdowns retain their
 single-acquisition fast path.
 
-Correctness validation includes three deterministic 360-step randomized
-repository mutation sequences, comparing Operations, every Agent and execution
-statistics against fresh references after each step. The test relaxes only the
+Correctness validation includes the original three deterministic 360-step
+repository mutation sequences and six expanded seeds read after random batches
+of one to eight changes. Operations, individual/batched Agent aggregates, running
+counts and execution statistics are compared with independent fresh references.
+The generator includes all surfaces, NULL Agent/Project scopes, account deletion,
+admission estimates, unmetered/unsettled outcomes, shared provenance, nonzero
+durations, ownership/date edits and heartbeats, plus a cold rebuild at the end.
+The test relaxes only the
 Agent-attribution clause of the in-memory event admission guard to exercise
 historical cross-Agent attribution; all other guards remain enforced. Execution
 delete and ownership SQL match the existing workspace boundary because there
-is no repository API for them. Additional tests cover source winner ordering,
-old-event repricing, rollback, deletion/rowid reuse and bounded fallback. A
+is no repository API for them. A pure-fold differential gate runs 3,000 seeds
+split between guarded and legacy shapes, including tied order keys. File-backed
+tests exercise concurrent readers/writers and cancellation at every poll boundary
+for event/reprice deltas. Additional tests cover compact source winner recovery,
+repair-buffer bounds, old-event repricing, rollback, deletion/rowid reuse, cold
+header/schema checks and bounded fallback. A
 read-count seam proves seven appends read fourteen event/provenance rows at
 both 12- and 420-run histories; a single append after 420 events on one run
 reads two rows.
 
-The activity/scale benchmark lives under
-`/Volumes/Data/tmp/perf/heavy/usage2_bench.py`. It scales only scratch copies,
-keeps the pinned heavy profile unchanged, and appends one immutable event
-between consecutive requests using raw SQL through the server's unchanged
-production guards. It never disables a guard in benchmark databases or writes
-the source fixture. First-pass binaries and outputs are preserved as
+`scripts/test_usage_mutations.py` ports the audit's 18 fault injections. It copies
+source into a new scratch directory with its own Cargo target, uses dependencies
+offline, and requires every mutation to compile and fail a repository test:
+
+```sh
+python3 scripts/test_usage_mutations.py \
+  --scratch /Volumes/Data/tmp/usage-mutations --no-debug-info
+```
+
+The first-pass activity/scale results below were produced by the predecessor
+of `scripts/perf_usage_reads.py`. First-pass binaries and outputs are preserved as
 `usage2-before-forge`, `usage2-before-1.json` and `usage2-before-20.json`.
 
 ### Release validation, 2026-10-02
@@ -401,8 +475,8 @@ queries; query-plan tests require their use without a temporary sort. Those
 indexes and the running-occupancy index are in the same migration.
 
 A warm usage read executes one primary-key revision SELECT. An event-only
-delta executes five SELECTs (two header probes, new-event rows, frozen
-provenance, and an empty execution-change probe), plus read BEGIN/COMMIT. Seven
+delta executes four SELECTs (two header probes, new-event rows and frozen
+provenance), plus read BEGIN/COMMIT. Seven
 appends transfer fourteen payload/provenance rows independent of history;
 there is no source/invocation history reload. Agent page execution metadata
 adds a second constant header probe; the whole idle collection routes execute
@@ -417,3 +491,79 @@ budget fallback, transaction rollback, diagnostic index plans, and relevant
 existing projection/Operations cases. Touched-crate check, warnings-denied
 Clippy, formatting and final release build passed. Workspace/broad suites
 remain CI work; no public response changes or generated-type edits were made.
+
+### Audit follow-up release validation, 2026-10-02
+
+Darwin arm64; release build of the uncommitted audit fixes. All source fixtures retain their original hashes. Timings are milliseconds. Each route uses a fresh server for its cold request. Idle/active phases have 50 samples per sequential client and 200 with four clients; the over-bound four-client comparison has 52 samples on both builds. Active writes rotate invocations, with an old-event reprice every 50 writes, through production SQL guards in copied fixtures. Four-client rounds commit their writes before reading together.
+
+Reported fixtures contain 600/12,000/33,000 executions and 1,800/36,000/99,000 invocations/events (1×/20×/55×). Estimated fixtures have the same 1×/20× counts plus 1,800/36,000 applied revisions, spread over three Agents. The 55× fixture is above the summary budget.
+
+RSS columns are MiB: before the cold request → after cold → after idle → after active. `R` means reported cost; `E` means estimated cost.
+
+| Fixture | Clients | Route | Idle p50 / p95 | Active p50 / p95 | Cold | RSS before / cold / idle / active |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| R1× | 1 | operations status | 0.680 / 0.808 | 1.147 / 1.654 | 39.969 | 47.3 / 57.9 / 60.3 / 60.8 |
+| R1× | 1 | agents | 0.450 / 0.488 | 0.724 / 1.207 | 37.463 | 47.0 / 58.1 / 58.4 / 58.8 |
+| R1× | 1 | project agents | 0.510 / 0.598 | 0.626 / 1.080 | 40.656 | 46.5 / 58.5 / 58.7 / 59.0 |
+| R1× | 4 | operations status | 1.866 / 2.814 | 3.126 / 4.008 | 37.326 | 47.4 / 59.7 / 62.5 / 63.0 |
+| R1× | 4 | agents | 1.063 / 1.354 | 1.624 / 2.060 | 38.031 | 47.0 / 58.1 / 59.4 / 59.9 |
+| R1× | 4 | project agents | 1.242 / 1.800 | 1.580 / 2.048 | 36.536 | 47.4 / 58.7 / 59.8 / 60.3 |
+| R20× | 1 | operations status | 0.670 / 0.829 | 1.150 / 1.769 | 798.387 | 46.8 / 158.2 / 161.7 / 162.1 |
+| R20× | 1 | agents | 0.457 / 0.524 | 0.588 / 0.868 | 790.263 | 47.4 / 160.3 / 161.2 / 161.5 |
+| R20× | 1 | project agents | 0.476 / 0.515 | 0.594 / 1.002 | 745.346 | 47.4 / 155.9 / 156.0 / 156.5 |
+| R20× | 4 | operations status | 1.563 / 2.434 | 2.737 / 3.112 | 727.269 | 47.0 / 157.8 / 161.6 / 162.1 |
+| R20× | 4 | agents | 0.925 / 1.168 | 1.309 / 1.993 | 741.767 | 47.3 / 158.4 / 159.5 / 160.0 |
+| R20× | 4 | project agents | 0.994 / 1.230 | 1.382 / 1.704 | 754.836 | 47.3 / 157.1 / 158.2 / 158.6 |
+| E1× | 1 | operations status | 0.636 / 0.673 | 0.802 / 1.077 | 43.059 | 45.0 / 56.3 / 59.9 / 60.1 |
+| E1× | 1 | agents | 0.458 / 0.500 | 0.544 / 0.733 | 41.956 | 45.2 / 58.1 / 59.0 / 59.0 |
+| E1× | 1 | project agents | 0.484 / 0.518 | 0.627 / 0.941 | 42.772 | 45.3 / 56.6 / 56.7 / 57.1 |
+| E1× | 4 | operations status | 1.561 / 2.192 | 3.361 / 15.024 | 41.925 | 45.8 / 57.0 / 60.4 / 61.4 |
+| E1× | 4 | agents | 1.027 / 1.253 | 1.570 / 5.290 | 42.895 | 45.4 / 57.1 / 59.5 / 60.1 |
+| E1× | 4 | project agents | 1.036 / 1.288 | 1.362 / 1.795 | 42.477 | 45.0 / 56.9 / 59.4 / 59.9 |
+| E20× | 1 | operations status | 0.691 / 0.731 | 0.886 / 1.146 | 911.213 | 51.2 / 159.8 / 160.2 / 160.5 |
+| E20× | 1 | agents | 0.452 / 0.486 | 0.561 / 0.751 | 901.879 | 49.6 / 159.2 / 159.5 / 159.6 |
+| E20× | 1 | project agents | 0.476 / 0.511 | 0.609 / 0.978 | 901.610 | 51.0 / 159.6 / 159.7 / 160.2 |
+| E20× | 4 | operations status | 2.135 / 3.122 | 3.870 / 9.348 | 1009.073 | 51.2 / 162.3 / 163.1 / 164.1 |
+| E20× | 4 | agents | 1.115 / 1.437 | 2.218 / 27.649 | 1234.097 | 50.8 / 162.5 / 163.6 / 164.7 |
+| E20× | 4 | project agents | 1.177 / 1.572 | 2.237 / 32.691 | 1000.820 | 49.8 / 159.3 / 160.4 / 121.4 |
+| R55× | 1 | operations status | 0.922 / 1.025 | 2887.051 / 3403.240 | 2853.784 | 48.5 / 58.5 / 63.0 / 70.5 |
+| R55× | 1 | agents | 0.468 / 0.643 | 2827.528 / 3129.087 | 2984.248 | 49.9 / 60.8 / 60.9 / 72.1 |
+| R55× | 1 | project agents | 0.475 / 0.705 | 2753.402 / 2876.157 | 2924.962 | 48.2 / 60.0 / 61.0 / 68.5 |
+| R55× | 4 | operations status | 1.718 / 2.762 | 2652.892 / 2734.335 | 2724.469 | 48.8 / 59.7 / 62.9 / 68.0 |
+| R55× | 4 | agents | 1.074 / 1.511 | 2732.388 / 3034.957 | 2776.996 | 47.7 / 60.7 / 62.9 / 66.8 |
+| R55× | 4 | project agents | 1.458 / 1.938 | 2852.462 / 2891.145 | 2960.271 | 47.5 / 59.9 / 61.9 / 67.2 |
+
+Outputs are under `/Volumes/Data/tmp/usage-fixes/`: `bench6-after-{reported1,reported20,estimated1,estimated20}-{1,4}.json` and `bench5-after-reported55-{1,4}.json`.
+
+The same over-bound fixture on base `5db8ea0b`:
+
+| Clients | Route | Base idle p50 / p95 | Base active p50 / p95 | Base cold | Base RSS before / cold / idle / active |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | operations status | 2956.716 / 3893.183 | 3018.484 / 3969.922 | 2979.163 | 47.0 / 576.6 / 2032.5 / 1264.1 |
+| 1 | agents | 420.633 / 443.280 | 12173.807 / 14110.676 | 11921.167 | 45.7 / 450.6 / 451.4 / 471.8 |
+| 1 | project agents | 438.457 / 455.184 | 12091.295 / 13834.336 | 13751.571 | 48.3 / 451.3 / 452.2 / 598.4 |
+| 4 | operations status | 16493.164 / 18461.239 | 17921.874 / 26625.839 | 3215.782 | 47.5 / 571.4 / 2980.8 / 3459.9 |
+| 4 | agents | 1354.389 / 1594.151 | 29089.596 / 33049.282 | 18926.576 | 46.1 / 449.5 / 488.8 / 1793.2 |
+| 4 | project agents | 1214.831 / 1521.026 | 26053.328 / 33692.692 | 13176.358 | 47.5 / 451.4 / 490.4 / 2020.2 |
+
+Base outputs: `bench3-base-reported55-{1,4}.json`. The over-bound new build improves p50/p95 and cold latency on all three reads and both client counts. It retains zero index summaries: 232.4 MiB is the rejected minimum allocation, not allocated memory. The response memo keeps idle reads constant; source batches keep active RSS below 80 MiB in these runs.
+
+All 28 projection tests pass. Pure fold uses 3,000 deterministic seeds; repository differential tests cover all surfaces, legacy shapes, batched changes, deletion, timestamps/ownership, running counts and cold/warm equality. Cancellation tests cover every poll boundary through completion for event/reprice deltas. All 18 final-source mutations compiled and were caught by repository tests; results are `/Volumes/Data/tmp/usage-fixes/mutations-final/results.json` and `mutations-ultimate.log`. Clippy (warnings denied), formatting for db/services/api, the release build, and named DB/pricing/Operations/API-Agent tests pass.
+
+The standard runner also completed all 40 scenarios without errors on the final
+release binary: `/Volumes/Data/tmp/perf/heavy/usage5.json` and the repeat
+`/Volumes/Data/tmp/perf/heavy/usage-repeat.json`. Repeat warm p50/p95 was
+0.873/1.294 ms for Operations, 0.499/0.636 ms for Agents, and 0.508/0.688 ms for
+Project Agents, against 36.716/44.502, 11.052/11.862 and 10.709/12.950 ms in
+`final-next.json`. A paired base run is `base-paired.json`; its comparison with
+`usage5.json` is `/Volumes/Data/tmp/usage-fixes/paired-comparison.md`.
+Unchanged Task list routes varied by +0.122/+0.187/+0.158 ms (limits 20/50/100,
+4–8%) on the repeat versus that paired base. These small host/run differences
+are recorded rather than treated as evidence of a change to those routes.
+
+Sequential warm/active p50 stays flat between 1× and 20× for both pricing
+shapes. Four-client estimated-cost active p95 is less stable: 9.348 ms for
+Operations, 27.649 ms for Agents and 32.691 ms for Project Agents at 20×.
+Those tails remain visible in the table; this measurement does not establish
+flat concurrent p95. Over-bound active reads intentionally use the bounded
+fresh fallback, while idle reads retain the constant-cost response memo.

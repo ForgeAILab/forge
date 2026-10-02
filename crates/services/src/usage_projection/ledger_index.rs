@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 const REASONS: usize = 10;
 const MAX_INDEX_BYTES: usize = 128 * 1024 * 1024;
+const READ_MEMORY_RESERVE: usize = 8 * 1024 * 1024;
 const REASON_CODES: [CostCoverageReasonCode; REASONS] = [
     CostCoverageReasonCode::Pending,
     CostCoverageReasonCode::Unsettled,
@@ -31,6 +32,8 @@ struct Watermarks {
     invocation_revision: i64,
     execution_revision: i64,
     deletion_generation: i64,
+    rows: [i64; 4],
+    owned_executions: i64,
 }
 impl Watermarks {
     async fn read(connection: &mut sqlx::SqliteConnection) -> Result<Self> {
@@ -45,6 +48,13 @@ impl Watermarks {
             invocation_revision: r.try_get("invocation_revision")?,
             execution_revision: r.try_get("execution_revision")?,
             deletion_generation: r.try_get("deletion_generation")?,
+            owned_executions: r.try_get("owned_execution_count")?,
+            rows: [
+                r.try_get("invocation_count")?,
+                r.try_get("event_count")?,
+                r.try_get("estimate_count")?,
+                r.try_get("execution_count")?,
+            ],
         })
     }
 }
@@ -406,9 +416,9 @@ impl Run {
     }
 }
 
-// Reported provenance is invariant for each key, so only its reference count is
-// retained. Estimated provenance needs ordering citations: freshness/formula/
-// retrospective fields can differ for the same key. No event payload is kept.
+// One count and maximum order per distinct reference, not per event. A reprice
+// which removes a maximum is repaired from the same read snapshot before the
+// delta is published. Frozen pricing ids keep references stable.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SourceOrder {
     source: Arc<str>,
@@ -418,9 +428,155 @@ struct SourceOrder {
     event: Arc<str>,
 }
 #[derive(Debug)]
-enum Citations {
-    Uniform(CostSourceRef, i64),
-    Ordered(BTreeMap<SourceOrder, CostSourceRef>),
+struct Citation {
+    reference: CostSourceRef,
+    count: i64,
+    winner: Option<SourceOrder>,
+    needs_repair: bool,
+}
+#[derive(Debug, Default)]
+struct Citations {
+    variants: BTreeMap<String, Citation>,
+    winners: BTreeMap<SourceOrder, String>,
+    bytes: usize,
+    pending: usize,
+}
+impl Citations {
+    fn variant_key(reference: &CostSourceRef) -> Result<String> {
+        serde_json::to_string(reference).map_err(|_| invalid_transition())
+    }
+    fn charge(key: &str, citation: &Citation) -> usize {
+        // Inline BTree entries, allocator/node overhead, serialized identity,
+        // provenance strings and its public-cache copy; winners retain one
+        // order/key per variant. This is independent of citation count.
+        let reference = &citation.reference;
+        let strings = [
+            &reference.rate_revision_id,
+            &reference.catalog_snapshot_id,
+            &reference.catalog_digest,
+            &reference.effective_at,
+            &reference.fetched_at,
+            &reference.formula_revision,
+        ]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(|s| s.capacity() + 16)
+        .sum::<usize>();
+        std::mem::size_of::<Citation>()
+            + std::mem::size_of::<CostSourceRef>()
+            + key.len() * 2
+            + strings * 2
+            + 256
+            + citation.winner.as_ref().map_or(0, |order| {
+                std::mem::size_of::<SourceOrder>()
+                    + order.source.len()
+                    + order.invocation.len()
+                    + order.occurred.len()
+                    + order.event.len()
+                    + 96
+            })
+    }
+    fn heap_bytes(&self) -> usize {
+        self.bytes
+    }
+    fn change(
+        &mut self,
+        reference: &CostSourceRef,
+        order: SourceOrder,
+        sign: i64,
+        uniform: bool,
+    ) -> Result<()> {
+        let key = Self::variant_key(reference)?;
+        let old = self.variants.remove(&key);
+        let mut citation = if let Some(c) = old {
+            self.bytes = self
+                .bytes
+                .checked_sub(Self::charge(&key, &c))
+                .ok_or_else(invalid_transition)?;
+            if c.needs_repair {
+                self.pending -= 1;
+            }
+            if let Some(order) = &c.winner {
+                self.winners.remove(order);
+            }
+            c
+        } else {
+            if sign < 0 {
+                return Err(invalid_transition());
+            }
+            Citation {
+                reference: reference.clone(),
+                count: 0,
+                winner: None,
+                needs_repair: false,
+            }
+        };
+        change(&mut citation.count, 1, sign)?;
+        if sign > 0 {
+            if citation.winner.as_ref().is_none_or(|old| order > *old) {
+                citation.winner = Some(order);
+            }
+        } else if !uniform && citation.winner.as_ref() == Some(&order) {
+            citation.winner = None;
+            citation.needs_repair = citation.count > 0;
+        }
+        if citation.count > 0 {
+            self.bytes += Self::charge(&key, &citation);
+            if citation.needs_repair {
+                self.pending += 1;
+            }
+            if let Some(order) = &citation.winner {
+                self.winners.insert(order.clone(), key.clone());
+            }
+            self.variants.insert(key, citation);
+        }
+        Ok(())
+    }
+    fn repair(&mut self, reference: &CostSourceRef, winner: Option<SourceOrder>) -> Result<()> {
+        let key = Self::variant_key(reference)?;
+        if let Some(citation) = self.variants.get_mut(&key) {
+            let before = Self::charge(&key, citation);
+            if let Some(order) = &citation.winner {
+                self.winners.remove(order);
+            }
+            if citation.needs_repair {
+                self.pending -= 1;
+            }
+            // A known retained winner can be older than another event added
+            // in this delta. Both are valid candidates; keep the greater order.
+            citation.winner = citation.winner.take().max(winner);
+            citation.needs_repair = false;
+            if let Some(order) = &citation.winner {
+                self.winners.insert(order.clone(), key.clone());
+            }
+            self.bytes = self
+                .bytes
+                .checked_add_signed(Self::charge(&key, citation) as isize - before as isize)
+                .ok_or_else(invalid_transition)?;
+        }
+        Ok(())
+    }
+    fn contains_winner(&self, reference: &CostSourceRef, order: &SourceOrder) -> Result<bool> {
+        Ok(self
+            .variants
+            .get(&Self::variant_key(reference)?)
+            .is_some_and(|c| c.count > 1 && c.winner.as_ref() == Some(order)))
+    }
+    fn winner(&self) -> Result<CostSourceRef> {
+        if self.pending > 0 {
+            return Err(invalid_transition());
+        }
+        let (_, key) = self
+            .winners
+            .last_key_value()
+            .ok_or_else(invalid_transition)?;
+        Ok(self
+            .variants
+            .get(key)
+            .ok_or_else(invalid_transition)?
+            .reference
+            .clone())
+    }
 }
 #[derive(Debug, Default)]
 struct Rollup {
@@ -436,28 +592,9 @@ impl Rollup {
         order: SourceOrder,
         sign: i64,
     ) -> Result<()> {
-        let book = self.sources.entry(key.to_owned()).or_insert_with(|| {
-            if key.starts_with("reported:") {
-                Citations::Uniform(source.clone(), 0)
-            } else {
-                Citations::Ordered(BTreeMap::new())
-            }
-        });
-        let empty = match book {
-            Citations::Uniform(_, count) => {
-                change(count, 1, sign)?;
-                *count == 0
-            }
-            Citations::Ordered(entries) => {
-                if sign > 0 {
-                    entries.insert(order, source.clone());
-                } else {
-                    entries.remove(&order).ok_or_else(invalid_transition)?;
-                }
-                entries.is_empty()
-            }
-        };
-        if empty {
+        let book = self.sources.entry(key.to_owned()).or_default();
+        book.change(source, order, sign, key.starts_with("reported:"))?;
+        if book.variants.is_empty() {
             self.sources.remove(key);
         }
         self.cached = None;
@@ -467,16 +604,10 @@ impl Rollup {
         if let Some(value) = &self.cached {
             return Ok(value.clone());
         }
-        let mut sources = self
-            .sources
-            .values()
-            .map(|entries| match entries {
-                Citations::Uniform(source, _) => source.clone(),
-                Citations::Ordered(values) => {
-                    values.last_key_value().expect("nonempty source").1.clone()
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut sources = Vec::with_capacity(self.sources.len());
+        for book in self.sources.values() {
+            sources.push(book.winner()?);
+        }
         sources.sort_by(|a, b| {
             source_order(a.source_kind)
                 .cmp(&source_order(b.source_kind))
@@ -566,7 +697,8 @@ impl ExecutionStats {
 #[derive(Debug, Default)]
 struct State {
     watermarks: Option<Watermarks>,
-    overflow: Option<i64>,
+    overflow: Option<Overflow>,
+    observed_header: Option<Watermarks>,
     invocations: HashMap<Arc<str>, Invocation>,
     executions: HashMap<Arc<str>, Execution>,
     runs: HashMap<ScopedRun, Run>,
@@ -603,6 +735,9 @@ impl State {
             r.domain = domain;
         }
         let new = r.totals(key.1.surface);
+        if r.domain.is_none() && r.attempts.coverage[7] == 0 {
+            self.runs.remove(&key);
+        }
         let total = self.scopes.entry(key.0).or_default();
         total.totals.change(&old, -1)?;
         total.totals.change(&new, 1)?;
@@ -653,11 +788,11 @@ impl State {
                 foreign: HashMap::new(),
             };
             let after = item.events.attempt(item.lifecycle, item.telemetry);
-            self.bytes += std::mem::size_of::<Invocation>()
-                + id.len()
+            self.bytes += id.len()
                 + run.source_id.len()
                 + owner.as_ref().map_or(0, |s: &Arc<str>| s.len())
-                + 256;
+                + std::mem::size_of::<RunKey>()
+                + 128;
             self.run_change((None, run.clone()), None, Some(after.clone()), None)?;
             if owner.is_some() {
                 self.run_change((owner, run), None, Some(after), None)?;
@@ -706,31 +841,26 @@ impl State {
         };
         for scope in &scopes {
             if let Some((key, value)) = source {
-                self.scopes.entry(scope.clone()).or_default().source(
-                    key,
-                    value,
-                    order.clone(),
-                    sign,
-                )?;
-                if !key.starts_with("reported:") {
-                    let size = std::mem::size_of::<SourceOrder>()
-                        + std::mem::size_of::<CostSourceRef>()
-                        + key.len()
-                        + order.source.len()
-                        + order.invocation.len()
-                        + order.occurred.len()
-                        + order.event.len()
-                        + 512;
-                    self.bytes = self
-                        .bytes
-                        .checked_add_signed(sign as isize * size as isize)
-                        .ok_or_else(invalid_transition)?;
-                }
+                let rollup = self.scopes.entry(scope.clone()).or_default();
+                let before = rollup
+                    .sources
+                    .get(key)
+                    .map_or(0, |book| book.heap_bytes() + key.len() + 96);
+                rollup.source(key, value, order.clone(), sign)?;
+                let after = rollup
+                    .sources
+                    .get(key)
+                    .map_or(0, |book| book.heap_bytes() + key.len() + 96);
+                self.bytes = self
+                    .bytes
+                    .checked_add_signed(after as isize - before as isize)
+                    .ok_or_else(invalid_transition)?;
             }
         }
         let previous_heap = {
             let i = self.invocations.get(&id).expect("indexed invocation");
             i.events.heap_bytes()
+                + i.foreign.capacity() * (std::mem::size_of::<(Arc<str>, Events)>() + 2) * 8 / 7
                 + foreign
                     .as_ref()
                     .and_then(|a| i.foreign.get(a))
@@ -740,7 +870,7 @@ impl State {
         i.events.change(&e, sign)?;
         if let Some(agent) = &foreign {
             if !i.foreign.contains_key(agent) {
-                self.bytes += std::mem::size_of::<Events>() + agent.len() + 128;
+                self.bytes += agent.len() + 32;
             }
             i.foreign
                 .entry(agent.clone())
@@ -748,13 +878,14 @@ impl State {
                 .change(&e, sign)?;
         }
         let new_heap = i.events.heap_bytes()
+            + i.foreign.capacity() * (std::mem::size_of::<(Arc<str>, Events)>() + 2) * 8 / 7
             + foreign
                 .as_ref()
                 .and_then(|a| i.foreign.get(a))
                 .map_or(0, Events::heap_bytes);
         self.bytes = self
             .bytes
-            .checked_add(new_heap - previous_heap)
+            .checked_add_signed(new_heap as isize - previous_heap as isize)
             .ok_or_else(invalid_transition)?;
         let after = scopes
             .iter()
@@ -796,10 +927,10 @@ impl State {
                 self.run_change((old.owner, old.run), None, None, Some(None))?;
             }
         } else {
-            self.bytes += std::mem::size_of::<Execution>()
-                + id.len() * 2
+            self.bytes += id.len() * 2
                 + new.owner.as_ref().map_or(0, |s| s.len())
-                + 128;
+                + std::mem::size_of::<RunKey>()
+                + 96;
         }
         if let Some(owner) = &new.owner {
             self.execution_stats
@@ -819,168 +950,798 @@ impl State {
         self.executions.insert(id, new);
         Ok(())
     }
+    fn charged_bytes(&self) -> usize {
+        fn table<K, V>(capacity: usize) -> usize {
+            capacity * (std::mem::size_of::<(K, V)>() + 2) * 8 / 7 + 64
+        }
+        let live = self.bytes
+            + table::<Arc<str>,Invocation>(self.invocations.capacity())
+            + table::<Arc<str>,Execution>(self.executions.capacity())
+            + table::<ScopedRun,Run>(self.runs.capacity())
+            + table::<Scope,Rollup>(self.scopes.capacity())
+            + table::<Arc<str>,ExecutionStats>(self.execution_stats.capacity())
+            // Rollup caches own a second copy of the small public vocabulary;
+            // BTree nodes and keys are charged conservatively here.
+            + self.scopes.len() * 4096;
+        // Allocator arenas retain freed read batches and retired hash-table
+        // buckets. Include a 50% reserve in the enforced charge;
+        // RSS calibration is recorded with the release benchmark results.
+        live.saturating_mul(3) / 2
+            + if self.invocations.is_empty() && self.executions.is_empty() {
+                0
+            } else {
+                READ_MEMORY_RESERVE
+            }
+    }
     fn bound(&self) -> bool {
-        self.bytes + self.runs.len() * (std::mem::size_of::<Run>() + 256) + self.scopes.len() * 2048
-            > MAX_INDEX_BYTES
+        self.charged_bytes() > MAX_INDEX_BYTES
     }
 }
 
-/// One per database in the shared server/Solo graph. A warm read probes one
-/// singleton row. Deltas replace compact attempt/run summaries and update
-/// running totals; they never fold the historical run map. At the charged
-/// 128 MiB bound the index is discarded and reads use the fresh reference until
-/// a deletion generation permits a smaller rebuild. Correctness wins at the bound.
+#[derive(Debug, Clone, Copy)]
+struct Overflow {
+    header: Watermarks,
+    rows: i64,
+}
+#[derive(Debug, Default)]
+struct Fallback {
+    header: Option<Watermarks>,
+    operations: Option<UsageAggregate>,
+    agents: HashMap<String, UsageAggregate>,
+    stats: HashMap<String, (db::AgentExecutionStats, i64)>,
+    bytes: usize,
+}
+const MAX_FALLBACK_BYTES: usize = 32 * 1024 * 1024;
+impl Fallback {
+    fn charge(value: &UsageAggregate) -> usize {
+        serde_json::to_string(value).map_or(MAX_FALLBACK_BYTES + 1, |s| s.len() * 2 + 1024)
+    }
+    fn room(&mut self, bytes: usize) {
+        if self.bytes + bytes > MAX_FALLBACK_BYTES
+            || self.agents.len() >= 256
+            || self.stats.len() >= 256
+        {
+            self.operations = None;
+            self.agents.clear();
+            self.stats.clear();
+            self.bytes = 0;
+        }
+    }
+    fn store_operations(&mut self, value: &UsageAggregate) {
+        let bytes = Self::charge(value);
+        self.room(bytes);
+        if bytes <= MAX_FALLBACK_BYTES {
+            self.operations = Some(value.clone());
+            self.bytes += bytes;
+        }
+    }
+    fn store_agent(&mut self, id: &str, value: &UsageAggregate) {
+        let bytes = Self::charge(value) + id.len();
+        self.room(bytes);
+        if bytes <= MAX_FALLBACK_BYTES {
+            self.agents.insert(id.to_owned(), value.clone());
+            self.bytes += bytes;
+        }
+    }
+}
+
+/// One shared, bounded observation index per database. Reads stage all deltas in
+/// a snapshot, then publish them synchronously. Cancellation cannot publish a
+/// partial delta. Oversized ledgers use separately memoized fresh aggregates.
 #[derive(Debug)]
 pub struct UsageLedgerIndex {
     db: Arc<db::SqliteDb>,
     state: tokio::sync::Mutex<State>,
+    fallback: tokio::sync::Mutex<Fallback>,
+    operations_fill: tokio::sync::Mutex<()>,
+    agents_fill: tokio::sync::Mutex<()>,
 }
 impl UsageLedgerIndex {
     pub fn new(db: Arc<db::SqliteDb>) -> Self {
         Self {
             db,
             state: tokio::sync::Mutex::new(State::default()),
+            fallback: tokio::sync::Mutex::new(Fallback::default()),
+            operations_fill: tokio::sync::Mutex::new(()),
+            agents_fill: tokio::sync::Mutex::new(()),
         }
     }
     pub async fn operations(&self) -> Result<UsageAggregate> {
         let mut state = self.state.lock().await;
-        self.sync(&mut state).await?;
-        if state.overflow.is_some() {
-            return usage_aggregate_for_operations(&self.db).await;
+        let header = self.sync(&mut state).await?;
+        if state.overflow.is_none() {
+            match state.scopes.entry(None).or_default().public() {
+                Ok(value) => return Ok(value),
+                Err(error) => self.invariant_failure(&mut state, header, &error),
+            }
         }
-        state.scopes.entry(None).or_default().public()
+        drop(state);
+        if let Some(value) = {
+            let memo = self.fallback.lock().await;
+            if memo.header == Some(header) {
+                memo.operations.clone()
+            } else {
+                None
+            }
+        } {
+            return Ok(value);
+        }
+        // Coalesce concurrent reads of the same oversized ledger. This gate
+        // is separate from Agent fills and the observation-index mutex.
+        let _fill = self.operations_fill.lock().await;
+        let mut tx = self.db.pool().begin().await?;
+        let header = Watermarks::read(&mut tx).await?;
+        self.prepare_fallback(&mut tx, header).await?;
+        if let Some(value) = {
+            let memo = self.fallback.lock().await;
+            memo.operations.clone()
+        } {
+            return Ok(value);
+        }
+        let value = match overflow_usage_snapshot(&mut tx, None).await?.remove(&None) {
+            Some(value) => value,
+            None => {
+                tracing::error!(
+                    "usage overflow fold lost Operations scope; using independent fresh reference"
+                );
+                operations_usage_in_snapshot(&mut tx).await?
+            }
+        };
+        tx.commit().await?;
+        let mut memo = self.fallback.lock().await;
+        if memo.header == Some(header) {
+            memo.store_operations(&value);
+        }
+        Ok(value)
     }
     pub async fn agent(&self, id: &str) -> Result<UsageAggregate> {
-        self.agents(&[id.to_owned()])
-            .await?
-            .remove(id)
-            .ok_or_else(invalid_transition)
+        // agents() constructs an entry for every requested id, including ids
+        // with no activity. This local fallback also preserves that contract.
+        match self.agents(&[id.to_owned()]).await?.remove(id) {
+            Some(value) => Ok(value),
+            None => Totals::default().public(Vec::new()),
+        }
     }
     pub async fn agents(&self, ids: &[String]) -> Result<HashMap<String, UsageAggregate>> {
         let mut state = self.state.lock().await;
-        self.sync(&mut state).await?;
-        if state.overflow.is_some() {
-            let mut tx = self.db.pool().begin().await?;
-            let values = agent_usage_in_snapshot(&mut tx, ids).await?;
-            tx.commit().await?;
-            return Ok(values);
+        let header = self.sync(&mut state).await?;
+        if state.overflow.is_none() {
+            let result = ids
+                .iter()
+                .map(|id| {
+                    let value = match state.scopes.get_mut(&Some(Arc::from(id.as_str()))) {
+                        Some(scope) => scope.public()?,
+                        None => Totals::default().public(Vec::new())?,
+                    };
+                    Ok((id.clone(), value))
+                })
+                .collect::<Result<HashMap<_, _>>>();
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => self.invariant_failure(&mut state, header, &error),
+            }
         }
+        drop(state);
+        {
+            let memo = self.fallback.lock().await;
+            if memo.header == Some(header) && ids.iter().all(|id| memo.agents.contains_key(id)) {
+                return Ok(ids
+                    .iter()
+                    .map(|id| (id.clone(), memo.agents[id].clone()))
+                    .collect());
+            }
+        }
+        let _fill = self.agents_fill.lock().await;
+        let mut tx = self.db.pool().begin().await?;
+        let header = Watermarks::read(&mut tx).await?;
+        self.prepare_fallback(&mut tx, header).await?;
         let mut result = HashMap::new();
-        for id in ids {
-            let key = Some(Arc::<str>::from(id.as_str()));
-            let value = if let Some(scope) = state.scopes.get_mut(&key) {
-                scope.public()?
-            } else {
-                Totals::default().public(Vec::new())?
-            };
-            result.insert(id.clone(), value);
+        let missing = {
+            let memo = self.fallback.lock().await;
+            ids.iter()
+                .filter_map(|id| {
+                    if let Some(value) = memo.agents.get(id) {
+                        result.insert(id.clone(), value.clone());
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if !missing.is_empty() {
+            let values = overflow_usage_snapshot(&mut tx, Some(&missing))
+                .await?
+                .into_iter()
+                .filter_map(|(scope, value)| scope.map(|id| (id.to_string(), value)))
+                .collect::<HashMap<_, _>>();
+            let mut memo = self.fallback.lock().await;
+            for (id, value) in values {
+                if memo.header == Some(header) {
+                    memo.store_agent(&id, &value);
+                }
+                result.insert(id, value);
+            }
         }
+        tx.commit().await?;
         Ok(result)
     }
-    /// Page statistics share the execution deltas; active assignment counts
-    /// remain a live repository query. No terminal history scan on ledger appends.
+    /// Assignment counts stay live; execution deltas supply page statistics.
     pub async fn agent_execution_stats(
         &self,
         ids: &[String],
     ) -> Result<HashMap<String, (db::AgentExecutionStats, i64)>> {
-        use db::{AgentRepo, ExecutionRepo};
         let mut state = self.state.lock().await;
         self.sync(&mut state).await?;
         let mut result = HashMap::new();
-        for id in ids {
-            let key: Arc<str> = Arc::from(id.as_str());
-            if state.overflow.is_some() {
-                result.insert(
-                    id.clone(),
-                    (
-                        ExecutionRepo::stats_by_agent(&*self.db, id).await?,
-                        AgentRepo::count_running_executions(&*self.db, id).await?,
-                    ),
-                );
-                continue;
-            }
-            let Some(stats) = state.execution_stats.get_mut(&key) else {
+        if state.overflow.is_none() {
+            for id in ids {
+                let stats = state
+                    .execution_stats
+                    .entry(Arc::from(id.as_str()))
+                    .or_default();
+                let average = if let Some(value) = stats.average() {
+                    value
+                } else {
+                    let value = db::ExecutionRepo::stats_by_agent(&*self.db, id)
+                        .await?
+                        .avg_duration_ms;
+                    if stats.unstable == 0 {
+                        stats.cached_average = Some(value);
+                    }
+                    value
+                };
                 result.insert(
                     id.clone(),
                     (
                         db::AgentExecutionStats {
-                            avg_duration_ms: None,
-                            success_rate: None,
+                            avg_duration_ms: average,
+                            success_rate: (stats.count > 0)
+                                .then_some(stats.completed as f64 / stats.count as f64),
                         },
-                        0,
+                        stats.running,
                     ),
                 );
-                continue;
-            };
-
-            let average = if let Some(average) = stats.average() {
-                average
-            } else {
-                let value = ExecutionRepo::stats_by_agent(&*self.db, id)
-                    .await?
-                    .avg_duration_ms;
-                if stats.unstable == 0 {
-                    stats.cached_average = Some(value);
-                }
-                value
-            };
-            result.insert(
-                id.clone(),
-                (
-                    db::AgentExecutionStats {
-                        avg_duration_ms: average,
-                        success_rate: (stats.count > 0)
-                            .then_some(stats.completed as f64 / stats.count as f64),
-                    },
-                    stats.running,
-                ),
-            );
+            }
+            return Ok(result);
         }
+        drop(state);
+        let mut tx = self.db.pool().begin().await?;
+        let header = Watermarks::read(&mut tx).await?;
+        self.prepare_fallback(&mut tx, header).await?;
+        let missing = {
+            let memo = self.fallback.lock().await;
+            ids.iter()
+                .filter_map(|id| {
+                    if let Some(value) = memo.stats.get(id) {
+                        result.insert(id.clone(), value.clone());
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if !missing.is_empty() {
+            let rows=sqlx::query("WITH requested AS (SELECT value AS id FROM json_each(?)) SELECT requested.id,COUNT(e.id) AS n,COALESCE(SUM(e.status='running'),0) AS running,COALESCE(SUM(e.status='completed'),0) AS completed,AVG(CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END) AS duration,COALESCE(SUM(CASE WHEN e.status!='running' AND (e.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*' OR e.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') THEN 1 ELSE 0 END),0) AS unstable FROM requested LEFT JOIN execution e ON e.agent_id=requested.id GROUP BY requested.id")
+                .bind(serde_json::to_string(&missing).map_err(|_|invalid_transition())?).fetch_all(&mut *tx).await?;
+            let mut memo = self.fallback.lock().await;
+            for row in rows {
+                let id: String = row.try_get("id")?;
+                let n: i64 = row.try_get("n")?;
+                let complete: i64 = row.try_get("completed")?;
+                let value = (
+                    db::AgentExecutionStats {
+                        avg_duration_ms: row
+                            .try_get::<Option<f64>, _>("duration")?
+                            .map(|v| v.round() as i64),
+                        success_rate: (n > 0).then_some(complete as f64 / n as f64),
+                    },
+                    row.try_get("running")?,
+                );
+                if memo.header == Some(header) && row.try_get::<i64, _>("unstable")? == 0 {
+                    memo.room(256);
+                    memo.stats.insert(id.clone(), value.clone());
+                    memo.bytes += 256;
+                }
+                result.insert(id, value);
+            }
+        }
+        tx.commit().await?;
         Ok(result)
     }
-
-    async fn sync(&self, state: &mut State) -> Result<()> {
+    async fn prepare_fallback(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        header: Watermarks,
+    ) -> Result<()> {
+        // This small gate covers cache invalidation only. Fresh computations
+        // run outside both mutexes, so unrelated requests can execute together.
+        let mut memo = self.fallback.lock().await;
+        if memo.header == Some(header) {
+            return Ok(());
+        }
+        let affected = if let Some(old) = memo.header {
+            if old.deletion_generation != header.deletion_generation
+                || old.execution_revision != header.execution_revision
+                || old
+                    .rows
+                    .iter()
+                    .zip(header.rows)
+                    .zip([
+                        (old.invocation_rowid, header.invocation_rowid),
+                        (old.event_rowid, header.event_rowid),
+                        (old.estimate_rowid, header.estimate_rowid),
+                        (old.execution_rowid, header.execution_rowid),
+                    ])
+                    .any(|((&before, after), (old_rowid, new_rowid))| {
+                        after > before && new_rowid <= old_rowid
+                    })
+            {
+                None
+            } else {
+                let rows=sqlx::query("SELECT i.agent_id AS owner,e.agent_id AS attributed FROM usage_event e JOIN usage_invocation i ON i.id=e.invocation_id WHERE e.rowid>?1 AND e.rowid<=?2
+                  UNION SELECT i.agent_id,e.agent_id FROM cost_estimate_revision r JOIN usage_event e ON e.id=r.usage_event_id JOIN usage_invocation i ON i.id=e.invocation_id WHERE r.rowid>?3 AND r.rowid<=?4
+                  UNION SELECT agent_id,NULL FROM usage_invocation WHERE rowid>?5 AND rowid<=?6
+                  UNION SELECT i.agent_id,NULL FROM usage_changed_invocation c JOIN usage_invocation i ON i.id=c.id WHERE c.revision>?7 AND c.revision<=?8
+                  UNION SELECT agent_id,NULL FROM execution WHERE rowid>?9 AND rowid<=?10")
+                    .bind(old.event_rowid).bind(header.event_rowid).bind(old.estimate_rowid).bind(header.estimate_rowid)
+                    .bind(old.invocation_rowid).bind(header.invocation_rowid).bind(old.invocation_revision).bind(header.invocation_revision)
+                    .bind(old.execution_rowid).bind(header.execution_rowid).fetch_all(&mut *connection).await?;
+                let mut affected = HashSet::new();
+                for row in rows {
+                    for column in ["owner", "attributed"] {
+                        if let Some(id) = row.try_get::<Option<String>, _>(column)? {
+                            affected.insert(id);
+                        }
+                    }
+                }
+                Some(affected)
+            }
+        } else {
+            None
+        };
+        // No cache mutation above: cancellation leaves the old header and
+        // values intact. Header and invalidation are now published together.
+        if let Some(affected) = affected {
+            memo.agents.retain(|id, _| !affected.contains(id));
+            if memo
+                .header
+                .is_some_and(|old| old.execution_rowid != header.execution_rowid)
+            {
+                memo.stats.clear();
+            }
+        } else {
+            memo.agents.clear();
+            memo.stats.clear();
+        }
+        memo.operations = None;
+        memo.header = Some(header);
+        // Conservative charge need not decrease on selective invalidation;
+        // insertion's room() clears it before it can exceed the fixed budget.
+        Ok(())
+    }
+    fn minimum_charge(header: Watermarks) -> usize {
+        // Every execution requires a global run, plus a distinct Agent run
+        // when owned. These cannot coalesce because execution ids are unique.
+        // Account for the standard HashMap bucket allocation (validated by a
+        // schema-independent capacity test), without allocating those tables.
+        fn table<K, V>(rows: i64) -> usize {
+            if rows <= 0 {
+                return 0;
+            }
+            let buckets = (rows as usize)
+                .saturating_mul(8)
+                .div_ceil(7)
+                .max(4)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX);
+            buckets.saturating_mul(std::mem::size_of::<(K, V)>() + 2)
+        }
+        let live = table::<Arc<str>, Invocation>(header.rows[0])
+            .saturating_add(table::<Arc<str>, Execution>(header.rows[3]))
+            .saturating_add(table::<ScopedRun, Run>(
+                header.rows[3].saturating_add(header.owned_executions),
+            ));
+        live.saturating_mul(3) / 2
+            + if header.rows[0] > 0 || header.rows[3] > 0 {
+                READ_MEMORY_RESERVE
+            } else {
+                0
+            }
+    }
+    fn invariant_failure(&self, state: &mut State, header: Watermarks, error: &ServiceError) {
+        tracing::error!(%error,"usage index invariant failed; using fresh computation");
+        *state = State {
+            observed_header: Some(header),
+            overflow: Some(Overflow {
+                header,
+                rows: header.rows.iter().sum(),
+            }),
+            ..State::default()
+        };
+    }
+    fn discard(&self, state: &mut State, header: Watermarks, charge: usize) {
+        tracing::warn!(
+            charge,
+            bound = MAX_INDEX_BYTES,
+            invocations = header.rows[0],
+            events = header.rows[1],
+            estimates = header.rows[2],
+            executions = header.rows[3],
+            "usage index discarded at memory bound"
+        );
+        *state = State {
+            observed_header: Some(header),
+            overflow: Some(Overflow {
+                header,
+                rows: header.rows.iter().sum(),
+            }),
+            ..State::default()
+        };
+    }
+    // A synchronous API is the cancellation boundary: the compiler cannot
+    // permit an await between the first mutation and watermark publication.
+    #[allow(clippy::too_many_arguments)]
+    fn publish(
+        &self,
+        state: &mut State,
+        staged: Staged,
+        repairs: Vec<CitationRepair>,
+        actual: Watermarks,
+        observed: Watermarks,
+        cold: bool,
+        was_overflow: bool,
+    ) {
+        #[cfg(test)]
+        let audit = match &staged {
+            Staged::Cold { state, .. } => state.audit,
+            Staged::Delta { audit, .. } => *audit,
+        };
+        match staged {
+            Staged::Cold { state: fresh, .. } => *state = *fresh,
+            Staged::Delta { changes, bytes, .. } => {
+                let mut remaining = bytes - state.charged_bytes();
+                for change in changes {
+                    remaining -= change.staging_bytes();
+                    // Published summaries plus still-private rows share one
+                    // budget, including a hash-table capacity growth step.
+                    if state.projected_charge(&change) + remaining > MAX_INDEX_BYTES {
+                        self.discard(state, observed, state.charged_bytes());
+                        return;
+                    }
+                    if let Err(error) = change.apply(state) {
+                        self.invariant_failure(state, observed, &error);
+                        return;
+                    }
+                }
+            }
+        }
+        for (scope, key, reference, winner) in repairs {
+            if let Some(book) = state
+                .scopes
+                .get_mut(&scope)
+                .and_then(|r| r.sources.get_mut(&key))
+            {
+                let before = book.heap_bytes();
+                if let Err(error) = book.repair(&reference, winner) {
+                    self.invariant_failure(state, observed, &error);
+                    return;
+                }
+                let after = book.heap_bytes();
+                if let Some(bytes) = state
+                    .bytes
+                    .checked_add_signed(after as isize - before as isize)
+                {
+                    state.bytes = bytes;
+                } else {
+                    self.invariant_failure(state, observed, &invalid_transition());
+                    return;
+                }
+            }
+        }
+        // No await is allowed from the first published mutation above through
+        // these watermark assignments. Dropping a future is safe at every await.
+        state.watermarks = Some(actual);
+        state.observed_header = Some(observed);
         #[cfg(test)]
         {
-            state.audit = Audit::default();
-            state.audit.statements = 1;
+            let updates = state.audit.attempt_updates;
+            state.audit = audit;
+            state.audit.attempt_updates = updates;
+        }
+        if state.bound() {
+            self.discard(state, observed, state.charged_bytes());
+        } else if cold {
+            tracing::info!(
+                charge = state.charged_bytes(),
+                invocations = actual.rows[0],
+                events = actual.rows[1],
+                executions = actual.rows[3],
+                "usage index built"
+            );
+        }
+        if was_overflow && state.overflow.is_none() {
+            tracing::info!(charge = state.charged_bytes(), "usage index fits again");
+        }
+    }
+
+    async fn sync(&self, state: &mut State) -> Result<Watermarks> {
+        #[cfg(test)]
+        {
+            state.audit = Audit {
+                statements: 1,
+                ..Audit::default()
+            };
         }
         let header = {
             let mut connection = self.db.pool().acquire().await?;
             Watermarks::read(&mut connection).await?
         };
-        if state.watermarks == Some(header) || state.overflow == Some(header.deletion_generation) {
-            return Ok(());
+        if state.bound() {
+            self.discard(state, header, state.charged_bytes());
+            return Ok(header);
+        }
+        if state.observed_header == Some(header) {
+            return Ok(header);
+        }
+        if let Some(overflow) = state.overflow {
+            // Counts are trigger-maintained, so this fit probe is O(1). A tiny
+            // deletion does not repeat an expensive, known-oversized build.
+            if header.deletion_generation == overflow.header.deletion_generation
+                || header.rows.iter().sum::<i64>() > overflow.rows * 3 / 4
+            {
+                state.observed_header = Some(header);
+                return Ok(header);
+            }
         }
         let mut tx = self.db.pool().begin().await?;
-        let header = Watermarks::read(&mut tx).await?;
-        if state
-            .watermarks
-            .is_none_or(|old| old.deletion_generation != header.deletion_generation)
-            || state.overflow.is_some()
-        {
+        let observed = Watermarks::read(&mut tx).await?;
+        let stalled_cursor = state.observed_header.is_some_and(|old| {
+            old.rows
+                .iter()
+                .zip(observed.rows)
+                .zip([
+                    (old.invocation_rowid, observed.invocation_rowid),
+                    (old.event_rowid, observed.event_rowid),
+                    (old.estimate_rowid, observed.estimate_rowid),
+                    (old.execution_rowid, observed.execution_rowid),
+                ])
+                .any(|((&before, after), (old_rowid, new_rowid))| {
+                    after > before && new_rowid <= old_rowid
+                })
+        });
+        let cold = stalled_cursor
+            || state
+                .watermarks
+                .is_none_or(|old| old.deletion_generation != observed.deletion_generation);
+        let mut actual = observed;
+        if !cold {
+            // A cold-build repair may have found rowids above stale migration
+            // metadata. Preserve those actual scan positions until a normal
+            // insert brings the singleton maxima back into agreement.
+            let old = state.watermarks.expect("warm state");
+            actual.invocation_rowid = actual.invocation_rowid.max(old.invocation_rowid);
+            actual.event_rowid = actual.event_rowid.max(old.event_rowid);
+            actual.estimate_rowid = actual.estimate_rowid.max(old.estimate_rowid);
+            actual.execution_rowid = actual.execution_rowid.max(old.execution_rowid);
+        }
+
+        if cold {
+            let row=sqlx::query("SELECT COALESCE((SELECT MAX(rowid) FROM usage_invocation),0) AS i,COALESCE((SELECT MAX(rowid) FROM usage_event),0) AS e,COALESCE((SELECT MAX(rowid) FROM cost_estimate_revision),0) AS r,COALESCE((SELECT MAX(rowid) FROM execution),0) AS x").fetch_one(&mut *tx).await?;
+            actual.invocation_rowid = row.try_get("i")?;
+            actual.event_rowid = row.try_get("e")?;
+            actual.estimate_rowid = row.try_get("r")?;
+            actual.execution_rowid = row.try_get("x")?;
+            if actual != observed {
+                tracing::error!(
+                    ?observed,
+                    ?actual,
+                    "usage rowid header mismatch; rebuilding observation index"
+                );
+            }
+            if stalled_cursor {
+                tracing::error!("usage row count advanced without its rowid cursor; rebuilding observation index");
+            }
+            let minimum = Self::minimum_charge(observed);
+            if minimum > MAX_INDEX_BYTES {
+                self.discard(state, observed, minimum);
+                return Ok(observed);
+            }
+        }
+        let was_overflow = state.overflow.is_some();
+        if cold && state.watermarks.is_some() {
+            // Deleted ledger rows invalidate the old observation state. Drop
+            // its allocations before building the private replacement so a
+            // reset cannot keep two full indexes alive under one budget.
             *state = State::default();
         }
-        let old = state.watermarks.unwrap_or_default();
-        let result = apply_delta(state, &mut tx, old, header).await;
+        let old = if cold {
+            Watermarks::default()
+        } else {
+            state.watermarks.expect("warm state")
+        };
+        let mut staged = if cold {
+            Staged::Cold {
+                state: Box::default(),
+                discard_charge: None,
+            }
+        } else {
+            Staged::Delta {
+                changes: Vec::new(),
+                bytes: state.charged_bytes(),
+                #[cfg(test)]
+                audit: Audit::default(),
+            }
+        };
+        let result = read_delta(&mut staged, &mut tx, old, actual, cold).await;
         if let Err(error) = result {
-            *state = State::default();
+            if matches!(error, ServiceError::Db(db::DbError::InvalidTransition)) {
+                self.invariant_failure(state, observed, &error);
+                return Ok(observed);
+            }
             return Err(error);
         }
-        if let Err(error) = tx.commit().await {
-            *state = State::default();
-            return Err(error.into());
+        let charge = staged.charged_bytes();
+        if staged.overflowed() {
+            self.discard(state, observed, charge);
+            return Ok(observed);
         }
-        if state.bound() {
-            *state = State {
-                overflow: Some(header.deletion_generation),
-                ..State::default()
-            };
+        let repairs = if cold {
+            Vec::new()
         } else {
-            state.watermarks = Some(header);
-        }
-        Ok(())
+            match citation_repairs(state, &staged, &mut tx, actual).await {
+                Ok(CitationRepairs::Ready(repairs, reserved)) => {
+                    if let Staged::Delta { bytes, .. } = &mut staged {
+                        // Completed repair buffers remain alive while changes
+                        // are published, so publication must retain their reserve.
+                        *bytes = bytes.saturating_add(reserved);
+                    }
+                    repairs
+                }
+                Ok(CitationRepairs::Overflow(charge)) => {
+                    self.discard(state, observed, charge);
+                    return Ok(observed);
+                }
+                Err(error) if matches!(error, ServiceError::Db(db::DbError::InvalidTransition)) => {
+                    self.invariant_failure(state, observed, &error);
+                    return Ok(observed);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        // Finish every fallible/awaiting read before touching published state.
+        tx.commit().await?;
+        self.publish(state, staged, repairs, actual, observed, cold, was_overflow);
+        Ok(observed)
     }
+}
+
+async fn overflow_usage_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+    ids: Option<&[String]>,
+) -> Result<HashMap<Scope, UsageAggregate>> {
+    match bounded_usage_snapshot(connection, ids).await {
+        Err(error) if matches!(error, ServiceError::Db(db::DbError::InvalidTransition)) => {
+            tracing::error!(%error, "usage overflow fold invariant failed; using independent fresh reference");
+            match ids {
+                Some(ids) => Ok(agent_usage_in_snapshot(connection, ids)
+                    .await?
+                    .into_iter()
+                    .map(|(id, value)| (Some(Arc::from(id)), value))
+                    .collect()),
+                None => Ok(HashMap::from([(
+                    None,
+                    operations_usage_in_snapshot(connection).await?,
+                )])),
+            }
+        }
+        result => result,
+    }
+}
+
+/// A fresh fold with bounded source batches. Every logical run stays in one
+/// batch, so run classifications/reason deduplication are summed exactly once.
+/// The reference readers remain independent; only overflow reads use this path.
+async fn bounded_usage_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+    ids: Option<&[String]>,
+) -> Result<HashMap<Scope, UsageAggregate>> {
+    let requested = ids.map(|ids| {
+        ids.iter()
+            .map(|id| Some(Arc::<str>::from(id.as_str())))
+            .collect::<HashSet<_>>()
+    });
+    let ids_json =
+        serde_json::to_string(ids.unwrap_or_default()).map_err(|_| invalid_transition())?;
+    let mut after = String::new();
+    let mut first = true;
+    let mut totals = HashMap::<Scope, Rollup>::new();
+    loop {
+        let boundary = if first { ">=" } else { ">" };
+        let query=format!("SELECT source_id FROM (SELECT DISTINCT source_id FROM usage_invocation WHERE source_id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY source_id LIMIT 128)
+            UNION SELECT source_id FROM (SELECT DISTINCT source_id FROM usage_event WHERE source_id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY source_id LIMIT 128)
+            UNION SELECT source_id FROM (SELECT id AS source_id FROM execution WHERE id {boundary} ?3 AND (?1 OR agent_id IN (SELECT value FROM json_each(?2))) ORDER BY id LIMIT 128)
+            ORDER BY source_id LIMIT 128");
+        let sources = sqlx::query_scalar::<_, String>(&query)
+            .bind(ids.is_none())
+            .bind(&ids_json)
+            .bind(&after)
+            .fetch_all(&mut *connection)
+            .await?;
+        if sources.is_empty() {
+            break;
+        }
+        after = sources.last().expect("source batch").clone();
+        first = false;
+        let invocations = db::SqliteDb::usage_invocations_for_sources(connection, &sources).await?;
+        let mut events = effective_usage_events_for_invocations(connection, &invocations).await?;
+        let mut batch = State::default();
+        for invocation in invocations {
+            let effective = events.remove(&invocation.id).unwrap_or_default();
+            batch.invocation(invocation)?;
+            for event in effective {
+                batch.event(event, 1)?;
+            }
+        }
+        for row in sqlx::query(
+            "SELECT id,agent_id,status FROM execution WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(&sources).map_err(|_| invalid_transition())?)
+        .fetch_all(&mut *connection)
+        .await?
+        {
+            let id: String = row.try_get("id")?;
+            let owner = row
+                .try_get::<Option<String>, _>("agent_id")?
+                .map(Arc::<str>::from);
+            let run = Arc::new(RunKey {
+                surface: DbUsageSurface::TaskExecution,
+                source_id: id,
+            });
+            let domain = Some(Some(row.try_get::<String, _>("status")? == "running"));
+            batch.run_change((None, run.clone()), None, None, domain)?;
+            if owner.is_some() {
+                batch.run_change((owner, run), None, None, domain)?;
+            }
+        }
+        for (scope, rollup) in batch.scopes {
+            if requested.as_ref().is_some_and(|ids| !ids.contains(&scope))
+                || (ids.is_none() && scope.is_some())
+            {
+                continue;
+            }
+            let target = totals.entry(scope).or_default();
+            target.totals.change(&rollup.totals, 1)?;
+            for (key, book) in rollup.sources {
+                let dest = target.sources.entry(key.clone()).or_default();
+                for citation in book.variants.into_values() {
+                    dest.change(
+                        &citation.reference,
+                        citation.winner.ok_or_else(invalid_transition)?,
+                        1,
+                        key.starts_with("reported:"),
+                    )?;
+                    let entry = dest
+                        .variants
+                        .get_mut(&Citations::variant_key(&citation.reference)?)
+                        .ok_or_else(invalid_transition)?;
+                    change(&mut entry.count, citation.count - 1, 1)?;
+                }
+            }
+        }
+    }
+    if let Some(ids) = ids {
+        for id in ids {
+            totals.entry(Some(Arc::from(id.as_str()))).or_default();
+        }
+    } else {
+        totals.entry(None).or_default();
+    }
+    totals
+        .into_iter()
+        .map(|(scope, mut rollup)| Ok((scope, rollup.public()?)))
+        .collect()
 }
 
 async fn effective_events(
@@ -1048,11 +1809,432 @@ async fn effective_events(
     Ok(result)
 }
 
-async fn apply_delta(
-    state: &mut State,
+type CitationRepair = (Scope, String, CostSourceRef, Option<SourceOrder>);
+enum CitationRepairs {
+    Ready(Vec<CitationRepair>, usize),
+    Overflow(usize),
+}
+async fn citation_repairs(
+    state: &State,
+    staged: &Staged,
+    connection: &mut sqlx::SqliteConnection,
+    through: Watermarks,
+) -> Result<CitationRepairs> {
+    let Staged::Delta { changes, .. } = staged else {
+        return Ok(CitationRepairs::Ready(Vec::new(), 0));
+    };
+    // A reprice may change only the amount. Its winning event then retains
+    // the same provenance and order, so no historical lookup is necessary.
+    let revised = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Event(event, -1) => Some(event.event.id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    if revised.is_empty() {
+        return Ok(CitationRepairs::Ready(Vec::new(), 0));
+    }
+    let retained = changes
+        .iter()
+        .filter_map(|change| match change {
+            Change::Event(event, 1) if revised.contains(event.event.id.as_str()) => event
+                .source
+                .as_ref()
+                .map(|source| (event.event.id.as_str(), source)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut requests = Vec::<(Scope, String, CostSourceRef, Option<SourceOrder>)>::new();
+    let mut requested = HashSet::new();
+    let mut charge = staged.charged_bytes();
+    for change in changes {
+        let Change::Event(event, -1) = change else {
+            continue;
+        };
+        let Some((key, reference)) = &event.source else {
+            continue;
+        };
+        if key.starts_with("reported:") {
+            continue;
+        }
+        let invocation = state
+            .invocations
+            .get(event.event.invocation_id.as_str())
+            .ok_or_else(invalid_transition)?;
+        let order = SourceOrder {
+            source: Arc::from(invocation.run.source_id.as_str()),
+            ordinal: invocation.ordinal,
+            invocation: Arc::from(event.event.invocation_id.as_str()),
+            occurred: Arc::from(event.event.occurred_at.as_str()),
+            event: Arc::from(event.event.id.as_str()),
+        };
+        let retained_order = retained
+            .get(event.event.id.as_str())
+            .is_some_and(|(new_key, new_reference)| new_key == key && new_reference == reference)
+            .then(|| order.clone());
+        let mut scopes = vec![None];
+        if invocation.owner.is_some() {
+            scopes.push(invocation.owner.clone());
+        }
+        if let Some(agent) = event
+            .event
+            .agent_id
+            .as_deref()
+            .filter(|agent| invocation.owner.as_deref() != Some(*agent))
+        {
+            scopes.push(Some(Arc::from(agent)));
+        }
+        for scope in scopes {
+            let Some(rollup) = state.scopes.get(&scope) else {
+                continue;
+            };
+            if rollup
+                .sources
+                .get(key)
+                .map(|book| book.contains_winner(reference, &order))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                let variant = Citations::variant_key(reference)?;
+                if requested.insert((scope.clone(), key.clone(), variant.clone())) {
+                    // Requests and completed repairs coexist with the staged
+                    // delta. Reserve their owned provenance/order buffers before
+                    // retaining them; the query itself uses 150-row batches.
+                    charge = charge.saturating_add(
+                        4096 + Citations::charge(
+                            &variant,
+                            &Citation {
+                                reference: reference.clone(),
+                                count: 1,
+                                winner: Some(order.clone()),
+                                needs_repair: false,
+                            },
+                        ),
+                    );
+                    if charge > MAX_INDEX_BYTES {
+                        return Ok(CitationRepairs::Overflow(charge));
+                    }
+                    requests.push((
+                        scope,
+                        key.clone(),
+                        reference.clone(),
+                        retained_order.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut repairs = Vec::with_capacity(requests.len());
+    for (scope, key, reference, retained_order) in requests {
+        if let Some(order) = retained_order {
+            repairs.push((scope, key, reference, Some(order)));
+            continue;
+        }
+        let mut offset = 0i64;
+        let winner = loop {
+            // Narrow by immutable provenance ids and variant fields, then seek
+            // in the exact source/attempt/invocation/occurrence/event order.
+            // Only a removed winner needs this query; ordinary appends do not.
+            let ids=sqlx::query_scalar::<_,String>("SELECT e.id FROM usage_event e
+              JOIN usage_invocation i ON i.id=e.invocation_id
+              LEFT JOIN cost_estimate_revision er ON er.id=(SELECT prior.id FROM cost_estimate_revision prior
+                WHERE prior.usage_event_id=e.id AND prior.state='applied' AND prior.rowid<=?1
+                ORDER BY prior.revision DESC,prior.created_at DESC,prior.id DESC LIMIT 1)
+              LEFT JOIN pricing_selection ps ON ps.id=i.pricing_selection_id
+              LEFT JOIN pricing_rate_revision r ON r.id=COALESCE(er.rate_revision_id,e.rate_revision_id,ps.rate_revision_id)
+              WHERE e.rowid<=?2 AND i.lifecycle!='unsettled'
+                AND (?3 IS NULL OR i.agent_id=?3 OR e.agent_id=?3)
+                AND COALESCE(er.rate_revision_id,e.rate_revision_id,ps.rate_revision_id) IS ?4
+                AND COALESCE(er.catalog_snapshot_id,e.catalog_snapshot_id,r.catalog_snapshot_id,ps.catalog_snapshot_id) IS ?5
+                AND COALESCE(er.formula_revision,e.formula_revision) IS ?6
+                AND COALESCE(er.retrospective,e.retrospective)=?7
+              ORDER BY i.source_id DESC,i.attempt_ordinal DESC,i.id DESC,e.occurred_at DESC,e.id DESC
+              LIMIT 150 OFFSET ?8")
+                .bind(through.estimate_rowid).bind(through.event_rowid).bind(scope.as_deref())
+                .bind(&reference.rate_revision_id).bind(&reference.catalog_snapshot_id).bind(&reference.formula_revision)
+                .bind(reference.retrospective).bind(offset).fetch_all(&mut *connection).await?;
+            if ids.is_empty() {
+                break None;
+            }
+            offset += ids.len() as i64;
+            let rows = db::SqliteDb::usage_events_by_ids(connection, &ids).await?;
+            let mut effective = effective_events(connection, rows, through.estimate_rowid)
+                .await?
+                .into_iter()
+                .map(|e| (e.event.id.clone(), e))
+                .collect::<HashMap<_, _>>();
+            let mut winner = None;
+            for id in ids {
+                let e = effective.remove(&id).ok_or_else(invalid_transition)?;
+                if e.source.as_ref() == Some(&(key.clone(), reference.clone())) {
+                    winner = Some(SourceOrder {
+                        source: Arc::from(e.event.source_id.as_str()),
+                        ordinal: e.event.attempt_ordinal,
+                        invocation: Arc::from(e.event.invocation_id.as_str()),
+                        occurred: Arc::from(e.event.occurred_at.as_str()),
+                        event: Arc::from(e.event.id.as_str()),
+                    });
+                    break;
+                }
+            }
+            if winner.is_some() {
+                break winner;
+            }
+        };
+        repairs.push((scope, key, reference, winner));
+    }
+    Ok(CitationRepairs::Ready(
+        repairs,
+        charge - staged.charged_bytes(),
+    ))
+}
+
+enum Change {
+    Invocation(Box<UsageInvocation>),
+    Event(Box<EffectiveUsageEvent>, i64),
+    Execution(sqlx::sqlite::SqliteRow),
+    RemoveExecution(String),
+}
+impl Change {
+    fn staging_bytes(&self) -> usize {
+        let strings = match self {
+            Self::Invocation(i) => {
+                let mandatory = [
+                    &i.id,
+                    &i.source_id,
+                    &i.domain_idempotency_key,
+                    &i.pricing_selection_id,
+                    &i.admitted_at,
+                    &i.created_at,
+                    &i.updated_at,
+                ]
+                .iter()
+                .map(|s| s.capacity() + 16)
+                .sum::<usize>();
+                let optional = [
+                    &i.owner_user_id,
+                    &i.project_id,
+                    &i.execution_id,
+                    &i.task_id,
+                    &i.candidate_key,
+                    &i.admitted_provider_id,
+                    &i.admitted_model_id,
+                    &i.admitted_runtime_model,
+                    &i.pricing_subject_id,
+                    &i.pricing_subject_revision_id,
+                    &i.subject_revision_digest,
+                    &i.agent_id,
+                    &i.profile_id,
+                    &i.agent_name_snapshot,
+                    &i.project_name_snapshot,
+                    &i.executor_type,
+                    &i.backend_kind,
+                    &i.terminal_reason,
+                    &i.started_at,
+                    &i.settled_at,
+                ]
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.capacity() + 16)
+                .sum::<usize>();
+                mandatory + optional
+            }
+            Self::Event(e, _) => {
+                let v = &e.event;
+                let mandatory = [
+                    &v.id,
+                    &v.invocation_id,
+                    &v.source_id,
+                    &v.event_idempotency_key,
+                    &v.source_report_id,
+                    &v.legacy_counter_values_json,
+                    &v.occurred_at,
+                    &v.created_at,
+                ]
+                .iter()
+                .map(|s| s.capacity() + 16)
+                .sum::<usize>();
+                let optional = [
+                    &v.owner_user_id,
+                    &v.project_id,
+                    &v.execution_id,
+                    &v.task_id,
+                    &v.legacy_source_table,
+                    &v.legacy_source_id,
+                    &v.legacy_provider_raw,
+                    &v.legacy_provider_sqlite_type,
+                    &v.legacy_provider_sql_literal,
+                    &v.legacy_model_raw,
+                    &v.legacy_model_sqlite_type,
+                    &v.legacy_model_sql_literal,
+                    &v.legacy_cost_usd_raw,
+                    &v.legacy_created_at_raw,
+                    &v.legacy_project_owner_raw,
+                    &v.provider_id,
+                    &v.model_id,
+                    &v.runtime_model,
+                    &v.candidate_key,
+                    &v.agent_id,
+                    &v.profile_id,
+                    &v.agent_name_snapshot,
+                    &v.project_name_snapshot,
+                    &v.executor_type,
+                    &v.pricing_subject_revision_id,
+                    &v.subject_revision_digest,
+                    &v.selected_tier,
+                    &v.rate_revision_id,
+                    &v.catalog_snapshot_id,
+                    &v.formula_revision,
+                ]
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.capacity() + 16)
+                .sum::<usize>();
+                mandatory
+                    + optional
+                    + e.source.as_ref().map_or(0, |(key, reference)| {
+                        key.capacity()
+                            + serde_json::to_string(reference)
+                                .map_or(MAX_INDEX_BYTES, |s| s.len() * 2 + 256)
+                    })
+            }
+            Self::Execution(row) => ["id", "agent_id", "status", "created_at", "updated_at"]
+                .iter()
+                .filter_map(|column| row.try_get::<Option<String>, _>(*column).ok().flatten())
+                .map(|s| s.len() + 16)
+                .sum(),
+            Self::RemoveExecution(id) => id.capacity(),
+        };
+        // Inline values, Vec capacity slack, SQL storage and allocator headers.
+        // Variable-width buffers are charged in addition to the fixed allowance.
+        4096 + strings
+    }
+    fn apply(self, state: &mut State) -> Result<()> {
+        match self {
+            Self::Invocation(row) => state.invocation(*row),
+            Self::Event(event, sign) => state.event(*event, sign),
+            Self::Execution(row) => state.execution(&row),
+            Self::RemoveExecution(id) => {
+                if let Some(previous) = state.executions.remove(id.as_str()) {
+                    if let Some(owner) = &previous.owner {
+                        state
+                            .execution_stats
+                            .entry(owner.clone())
+                            .or_default()
+                            .change(&previous, -1)?;
+                    }
+                    state.run_change((None, previous.run.clone()), None, None, Some(None))?;
+                    if previous.owner.is_some() {
+                        state.run_change((previous.owner, previous.run), None, None, Some(None))?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+enum Staged {
+    Cold {
+        state: Box<State>,
+        discard_charge: Option<usize>,
+    },
+    Delta {
+        changes: Vec<Change>,
+        bytes: usize,
+        #[cfg(test)]
+        audit: Audit,
+    },
+}
+impl Staged {
+    fn charged_bytes(&self) -> usize {
+        match self {
+            Self::Cold {
+                state,
+                discard_charge,
+            } => discard_charge.unwrap_or_else(|| state.charged_bytes()),
+            Self::Delta { bytes, .. } => *bytes,
+        }
+    }
+    fn overflowed(&self) -> bool {
+        self.charged_bytes() > MAX_INDEX_BYTES
+    }
+    fn push(&mut self, change: Change) -> Result<()> {
+        match self {
+            Self::Cold {
+                state,
+                discard_charge,
+            } => {
+                if !state.fits_next(&change) {
+                    *discard_charge = Some(state.projected_charge(&change));
+                    return Ok(());
+                }
+                change.apply(state)
+            }
+            Self::Delta { changes, bytes, .. } => {
+                // A staged row includes strings/SQL row storage; its generous
+                // allowance bounds even a burst of changes before publication.
+                *bytes += change.staging_bytes();
+                if *bytes <= MAX_INDEX_BYTES {
+                    changes.push(change);
+                }
+                Ok(())
+            }
+        }
+    }
+    #[cfg(test)]
+    fn audit(&mut self) -> &mut Audit {
+        match self {
+            Self::Cold { state, .. } => &mut state.audit,
+            Self::Delta { audit, .. } => audit,
+        }
+    }
+}
+impl State {
+    fn fits_next(&self, change: &Change) -> bool {
+        self.projected_charge(change) <= MAX_INDEX_BYTES
+    }
+    fn projected_charge(&self, change: &Change) -> usize {
+        fn growth<K, V>(len: usize, capacity: usize, add: usize) -> usize {
+            if len + add > capacity {
+                (capacity.max(3) + 1) * (std::mem::size_of::<(K, V)>() + 2) * 8 / 7
+            } else {
+                0
+            }
+        }
+        let (inv, exec, runs) = match change {
+            Change::Invocation(row) if !self.invocations.contains_key(row.id.as_str()) => (1, 0, 2),
+            Change::Execution(row)
+                if row
+                    .try_get::<String, _>("id")
+                    .is_ok_and(|id| !self.executions.contains_key(id.as_str())) =>
+            {
+                (0, 1, 2)
+            }
+            Change::Event(_, 1) => (0, 0, 1),
+            _ => (0, 0, 0),
+        };
+        let growth =
+            4096 + growth::<Arc<str>, Invocation>(
+                self.invocations.len(),
+                self.invocations.capacity(),
+                inv,
+            ) + growth::<Arc<str>, Execution>(
+                self.executions.len(),
+                self.executions.capacity(),
+                exec,
+            ) + growth::<ScopedRun, Run>(self.runs.len(), self.runs.capacity(), runs);
+        self.charged_bytes()
+            .saturating_add(growth.saturating_mul(3) / 2)
+    }
+}
+
+async fn read_delta(
+    staged: &mut Staged,
     connection: &mut sqlx::SqliteConnection,
     old: Watermarks,
     new: Watermarks,
+    cold: bool,
 ) -> Result<()> {
     let mut position = old.invocation_rowid;
     while position < new.invocation_rowid {
@@ -1060,25 +2242,28 @@ async fn apply_delta(
             .await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         if rows.is_empty() {
             break;
         }
         for (rowid, row) in rows {
             position = rowid;
-            state.invocation(row)?;
+            staged.push(Change::Invocation(Box::new(row)))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
     }
     let mut position = old.invocation_revision;
-    while position < new.invocation_revision {
-        let changes=sqlx::query("SELECT id,revision FROM usage_changed_invocation WHERE revision>? AND revision<=? ORDER BY revision LIMIT 400")
-            .bind(position).bind(new.invocation_revision).fetch_all(&mut *connection).await?;
+    while !cold && position < new.invocation_revision {
+        let changes=sqlx::query("SELECT c.id,c.revision FROM usage_changed_invocation c JOIN usage_invocation i ON i.id=c.id WHERE c.revision>? AND c.revision<=? AND i.rowid<=?3 ORDER BY c.revision LIMIT 400")
+            .bind(position).bind(new.invocation_revision).bind(old.invocation_rowid).fetch_all(&mut *connection).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += changes.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += changes.len();
         }
         if changes.is_empty() {
             break;
@@ -1091,11 +2276,14 @@ async fn apply_delta(
         let rows = db::SqliteDb::usage_invocations_by_ids(connection, &ids).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         for row in rows {
-            state.invocation(row)?;
+            staged.push(Change::Invocation(Box::new(row)))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
     }
     let mut position = old.event_rowid;
@@ -1103,8 +2291,8 @@ async fn apply_delta(
         let rows = db::SqliteDb::usage_event_slice(connection, position, new.event_rowid).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         if rows.is_empty() {
             break;
@@ -1113,11 +2301,14 @@ async fn apply_delta(
         let events = rows.into_iter().map(|(_, e)| e).collect::<Vec<_>>();
         #[cfg(test)]
         {
-            state.audit.statements += events.len().div_ceil(150);
-            state.audit.payload_rows += events.len();
+            staged.audit().statements += events.len().div_ceil(150);
+            staged.audit().payload_rows += events.len();
         }
         for event in effective_events(connection, events, new.estimate_rowid).await? {
-            state.event(event, 1)?;
+            staged.push(Change::Event(Box::new(event), 1))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
     }
     // A new revision can replace the effective amount/provenance of an old
@@ -1125,34 +2316,58 @@ async fn apply_delta(
     // the old contribution and add the new one. No invocation history walk.
     let mut position = old.estimate_rowid;
     let mut revised = BTreeSet::new();
-    while position < new.estimate_rowid {
+    while !cold && position < new.estimate_rowid {
         let rows=sqlx::query("SELECT r.rowid AS revision_rowid,e.id FROM cost_estimate_revision r JOIN usage_event e ON e.id=r.usage_event_id WHERE r.rowid>? AND r.rowid<=? AND e.rowid<=? ORDER BY r.rowid LIMIT 400")
             .bind(position).bind(new.estimate_rowid).bind(old.event_rowid).fetch_all(&mut *connection).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         if rows.is_empty() {
             break;
         }
         for row in rows {
             position = row.try_get("revision_rowid")?;
-            revised.insert(row.try_get::<String, _>("id")?);
+            let id = row.try_get::<String, _>("id")?;
+            let bytes = id.capacity() + 192;
+            if revised.insert(id) {
+                // The deduplicated revision set and its eventual Vec are
+                // temporary delta storage too, not just decoded events.
+                let overflowed = match staged {
+                    Staged::Delta {
+                        bytes: staged_bytes,
+                        ..
+                    } => {
+                        *staged_bytes = staged_bytes.saturating_add(bytes);
+                        *staged_bytes > MAX_INDEX_BYTES
+                    }
+                    Staged::Cold { .. } => false,
+                };
+                if overflowed {
+                    return Ok(());
+                }
+            }
         }
     }
     for chunk in revised.into_iter().collect::<Vec<_>>().chunks(400) {
         let events = db::SqliteDb::usage_events_by_ids(connection, chunk).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1 + 2 * events.len().div_ceil(150);
-            state.audit.payload_rows += 3 * events.len();
+            staged.audit().statements += 1 + 2 * events.len().div_ceil(150);
+            staged.audit().payload_rows += 3 * events.len();
         }
         for event in effective_events(connection, events.clone(), old.estimate_rowid).await? {
-            state.event(event, -1)?;
+            staged.push(Change::Event(Box::new(event), -1))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
         for event in effective_events(connection, events, new.estimate_rowid).await? {
-            state.event(event, 1)?;
+            staged.push(Change::Event(Box::new(event), 1))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
     }
     let mut position = old.execution_rowid;
@@ -1161,26 +2376,32 @@ async fn apply_delta(
             .bind(position).bind(new.execution_rowid).fetch_all(&mut *connection).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         if rows.is_empty() {
             break;
         }
         for row in rows {
             position = row.try_get("execution_rowid")?;
-            state.execution(&row)?;
+            staged.push(Change::Execution(row))?;
+            if staged.overflowed() {
+                return Ok(());
+            }
         }
+    }
+    if old.execution_revision == new.execution_revision {
+        return Ok(());
     }
     let mut position = old.execution_revision;
     let mut last_id = String::new();
-    loop {
-        let rows=sqlx::query("SELECT c.id,c.revision,e.id AS present_id,e.agent_id,e.status,e.created_at,e.updated_at,CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END AS duration_ms FROM usage_changed_execution c LEFT JOIN execution e ON e.id=c.id WHERE (c.revision>? OR (c.revision=? AND c.id>?)) AND c.revision<=? ORDER BY c.revision,c.id LIMIT 400")
-            .bind(position).bind(position).bind(&last_id).bind(new.execution_revision).fetch_all(&mut *connection).await?;
+    while !cold && position <= new.execution_revision {
+        let rows=sqlx::query("SELECT c.id,c.revision,e.id AS present_id,e.agent_id,e.status,e.created_at,e.updated_at,CASE WHEN e.status!='running' THEN (JULIANDAY(e.updated_at)-JULIANDAY(e.created_at))*86400000 END AS duration_ms FROM usage_changed_execution c LEFT JOIN execution e ON e.id=c.id WHERE (c.revision>? OR (c.revision=? AND c.id>?)) AND c.revision<=? AND (e.rowid<=? OR e.id IS NULL) AND c.revision>?6 ORDER BY c.revision,c.id LIMIT 400")
+            .bind(position).bind(position).bind(&last_id).bind(new.execution_revision).bind(old.execution_rowid).bind(old.execution_revision).fetch_all(&mut *connection).await?;
         #[cfg(test)]
         {
-            state.audit.statements += 1;
-            state.audit.payload_rows += rows.len();
+            staged.audit().statements += 1;
+            staged.audit().payload_rows += rows.len();
         }
         if rows.is_empty() {
             break;
@@ -1190,19 +2411,12 @@ async fn apply_delta(
             last_id = row.try_get("id")?;
             if let Some(id) = row.try_get::<Option<String>, _>("present_id")? {
                 let _ = id;
-                state.execution(&row)?;
-            } else if let Some(previous) = state.executions.remove(last_id.as_str()) {
-                if let Some(owner) = &previous.owner {
-                    state
-                        .execution_stats
-                        .entry(owner.clone())
-                        .or_default()
-                        .change(&previous, -1)?;
+                staged.push(Change::Execution(row))?;
+                if staged.overflowed() {
+                    return Ok(());
                 }
-                state.run_change((None, previous.run.clone()), None, None, Some(None))?;
-                if previous.owner.is_some() {
-                    state.run_change((previous.owner, previous.run), None, None, Some(None))?;
-                }
+            } else {
+                staged.push(Change::RemoveExecution(last_id.clone()))?;
             }
         }
     }

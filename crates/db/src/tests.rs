@@ -9554,48 +9554,11 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
         2
     );
     let grouped = db
-        .agent_list_read_stats(&[agent_id.clone(), "missing".to_owned()])
+        .agent_list_active_assignments(&[agent_id.clone(), "missing".to_owned()])
         .await
         .unwrap();
-    assert_eq!(grouped[&agent_id].active_assigned_task_count, 2);
-    assert_eq!(grouped[&agent_id].running_execution_count, 0);
-    assert_eq!(grouped["missing"].active_assigned_task_count, 0);
-    assert_eq!(grouped["missing"].execution_stats.success_rate, None);
-    let fallback = seed_task(
-        &db,
-        &project_id,
-        Some(&agent_id),
-        "in_progress".to_owned(),
-        "fallback active",
-    )
-    .await;
-    for (id, status) in [
-        ("grouped-running", "running"),
-        ("grouped-completed", "completed"),
-    ] {
-        sqlx::query("INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at) VALUES (?, ?, ?, 'coder', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:02Z')")
-            .bind(id).bind(&fallback).bind(&agent_id).bind(status).execute(db.pool()).await.unwrap();
-    }
-    let grouped = db
-        .agent_list_read_stats(std::slice::from_ref(&agent_id))
-        .await
-        .unwrap();
-    let original = ExecutionRepo::stats_by_agent(&db, &agent_id).await.unwrap();
-    assert_eq!(
-        grouped[&agent_id].active_assigned_task_count,
-        AgentRepo::count_active_assigned_tasks(&db, &agent_id)
-            .await
-            .unwrap()
-    );
-    assert_eq!(grouped[&agent_id].running_execution_count, 1);
-    assert_eq!(
-        grouped[&agent_id].execution_stats.avg_duration_ms,
-        original.avg_duration_ms
-    );
-    assert_eq!(
-        grouped[&agent_id].execution_stats.success_rate,
-        original.success_rate
-    );
+    assert_eq!(grouped[&agent_id], 2);
+    assert_eq!(grouped["missing"], 0);
 }
 
 #[tokio::test]
@@ -11899,10 +11862,173 @@ async fn usage_ledger_revision_tracks_terminal_edits_and_rolls_back() {
     );
     for (query, expected) in [
         ("EXPLAIN QUERY PLAN SELECT id,error FROM execution INDEXED BY idx_execution_usage_failed_recent WHERE status='failed' AND COALESCE(stopped_at,updated_at)>='2026-01-01' ORDER BY COALESCE(stopped_at,updated_at) DESC,id ASC", "idx_execution_usage_failed_recent"),
-        ("EXPLAIN QUERY PLAN SELECT error FROM execution INDEXED BY idx_execution_usage_failed_task WHERE status='failed' AND task_id='task' ORDER BY COALESCE(stopped_at,updated_at) DESC,id DESC LIMIT 1", "idx_execution_usage_failed_task"),
+        ("EXPLAIN QUERY PLAN SELECT error FROM execution WHERE status='failed' AND task_id='task' ORDER BY COALESCE(stopped_at,updated_at) DESC,id DESC LIMIT 1", "idx_execution_usage_failed_task"),
     ] {
         let rows=sqlx::query(query).fetch_all(db.pool()).await.unwrap();
         let plan=rows.iter().map(|r|sqlx::Row::get::<String,_>(r, "detail")).collect::<Vec<_>>().join(" ");
         assert!(plan.contains(expected), "{plan}");assert!(!plan.contains("TEMP B-TREE"),"{plan}");
     }
+}
+
+#[tokio::test]
+async fn agent_list_active_assignments_match_scalar_for_workflow_shapes() {
+    for (label, definition) in [
+        (
+            "custom",
+            serde_json::json!({"states": [
+                {"name": "todo", "kind": "initial"},
+                {"name": "running", "kind": "active"},
+                {"name": "waiting_review", "kind": "gate"},
+                {"name": "in_progress", "kind": "terminal"},
+                {"name": "dup", "kind": "terminal"},
+                {"name": "dup", "kind": "gate"},
+                {"kind": "active"},
+                {"name": "done", "kind": "terminal"}
+            ]})
+            .to_string(),
+        ),
+        ("empty-object", "{}".to_owned()),
+        ("not-json", "not json".to_owned()),
+        ("states-string", "{\"states\": \"x\"}".to_owned()),
+        (
+            "states-array-of-strings",
+            "{\"states\": [\"todo\", \"running\"]}".to_owned(),
+        ),
+        (
+            "states-object",
+            "{\"states\": {\"a\": {\"name\": \"running\", \"kind\": \"active\"}}}".to_owned(),
+        ),
+        ("array-root", "[1,2]".to_owned()),
+        (
+            "numeric-name",
+            "{\"states\": [{\"name\": 5, \"kind\": \"active\"}]}".to_owned(),
+        ),
+    ] {
+        let db = sqlite_db().await;
+        let (p1, _r1, a) = seed_project_repo_agent(&db).await;
+        let (_p2, _r2, b) = seed_project_repo_agent(&db).await;
+        let set = sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+            .bind(&definition)
+            .bind(&p1)
+            .execute(db.pool())
+            .await;
+        if let Err(error) = &set {
+            println!("AUDIT assignments {label}: definition rejected by schema: {error}");
+            continue;
+        }
+        let mut n = 0;
+        for status in [
+            "todo",
+            "in_progress",
+            "review",
+            "merging",
+            "running",
+            "waiting_review",
+            "done",
+            "dup",
+            "5",
+        ] {
+            for owner in [&a, &b] {
+                n += 1;
+                let task = seed_task(&db, &p1, Some(owner), status.to_owned(), "t").await;
+                if n % 3 == 0 {
+                    sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, 'reviewer', 'agent', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')")
+                        .bind(new_uuid_v4()).bind(&task).bind(if n % 2 == 0 { &a } else { owner }).execute(db.pool()).await.unwrap();
+                }
+                if n % 5 == 0 {
+                    sqlx::query("UPDATE task SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?")
+                        .bind(&task)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+                if n % 4 == 0 {
+                    let parent = seed_task(&db, &p1, None, "todo".to_owned(), "parent").await;
+                    sqlx::query("UPDATE task SET parent_task_id = ? WHERE id = ?")
+                        .bind(&parent)
+                        .bind(&task)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let ids = vec![a.clone(), b.clone(), "missing".to_owned()];
+        let grouped = db.agent_list_active_assignments(&ids).await;
+        for id in &ids {
+            let single = AgentRepo::count_active_assigned_tasks(&db, id).await;
+            let grouped = grouped.as_ref().map(|g| g[id]).map_err(|e| e.to_string());
+            let single = single.map_err(|e| e.to_string());
+            if ["states-string", "states-array-of-strings"].contains(&label) {
+                // Both scalar and grouped contracts reject malformed state
+                // elements when any assigned Agent visits this Project.
+                assert!(grouped.is_err());
+                if id != "missing" {
+                    assert!(single.is_err());
+                }
+            } else {
+                assert_eq!(single, grouped, "{label} {id}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn usage_read_schema_contains_all_revision_triggers_and_indexes() {
+    let db = sqlite_db().await;
+    let names:Vec<String>=sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'usage_read_%' ORDER BY name").fetch_all(db.pool()).await.unwrap();
+    let mut expected = Vec::new();
+    for table in ["invocation", "event", "estimate", "execution"] {
+        for action in ["insert", "delete"] {
+            expected.push(format!("usage_read_{table}_{action}"));
+        }
+    }
+    expected.extend([
+        "usage_read_invocation_update".to_owned(),
+        "usage_read_execution_update".to_owned(),
+    ]);
+    expected.sort();
+    assert_eq!(names, expected);
+    for name in [
+        "idx_usage_changed_invocation_revision",
+        "idx_usage_changed_execution_revision",
+        "idx_execution_usage_running_agent",
+        "idx_execution_usage_failed_recent",
+        "idx_execution_usage_failed_task",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?"
+            )
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1,
+            "{name}"
+        );
+    }
+    let header = sqlx::query("SELECT * FROM usage_ledger_revision WHERE id=1")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for (column, table) in [
+        ("invocation_count", "usage_invocation"),
+        ("event_count", "usage_event"),
+        ("estimate_count", "cost_estimate_revision"),
+        ("execution_count", "execution"),
+    ] {
+        let count = sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(sqlx::Row::get::<i64, _>(&header, column), count);
+    }
+    assert_eq!(
+        sqlx::Row::get::<i64, _>(&header, "owned_execution_count"),
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution WHERE agent_id IS NOT NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
 }

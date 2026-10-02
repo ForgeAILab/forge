@@ -490,7 +490,7 @@ async fn build_agent_response_for_user(
     active_assigned_task_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
-    let usage = state.agent_usage_cache.agent(&agent.id).await?;
+    let usage = state.usage_ledger_index.agent(&agent.id).await?;
     let mut response =
         build_agent_response(state, agent, active_assigned_task_count, usage).await?;
     if !user.is_admin {
@@ -499,7 +499,7 @@ async fn build_agent_response_for_user(
     Ok(response)
 }
 
-/// Share the usage fingerprint and miss load across either Agent list page.
+/// Share incremental usage and execution statistics across either Agent page.
 pub(super) async fn build_agent_responses_for_user(
     state: &AppState,
     agents: Vec<Agent>,
@@ -509,25 +509,30 @@ pub(super) async fn build_agent_responses_for_user(
         .iter()
         .map(|agent| agent.id.clone())
         .collect::<Vec<_>>();
-    let mut usage = state.agent_usage_cache.agents(&ids).await?;
-    let mut stats = state.agent_usage_cache.agent_execution_stats(&ids).await?;
+    let mut usage = state.usage_ledger_index.agents(&ids).await?;
+    let mut stats = state.usage_ledger_index.agent_execution_stats(&ids).await?;
     let mut assignments = state.db.agent_list_active_assignments(&ids).await?;
     let mut responses = Vec::with_capacity(agents.len());
     for agent in agents {
-        let aggregate = usage
-            .remove(&agent.id)
-            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
-        let live = stats
-            .remove(&agent.id)
-            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
+        let aggregate = match usage.remove(&agent.id) {
+            Some(value) => value,
+            None => {
+                services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?
+            }
+        };
+        let live = match stats.remove(&agent.id) {
+            Some(value) => value,
+            None => (
+                db::ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?,
+                db::AgentRepo::count_running_executions(&*state.db, &agent.id).await?,
+            ),
+        };
         let effective_status =
             compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
                 .await?
                 .as_str()
                 .to_owned();
-        let assigned = assignments
-            .remove(&agent.id)
-            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
+        let assigned = assignments.remove(&agent.id).unwrap_or(0);
         let mut response = agent_response(
             agent,
             Some(assigned),

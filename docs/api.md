@@ -172,6 +172,9 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 
+Agent daemon pins (`daemon_id`) are admin-only in both the account Agent list
+and `GET /api/v1/projects/{id}/agents`; non-admin responses return `null`.
+
 Agent responses report two different counts, and only one of them is a capacity
 ratio:
 

@@ -579,7 +579,7 @@ impl OperatorStatusService {
                 COUNT(tl.id) AS attempt_count,
                 (
                     SELECT e.error
-                    FROM execution e INDEXED BY idx_execution_usage_failed_task
+                    FROM execution e
                     WHERE e.task_id = t.id AND e.status = 'failed'
                     ORDER BY COALESCE(e.stopped_at, e.updated_at) DESC, e.id DESC
                     LIMIT 1

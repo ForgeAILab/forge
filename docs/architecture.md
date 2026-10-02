@@ -1972,6 +1972,28 @@ in two hours, while limiting each write-lock acquisition to 100 pages. It shares
 the runtime shutdown channel and skips missed ticks. It does nothing on a
 database outside incremental mode.
 
+Operations and Agent lifetime reads share one process-local `UsageLedgerIndex`
+per database in both the server and Solo runtime. Its bounded attempt/run
+summaries are observations; fresh ledger projections remain the accounting
+reference. Cold builds and warm deltas publish atomically, so request
+cancellation cannot leave partial accounting totals. Estimated source citations
+retain counts and winning order per distinct reference, rather than events.
+The index charges up to 128 MiB and uses a separately bounded 32 MiB fallback
+memo outside its mutex when a ledger does not fit. Trigger-maintained row counts
+make shrink probes constant time. See
+[performance testing](performance-testing.md#incremental-usage-reads) for the
+fold, invalidation proof, bounds, differential tests and benchmark runner.
+
+The ten `usage_read_*` triggers maintain rowid maxima, invocation/execution
+change revisions, row counts and a deletion generation in one singleton row.
+`usage_changed_invocation` and `usage_changed_execution` coalesce updates into
+one latest marker per identity. Applied markers are deliberately not pruned:
+a second server process may still need an older revision. Storage is bounded
+by one marker per invocation or execution identity ever updated, with markers
+for deleted invocations/executions removed by cascade/delete triggers (renamed
+execution identities can leave a marker for their old identity). A process
+advances its own watermarks in the same read snapshot as its delta.
+
 New SQLite files enable `auto_vacuum=INCREMENTAL` before the WAL switch and their
 first table. WAL pool connections use `synchronous=NORMAL`. Existing files retain
 their mode until an operator runs the explicit offline full-VACUUM conversion.

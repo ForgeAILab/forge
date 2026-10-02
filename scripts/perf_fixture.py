@@ -128,9 +128,10 @@ def binary_info(binary: Path) -> tuple[str, str]:
 
 
 class Server:
-    def __init__(self, binary: Path, directory: Path, port: int, log_path: Path):
+    def __init__(self, binary: Path, directory: Path, port: int, log_path: Path, log_filter: str = "warn"):
         self.binary, self.directory, self.port = binary, directory, port
         self.log_path = log_path
+        self.log_filter = log_filter
         self.process: subprocess.Popen | None = None
         self.log: Any = None
         self.home: tempfile.TemporaryDirectory | None = None
@@ -151,7 +152,7 @@ class Server:
         home = Path(os.environ.get('FORGE_PERF_HOME', self.home.name))
         home.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, HOME=str(home), FORGE_DATA_DIR=str(self.directory),
-                   FORGE_SERVER_BIND=f'127.0.0.1:{self.port}', RUST_LOG='warn')
+                   FORGE_SERVER_BIND=f'127.0.0.1:{self.port}', RUST_LOG=self.log_filter)
         # Ignore inherited production config locations; this is a synthetic server.
         for key in ('FORGE_CONFIG', 'FORGE_CONFIG_FILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'):
             env.pop(key, None)
@@ -292,7 +293,7 @@ def seed_deferred_project(db: sqlite3.Connection, sql: SqlBuilder, workflow: dic
                    created_at=timestamp(i * 1000), updated_at=timestamp(i * 1000 + 900))
 
 
-def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
+def seed(db: sqlite3.Connection, workflow: dict, user_id: str, estimated: bool = False) -> list[str]:
     sql = SqlBuilder(db)
     agents = normalize_bootstrap(db, user_id)
     agent = next((row for row in agents if row['name'] == 'Codex Default'), agents[0])
@@ -350,6 +351,9 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
         for j in range(HEAVY_EXECUTIONS):
             k = i * HEAVY_EXECUTIONS + j
             execution_id = fixture_id('execution', k)
+            if estimated:
+                agent = agents[k % min(3, len(agents))]
+                agent_id, profile_id = agent['id'], agent['selected_profile_id']
             created, finished = timestamp(i * 1000 + j * 60), timestamp(i * 1000 + j * 60 + 50)
             sql.insert('execution', id=execution_id, task_id=task_id, agent_id=agent_id,
                        role='reviewer' if j % 3 == 2 else 'coder', status='completed' if j % 4 else 'failed',
@@ -380,8 +384,9 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
                            provider_id='synthetic', model_id='synthetic-model', agent_id=agent_id, profile_id=profile_id,
                            executor_type='codex', agent_name_snapshot=agent['name'],
                            project_name_snapshot='Synthetic heavy performance Project', input_tokens=10_000 + n, output_tokens=2000 + n % 700,
-                           cache_read_tokens=4000, cache_write_tokens=1000, cost_kind='provider_reported',
-                           provider_reported_nano_usd=30_000_000 + n * 1000, occurred_at=finished, created_at=finished)
+                           cache_read_tokens=4000, cache_write_tokens=1000, cost_kind='none' if estimated else 'provider_reported',
+                           coverage_reason_code='missing_rate' if estimated else None,
+                           provider_reported_nano_usd=None if estimated else 30_000_000 + n * 1000, occurred_at=finished, created_at=finished)
         for j in range(HEAVY_REVIEWS):
             awaiting = state == 'review' and j == HEAVY_REVIEWS - 1 and i % 2 == 0
             sql.insert('review', id=fixture_id('review', f'{i}:{j}'), task_id=task_id,
@@ -429,10 +434,14 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str) -> list[str]:
                    scope_type='project', scope_id=project_id, correlation_id=fixture_id('event-correlation', i),
                    payload_json=encode({'synthetic': True, 'index': i}), created_at=timestamp(i))
     db.execute('UPDATE event_consumer_cursor SET last_sequence=?, updated_at=?', (HEAVY_EVENTS, timestamp(HEAVY_EVENTS)))
+    if estimated:
+        from perf_usage_fixture import seed_estimates
+        seed_estimates(db, user_id, project_id)
+        sql.tables.update(('pricing_catalog_snapshot', 'pricing_rate_revision', 'cost_estimation_preview', 'cost_estimation_run', 'cost_estimate_revision'))
     return sorted(sql.tables | {'agent_identity', 'agent_profile', 'project_agent_binding', 'event_consumer_cursor', 'user'})
 
 
-def build(binary: Path, out: Path, port: int) -> dict:
+def build(binary: Path, out: Path, port: int, profile: str = "heavy") -> dict:
     if out.exists() and any(out.iterdir()):
         raise ValueError('--out must be an empty data directory')
     out.mkdir(parents=True, exist_ok=True)
@@ -448,13 +457,13 @@ def build(binary: Path, out: Path, port: int) -> dict:
     with closing(sqlite3.connect(out / 'forge.db')) as db, db:
         db.execute('PRAGMA foreign_keys=ON')
         user_id = db.execute('SELECT id FROM user WHERE email=?', (EMAIL,)).fetchone()[0]
-        tables = seed(db, workflow, user_id)
+        tables = seed(db, workflow, user_id, estimated=profile == "usage-estimated")
         db.commit()
         validate_database(db)
         digest = hashlib.sha256(canonical_dump(db, tables, user_id).encode()).hexdigest()
         counts = {table: db.execute(f'SELECT count(*) FROM {quote(table)}').fetchone()[0] for table in tables}
         db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-    report = {'schema': 'forge.perf-fixture/2', 'profile': 'heavy', 'baseline_version': version,
+    report = {'schema': 'forge.perf-fixture/2', 'profile': profile, 'baseline_version': version,
               'email': EMAIL, 'project_id': fixture_id('project'), 'chat_id': fixture_id('chat'),
               'deferred_project_id': fixture_id('deferred-project'),
               'task_ids': [fixture_id('task', i) for i in (0, 1, 2, 3, 4, 12, 13, 14, 15, 16)],
@@ -464,13 +473,13 @@ def build(binary: Path, out: Path, port: int) -> dict:
                               'terminal executions and chat jobs; cleaned workspaces with no cleanup deadline',
                               'every baseline consumer cursor at the event head; no plan-publication claims'],
               'notes': ['The heavy Project has no deferred-dispatch metadata; the small deferred Project carries it on two Tasks.',
-                        'Usage uses three settled provider attempts per execution with provider-reported costs; no remote pricing catalog required.',
+                        ('Usage uses three settled provider attempts per execution with applied estimated-cost revisions spread over three Agents.' if profile == 'usage-estimated' else 'Usage uses three settled provider attempts per execution with provider-reported costs; no remote pricing catalog required.'),
                         'Some reviews await human approval; no reviewer execution is running.',
                         'Registration password is the public test constant PASSWORD in perf_fixture.py.']}
     with (out / 'perf-fixture.json').open('x', encoding='utf-8') as target:
         json.dump(report, target, indent=2, sort_keys=True, allow_nan=False)
         target.write('\n')
-    print(f'{version}; heavy fixture; DB {report["db_bytes"]:,} bytes')
+    print(f'{version}; {profile} fixture; DB {report["db_bytes"]:,} bytes')
     for table, count in sorted(counts.items()):
         print(f'  {table}: {count:,}')
     return report
@@ -482,11 +491,11 @@ def main() -> int:
     command = commands.add_parser('build')
     command.add_argument('--baseline-binary', type=Path, required=True)
     command.add_argument('--out', type=Path, required=True)
-    command.add_argument('--profile', choices=('heavy',), default='heavy')
+    command.add_argument('--profile', choices=('heavy', 'usage-estimated'), default='heavy')
     command.add_argument('--port', type=int, default=18101)
     args = parser.parse_args()
     try:
-        build(args.baseline_binary.resolve(), args.out.resolve(), args.port)
+        build(args.baseline_binary.resolve(), args.out.resolve(), args.port, args.profile)
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
         parser.exit(1, f'Cannot build fixture: {error}\n')
     return 0
