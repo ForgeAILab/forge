@@ -44,6 +44,8 @@ pub struct ServerExecutionEventSink {
 enum TerminalReportRecord {
     Pending {
         daemon_id: String,
+        connection_id: u64,
+        execution_id: String,
         fingerprint: String,
     },
     Committed {
@@ -402,6 +404,14 @@ impl ServerExecutionEventSink {
             if !self.connection_is_current(daemon_id, connection_id) {
                 return Ok(());
             }
+            if self.execution_has_pending_terminal(daemon_id, connection_id, &execution.id) {
+                // The authenticated terminal report now owns this execution's
+                // next durable mutation. Continuing to renew the same lease
+                // can starve its owner/version CAS under frequent heartbeats.
+                // A failed reservation is released, so renewal resumes on the
+                // next heartbeat when the report cannot be committed.
+                continue;
+            }
             // The owner is taken from the authenticated transport identity,
             // never from heartbeat payload data. Rows without a claimed lease
             // are left to the scheduler/dispatch claim path.
@@ -478,6 +488,27 @@ impl ServerExecutionEventSink {
             .map(|record| terminal_record_disposition(record, daemon_id, &fingerprint)))
     }
 
+    fn execution_has_pending_terminal(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        execution_id: &str,
+    ) -> bool {
+        lock(&self.terminal_reports).values().any(|record| {
+            matches!(
+                record,
+                TerminalReportRecord::Pending {
+                    daemon_id: pending_daemon_id,
+                    connection_id: pending_connection_id,
+                    execution_id: pending_execution_id,
+                    ..
+                } if pending_daemon_id == daemon_id
+                    && *pending_connection_id == connection_id
+                    && pending_execution_id == execution_id
+            )
+        })
+    }
+
     fn reserve_terminal(
         &self,
         daemon_id: &str,
@@ -505,6 +536,8 @@ impl ServerExecutionEventSink {
             notification.terminal_report_id.clone(),
             TerminalReportRecord::Pending {
                 daemon_id: daemon_id.to_owned(),
+                connection_id,
+                execution_id: notification.execution_id.clone(),
                 fingerprint,
             },
         );
@@ -525,6 +558,7 @@ impl ServerExecutionEventSink {
             Some(TerminalReportRecord::Pending {
                 daemon_id: existing_daemon,
                 fingerprint: existing,
+                ..
             }) if existing_daemon == daemon_id && existing == &fingerprint
         ) {
             reports.remove(&notification.terminal_report_id);
@@ -543,6 +577,7 @@ impl ServerExecutionEventSink {
                 TerminalReportRecord::Pending {
                     daemon_id: existing_daemon,
                     fingerprint: existing,
+                    ..
                 } => {
                     if existing_daemon == daemon_id && existing == &fingerprint {
                         *record = TerminalReportRecord::Committed {
@@ -996,6 +1031,7 @@ fn terminal_record_disposition(
         TerminalReportRecord::Pending {
             daemon_id,
             fingerprint,
+            ..
         } => (daemon_id, fingerprint, false),
         TerminalReportRecord::Committed {
             daemon_id,
@@ -1141,6 +1177,66 @@ mod tests {
                 .unwrap()
                 .status,
             ExecutionStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_terminal_reservation_suppresses_same_owner_heartbeat_renewal() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let (_, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let bus = Arc::new(EventBus::new(16));
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            PathBuf::new(),
+        ));
+        let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::new(
+            bus,
+            sink.clone(),
+        ));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        let (connection_id, _outbound) =
+            crate::recovery::tests::owner_connection(&registry, daemon_id, false);
+        let mut report = notification();
+        report.terminal_report_id = "terminal-report-heartbeat-race".to_owned();
+        report.execution_id = execution.id.clone();
+
+        assert_eq!(
+            sink.reserve_terminal(daemon_id, connection_id, &report)
+                .unwrap(),
+            None
+        );
+        let reserved = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        sink.handle_heartbeat(daemon_id, connection_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            reserved,
+            "a pending terminal report must not race same-owner heartbeat renewal"
+        );
+
+        sink.release_terminal(daemon_id, &report);
+        sink.handle_heartbeat(daemon_id, connection_id, 2)
+            .await
+            .unwrap();
+        let renewed = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(renewed.execution_version > reserved.execution_version);
+        assert_eq!(
+            renewed.lease_owner.as_deref(),
+            Some(execution_lease_owner(daemon_id, connection_id).as_str())
         );
     }
 
@@ -1490,6 +1586,8 @@ mod tests {
         let fingerprint = terminal_fingerprint(&notification()).unwrap();
         let record = TerminalReportRecord::Pending {
             daemon_id: "owner-daemon".to_owned(),
+            connection_id: 7,
+            execution_id: "execution-ownership".to_owned(),
             fingerprint: fingerprint.clone(),
         };
         assert_eq!(

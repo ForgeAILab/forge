@@ -489,6 +489,33 @@ impl Fixture {
         }
     }
 
+    async fn mark_task_done(&self) {
+        let task = TaskRepo::get_by_id(
+            &*self.harness.state.db,
+            &self.resolved.placement.task_id,
+            false,
+        )
+        .await
+        .expect("cleanup Task loads")
+        .expect("cleanup Task exists");
+        let task = TaskRepo::update_status(
+            &*self.harness.state.db,
+            db::UpdateTaskStatus {
+                id: task.id,
+                expected_version: task.version,
+                status: "done".into(),
+                assignee_id: None,
+                error_annotation: None,
+                blocked_json: None,
+                failed_json: None,
+                updated_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .expect("cleanup Task becomes terminal");
+        assert_eq!(task.status, "done");
+    }
+
     async fn run(&self, command: &str) -> services::workspace_backend::RunResult {
         self.resolved
             .backend
@@ -1562,6 +1589,7 @@ async fn remote_merge_without_a_reviewer_preserves_merge_commit_and_conflict_evi
 #[tokio::test]
 async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
     let mut fixture = Fixture::new("forge-workspace-cleanup").await;
+    fixture.mark_task_done().await;
     fixture.link.take();
     common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
     fixture
@@ -1582,8 +1610,23 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(placement.state, PlacementState::Cleaning);
-    assert_eq!(workspace.status, WorkspaceStatus::Cleaning);
+    let offline_diagnostic = format!(
+        "placement_state={:?}, workspace_status={:?}, pending_journal_count={}, last_server_frame={:?}",
+        placement.state,
+        workspace.status,
+        fixture.runtime.journal().pending().unwrap().len(),
+        fixture.link.as_ref().and_then(DaemonLink::last_request),
+    );
+    assert_eq!(
+        placement.state,
+        PlacementState::Cleaning,
+        "offline cleanup remains pending: {offline_diagnostic}"
+    );
+    assert_eq!(
+        workspace.status,
+        WorkspaceStatus::Cleaning,
+        "offline cleanup preserves workspace state: {offline_diagnostic}"
+    );
     fixture.reconnect().await;
     let cleanup_result = fixture
         .harness
@@ -1614,8 +1657,23 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(placement.state, PlacementState::Cleaned);
-    assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+    let settled_diagnostic = format!(
+        "placement_state={:?}, workspace_status={:?}, pending_journal_count={}, last_server_frame={:?}",
+        placement.state,
+        workspace.status,
+        fixture.runtime.journal().pending().unwrap().len(),
+        fixture.link.as_ref().and_then(DaemonLink::last_request),
+    );
+    assert_eq!(
+        placement.state,
+        PlacementState::Cleaned,
+        "owner acknowledgement cleans placement: {settled_diagnostic}"
+    );
+    assert_eq!(
+        workspace.status,
+        WorkspaceStatus::Cleaned,
+        "owner acknowledgement cleans workspace: {settled_diagnostic}"
+    );
     assert_eq!(
         fixture.receipt(METHOD_WORKSPACE_CLEANUP).await["owner_result"]["cleaned"],
         true
@@ -1627,6 +1685,7 @@ async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
 #[tokio::test]
 async fn remote_cleanup_retry_acknowledges_after_the_cleaned_state_commits() {
     let fixture = Fixture::new("forge-workspace-cleanup-retained-ack").await;
+    fixture.mark_task_done().await;
     // Lose the unsolicited cleanup notification while retaining RPC replies,
     // so the test can stop between the state commit and journal acknowledgement.
     let (outbound, _notifications) = mpsc::unbounded_channel();

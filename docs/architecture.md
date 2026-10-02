@@ -2554,7 +2554,10 @@ may then require an explicit reset.
 Terminal reports are acknowledged only after their Task cascade commits. A
 report received during suspension stays unacknowledged until reconciliation and
 cascade settlement finish; retained reports can replay after a cascade failure
-or server restart.
+or server restart. Once an authenticated terminal report is reserved for durable
+settlement, transport heartbeats stop renewing that execution until the
+reservation commits or is released; this prevents same-owner lease churn from
+starving the terminal compare-and-swap.
 A periodic sweep
 retries reconciliation for disconnected placements whose owner is online, so
 an interrupted reconnect can finish after a server restart. The workspace cleanup
