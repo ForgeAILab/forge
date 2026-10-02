@@ -96,16 +96,36 @@ pub(crate) fn harvest(
 /// The final serialized report, rather than raw artifact bytes, sets the bound.
 /// The reserved validation entry travels and replays with the terminal report.
 pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
+    // Match the terminal contract's inference when status is omitted.
+    // Explicit failed/cancelled outcomes keep their original diagnostics.
+    let completed = match report.status.as_deref() {
+        Some(status) => status == "completed",
+        None => {
+            report.exit_code == Some(0)
+                && report
+                    .signal
+                    .as_deref()
+                    .is_none_or(|signal| signal.trim().is_empty())
+                && report
+                    .error
+                    .as_deref()
+                    .is_none_or(|error| error.trim().is_empty())
+        }
+    };
     if report
         .plan_text
         .as_ref()
         .is_some_and(|text| text.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES)
     {
+        let size = report.plan_text.as_ref().unwrap().len();
         report.plan_text = None;
-        if report.status.as_deref() == Some("completed") {
+        if completed {
             report.status = Some("failed".into());
             report.exit_code = Some(1);
-            report.error = Some("execution plan exceeds transport size bound".into());
+            report.error = Some(format!(
+                "execution plan exceeds transport size bound of {} bytes: {size} bytes",
+                api_types::MAX_EXECUTION_PLAN_BYTES
+            ));
         }
     }
     let mut dropped = 0;
@@ -139,7 +159,7 @@ pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
             .unwrap_or(true)
         {
             report.plan_text = None;
-            if report.status.as_deref() == Some("completed") {
+            if completed {
                 report.status = Some("failed".into());
                 report.exit_code = Some(1);
                 report.error =
@@ -335,6 +355,67 @@ mod tests {
         assert!(report.plan_text.is_none());
         assert_eq!(report.status.as_deref(), Some("failed"));
         assert!(report.error.as_deref().unwrap().contains("size bound"));
+    }
+
+    #[test]
+    fn plan_capture_failures_follow_explicit_or_inferred_terminal_outcome() {
+        for status in [None, Some("completed"), Some("failed"), Some("cancelled")] {
+            for immutable_overflow in [false, true] {
+                let mut report: ExecutionTerminalNotification =
+                    serde_json::from_value(serde_json::json!({
+                        "terminal_report_id":"plan-outcome", "execution_id":"exec-plan",
+                        "exit_code":0, "signal":null, "error":null, "ts":"now", "usage_reports":[]
+                    }))
+                    .unwrap();
+                report.status = status.map(str::to_owned);
+                let completed = matches!(status, None | Some("completed"));
+                if !completed {
+                    report.exit_code = Some(3);
+                    report.signal = Some("original signal".into());
+                    report.error = Some("original executor error".into());
+                }
+                report.plan_text = Some(if immutable_overflow {
+                    "- [ ] plan".into()
+                } else {
+                    "x".repeat(api_types::MAX_EXECUTION_PLAN_BYTES as usize + 1)
+                });
+                if immutable_overflow {
+                    report.ts = "t".repeat(MAX_TERMINAL_REPORT_SIZE);
+                }
+                fit_report(&mut report);
+                assert!(report.plan_text.is_none());
+                if completed {
+                    assert_eq!(report.status.as_deref(), Some("failed"));
+                    assert_eq!(report.exit_code, Some(1));
+                    assert!(report.error.as_deref().unwrap().contains("size bound"));
+                } else {
+                    assert_eq!(report.status.as_deref(), status);
+                    assert_eq!(report.exit_code, Some(3));
+                    assert_eq!(report.signal.as_deref(), Some("original signal"));
+                    if immutable_overflow {
+                        assert!(!report.error.as_deref().unwrap().contains("execution plan"));
+                    } else {
+                        assert_eq!(report.error.as_deref(), Some("original executor error"));
+                    }
+                }
+            }
+        }
+        for (exit_code, signal, error) in [
+            (Some(3), None, Some("failed")),
+            (None, Some("cancelled"), None),
+        ] {
+            let mut report: ExecutionTerminalNotification=serde_json::from_value(serde_json::json!({
+                "terminal_report_id":"inferred-failure", "execution_id":"exec-plan", "exit_code":exit_code,
+                "signal":signal, "error":error, "ts":"now", "usage_reports":[],
+                "plan_text":"x".repeat(api_types::MAX_EXECUTION_PLAN_BYTES as usize+1)
+            })).unwrap();
+            fit_report(&mut report);
+            assert!(report.plan_text.is_none());
+            assert!(report.status.is_none());
+            assert_eq!(report.exit_code, exit_code);
+            assert_eq!(report.signal.as_deref(), signal);
+            assert_eq!(report.error.as_deref(), error);
+        }
     }
 
     #[test]

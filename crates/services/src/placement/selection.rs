@@ -1389,6 +1389,7 @@ mod tests {
         let mut context = context();
         context.candidates[0].location.owner_kind = RepoLocationOwnerKind::Server;
         context.candidates[0].location.kind = RepoLocationKind::SharedMount;
+        context.candidates[0].plan_transport = false;
         context.candidates[0].negotiated_revision = Some(2);
         context.candidates[0].workspace_v1 = false;
         context.candidates[0].connected = false;
@@ -1662,7 +1663,10 @@ mod tests {
             capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
                 .iter()
                 .map(|name| (*name).to_owned())
-                .chain(std::iter::once("workspace.v1".to_owned()))
+                .chain([
+                    api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned(),
+                    api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
+                ])
                 .collect(),
             executor_capabilities: BTreeMap::from([("codex".to_owned(), capabilities())]),
             workspace_run_policy: api_types::WorkspaceRunPolicy {

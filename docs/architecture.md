@@ -621,7 +621,10 @@ retains the winning transported artifact until its Execution is deleted.
 Empty, checklist-free and missing required candidates use the existing bounded
 workflow guard rejection. Unchanged daemon seed content uses that same guard. Oversized remote
 candidates terminalize as failed and are acknowledged with the actual byte size
-and limit. Failed or cancelled executor outcomes retain their original reason.
+and limit. When terminal status is omitted, capture uses the same outcome
+inference as the server: exit code zero with no signal or error means completed.
+An oversized plan then produces a failed capture. Explicit or inferred failed
+or cancelled executor outcomes retain their original reason.
 Owner settlement errors persist exponential retry backoff and a visible Task
 wait annotation; unreachable owners also carry `runtime_offline`, `owner_wait`,
 and `deferred_dispatch`. Successful settlement clears that wait. Plan RPCs wait
