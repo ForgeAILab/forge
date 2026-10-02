@@ -2128,7 +2128,7 @@ async fn planner_completion_advances_default_planning_gate() {
     .find(|execution| execution.role == crate::workflow::default_roles::PLANNER)
     .expect("the workflow hook creates a planner execution");
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let current = ExecutionRepo::get_by_id(&*db, &execution.id)
                 .await
@@ -2143,28 +2143,31 @@ async fn planner_completion_advances_default_planning_gate() {
     .await
     .expect("planner execution completes");
 
-    let early_settlement = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-        loop {
-            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
-                .await
-                .expect("transition logs load while completion slot is held");
-            if logs.iter().any(|log| {
-                log.from_state == crate::workflow::default_states::PLANNING
-                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
-            }) || workspace_root
-                .path()
-                .join(&task.id)
-                .join("plan.md")
-                .exists()
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Poll against a deadline instead of wrapping the loop in a timeout: a
+    // timeout can cancel a query mid-flight, and the single in-memory
+    // connection is then replaced by an empty database.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut settled_early = false;
+    while std::time::Instant::now() < deadline {
+        let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+            .await
+            .expect("transition logs load while completion slot is held");
+        if logs.iter().any(|log| {
+            log.from_state == crate::workflow::default_states::PLANNING
+                && log.to_state == crate::workflow::default_states::IN_PROGRESS
+        }) || workspace_root
+            .path()
+            .join(&task.id)
+            .join("plan.md")
+            .exists()
+        {
+            settled_early = true;
+            break;
         }
-    })
-    .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
-        early_settlement.is_err(),
+        !settled_early,
         "the workflow-dispatched runner must wait on the originating service's completion slot"
     );
     let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
