@@ -774,31 +774,62 @@ executor set it on the child process before Forge's own variables. Assets are
 copied through a sibling staging path and atomically renamed only when the
 target is absent; symlink traversal and recursive/overlapping declarations are
 refused. A failing check terminalizes the execution through the dedicated
-pre-dispatch environment failure path and pauses the Project with
-`system_pause_reason = "environment_not_ready"`, without changing the Task's
-workflow state or adding a Task annotation. No provider call or retry budget
-is spent. The stopped execution is tagged as an environment pre-dispatch
-failure so it does not block re-dispatch after resume. User and repository
-pauses are never overwritten. Pause detail (workspace ID, check names, triggering role,
-bounded output, pause/last-check/next-check times) persists in
-`project.environment_pause_json` and is returned as `environment_pause`.
-Migration V202610010410 clears legacy Task environment annotations without deleting
-Tasks or their execution history.
+pre-dispatch environment failure path. No provider call or retry budget is
+spent, and the Task keeps its workflow state with no blocking annotation. The
+workspace owner is recorded `not_ready` in `project_machine_readiness`, with
+its current checks digest, failing check names, role, bounded redacted output,
+and next-check time. The key is the Project plus the server host, or the daemon
+and runtime IDs of a daemon-owned placement. An embedded execution daemon or a
+shared-mount execution provider does not change a server workspace's owner key.
 
-`environment_pause_sync` starts a background job for recorded failing checks
-when due on the recorded ready daemon placement, with Project `env` and without
-assets. Embedded work, missing or unresolved workspaces, and daemon placements
-that are not ready or whose owner is unreachable use the primary checkout. The tick
-only starts or observes a job; operations refresh does not wait for host checks.
-Scheduled and manual re-checks share single-flight ownership per Project. Results
-use the original Project version and pause timestamp in the existing CAS, so a
-new pause, settings edit, or user pause wins over stale results. Check timeouts
-accept 1–300 seconds (default 120); execution clamps legacy stored values too.
-The interval defaults to 600 seconds (60–86400). Failure, including a re-check
-error, refreshes detail and schedules another check; an error is logged once at
-warn and does not skip the Project's plan-publication reconciliation;
-success compare-and-clears only the environment pause and publishes a Project
-resumed event. The next tick re-dispatches Tasks in their current states.
+A failed machine's placed Task waits durably in `metadata.environment_wait`
+and `deferred_dispatch`, with Task-scoped Attention naming the machine and
+checks. Attention uses the existing `execution_failed` category and an
+`environment_not_ready` cause; it introduces no public category. Placement
+stays sticky. New Tasks can select another ready machine. Only when every
+machine with a ready location for the Project is known `not_ready` for the
+current digest does Forge pause the Project with
+`system_pause_reason = "environment_not_ready"`. The pause write re-checks
+alternatives under its writer transaction, so a concurrent successful probe
+prevents the pause. User and repository pauses are never overwritten. With
+one machine, the existing execution failure, Project pause, and automatic
+resume behavior are retained. Internal `project.environment_pause_json`
+retains the machine alongside workspace ID, check names, role, bounded output,
+and pause/last-check/next-check times. The current public `environment_pause`
+response keeps its existing fields during this backend step. Migration
+V202610020600 carries every existing environment pause into a readiness row
+(the server when no machine was recorded), without changing its pause or
+existing placements; the migration runner fills the canonical checks digest.
+Migration V202610010410 clears legacy Task environment annotations without
+removing Tasks or execution history.
+
+`environment_pause_sync` starts independent background re-checks for each
+`not_ready` machine once its `next_check_at` passes, even while the Project is
+active. It runs only recorded failing checks, with Project `env` and no assets,
+on that machine. Server checks use the primary or managed server checkout;
+daemon checks use an existing ready owner placement through `workspace.run`.
+An unreachable or unresolvable daemon keeps its row: scheduled checks never
+substitute the server for the failed machine. Successful checks mark that
+machine `ready`, resolve its waiting Task Attention, remove its dispatch delay,
+and compare-and-clear an unchanged environment pause, publishing
+`project.resumed`. Failure updates the bounded output and check times. Result
+writes compare the readiness version and current environment digest; Project
+pause changes retain the existing Project-version and pause-time CAS. The tick
+only starts or observes jobs and does not wait for command I/O. Single-flight
+ownership is per Project and machine; server re-checks also share the existing
+manual-check guard. A pause without a runnable recorded check remains paused
+with an explicit manual-resume message. Check timeouts accept 1–300 seconds
+(default 120), including clamping old documents. Re-check intervals default to
+600 seconds and accept 60–86400.
+
+Readiness success removes the machine wait and wakes dispatch; independent
+execution blockers still apply. Current daemon coder prompt loading uses a
+server-only canonical-plan accessor in `workflow/dispatch/loader.rs`, and
+coder/planner start prepares plan outboxes on the server using daemon-local
+paths in `task_service/execution/runner.rs`. These existing plan I/O paths are
+owned by the workflow/runtime refactor; this backend step verifies daemon
+re-dispatch through the execution path without plan I/O.
+
 `POST /projects/{id}/environment/recheck` runs every configured check immediately
 and returns per-check results plus the Project; all passing clears a matching
 environment pause. A manual check returns HTTP 409 immediately if another
@@ -806,8 +837,11 @@ re-check is running. An empty check list never resumes automatically: asset-copy
 failures and removed probes stay paused with an explicit manual-resume message.
 Checks that were already passing do not resume such a pause on a timer; the
 owner's own "Check now" runs every configured check and resumes when all pass.
-Manual resume clears the pause too; another failing launch pauses the Project
-again. Running executions are left to finish.
+The manual endpoint retains its existing primary-checkout fallback when its
+recorded daemon workspace is unavailable; scheduled re-checks do not use that
+fallback. Manual resume clears the Project pause; known machine failures
+remain placement filters until a check passes. A subsequent launch failure
+records the machine again. Running executions are left to finish.
 
 Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks
@@ -2318,7 +2352,30 @@ explicit expiry after ten minutes from their last update.
 
 Candidates must pass reachability and visibility, executor availability and
 adapter capability facts, daemon `workspace.v1` support, run policy, Agent pin,
-capacity, and the daemon placement limits. Missing adapter facts mean unsupported.
+capacity, the daemon placement limits, and Project environment readiness.
+Missing adapter facts mean unsupported. Readiness is a fact per Project and
+workspace-owner machine, with a SHA-256 digest covering only `environment.env`
+and `environment.checks`; asset and interval edits do not invalidate it. Pure
+selection reads the candidate's readiness: current `ready` passes; current
+`not_ready` returns `environment_not_ready` with failing check names; missing,
+unknown, or stale records return retryable `environment_probe_pending`.
+Projects with no checks ignore readiness, never probe, and write no new rows;
+removing their checks deletes existing rows and resolves machine waits.
+
+Probes run outside admission's transaction, single-flight per Project and
+machine, with all configured checks, Project env, bounded redacted results,
+and no asset staging or workspace preparation. Server probes use a ready
+repository checkout through the same command path as scheduled re-checks.
+Daemon probes currently require a ready placement reachable through the
+existing `workspace.run` operation; no daemon-local path is opened by the
+server. Until `machine.probe` is implemented, a daemon candidate with no
+readiness record and no existing probe path passes the environment filter and
+relies on launch-time checks. That temporary rule is the explicit missing-row
+arm in `placement/selection.rs::filter_candidate`; known failures still reject.
+Versioned result writes discard older digests and competing newer results.
+Settings edits invalidate rows in the Project update transaction. A
+`project.updated` observer starts probes for rows and ready locations without a
+Task; the regular scan also reconciles changes from non-event callers.
 The embedded provider supplies the server host's adapter facts, including session
 resume for its session-capable executors. Recovery uses those facts for embedded
 execution and the current owner's handshake for daemon execution; no command
@@ -2328,8 +2385,14 @@ default location → server-owned → `(created_at, id)`. The selection reason r
 the winning rule and rejected candidates with filter codes. If no owner is
 eligible, claim returns structured `placement_unavailable`; there is no silent
 fallback.
-Automatic dispatch keeps transient owner-unreachable or capacity refusals queued
-on the same owner. Before the first placement exists, an offline owner creates
+Automatic dispatch keeps transient owner-unreachable, capacity, and
+`environment_probe_pending` refusals queued. Initial dispatch reads the same
+selection context before its workflow transition and defers an otherwise
+viable probe refusal without entering the target state. The queued marker
+creates no Execution or Task version change. Repeated probe waits refresh
+only their retry time. Probe completion clears the delay without another Task
+version change, so the next tick can enter the target state and launch.
+Before the first placement exists, an offline owner creates
 Task-scoped `runtime_offline` Attention and a durable wait bounded by
 `workspace.max_disconnect_seconds`; expiry blocks the Task visibly. Repeated
 identical waits update only their retry time; events, Attention, and Task version
@@ -2341,7 +2404,7 @@ uses `queued_recovery`; permanent replay refusals restore its original blocker.
 The active scan retries structural placement refusals, because location,
 executor, handshake, and run-policy changes can fix them without editing a Task.
 On state entry, a structural refusal still rolls the transition back with
-`dispatch_failed`; only retryable owner/capacity refusals defer dispatch.
+`dispatch_failed`; retryable owner, capacity, and environment-probe refusals defer dispatch.
 Stable governance refusals use `metadata.dispatch_disposition` with the safe
 reason, and remain parked until their authority changes or dispatch is woken.
 

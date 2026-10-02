@@ -440,6 +440,26 @@ impl ProjectRepo for SqliteDb {
             || original_primary_repo_id != project.primary_repo_id
             || original_paused_at != project.paused_at
             || original_system_pause_reason != project.system_pause_reason;
+        if original_settings != project.settings {
+            let before = crate::environment_readiness::settings_environment(&original_settings)?;
+            let after = crate::environment_readiness::settings_environment(&project.settings)?;
+            if after.checks.is_empty() {
+                sqlx::query("DELETE FROM project_machine_readiness WHERE project_id = ?")
+                    .bind(&project.id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id = ?)")
+                    .bind(&project.updated_at).bind(&project.updated_at).bind(&project.id).execute(&mut *transaction).await?;
+                sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
+                    .bind(&project.id).execute(&mut *transaction).await?;
+            } else if crate::environment_checks_digest(&before)
+                != crate::environment_checks_digest(&after)
+            {
+                sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
+                    .bind(crate::environment_checks_digest(&after)).bind(&project.id)
+                    .execute(&mut *transaction).await?;
+            }
+        }
         if project_authority_changed {
             wake_dispatch_for_project_in_tx(&mut transaction, &project.id, &project.updated_at)
                 .await?;
@@ -611,6 +631,48 @@ impl ProjectRepo for SqliteDb {
         detail_json: &str,
     ) -> Result<bool> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        if serde_json::from_str::<serde_json::Value>(detail_json)
+            .ok()
+            .is_some_and(|detail| detail.get("machine").is_some())
+        {
+            let settings: Option<String> =
+                sqlx::query_scalar("SELECT settings FROM project WHERE id = ? AND version = ?")
+                    .bind(id)
+                    .bind(expected_version)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            if let Some(settings) = settings {
+                let environment = crate::environment_readiness::settings_environment(&settings)?;
+                if !environment.checks.is_empty() {
+                    let digest = crate::environment_checks_digest(&environment);
+                    let readiness = crate::ProjectMachineReadinessRepo::list_readiness_in_tx(
+                        self,
+                        &mut transaction,
+                        id,
+                    )
+                    .await?;
+                    let locations: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as("SELECT l.owner_kind, l.daemon_id, l.runtime_id FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.status = 'ready'")
+                        .bind(id).fetch_all(&mut *transaction).await?;
+                    if locations.iter().any(|(kind, daemon, runtime)| {
+                        !readiness.iter().any(|row| {
+                            row.machine.columns()
+                                == (
+                                    kind.as_str(),
+                                    daemon.as_deref().filter(|_| kind == "daemon").unwrap_or(""),
+                                    runtime
+                                        .as_deref()
+                                        .filter(|_| kind == "daemon")
+                                        .unwrap_or(""),
+                                )
+                                && row.status == crate::EnvironmentReadinessStatus::NotReady
+                                && row.checks_digest == digest
+                        })
+                    }) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
         let updated_at = now_rfc3339();
         let result = sqlx::query(
             "UPDATE project

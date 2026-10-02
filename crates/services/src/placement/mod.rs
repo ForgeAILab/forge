@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod capacity;
+pub(crate) mod environment;
 pub mod selection;
 
 pub use selection::{
@@ -24,6 +25,7 @@ pub(crate) fn is_retryable_admission_refusal(error: &crate::ServiceError) -> boo
                             PlacementFilterCode::AgentCapacity
                                 | PlacementFilterCode::DaemonCapacity
                                 | PlacementFilterCode::OwnerUnreachable
+                                | PlacementFilterCode::EnvironmentProbePending
                         ) || (candidate
                             .filter_codes
                             .contains(&PlacementFilterCode::OwnerUnreachable)
@@ -45,6 +47,18 @@ pub(crate) async fn admission_refusal_is_retryable(
     error: &crate::ServiceError,
 ) -> crate::Result<bool> {
     let placement = db::WorkspacePlacementRepo::get_for_task(db, task_id).await?;
+    if let crate::ServiceError::PlacementUnavailable(refusal) = error {
+        if placement.as_ref().is_some_and(|placement| {
+            refusal.rejected_candidates.iter().any(|candidate| {
+                candidate.repo_location_id == placement.repo_location_id
+                    && candidate
+                        .filter_codes
+                        .contains(&PlacementFilterCode::EnvironmentNotReady)
+            })
+        }) {
+            return Ok(true);
+        }
+    }
     if matches!(
         error,
         crate::ServiceError::DaemonUnavailable { .. }
@@ -102,6 +116,7 @@ mod tests {
             rejected_candidates: codes
                 .into_iter()
                 .map(|filter_codes| CandidateRejection {
+                    failing_checks: Vec::new(),
                     repo_location_id: "location".into(),
                     owner_kind: "daemon".into(),
                     daemon_id: Some("daemon".into()),
@@ -144,6 +159,7 @@ mod tests {
                 task_id: "task".into(),
                 repo_id: "repo".into(),
                 rejected_candidates: vec![CandidateRejection {
+                    failing_checks: Vec::new(),
                     repo_location_id: "location".into(),
                     owner_kind: "server".into(),
                     daemon_id: None,

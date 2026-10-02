@@ -91,6 +91,7 @@ mod commitment;
 mod daemon;
 mod domain_event;
 mod embedded_agent;
+pub(crate) mod environment_readiness;
 mod execution;
 mod external_link;
 mod inbox;

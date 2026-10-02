@@ -51,6 +51,142 @@ pub(super) struct WorkspaceAdmission {
 }
 
 impl TaskService {
+    /// The sole new initial-dispatch refusal: unknown environment readiness
+    /// parks the Task before the workflow enters its target state.
+    pub(crate) async fn defer_initial_environment_probe(
+        &self,
+        task: &Task,
+        agent: &Agent,
+        role: &str,
+    ) -> Result<bool> {
+        let authority = resolve_task_repository_authority(&self.db, task).await?;
+        let settings: ProjectSettings = serde_json::from_str(&authority.project.settings)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        if settings.environment.checks.is_empty() {
+            return Ok(false);
+        }
+        let claiming = worktree_agent(role, agent.clone());
+        let agents =
+            crate::placement::environment::dispatch_worktree_agents(&self.db, task, &agent.id)
+                .await?
+                .into_iter()
+                .map(|(role, agent)| worktree_agent(&role, agent))
+                .collect::<Vec<_>>();
+        let server = server_executor_facts(
+            &self.db,
+            std::iter::once(&claiming).chain(agents.iter()),
+            self.placement_adapter_registry.as_deref(),
+        )
+        .await?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &authority.project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::General),
+        );
+        let source = json!({"workflow":workflow, "project_settings":parse_json_value("project settings", &authority.project.settings)?,
+            "task_scope":{"task_type":task.task_type,"config":task.task_state_config.as_deref().map(|raw| parse_json_value("task state config", raw)).transpose()?}});
+        let review = serde_json::from_value(
+            api_types::effective_review_config(&source).map_err(ServiceError::invalid_operation)?,
+        )
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let empty = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
+        let registry = self.daemon_connections.as_deref().unwrap_or(&empty);
+        let handshakes = connection_handshakes(registry);
+        let workspace = WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let (version, paused_at): (i64, Option<String>) =
+            sqlx::query_as("SELECT version, paused_at FROM project WHERE id = ?")
+                .bind(&task.project_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if paused_at.is_some() {
+            return Err(ServiceError::ProjectPaused {
+                project_id: task.project_id.clone(),
+            });
+        }
+        if version != authority.project.version {
+            return Err(DbError::VersionConflict.into());
+        }
+        for role in std::iter::once(&claiming).chain(agents.iter()) {
+            let version: Option<i64> =
+                sqlx::query_scalar("SELECT version FROM agent_current WHERE id = ?")
+                    .bind(&role.agent.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if version != Some(role.agent.version) {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_location WHERE repo_id = ?")
+            .bind(&authority.repo.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if count == 0 {
+            let path = authority
+                .repo
+                .local_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.workspace_root.join(".repos").join(&authority.repo.id));
+            // The dispatcher has verified checkout readiness already. As in
+            // ordinary admission, register its location without a workspace.
+            if path.is_dir() {
+                server_repo_location_in_tx(
+                    &mut tx,
+                    &authority.repo,
+                    &path.to_string_lossy(),
+                    &now_rfc3339(),
+                )
+                .await?;
+            }
+        }
+        let context = crate::placement::load_selection_context(
+            &self.db,
+            &mut tx,
+            registry,
+            crate::placement::SelectionLoadInput {
+                task,
+                repo: &authority.repo,
+                claiming_agent: &claiming,
+                worktree_agents: &agents,
+                task_owner_id: authority.project.owner_id.as_deref(),
+                workspace_id: workspace
+                    .as_ref()
+                    .filter(|_| task.parent_task_id.is_none())
+                    .map(|workspace| workspace.id.as_str()),
+                inherited_root_workspace_id: workspace
+                    .as_ref()
+                    .filter(|_| task.parent_task_id.is_some())
+                    .map(|workspace| workspace.id.as_str()),
+                review_config: &review,
+                project_settings: &settings,
+                server: &server,
+                handshakes: &handshakes,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        let Err(refusal) = crate::placement::select_placement(&context).into_result() else {
+            return Ok(false);
+        };
+        if !refusal.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .filter_codes
+                .contains(&crate::placement::PlacementFilterCode::EnvironmentProbePending)
+        }) {
+            return Ok(false);
+        }
+        let error = ServiceError::PlacementUnavailable(refusal);
+        if !crate::placement::is_retryable_admission_refusal(&error) {
+            return Ok(false);
+        }
+        self.defer_placement_refusal(task, &error).await
+    }
+
     pub(super) fn check_placement_lease_owner(
         &self,
         placement: &db::WorkspacePlacement,
@@ -85,6 +221,11 @@ impl TaskService {
         task: &Task,
         error: &ServiceError,
     ) -> Result<bool> {
+        if let Some(deferred) =
+            crate::placement::environment::defer_refusal(&self.db, task, error).await?
+        {
+            return Ok(deferred);
+        }
         if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await? {
             return Ok(false);
         }

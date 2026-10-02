@@ -593,7 +593,7 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
 }
 
 /// Embedded commands share timeout, stdin, Git environment and output semantics.
-pub(super) async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
+pub(crate) async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
     if spec.max_output_bytes == 0
         || (spec.timeout_secs == 0 && spec.purpose != super::WorkspaceRunPurpose::CiStep)
     {

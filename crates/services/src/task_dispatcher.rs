@@ -37,6 +37,7 @@ pub struct TaskDispatcher {
     /// `sync_repository_pause`.
     ready_repositories: Mutex<HashSet<String>>,
     environment_rechecks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<bool>>>>,
+    environment_settings_observer: std::sync::OnceLock<tokio::task::JoinHandle<Result<bool>>>,
 }
 
 impl TaskDispatcher {
@@ -65,6 +66,7 @@ impl TaskDispatcher {
             stop_notify: Notify::new(),
             ready_repositories: Mutex::new(HashSet::new()),
             environment_rechecks: Mutex::new(HashMap::new()),
+            environment_settings_observer: std::sync::OnceLock::new(),
         }
     }
 

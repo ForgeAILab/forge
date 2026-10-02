@@ -557,6 +557,23 @@ async fn claim_shell_task_with_environment(
         .execute(db.pool())
         .await
         .expect("environment sets");
+    // These tests exercise preflight on a previously admitted machine. Initial
+    // unknown-machine admission is covered by the placement/probe tests.
+    let project = ProjectRepo::get_by_id(&**db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings).unwrap();
+    if !settings.environment.checks.is_empty() {
+        use db::ProjectMachineReadinessRepo;
+        let mut readiness = crate::placement::environment::unknown_record(
+            &project_id,
+            db::EnvironmentMachine::Server,
+            &settings.environment,
+        );
+        readiness.status = db::EnvironmentReadinessStatus::Ready;
+        db.put_readiness(readiness, None).await.unwrap();
+    }
     let agent_id = seed_agent(db).await;
     let task = service
         .create_task(

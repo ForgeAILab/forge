@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610012120 (remove retired knowledge lifecycle hooks).
+// Embedded migration bundle revision: V202610020600 (Project machine readiness).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -74,6 +74,7 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     }
 
     reconcile_project_admission_bindings(pool).await?;
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
 
     Ok(())
 }
@@ -343,6 +344,7 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         apply_migration(pool, &migration).await?;
     }
 
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
     Ok(())
 }
 
