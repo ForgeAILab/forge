@@ -241,6 +241,8 @@ async fn direct_prompt_for_accept_to_planning(
     );
     let dispatch_ctx = load_agent_dispatch_context(
         Arc::clone(&db),
+        &services::TaskService::new_for_test(db.clone(), Arc::new(events::EventBus::new(16)))
+            .workspace_backend_router(),
         task_id,
         default_roles::PLANNER,
         &target_state.name,

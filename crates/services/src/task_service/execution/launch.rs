@@ -851,6 +851,7 @@ impl TaskService {
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
         let dispatch_ctx = match load_agent_dispatch_context(
             Arc::clone(&self.db),
+            &self.workspace_backend_router,
             &task.id,
             role_name,
             &task.status,

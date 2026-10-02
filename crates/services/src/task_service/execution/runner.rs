@@ -348,7 +348,17 @@ impl TaskService {
 
                 let plan_writing_role =
                     executors::task_role_can_write_plan(Some(execution.role.as_str()));
-                if plan_writing_role {
+                let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("execution missing workspace_id")
+                })?;
+                let placement =
+                    db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id)
+                        .await?;
+                if plan_writing_role
+                    && placement.as_ref().is_none_or(|placement| {
+                        placement.owner_kind == db::PlacementOwnerKind::Server
+                    })
+                {
                     let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
                         .await?
                         .ok_or_else(|| {
@@ -2268,6 +2278,7 @@ impl TaskService {
         // The backend durably retains the owner's prepare/reset result before
         // acknowledging it. Resolve the path from that result, fenced to this
         // handle and generation, without opening or inferring any server path.
+        // Plan operations also use workspace.reset, but do not prepare a path.
         let receipt = sqlx::query_scalar::<_, String>(
             "SELECT outcome_json FROM command_receipt
              WHERE principal_type = 'system' AND principal_id = 'workspace-backend'
@@ -2275,6 +2286,7 @@ impl TaskService {
                AND operation IN ('daemon.workspace.prepare', 'daemon.workspace.reset')
                AND json_valid(outcome_json)
                AND json_extract(outcome_json, '$.metadata.status') = 'result'
+               AND json_type(outcome_json, '$.owner_result.workspace_path') = 'text'
                AND json_extract(outcome_json, '$.metadata.placement_id') = ?
                AND json_extract(outcome_json, '$.metadata.generation') = ?
                AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
@@ -2316,6 +2328,8 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        executor_config["_forge_plan_transport"] =
+            json!(resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon);
         if read_only_execution_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
@@ -2353,6 +2367,26 @@ impl TaskService {
         let max_turns = self.resolve_max_turns(&task).await?;
 
         Ok(api_types::ExecutionStartParams {
+            plan_text: if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+                && executors::task_role_can_write_plan(Some(&execution.role))
+            {
+                if execution.role == crate::workflow::default_roles::PLANNER {
+                    task.plan.clone()
+                } else {
+                    crate::plan_artifact::read_plan_text_with_router(
+                        &self.db,
+                        &self.workspace_backend_router,
+                        workspace_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        error.into_service_error("canonical plan artifact is unreadable")
+                    })?
+                    .or_else(|| task.plan.clone())
+                }
+            } else {
+                None
+            },
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             workspace_path,

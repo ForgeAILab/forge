@@ -933,8 +933,8 @@ async fn connection_snapshot_retains_handshake_facts_only_for_current_incarnatio
     let (connection, _outbound) = DaemonConnection::new("snapshot-owner".to_owned());
     let first_id = connection.id();
     registry.register("snapshot-owner".to_owned(), connection.clone());
-    let handshake = json!({"protocol_revision": 3,
-        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+    let handshake = json!({"protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],
         "executor_capabilities": {"codex": {"resume": true, "usage": true}},
         "workspace_run_policy": {"allowed_purposes": ["ci_step", "hook"]}});
     registry.dispatch_incoming_for_connection(

@@ -598,10 +598,22 @@ those two Unix properties. Reviewer and stale execution output cannot publish a
 plan. Non-regular files, symlinks, invalid UTF-8, oversized content, and plans
 without a checklist are rejected; a rejected candidate is retained in its
 execution outbox for diagnosis. After successful staging, Forge removes the
-agent-writable outbox and settles from the frozen copy. This broker shares the
-managed-daemon filesystem requirement: the API server and execution host must
-see the Task directory at the same absolute path through a shared workspace
-mount; separate-filesystem daemon sync is not implemented. A read-only role
+agent-writable outbox and settles from the frozen copy.
+For a server-owned workspace (including verified shared mounts), this broker
+uses the same local sibling and staging files. For a daemon-owned workspace,
+the server reads canonical text through the owner router and sends it in
+`execution.start.plan_text`; implementation roles use the canonical plan with
+`task.plan` as fallback, while a planner revision receives the current `task.plan`.
+The daemon seeds its private outbox locally and returns the exact candidate in
+`execution.terminal.plan_text`. The winning terminal CAS stores that candidate
+in the execution snapshot (`terminal_plan_text`), together with the existing
+terminal receipt. The publication claim then authorizes a fenced owner-local
+`publish_plan` operation. The owner preserves the prior canonical plan in a
+private snapshot for idempotent publication, compare-safe rollback, and cleanup.
+These artifact operations preserve owner/generation/HEAD fences and can settle
+while the next CLI turn runs; they do not mutate tracked repository files.
+The server never opens the daemon's worktree or outbox path; there is no
+workspace filesystem sync. A read-only role
 still cannot deliver code: Forge skips
 its finalization, fails any execution that changed a tracked file or moved HEAD,
 and resets the worktree afterwards. An unexpected authority-bearing input in that managed home
@@ -2392,7 +2404,11 @@ placement without a shared mount. Admission records that embedded daemon as
 recorded provider; the workspace owner and handle stay on the server.
 Daemon placements require CLI Agents for every assigned worktree role (coder,
 reviewer, planner); native Agents are rejected with
-`native_backend_unsupported`.
+`native_backend_unsupported`. Plan-writing roles (`planner`, `coder`, `worker`,
+`executor`) also require the owner's `execution.plan_transport` capability;
+a missing capability is a structured `capability_missing` placement refusal.
+Revision-3 and older owners receive `daemon_upgrade_required` at admission.
+No plan-writing role is parked with `owner_unsupported`.
 
 Agent claims, initial launches, ordinary re-execution, and resume refuse a
 paused Project with `ProjectPaused` before placement selection, reservation,
@@ -2512,13 +2528,13 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 3 adds `workspace.v1`: `repo_location.verify`,
+Protocol revision 4 retains `workspace.v1` and adds `execution.plan_transport`: `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 3 or newer), restarting each with its existing
+release (protocol revision 4 or newer), restarting each with its existing
 `--workspace-root`.
-A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+A revision-2 or revision-3 connection receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -2529,7 +2545,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the revision-3 handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
@@ -2573,13 +2589,20 @@ the exact frozen candidate was integrated, with a diffstat reconstructed from
 the original target SHA. Interrupted errors carry `entry_id`, `operation_id`,
 and `interrupted: true` in their details.
 
-Terminal reports, bounded worklog/evidence outbox entries, operation results,
+Terminal reports, bounded plan/worklog/evidence outbox content, operation results,
 and cleanup acknowledgements share one daemon journal. Both owner harvesters
 accept newline-delimited, concatenated, and pretty-printed JSON objects, resume
 at the next physical line after malformed input, and retain unknown evidence
 kinds as `other` with the original kind in the caption. Entry positions use
 stable `line` or `line:column` strings for ingestion receipts. Terminal and cleanup
-results replay after reconnect until `journal.ack { entry_id }`. The server must
+results replay after reconnect until `journal.ack { entry_id }`.
+Daemon plan candidates have a 128 KiB UTF-8 byte limit, leaving room for JSON
+escaping within the 1 MiB terminal journal bound. Oversized, unreadable,
+non-regular, symlinked, multiply linked (on Unix), or checklist-free candidates produce an explicit failed
+terminal report, rather than truncating or omitting a successful plan. Plans
+are retained with the same report identity and digest as worklog and evidence;
+replay cannot substitute a different candidate. Server-owned plans retain
+their existing 1 MiB limit and file layout. The server must
 persist a result, including a terminal operation error, before acknowledging it.
 Exact terminal replays are coalesced while retained so a describe-triggered replay
 cannot compete with the reconciliation drain. The daemon then deletes the receipt; repeated acks are

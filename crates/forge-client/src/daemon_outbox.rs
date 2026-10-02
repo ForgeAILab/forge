@@ -96,6 +96,16 @@ pub(crate) fn harvest(
 /// The final serialized report, rather than raw artifact bytes, sets the bound.
 /// The reserved validation entry travels and replays with the terminal report.
 pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
+    if report
+        .plan_text
+        .as_ref()
+        .is_some_and(|text| text.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES)
+    {
+        report.plan_text = None;
+        report.status = Some("failed".into());
+        report.exit_code = Some(1);
+        report.error = Some("execution plan exceeds transport size bound".into());
+    }
     let mut dropped = 0;
     while serde_json::to_vec(report)
         .map(|bytes| bytes.len() > MAX_TERMINAL_REPORT_SIZE - 1024)
@@ -117,6 +127,21 @@ pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
         });
         reserve_truncation_room(report);
         append_truncation_marker(&mut report.outbox_entries, dropped);
+    }
+    // Plan content is indivisible. Trim diagnostic text first; if immutable
+    // metadata still leaves no room, return an explicit failed capture report.
+    if report.plan_text.is_some() {
+        reserve_truncation_room(report);
+        if serde_json::to_vec(report)
+            .map(|bytes| bytes.len() > MAX_TERMINAL_REPORT_SIZE)
+            .unwrap_or(true)
+        {
+            report.plan_text = None;
+            report.status = Some("failed".into());
+            report.exit_code = Some(1);
+            report.error =
+                Some("execution plan cannot fit in the terminal report size bound".into());
+        }
     }
 }
 
@@ -288,6 +313,25 @@ fn content_type(filename: &str, kind: ExecutionOutboxEvidenceKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_report_bounds_preserve_exact_content_or_fail_capture() {
+        let mut report: ExecutionTerminalNotification = serde_json::from_value(serde_json::json!({"terminal_report_id":"plan-report", "execution_id":"exec-plan", "exit_code":0, "signal":null, "error":null, "ts":"now", "usage_reports":[]})).unwrap();
+        let content = format!(
+            "- [ ] {}",
+            "\u{0001}".repeat(api_types::MAX_EXECUTION_PLAN_BYTES as usize - 6)
+        );
+        report.plan_text = Some(content.clone());
+        report.summary = Some("s".repeat(900 * 1024));
+        fit_report(&mut report);
+        assert_eq!(report.plan_text.as_deref(), Some(content.as_str()));
+        assert!(serde_json::to_vec(&report).unwrap().len() <= MAX_TERMINAL_REPORT_SIZE);
+        report.plan_text = Some("x".repeat(api_types::MAX_EXECUTION_PLAN_BYTES as usize + 1));
+        fit_report(&mut report);
+        assert!(report.plan_text.is_none());
+        assert_eq!(report.status.as_deref(), Some("failed"));
+        assert!(report.error.as_deref().unwrap().contains("size bound"));
+    }
 
     #[test]
     fn oversized_evidence_is_marked_and_report_fits_journal() {

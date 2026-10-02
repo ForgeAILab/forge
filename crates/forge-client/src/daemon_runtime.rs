@@ -346,6 +346,7 @@ impl DaemonRuntime {
         let mut capabilities = vec![
             DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
             DAEMON_CAPABILITY_JOURNAL_ACK.to_owned(),
+            api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
         ];
         if self.workspace.is_some() {
             capabilities.push(api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned());
@@ -490,6 +491,24 @@ impl DaemonRuntime {
             Path::new(params.workspace_path.trim()),
             &self.workspace_root,
         )?;
+        if params
+            .executor_config
+            .get("_forge_plan_transport")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && executors::task_role_can_write_plan(executors::task_role(&params.executor_config))
+        {
+            crate::daemon_plan::seed(
+                &worktree_path,
+                &params.execution_id,
+                params.plan_text.as_deref(),
+            )
+            .map_err(|error| DaemonErrorPayload {
+                code: api_types::INVALID_INPUT.into(),
+                message: format!("failed to prepare execution plan: {error}"),
+                details: None,
+            })?;
+        }
         let active_guard = self.active_executions.track(params.execution_id.clone());
         if let Some(workspace) = &self.workspace {
             workspace
@@ -597,6 +616,14 @@ async fn run_execution_task(
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf);
+    let plan_writing_role = ctx
+        .agent_config
+        .get("_forge_plan_transport")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && executors::task_role_can_write_plan(executors::task_role(&ctx.agent_config));
+    let mut plan_text = None;
+    let mut plan_error = None;
     let mut outbox_entries = Vec::new();
     let read_only_path = executors::is_worktree_read_only(&ctx.agent_config)
         .then(|| PathBuf::from(&ctx.worktree_path));
@@ -620,6 +647,14 @@ async fn run_execution_task(
             }
             if let Some(root) = &workspace_root {
                 outbox_entries = daemon_outbox::harvest(&worktree_path, &execution_id, root);
+            }
+            if plan_writing_role {
+                match crate::daemon_plan::harvest(&worktree_path, &execution_id) {
+                    Ok(content) => plan_text = content,
+                    Err(error) => {
+                        plan_error = Some(format!("execution plan transport failed: {error}"))
+                    }
+                }
             }
             let restore_result = match (read_only_path.as_deref(), read_only_head.as_deref()) {
                 (Some(path), Some(head)) => {
@@ -671,6 +706,7 @@ async fn run_execution_task(
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -678,6 +714,12 @@ async fn run_execution_task(
         },
     };
     notification.outbox_entries = outbox_entries;
+    notification.plan_text = plan_text;
+    if let Some(error) = plan_error {
+        notification.status = Some("failed".into());
+        notification.exit_code = Some(1);
+        notification.error = Some(error);
+    }
     crate::daemon_persistence::sanitize_terminal_report(&mut notification, &environment);
     daemon_outbox::fit_report(&mut notification);
     match journal.retain(&notification) {
@@ -717,6 +759,7 @@ fn terminal_notification_from_result(
             .map(remote_usage_report_from_executor)
             .collect(),
         outbox_entries: Vec::new(),
+        plan_text: None,
         failure_class: result.failure_class.map(|class| match class {
             ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
             ExecutionFailureClass::ExecutorUnavailable => {
@@ -1018,6 +1061,7 @@ mod tests {
         Arc::get_mut(&mut runtime).unwrap().workspace_root = root;
         let result = runtime
             .start(ExecutionStartParams {
+                plan_text: None,
                 task_id: "task".into(),
                 execution_id: "execution".into(),
                 workspace_path: "unused".into(),
@@ -1043,6 +1087,7 @@ mod tests {
         );
         runtime
             .start(ExecutionStartParams {
+                plan_text: None,
                 task_id: "task-1".into(),
                 execution_id: "execution-1".into(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
@@ -1074,6 +1119,7 @@ mod tests {
 
         let result = runtime
             .start(ExecutionStartParams {
+                plan_text: None,
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
@@ -1110,6 +1156,7 @@ mod tests {
 
         runtime
             .start(ExecutionStartParams {
+            plan_text: None,
                 task_id: "task-1".to_owned(),
                 execution_id: "exec-shell-commit".to_owned(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
@@ -1195,9 +1242,10 @@ mod tests {
             }
         }
         runtime.start(ExecutionStartParams {
+            plan_text: Some("- [ ] revision".into()),
             task_id: "task-1".into(), execution_id: "exec-outbox".into(), workspace_path: workspace_path.unwrap(),
-            executor_type: "shell".into(), executor_config: serde_json::json!({"executor_type":"shell", "config":{}}),
-            prompt: serde_json::json!({"description": r#"mkdir -p ../.forge-outbox/exec-outbox; printf '%s\n' '{"kind":"progress","summary":"remote progress"}' > ../.forge-outbox/exec-outbox/worklog.jsonl; printf '%s\n' '{"kind":"report","caption":"remote evidence","content":"captured remotely"}' > ../.forge-outbox/exec-outbox/evidence.jsonl"#}),
+            executor_type: "shell".into(), executor_config: serde_json::json!({"executor_type":"shell", "config":{}, "_forge_task_role":"planner", "_forge_plan_transport":true}),
+            prompt: serde_json::json!({"description": r#"test "$(cat ../.forge-outbox/exec-outbox/plan.md)" = "- [ ] revision" || exit 13; printf '%s\n' '- [ ] remote plan' > ../.forge-outbox/exec-outbox/plan.md; mkdir -p ../.forge-outbox/exec-outbox; printf '%s\n' '{"kind":"progress","summary":"remote progress"}' > ../.forge-outbox/exec-outbox/worklog.jsonl; printf '%s\n' '{"kind":"report","caption":"remote evidence","content":"captured remotely"}' > ../.forge-outbox/exec-outbox/evidence.jsonl"#}),
             max_turns: None,
         }).await.unwrap();
         let report = next_terminal_notification(&mut rx, "exec-outbox").await;
@@ -1205,6 +1253,7 @@ mod tests {
         assert!(
             matches!(&report.outbox_entries[0], ExecutionOutboxEntry::Worklog { summary, .. } if summary == "remote progress")
         );
+        assert_eq!(report.plan_text.as_deref(), Some("- [ ] remote plan\n"));
         drop(runtime);
         let (tx, mut replay_rx) = mpsc::unbounded_channel();
         let restarted = test_owned_runtime(
@@ -1255,6 +1304,7 @@ mod tests {
 
         runtime
             .start(ExecutionStartParams {
+                plan_text: None,
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),
@@ -1308,6 +1358,7 @@ mod tests {
 
         runtime
             .start(ExecutionStartParams {
+                plan_text: None,
                 task_id: "task-1".to_owned(),
                 execution_id: execution_id.clone(),
                 workspace_path: dir.path().to_string_lossy().into_owned(),

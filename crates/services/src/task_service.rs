@@ -1552,13 +1552,35 @@ impl TaskService {
                 .collect(),
             unavailable_retry_at: executor_unavailable.then(|| notification.retry_at.clone()),
         };
-        let snapshot_update = match current_execution.executor_config_snapshot_json.as_deref() {
+        let mut snapshot_update = match current_execution.executor_config_snapshot_json.as_deref() {
             Some(snapshot) => crate::task_service::config::apply_route_outcome_to_snapshot(
                 snapshot,
                 &route_outcome,
             )?,
             None => None,
         };
+
+        // Persist the exact candidate in the winning terminal CAS. Reconnect
+        // replay and completion recovery therefore use the same bounded bytes.
+        if notification.plan_text.as_ref().is_some_and(|content| {
+            !executors::task_role_can_write_plan(Some(&current_execution.role))
+                || content.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES
+        }) {
+            return Err(ServiceError::invalid_operation(
+                "invalid or oversized terminal plan candidate",
+            ));
+        }
+        if executors::task_role_can_write_plan(Some(&current_execution.role)) {
+            let mut snapshot = parse_json_value(
+                "executor config snapshot",
+                snapshot_update
+                    .as_deref()
+                    .or(current_execution.executor_config_snapshot_json.as_deref())
+                    .unwrap_or("{}"),
+            )?;
+            snapshot["terminal_plan_text"] = json!(notification.plan_text);
+            snapshot_update = Some(snapshot.to_string());
+        }
 
         let remote_reports = remote_usage_reports(&notification.usage_reports);
         let snapshot_value = current_execution

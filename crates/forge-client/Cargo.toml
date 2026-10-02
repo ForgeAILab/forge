@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
+libc = "0.2"
 url = "2"
 tracing = { workspace = true }
 which = "7"

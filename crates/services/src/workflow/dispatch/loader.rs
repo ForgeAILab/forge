@@ -13,8 +13,10 @@ use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn load_agent_dispatch_context(
     db: Arc<db::SqliteDb>,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
     task_id: &str,
     role: &str,
     state_name: &str,
@@ -65,18 +67,21 @@ pub async fn load_agent_dispatch_context(
     ) {
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(task_id);
         match WorkspaceRepo::get_by_task_id(&*db, workspace_task_id).await? {
-            Some(workspace) => crate::plan_artifact::read_canonical_plan_text(
-                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                    &db, &workspace,
-                )
-                .await?,
-            )
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "canonical plan artifact is unreadable: {error}"
-                ))
-            })?
-            .or_else(|| task.plan.clone()),
+            Some(workspace) => {
+                match crate::plan_artifact::read_plan_text_with_router(&db, router, &workspace.id)
+                    .await
+                {
+                    Ok(plan) => plan.or_else(|| task.plan.clone()),
+                    // Admission owns owner/protocol refusals. Its hard filters or
+                    // workspace preconditions must report these structurally.
+                    Err(error) if error.needs_placement_check() => task.plan.clone(),
+                    Err(error) => {
+                        return Err(
+                            error.into_service_error("canonical plan artifact is unreadable")
+                        )
+                    }
+                }
+            }
             None => task.plan.clone(),
         }
     } else {

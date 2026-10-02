@@ -220,7 +220,13 @@ impl TaskService {
             if super::pending_plan_publication_cleanup_owner(&task)?.as_deref()
                 == Some(execution.id.as_str())
             {
-                super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id).await?;
+                super::cleanup_execution_plan_private_files(
+                    &self.db,
+                    &self.workspace_backend_router,
+                    &task,
+                    &execution.id,
+                )
+                .await?;
                 super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
             }
             return Ok(());
@@ -392,12 +398,12 @@ impl TaskService {
             let workspace = brokered_workspace
                 .as_ref()
                 .expect("brokered workspace checked before plan publication");
-            let worktree =
-                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                    &self.db, workspace,
-                )
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, workspace)
                 .await?;
-            match crate::plan_artifact::publish_staged_execution_plan(worktree, &execution.id) {
+            let plan = crate::plan_artifact::ExecutionPlan::new(&resolved);
+            match plan.publish(&execution).await {
                 Ok(true) => {}
                 Ok(false) => {
                     let candidate_required = execution.role
@@ -407,7 +413,8 @@ impl TaskService {
                                 .items
                                 .is_empty()
                         })
-                        || crate::plan_artifact::read_canonical_plan_text(worktree)
+                        || crate::plan_artifact::read_plan_text_for_resolved_workspace(&resolved)
+                            .await
                             .map_err(|error| {
                                 ServiceError::invalid_operation(format!(
                                     "canonical plan artifact is unreadable: {error}"
@@ -687,8 +694,13 @@ impl TaskService {
             return Ok(());
         }
         if let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? {
-            return super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id)
-                .await;
+            return super::cleanup_execution_plan_private_files(
+                &self.db,
+                &self.workspace_backend_router,
+                &task,
+                &execution.id,
+            )
+            .await;
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
             return Ok(());
@@ -696,35 +708,18 @@ impl TaskService {
         let Some(workspace) = WorkspaceRepo::get_by_id(&*self.db, workspace_id).await? else {
             return Ok(());
         };
-        crate::plan_artifact::discard_staged_execution_plan(
-            &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                &self.db, &workspace,
-            )
-            .await?,
-            &execution.id,
-        )
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "failed to remove settled execution plan stage: {error}"
-            ))
-        })?;
-        if let Some(outbox) = executors::execution_outbox_path(
-            &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                &self.db, &workspace,
-            )
-            .await?,
-            &execution.id,
-        ) {
-            match std::fs::remove_dir_all(&outbox) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(ServiceError::invalid_operation(format!(
-                        "failed to remove settled execution plan outbox: {error}"
-                    )));
-                }
-            }
-        }
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        crate::plan_artifact::ExecutionPlan::new(&resolved)
+            .discard(&execution.id)
+            .await
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "failed to remove settled execution plan stage: {error}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -774,17 +769,24 @@ impl TaskService {
             }
         };
         if let Some(workspace) = workspace.as_ref() {
-            crate::plan_artifact::restore_plan_before_abandon(
-                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(&self.db, workspace).await?,
-                execution_id,
-            )
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, workspace)
+                .await?;
+            crate::plan_artifact::ExecutionPlan::new(&resolved).restore(execution_id).await
             .map_err(|_| {
                 ServiceError::invalid_operation(
                     "failed to restore the prior plan while abandoning an invalid publication claim",
                 )
             })?;
         }
-        super::cleanup_execution_plan_private_files(&self.db, task, execution_id).await?;
+        super::cleanup_execution_plan_private_files(
+            &self.db,
+            &self.workspace_backend_router,
+            task,
+            execution_id,
+        )
+        .await?;
         super::release_plan_publication_for_execution_id(&self.db, task, execution_id).await?;
         Ok(())
     }
@@ -832,18 +834,18 @@ impl TaskService {
             }
         };
         if let Some(workspace) = workspace {
-            crate::plan_artifact::restore_plan_before_abandon(
-                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                    &self.db, &workspace,
-                )
-                .await?,
-                &execution.id,
-            )
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!(
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, &workspace)
+                .await?;
+            crate::plan_artifact::ExecutionPlan::new(&resolved)
+                .restore(&execution.id)
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
                     "failed to restore the prior plan after losing publication authority: {error}"
                 ))
-            })?;
+                })?;
         }
         Ok(())
     }

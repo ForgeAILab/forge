@@ -112,6 +112,49 @@ impl fmt::Display for PlanArtifactError {
     }
 }
 
+impl PlanArtifactError {
+    pub(crate) fn needs_placement_check(&self) -> bool {
+        match self {
+            Self::BackendError(
+                WorkspaceBackendError::OwnerUnsupported { .. }
+                | WorkspaceBackendError::WrongOwner { .. }
+                | WorkspaceBackendError::StaleGeneration { .. },
+            ) => true,
+            Self::BackendError(WorkspaceBackendError::Other(error)) => {
+                matches!(
+                    error.as_ref(),
+                    crate::ServiceError::DaemonUpgradeRequired { .. }
+                ) || matches!(error.as_ref(), crate::ServiceError::InvalidOperation { message }
+                    if message.starts_with(api_types::UNSUPPORTED_METHOD))
+            }
+            _ => false,
+        }
+    }
+    /// Owner transport refusals must retain their classification so dispatch
+    /// can queue an outage or surface an upgrade instead of parking silently.
+    pub(crate) fn into_service_error(self, context: &str) -> crate::ServiceError {
+        use crate::ServiceError;
+        match self {
+            Self::DbError(error) => error.into(),
+            Self::BackendError(WorkspaceBackendError::Other(error)) => match *error {
+                error @ (ServiceError::DaemonUnavailable { .. }
+                | ServiceError::DaemonTimeout { .. }
+                | ServiceError::DaemonUpgradeRequired { .. }
+                | ServiceError::Db(_)) => error,
+                ServiceError::InvalidOperation { message } => {
+                    ServiceError::invalid_operation(format!("{context}: {message}"))
+                }
+                error => ServiceError::invalid_operation(format!("{context}: {error}")),
+            },
+            Self::BackendError(
+                error @ (WorkspaceBackendError::OwnerUnreachable { .. }
+                | WorkspaceBackendError::RpcTimeoutBeforeStart { .. }),
+            ) => error.into(),
+            error => ServiceError::invalid_operation(format!("{context}: {error}")),
+        }
+    }
+}
+
 impl Error for PlanArtifactError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -195,27 +238,11 @@ pub async fn read_plan_with_router(
 pub(crate) async fn read_plan_for_resolved_workspace(
     resolved: &ResolvedWorkspace,
 ) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
-    let artifact = match resolved
-        .backend
-        .read(
-            &resolved.placement,
-            "../plan.md",
-            MAX_PLAN_ARTIFACT_SIZE_BYTES,
-        )
+    let artifact = read_plan_text_for_resolved_workspace(resolved)
         .await
-    {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map(|content| parse_plan_markdown(&content))
-            .map_err(|_| {
-                PlanArtifactError::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                ))
-            }),
-        Err(error) => Err(error.into()),
-    };
+        .map(|content| content.map(|text| parse_plan_markdown(&text)));
     match artifact {
-        Ok(artifact) => {
+        Ok(Some(artifact)) => {
             let source_path = match resolved.placement.owner_kind {
                 db::PlacementOwnerKind::Server => {
                     default_plan_artifact_path(&resolved.embedded_path()?)
@@ -229,8 +256,134 @@ pub(crate) async fn read_plan_for_resolved_workspace(
                 to_plan_artifact_detail(&artifact, Some(source_path), None),
             )))
         }
-        Err(PlanArtifactError::NotFound) => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Canonical plan text always comes through the recorded owner.
+pub async fn read_plan_text_with_router(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    workspace_id: &str,
+) -> Result<Option<String>, PlanArtifactError> {
+    let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+        .await?
+        .ok_or_else(|| PlanArtifactError::WorkspaceNotFound {
+            workspace_id: workspace_id.into(),
+        })?;
+    let resolved = router.resolve(db, &workspace).await?;
+    read_plan_text_for_resolved_workspace(&resolved).await
+}
+
+pub(crate) async fn read_plan_text_for_resolved_workspace(
+    resolved: &ResolvedWorkspace,
+) -> Result<Option<String>, PlanArtifactError> {
+    if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+        return read_canonical_plan_text(&resolved.embedded_path()?);
+    }
+    match resolved
+        .backend
+        .read(
+            &resolved.placement,
+            "../plan.md",
+            MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        )
+        .await
+    {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            PlanArtifactError::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ))
+        }),
+        Err(error) => match PlanArtifactError::from(error) {
+            PlanArtifactError::NotFound => Ok(None),
+            error => Err(error),
+        },
+    }
+}
+
+/// Owner-aware publication boundary. Local/shared-mount files retain their
+/// existing layout; daemon files are mutated only by fenced owner operations.
+pub(crate) struct ExecutionPlan<'a> {
+    resolved: &'a ResolvedWorkspace,
+}
+impl<'a> ExecutionPlan<'a> {
+    pub(crate) fn new(resolved: &'a ResolvedWorkspace) -> Self {
+        Self { resolved }
+    }
+    pub(crate) async fn publish(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<bool, PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return publish_staged_execution_plan(&self.resolved.embedded_path()?, &execution.id);
+        }
+        let snapshot: serde_json::Value = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| {
+                PlanArtifactError::IoError(io::Error::new(io::ErrorKind::InvalidData, error))
+            })?
+            .unwrap_or_default();
+        let Some(content) = snapshot
+            .get("terminal_plan_text")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(false);
+        };
+        if content.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES {
+            return Err(PlanArtifactError::FileTooLarge {
+                size: content.len() as u64,
+                max: api_types::MAX_EXECUTION_PLAN_BYTES,
+            });
+        }
+        if parse_plan_markdown(content).items.is_empty() {
+            return Err(PlanArtifactError::MissingChecklist {
+                path: PathBuf::from("execution plan transport"),
+            });
+        }
+        self.resolved
+            .apply_owner_operation(api_types::WorkspaceOwnerOperation::PublishPlan {
+                execution_id: execution.id.clone(),
+                content: content.into(),
+            })
+            .await?;
+        Ok(true)
+    }
+    pub(crate) async fn restore(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return restore_plan_before_abandon(&self.resolved.embedded_path()?, execution_id);
+        }
+        self.resolved
+            .apply_owner_operation(api_types::WorkspaceOwnerOperation::RestorePlan {
+                execution_id: execution_id.into(),
+            })
+            .await?;
+        Ok(())
+    }
+    pub(crate) async fn discard(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let path = self.resolved.embedded_path()?;
+            discard_staged_execution_plan(&path, execution_id)?;
+            if let Some(outbox) = executors::execution_outbox_path(&path, execution_id) {
+                match fs::remove_dir_all(outbox) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(PlanArtifactError::IoError(error)),
+                }
+            }
+            return Ok(());
+        }
+        self.resolved
+            .apply_owner_operation(api_types::WorkspaceOwnerOperation::DiscardPlan {
+                execution_id: execution_id.into(),
+            })
+            .await?;
+        Ok(())
     }
 }
 
@@ -1083,6 +1236,38 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_plan_read_preserves_transport_refusals() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::Other(Box::new(
+            crate::ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+        )));
+        assert!(error.needs_placement_check());
+        assert!(
+            matches!(error.into_service_error("canonical plan artifact is unreadable"), crate::ServiceError::DaemonUpgradeRequired { daemon_id } if daemon_id == "owner")
+        );
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(matches!(
+            error.into_service_error("canonical plan artifact is unreadable"),
+            crate::ServiceError::DaemonUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn unsupported_plan_owner_reaches_placement_checks() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnsupported {
+            owner_kind: db::PlacementOwnerKind::Daemon,
+        });
+        assert!(error.needs_placement_check());
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(!error.needs_placement_check());
+    }
 
     #[test]
     fn valid_nested_checklist_with_mixed_levels() {

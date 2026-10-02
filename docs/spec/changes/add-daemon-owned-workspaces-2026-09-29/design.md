@@ -138,7 +138,7 @@ placement skips steps 1–2 and only runs `describe` as a cheap precondition.
 
 Hard filters (candidate = one ready repo location):
 
-1. The owner is reachable. For a `daemon` owner: connected, protocol ≥ 3
+1. The owner is reachable. For a `daemon` owner: connected, protocol ≥ 4
    with `workspace.v1`, visible to the Task owner, runtime `ready`.
 2. The Agent's executor is installed, authenticated, and enabled on that
    owner, and the owner's advertised adapter capability facts for that
@@ -219,7 +219,7 @@ cleanup(placement)       -> CleanupAck
   from the server filesystem after the turn (`runner.rs`, the
   `ingest_execution_outbox` call). On a daemon placement the server cannot
   see that directory. The daemon therefore reads the outbox after the CLI
-  exits and embeds the bounded entries in the terminal report. The report
+  exits and embeds the bounded plan candidate, worklog, and evidence entries in the terminal report. The report
   is retained, replayed, and acked as one unit, so evidence and terminal
   status can never arrive separately. The runner ingests entries from the
   report for every placement. The embedded backend fills the same field
@@ -228,11 +228,24 @@ cleanup(placement)       -> CleanupAck
   unchanged. Phase 2 ships only this, and it must be behavior-neutral: the
   existing merge, workspace, and review tests stay green without edits.
 - `DaemonWorkspaceBackend` maps each call to one `workspace.*` RPC.
+- Plans use the same owner routing boundary for reads, publication, rollback,
+  and cleanup. The server sends the start seed in `execution.start.plan_text`;
+  the daemon initializes its own outbox and returns `execution.terminal.plan_text`
+  with the terminal journal record. The terminal CAS freezes the returned text
+  in the execution snapshot; the existing publication claim authorizes fenced
+  owner operations (`publish_plan`, `restore_plan`, `discard_plan`). The daemon
+  retains a private prior-plan snapshot until workflow settlement, preserving
+  publication and rollback replay. The capability `execution.plan_transport`
+  is required at placement for plan-writing roles; absent support yields
+  `capability_missing`, while older protocol revisions yield
+  `daemon_upgrade_required`. Remote candidates have a 128 KiB byte bound;
+  capture failure fails the execution explicitly. Server-owned and shared-mount
+  plan storage remains unchanged.
 
-### D7. Daemon protocol revision 3
+### D7. Daemon protocol revision 4
 
-- `DAEMON_PROTOCOL_REVISION` becomes 3, and the handshake gains the
-  capability `workspace.v1`. The minimum command revision is 3. Revision-2
+- `DAEMON_PROTOCOL_REVISION` becomes 4, and the handshake gains the
+  capability `workspace.v1`. The minimum command revision is 4. Revision-2 and revision-3
   sockets remain visible for upgrade diagnostics but every command RPC is
   refused, including execution, filesystem browsing, verification, and PTY
   terminals. `daemon_upgrade_required` is a human-action refusal on Task

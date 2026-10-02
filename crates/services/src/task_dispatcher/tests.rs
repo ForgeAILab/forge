@@ -7296,7 +7296,7 @@ async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_actio
     registry.register(daemon_id.into(), connection);
     registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
         method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
-        params:serde_json::json!({"protocol_revision":3,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports"],
+        params:serde_json::json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["workspace.v1","journal.ack","execution.terminal.usage_reports", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],
             "executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["ci_step","hook","environment_setup"]}}),
     });
     let responses = registry.clone();

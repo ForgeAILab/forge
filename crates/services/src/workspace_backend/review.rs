@@ -347,7 +347,7 @@ impl ResolvedWorkspace {
         }
     }
 
-    async fn apply_owner_operation(
+    pub(crate) async fn apply_owner_operation(
         &self,
         operation: WorkspaceOwnerOperation,
     ) -> Result<WorkspaceOwnerOperationOutcome> {

@@ -19,6 +19,7 @@ use crate::{
 
 pub async fn preview_effective_prompt(
     db: Arc<db::SqliteDb>,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
     task_id: &str,
     role: &str,
     trigger: Option<WorkflowTrigger>,
@@ -45,6 +46,7 @@ pub async fn preview_effective_prompt(
         effective_prompt_selection(role, trigger_dispatch.as_ref(), state_dispatch.as_ref());
     let dispatch_ctx = load_agent_dispatch_context(
         Arc::clone(&db),
+        router,
         task_id,
         role,
         &preview_state.name,

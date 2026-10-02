@@ -57,6 +57,7 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
     let workflow = default_workflow::default_workflow();
     let ctx = load_agent_dispatch_context(
         Arc::clone(&db),
+        &service.workspace_backend_router(),
         &task_id,
         default_roles::CODER,
         default_states::IN_PROGRESS,

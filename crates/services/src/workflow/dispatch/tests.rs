@@ -1009,6 +1009,7 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
 
     let context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
         db.clone(),
+        &crate::diff::embedded_read_router_for_test(db.clone()),
         &task.id,
         default_roles::CODER,
         default_states::IN_PROGRESS,

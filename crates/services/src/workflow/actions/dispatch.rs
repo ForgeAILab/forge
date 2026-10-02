@@ -228,6 +228,7 @@ impl HookAction for DispatchRoleAgent {
                 );
                 let dispatch_ctx = match load_agent_dispatch_context(
                     Arc::clone(&ctx.db),
+                    &ctx.workspace_backend_router,
                     &ctx.task_id,
                     role_name,
                     &ctx.to_state,

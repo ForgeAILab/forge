@@ -928,6 +928,7 @@ async fn assert_outage_order(socket_first: bool) {
         .unwrap());
     let (workspace_path, _) = fixture.resolved.owner_paths().await.unwrap();
     fixture.runtime.start(ExecutionStartParams {
+            plan_text: None,
         task_id: placement.task_id.clone(), execution_id: execution_id.clone(),
             workspace_path,
         executor_type: "shell".into(), executor_config: json!({"executor_type": "shell", "config": {}}),
@@ -2040,5 +2041,137 @@ async fn remote_lost_run_result_reconciles_from_the_real_daemon_journal() {
     );
     fixture.wait_until_journal_empty().await;
     assert_eq!(fixture.run("cat run-count").await.stdout_tail, "once");
+    fixture.assert_server_cannot_resolve_workspace();
+}
+
+#[tokio::test]
+async fn remote_plan_owner_publication_restore_and_discard_are_fenced() {
+    let fixture = Fixture::new("forge-owner-plan-publication").await;
+    let placement = &fixture.resolved.placement;
+    let client = fixture.resolved.backend.daemon_client().unwrap();
+    let daemon = placement.daemon_id.as_deref().unwrap();
+    let params = |operation| WorkspaceOwnerOperationParams {
+        fence: WorkspaceMutationFence {
+            daemon_id: daemon.into(),
+            runtime_id: placement.runtime_id.clone().unwrap(),
+            placement_id: placement.id.clone(),
+            operation_id: db::new_uuid_v4(),
+            generation: placement.generation as u64,
+            expected: WorkspaceOperationExpected::BaseSha {
+                sha: fixture.base_sha.clone(),
+            },
+        },
+        workspace_handle: placement.workspace_handle.clone().unwrap(),
+        operation,
+    };
+    let initial = params(WorkspaceOwnerOperation::PublishPlan {
+        execution_id: "plan-initial".into(),
+        content: "- [ ] prior plan\n".into(),
+    });
+    client.owner_operation(daemon, initial).await.unwrap();
+    let publication = params(WorkspaceOwnerOperation::PublishPlan {
+        execution_id: "plan-revision".into(),
+        content: "- [x] revised plan\n".into(),
+    });
+    client
+        .owner_operation(daemon, publication.clone())
+        .await
+        .unwrap();
+    client
+        .owner_operation(daemon, publication.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .resolved
+            .backend
+            .read(placement, "../plan.md", 1024)
+            .await
+            .unwrap(),
+        b"- [x] revised plan\n"
+    );
+    let mut stale = publication;
+    stale.fence.operation_id = db::new_uuid_v4();
+    stale.fence.generation = 0;
+    assert!(client.owner_operation(daemon, stale).await.is_err());
+    let restore = params(WorkspaceOwnerOperation::RestorePlan {
+        execution_id: "plan-revision".into(),
+    });
+    client
+        .owner_operation(daemon, restore.clone())
+        .await
+        .unwrap();
+    client.owner_operation(daemon, restore).await.unwrap();
+    assert_eq!(
+        fixture
+            .resolved
+            .backend
+            .read(placement, "../plan.md", 1024)
+            .await
+            .unwrap(),
+        b"- [ ] prior plan\n"
+    );
+    // The next execution can already be active when the previous terminal
+    // settlement removes its private plan snapshot and outbox.
+    let (path, _) = fixture.resolved.owner_paths().await.unwrap();
+    fixture
+        .runtime
+        .start(ExecutionStartParams {
+            task_id: placement.task_id.clone(),
+            execution_id: "active-next-turn".into(),
+            workspace_path: path.clone(),
+            executor_type: "shell".into(),
+            executor_config: json!({"executor_type":"shell", "config":{}}),
+            prompt: json!({"description":"while [ ! -f finish-next-turn ]; do sleep 0.01; done"}),
+            max_turns: None,
+            plan_text: None,
+        })
+        .await
+        .unwrap();
+    assert!(fixture
+        .runtime
+        .active_execution_ids()
+        .contains(&"active-next-turn".into()));
+    client
+        .owner_operation(
+            daemon,
+            params(WorkspaceOwnerOperation::DiscardPlan {
+                execution_id: "plan-revision".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(fixture
+        .resolved
+        .backend
+        .describe(placement)
+        .await
+        .unwrap()
+        .active_execution_ids
+        .contains(&"active-next-turn".into()));
+    // End the owner-side fixture turn without depending on cancellation races.
+    std::fs::write(PathBuf::from(path).join("finish-next-turn"), "done").unwrap();
+    for _ in 0..500 {
+        if !fixture
+            .resolved
+            .backend
+            .describe(placement)
+            .await
+            .unwrap()
+            .active_execution_ids
+            .contains(&"active-next-turn".into())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!fixture
+        .resolved
+        .backend
+        .describe(placement)
+        .await
+        .unwrap()
+        .active_execution_ids
+        .contains(&"active-next-turn".into()));
     fixture.assert_server_cannot_resolve_workspace();
 }

@@ -113,7 +113,7 @@ impl TaskDispatcher {
                     return Ok(());
                 }
                 task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                    &self.db, &task,
+                    &self.db, &self.task_service.workspace_backend_router(), &task,
                 )
                 .await
                 {
@@ -943,6 +943,7 @@ impl TaskDispatcher {
         }
         let dispatch_ctx = load_agent_dispatch_context(
             Arc::clone(&self.db),
+            &self.task_service.workspace_backend_router(),
             &task.id,
             role_name,
             &state.name,
