@@ -392,6 +392,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Operations status reads the usage ledger in batches (about 5× faster on a
   large ledger). The chat switcher and chat detail count pending turns without
   loading the turn history.
+- Operations status and both Agent lists (account and Project) read lifetime
+  usage from one shared incremental index: each read folds in only the ledger
+  rows added or changed since the previous read, so warm reads no longer grow
+  with the size of the ledger. A page of Agents loads usage, execution
+  statistics, assignments and effective status in a few batched queries
+  instead of several per Agent. The index keeps up to about 41,000 usage
+  events (128 MiB) per server process; a larger ledger falls back to a
+  memoized full read. A new migration adds change markers for the index
+  (`usage_ledger_revision` and changed-row tables); ledger rows are unchanged.
+- A paused Agent reports no runnable machines (`runnable_on.count` 0) and no
+  longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
 
