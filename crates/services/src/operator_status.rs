@@ -233,7 +233,15 @@ impl OperatorStatusService {
         }
 
         let event_relay = self.event_relay_status().await?;
+        // A process that declares the relay but has not attached one (a
+        // service built without the runtime) has nothing to report on.
+        let relay_attached = self
+            .event_relay
+            .read()
+            .expect("relay status lock")
+            .is_some();
         if self.relay_enabled.load(Ordering::SeqCst)
+            && relay_attached
             && (!event_relay.running || event_relay.last_error.is_some())
         {
             recent_errors.push(RecentErrorSummary {

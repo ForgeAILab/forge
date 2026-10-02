@@ -24,7 +24,10 @@ async fn database() -> Arc<SqliteDb> {
 }
 
 async fn file_database() -> (Arc<SqliteDb>, String) {
-    let path = format!("/Volumes/Data/tmp/forge-wake-turn-{}.sqlite", new_uuid_v4());
+    let path = std::env::temp_dir()
+        .join(format!("forge-wake-turn-{}.sqlite", new_uuid_v4()))
+        .display()
+        .to_string();
     let pool = create_sqlite_pool(&format!("sqlite://{path}"))
         .await
         .unwrap();
