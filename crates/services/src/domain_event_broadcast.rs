@@ -1,12 +1,22 @@
 //! Read-only, in-memory tail of committed domain events for the live SSE bus.
-use crate::{DomainEventService, Result};
+use crate::{
+    worker_runtime::{HealthErrorKind, SupervisorPolicy, WorkerHealth, WorkerSupervisor},
+    DomainEventService, Result,
+};
 use db::{DomainEventRepo, SqliteDb};
 use events::EventBus;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
+const RELAY_NAME: &str = "domain-event-relay";
 const BATCH_LIMIT: i64 = 100;
 const MIN_IDLE: Duration = Duration::from_millis(250);
 const MAX_IDLE: Duration = Duration::from_secs(5);
@@ -14,6 +24,9 @@ pub struct DomainEventBroadcastConsumer {
     db: Arc<SqliteDb>,
     bus: Arc<EventBus>,
     position: Mutex<Option<i64>>,
+    running: AtomicBool,
+    #[cfg(test)]
+    child_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
 impl DomainEventBroadcastConsumer {
     pub fn new(db: Arc<SqliteDb>, bus: Arc<EventBus>, after: Option<i64>) -> Self {
@@ -21,34 +34,80 @@ impl DomainEventBroadcastConsumer {
             bus,
             db,
             position: Mutex::new(after),
+            running: AtomicBool::new(false),
+            #[cfg(test)]
+            child_abort: Arc::new(std::sync::Mutex::new(None)),
         }
     }
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let notify = self.db.domain_event_notify();
-            let mut idle = MIN_IDLE;
-            loop {
-                if *shutdown.borrow_and_update() {
-                    return;
-                }
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                match self.broadcast_once(BATCH_LIMIT).await {
-                    Ok(n) if n > 0 => {
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        let supervisor = WorkerSupervisor::new(
+            WorkerHealth::new(Arc::clone(&self.db), RELAY_NAME),
+            SupervisorPolicy::default(),
+        );
+        #[cfg(test)]
+        let supervisor = supervisor.with_child_abort(Arc::clone(&self.child_abort));
+        supervisor.start(
+            move |shutdown| {
+                let relay = Arc::clone(&self);
+                async move { relay.run_loop(shutdown).await }
+            },
+            shutdown,
+        )
+    }
+    async fn run_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        self.running.store(true, Ordering::SeqCst);
+        let _running = Running(&self.running);
+        let health = WorkerHealth::new(Arc::clone(&self.db), RELAY_NAME);
+        let notify = self.db.domain_event_notify();
+        let mut idle = MIN_IDLE;
+        loop {
+            if *shutdown.borrow_and_update() {
+                return Ok(());
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.broadcast_once(BATCH_LIMIT).await {
+                Ok(n) => {
+                    health.clear_error_if_set(HealthErrorKind::Runtime).await?;
+                    if n > 0 {
                         idle = MIN_IDLE;
                         continue;
                     }
-                    Err(error) => tracing::warn!(%error, "SSE domain-event tail read failed"),
-                    _ => {}
                 }
-                tokio::select! {
-                    changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow_and_update() { return; } }
-                    _ = &mut notified => {}
-                    _ = tokio::time::sleep(idle) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "SSE domain-event tail read failed");
+                    health.report_error(&error.to_string()).await?;
                 }
-                idle = idle.saturating_mul(2).min(MAX_IDLE);
             }
+            tokio::select! {
+                changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); } }
+                _ = &mut notified => {}
+                _ = tokio::time::sleep(idle) => {}
+            }
+            idle = idle.saturating_mul(2).min(MAX_IDLE);
+        }
+    }
+    pub async fn status(&self) -> Result<api_types::EventRelayStatus> {
+        let error: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT last_error, last_error_at FROM worker_health WHERE worker_name = ?",
+        )
+        .bind(RELAY_NAME)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let (last_error, last_error_at) = error.unwrap_or_default();
+        Ok(api_types::EventRelayStatus {
+            running: self.running.load(Ordering::SeqCst),
+            position: *self.position.lock().await,
+            head: self.db.domain_event_head().await.ok(),
+            last_error,
+            last_error_at,
         })
     }
     pub async fn broadcast_once(&self, limit: i64) -> Result<usize> {
@@ -225,5 +284,77 @@ mod tests {
         assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
         assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
         assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn audit2_supervised_relay_restarts_and_catches_up_without_duplicate() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(1024));
+        let mut rx = bus.subscribe();
+        let relay = Arc::new(DomainEventBroadcastConsumer::new(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            Some(0),
+        ));
+        let operator = crate::OperatorStatusService::new_for_test(Arc::clone(&db));
+        operator.set_event_relay(Arc::clone(&relay));
+        operator.set_runtime_workers(&[crate::RuntimeWorker::DomainEventBroadcast]);
+        let (shutdown, signal) = watch::channel(false);
+        let handle = Arc::clone(&relay).start(signal);
+        let append = |id: &str| db::CreateDomainEvent {
+            id: id.into(),
+            event_type: "test".into(),
+            entity_type: "project".into(),
+            entity_id: "p".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: "p".into(),
+            correlation_id: id.into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: db::now_rfc3339(),
+        };
+        let first = db.append_event(append("relay-first")).await.unwrap();
+        let first_frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first_frame.context, events::EventContext::DomainEventCommitted { sequence, .. } if sequence == first.sequence)
+        );
+        relay.child_abort.lock().unwrap().as_ref().unwrap().abort();
+        // The shared position survives task death; append while the child is restarting.
+        let second = db.append_event(append("relay-second")).await.unwrap();
+        let second_frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(second_frame.context, events::EventContext::DomainEventCommitted { sequence, .. } if sequence == second.sequence)
+        );
+        assert!(rx.try_recv().is_err());
+        let restarts: i64 = sqlx::query_scalar(
+            "SELECT restart_count FROM worker_health WHERE worker_name = 'domain-event-relay'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(restarts, 1);
+        let status = operator.compute_status().await.unwrap();
+        assert!(status.event_relay.running);
+        assert_eq!(status.event_relay.position, Some(second.sequence));
+        assert_eq!(status.event_relay.head, Some(second.sequence));
+        assert!(
+            status.event_consumers.is_empty(),
+            "the tail is not a durable consumer"
+        );
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!relay.status().await.unwrap().running);
     }
 }

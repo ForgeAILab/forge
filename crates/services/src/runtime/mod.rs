@@ -741,6 +741,7 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.event_bus),
             None,
         ));
+        operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
@@ -1151,7 +1152,7 @@ mod tests {
                     .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
             }
             let status = service.compute_status().await.unwrap();
-            assert_eq!(status.event_consumers.len(), 4);
+            assert_eq!(status.event_consumers.len(), 3);
             assert!(status
                 .event_consumers
                 .iter()
@@ -1188,7 +1189,7 @@ mod tests {
             .compute_status()
             .await
             .unwrap();
-        assert_eq!(monitored.event_consumers.len(), 5);
+        assert_eq!(monitored.event_consumers.len(), 4);
         assert_eq!(supervisor.start().await.expect("second start is no-op"), 0);
         supervisor.shutdown().await.expect("runtime shuts down");
         assert_eq!(supervisor.worker_handle_count(), 0);

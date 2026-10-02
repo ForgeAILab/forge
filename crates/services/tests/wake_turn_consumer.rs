@@ -2907,8 +2907,8 @@ async fn runtime_deferred_agent_and_failing_tick_do_not_block_other_agent_and_ad
     .await
     .unwrap();
     assert!(
-        tick_error.is_some(),
-        "failing tick is visible without blocking Agent B"
+        tick_error.is_none(),
+        "waiting in retry backoff is not an active tick error"
     );
 }
 
@@ -2969,7 +2969,7 @@ async fn audit_retry_rows_are_isolated_and_bounded_with_visible_dead_letter() {
         .await
         .unwrap();
     // A malformed persisted retry cannot stop B's healthy due retry.
-    sqlx::raw_sql(&format!("CREATE TRIGGER fail_one_retry BEFORE INSERT ON agent_wake_disposition WHEN NEW.source_event_id = '{event_a}' AND NEW.attempt_number > 1 BEGIN SELECT RAISE(ABORT, 'persistent retry storage failure'); END;")).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql(&format!("CREATE TRIGGER fail_one_retry BEFORE INSERT ON agent_wake_disposition WHEN NEW.source_event_id = '{event_a}' AND NEW.attempt_number > 1 AND NEW.disposition <> 'deterministically_suppressed' BEGIN SELECT RAISE(ABORT, 'persistent retry storage failure'); END;")).execute(db.pool()).await.unwrap();
     for _ in 0..8 {
         let _ = services::worker_runtime::Worker::tick(&consumer).await;
         sqlx::query("UPDATE worker_item_failure SET retry_not_before = '2000-01-01T00:00:00Z'")
@@ -2988,6 +2988,20 @@ async fn audit_retry_rows_are_isolated_and_bounded_with_visible_dead_letter() {
     let key = format!("wake-retry:{}", deferred.id);
     let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM worker_dead_letter WHERE worker_name = 'agent-wake-turns' AND source_key = ?").bind(key).fetch_one(db.pool()).await.unwrap();
     assert_eq!(attempts, 8);
+    let terminal = db
+        .get_current_agent_wake_disposition("agent-wake-turns", &event_a)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal.disposition,
+        db::AgentWakeDispositionKind::DeterministicallySuppressed
+    );
+    assert_eq!(terminal.reason, "wake_retry_failed");
+    assert_eq!(
+        terminal.parent_disposition_id.as_deref(),
+        Some(deferred.id.as_str())
+    );
     assert!(db
         .list_reconsiderable_agent_wake_dispositions("agent-wake-turns", &now_rfc3339(), 100)
         .await
@@ -3106,4 +3120,208 @@ async fn audit_two_runtimes_race_one_wake_event() {
     assert_eq!(turns, 1);
     drop(db);
     let _ = std::fs::remove_file(database_path);
+}
+
+#[tokio::test]
+async fn audit2_retry_backoff_filters_before_limit_and_transients_never_strike() {
+    let db = database().await;
+    let id = new_uuid_v4();
+    let profile = identity_with_profile(&db, &id).await;
+    let (project, _) = bound_project(&db, &id, &profile).await;
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(&id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let event_id = append_project_attention_wake(
+        &db,
+        &id,
+        &project,
+        &format!("attention:decision_recorded:project:{project}"),
+    )
+    .await;
+    sqlx::query("UPDATE domain_event SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&event_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db));
+    consumer.run_once(100).await.unwrap();
+    let row = db
+        .get_current_agent_wake_disposition("agent-wake-turns", &event_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let health = db::WorkerHealth::new(Arc::clone(&db), "agent-wake-turns");
+    let key = format!("wake-retry:{}", row.id);
+    for _ in 0..12 {
+        assert!(matches!(
+            health
+                .isolated_item_failed(
+                    db::WorkItem {
+                        source_key: &key,
+                        item_type: "agent_wake_retry"
+                    },
+                    db::RetryPolicy::default(),
+                    "transient",
+                    "database busy"
+                )
+                .await
+                .unwrap(),
+            db::PoisonDecision::Retry(_)
+        ));
+    }
+    let counters: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT attempts FROM worker_item_failure WHERE source_key = ?), (SELECT transient_attempts FROM worker_item_failure WHERE source_key = ?), (SELECT COUNT(*) FROM worker_dead_letter)").bind(&key).bind(&key).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(counters, (0, 12, 0));
+    // Fill the first hundred due rows with backoffs, then put a healthy due
+    // row behind them. Filtering after LIMIT would starve it.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    for n in 0..101 {
+        let source = format!("backoff-source-{n}");
+        db.append_event_in_tx(
+            &mut tx,
+            &db::CreateDomainEvent {
+                id: source.clone(),
+                event_type: "agent.wake.suppressed".into(),
+                entity_type: "project".into(),
+                entity_id: project.clone(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: project.clone(),
+                correlation_id: source.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: "2000-01-01T00:00:00Z".into(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_wake_disposition (id, consumer_name, source_event_id, source_event_sequence, attempt_number, max_attempts, disposition, reason, retry_at, created_at, updated_at) SELECT ?, 'agent-wake-turns', id, sequence, 1, 3, 'deferred', 'test', '2000-01-01T00:00:00Z', created_at, created_at FROM domain_event WHERE id = ?").bind(format!("backoff-row-{n}")).bind(&source).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO agent_wake_disposition_current (consumer_name, source_event_id, disposition_id, attempt_number, updated_at) VALUES ('agent-wake-turns', ?, ?, 1, '2000-01-01T00:00:00Z')").bind(source).bind(format!("backoff-row-{n}")).execute(&mut *tx).await.unwrap();
+        if n < 100 {
+            sqlx::query("INSERT INTO worker_item_failure (worker_name, source_key, attempts, first_failed_at, last_error, error_kind, retry_not_before) VALUES ('agent-wake-turns', ?, 0, '2000-01-01T00:00:00Z', 'busy', 'transient', '2999-01-01T00:00:00Z')").bind(format!("wake-retry:backoff-row-{n}")).execute(&mut *tx).await.unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    let due = db
+        .list_reconsiderable_agent_wake_dispositions("agent-wake-turns", &now_rfc3339(), 1)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].id, "backoff-row-100");
+    // Backoff itself is not a tick error; the one due suppressed row completes.
+    services::worker_runtime::Worker::tick(&consumer)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_current_agent_wake_disposition("agent-wake-turns", "backoff-source-100")
+            .await
+            .unwrap()
+            .unwrap()
+            .disposition,
+        db::AgentWakeDispositionKind::DeterministicallySuppressed
+    );
+}
+
+#[tokio::test]
+async fn audit2_wake_admission_rejection_and_missing_snapshot_keep_typed_dispositions() {
+    use services::worker_runtime::{Outcome, Worker};
+    for missing in [false, true] {
+        let db = database().await;
+        let id = new_uuid_v4();
+        let profile = identity_with_profile(&db, &id).await;
+        let (project, _) = bound_project(&db, &id, &profile).await;
+        let key = format!("attention:decision_recorded:project:{project}");
+        let event_id = append_project_attention_wake(&db, &id, &project, &key).await;
+        let event = db.get_event(&event_id).await.unwrap().unwrap();
+        let consumer = WakeTurnConsumer::new(Arc::clone(&db));
+        let Outcome::Done(mut plan) = Worker::handle(&consumer, &event).await.unwrap() else {
+            panic!("admission plan")
+        };
+        if missing {
+            sqlx::query("DELETE FROM attention_projection WHERE dedupe_key = ?")
+                .bind(&key)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        } else if let services::wake_turn_consumer::WakeDeliveryPlan::Admitted {
+            admission, ..
+        } = &mut plan
+        {
+            admission.turn.id = "wrong-turn-link".into();
+        }
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        Worker::commit(&consumer, &mut tx, &event, &plan)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let row = db
+            .get_current_agent_wake_disposition("agent-wake-turns", &event_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.reason,
+            if missing {
+                "turn_admission_unavailable"
+            } else {
+                "turn_admission_rejected"
+            }
+        );
+        assert_eq!(
+            row.disposition,
+            if missing {
+                db::AgentWakeDispositionKind::Deferred
+            } else {
+                db::AgentWakeDispositionKind::DeterministicallySuppressed
+            }
+        );
+        assert_eq!(admitted_count(&db).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn audit2_responder_read_failure_keeps_existing_deferral() {
+    let db = database().await;
+    let id = new_uuid_v4();
+    let profile = identity_with_profile(&db, &id).await;
+    let (project, _) = bound_project(&db, &id, &profile).await;
+    let key = format!("attention:decision_recorded:project:{project}");
+    let event_id = append_project_attention_wake(&db, &id, &project, &key).await;
+    // The resolver already translates an unreadable legacy domain enum into
+    // its own readiness deferral; preserve that more specific outcome.
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET status = 'unreadable_legacy_status' WHERE id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = OFF")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    WakeTurnConsumer::new(Arc::clone(&db))
+        .run_once(100)
+        .await
+        .unwrap();
+    let row = db
+        .get_current_agent_wake_disposition("agent-wake-turns", &event_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.reason, "responder_resolution_unavailable");
+    assert_eq!(row.disposition, db::AgentWakeDispositionKind::Deferred);
+    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, 0);
 }

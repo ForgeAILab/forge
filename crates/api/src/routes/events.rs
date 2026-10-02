@@ -17,8 +17,14 @@ const DURABLE_ID_PREFIX: &str = "domain-event:";
 
 enum Replay {
     None,
-    Events { after: i64, through: i64 },
-    Resync { reason: &'static str },
+    Events {
+        after: i64,
+        through: i64,
+    },
+    Resync {
+        reason: &'static str,
+        reset_to: Option<i64>,
+    },
 }
 
 pub async fn stream_events(
@@ -38,6 +44,7 @@ pub async fn stream_events(
             Ok(through) if after > through => (
                 Replay::Resync {
                     reason: "resume cursor beyond ledger head",
+                    reset_to: Some(through),
                 },
                 Some(through),
             ),
@@ -50,11 +57,13 @@ pub async fn stream_events(
                     Ok(false) => Replay::Events { after, through },
                     Ok(true) => Replay::Resync {
                         reason: "replay limit exceeded",
+                        reset_to: None,
                     },
                     Err(error) => {
                         tracing::warn!(%error, "SSE replay bound query failed");
                         Replay::Resync {
                             reason: "ledger replay failed",
+                            reset_to: None,
                         }
                     }
                 };
@@ -65,6 +74,7 @@ pub async fn stream_events(
                 (
                     Replay::Resync {
                         reason: "ledger replay failed",
+                        reset_to: None,
                     },
                     None,
                 )
@@ -95,7 +105,7 @@ pub async fn stream_events(
             }
             frame(event).map(Ok)
         }
-        Err(error) => Some(Ok(resync_frame(&error.to_string()))),
+        Err(error) => Some(Ok(resync_frame(&error.to_string(), None))),
     });
     Sse::new(futures_util::StreamExt::take_until(
         tokio_stream::StreamExt::chain(replay, stream),
@@ -122,9 +132,14 @@ fn frame(event: events::ForgeEvent) -> Option<Event> {
     Some(frame)
 }
 
-fn resync_frame(reason: &str) -> Event {
+fn resync_frame(reason: &str, reset_to: Option<i64>) -> Event {
     let data = json!({ "event_type": "events.resync_required", "entity_id": "events.resync_required", "timestamp": events::event_timestamp(), "reason": reason });
-    Event::default().data(data.to_string())
+    let frame = Event::default().data(data.to_string());
+    if let Some(sequence) = reset_to {
+        frame.id(format!("{DURABLE_ID_PREFIX}{sequence}"))
+    } else {
+        frame
+    }
 }
 
 fn replay_events(
@@ -137,9 +152,10 @@ fn replay_events(
         |(db, replay, mut pending, mut remaining)| async move {
             match replay {
                 Replay::None => None,
-                Replay::Resync { reason } => {
-                    Some((Ok(resync_frame(reason)), (db, Replay::None, pending, 0)))
-                }
+                Replay::Resync { reason, reset_to } => Some((
+                    Ok(resync_frame(reason, reset_to)),
+                    (db, Replay::None, pending, 0),
+                )),
                 Replay::Events { after, through } => {
                     if remaining == 0 {
                         return None;
@@ -154,7 +170,7 @@ fn replay_events(
                             Err(error) => {
                                 tracing::warn!(%error, "SSE ledger replay failed");
                                 return Some((
-                                    Ok(resync_frame("ledger replay failed")),
+                                    Ok(resync_frame("ledger replay failed", None)),
                                     (db, Replay::None, pending, 0),
                                 ));
                             }

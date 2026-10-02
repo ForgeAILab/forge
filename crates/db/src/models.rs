@@ -5007,3 +5007,11 @@ impl DomainEventConsumerLag {
             && self.initialized_at.as_deref().is_none_or(old)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct WorkerDeadLetterRecord {
+    pub id: String,
+    pub source_key: String,
+    pub reason: String,
+    pub occurred_at: String,
+}

@@ -3092,7 +3092,15 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `event_consumers[].oldest_unprocessed_at` | Creation timestamp of the lowest pending subscribed sequence. Computed live, `null` when caught up. |
 | `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
-| `event_consumers[].stalled` | Remaining unprocessed events exist and the cursor has not advanced for more than `server.event_consumer_stall_seconds` (default 300). For a missing cursor, inactivity starts at the oldest pending event. Idle, caught-up consumers are never stalled. |
+| `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
+| `event_consumers[].dead_letter_count` | Total retained quarantines for that worker, without an age cutoff. |
+| `event_consumers[].recent_dead_letters` | Most recent five retained quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
+
+Dead-letter history remains visible after the one-hour degraded-health window.
+Replay and dismiss actions are not available in this slice. IDs are stable and
+opaque; the stored worker/item key identifies the source for later actions.
+Relay read errors or a stopped/restarting enabled relay raise attention.
 
 A stalled consumer raises `overall_severity` to at least `attention` and appears
 in the existing `recent_errors` operator issue list with `entity_type:
@@ -3717,12 +3725,12 @@ Every committed `domain_event` row is also relayed as a
 "...", "domain_entity_id": "...", "entity_type": "...", "scope_type": "...",
 "scope_id": "..." }`; the frame's own `entity_id` is the domain event id.
 
-The relay is a read-only in-memory tail, not a durable consumer, and is omitted
-from operator `event_consumers`. Plain connections are live-only and do not read
+The relay is a supervised in-memory tail, not a durable consumer, and is omitted
+from operator `event_consumers`; its own `event_relay` object reports health and position. Plain connections are live-only and do not read
 historical ledger rows. Frame IDs are transport identifiers:
 
 - Durable `domain_event.committed` frames use `id: domain-event:<sequence>`.
-- Bus-only and `events.resync_required` frames omit the SSE `id` field entirely.
+- Bus-only and ordinary `events.resync_required` frames omit the SSE `id` field entirely.
   They preserve the client's last durable cursor; an empty `id` would reset it.
 - Keep-alive frames are comments and also carry no `id` field.
 - JSON `entity_id` and the other committed-envelope fields retain their meaning.
@@ -3731,7 +3739,7 @@ A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that
 fits SQLite's signed 64-bit sequence range, requests replay after that sequence.
 Missing, entity-shaped, old event-ID-shaped, or malformed IDs produce live-only
 connections. A durable cursor beyond the current ledger head emits one resync
-frame with `reason: "resume cursor beyond ledger head"` before continuing live. No numeric sequence query parameter is introduced.
+frame with `reason: "resume cursor beyond ledger head"` and `id: domain-event:<head>` before continuing live. This exception resets a stale cursor so automatic reconnect does not repeat resync forever. No numeric sequence query parameter is introduced.
 
 Resume subscribes to the live bus before capturing a ledger head. If at most
 1,000 rows were missed, it reads them in 100-row pages and emits them in sequence

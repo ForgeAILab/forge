@@ -87,11 +87,17 @@ impl WorkerErrorKind {
 /// Classification shared by the durable projections. Domain refusals cannot
 /// become valid by repeating the same event; availability and CAS races can.
 pub fn consumer_error(error: crate::ServiceError) -> WorkerError {
+    let kind = consumer_error_kind(&error);
+    WorkerError {
+        kind,
+        message: bounded_error(&error.to_string()),
+    }
+}
+pub fn consumer_error_kind(error: &crate::ServiceError) -> WorkerErrorKind {
     use crate::ServiceError as S;
     use db::DbError as D;
-    let message = error.to_string();
-    match &error {
-        S::Db(e) if e.is_transient() => WorkerError::transient(message),
+    match error {
+        S::Db(e) if e.is_transient() => WorkerErrorKind::Transient,
         S::Db(
             D::NotFound
             | D::Check(_)
@@ -103,12 +109,12 @@ pub fn consumer_error(error: crate::ServiceError) -> WorkerError {
         )
         | S::InvalidOperation { .. }
         | S::NotFound { .. }
-        | S::AuthorizationDenied { .. } => WorkerError::terminal(message),
+        | S::AuthorizationDenied { .. } => WorkerErrorKind::Terminal,
         S::ExecutionAlreadyRunning { .. }
         | S::RateLimited { .. }
         | S::DaemonUnavailable { .. }
         | S::DaemonNotReady { .. }
-        | S::DaemonTimeout { .. } => WorkerError::transient(message),
-        _ => WorkerError::new(message),
+        | S::DaemonTimeout { .. } => WorkerErrorKind::Transient,
+        _ => WorkerErrorKind::Failure,
     }
 }

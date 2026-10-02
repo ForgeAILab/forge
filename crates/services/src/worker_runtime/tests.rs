@@ -11,6 +11,11 @@ struct TinyWorker {
     commit_failures: AtomicUsize,
     transient: AtomicBool,
     commit_transient: AtomicBool,
+    commit_terminal_once: AtomicBool,
+    commit_terminal_always: bool,
+    skip_on_refresh: bool,
+    ticks: AtomicUsize,
+    tick_timeout: Duration,
     active: AtomicUsize,
     after_failure: bool,
     tick_panics: AtomicUsize,
@@ -30,6 +35,11 @@ impl TinyWorker {
             commit_failures: AtomicUsize::new(0),
             transient: AtomicBool::new(false),
             commit_transient: AtomicBool::new(false),
+            commit_terminal_once: AtomicBool::new(false),
+            commit_terminal_always: false,
+            skip_on_refresh: false,
+            ticks: AtomicUsize::new(0),
+            tick_timeout: Duration::from_secs(30),
             active: AtomicUsize::new(0),
             after_failure: false,
             tick_panics: AtomicUsize::new(0),
@@ -62,7 +72,11 @@ impl Worker for TinyWorker {
     fn handle_timeout(&self) -> Duration {
         self.timeout
     }
+    fn tick_timeout(&self) -> Duration {
+        self.tick_timeout
+    }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        self.ticks.fetch_add(1, Ordering::SeqCst);
         if self.tick_hangs.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -78,6 +92,9 @@ impl Worker for TinyWorker {
     async fn handle(&self, event: &DomainEvent) -> std::result::Result<Outcome<i64>, WorkerError> {
         self.seen.lock().unwrap().push(event.sequence);
         self.entered.notify_one();
+        if self.skip_on_refresh && !self.commit_terminal_once.load(Ordering::SeqCst) {
+            return Ok(Outcome::Skip);
+        }
         if self.transient.load(Ordering::SeqCst) {
             return Err(WorkerError::transient("database unavailable"));
         }
@@ -118,6 +135,9 @@ impl Worker for TinyWorker {
             .execute(&mut **tx)
             .await
             .map_err(|e| WorkerError::transient(e.to_string()))?;
+        if self.commit_terminal_once.swap(false, Ordering::SeqCst) || self.commit_terminal_always {
+            return Err(WorkerError::terminal("stale or rejected domain snapshot"));
+        }
         if self.commit_transient.load(Ordering::SeqCst) {
             return Err(WorkerError::transient("commit concurrency conflict"));
         }
@@ -1186,7 +1206,7 @@ async fn audit_timed_out_tick_is_reported_and_does_not_gate_events() {
     let db = database().await;
     let mut worker = TinyWorker::new("hung-tick");
     worker.tick_hangs.store(true, Ordering::SeqCst);
-    worker.timeout = Duration::from_millis(10);
+    worker.tick_timeout = Duration::from_millis(10);
     let event = append(&db, "wanted", "good").await;
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
     assert_eq!(runtime.run_once(10).await.unwrap(), 1);
@@ -1197,4 +1217,73 @@ async fn audit_timed_out_tick_is_reported_and_does_not_gate_events() {
             .await
             .unwrap();
     assert_eq!(error.as_deref(), Some("worker tick timed out"));
+}
+
+#[tokio::test]
+async fn audit2_terminal_commit_refreshes_preparation_once_before_quarantine() {
+    for (skip, always_terminal) in [(false, false), (true, false), (false, true)] {
+        let db = database().await;
+        let mut worker = TinyWorker::new("fresh-terminal");
+        worker.commit_terminal_once.store(true, Ordering::SeqCst);
+        worker.skip_on_refresh = skip;
+        worker.commit_terminal_always = always_terminal;
+        let worker = Arc::new(worker);
+        let event = append(&db, "wanted", "good").await;
+        let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+        runtime.run_once(10).await.unwrap();
+        assert_eq!(
+            worker.seen.lock().unwrap().as_slice(),
+            &[event.sequence, event.sequence]
+        );
+        assert_eq!(
+            effects(&db).await,
+            if skip || always_terminal {
+                vec![]
+            } else {
+                vec![event.sequence]
+            }
+        );
+        let count = scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await;
+        assert_eq!(count, i64::from(always_terminal));
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT retry_attempts FROM worker_health WHERE worker_name = 'fresh-terminal'"
+            )
+            .await,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit2_hung_tick_does_not_repeat_during_failure_backoff() {
+    let db = database().await;
+    let mut worker = TinyWorker::new("tick-backoff");
+    worker.tick_hangs.store(true, Ordering::SeqCst);
+    worker.tick_timeout = Duration::from_millis(10);
+    let worker = Arc::new(worker);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    // Exercise the long failure backoff without spending minutes in test sleeps.
+    runtime.tick_schedule.lock().unwrap().failures = 9;
+    let mut wanted = Vec::new();
+    for n in 0..20 {
+        wanted.push(append(&db, "wanted", &format!("good-{n}")).await.sequence);
+        runtime.run_once(1).await.unwrap();
+    }
+    assert_eq!(effects(&db).await, wanted);
+    assert_eq!(
+        worker.ticks.load(Ordering::SeqCst),
+        1,
+        "only one tick timeout across twenty event cycles"
+    );
+    let mut schedule = Schedule::default();
+    for seconds in [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
+        assert_eq!(
+            schedule.failed_with_cap(MAX_TICK_RETRY),
+            Duration::from_secs(seconds)
+        );
+    }
+    schedule.reset();
+    assert!(schedule.ready());
 }

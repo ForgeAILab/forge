@@ -110,10 +110,11 @@ impl WorkerHealth {
     ) -> Result<()> {
         let now = now_rfc3339();
         sqlx::query(
-            "INSERT INTO worker_dead_letter (worker_name, source_key, item_type, attempts,
+            "INSERT INTO worker_dead_letter (id, worker_name, source_key, item_type, attempts,
             last_error, first_failed_at, last_failed_at, dead_lettered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO NOTHING",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO NOTHING",
         )
+        .bind(crate::new_uuid_v4())
         .bind(&self.name)
         .bind(item.source_key)
         .bind(item.item_type)
@@ -311,20 +312,6 @@ impl WorkerHealth {
         })
     }
 
-    pub async fn isolated_item_ready(&self, key: &str) -> Result<bool> {
-        let dead: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM worker_dead_letter WHERE worker_name = ? AND source_key = ?)")
-            .bind(&self.name).bind(key).fetch_one(self.db.pool()).await?;
-        if dead != 0 {
-            return Ok(false);
-        }
-        let due: Option<String> = sqlx::query_scalar("SELECT retry_not_before FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
-            .bind(&self.name).bind(key).fetch_optional(self.db.pool()).await?;
-        Ok(due.is_none_or(|due| due <= now_rfc3339()))
-    }
-    pub async fn isolated_item_error(&self, key: &str) -> Result<Option<(String, String)>> {
-        Ok(sqlx::query_as("SELECT error_kind, last_error FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
-            .bind(&self.name).bind(key).fetch_optional(self.db.pool()).await?)
-    }
     pub async fn isolated_item_failed(
         &self,
         item: WorkItem<'_>,
@@ -333,19 +320,39 @@ impl WorkerHealth {
         reason: &str,
     ) -> Result<PoisonDecision> {
         let mut tx = crate::begin_immediate(self.db.pool()).await?;
-        let previous: Option<(i64, String)> = sqlx::query_as("SELECT attempts, first_failed_at FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
-            .bind(&self.name).bind(item.source_key).fetch_optional(&mut *tx).await?;
-        let (attempts, started) = previous.unwrap_or((0, now_rfc3339()));
-        let attempts = attempts as u32 + 1;
-        let decision = if class == "terminal" {
-            PoisonDecision::DeadLettered
+        let decision = self
+            .isolated_item_failed_in_tx(&mut tx, item, policy, class, reason)
+            .await?;
+        tx.commit().await?;
+        Ok(decision)
+    }
+    /// Isolated item failure and any terminal domain record share the caller's transaction.
+    pub async fn isolated_item_failed_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        item: WorkItem<'_>,
+        policy: RetryPolicy,
+        class: &str,
+        reason: &str,
+    ) -> Result<PoisonDecision> {
+        let previous: Option<(i64, i64, String)> = sqlx::query_as("SELECT attempts, transient_attempts, first_failed_at FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+            .bind(&self.name).bind(item.source_key).fetch_optional(&mut **tx).await?;
+        let (attempts, transient_attempts, started) = previous.unwrap_or((0, 0, now_rfc3339()));
+        let attempts = attempts as u32 + u32::from(class == "failure");
+        let transient_attempts = if class == "transient" {
+            transient_attempts as u32 + 1
         } else {
-            policy.decision(attempts)
+            0
+        };
+        let decision = match class {
+            "terminal" => PoisonDecision::DeadLettered,
+            "transient" => PoisonDecision::Retry(policy.delay(transient_attempts)),
+            _ => policy.decision(attempts),
         };
         if matches!(decision, PoisonDecision::DeadLettered) {
             let key = item.source_key;
             self.dead_letter_in_tx(
-                &mut tx,
+                tx,
                 item,
                 FailureState {
                     attempts,
@@ -354,17 +361,20 @@ impl WorkerHealth {
                 reason,
             )
             .await?;
-            sqlx::query("UPDATE worker_dead_letter SET error_kind = ? WHERE worker_name = ? AND source_key = ?").bind(class).bind(&self.name).bind(key).execute(&mut *tx).await?;
+            sqlx::query("UPDATE worker_dead_letter SET error_kind = ? WHERE worker_name = ? AND source_key = ?").bind(class).bind(&self.name).bind(key).execute(&mut **tx).await?;
             sqlx::query("DELETE FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
                 .bind(&self.name)
                 .bind(key)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
         } else {
-            sqlx::query("INSERT INTO worker_item_failure (worker_name, source_key, attempts, first_failed_at, last_error, error_kind, retry_not_before) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO UPDATE SET attempts = excluded.attempts, last_error = excluded.last_error, error_kind = excluded.error_kind, retry_not_before = excluded.retry_not_before")
-                .bind(&self.name).bind(item.source_key).bind(i64::from(attempts)).bind(started).bind(bounded_error(reason)).bind(class).bind(not_before(policy.delay(attempts))).execute(&mut *tx).await?;
+            let delay = match decision {
+                PoisonDecision::Retry(delay) => delay,
+                _ => unreachable!(),
+            };
+            sqlx::query("INSERT INTO worker_item_failure (worker_name, source_key, attempts, transient_attempts, first_failed_at, last_error, error_kind, retry_not_before) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO UPDATE SET attempts = excluded.attempts, transient_attempts = excluded.transient_attempts, last_error = excluded.last_error, error_kind = excluded.error_kind, retry_not_before = excluded.retry_not_before")
+                .bind(&self.name).bind(item.source_key).bind(i64::from(attempts)).bind(i64::from(transient_attempts)).bind(started).bind(bounded_error(reason)).bind(class).bind(not_before(delay)).execute(&mut **tx).await?;
         }
-        tx.commit().await?;
         Ok(decision)
     }
     pub async fn isolated_item_succeeded(&self, key: &str) -> Result<()> {

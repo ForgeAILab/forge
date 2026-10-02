@@ -221,7 +221,8 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
                   <span>
                     {execution.token_totals.cost.coverage === 'pending'
                       ? 'Cost pending'
-                      : execution.token_totals.cost.coverage === 'complete' && execution.token_totals.cost.complete_total
+                      : execution.token_totals.cost.coverage === 'complete' &&
+                          execution.token_totals.cost.complete_total
                         ? formatMoneyAmount(execution.token_totals.cost.complete_total)
                         : execution.token_totals.cost.coverage === 'no_usage'
                           ? 'No usage'
@@ -474,6 +475,7 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
               <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
                 <span>Pending events {item.lag}</span>
                 <span>Cursor {item.last_sequence}</span>
+                <span>Dead letters {item.dead_letter_count}</span>
                 <span>Last advanced {formatDate(item.last_advanced_at)}</span>
                 {item.oldest_unprocessed_age_seconds !== null ? (
                   <span>
@@ -481,6 +483,11 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
                   </span>
                 ) : null}
               </div>
+              {item.recent_dead_letters.map((dead) => (
+                <p key={dead.id} className="mt-1 break-words text-xs text-muted-foreground">
+                  {dead.item_key}: {dead.reason} · {formatDate(dead.occurred_at)}
+                </p>
+              ))}
             </div>
             <div className="flex items-center gap-2 text-xs">
               <span>
@@ -618,6 +625,11 @@ export function OperationsPage() {
         />
         <StatCard label="Database free pages" value={status.database.free_pages} />
       </div>
+      <p className="text-xs text-muted-foreground">
+        Event relay {status.event_relay.running ? 'Running' : 'Stopped'} · Position{' '}
+        {status.event_relay.position ?? '-'} · Head {status.event_relay.head ?? '-'}
+        {status.event_relay.last_error ? ` · ${status.event_relay.last_error}` : ''}
+      </p>
       <EventConsumersSection items={status.event_consumers} />
 
       {status.usage_summary ? (

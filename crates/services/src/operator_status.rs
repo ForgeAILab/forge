@@ -1,13 +1,17 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Instant,
 };
 
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
     DaemonPressureSummary, DatabaseStorageStatus, EffectiveExecutionPolicy, EventConsumerStatus,
-    OperatorSeverity, OperatorStatusResponse, PlanProgressSummary, RecentErrorSummary,
-    RetryPressureSummary, TokenTotalsSummary, UsageSummary, WorkspaceCleanupSummary,
+    EventRelayStatus, OperatorSeverity, OperatorStatusResponse, PlanProgressSummary,
+    RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
+    WorkerDeadLetterSummary, WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{SqliteDb, WorkspaceRepo};
@@ -31,6 +35,8 @@ pub struct OperatorStatusService {
     log_snapshots: ExecutionLogSnapshots,
     consumer_stall_seconds: u32,
     expected_event_consumers: RwLock<Vec<&'static str>>,
+    event_relay: RwLock<Option<Arc<crate::DomainEventBroadcastConsumer>>>,
+    relay_enabled: AtomicBool,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
@@ -45,6 +51,8 @@ impl OperatorStatusService {
             log_snapshots: ExecutionLogSnapshots::default(),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            event_relay: RwLock::new(None),
+            relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
             workspace_backend_router,
         }
@@ -63,6 +71,8 @@ impl OperatorStatusService {
             log_snapshots: ExecutionLogSnapshots::default(),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            event_relay: RwLock::new(None),
+            relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
         }
     }
@@ -88,6 +98,11 @@ impl OperatorStatusService {
     /// Monitor only durable consumers owned by the process's started workers.
     /// Persisted cursors from other assemblies are not evidence of a live worker.
     pub fn set_runtime_workers(&self, workers: &[crate::runtime::RuntimeWorker]) {
+        self.relay_enabled.store(
+            workers.contains(&crate::runtime::RuntimeWorker::DomainEventBroadcast),
+            Ordering::SeqCst,
+        );
+
         *self
             .expected_event_consumers
             .write()
@@ -97,6 +112,22 @@ impl OperatorStatusService {
             .collect();
     }
 
+    pub fn set_event_relay(&self, relay: Arc<crate::DomainEventBroadcastConsumer>) {
+        *self.event_relay.write().expect("relay status lock") = Some(relay);
+    }
+    async fn event_relay_status(&self) -> Result<EventRelayStatus, ServiceError> {
+        let relay = self.event_relay.read().expect("relay status lock").clone();
+        if let Some(relay) = relay {
+            return relay.status().await;
+        }
+        Ok(EventRelayStatus {
+            running: false,
+            position: None,
+            head: self.db.domain_event_head().await.ok(),
+            last_error: None,
+            last_error_at: None,
+        })
+    }
     pub async fn compute_status(&self) -> Result<OperatorStatusResponse, ServiceError> {
         let started = Instant::now();
         let result = self.compute_status_inner().await;
@@ -201,6 +232,24 @@ impl OperatorStatusService {
             });
         }
 
+        let event_relay = self.event_relay_status().await?;
+        if self.relay_enabled.load(Ordering::SeqCst)
+            && (!event_relay.running || event_relay.last_error.is_some())
+        {
+            recent_errors.push(RecentErrorSummary {
+                entity_type: "event_relay".into(),
+                entity_id: "domain-event-relay".into(),
+                error: event_relay
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "event relay is restarting or stopped".into()),
+                occurred_at: event_relay
+                    .last_error_at
+                    .clone()
+                    .unwrap_or_else(|| computed_at.clone()),
+                severity: OperatorSeverity::Attention,
+            });
+        }
         let mut overall_severity = OperatorSeverity::Healthy;
         if !daemon_issues.is_empty() || !workspace_cleanup.is_empty() {
             raise_severity(&mut overall_severity, OperatorSeverity::Attention);
@@ -232,6 +281,7 @@ impl OperatorStatusService {
             usage_summary,
             recent_errors,
             event_consumers,
+            event_relay,
             database,
             computed_at,
         })
@@ -247,24 +297,49 @@ impl OperatorStatusService {
             .expect("event consumer set lock")
             .clone();
         let lag = self.db.domain_event_consumer_lag(&expected).await?;
-        Ok(lag
-            .into_iter()
-            .map(|consumer| {
-                let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
-                EventConsumerStatus {
-                    consumer_name: consumer.consumer_name,
-                    last_sequence: consumer.last_sequence,
-                    lag: consumer.lag,
-                    oldest_unprocessed_age_seconds: consumer
-                        .oldest_unprocessed_at
-                        .as_deref()
-                        .map(|created| seconds_since(created, now)),
-                    oldest_unprocessed_at: consumer.oldest_unprocessed_at,
-                    last_advanced_at: consumer.last_advanced_at,
-                    stalled,
-                }
-            })
-            .collect())
+        let mut statuses = Vec::with_capacity(lag.len());
+        for consumer in lag {
+            let (dead_letter_count, recent_dead_letters) = self
+                .db
+                .worker_dead_letter_history(&consumer.consumer_name)
+                .await?;
+            let recent_dead_letters = recent_dead_letters
+                .into_iter()
+                .map(|dead| {
+                    let event_sequence = dead.source_key.parse().ok().or_else(|| {
+                        dead.source_key
+                            .strip_prefix("event:")?
+                            .split(':')
+                            .next()?
+                            .parse()
+                            .ok()
+                    });
+                    WorkerDeadLetterSummary {
+                        id: dead.id,
+                        item_key: dead.source_key,
+                        event_sequence,
+                        reason: dead.reason,
+                        occurred_at: dead.occurred_at,
+                    }
+                })
+                .collect();
+            let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
+            statuses.push(EventConsumerStatus {
+                consumer_name: consumer.consumer_name,
+                last_sequence: consumer.last_sequence,
+                lag: consumer.lag,
+                oldest_unprocessed_age_seconds: consumer
+                    .oldest_unprocessed_at
+                    .as_deref()
+                    .map(|created| seconds_since(created, now)),
+                oldest_unprocessed_at: consumer.oldest_unprocessed_at,
+                last_advanced_at: consumer.last_advanced_at,
+                stalled,
+                dead_letter_count,
+                recent_dead_letters,
+            });
+        }
+        Ok(statuses)
     }
 
     async fn active_executions(
@@ -1675,5 +1750,61 @@ mod tests {
             .unwrap()
             .event_consumers
             .is_empty());
+    }
+    #[tokio::test]
+    async fn audit2_dead_letter_history_does_not_expire_or_degrade_old_failures() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        let name = crate::coordination_consumer_name();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.ensure_in_tx(&mut tx).await.unwrap();
+        for n in 0..7 {
+            let key = format!("event:{n}:commitment:c-{n}");
+            health
+                .dead_letter_in_tx(
+                    &mut tx,
+                    db::WorkItem {
+                        source_key: &key,
+                        item_type: "coordination_commitment",
+                    },
+                    db::FailureState {
+                        attempts: 0,
+                        first_failed_at: "2000-01-01T00:00:00Z",
+                    },
+                    "domain rejection",
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE worker_dead_letter SET dead_lettered_at = '2000-01-01T00:00:00Z'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        let worker = &status.event_consumers[0];
+        assert_eq!(worker.dead_letter_count, 7);
+        assert_eq!(worker.recent_dead_letters.len(), 5);
+        assert!(worker
+            .recent_dead_letters
+            .iter()
+            .all(|item| !item.id.is_empty() && item.event_sequence.is_some()));
+        let ids: Vec<_> = worker
+            .recent_dead_letters
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        let again = service.compute_status().await.unwrap();
+        assert_eq!(
+            again.event_consumers[0]
+                .recent_dead_letters
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
     }
 }

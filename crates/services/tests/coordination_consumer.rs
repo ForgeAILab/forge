@@ -948,3 +948,168 @@ async fn audit_inbox_replay_dedupe_check_is_terminal() {
 async fn audit_two_runtimes_race_coordination_outcomes_on_file_database() {
     audit_outcome_failure_fixture(db::AgentCommitmentStatus::InProgress, false, true).await;
 }
+
+/// Second-round audit: one commitment that rejects completion (blocked)
+/// quarantines the whole outcome event. What happens to the *other*
+/// commitment on the same Task and to the outcome inbox items?
+#[tokio::test]
+async fn audit2_blocked_commitment_failure_preserves_sibling_commitment_and_inbox() {
+    let db = database().await;
+    seed_identity(&db, "identity-a").await;
+    sqlx::query("UPDATE agent_identity SET name = 'owner-a' WHERE id = 'identity-a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_identity(&db, "identity-b").await;
+    let now = now_rfc3339();
+    let project_id = "project-q";
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.to_owned(),
+            name: "Quarantine Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("user-1".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let task = TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: "task-q".to_owned(),
+            project_id: project_id.to_owned(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "task-q".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "done".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let commitments = CommitmentService::new(Arc::clone(&db));
+    let mut created = Vec::new();
+    for owner in ["identity-a", "identity-b"] {
+        created.push(
+            commitments
+                .create(CreateCommitmentInput {
+                    id: Some(format!("commitment-{owner}")),
+                    owner_identity_id: owner.to_owned(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id.to_owned(),
+                    title: "Deliver".to_owned(),
+                    description: None,
+                    status: db::AgentCommitmentStatus::InProgress,
+                    due_at: None,
+                    correlation_id: format!("correlation-{owner}"),
+                    originating_action_id: None,
+                    originating_task_id: Some(task.id.clone()),
+                    evidence_required: true,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    // Owner A's commitment is blocked (as the consumer itself does on a
+    // cancelled/blocked Task outcome, or the Agent does by hand).
+    sqlx::query(
+        "UPDATE agent_commitment SET status = 'blocked', version = version + 1 WHERE id = ?",
+    )
+    .bind(&created[0].id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let workflow = services::workflow::default_workflow::default_workflow();
+    let snapshot = services::workflow::transition_event::transition_workflow_snapshot(
+        &task,
+        &workflow,
+        "in_progress",
+        "done",
+    )
+    .unwrap();
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent::task_transition(
+            "transition-task-q".to_owned(),
+            task.id.clone(),
+            project_id,
+            "in_progress",
+            "done",
+            None,
+            "system:workflow",
+            "delivered",
+            false,
+            now_rfc3339(),
+            snapshot,
+        ),
+    )
+    .await
+    .unwrap();
+    let consumer = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    consumer.run_once(100).await.unwrap();
+    consumer.run_once(100).await.unwrap();
+
+    let dead: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT source_key, error_kind, last_error FROM worker_dead_letter")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let a = db
+        .get_commitment(&created[0].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let b = db
+        .get_commitment(&created[1].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let outcome_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_inbox_item WHERE source_type = 'task_outcome' AND source_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let cursor = db
+        .get_consumer_cursor(coordination_consumer_name())
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    println!(
+        "AUDIT2 dead={dead:?} a={a:?} b={b:?} outcome_inbox_items={outcome_items} cursor={cursor}"
+    );
+    assert_eq!(dead.len(), 1, "only the rejected commitment is quarantined");
+    assert_eq!(a, db::AgentCommitmentStatus::Blocked);
+    assert!(dead[0].0.contains(&created[0].id));
+    assert!(dead[0].2.contains(&created[0].id));
+    assert_eq!(b, db::AgentCommitmentStatus::Completed);
+    assert_eq!(outcome_items, 2);
+    let event = db.get_event("transition-task-q").await.unwrap().unwrap();
+    assert_eq!(cursor, event.sequence);
+    let operator = services::OperatorStatusService::new_for_test(Arc::clone(&db));
+    operator.set_runtime_workers(&[services::RuntimeWorker::Coordination]);
+    let status = operator.compute_status().await.unwrap();
+    assert_eq!(status.event_consumers[0].dead_letter_count, 1);
+    assert!(status.event_consumers[0].recent_dead_letters[0]
+        .item_key
+        .contains(&created[0].id));
+}

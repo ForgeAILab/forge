@@ -96,6 +96,30 @@ impl SqliteDb {
             })
             .collect()
     }
+    pub async fn worker_dead_letter_history(
+        &self,
+        name: &str,
+    ) -> Result<(i64, Vec<crate::WorkerDeadLetterRecord>)> {
+        let count =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter WHERE worker_name = ?")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
+        let rows = sqlx::query("SELECT id, source_key, last_error, dead_lettered_at FROM worker_dead_letter WHERE worker_name = ? ORDER BY dead_lettered_at DESC, id DESC LIMIT 5")
+            .bind(name).fetch_all(&self.pool).await?;
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                Ok(crate::WorkerDeadLetterRecord {
+                    id: row.try_get("id")?,
+                    source_key: row.try_get("source_key")?,
+                    reason: row.try_get("last_error")?,
+                    occurred_at: row.try_get("dead_lettered_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((count, records))
+    }
     pub async fn domain_event_consumer_lag(
         &self,
         expected_consumers: &[&str],

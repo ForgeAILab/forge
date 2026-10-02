@@ -71,6 +71,13 @@ const usageSummary: UsageAggregate = {
 
 const degradedStatus: OperatorStatusResponse = {
   overall_severity: 'error',
+  event_relay: {
+    running: true,
+    position: 12,
+    head: 15,
+    last_error: 'tail retry',
+    last_error_at: '2026-04-29T11:59:00Z',
+  },
   database: { incremental_vacuum: false, free_pages: 42 },
   event_consumers: [
     {
@@ -81,6 +88,16 @@ const degradedStatus: OperatorStatusResponse = {
       oldest_unprocessed_at: '2026-04-29T11:55:00Z',
       oldest_unprocessed_age_seconds: 300,
       stalled: true,
+      dead_letter_count: 7,
+      recent_dead_letters: [
+        {
+          id: 'dead-1',
+          item_key: 'event:9:commitment:c-1',
+          event_sequence: 9,
+          reason: 'blocked commitment',
+          occurred_at: '2025-04-29T12:00:00Z',
+        },
+      ],
     },
   ],
   computed_at: '2026-04-29T12:00:00Z',
@@ -289,5 +306,13 @@ describe('OperationsPage', () => {
       '/tasks/task-active-1',
     )
     expect(screen.getByText('Policy escalation failed')).toBeTruthy()
+  })
+  it('shows relay state and lasting worker quarantine history', () => {
+    render(<OperationsPage />)
+    expect(screen.getByText(/Event relay Running/).textContent).toContain(
+      'Position 12 · Head 15 · tail retry',
+    )
+    expect(screen.getByText('Dead letters 7')).toBeTruthy()
+    expect(screen.getByText(/event:9:commitment:c-1: blocked commitment/)).toBeTruthy()
   })
 })

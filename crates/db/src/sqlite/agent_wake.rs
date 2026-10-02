@@ -88,6 +88,9 @@ impl AgentWakeDispositionRepo for SqliteDb {
              WHERE current.consumer_name = ?
                AND NOT EXISTS (SELECT 1 FROM worker_dead_letter dead
                    WHERE dead.worker_name = current.consumer_name AND dead.source_key = 'wake-retry:' || disposition.id)
+               AND NOT EXISTS (SELECT 1 FROM worker_item_failure failure
+                   WHERE failure.worker_name = current.consumer_name AND failure.source_key = 'wake-retry:' || disposition.id
+                     AND failure.retry_not_before > ?)
                AND disposition.attempt_number < disposition.max_attempts
                AND (
                    (disposition.disposition = 'deferred'
@@ -156,6 +159,7 @@ impl AgentWakeDispositionRepo for SqliteDb {
         )
         .bind(consumer_name)
         .bind(now)
+        .bind(now)
         .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await?
@@ -168,124 +172,8 @@ impl AgentWakeDispositionRepo for SqliteDb {
         &self,
         input: RetryAgentWakeDisposition,
     ) -> Result<AgentWakeDisposition> {
-        validate_disposition_input(&input.disposition)?;
-        if input.disposition.consumer_name.trim().is_empty()
-            || input.disposition.source_event_id.trim().is_empty()
-        {
-            return Err(DbError::Check(
-                "wake retry source identity must be non-empty".to_owned(),
-            ));
-        }
-
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        if let Some(expected_attention) = input.expected_attention.as_ref() {
-            validate_expected_attention_in_tx(&mut transaction, expected_attention).await?;
-        }
-        match input.disposition.disposition {
-            AgentWakeDispositionKind::TurnAdmitted => {
-                let admission = input.admission.clone().ok_or_else(|| {
-                    DbError::Check(
-                        "turn_admitted wake retry requires an atomic turn admission".to_owned(),
-                    )
-                })?;
-                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                    || admission.message.id != admission.turn.triggering_message_id
-                {
-                    return Err(DbError::Check(
-                        "wake retry turn link does not match admission".to_owned(),
-                    ));
-                }
-                let admitted =
-                    admit_agent_chat_turn_in_tx(self, &mut transaction, admission).await?;
-                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                {
-                    return Err(DbError::IdempotencyConflict);
-                }
-            }
-            _ if input.admission.is_some() => {
-                return Err(DbError::Check(
-                    "only turn_admitted wake retries may carry admission".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-        let existing = sqlx::query(
-            "SELECT * FROM agent_wake_disposition
-             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
-        )
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(input.disposition.attempt_number)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if let Some(row) = existing {
-            let existing = map_agent_wake_disposition(row)?;
-            if !wake_disposition_semantics_match(&input.disposition, &existing) {
-                return Err(DbError::IdempotencyConflict);
-            }
-            transaction.commit().await?;
-            return Ok(existing);
-        }
-
-        let current = current_disposition_with_pointer_in_tx(
-            &mut transaction,
-            &input.disposition.consumer_name,
-            &input.disposition.source_event_id,
-        )
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if current.disposition.disposition != AgentWakeDispositionKind::Deferred
-            && current.disposition.disposition != AgentWakeDispositionKind::SetupRequired
-        {
-            return Err(DbError::InvalidTransition);
-        }
-        if current.id != input.expected_parent_id
-            || input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
-            || input.disposition.attempt_number != current.attempt_number + 1
-            || input.disposition.max_attempts != current.max_attempts
-        {
-            return Err(DbError::VersionConflict);
-        }
-        if current.disposition.disposition == AgentWakeDispositionKind::Deferred
-            && current
-                .retry_at
-                .as_deref()
-                .is_none_or(|retry_at| retry_at > input.now.as_str())
-        {
-            return Err(DbError::Check("deferred wake retry is not due".to_owned()));
-        }
-        if current.attempt_number >= current.max_attempts {
-            return Err(DbError::Check("wake retry budget is exhausted".to_owned()));
-        }
-
-        insert_disposition(&mut transaction, &input.disposition).await?;
-        let updated = sqlx::query(
-            "UPDATE agent_wake_disposition_current
-             SET disposition_id = ?, attempt_number = ?, version = version + 1,
-                 updated_at = ?
-             WHERE consumer_name = ? AND source_event_id = ?
-               AND disposition_id = ? AND version = ?",
-        )
-        .bind(&input.disposition.id)
-        .bind(input.disposition.attempt_number)
-        .bind(&input.disposition.updated_at)
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(&input.expected_parent_id)
-        .bind(current.version)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-
-        self.settle_wake_decision_in_tx(
-            &mut transaction,
-            &input.disposition,
-            input.expected_attention.as_ref(),
-        )
-        .await?;
-        let disposition = disposition_from_create(&input.disposition);
+        let disposition = self.retry_agent_wake_in_tx(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(disposition)
     }
@@ -711,6 +599,128 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
 }
 
 impl SqliteDb {
+    pub async fn retry_agent_wake_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: RetryAgentWakeDisposition,
+    ) -> Result<AgentWakeDisposition> {
+        validate_disposition_input(&input.disposition)?;
+        if input.disposition.consumer_name.trim().is_empty()
+            || input.disposition.source_event_id.trim().is_empty()
+        {
+            return Err(DbError::Check(
+                "wake retry source identity must be non-empty".to_owned(),
+            ));
+        }
+
+        if let Some(expected_attention) = input.expected_attention.as_ref() {
+            validate_expected_attention_in_tx(transaction, expected_attention).await?;
+        }
+        match input.disposition.disposition {
+            AgentWakeDispositionKind::TurnAdmitted => {
+                let admission = input.admission.clone().ok_or_else(|| {
+                    DbError::Check(
+                        "turn_admitted wake retry requires an atomic turn admission".to_owned(),
+                    )
+                })?;
+                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                    || admission.message.id != admission.turn.triggering_message_id
+                {
+                    return Err(DbError::Check(
+                        "wake retry turn link does not match admission".to_owned(),
+                    ));
+                }
+                let admitted = admit_agent_chat_turn_in_tx(self, transaction, admission).await?;
+                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+            }
+            _ if input.admission.is_some() => {
+                return Err(DbError::Check(
+                    "only turn_admitted wake retries may carry admission".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let existing = sqlx::query(
+            "SELECT * FROM agent_wake_disposition
+             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
+        )
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(input.disposition.attempt_number)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(row) = existing {
+            let existing = map_agent_wake_disposition(row)?;
+            if !wake_disposition_semantics_match(&input.disposition, &existing) {
+                return Err(DbError::IdempotencyConflict);
+            }
+            return Ok(existing);
+        }
+
+        let current = current_disposition_with_pointer_in_tx(
+            transaction,
+            &input.disposition.consumer_name,
+            &input.disposition.source_event_id,
+        )
+        .await?
+        .ok_or(DbError::NotFound)?;
+        if current.disposition.disposition != AgentWakeDispositionKind::Deferred
+            && current.disposition.disposition != AgentWakeDispositionKind::SetupRequired
+        {
+            return Err(DbError::InvalidTransition);
+        }
+        if current.id != input.expected_parent_id
+            || input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
+            || input.disposition.attempt_number != current.attempt_number + 1
+            || input.disposition.max_attempts != current.max_attempts
+        {
+            return Err(DbError::VersionConflict);
+        }
+        if current.disposition.disposition == AgentWakeDispositionKind::Deferred
+            && current
+                .retry_at
+                .as_deref()
+                .is_none_or(|retry_at| retry_at > input.now.as_str())
+        {
+            return Err(DbError::Check("deferred wake retry is not due".to_owned()));
+        }
+        if current.attempt_number >= current.max_attempts {
+            return Err(DbError::Check("wake retry budget is exhausted".to_owned()));
+        }
+
+        insert_disposition(transaction, &input.disposition).await?;
+        let updated = sqlx::query(
+            "UPDATE agent_wake_disposition_current
+             SET disposition_id = ?, attempt_number = ?, version = version + 1,
+                 updated_at = ?
+             WHERE consumer_name = ? AND source_event_id = ?
+               AND disposition_id = ? AND version = ?",
+        )
+        .bind(&input.disposition.id)
+        .bind(input.disposition.attempt_number)
+        .bind(&input.disposition.updated_at)
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(&input.expected_parent_id)
+        .bind(current.version)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+
+        self.settle_wake_decision_in_tx(
+            transaction,
+            &input.disposition,
+            input.expected_attention.as_ref(),
+        )
+        .await?;
+        let disposition = disposition_from_create(&input.disposition);
+        Ok(disposition)
+    }
     async fn settle_wake_decision_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,

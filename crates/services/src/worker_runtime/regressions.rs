@@ -150,7 +150,7 @@ async fn tick_runs_once_per_cycle_and_failures_do_not_gate_events() {
     assert_eq!(worker.ticks.load(Ordering::SeqCst), 1);
     assert_eq!(worker.handled.load(Ordering::SeqCst), 10);
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM tick_writes").await, 1);
-    for expected in [2, 4, 5] {
+    for expected in [2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
         runtime.tick_schedule.lock().unwrap().due = None;
         runtime.run_once(1).await.unwrap();
         let remaining = runtime

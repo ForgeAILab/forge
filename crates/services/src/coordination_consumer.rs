@@ -15,7 +15,7 @@ use db::{
     DomainEventRepo, SqliteDb, Task, TaskRepo,
 };
 use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Acquire, Row, Sqlite, Transaction};
 
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -288,6 +288,9 @@ impl CoordinationOutcomeConsumer {
         if current.status == AgentCommitmentStatus::Cancelled {
             return Ok(());
         }
+        if current.version != commitment.version {
+            return Err(db::DbError::VersionConflict.into());
+        }
         let dedupe_key = format!("task-outcome:{}:{}:commitment", task.id, event.id);
         match outcome {
             TaskOutcome::Delivered => {
@@ -541,9 +544,57 @@ impl Worker for CoordinationOutcomeConsumer {
         async {
             self.acknowledge_originating_inbox_in_tx(tx, &p.task.id, &p.actions)
                 .await?;
+            let health =
+                crate::worker_runtime::WorkerHealth::new(Arc::clone(&self.db), &self.consumer_name);
+            let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id = ?)")
+                .bind(&p.task.id)
+                .fetch_one(&mut **tx)
+                .await?;
+            if !exists {
+                return Err(db::DbError::NotFound.into());
+            }
             for commitment in &p.commitments {
-                self.reconcile_commitment_in_tx(tx, commitment, &p.task, event, &p.outcome)
-                    .await?;
+                if self
+                    .db
+                    .get_commitment_in_tx(tx, &commitment.id)
+                    .await?
+                    .is_none()
+                {
+                    continue;
+                }
+                let mut item_tx = tx.begin().await?;
+                match self
+                    .reconcile_commitment_in_tx(
+                        &mut item_tx,
+                        commitment,
+                        &p.task,
+                        event,
+                        &p.outcome,
+                    )
+                    .await
+                {
+                    Ok(()) => item_tx.commit().await?,
+                    Err(error) => {
+                        item_tx.rollback().await?;
+                        let kind = crate::worker_runtime::consumer_error_kind(&error);
+                        if kind != crate::worker_runtime::WorkerErrorKind::Terminal {
+                            return Err(error);
+                        }
+                        let key = format!("event:{}:commitment:{}", event.sequence, commitment.id);
+                        health
+                            .isolated_item_failed_in_tx(
+                                tx,
+                                crate::worker_runtime::WorkItem {
+                                    source_key: &key,
+                                    item_type: "coordination_commitment",
+                                },
+                                db::RetryPolicy::default(),
+                                "terminal",
+                                &format!("commitment {}: {}", commitment.id, error),
+                            )
+                            .await?;
+                    }
+                }
             }
             for (recipient, source) in &p.recipients {
                 if let RecipientSource::Commitment(id) = source {
@@ -551,13 +602,52 @@ impl Worker for CoordinationOutcomeConsumer {
                         .db
                         .get_commitment_in_tx(tx, id)
                         .await?
-                        .is_some_and(|current| current.status == AgentCommitmentStatus::Cancelled)
+                        .is_none_or(|current| current.status == AgentCommitmentStatus::Cancelled)
                     {
                         continue;
                     }
                 }
-                self.deliver_outcome_in_tx(tx, recipient, source, &p.task, event, &p.outcome)
-                    .await?;
+                let mut item_tx = tx.begin().await?;
+                match self
+                    .deliver_outcome_in_tx(
+                        &mut item_tx,
+                        recipient,
+                        source,
+                        &p.task,
+                        event,
+                        &p.outcome,
+                    )
+                    .await
+                {
+                    Ok(()) => item_tx.commit().await?,
+                    Err(error) => {
+                        item_tx.rollback().await?;
+                        let kind = crate::worker_runtime::consumer_error_kind(&error);
+                        if kind != crate::worker_runtime::WorkerErrorKind::Terminal {
+                            return Err(error);
+                        }
+                        let key = format!(
+                            "event:{}:inbox:{}:{}:{}:{:?}",
+                            event.sequence,
+                            recipient.identity_id,
+                            recipient.scope_type,
+                            recipient.scope_id,
+                            source
+                        );
+                        health
+                            .isolated_item_failed_in_tx(
+                                tx,
+                                crate::worker_runtime::WorkItem {
+                                    source_key: &key,
+                                    item_type: "coordination_inbox",
+                                },
+                                db::RetryPolicy::default(),
+                                "terminal",
+                                &error.to_string(),
+                            )
+                            .await?;
+                    }
+                }
             }
             Ok::<_, ServiceError>(())
         }

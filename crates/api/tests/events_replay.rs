@@ -344,12 +344,16 @@ async fn durable_cursor_survives_bus_only_frame_and_reconnect_replays_missed_eve
 async fn audit_resume_beyond_head_requests_resync_then_goes_live() {
     let workspace = common::TestDir::new("events-beyond-head");
     let h = common::test_app(workspace.path(), "events-beyond-head").await;
-    append(&h.state.db, "only").await;
+    let head = append(&h.state.db, "only").await;
     let mut stream = response_stream(&h, Some("domain-event:5000")).await;
     let (id, payload) = next_event(&mut stream).await;
-    assert_eq!(id, None);
+    assert_eq!(id, Some(format!("domain-event:{}", head.sequence)));
     assert_eq!(payload["event_type"], "events.resync_required");
     assert_eq!(payload["reason"], "resume cursor beyond ledger head");
+    // A spec-following reconnect sends the resync frame's corrected cursor,
+    // so it does not receive another resync while waiting for a durable event.
+    drop(stream);
+    let mut stream = response_stream(&h, id.as_deref()).await;
     let live = append(&h.state.db, "live-after").await;
     publish(&h, &live);
     assert_eq!(
