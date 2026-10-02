@@ -21,7 +21,7 @@ const EVENT_TYPES: &[&str] = &[
 
 #[derive(Debug)]
 pub struct PreparedMemoryProjection {
-    item: Option<MemoryItem>,
+    item: MemoryItem,
     source_ref: String,
 }
 
@@ -75,16 +75,11 @@ impl Worker for AgentChatMemoryConsumer {
         event: &DomainEvent,
     ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
         if event.entity_type != "agent_chat_message" {
-            return Ok(Outcome::Done(PreparedMemoryProjection {
-                item: None,
-                source_ref: event.entity_id.clone(),
-            }));
+            return Ok(Outcome::Skip);
         }
         let Some(chat) = AgentChatRepo::get_agent_chat(&*self.db, &event.scope_id)
             .await
-            .map_err(|error| {
-                WorkerError::transient(format!("Agent Chat lookup failed: {error}"))
-            })?
+            .map_err(|error| WorkerError::database("Agent Chat lookup failed", error))?
         else {
             return Ok(Outcome::DeadLetter {
                 reason: "Agent Chat source was deleted".to_owned(),
@@ -94,19 +89,22 @@ impl Worker for AgentChatMemoryConsumer {
             AgentChatMessageRepo::get_agent_chat_message(&*self.db, &event.entity_id)
                 .await
                 .map_err(|error| {
-                    WorkerError::transient(format!("Agent Chat message lookup failed: {error}"))
+                    WorkerError::database("Agent Chat message lookup failed", error)
                 })?
         else {
             return Ok(Outcome::DeadLetter {
                 reason: "Agent Chat message source was deleted".to_owned(),
             });
         };
-        let item = self
+        let Some(item) = self
             .memory
             .prepare_agent_chat_message_event(event, &chat, &message)
             .map_err(|error| {
                 WorkerError::new(format!("Agent Chat memory preparation failed: {error}"))
-            })?;
+            })?
+        else {
+            return Ok(Outcome::Skip);
+        };
         Ok(Outcome::Done(PreparedMemoryProjection {
             item,
             source_ref: message.id,
@@ -119,20 +117,15 @@ impl Worker for AgentChatMemoryConsumer {
         _event: &DomainEvent,
         prepared: &Self::Prepared,
     ) -> std::result::Result<(), WorkerError> {
-        let Some(item) = prepared.item.as_ref() else {
-            return Ok(());
-        };
         self.db
             .insert_memory_item_if_source_absent_in_tx(
                 transaction,
-                item,
+                &prepared.item,
                 "agent_chat",
                 &prepared.source_ref,
             )
             .await
-            .map_err(|error| {
-                WorkerError::transient(format!("Agent Chat memory write failed: {error}"))
-            })?;
+            .map_err(|error| WorkerError::database("Agent Chat memory write failed", error))?;
         Ok(())
     }
 }

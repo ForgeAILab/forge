@@ -300,7 +300,7 @@ async fn agent_chat_memory_consumer_deleted_sources_are_terminal_without_strikes
 }
 
 #[tokio::test]
-async fn agent_chat_memory_consumer_database_read_errors_are_transient() {
+async fn agent_chat_memory_consumer_database_read_failures_are_strikes() {
     let db = sqlite_db().await;
     let (project_id, _) = seed_project_and_task(&db, "review").await;
     let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
@@ -348,13 +348,17 @@ async fn agent_chat_memory_consumer_database_read_errors_are_transient() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(attempts, 0);
+    assert_eq!(attempts, 1);
     let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
         .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(dead, 0);
     sqlx::query("ALTER TABLE unavailable_message RENAME TO agent_chat_message")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -365,6 +369,96 @@ async fn agent_chat_memory_consumer_database_read_errors_are_transient() {
             .unwrap(),
         1
     );
+}
+
+// S1: a deterministic memory FK failure must consume the real poison budget
+// and unblock the good message behind it, including through fresh instances.
+#[tokio::test]
+async fn agent_chat_memory_consumer_constraint_failure_is_capped_then_good_message_is_indexed() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_and_task(&db, "review").await;
+    let chat = AgentChatRepo::get_project_chat(&*db, &project.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let now = now_rfc3339();
+    let bad_message = new_uuid_v4();
+    let good_message = new_uuid_v4();
+    sqlx::query("INSERT INTO agent_chat_message (id, chat_id, sequence, author_type, author_id, content, status,
+        correlation_id, source_type, source_metadata_json, created_at)
+        VALUES (?, ?, 0, 'agent', 'deleted-identity', 'agent text', 'complete', ?, 'native', '{}', ?),
+               (?, ?, 1, 'user', NULL, 'user text', 'complete', ?, 'native', '{}', ?)")
+        .bind(&bad_message).bind(&chat.id).bind(new_uuid_v4()).bind(&now)
+        .bind(&good_message).bind(&chat.id).bind(new_uuid_v4()).bind(&now).execute(db.pool()).await.unwrap();
+    // V129 deliberately removed the historical owner FK. Reproduce the
+    // same deterministic commit constraint with a fixture-only trigger.
+    sqlx::query(
+        "CREATE TRIGGER rejected_memory_owner BEFORE INSERT ON memory_item
+        WHEN NEW.owner_identity_id = 'deleted-identity'
+        BEGIN SELECT RAISE(ABORT, 'memory owner constraint'); END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for (kind, message) in [
+        ("agent_chat.response.completed", &bad_message),
+        ("agent_chat.message.admitted", &good_message),
+    ] {
+        DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: kind.into(),
+                entity_type: "agent_chat_message".into(),
+                entity_id: message.clone(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "agent_chat".into(),
+                scope_id: chat.id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for _ in 0..7 {
+        assert_eq!(
+            AgentChatMemoryConsumer::new(Arc::clone(&db))
+                .run_once(10)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(10)
+            .await
+            .unwrap(),
+        2
+    );
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(attempts, 8);
+    let good: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_item WHERE json_extract(metadata_json, '$.source_ref') = ?",
+    )
+    .bind(&good_message)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(good, 1);
 }
 
 #[tokio::test]

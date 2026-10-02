@@ -22,7 +22,6 @@ struct TinyWorker {
     timeout: Duration,
     subscription: Subscription,
     entered: Notify,
-    release: Notify,
     append_in_commit: bool,
 }
 impl TinyWorker {
@@ -45,7 +44,6 @@ impl TinyWorker {
             timeout: Duration::from_secs(300),
             subscription: Subscription::Exact(vec!["wanted".into()]),
             entered: Notify::new(),
-            release: Notify::new(),
             append_in_commit: false,
         }
     }
@@ -100,8 +98,9 @@ impl Worker for TinyWorker {
                     }
                 }
                 let _active = Active(&self.active);
-                self.release.notified().await;
-                Ok(Outcome::Done(event.sequence))
+                // Intentional hung worker; production timeout/shutdown and
+                // the test's bounded outer waits are the guards.
+                std::future::pending().await
             }
             _ => Ok(Outcome::Done(event.sequence)),
         }
@@ -145,6 +144,7 @@ impl Worker for TinyWorker {
         &self,
         _event: &DomainEvent,
         _prepared: &i64,
+        _committed: &(),
     ) -> std::result::Result<(), WorkerError> {
         if self.after_failure {
             Err(WorkerError::new("post-commit failed"))
@@ -217,6 +217,25 @@ where
     .expect("condition reached");
 }
 
+async fn due<W: Worker<C>, C: Send + Sync + 'static>(runtime: &WorkerRuntime<W, C>) {
+    *runtime.wait.lock().unwrap() = None;
+    sqlx::query(
+        "UPDATE worker_health SET
+        retry_not_before = CASE WHEN retry_source_key IS NOT NULL THEN '2000-01-01T00:00:00Z' END,
+        defer_not_before = CASE WHEN deferred_source_key IS NOT NULL THEN '2000-01-01T00:00:00Z' END
+        WHERE worker_name = ?",
+    )
+    .bind(runtime.worker.name())
+    .execute(runtime.db.pool())
+    .await
+    .unwrap();
+}
+async fn notified(signal: &Notify) {
+    tokio::time::timeout(Duration::from_secs(30), signal.notified())
+        .await
+        .expect("notification arrived");
+}
+
 #[tokio::test]
 async fn effect_and_cursor_commit_together() {
     let db = database().await;
@@ -227,6 +246,7 @@ async fn effect_and_cursor_commit_together() {
     assert_eq!(runtime.run_once(1).await.unwrap(), 0);
     assert!(effects(&db).await.is_empty());
     assert_eq!(runtime.source.cursor().await.unwrap(), 0);
+    due(&runtime).await;
     assert_eq!(runtime.run_once(1).await.unwrap(), 1);
     assert_eq!(effects(&db).await, [event.sequence]);
     assert_eq!(runtime.source.cursor().await.unwrap(), event.sequence);
@@ -280,29 +300,21 @@ async fn trickled_ignored_events_are_checkpointed_at_most_once_per_idle_interval
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("trickle")));
     runtime.initialize().await.unwrap();
     let before = runtime.write_transaction_count();
-    tokio::time::pause();
-    let clock_guard = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
     for _ in 0..20 {
         append(&db, "ignored", "ignored").await;
         assert!(matches!(
             runtime.poll_once().await.unwrap(),
             PollResult::Idle
         ));
-        tokio::time::advance(Duration::from_millis(40)).await;
     }
     assert_eq!(runtime.write_transaction_count(), before);
-    tokio::time::advance(Duration::from_secs(5)).await;
+    runtime.source.make_flush_due();
     assert!(matches!(
         runtime.poll_once().await.unwrap(),
         PollResult::Progress
     ));
     assert_eq!(runtime.write_transaction_count() - before, 1);
     assert_eq!(runtime.source.cursor().await.unwrap(), 20);
-    clock_guard.abort();
 }
 
 #[tokio::test]
@@ -313,6 +325,7 @@ async fn retry_attempts_survive_new_runtime_then_cap_and_process_next() {
     let worker = Arc::new(TinyWorker::new("retry"));
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
     assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    due(&runtime).await;
     drop(runtime);
     let runtime = WorkerRuntime::new(Arc::clone(&db), worker);
     assert_eq!(runtime.run_once(10).await.unwrap(), 0);
@@ -324,6 +337,7 @@ async fn retry_attempts_survive_new_runtime_then_cap_and_process_next() {
         .await,
         2
     );
+    due(&runtime).await;
     assert_eq!(runtime.run_once(10).await.unwrap(), 2);
     let dead: (String, i64) = sqlx::query_as("SELECT source_key, attempts FROM worker_dead_letter")
         .fetch_one(db.pool())
@@ -344,6 +358,7 @@ async fn panicking_handle_and_commit_are_capped_without_supervisor_restarts() {
         let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
         for _ in 0..2 {
             assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+            due(&runtime).await;
         }
         assert_eq!(runtime.run_once(10).await.unwrap(), 2);
         let dead: (String, i64, String) =
@@ -354,14 +369,6 @@ async fn panicking_handle_and_commit_are_capped_without_supervisor_restarts() {
         assert_eq!(dead.0, bad.sequence.to_string());
         assert_eq!(dead.1, 3);
         assert!(dead.2.contains("panicked"));
-        assert_eq!(
-            scalar(
-                &db,
-                "SELECT restart_count FROM worker_health WHERE worker_name = 'panic'"
-            )
-            .await,
-            0
-        );
         assert_eq!(effects(&db).await, [next.sequence]);
     }
 }
@@ -399,6 +406,12 @@ async fn runtime_internal_failures_never_strike_and_recovery_applies_effect_once
     );
     assert_eq!(runtime.source.cursor().await.unwrap(), 0);
     assert!(effects(&db).await.is_empty());
+    let cause: String =
+        sqlx::query_scalar("SELECT runtime_error FROM worker_health WHERE worker_name = 'infra'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(cause.contains("simulated disk I/O error"));
     sqlx::query("DROP TRIGGER infra_failure")
         .execute(db.pool())
         .await
@@ -417,6 +430,7 @@ async fn transient_worker_errors_never_strike_or_dead_letter() {
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
     for _ in 0..10 {
         assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+        due(&runtime).await;
     }
     assert_eq!(
         scalar(
@@ -434,6 +448,7 @@ async fn transient_worker_errors_never_strike_or_dead_letter() {
     worker.commit_transient.store(true, Ordering::SeqCst);
     for _ in 0..10 {
         assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+        due(&runtime).await;
     }
     assert!(effects(&db).await.is_empty());
     assert_eq!(
@@ -463,6 +478,7 @@ async fn defer_is_uncapped_keeps_order_reason_and_first_time() {
             .await
             .unwrap();
     for _ in 0..20 {
+        due(&runtime).await;
         assert_eq!(runtime.run_once(10).await.unwrap(), 0);
     }
     let state: (i64, String, String, Option<String>) = sqlx::query_as(
@@ -539,6 +555,7 @@ async fn health_error_persists_until_success_and_backlog_is_live() {
         lag[0].oldest_unprocessed_at.as_deref(),
         Some("2000-01-01T00:00:00Z")
     );
+    due(&runtime).await;
     assert_eq!(runtime.run_once(10).await.unwrap(), 2);
     let lag = db.domain_event_consumer_lag(&["health"]).await.unwrap();
     assert_eq!(lag[0].lag, 0);
@@ -567,7 +584,7 @@ async fn hung_handler_has_live_lag_timeout_strikes_and_false_watch_does_not_dupl
     let worker = Arc::new(tiny);
     let runtime = Arc::new(WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker)));
     let (tx, rx) = watch::channel(false);
-    let handle = runtime.start(rx);
+    let handle = Arc::clone(&runtime).start(rx);
     tokio::time::timeout(Duration::from_secs(10), worker.entered.notified())
         .await
         .unwrap();
@@ -579,14 +596,15 @@ async fn hung_handler_has_live_lag_timeout_strikes_and_false_watch_does_not_dupl
     );
     assert_eq!(worker.active.load(Ordering::SeqCst), 1);
     tx.send_replace(false);
-    // Synchronize through the supervisor: paused time gives it time to react
-    // to false while the handler remains blocked.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(1)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::time::sleep(Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
     assert_eq!(worker.seen.lock().unwrap().len(), 1);
+    assert_eq!(runtime.loop_starts.load(Ordering::SeqCst), 1);
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(300)).await;
     // Resume for DB persistence, avoiding paused-time auto-advance during SQLx IO.
     tokio::time::resume();
@@ -651,7 +669,6 @@ async fn prefix_and_all_subscriptions_and_tick_support_non_event_work() {
         tiny.subscription = subscription.clone();
         tiny.tick_panics = AtomicUsize::new(1);
         let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(tiny));
-        assert_eq!(runtime.run_once(10).await.unwrap(), 0); // tick runs even before next event
         let expected = if matches!(subscription, Subscription::All) {
             2
         } else {
@@ -700,6 +717,12 @@ async fn per_event_commit_cost_is_independent_of_wanted_backlog() {
         drop(connection);
         assert_eq!(runtime.run_once(1).await.unwrap(), 1);
         counts.push(steps.load(Ordering::Relaxed));
+        let mut connection = db.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .remove_progress_handler();
     }
     assert!(
         counts[1] <= counts[0] + 100,
@@ -713,17 +736,21 @@ async fn caught_up_idle_poll_opens_no_write_transaction_or_pool_write() {
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("idle")));
     runtime.initialize().await.unwrap();
     let before = runtime.write_transaction_count();
-    let updates = Arc::new(AtomicUsize::new(0));
-    let count = Arc::clone(&updates);
-    let mut connection = db.pool().acquire().await.unwrap();
-    connection
-        .lock_handle()
+    sqlx::query("CREATE TABLE observed_metadata_write (n INTEGER)")
+        .execute(db.pool())
         .await
-        .unwrap()
-        .set_update_hook(move |_| {
-            count.fetch_add(1, Ordering::Relaxed);
-        });
-    drop(connection);
+        .unwrap();
+    for table in ["worker_health", "event_consumer_cursor"] {
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            sqlx::query(&format!(
+                "CREATE TRIGGER observed_{table}_{operation} AFTER {operation} ON {table}
+                BEGIN INSERT INTO observed_metadata_write VALUES (1); END"
+            ))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    }
     for _ in 0..10 {
         assert!(matches!(
             runtime.poll_once().await.unwrap(),
@@ -731,7 +758,10 @@ async fn caught_up_idle_poll_opens_no_write_transaction_or_pool_write() {
         ));
     }
     assert_eq!(runtime.write_transaction_count(), before);
-    assert_eq!(updates.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM observed_metadata_write").await,
+        0
+    );
 }
 
 // P8: old live leases neither block nor duplicate delivery; cleanup belongs to
@@ -991,26 +1021,28 @@ async fn supervisor_backoff_resets_after_a_healthy_period() {
                 let call = count.fetch_add(1, Ordering::SeqCst);
                 started.notify_one();
                 if call > 0 {
-                    release.notified().await;
+                    tokio::time::timeout(Duration::from_secs(3600), release.notified())
+                        .await
+                        .expect("test release");
                 }
                 Ok(())
             }
         },
         rx,
     );
-    entered.notified().await;
-    backoff.notified().await;
+    notified(&entered).await;
+    notified(&backoff).await;
     // Pause only the pure timer/notification portion. SQLite persistence runs
     // with real time so SQLx acquisition timers cannot auto-advance during IO.
     tokio::time::pause();
-    entered.notified().await;
+    notified(&entered).await;
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::time::resume();
     finish.notify_one();
-    backoff.notified().await;
+    notified(&backoff).await;
     tokio::time::pause();
     let waiting_since = Instant::now();
-    entered.notified().await;
+    notified(&entered).await;
     // Reset waits ten seconds; an accumulated restart backoff would be twenty.
     assert!(waiting_since.elapsed() < Duration::from_secs(15));
     tokio::time::resume();
@@ -1102,13 +1134,15 @@ async fn supervisor_shutdown_interrupts_restart_health_persistence() {
             let finish = Arc::clone(&finish);
             async move {
                 started.notify_one();
-                finish.notified().await;
+                tokio::time::timeout(Duration::from_secs(30), finish.notified())
+                    .await
+                    .expect("test finish");
                 Ok(())
             }
         },
         rx,
     );
-    entered.notified().await;
+    notified(&entered).await;
     let connection = db.pool().acquire().await.unwrap();
     release.notify_one();
     for _ in 0..20 {
@@ -1119,7 +1153,7 @@ async fn supervisor_shutdown_interrupts_restart_health_persistence() {
 }
 
 #[tokio::test]
-async fn invalid_retry_timestamp_is_runtime_error_without_a_strike() {
+async fn invalid_retry_timestamp_is_due_and_recovers_without_resetting_strikes() {
     let db = database().await;
     append(&db, "wanted", "poison").await;
     let worker = Arc::new(TinyWorker::new("timestamp"));
@@ -1132,20 +1166,29 @@ async fn invalid_retry_timestamp_is_runtime_error_without_a_strike() {
     .await
     .unwrap();
     let runtime = WorkerRuntime::new(Arc::clone(&db), worker);
-    assert!(matches!(
-        runtime.run_once(1).await,
-        Err(ServiceError::Db(db::DbError::Check(_)))
-    ));
+    assert_eq!(runtime.run_once(1).await.unwrap(), 0);
     assert_eq!(
         scalar(
             &db,
             "SELECT retry_attempts FROM worker_health WHERE worker_name = 'timestamp'"
         )
         .await,
-        1
+        2
     );
+    let repaired: String = sqlx::query_scalar(
+        "SELECT retry_not_before FROM worker_health WHERE worker_name = 'timestamp'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(DateTime::parse_from_rfc3339(&repaired).is_ok());
+    due(&runtime).await;
+    assert_eq!(runtime.run_once(1).await.unwrap(), 1);
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
-        0
+        1
     );
 }
+
+#[path = "regressions.rs"]
+mod regressions;

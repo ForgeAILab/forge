@@ -1969,112 +1969,111 @@ bookkeeping.
 
 #### Worker runtime contract
 
-`services::worker_runtime::WorkerRuntime` assembles three independently usable
-parts: `WorkerSupervisor` runs any asynchronous work loop with restart back-off;
-`WorkerHealth`, `RetryPolicy`, `WorkItem` and `PoisonDecision` persist health and
-poison policy independently of a work source; `DurableEventSource` supplies
-strictly ordered events and lazy checkpoints. Health cursor and retry keys are
-text, and dead letters are keyed by `(worker_name, source_key)` with an item
-type. A later leased step loop can reuse supervision and poison persistence
-with step IDs without introducing event sequences into those types.
-`RetryPolicy::decision` accepts source-owned attempt accounting, and
-`WorkerHealth::dead_letter_in_tx` accepts `FailureState` for leased sources;
-they do not have to reuse the serial event adapter's single retry row. Leases,
-concurrency and per-task ordering are outside this slice.
+`services::worker_runtime::WorkerRuntime` combines a source-independent
+`WorkerSupervisor` with `db::WorkerHealth`, poison policy and an ordered
+`DurableEventSource`. Health, retry and dead-letter persistence live in `db`;
+services contains scheduling and worker hooks. Dead letters use
+`(worker_name, source_key)` text identity and item type, so a future leased-step
+source can supply its own `FailureState` to `dead_letter_in_tx` and use
+`RetryPolicy::decision`. Leases, concurrency and per-task ordering are outside
+this slice.
 
-An event `Worker` declares its stable name, `Subscription::Exact(list)`,
-`Prefix(list)` (literal prefixes, e.g. `agent.wake.`), or `All`, a per-worker
-`RetryPolicy`, and a handle timeout. Its name remains the
-`event_consumer_cursor` key, preserving the upgrade checkpoint. Subscription
-filtering, event row mapping and the optimistic cursor UPDATE live in `db`;
-the cursor implementation is shared with legacy delivery. Exact subscriptions
-use one indexed minimum-sequence seek per event type and a bounded merge,
-avoiding a sort of the wanted backlog inside cursor validation. Only subscribed rows
-reach the handler, in ascending sequence order, including across deleted gaps.
-Ignored advances remain in memory until the next wanted commit or one lazy
-flush per five seconds. Idle polls write nothing; trickled ignored events do
-not each open a write transaction. Restarting may re-scan ignored rows.
+An event worker declares a stable name, `Subscription::Exact`, literal `Prefix`
+or `All`, per-worker retry policy and handle timeout. Subscription changes are
+compared with persisted health on initialization and refreshed before handling.
+The existing `event_consumer_cursor` is the sole checkpoint authority; health
+has no cursor copy. SQL filtering, indexed lookups, mapping, validation and
+checkpoint writes live in `db`, with cursor creation/update shared by legacy
+delivery. Exact subscriptions seek each type's `(event_type, sequence)` index;
+prefix subscriptions use disjoint binary type ranges on that index. Live lag
+counts matching ranges. The oldest pending wanted event is the lowest matching
+sequence, whose creation time supplies its age.
 
-`handle(event) -> Result<Outcome<Prepared>, WorkerError>` performs slow or
-external preparation without a write transaction. `Done(prepared)` opens one
-short `BEGIN IMMEDIATE`: validate the expected cursor and next subscribed
-sequence, call `commit(transaction, event, prepared)`, update the cursor and
-health, then commit. `commit` may await only database work. Failure rolls back
-the effect and checkpoint together. `tick()` runs before each poll for non-event
-work; `after_commit(event, prepared)` runs after successful COMMIT. Both hooks
-default to no-op. Hook failures are logged and recorded in health; an
-`after_commit` failure cannot undo, retry or strike the committed event. Hooks
-must be idempotent; this is not an exactly-once guarantee for external effects.
+`Worker<C = ()>` uses a defaulted generic commit-result type because the stable
+Rust compiler does not support associated type defaults. `handle(event)` returns
+`Result<Outcome<Prepared>, WorkerError>` outside a transaction. `Done(prepared)`
+opens one short `BEGIN IMMEDIATE`, validates the checkpoint and next candidate,
+calls `commit(transaction, event, prepared) -> Result<C, WorkerError>`, and commits
+effect, cursor and item health atomically. `commit` may await only database work.
+`after_commit(event, prepared, committed)` receives the actual committed result,
+so the worker can condition its post-step on successful admission. Its failure
+is logged and reported but cannot undo or strike the acknowledged event.
 
-`Defer { after, reason }` is an uncapped readiness wait. It retains strict order,
-records the reason and first deferral time, never adds a strike and never leads
-to quarantine. `DeadLetter { reason }` quarantines immediately with zero new
-strikes. Only a worker's own `handle`/`commit` failure, panic in either, or handle
-timeout adds a strike. Default policy is eight attempts, exponential waits from
-one second capped at five minutes per wait; default handle timeout is five
-minutes and drops the hung future. Retry state survives a new runtime instance.
-`WorkerError::transient` reports infrastructure failure and backs off without a
-strike. Runtime failures (including begin, validation, health/cursor writes,
-COMMIT, SQLite busy or pool failure) take the loop error path and never consume
-an attempt. A capped failure writes the dead letter and cursor in one
-transaction. Error strings are bounded to 1,024 characters and exclude payloads.
+`Skip` means this event is not for the worker. It writes no effect or per-event
+transaction; its advance is buffered with ignored events, folded into the next
+handled checkpoint or flushed at most once per five seconds. A restart can
+reclassify that small buffered prefix. Wanted events remain strictly ordered.
+`Defer { after, reason }` suspends the whole stream without a strike or an
+attempt cap; individual waits are clamped to one second through one hour before
+persistence. Deferral reason and first deferral time are retained. A malformed
+stored wait is logged once per runtime and treated as due; the next state change
+rewrites it. All deadline arithmetic is checked.
 
-The runtime writes only what it knows to `worker_health`: text checkpoint,
-subscription, attempts and wait state, persistent last error, success time,
-restart count and current deferral. Operator reads compute the exact count and
-oldest creation timestamp of pending subscribed events live from the event
-table. Stall detection therefore continues to age while a handler hangs or the
-runtime fails. The commit transaction never counts the backlog. The existing
-operator response has no dedicated worker last-error or deferral field.
-Persistent worker errors use its existing `recent_errors` issue list with
-`attention` severity; long deferrals surface through live lag, pending age and
-the existing stall alert, with the detailed reason/since in `worker_health`. Last error persists until the next success.
-Missing health rows are recreated.
+Only failures/panics in `handle` or `commit`, and handle timeout, add a strike.
+Default policy is eight attempts, waits exponential from one second capped at
+five minutes, and five-minute handle timeout. Policy waits have a one-second
+floor, respect their representable cap, and an unrepresentable cap falls back
+to five minutes. A capped or explicit `DeadLetter` moves the cursor and inserts
+the quarantine record together. Runtime infrastructure failures never strike.
+Memory classifies only SQLite busy/locked, pool failures and version conflicts
+as transient; other database failures strike. Transient worker retries back off
+independently from one second to the five-second idle maximum.
 
-Idle polling backs off from 250 milliseconds to five seconds. Every SQLite pool
-connection has an update hook marking `domain_event` inserts, a commit hook
-marking committed appends, and a rollback hook clearing uncommitted insert flags. The
-pool release hook wakes the process-local `Notify` after COMMIT completes and
-is visible to other connections. Appenders need no explicit notify call,
-including caller-owned transactions and worker commits. Waiters register their
-`Notified` before the poll, closing the poll-to-wait race. Pool connections are
-released by the repository's pool-owned transactions after commit; retain an
-explicitly acquired connection only for short DB work. Notifications are
-process-wide hints; durable polling remains authoritative.
+`tick` defaults to no-op and runs once per bounded poll cycle, not once per
+backlogged event. It runs again on wakes during retry/deferral waits; individual
+sleeps are capped at five seconds. Tick errors do not gate event handling. They
+have their own exponential schedule and health error scope. Identical runtime
+and tick errors are deduplicated. Successful cycles clear runtime errors even
+when empty; successful ticks clear tick errors. An item error survives unrelated
+recovery until that item completes or is quarantined. Health's generated
+`last_error` exposes the latest of the independently retained causes.
 
-The source-independent supervisor catches loop exits and runtime-level panics,
-counts restarts even when event-source initialization fails, and resets restart
-back-off after a healthy period. Worker-hook panics are caught separately and
-become strikes rather than restarts. A non-shutdown watch update keeps the
-existing child loop. Shutdown aborts and awaits the child, interrupting handlers,
-readiness waits and retry/restart back-off.
+Operator status computes lag/age/stalls live from the cursor table and current
+subscription, without scanning ignored event rows through `json_each`. Existing
+`recent_errors` entries carry bounded worker causes and deferral reason/since;
+readiness alone is informational, while errors and stalls raise attention.
+Dead letters are separate issues in the same one-hour window as ordinary errors,
+not permanent health errors. The response shape is unchanged.
 
-Only `scoped-memory-agent-chat-indexer` uses the new runtime. Database lookup
-and write failures in memory are transient; deleted chats/messages are immediate
-terminal outcomes. Migration `V202610012200` removes this worker's old delivery
-lease/receipt rows, for which no retention job exists, while preserving its
-cursor, memory items, source-idempotency receipts and every other consumer's
-metadata. The unreleased migration is edited in place in this slice.
+Each standard SQLite pool connection has an insert hook, commit marker and
+rollback handling. Pool-scoped `Notify` is delivered on connection release
+after COMMIT is visible. A pending-marker atomic gives ordinary releases an
+immediate fast path, with no extra ping or lock-handle round trip. Hook mutexes
+recover poisoning. `max_lifetime(None)` remains necessary because SQLx's expiry
+close path bypasses the release hook; idle connection recycling is retained.
+Explicitly held connections deliver their commit hint when released. Waiters
+register before polling; notification hints never replace durable reads.
 
-The other consumers remain unchanged. Their next migrations fit as follows:
+The supervisor counts loop exits/runtime panics, including failed initialization,
+resets restart back-off after a healthy period, and aborts/awaits its existing
+child on shutdown. False watch changes cannot create another loop. Missing health
+rows are recreated. Only `scoped-memory-agent-chat-indexer` uses this library;
+the other four consumers remain on their current loops. Migration
+`V202610012200` removes only memory's retired delivery leases/receipts and
+preserves cursors, projection/source receipts and other consumers' metadata.
+The still-unmerged migration is edited in place.
 
-- Attention: move `resolve_superseded_turn_incidents` to `tick`; split
-  `project_event` into preparation in `handle` and transaction-owned projection
-  in `commit`; map `ProjectionOutcome::Deferred` to uncapped `Defer`.
-- Wake-turn: subscribe with `Prefix(["agent.wake."])`; move `plan_event` to
-  `handle`, the admission/disposition portion of `process_claimed_event` to
-  `commit`, and `settle_decision_incident` to `after_commit`. Move
-  `list_reconsiderable_agent_wake_dispositions` plus `process_retry` to `tick`.
-  Readiness deferrals use uncapped `Defer`. The existing
-  `complete_claimed_agent_wake` must expose transaction-owned admission and
-  disposition persistence separately from legacy lease/receipt completion.
-- Coordination: split `reconcile_event` reads/planning into `handle`; move
+The next consumer placements are:
+
+- Attention subscribes to `All`: its classification is case-insensitive and
+  substring-based. Move `resolve_superseded_turn_incidents` to `tick`, split
+  `project_event` into preparation and transaction-owned projection writes,
+  and return `Skip` for irrelevant events. Express `DbError::Check` as immediate
+  `DeadLetter`; other errors use `WorkerError::transient` and retry forever.
+  A whole-stream `ProjectionOutcome::Deferred` can use runtime `Defer`.
+- Wake-turn subscribes to `Prefix(["agent.wake."])`. Move `plan_event` to handle,
+  the admission/disposition portion of `process_claimed_event` into commit, and
+  `settle_decision_incident` into after_commit, conditioned on the committed
+  admission result. A deferred wake is `Done` with a persisted `Deferred`
+  disposition and an advanced cursor; it does not use runtime `Defer`, which
+  would block other Agents' wakes. Reconsiderable-disposition lookup and
+  `process_retry` belong in tick. Split `complete_claimed_agent_wake` persistence
+  from its legacy lease/receipt completion.
+- Coordination prepares `reconcile_event` reads/planning in handle and moves
   `acknowledge_originating_inbox`, `reconcile_commitment` and `deliver_outcome`
-  writes to transaction-owned variants called by `commit`. Its current
-  pool-level writes must be adapted before migration; the library needs no
-  further hook or outcome changes.
-- SSE relay: becomes a non-durable tail in the next slice, outside the cursor
-  runtime. No cursor-worker batching is added.
+  into transaction-owned variants called by commit.
+- SSE becomes a non-durable tail outside this cursor runtime; no batching is
+  added here.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
@@ -2090,7 +2089,7 @@ Server and Solo data-root process locking excludes that conversion from a
 running runtime. Operator status reports free pages, incremental mode, consumer
 lag and oldest pending age. Its expected consumers are derived from the
 workers the supervisor starts; persisted cursors for workers outside that set
-are omitted. Migrated workers use `worker_health` checkpoints/subscriptions and
+are omitted. Migrated workers use the cursor table and `worker_health` subscriptions with
 live event queries; legacy consumers derive lag from the cursor and global head. All five durable
 consumers currently start unconditionally in both
 Server and Solo, including when MCP or the embedded daemon is disabled. A cursor

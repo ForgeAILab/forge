@@ -16,6 +16,11 @@ mod task_metadata;
 #[cfg(test)]
 mod tests;
 mod time;
+mod worker;
+pub use worker::{
+    clamp_worker_deferral, FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem,
+    WorkerHealth, WorkerWaitState,
+};
 
 pub use agent_chat_topic_repository::*;
 pub use chat_session_denials::*;
@@ -31,7 +36,10 @@ pub use orchestration::*;
 pub use pagination::*;
 pub use repository::*;
 pub use review_conformance::*;
-pub use sqlite::{supported_main_baseline_revision, EventSubscription, SqliteDb, TaskListRead};
+pub use sqlite::{
+    supported_main_baseline_revision, EventSubscription, SqliteDb, TaskListRead,
+    WorkerDeadLetterIssue, WorkerDiagnostic,
+};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;

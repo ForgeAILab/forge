@@ -136,23 +136,67 @@ impl OperatorStatusService {
             .iter()
             .map(|consumer| consumer.consumer_name.as_str())
             .collect();
-        for (worker, error, occurred_at) in self.db.domain_event_worker_errors(&names).await? {
-            recent_errors.push(RecentErrorSummary {
-                entity_type: "event_consumer".to_owned(),
-                entity_id: worker,
-                error,
-                occurred_at,
-                severity: OperatorSeverity::Attention,
-            });
+        let diagnostics = self.db.worker_operator_diagnostics(&names).await?;
+        for consumer in &event_consumers {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|row| row.worker_name == consumer.consumer_name);
+            let mut messages = Vec::new();
+            let mut occurred_at = None;
+            let mut attention = consumer.stalled;
+            if let Some(diagnostic) = diagnostic {
+                for (kind, cause, time) in &diagnostic.errors {
+                    let label = match kind {
+                        db::HealthErrorKind::Runtime => "Runtime",
+                        db::HealthErrorKind::Item => "Event",
+                        db::HealthErrorKind::Tick => "Tick",
+                        db::HealthErrorKind::AfterCommit => "After commit",
+                    };
+                    messages.push(format!("{label}: {cause}"));
+                    occurred_at = Some(time.clone());
+                    attention = true;
+                }
+                if let (Some(reason), Some(since)) =
+                    (&diagnostic.deferred_reason, &diagnostic.deferred_since)
+                {
+                    messages.push(format!("Deferred since {since}: {reason}"));
+                    occurred_at.get_or_insert_with(|| since.clone());
+                }
+            }
+            if consumer.stalled {
+                messages.push(format!("Event consumer stalled: cursor has not advanced for more than {} seconds; lag {}",
+                    self.consumer_stall_seconds, consumer.lag));
+            }
+            if !messages.is_empty() {
+                recent_errors.push(RecentErrorSummary {
+                    entity_type: "event_consumer".to_owned(),
+                    entity_id: consumer.consumer_name.clone(),
+                    error: messages.join("; "),
+                    occurred_at: occurred_at
+                        .or_else(|| consumer.last_advanced_at.clone())
+                        .or_else(|| consumer.oldest_unprocessed_at.clone())
+                        .unwrap_or_else(|| computed_at.clone()),
+                    severity: if attention {
+                        OperatorSeverity::Attention
+                    } else {
+                        OperatorSeverity::Healthy
+                    },
+                });
+            }
         }
-        // Reuse the existing operator issue/severity surface. These current
-        // alerts disappear on cursor recovery; no new alert ledger is needed.
-        for consumer in event_consumers.iter().filter(|consumer| consumer.stalled) {
+        for dead in self
+            .db
+            .worker_dead_letter_issues(&names, &(now - Duration::hours(1)).to_rfc3339())
+            .await?
+        {
             recent_errors.push(RecentErrorSummary {
-                entity_type: "event_consumer".to_owned(),
-                entity_id: consumer.consumer_name.clone(),
-                error: format!("Event consumer stalled: cursor has not advanced for more than {} seconds; sequence lag {}", self.consumer_stall_seconds, consumer.lag),
-                occurred_at: consumer.last_advanced_at.clone().or_else(|| consumer.oldest_unprocessed_at.clone()).unwrap_or_else(|| computed_at.clone()),
+                entity_type: "worker_dead_letter".to_owned(),
+                entity_id: format!("{}:{}", dead.worker_name, dead.source_key),
+                error: format!(
+                    "{} quarantined {} {}: {}",
+                    dead.worker_name, dead.item_type, dead.source_key, dead.reason
+                ),
+                occurred_at: dead.occurred_at,
                 severity: OperatorSeverity::Attention,
             });
         }
@@ -1466,10 +1510,86 @@ mod tests {
         assert!(status
             .recent_errors
             .iter()
-            .any(|issue| issue.entity_id == name && issue.error == "persistent worker failure"));
+            .any(|issue| issue.entity_id == name
+                && issue.error.contains("persistent worker failure")));
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
         crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
             .run_once(10)
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(!status
+            .recent_errors
+            .iter()
+            .any(|issue| issue.error.contains("persistent worker failure")));
+        // Skip has a lazy checkpoint. Simulate that subsequent flush to test
+        // recovery against the sole cursor authority, not a health copy.
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        db.advance_domain_event_cursor_in_tx(&mut tx, name, 0, 2, &now.to_rfc3339())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    }
+
+    #[tokio::test]
+    async fn consumer_deferral_text_and_dead_letters_have_distinct_operator_lifetimes() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        let name = crate::memory_consumer_name();
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(1)
+            .await
+            .unwrap();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health
+            .defer_in_tx(
+                &mut tx,
+                "1",
+                std::time::Duration::from_secs(3600),
+                "waiting for settlement",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        let issue = status
+            .recent_errors
+            .iter()
+            .find(|i| i.entity_id == name)
+            .unwrap();
+        assert!(issue.error.contains("waiting for settlement"));
+        assert!(issue.error.contains("Deferred since"));
+        assert_eq!(issue.severity, OperatorSeverity::Healthy);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.clear_pending_in_tx(&mut tx).await.unwrap();
+        health
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "1",
+                    item_type: "test",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: "2000-01-01T00:00:00Z",
+                },
+                "poison event",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|i| i.entity_type == "worker_dead_letter" && i.error.contains("poison event")));
+        sqlx::query("UPDATE worker_dead_letter SET dead_lettered_at = ?")
+            .bind((Utc::now() - Duration::hours(2)).to_rfc3339())
+            .execute(db.pool())
             .await
             .unwrap();
         let status = service.compute_status().await.unwrap();

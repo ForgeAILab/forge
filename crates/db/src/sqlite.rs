@@ -105,6 +105,7 @@ mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
 mod outbox;
+pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
 mod pricing;
 mod project;
@@ -139,7 +140,7 @@ mod workspace_placement;
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
     pool: SqlitePool,
-    domain_event_notify: Arc<Notify>,
+    domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,9 +150,10 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
+        let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
-            domain_event_notify: crate::connection::domain_event_notify(),
+            domain_event_hooks,
         }
     }
 
@@ -159,11 +161,11 @@ impl SqliteDb {
         &self.pool
     }
 
-    /// Process-local wakeup for workers that consume committed domain events.
+    /// Pool-scoped wakeup for workers that consume committed domain events.
     /// Durable cursors remain authoritative; a missed notification only falls
     /// back to the worker's bounded idle poll.
     pub fn domain_event_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.domain_event_notify)
+        self.domain_event_hooks.notify()
     }
 }
 

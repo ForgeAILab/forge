@@ -1,14 +1,13 @@
-//! Two-phase event execution, assembled from a durable source and reusable
-//! source-neutral supervisor, health and poison policy.
+//! Ordered event execution assembled from a durable source and reusable,
+//! source-neutral DB health, poison policy and loop supervision.
 mod event_source;
-mod health;
 mod policy;
 mod supervisor;
 
 pub use db::EventSubscription as Subscription;
+pub use db::{FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem, WorkerHealth};
 pub use event_source::DurableEventSource;
-pub use health::{FailureState, WorkItem, WorkerHealth};
-pub use policy::{Outcome, PoisonDecision, RetryPolicy, WorkerError, WorkerErrorKind};
+pub use policy::{Outcome, WorkerError, WorkerErrorKind};
 pub use supervisor::{SupervisorPolicy, WorkerSupervisor};
 
 use crate::{Result, ServiceError};
@@ -17,7 +16,9 @@ use chrono::{DateTime, Utc};
 use db::{DomainEvent, SqliteDb};
 use sqlx::{Sqlite, Transaction};
 use std::{
+    collections::HashSet,
     future::Future,
+    marker::PhantomData,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
     time::Duration,
@@ -31,11 +32,14 @@ use tokio::{
 
 const MIN_IDLE: Duration = Duration::from_millis(250);
 const MAX_IDLE: Duration = Duration::from_secs(5);
+const MIN_RETRY: Duration = Duration::from_secs(1);
+const CYCLE_LIMIT: usize = 100;
 
-/// Slow preparation is outside the transaction. `commit` must await only DB
-/// work. Hooks must be idempotent; after_commit cannot undo acknowledgement.
+/// Stable Rust does not support associated type defaults. The commit-result
+/// parameter therefore defaults to (), preserving the no-result worker form.
+/// Slow preparation precedes the transaction; commit may await only DB work.
 #[async_trait]
-pub trait Worker: Send + Sync + 'static {
+pub trait Worker<C: Send + Sync + 'static = ()>: Send + Sync + 'static {
     type Prepared: Send + Sync + 'static;
     fn name(&self) -> &str;
     fn subscription(&self) -> Subscription;
@@ -57,36 +61,73 @@ pub trait Worker: Send + Sync + 'static {
         transaction: &mut Transaction<'_, Sqlite>,
         event: &DomainEvent,
         prepared: &Self::Prepared,
-    ) -> std::result::Result<(), WorkerError>;
+    ) -> std::result::Result<C, WorkerError>;
     async fn after_commit(
         &self,
         _event: &DomainEvent,
         _prepared: &Self::Prepared,
+        _committed: &C,
     ) -> std::result::Result<(), WorkerError> {
         Ok(())
     }
 }
-
-pub struct WorkerRuntime<W: Worker> {
+struct Wait {
+    key: String,
+    deadline: Instant,
+    infrastructure: bool,
+}
+#[derive(Default)]
+struct Schedule {
+    failures: u32,
+    due: Option<Instant>,
+}
+impl Schedule {
+    fn failed(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let delay = MIN_RETRY
+            .checked_mul(1 << self.failures.saturating_sub(1).min(10))
+            .unwrap_or(MAX_IDLE)
+            .min(MAX_IDLE);
+        self.due = Instant::now().checked_add(delay);
+        delay
+    }
+    fn ready(&self) -> bool {
+        self.due.is_none_or(|due| due <= Instant::now())
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+pub struct WorkerRuntime<W: Worker<C>, C: Send + Sync + 'static = ()> {
     db: Arc<SqliteDb>,
     worker: Arc<W>,
     notify: Arc<Notify>,
     source: DurableEventSource,
     health: WorkerHealth,
-    wait: Mutex<Option<(String, Instant)>>,
+    wait: Mutex<Option<Wait>>,
+    tick_schedule: Mutex<Schedule>,
+    transient_schedule: Mutex<Schedule>,
+    bad_timestamps: Mutex<HashSet<&'static str>>,
+    committed_type: PhantomData<fn() -> C>,
     #[cfg(test)]
     idle_entered: Notify,
+    #[cfg(test)]
+    cycle_finished: Notify,
+    #[cfg(test)]
+    loop_starts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     write_transactions: std::sync::atomic::AtomicU64,
 }
 #[derive(Debug)]
 enum PollResult {
     Progress,
+    Scanned,
     Retry(Duration),
+    InfrastructureRetry(Duration),
     Idle,
 }
 
-impl<W: Worker> WorkerRuntime<W> {
+impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
     pub fn new(db: Arc<SqliteDb>, worker: Arc<W>) -> Self {
         Self {
             source: DurableEventSource::new(Arc::clone(&db), worker.name(), worker.subscription()),
@@ -95,8 +136,16 @@ impl<W: Worker> WorkerRuntime<W> {
             db,
             worker,
             wait: Mutex::new(None),
+            tick_schedule: Mutex::new(Schedule::default()),
+            transient_schedule: Mutex::new(Schedule::default()),
+            bad_timestamps: Mutex::new(HashSet::new()),
+            committed_type: PhantomData,
             #[cfg(test)]
             idle_entered: Notify::new(),
+            #[cfg(test)]
+            cycle_finished: Notify::new(),
+            #[cfg(test)]
+            loop_starts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             write_transactions: std::sync::atomic::AtomicU64::new(0),
         }
@@ -111,14 +160,13 @@ impl<W: Worker> WorkerRuntime<W> {
         )
     }
     pub async fn run_once(&self, limit: usize) -> Result<usize> {
-        let mut progressed = 0;
-        for _ in 0..limit.clamp(1, 100) {
-            match self.poll_once().await? {
-                PollResult::Progress => progressed += 1,
-                PollResult::Retry(_) | PollResult::Idle => break,
+        match self.poll_cycle(limit.clamp(1, CYCLE_LIMIT)).await {
+            Ok((count, _)) => Ok(count),
+            Err(error) => {
+                let _ = self.health.report_error(&error.to_string()).await;
+                Err(error)
             }
         }
-        Ok(progressed)
     }
     async fn initialize(&self) -> Result<()> {
         if self.worker.name().trim().is_empty() {
@@ -133,6 +181,72 @@ impl<W: Worker> WorkerRuntime<W> {
         }
         Ok(())
     }
+    async fn poll_cycle(&self, limit: usize) -> Result<(usize, PollResult)> {
+        self.initialize().await?;
+        self.tick_if_due().await;
+        let mut count = 0;
+        let mut result = PollResult::Idle;
+        for _ in 0..limit {
+            result = self.poll_event().await?;
+            match result {
+                PollResult::Progress => count += 1,
+                PollResult::Scanned => {}
+                _ => break,
+            }
+        }
+        if matches!(result, PollResult::Scanned) {
+            let cursor = self.source.cursor().await?;
+            if self.source.flush_due(cursor) {
+                let mut tx = self.begin_write().await?;
+                self.source.flush_in_tx(&mut tx, cursor).await?;
+                tx.commit().await?;
+                self.source.flushed();
+            }
+        }
+        if !matches!(result, PollResult::InfrastructureRetry(_)) {
+            self.health
+                .clear_error_if_set(HealthErrorKind::Runtime)
+                .await?;
+        }
+        #[cfg(test)]
+        self.cycle_finished.notify_one();
+        Ok((count, result))
+    }
+    async fn tick_if_due(&self) {
+        if !self
+            .tick_schedule
+            .lock()
+            .expect("tick schedule lock")
+            .ready()
+        {
+            return;
+        }
+        match catch_worker(async { self.worker.tick().await }, "worker tick panicked").await {
+            Ok(()) => {
+                self.tick_schedule
+                    .lock()
+                    .expect("tick schedule lock")
+                    .reset();
+                if let Err(error) = self.health.clear_error_if_set(HealthErrorKind::Tick).await {
+                    tracing::warn!(worker = self.worker.name(), %error, "failed to clear tick error");
+                }
+            }
+            Err(error) => {
+                self.tick_schedule
+                    .lock()
+                    .expect("tick schedule lock")
+                    .failed();
+                tracing::warn!(worker = self.worker.name(), %error, "worker tick failed");
+                if let Err(report) = self
+                    .health
+                    .report_error_kind(HealthErrorKind::Tick, error.message())
+                    .await
+                {
+                    tracing::warn!(worker = self.worker.name(), %report, "failed to report tick error");
+                }
+            }
+        }
+    }
     async fn run_loop(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
         self.run_loop_with_idle(shutdown, MIN_IDLE).await
     }
@@ -141,55 +255,54 @@ impl<W: Worker> WorkerRuntime<W> {
         mut shutdown: watch::Receiver<bool>,
         initial_idle: Duration,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.loop_starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.initialize().await?;
         let mut idle = initial_idle;
         loop {
             if *shutdown.borrow_and_update() {
                 return Ok(());
             }
-            // enable registers with notify_waiters before the read, not merely
-            // when this future is first polled by the select below.
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            match self.poll_once().await {
-                Ok(PollResult::Progress) => {
+            let delay = match self.poll_cycle(CYCLE_LIMIT).await {
+                Ok((_, PollResult::Progress | PollResult::Scanned)) => {
                     idle = MIN_IDLE;
+                    continue;
                 }
-                Ok(PollResult::Retry(delay)) => {
-                    tokio::select! { _ = shutdown_signal(&mut shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(delay) => {} }
+                Ok((_, PollResult::Retry(delay) | PollResult::InfrastructureRetry(delay))) => {
+                    delay.min(MAX_IDLE)
                 }
-                Ok(PollResult::Idle) => {
+                Ok((_, PollResult::Idle)) => {
                     #[cfg(test)]
                     self.idle_entered.notify_one();
-                    tokio::select! { _ = shutdown_signal(&mut shutdown) => return Ok(()),
-                    _ = &mut notified => {},
-                    _ = tokio::time::sleep(idle) => { idle = idle.saturating_mul(2).min(MAX_IDLE); } }
+                    let delay = idle;
+                    idle = idle.saturating_mul(2).min(MAX_IDLE);
+                    delay
                 }
                 Err(error) => {
                     tracing::warn!(worker = self.worker.name(), %error, "worker runtime poll failed");
-                    // Error persistence cannot consume an event attempt.
-                    let _ = self
-                        .health
-                        .report_error("worker runtime database poll failed")
-                        .await;
-                    tokio::select! { _ = shutdown_signal(&mut shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(idle) => {} }
+                    let _ = self.health.report_error(&error.to_string()).await;
+                    let delay = idle;
                     idle = idle.saturating_mul(2).min(MAX_IDLE);
+                    delay
                 }
-            }
+            };
+            let tick_due = self.tick_schedule.lock().expect("tick schedule lock").due;
+            let delay = tick_due
+                .and_then(|due| due.checked_duration_since(Instant::now()))
+                .map_or(delay, |tick| delay.min(tick));
+            tokio::select! { _ = shutdown_signal(&mut shutdown) => return Ok(()),
+            _ = &mut notified => {}, _ = tokio::time::sleep(delay.min(MAX_IDLE)) => {} }
         }
     }
+    #[cfg(test)]
     async fn poll_once(&self) -> Result<PollResult> {
-        self.initialize().await?;
-        if let Err(error) =
-            catch_worker(async { self.worker.tick().await }, "worker tick panicked").await
-        {
-            tracing::warn!(worker = self.worker.name(), %error, "worker tick failed");
-            self.health.report_error(error.message()).await?;
-            return Ok(PollResult::Retry(MIN_IDLE));
-        }
+        Ok(self.poll_cycle(1).await?.1)
+    }
+    async fn poll_event(&self) -> Result<PollResult> {
         let cursor = self.source.cursor().await?;
         let Some(event) = self.source.next(cursor).await? else {
             if self.source.flush_due(cursor) {
@@ -204,8 +317,12 @@ impl<W: Worker> WorkerRuntime<W> {
             return Ok(PollResult::Idle);
         };
         let key = event.sequence.to_string();
-        if let Some(delay) = self.pending_delay(&key).await? {
-            return Ok(PollResult::Retry(delay));
+        if let Some((delay, infrastructure)) = self.pending_delay(&key).await? {
+            return Ok(if infrastructure {
+                PollResult::InfrastructureRetry(delay)
+            } else {
+                PollResult::Retry(delay)
+            });
         }
         let outcome = catch_worker(
             async {
@@ -223,34 +340,54 @@ impl<W: Worker> WorkerRuntime<W> {
                     .validate_in_tx(&mut tx, cursor, event.sequence)
                     .await?;
                 self.health.ensure_in_tx(&mut tx).await?;
-                if let Err(error) = catch_worker(
+                let committed = match catch_worker(
                     async { self.worker.commit(&mut tx, &event, &prepared).await },
                     "worker commit panicked",
                 )
                 .await
                 {
-                    tx.rollback().await?;
-                    return self.worker_failure(cursor, &event, error).await;
-                }
+                    Ok(committed) => committed,
+                    Err(error) => {
+                        tx.rollback().await?;
+                        return self.worker_failure(cursor, &event, error).await;
+                    }
+                };
                 self.source
                     .acknowledge_in_tx(&mut tx, cursor, event.sequence)
                     .await?;
-                self.health.success_in_tx(&mut tx).await?;
+                self.health.success_in_tx(&mut tx, &key).await?;
                 tx.commit().await?;
                 self.clear_wait();
+                self.source.flushed();
                 if let Err(error) = catch_worker(
-                    async { self.worker.after_commit(&event, &prepared).await },
+                    async {
+                        self.worker
+                            .after_commit(&event, &prepared, &committed)
+                            .await
+                    },
                     "worker after_commit panicked",
                 )
                 .await
                 {
                     tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
-                    // The event is already committed, even if reporting fails.
-                    let _ = self.health.report_error(error.message()).await;
+                    let _ = self
+                        .health
+                        .report_error_kind(HealthErrorKind::AfterCommit, error.message())
+                        .await;
                 }
                 Ok(PollResult::Progress)
             }
+            Ok(Outcome::Skip) => {
+                self.source.skip(event.sequence);
+                self.clear_wait();
+                Ok(PollResult::Scanned)
+            }
             Ok(Outcome::Defer { after, reason }) => {
+                self.transient_schedule
+                    .lock()
+                    .expect("transient schedule lock")
+                    .reset();
+                let after = db::clamp_worker_deferral(after);
                 let mut tx = self.begin_write().await?;
                 self.source
                     .validate_in_tx(&mut tx, cursor, event.sequence)
@@ -259,7 +396,7 @@ impl<W: Worker> WorkerRuntime<W> {
                     .defer_in_tx(&mut tx, &key, after, &reason)
                     .await?;
                 tx.commit().await?;
-                self.set_wait(key, after);
+                self.set_wait(key, after, false);
                 Ok(PollResult::Retry(after))
             }
             Ok(Outcome::DeadLetter { reason }) => self.failure(cursor, &event, &reason, true).await,
@@ -274,10 +411,18 @@ impl<W: Worker> WorkerRuntime<W> {
     ) -> Result<PollResult> {
         if error.kind == WorkerErrorKind::Transient {
             self.health.report_error(error.message()).await?;
-            let delay = self.worker.retry_policy().delay(1);
-            self.set_wait(event.sequence.to_string(), delay);
-            return Ok(PollResult::Retry(delay));
+            let delay = self
+                .transient_schedule
+                .lock()
+                .expect("transient schedule lock")
+                .failed();
+            self.set_wait(event.sequence.to_string(), delay, true);
+            return Ok(PollResult::InfrastructureRetry(delay));
         }
+        self.transient_schedule
+            .lock()
+            .expect("transient schedule lock")
+            .reset();
         self.failure(cursor, event, error.message(), false).await
     }
     async fn failure(
@@ -313,64 +458,92 @@ impl<W: Worker> WorkerRuntime<W> {
         tx.commit().await?;
         match decision {
             PoisonDecision::Retry(delay) => {
-                self.set_wait(key, delay);
+                self.set_wait(key, delay, false);
                 Ok(PollResult::Retry(delay))
             }
             PoisonDecision::DeadLettered => {
                 self.clear_wait();
+                self.source.flushed();
                 Ok(PollResult::Progress)
             }
         }
     }
-    async fn pending_delay(&self, key: &str) -> Result<Option<Duration>> {
+    async fn pending_delay(&self, key: &str) -> Result<Option<(Duration, bool)>> {
         {
             let wait = self.wait.lock().expect("worker wait lock");
-            if let Some((waiting_key, deadline)) = wait.as_ref() {
-                if waiting_key == key {
-                    return Ok(deadline
+            if let Some(wait) = wait.as_ref() {
+                if wait.key == key {
+                    return Ok(wait
+                        .deadline
                         .checked_duration_since(Instant::now())
-                        .filter(|d| !d.is_zero()));
+                        .filter(|d| !d.is_zero())
+                        .map(|delay| (delay, wait.infrastructure)));
                 }
             }
         }
-        let (retry_key, retry_at, defer_key, defer_at): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = sqlx::query_as(
-            "SELECT retry_source_key, retry_not_before, deferred_source_key, defer_not_before
-                FROM worker_health WHERE worker_name = ?",
-        )
-        .bind(self.worker.name())
-        .fetch_one(self.db.pool())
-        .await?;
+        let state = self.health.wait_state().await?;
         let mut delay = Duration::ZERO;
-        for (pending_key, at) in [(retry_key, retry_at), (defer_key, defer_at)] {
+        for (field, pending_key, at, cap) in [
+            (
+                "retry",
+                state.retry_key,
+                state.retry_at,
+                self.worker.retry_policy().delay(u32::MAX),
+            ),
+            (
+                "defer",
+                state.defer_key,
+                state.defer_at,
+                Duration::from_secs(3600),
+            ),
+        ] {
             if pending_key.as_deref() != Some(key) {
                 continue;
             }
             if let Some(at) = at {
-                let time = DateTime::parse_from_rfc3339(&at)
-                    .map_err(|_| db::DbError::Check("invalid worker retry timestamp".to_owned()))?;
-                delay = delay.max(
-                    (time.with_timezone(&Utc) - Utc::now())
-                        .to_std()
-                        .unwrap_or(Duration::ZERO),
-                );
+                if let Ok(time) = DateTime::parse_from_rfc3339(&at) {
+                    delay = delay.max(
+                        (time.with_timezone(&Utc) - Utc::now())
+                            .to_std()
+                            .unwrap_or(Duration::ZERO)
+                            .min(cap),
+                    );
+                } else if self
+                    .bad_timestamps
+                    .lock()
+                    .expect("timestamp warning lock")
+                    .insert(field)
+                {
+                    tracing::warn!(
+                        worker = self.worker.name(),
+                        field,
+                        "invalid worker wait timestamp; treating as due"
+                    );
+                }
             }
         }
         if delay.is_zero() {
             return Ok(None);
         }
-        self.set_wait(key.to_owned(), delay);
-        Ok(Some(delay))
+        self.set_wait(key.to_owned(), delay, false);
+        Ok(Some((delay, false)))
     }
-    fn set_wait(&self, key: String, delay: Duration) {
-        *self.wait.lock().expect("worker wait lock") = Some((key, Instant::now() + delay));
+    fn set_wait(&self, key: String, delay: Duration, infrastructure: bool) {
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+        *self.wait.lock().expect("worker wait lock") = Some(Wait {
+            key,
+            deadline,
+            infrastructure,
+        });
     }
     fn clear_wait(&self) {
         *self.wait.lock().expect("worker wait lock") = None;
+        self.transient_schedule
+            .lock()
+            .expect("transient schedule lock")
+            .reset();
     }
     async fn begin_write(&self) -> Result<Transaction<'_, Sqlite>> {
         #[cfg(test)]
@@ -384,9 +557,6 @@ impl<W: Worker> WorkerRuntime<W> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
-
-// Catch only worker hooks. Runtime errors/panics retain their own loop/supervisor
-// path. Polling inside catch_unwind also drops a timed-out or panicked future.
 async fn catch_worker<F, T>(
     future: F,
     panic_message: &'static str,

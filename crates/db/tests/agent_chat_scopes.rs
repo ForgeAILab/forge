@@ -263,6 +263,36 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
         .await
         .unwrap();
     assert_eq!(duplicate_count, 0);
+    // An item-level INSERT failure releases its savepoint too, while the
+    // caller's earlier write remains commit-able.
+    sqlx::query("CREATE TABLE preserved_parent_write(n INTEGER)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO preserved_parent_write VALUES (1)")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let failed = db
+        .insert_memory_item_if_source_absent_in_tx(
+            &mut transaction,
+            &memory,
+            "agent_chat_message",
+            "another-source",
+        )
+        .await;
+    assert!(failed.is_err());
+    assert!(sqlx::query("RELEASE memory_source_insert")
+        .execute(&mut *transaction)
+        .await
+        .is_err());
+    transaction.commit().await.unwrap();
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM preserved_parent_write")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained, 1);
     let stored_memory = memory;
 
     let binding = ScopedMemoryRepository::create_memory_source_binding(

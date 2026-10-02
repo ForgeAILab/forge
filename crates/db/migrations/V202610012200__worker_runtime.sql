@@ -2,13 +2,25 @@
 -- event_consumer_cursor; only retired memory delivery bookkeeping is removed.
 CREATE TABLE worker_health (
     worker_name TEXT PRIMARY KEY,
-    cursor_key TEXT,
     subscription_json TEXT CHECK (subscription_json IS NULL OR json_valid(subscription_json)),
-    last_error TEXT,
-    last_error_at TEXT,
+    runtime_error TEXT,
+    runtime_error_at TEXT,
+    item_error TEXT,
+    item_error_at TEXT,
+    tick_error TEXT,
+    tick_error_at TEXT,
+    after_commit_error TEXT,
+    after_commit_error_at TEXT,
+    last_error_at TEXT GENERATED ALWAYS AS (NULLIF(MAX(
+        COALESCE(runtime_error_at, ''), COALESCE(item_error_at, ''),
+        COALESCE(tick_error_at, ''), COALESCE(after_commit_error_at, '')), '')) VIRTUAL,
+    last_error TEXT GENERATED ALWAYS AS (CASE last_error_at
+        WHEN item_error_at THEN item_error
+        WHEN runtime_error_at THEN runtime_error
+        WHEN tick_error_at THEN tick_error
+        WHEN after_commit_error_at THEN after_commit_error END) VIRTUAL,
     restart_count INTEGER NOT NULL DEFAULT 0 CHECK (restart_count >= 0),
     last_success_at TEXT,
-    cursor_updated_at TEXT NOT NULL,
     retry_source_key TEXT,
     retry_attempts INTEGER NOT NULL DEFAULT 0 CHECK (retry_attempts >= 0),
     retry_not_before TEXT,

@@ -140,30 +140,20 @@ impl SqliteDb {
             return Ok(false);
         }
 
-        sqlx::query("SAVEPOINT memory_source_insert")
-            .execute(&mut **transaction)
-            .await?;
-        memory_item_insert(item).execute(&mut **transaction).await?;
-        let receipt = sqlx::query(
-            "INSERT INTO memory_source_receipt
-             (source_type, source_scope_type, source_scope_id, source_ref, memory_item_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(source_type)
-        .bind(&item.scope_type)
-        .bind(&item.scope_id)
-        .bind(source_ref)
-        .bind(&item.id)
-        .bind(&item.created_at)
-        .execute(&mut **transaction)
-        .await;
+        // SQLx's nested transaction owns the savepoint. Its Drop also queues
+        // rollback/release on cancellation or an error in commit/rollback.
+        let mut insertion = sqlx::Acquire::begin(&mut *transaction).await?;
+        if let Err(error) = memory_item_insert(item).execute(&mut *insertion).await {
+            insertion.rollback().await?;
+            return Err(error.into());
+        }
+        let receipt = sqlx::query("INSERT INTO memory_source_receipt
+            (source_type, source_scope_type, source_scope_id, source_ref, memory_item_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(source_type).bind(&item.scope_type).bind(&item.scope_id).bind(source_ref)
+            .bind(&item.id).bind(&item.created_at).execute(&mut *insertion).await;
         if let Err(error) = receipt {
-            sqlx::query("ROLLBACK TO memory_source_insert")
-                .execute(&mut **transaction)
-                .await?;
-            sqlx::query("RELEASE memory_source_insert")
-                .execute(&mut **transaction)
-                .await?;
+            insertion.rollback().await?;
             if error
                 .as_database_error()
                 .is_some_and(|error| error.is_unique_violation())
@@ -186,9 +176,7 @@ impl SqliteDb {
             }
             return Err(error.into());
         }
-        sqlx::query("RELEASE memory_source_insert")
-            .execute(&mut **transaction)
-            .await?;
+        insertion.commit().await?;
         Ok(true)
     }
 }
