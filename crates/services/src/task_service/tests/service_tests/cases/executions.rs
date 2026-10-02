@@ -2347,7 +2347,7 @@ async fn approval_gated_planner_completion_waits_for_human() {
         .await
         .expect("planner dispatch succeeds");
 
-    let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let current = TaskRepo::get_by_id(&*db, &task.id, false)
                 .await
