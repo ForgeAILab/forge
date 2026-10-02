@@ -199,11 +199,16 @@ impl PlacementUnavailable {
             && self.rejected_candidates.iter().all(|candidate| {
                 !candidate.filter_codes.is_empty()
                     && candidate.filter_codes.iter().all(|code| {
+                        // Capacity, reachability and environment readiness all
+                        // change without the Task changing, so a refusal for
+                        // them is retried on the next scan.
                         !matches!(
                             code,
                             PlacementFilterCode::OwnerUnreachable
                                 | PlacementFilterCode::AgentCapacity
                                 | PlacementFilterCode::DaemonCapacity
+                                | PlacementFilterCode::EnvironmentProbePending
+                                | PlacementFilterCode::EnvironmentNotReady
                         )
                     })
             })
@@ -2242,5 +2247,30 @@ mod tests {
         .await
         .unwrap();
         rejected(&loaded, PlacementFilterCode::OwnerUnreachable);
+    }
+    #[test]
+    fn environment_and_capacity_refusals_are_not_deterministic() {
+        let refusal = |codes: Vec<PlacementFilterCode>| PlacementUnavailable {
+            task_id: "task".to_owned(),
+            repo_id: "repo".to_owned(),
+            rejected_candidates: vec![CandidateRejection {
+                failing_checks: Vec::new(),
+                repo_location_id: "location".to_owned(),
+                owner_kind: "server".to_owned(),
+                daemon_id: None,
+                runtime_id: None,
+                filter_codes: codes,
+            }],
+        };
+        for code in [
+            PlacementFilterCode::EnvironmentProbePending,
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::AgentCapacity,
+            PlacementFilterCode::DaemonCapacity,
+            PlacementFilterCode::OwnerUnreachable,
+        ] {
+            assert!(!refusal(vec![code]).is_deterministic(), "{code:?}");
+        }
+        assert!(refusal(vec![PlacementFilterCode::CapabilityMissing]).is_deterministic());
     }
 }
