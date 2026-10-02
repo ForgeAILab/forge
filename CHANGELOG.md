@@ -310,6 +310,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   reset with `not a git repository`: it is recreated from the Task branch
   first, as launch already did. A transient failure to run git is returned as
   an error and never treated as a damaged worktree.
+- An execution whose Project and Agent have no owner is now priced and its
+  usage recorded. Pricing admission used to be skipped for it, so its usage
+  never reached the ledger. It is admitted at the models.dev catalogue price
+  under the Project owner, else the Agent owner, else the instance's first
+  administrator.
 
 ### Known issues
 
