@@ -612,6 +612,10 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             )
             .await
             .map_err(host_runtime_error)?;
+        // A persistent session restores its accumulated usage ledger, so
+        // everything already in it was reported by the turn that made the
+        // call. Only records appended from here on belong to this turn.
+        let usage_baseline = session.snapshot().usage.records().len();
         let mut events = session.subscribe();
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
@@ -760,21 +764,25 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 ),
                 None => manifest,
             });
-        let usage = snapshot.usage.total();
+        let turn_records = turn_usage_records(snapshot.usage.records(), usage_baseline);
+        let mut usage = agent_runtime::core::usage::UsageDelta::new();
+        for record in turn_records {
+            usage.merge(&record.delta);
+        }
         let output_tokens = usage
             .get(CounterKind::Output)
             .checked_add(usage.get(CounterKind::Reasoning))
             .ok_or_else(|| AgentHostError::Runtime("usage counter overflow".to_owned()))?;
-        let usage_reports = snapshot
-            .usage
-            .records()
+        let usage_reports = turn_records
             .iter()
-            .filter(|record| record.source == UsageSource::ProviderAttempt)
             .enumerate()
-            .map(|(index, record)| {
+            .filter(|(_, record)| record.source == UsageSource::ProviderAttempt)
+            .map(|(offset, record)| {
                 let counters = record_counters(&record.delta)?;
                 let request_id = record.provenance.request.as_ref().map(ToString::to_string);
                 let attempt_id = record.provenance.attempt.as_ref().map(ToString::to_string);
+                // The record's position in the session ledger, which never
+                // changes, keeps the id unique across the session's turns.
                 let report_id = format!(
                     "native:{}:{}:{}",
                     request.runtime_session_id,
@@ -782,7 +790,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                         .as_deref()
                         .or(attempt_id.as_deref())
                         .unwrap_or(turn_id.as_str()),
-                    index
+                    usage_baseline + offset
                 );
                 Ok(AgentTurnUsageReport {
                     report_id,
@@ -907,6 +915,19 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         Ok(())
     }
+}
+
+/// The usage records one turn appended to its session's ledger.
+///
+/// The runtime's ledger is append-only and accumulates for the life of the
+/// session, so a turn's own records are the ones past the length the ledger
+/// had when the turn started. The whole ledger would repeat every earlier
+/// turn's provider calls on each turn of a persistent session.
+fn turn_usage_records(
+    ledger: &[agent_runtime::core::usage::UsageRecord],
+    baseline: usize,
+) -> &[agent_runtime::core::usage::UsageRecord] {
+    ledger.get(baseline..).unwrap_or_default()
 }
 
 /// One provider attempt's disjoint `[input, output, cache_read, cache_write]`
@@ -1461,6 +1482,28 @@ mod usage_counter_tests {
             ..report
         };
         assert_eq!(unmetered.prompt_tokens(), None);
+    }
+
+    #[test]
+    fn a_turn_owns_only_the_records_appended_after_it_started() {
+        let record = |input| agent_runtime::core::usage::UsageRecord {
+            source: UsageSource::ProviderAttempt,
+            provenance: Default::default(),
+            delta: UsageDelta::new().with(CounterKind::InputUncached, input),
+        };
+        // Two earlier turns' calls restored with the session, then this one's.
+        let ledger = [record(5_162), record(5_679), record(6_381)];
+        let inputs = |baseline| {
+            turn_usage_records(&ledger, baseline)
+                .iter()
+                .map(|record| record.delta.get(CounterKind::InputUncached))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inputs(2), [6_381]);
+        assert_eq!(inputs(0), [5_162, 5_679, 6_381]);
+        // A turn that reached no provider reports nothing, not the session.
+        assert!(inputs(3).is_empty());
+        assert!(inputs(4).is_empty());
     }
 }
 

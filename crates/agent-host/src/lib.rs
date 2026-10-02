@@ -348,9 +348,13 @@ pub struct AgentTurnOutput {
     /// Input tokens the provider wrote to its prompt cache. Disjoint from
     /// `input_tokens`.
     pub cache_write_tokens: u64,
-    /// Per-provider-attempt records from the runtime ledger. This is the
+    /// One record per provider attempt this turn made. This is the
     /// authoritative usage shape; aggregate fields above remain useful for
     /// existing host-local consumers until their projections migrate.
+    ///
+    /// Both cover this turn alone. A persistent session's runtime ledger also
+    /// holds every earlier turn's attempts; those were reported by the turn
+    /// that made them and never appear here again.
     pub usage_reports: Vec<AgentTurnUsageReport>,
     pub telemetry_state: AgentTurnTelemetryState,
     /// Final Agent Runtime context/LCM metadata. Bodies and protected state

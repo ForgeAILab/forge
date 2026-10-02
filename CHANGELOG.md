@@ -270,6 +270,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Token and cost figures for embedded Agents were too high. Each chat turn
+  recorded its own provider calls and, again, every earlier call of the same
+  chat session, so a chat of `n` single-call turns was counted as
+  `1 + 2 + … + n` calls instead of `n`: an 8-turn chat showed about four times
+  its real usage, and the factor grew with the length of the chat. A turn
+  retried after a failed attempt counted the failed attempt's calls twice, and
+  an embedded worker or planner that ran the same Task more than once counted
+  its earlier runs again. Every provider call is now recorded once. This
+  corrects the per-reply usage in Agent Chat, Task and Agent usage, Project
+  analytics and `GET /api/v1/analytics/usage`, for tokens and for estimated
+  cost. Reviewer runs, inquiries and CLI Agents were not affected. Usage
+  recorded before this release is not rewritten, so totals that include
+  earlier chat turns still read high.
 - A Main Agent turn admitted under the second baseline revision is no longer
   treated as a discovery turn after an upgrade.
 - A Project Agent chat turn admitted before an upgrade no longer fails when

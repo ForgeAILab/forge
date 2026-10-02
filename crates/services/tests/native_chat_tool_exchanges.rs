@@ -20,6 +20,9 @@
 //! backend process, where the only source of the earlier id is the protected
 //! session store — and the durable timeline keeps exactly one call and one
 //! result per id.
+//!
+//! The last section holds the usage-ledger cases for the same persisted
+//! session: every provider call is recorded once, by the turn that made it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1135,4 +1138,470 @@ async fn native_provider_availability_failures_are_configuration_before_provider
         .unwrap();
         assert_eq!(incidents, 1, "{condition}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Usage ledger: every provider call is recorded exactly once.
+//
+// A chat's runtime session is persistent, and the runtime's usage ledger
+// accumulates for the life of that session. The host used to report the whole
+// ledger after each turn, so turn n recorded n calls (its own plus every
+// earlier turn's) and an n-turn chat was billed 1 + 2 + … + n calls.
+// ---------------------------------------------------------------------------
+
+/// The measured per-call usage of the live chat the over-count was found on.
+const MEASURED_CALLS: [(u64, u64); 4] = [(5_162, 496), (5_679, 683), (6_381, 257), (6_688, 181)];
+
+fn metered_text_step(text: &str, (input, output): (u64, u64)) -> ScriptedStream {
+    ScriptedStream::new(vec![
+        ProviderStreamEvent::TextDelta {
+            text: text.to_owned(),
+        },
+        usage_event(input, output),
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ])
+}
+
+fn metered_tool_call_step(id: &str, name: &str, (input, output): (u64, u64)) -> ScriptedStream {
+    ScriptedStream::new(vec![
+        ProviderStreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id.to_owned()),
+            name: Some(name.to_owned()),
+            arguments_fragment: "{}".to_owned(),
+        },
+        usage_event(input, output),
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ])
+}
+
+/// The host boundary every native scope shares (chat, Task worker, inquiry):
+/// a turn on a restored session reports its own provider calls, in both the
+/// per-attempt reports and the aggregate counters.
+#[tokio::test]
+async fn a_native_turn_reports_only_the_provider_calls_it_made() {
+    let fixture = chat_fixture().await;
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(scripted_provider(vec![
+            metered_text_step("first reply", MEASURED_CALLS[0]),
+            metered_tool_call_step(REUSED_ID, "forge_scope_propose", MEASURED_CALLS[1]),
+            metered_text_step("second reply", MEASURED_CALLS[2]),
+            metered_text_step("third reply", MEASURED_CALLS[3]),
+        ]));
+
+    let mut report_ids = std::collections::BTreeSet::new();
+    for (turn, calls) in [
+        &MEASURED_CALLS[0..1],
+        &MEASURED_CALLS[1..3],
+        &MEASURED_CALLS[3..4],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = backend
+            .run_turn(fixture.turn(&format!("turn {turn}")), Arc::new(NoopSink))
+            .await
+            .unwrap_or_else(|error| panic!("turn {turn} must complete: {error}"));
+        let reported: Vec<(u64, u64)> = output
+            .usage_reports
+            .iter()
+            .map(|report| {
+                (
+                    report.input_tokens.expect("metered input"),
+                    report.output_tokens.expect("metered output"),
+                )
+            })
+            .collect();
+        assert_eq!(reported, calls, "turn {turn} reports its own calls only");
+        assert_eq!(
+            (output.input_tokens, output.output_tokens),
+            (
+                calls.iter().map(|call| call.0).sum::<u64>(),
+                calls.iter().map(|call| call.1).sum::<u64>()
+            ),
+            "turn {turn}'s aggregate counters cover that turn, not the session"
+        );
+        for report in &output.usage_reports {
+            assert!(
+                report_ids.insert(report.report_id.clone()),
+                "a provider call is reported under one id, once: {}",
+                report.report_id
+            );
+        }
+    }
+    assert_eq!(report_ids.len(), MEASURED_CALLS.len());
+}
+
+#[cfg(feature = "test-support")]
+struct LedgerChat {
+    db: Arc<SqliteDb>,
+    chat_id: String,
+    chats: AgentChatService<SqliteDb>,
+    worker: services::AgentChatTurnWorker,
+    provider: Arc<FakeProvider>,
+    _logs: tempfile::TempDir,
+}
+
+/// A Main Chat whose turns run through the real worker, runner, native host
+/// and ledger settlement against a scripted provider priced at $1 per million
+/// input tokens and $2 per million output tokens.
+#[cfg(feature = "test-support")]
+async fn ledger_chat(steps: Vec<ScriptedStream>) -> LedgerChat {
+    use services::pricing::PricingCatalogRepository;
+    use std::time::{Duration, SystemTime};
+
+    let fixture = chat_fixture().await;
+    let binding = db::AccountMainAgentBindingRepo::get_active_main_binding(&*fixture.db, "user-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let agent = AgentRepo::get_by_id(&*fixture.db, &binding.identity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    AgentRepo::update(
+        &*fixture.db,
+        db::UpdateAgent {
+            id: agent.id.clone(),
+            expected_version: agent.version,
+            config_json: Some(r#"{"base_url":"https://unused.invalid/v1"}"#.into()),
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            daemon_id: None,
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let snapshot = services::pricing::parse_models_dev_catalog(
+        br#"{"openai": {"id":"openai","name":"OpenAI","models":{
+              "fake":{"id":"fake","last_updated":"2026-09-01",
+                "cost":{"input":1,"output":2}}}}}"#,
+    )
+    .expect("catalog parses")
+    .into_snapshot("usage-ledger-snapshot", None, when, when)
+    .expect("snapshot materializes");
+    services::pricing_db::SqlitePricingRepository::new(fixture.db.clone())
+        .activate_catalog_snapshot(snapshot, "usage-ledger-refresh")
+        .await
+        .expect("catalog activates");
+
+    let provider = scripted_provider(steps);
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(provider.clone());
+    let logs = tempfile::tempdir().unwrap();
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        fixture.db.clone(),
+        Arc::new(fixture.service.with_native_backend(Arc::new(backend))),
+        Arc::new(UnreachableCli),
+        services::AgentChatTurnLogRoot::new(logs.path()),
+    );
+    LedgerChat {
+        chats: AgentChatService::new(fixture.db.clone()),
+        worker: services::AgentChatTurnWorker::with_runner(fixture.db.clone(), Arc::new(runner)),
+        db: fixture.db,
+        chat_id: fixture.scope.scope_id,
+        provider,
+        _logs: logs,
+    }
+}
+
+/// One recorded provider call: `(attempt_ordinal, report_sequence, input,
+/// output, estimated nano-USD)`.
+#[cfg(feature = "test-support")]
+type RecordedCall = (i64, i64, i64, i64, Option<i64>);
+
+/// What `(input, output)` costs at the fixture's rates, in nano-USD.
+#[cfg(feature = "test-support")]
+fn nano_usd((input, output): (u64, u64)) -> i64 {
+    i64::try_from(input * 1_000 + output * 2_000).unwrap()
+}
+
+#[cfg(feature = "test-support")]
+fn recorded(attempt_ordinal: i64, report_sequence: i64, call: (u64, u64)) -> RecordedCall {
+    (
+        attempt_ordinal,
+        report_sequence,
+        i64::try_from(call.0).unwrap(),
+        i64::try_from(call.1).unwrap(),
+        Some(nano_usd(call)),
+    )
+}
+
+#[cfg(feature = "test-support")]
+impl LedgerChat {
+    /// Admit one user message and run its turn to a terminal state.
+    async fn turn(&self, content: &str) -> db::AgentChatTurnJob {
+        let admitted = self
+            .chats
+            .send_message(services::SendAgentChatMessageInput {
+                actor_user_id: "user-1".into(),
+                chat_id: self.chat_id.clone(),
+                content: content.into(),
+                dedupe_key: Some(content.into()),
+            })
+            .await
+            .expect("message admits");
+        assert_eq!(self.worker.run_once().await.unwrap(), 1, "{content}");
+        self.job(&admitted.turn_job.id).await
+    }
+
+    async fn job(&self, id: &str) -> db::AgentChatTurnJob {
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The usage events recorded for one turn, across all of its attempts.
+    async fn recorded_calls(&self, turn_job_id: &str) -> Vec<RecordedCall> {
+        sqlx::query_as(
+            "SELECT e.attempt_ordinal, e.report_sequence, e.input_tokens, e.output_tokens,
+                    e.estimated_nano_usd
+             FROM usage_event e
+             WHERE e.source_id = ?
+             ORDER BY e.attempt_ordinal, e.report_sequence",
+        )
+        .bind(turn_job_id)
+        .fetch_all(self.db.pool())
+        .await
+        .expect("usage events")
+    }
+
+    /// Asserts every total a user can read equals `calls` counted once each:
+    /// the raw ledger, the account analytics behind
+    /// `GET /api/v1/analytics/usage`, and its Main Chat surface row.
+    /// `turn_attempts` is the number of turn attempts that reached the
+    /// provider, which is what `provider_attempt_count` reports.
+    async fn assert_totals_count_each_call_once(
+        &self,
+        calls: &[(u64, u64)],
+        chat_turns: i64,
+        turn_attempts: i64,
+    ) {
+        let input = i64::try_from(calls.iter().map(|call| call.0).sum::<u64>()).unwrap();
+        let output = i64::try_from(calls.iter().map(|call| call.1).sum::<u64>()).unwrap();
+        let cost: i64 = calls.iter().copied().map(nano_usd).sum();
+        let events = i64::try_from(calls.len()).unwrap();
+
+        let ledger: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(estimated_nano_usd)
+             FROM usage_event",
+        )
+        .fetch_one(self.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(ledger, (events, input, output, cost), "raw ledger totals");
+
+        let account =
+            db::UsageAnalyticsRepo::get_account_usage_analytics(&*self.db, "user-1", None, None)
+                .await
+                .expect("account analytics");
+        let expected_tokens = api_types::TokenCounters {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let expected_cost = Some(api_types::MoneyAmount {
+            currency: "USD".to_owned(),
+            decimal: nano_decimal(cost),
+        });
+        assert_eq!(account.token_usage.tokens, expected_tokens);
+        assert_eq!(account.token_usage.counts.chat_turn_count, chat_turns);
+        assert_eq!(
+            account.token_usage.counts.provider_attempt_count,
+            turn_attempts
+        );
+        assert_eq!(account.token_usage.cost.estimated, expected_cost);
+        assert_eq!(account.token_usage.cost.complete_total, expected_cost);
+        assert_eq!(account.token_usage.by_surface.len(), 1);
+        let main_chat = &account.token_usage.by_surface[0];
+        assert_eq!(main_chat.surface, api_types::UsageSurface::MainChat);
+        assert_eq!(main_chat.tokens, expected_tokens);
+        assert_eq!(main_chat.cost.complete_total, expected_cost);
+    }
+}
+
+/// Canonical decimal USD text for a nano-USD amount.
+#[cfg(feature = "test-support")]
+fn nano_decimal(nanos: i64) -> String {
+    let text = format!("{}.{:09}", nanos / 1_000_000_000, nanos % 1_000_000_000);
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// The reported shape: several turns, one provider call each. Turn n's
+/// recorded usage is call n's, and every total is the sum of the calls.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn each_chat_turn_records_its_own_provider_call_and_totals_are_the_sum_of_the_calls() {
+    let chat = ledger_chat(
+        MEASURED_CALLS
+            .iter()
+            .enumerate()
+            .map(|(turn, call)| metered_text_step(&format!("reply {turn}"), *call))
+            .collect(),
+    )
+    .await;
+
+    for (turn, call) in MEASURED_CALLS.iter().enumerate() {
+        let job = chat.turn(&format!("message {turn}")).await;
+        assert_eq!(job.status, db::AgentChatTurnState::Succeeded, "turn {turn}");
+        assert_eq!(
+            chat.recorded_calls(&job.id).await,
+            [recorded(0, 0, *call)],
+            "turn {turn} records its own provider call, not the session so far"
+        );
+
+        // What the chat shows for this reply, and the turn's own aggregate.
+        let reply = services::usage_breakdowns_for_source(&chat.db, &job.id)
+            .await
+            .expect("reply usage");
+        assert_eq!(reply.len(), 1, "turn {turn}");
+        let expected_tokens = api_types::TokenCounters {
+            input_tokens: i64::try_from(call.0).unwrap(),
+            output_tokens: i64::try_from(call.1).unwrap(),
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        assert_eq!(reply[0].counters, Some(expected_tokens.clone()));
+        let aggregate = services::usage_aggregate_for_source(&chat.db, &job.id)
+            .await
+            .expect("turn aggregate");
+        assert_eq!(aggregate.tokens, expected_tokens);
+        assert_eq!(aggregate.counts.provider_attempt_count, 1);
+        assert_eq!(
+            aggregate.cost.complete_total,
+            Some(api_types::MoneyAmount {
+                currency: "USD".to_owned(),
+                decimal: nano_decimal(nano_usd(*call)),
+            })
+        );
+
+        let turns = i64::try_from(turn + 1).unwrap();
+        chat.assert_totals_count_each_call_once(&MEASURED_CALLS[..=turn], turns, turns)
+            .await;
+    }
+    assert_eq!(chat.provider.requests().len(), MEASURED_CALLS.len());
+}
+
+/// A tool loop makes several provider calls in one turn. Each is one event
+/// under that turn, and the following turn does not record them again.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_tool_loop_records_each_of_its_provider_calls_once() {
+    let chat = ledger_chat(vec![
+        metered_tool_call_step(REUSED_ID, "forge_scope_propose", MEASURED_CALLS[0]),
+        metered_tool_call_step("call_2", "forge_task_command", MEASURED_CALLS[1]),
+        metered_text_step("both tools answered.", MEASURED_CALLS[2]),
+        metered_text_step("a plain follow-up.", MEASURED_CALLS[3]),
+    ])
+    .await;
+
+    let tool_loop = chat.turn("run two tools").await;
+    assert_eq!(tool_loop.status, db::AgentChatTurnState::Succeeded);
+    assert_eq!(
+        chat.recorded_calls(&tool_loop.id).await,
+        [
+            recorded(0, 0, MEASURED_CALLS[0]),
+            recorded(0, 1, MEASURED_CALLS[1]),
+            recorded(0, 2, MEASURED_CALLS[2]),
+        ]
+    );
+    chat.assert_totals_count_each_call_once(&MEASURED_CALLS[..3], 1, 1)
+        .await;
+
+    let follow_up = chat.turn("and then").await;
+    assert_eq!(follow_up.status, db::AgentChatTurnState::Succeeded);
+    assert_eq!(
+        chat.recorded_calls(&follow_up.id).await,
+        [recorded(0, 0, MEASURED_CALLS[3])]
+    );
+    chat.assert_totals_count_each_call_once(&MEASURED_CALLS, 2, 2)
+        .await;
+    assert_eq!(chat.provider.requests().len(), MEASURED_CALLS.len());
+}
+
+/// A turn attempt that fails after the provider metered it is retried on the
+/// same restored session. The runtime gives one turn attempt three provider
+/// attempts; when all three fail the turn waits and Forge runs it again. The
+/// failed calls stay on the failed attempt, and the retry records only the
+/// call it made.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_retried_turn_does_not_record_the_failed_attempts_calls_again() {
+    use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
+
+    let earlier = MEASURED_CALLS[0];
+    let failed = [(5_679, 11), (5_680, 12), (5_681, 13)];
+    let retried = MEASURED_CALLS[2];
+    let failed_step = |(input, output): (u64, u64)| {
+        ScriptedStream::new(vec![
+            usage_event(input, output),
+            ProviderStreamEvent::Error {
+                error: ProviderError::new(ProviderErrorKind::Server, "provider returned HTTP 503"),
+            },
+        ])
+    };
+    let chat = ledger_chat(vec![
+        metered_text_step("an earlier reply.", earlier),
+        failed_step(failed[0]),
+        failed_step(failed[1]),
+        failed_step(failed[2]),
+        metered_text_step("the retry answered.", retried),
+    ])
+    .await;
+
+    let first = chat.turn("an earlier turn").await;
+    assert_eq!(first.status, db::AgentChatTurnState::Succeeded);
+
+    let waiting = chat.turn("this turn's first attempt fails").await;
+    assert_eq!(waiting.status, db::AgentChatTurnState::RetryWait);
+    let failed_attempt = [
+        recorded(0, 0, failed[0]),
+        recorded(0, 1, failed[1]),
+        recorded(0, 2, failed[2]),
+    ];
+    assert_eq!(
+        chat.recorded_calls(&waiting.id).await,
+        failed_attempt,
+        "the failed attempt keeps the calls the provider metered"
+    );
+
+    // Past the turn's retry cooldown and the provider entry's backoff.
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    assert_eq!(chat.worker.run_once_at(later).await.unwrap(), 1);
+    let retried_job = chat.job(&waiting.id).await;
+    assert_eq!(retried_job.status, db::AgentChatTurnState::Succeeded);
+    assert_eq!(retried_job.attempt_count, 2);
+    let mut both_attempts = failed_attempt.to_vec();
+    both_attempts.push(recorded(1, 0, retried));
+    assert_eq!(
+        chat.recorded_calls(&waiting.id).await,
+        both_attempts,
+        "the retry records its own call, not the session's earlier ones"
+    );
+
+    let mut calls = vec![earlier];
+    calls.extend(failed);
+    calls.push(retried);
+    chat.assert_totals_count_each_call_once(&calls, 2, 3).await;
+    assert_eq!(chat.provider.requests().len(), calls.len());
 }
