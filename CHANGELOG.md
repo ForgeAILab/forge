@@ -161,10 +161,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   card. Each request carries one card, after the conversation, and the card
   is not stored in the chat's history, so a long chat sends the current card
   only and never the earlier ones. The Gemini provider receives the card at
-  the end of its system instruction. Content digests, the event watermark
-  and context-manifest references are no longer shown to the agent; they are
-  still recorded in each turn's context manifest, and the agent reads current
-  state through its tools.
+  the end of its system instruction. The card lists permissions folded by
+  shared prefix, for example `read_{account,project}`. Content digests, the
+  event watermark and context-manifest references are no longer shown to the
+  agent; they are still recorded in each turn's context manifest, and the
+  agent reads current state through its tools.
 - A Project Agent or Main Agent that is refused an operation for a reason that
   covers the whole operation (a missing permission, its own identity paused,
   no adopted Charter, a paused Project, an operation outside its scope) gets

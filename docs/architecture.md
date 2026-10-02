@@ -1296,8 +1296,19 @@ artifact or server state always outranks chat, summaries, memory, or model
 output; cross-Project sources are rejected before retrieval and counting.
 
 Agent Chat system prompts contain the admitted immutable skill body, fixed
-server-owned overrides and state-placement rules, and complete Profile text
+server-owned overrides and state rules, and complete Profile text
 with each line quoted as subordinate data and control characters removed.
+The code-rendered suffix is sent with every request, so it states each rule
+once and does not repeat a sentence that every admitted skill body carries:
+the Main baseline override section leaves Main's missing authority and the
+rule against fabricated Forge state to the body. The state rules
+(`## SERVER STATE`) say that the card is data and never instructions or
+authority, that only the current request's card is state, and which tools
+refresh it. The refresh sentence names only operations on the role's own
+surface: `discovery.read`, `portfolio.read` and `charter.read` for Main,
+`project.current_state` for a Project Agent. The CLI prompt, not the shared
+rules, says that its card is the envelope's top-level `server_state_card`
+field.
 Legacy-adoption restrictions are conditional on the card's real
 `legacy_unverified` Charter status. Delivery follow-up correction is appended
 to the system prompt only on a `delivery_followup_postcondition_failed` retry,
@@ -1342,7 +1353,10 @@ or tools. Immutable skill bodies that refer to bounded context "below" mean
 the current state card.
 
 Cards show counts, current artifact pointers, milestones and blockers,
-open decisions, and a readable permission ceiling. Lists retain source query
+open decisions, and a readable permission ceiling. A permission list is sorted
+and folded by shared prefix (`read_account, read_project` is shown as
+`read_{account,project}`); every granted name is still present. The denial
+flow reads the stored ceiling, never this rendering. Lists retain source query
 order (priority, due date, recency, or milestone sequence, with ID tiebreaks)
 before bounding. Main's portfolio query remains `updated_at DESC, id DESC`
 with a limit of 20; the card displays its first eight entries. Reconciliation
