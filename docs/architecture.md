@@ -1616,6 +1616,15 @@ immutable domain/request identities. Exact duplicate reports are no-ops after
 payload equality validation; conflicting reuse is a version conflict, never an
 additive update.
 
+Each usage event is one provider call, and totals are plain sums of events, so
+a call must be reported by exactly one turn. Agent Runtime keeps one
+append-only usage ledger per session, and Agent Chat and Task worker/planner
+sessions persist across turns. The native host therefore notes the ledger's
+length when a turn starts and reports only the records appended after it;
+earlier records were reported by the turn that made them. A Forge-level retry
+of a turn gets a new invocation and records only its own calls, while the
+failed attempt keeps the calls the provider metered for it.
+
 Remote daemons transport the complete per-candidate usage vector and retain a
 terminal notification until the server acknowledges the composite transaction.
 Daemons that do not advertise the required protocol revision are rejected
