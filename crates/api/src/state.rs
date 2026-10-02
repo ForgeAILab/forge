@@ -32,6 +32,8 @@ pub struct AppState {
     pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
     /// Memoized lifetime usage per agent, shared by the agent routes.
     pub agent_usage_cache: Arc<services::usage_projection::AgentUsageAggregateCache>,
+    /// Display-only Project slot counts. Never shared with admission services.
+    pub project_slots_memo: Arc<crate::project_slots::ProjectSlotsMemo>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
@@ -188,6 +190,7 @@ impl AppState {
             pricing_repository: Arc::clone(&runtime.pricing_repository),
             models_dev_client: Arc::clone(&runtime.models_dev_client),
             agent_usage_cache: Arc::default(),
+            project_slots_memo: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
             workspace_backend_router: Arc::clone(&runtime.workspace_backend_router),
             agent_service: Arc::clone(&runtime.agent_service),

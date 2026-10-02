@@ -28,6 +28,14 @@ pub trait TaskRepo: Send + Sync {
         subtask_states_json: &str,
         blocking_kinds_json: &str,
     ) -> Result<(i64, i64, i64)>;
+    /// One grouped statement for a JSON object mapping Project IDs to state maps.
+    /// Revision fences come from the same SQLite snapshot as the counts.
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
     /// independently of the current workflow's state classification.
