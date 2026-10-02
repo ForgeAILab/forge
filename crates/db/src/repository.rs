@@ -834,11 +834,10 @@ pub trait DomainEventRepo: Send + Sync {
         &self,
         consumer_name: &str,
     ) -> Result<Option<EventConsumerCutover>>;
-    async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>>;
-    async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool>;
 }
 
-/// Durable wake dispositions and their atomic event checkpoint boundary.
+/// Durable wake dispositions and semantic retry lineage. Initial persistence
+/// uses SqliteDb::persist_agent_wake_in_tx inside the runtime checkpoint boundary.
 /// Disposition attempts are immutable; deferred/setup-required retry paths
 /// append a later attempt and move the current pointer.
 #[async_trait]
@@ -871,13 +870,6 @@ pub trait AgentWakeDispositionRepo: Send + Sync {
         now: &str,
         limit: i64,
     ) -> Result<Vec<AgentWakeDisposition>>;
-    /// Persist the first disposition and complete the claimed source event
-    /// in one transaction.  A replay of the same attempt is exact and does
-    /// not create a second row or advance the cursor twice.
-    async fn complete_claimed_agent_wake(
-        &self,
-        input: CompleteClaimedWake,
-    ) -> Result<AgentWakeDisposition>;
     /// Append a due deferred/setup-required retry attempt and move the
     /// current pointer without rewriting the prior immutable attempt.
     async fn retry_agent_wake(
@@ -904,14 +896,6 @@ pub trait AttentionRepo: Send + Sync {
         source_event_id: &str,
         updated_at: &str,
     ) -> Result<Option<AttentionProjection>>;
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>>;
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1153,25 +1137,6 @@ fn bounded_event_text(value: &str, max_bytes: usize) -> String {
     let mut output = value[..end].to_owned();
     output.push_str("[truncated]");
     output
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimDomainEvents {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub now: String,
-    pub leased_until: String,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteDomainEvent {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub event_sequence: i64,
-    pub event_id: String,
-    pub dedupe_key: String,
-    pub completed_at: String,
 }
 
 #[async_trait]

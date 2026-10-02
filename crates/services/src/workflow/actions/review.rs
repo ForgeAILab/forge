@@ -10,9 +10,9 @@ use crate::workflow::{
 
 use super::common::{
     block_task, cancel_review_after_authority_loss, create_review_attempt_with_authority,
-    get_role_assignment, latest_executor_execution, latest_review, publish_domain_event,
-    publish_review_failed, publish_review_passed, review_ci_steps, review_has_auditor_verdict,
-    review_is_ci_only, run_ci_steps_in_worktree, task, task_execution_is_read_only,
+    get_role_assignment, latest_executor_execution, latest_review, publish_review_failed,
+    publish_review_passed, review_ci_steps, review_has_auditor_verdict, review_is_ci_only,
+    run_ci_steps_in_worktree, task, task_execution_is_read_only,
     update_review_status_with_authority_checks, workspace_id,
 };
 
@@ -230,11 +230,7 @@ impl HookAction for RunCiSteps {
                     }
                 }
             };
-            publish_domain_event(
-                ctx,
-                &format!("review-status:{}:{}:{}", review.id, review.status, now),
-            )
-            .await;
+
             let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
             if let Err(error) = memory_service
                 .record_review_result_if_final(&ctx.project_id, &review)
@@ -336,11 +332,7 @@ impl HookAction for RunCiSteps {
                 }
             }
         };
-        publish_domain_event(
-            ctx,
-            &format!("review-status:{}:{}:{}", review.id, review.status, now),
-        )
-        .await;
+
         let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
         if let Err(error) = memory_service
             .record_review_result_if_final(&ctx.project_id, &review)

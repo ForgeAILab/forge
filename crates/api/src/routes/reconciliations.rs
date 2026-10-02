@@ -24,7 +24,7 @@ pub struct ReconciliationListQuery {
 }
 
 fn service(state: &AppState) -> ProjectReconciliationService {
-    ProjectReconciliationService::new(state.db.clone(), state.event_bus.clone())
+    ProjectReconciliationService::new(state.db.clone())
 }
 
 pub async fn list_project_reconciliations(

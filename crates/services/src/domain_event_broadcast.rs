@@ -1,149 +1,138 @@
-//! Generic post-commit relay from the durable domain-event outbox to the
-//! live SSE bus (D20: "every committed durable event must publish after its
-//! transaction commits").
-//!
-//! Several commands append a domain event with
-//! `DomainEventRepo::append_event_in_tx` from inside a larger composite
-//! transaction — Project creation from a Charter approval, Main Genesis
-//! control transfer, every Agent Chat message/turn, milestone
-//! readiness/release — so the event row commits atomically with the records
-//! it describes. That guarantees durability, but nothing then mirrors the
-//! row to `EventBus`: the write is correct, it is just invisible to a
-//! connected browser until its next poll or reconnect (the 8.4.2 audit
-//! finding behind F16 — the client's named-listener bug was real, but even a
-//! perfectly-routed client never saw these frames because the server never
-//! sent one). This consumer is the missing "then": it claims every new
-//! domain event exactly once, in commit order, and republishes it as a
-//! `domain_event.committed` frame — the same generic wrapper
-//! `DomainEventService::append` already uses for the events it publishes
-//! itself.
-//!
-//! It is deliberately generic across event types and independent of any
-//! bespoke `event_bus.publish` a command also makes directly (`project.
-//! created`, `project.deleted`, `task.status_changed`, ...): those never
-//! touch the `domain_event` table and are unaffected. An event that both
-//! writes to the outbox *and* is published immediately by
-//! `DomainEventService::append` is broadcast a second time here; the
-//! client's invalidation is idempotent, so the redundancy costs one extra
-//! broad-scoped refetch, never a correctness gap. `web/src/api/sse.ts`
-//! routes `domain_event.committed` by the frame's `scope_type`/`entity_type`
-//! to the exact query keys those scopes affect, falling back to a full
-//! resync only for a scope it does not recognize.
-
-use std::sync::Arc;
-
-use chrono::{Duration, Utc};
-use db::{now_rfc3339, ClaimDomainEvents, CompleteDomainEvent, DomainEventRepo, SqliteDb};
+//! Read-only, in-memory tail of committed domain events for the live SSE bus.
+use crate::{
+    worker_runtime::{HealthErrorKind, SupervisorPolicy, WorkerHealth, WorkerSupervisor},
+    DomainEventService, Result,
+};
+use db::{DomainEventRepo, SqliteDb};
 use events::EventBus;
-use tokio::{sync::watch, task::JoinHandle, time::Duration as TokioDuration};
-use uuid::Uuid;
-
-use crate::{DomainEventService, Result};
-
-const CONSUMER_NAME: &str = "sse-broadcast";
-const LEASE_SECONDS: i64 = 30;
-const POLL_INTERVAL: TokioDuration = TokioDuration::from_millis(500);
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+};
+const RELAY_NAME: &str = "domain-event-relay";
 const BATCH_LIMIT: i64 = 100;
-
-/// Drains the durable domain-event outbox and republishes every row to the
-/// live `EventBus` exactly once, independent of which command wrote it.
+const MIN_IDLE: Duration = Duration::from_millis(250);
+const MAX_IDLE: Duration = Duration::from_secs(5);
 pub struct DomainEventBroadcastConsumer {
     db: Arc<SqliteDb>,
-    events: DomainEventService,
-    lease_owner: String,
+    bus: Arc<EventBus>,
+    position: Mutex<Option<i64>>,
+    running: AtomicBool,
+    #[cfg(test)]
+    child_abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
 }
-
 impl DomainEventBroadcastConsumer {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
-        Self::with_lease_owner(db, event_bus, domain_event_broadcast_lease_owner())
-    }
-
-    pub fn with_lease_owner(
-        db: Arc<SqliteDb>,
-        event_bus: Arc<EventBus>,
-        lease_owner: impl Into<String>,
-    ) -> Self {
+    pub fn new(db: Arc<SqliteDb>, bus: Arc<EventBus>, after: Option<i64>) -> Self {
         Self {
-            events: DomainEventService::new(Arc::clone(&db), event_bus),
+            bus,
             db,
-            lease_owner: lease_owner.into(),
+            position: Mutex::new(after),
+            running: AtomicBool::new(false),
+            #[cfg(test)]
+            child_abort: Arc::new(std::sync::Mutex::new(None)),
         }
     }
-
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut poll = tokio::time::interval(POLL_INTERVAL);
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() {
-                            break;
-                        }
-                    }
-                    _ = poll.tick() => {
-                        if let Err(error) = self.broadcast_once(BATCH_LIMIT).await {
-                            tracing::warn!(error = %error, "SSE domain-event broadcast poll failed");
-                        }
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        let supervisor = WorkerSupervisor::new(
+            WorkerHealth::new(Arc::clone(&self.db), RELAY_NAME),
+            SupervisorPolicy::default(),
+        );
+        #[cfg(test)]
+        let supervisor = supervisor.with_child_abort(Arc::clone(&self.child_abort));
+        supervisor.start(
+            move |shutdown| {
+                let relay = Arc::clone(&self);
+                async move { relay.run_loop(shutdown).await }
+            },
+            shutdown,
+        )
+    }
+    async fn run_loop(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        struct Running<'a>(&'a AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        self.running.store(true, Ordering::SeqCst);
+        let _running = Running(&self.running);
+        let health = WorkerHealth::new(Arc::clone(&self.db), RELAY_NAME);
+        let notify = self.db.domain_event_notify();
+        let mut idle = MIN_IDLE;
+        loop {
+            if *shutdown.borrow_and_update() {
+                return Ok(());
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.broadcast_once(BATCH_LIMIT).await {
+                Ok(n) => {
+                    health.clear_error_if_set(HealthErrorKind::Runtime).await?;
+                    if n > 0 {
+                        idle = MIN_IDLE;
+                        continue;
                     }
                 }
+                Err(error) => {
+                    tracing::warn!(%error, "SSE domain-event tail read failed");
+                    health.report_error(&error.to_string()).await?;
+                }
             }
+            tokio::select! {
+                changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); } }
+                _ = &mut notified => {}
+                _ = tokio::time::sleep(idle) => {}
+            }
+            idle = idle.saturating_mul(2).min(MAX_IDLE);
+        }
+    }
+    pub async fn status(&self) -> Result<api_types::EventRelayStatus> {
+        let error: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT last_error, last_error_at FROM worker_health WHERE worker_name = ?",
+        )
+        .bind(RELAY_NAME)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let (last_error, last_error_at) = error.unwrap_or_default();
+        Ok(api_types::EventRelayStatus {
+            running: self.running.load(Ordering::SeqCst),
+            position: *self.position.lock().await,
+            head: self.db.domain_event_head().await.ok(),
+            last_error,
+            last_error_at,
         })
     }
-
-    /// Claim and republish a bounded batch, in commit order. Each event is
-    /// checkpointed only after its publish returns, so a crash mid-batch
-    /// leaves the remainder eligible for an idempotent replay rather than
-    /// losing it.
     pub async fn broadcast_once(&self, limit: i64) -> Result<usize> {
-        let now = now_rfc3339();
-        let leased_until = (Utc::now() + Duration::seconds(LEASE_SECONDS)).to_rfc3339();
-        let claimed = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                lease_owner: self.lease_owner.clone(),
-                now,
-                leased_until,
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
-
-        let mut published = 0;
-        for event in claimed {
-            self.events.publish_committed(&event);
-            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
-            DomainEventRepo::complete_claimed_event(
-                &*self.db,
-                CompleteDomainEvent {
-                    consumer_name: CONSUMER_NAME.to_owned(),
-                    lease_owner: self.lease_owner.clone(),
-                    event_sequence: event.sequence,
-                    event_id: event.id,
-                    dedupe_key,
-                    completed_at: now_rfc3339(),
-                },
-            )
+        let mut position = self.position.lock().await;
+        let Some(after) = *position else {
+            // Failure leaves None. Retry head initialization without ever
+            // interpreting a failed read as a request to replay from zero.
+            *position = Some(self.db.domain_event_head().await?);
+            return Ok(0);
+        };
+        let rows = self
+            .db
+            .list_events_after(after, limit.clamp(1, BATCH_LIMIT))
             .await?;
-            published += 1;
+        for row in &rows {
+            self.bus.publish(DomainEventService::committed_frame(row));
+            *position = Some(row.sequence);
         }
-        Ok(published)
+        Ok(rows.len())
     }
 }
-
-pub fn domain_event_broadcast_consumer_name() -> &'static str {
-    CONSUMER_NAME
-}
-
-pub fn domain_event_broadcast_lease_owner() -> String {
-    format!("sse-broadcast-{}", Uuid::new_v4())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{run_migrations, CreateDomainEvent};
+    use db::{now_rfc3339, run_migrations, CreateDomainEvent};
 
     async fn database() -> Arc<SqliteDb> {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
@@ -156,7 +145,8 @@ mod tests {
         let db = database().await;
         let bus = Arc::new(EventBus::new(16));
         let mut rx = bus.subscribe();
-        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus));
+        let consumer =
+            DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), Some(0));
 
         // Simulate the outbox pattern used by, e.g., project creation from a
         // Charter approval: the event row is inserted directly (standing in
@@ -206,5 +196,165 @@ mod tests {
             .await
             .expect("broadcast succeeds");
         assert_eq!(replayed, 0);
+    }
+    #[tokio::test]
+    async fn burst_is_ordered_without_gaps_duplicates_or_metadata_writes() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(512));
+        let mut rx = bus.subscribe();
+        let consumer =
+            DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), Some(0));
+        let mut expected = Vec::new();
+        for n in 0..250 {
+            let event = db
+                .append_event(CreateDomainEvent {
+                    id: format!("burst-{n}"),
+                    event_type: "test".into(),
+                    entity_type: "project".into(),
+                    entity_id: "p".into(),
+                    actor_type: "system".into(),
+                    actor_id: None,
+                    scope_type: "project".into(),
+                    scope_id: "p".into(),
+                    correlation_id: format!("burst-{n}"),
+                    causation_id: None,
+                    causation_depth: 0,
+                    dedupe_key: None,
+                    payload_json: "{}".into(),
+                    created_at: now_rfc3339(),
+                })
+                .await
+                .unwrap();
+            expected.push(event.sequence);
+        }
+        let before: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 100);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 100);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 50);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 0);
+        let mut actual = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let events::EventContext::DomainEventCommitted { sequence, .. } = frame.context {
+                actual.push(sequence);
+            }
+        }
+        assert_eq!(actual, expected);
+        let after: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        let health: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_health")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(health, 0);
+    }
+    #[tokio::test]
+    async fn audit_failed_startup_head_read_never_broadcasts_the_ledger() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+        let relay = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), None);
+        sqlx::query("ALTER TABLE domain_event RENAME TO unavailable_events")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(relay.broadcast_once(100).await.is_err());
+        assert_eq!(*relay.position.lock().await, None);
+        sqlx::query("ALTER TABLE unavailable_events RENAME TO domain_event")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.append_event(CreateDomainEvent {
+            id: "historical".into(),
+            event_type: "test".into(),
+            entity_type: "project".into(),
+            entity_id: "p".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: "p".into(),
+            correlation_id: "historical".into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
+        assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn audit2_supervised_relay_restarts_and_catches_up_without_duplicate() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(1024));
+        let mut rx = bus.subscribe();
+        let relay = Arc::new(DomainEventBroadcastConsumer::new(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            Some(0),
+        ));
+        let operator = crate::OperatorStatusService::new_for_test(Arc::clone(&db));
+        operator.set_event_relay(Arc::clone(&relay));
+        operator.set_runtime_workers(&[crate::RuntimeWorker::DomainEventBroadcast]);
+        let (shutdown, signal) = watch::channel(false);
+        let handle = Arc::clone(&relay).start(signal);
+        let append = |id: &str| db::CreateDomainEvent {
+            id: id.into(),
+            event_type: "test".into(),
+            entity_type: "project".into(),
+            entity_id: "p".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: "p".into(),
+            correlation_id: id.into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: db::now_rfc3339(),
+        };
+        let first = db.append_event(append("relay-first")).await.unwrap();
+        let first_frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(first_frame.context, events::EventContext::DomainEventCommitted { sequence, .. } if sequence == first.sequence)
+        );
+        relay.child_abort.lock().unwrap().as_ref().unwrap().abort();
+        // The shared position survives task death; append while the child is restarting.
+        let second = db.append_event(append("relay-second")).await.unwrap();
+        let second_frame = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(second_frame.context, events::EventContext::DomainEventCommitted { sequence, .. } if sequence == second.sequence)
+        );
+        assert!(rx.try_recv().is_err());
+        let restarts: i64 = sqlx::query_scalar(
+            "SELECT restart_count FROM worker_health WHERE worker_name = 'domain-event-relay'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(restarts, 1);
+        let status = operator.compute_status().await.unwrap();
+        assert!(status.event_relay.running);
+        assert_eq!(status.event_relay.position, Some(second.sequence));
+        assert_eq!(status.event_relay.head, Some(second.sequence));
+        assert!(
+            status.event_consumers.is_empty(),
+            "the tail is not a durable consumer"
+        );
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!relay.status().await.unwrap().running);
     }
 }

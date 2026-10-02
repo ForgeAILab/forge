@@ -11,8 +11,7 @@ use crate::{
 };
 
 use super::common::{
-    latest_review, publish_domain_event, publish_review_passed, review_ci_steps, task,
-    task_execution_is_read_only,
+    latest_review, publish_review_passed, review_ci_steps, task, task_execution_is_read_only,
 };
 
 /// How many consecutive mechanical integrations one passed review may cover
@@ -204,11 +203,7 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
         })
         .await
         .map_err(failed)?;
-    publish_domain_event(
-        ctx,
-        &format!("review-status:{}:{}:{}", settled.id, settled.status, now),
-    )
-    .await;
+
     publish_review_passed(ctx, &settled);
 
     let what = match kind {

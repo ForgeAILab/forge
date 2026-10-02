@@ -1130,12 +1130,6 @@ impl TaskService {
             return Ok(());
         };
 
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
-
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id.clone(),
@@ -1406,12 +1400,6 @@ impl TaskService {
             return Ok(());
         };
 
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
-
         tracing::info!(
             task_id = %task.id,
             execution_id = %execution.id,
@@ -1573,12 +1561,6 @@ impl TaskService {
         else {
             return Ok(());
         };
-
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
 
         tracing::info!(
             task_id = %task.id,
@@ -2085,11 +2067,7 @@ impl TaskService {
             .await?;
             (updated_review, task)
         };
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &updated_review)
@@ -2269,11 +2247,7 @@ impl TaskService {
             },
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
+
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id.clone(),
@@ -2458,7 +2432,7 @@ impl TaskService {
                 "status": "scheduled",
                 "scheduled_at": finished_at.clone(),
             });
-            let updated_review = ReviewRepo::update_status(
+            ReviewRepo::update_status(
                 &*self.db,
                 &review.id,
                 ReviewStatus::Running,
@@ -2467,11 +2441,7 @@ impl TaskService {
                 &finished_at,
             )
             .await?;
-            self.publish_domain_event_by_dedupe(&format!(
-                "review-status:{}:{}:{}",
-                updated_review.id, updated_review.status, finished_at
-            ))
-            .await;
+
             self.publish_reviewer_comment(
                 execution,
                 &task.id,
@@ -2495,11 +2465,7 @@ impl TaskService {
             None,
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &updated_review)

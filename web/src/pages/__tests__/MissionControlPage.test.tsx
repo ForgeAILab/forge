@@ -345,4 +345,14 @@ describe('MissionControlPage', () => {
       data.needs_attention = previous
     }
   })
+  it('renders worker error kind and message without a processed-event counter', () => {
+    data.consumer_health = { consumer_name: 'attention_projection', last_sequence: 12, last_success_at: null,
+      last_error_code: 'terminal', last_error_message: 'Commitment transition rejected', stale: false, updated_at: '2026-10-02T00:00:00Z' }
+    render(<MissionControlPage />)
+    expect(screen.getByText('Commitment transition rejected')).toBeTruthy()
+    expect(screen.queryByText('Processed events')).toBeNull()
+    expect(screen.queryByText('Stale')).toBeNull()
+    data.consumer_health = null
+  })
+
 })
