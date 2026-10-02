@@ -199,6 +199,18 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn('| Idle CPU seconds | unavailable | unavailable |', table)
         self.assertIn('ps unavailable: denied', table)
 
+    def test_project_list_scenario_measures_the_whole_page(self):
+        manifest = {'project_id': fixture_id('project'), 'chat_id': fixture_id('chat'),
+                    'task_ids': [fixture_id('task', 0)]}
+        class Client:
+            def request(self, *args, **kwargs):
+                return 200, {}, b'{}'
+        with patch('perf_bench.measure', side_effect=lambda client, name, path, headers=None:
+                   {'name': name, 'path': path}):
+            rows = scenarios(Client(), manifest)
+        self.assertEqual([row for row in rows if row['name'].startswith('project list')],
+                         [{'name': 'project list limit=100', 'path': '/api/v1/projects?limit=100'}])
+
     def test_scenario_analytics_windows_are_rfc3339_and_include_fixture_epoch(self):
         class Client:
             def request(self, *args, **kwargs):

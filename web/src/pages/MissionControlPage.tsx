@@ -616,10 +616,6 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
       <p className="mt-3 text-sm font-medium text-foreground">{health.consumer_name}</p>
       <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
         <div>
-          <p className="text-muted-foreground">Processed events</p>
-          <p className="mt-1 font-mono text-foreground">{health.processed_events}</p>
-        </div>
-        <div>
           <p className="text-muted-foreground">Last sequence</p>
           <p className="mt-1 font-mono text-foreground">{health.last_sequence}</p>
         </div>
@@ -628,6 +624,7 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
         Last success {formatDate(health.last_success_at)}
         {health.last_error_code ? ` · ${health.last_error_code}` : ''}
       </p>
+      {health.last_error_message ? <p className="mt-2 text-xs text-muted-foreground">{health.last_error_message}</p> : null}
     </Card>
   )
 }

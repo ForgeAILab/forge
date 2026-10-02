@@ -50,6 +50,71 @@ pub async fn load_project_slots(db: &db::SqliteDb, project: &Project) -> Result<
     Ok(slots)
 }
 
+/// Counts plus the revision observed by their statement. API readers may memoize
+/// only when this fence matches the Project row they already loaded.
+#[derive(Debug)]
+pub struct ProjectSlotsRead {
+    pub slots: ProjectSlots,
+    pub revision: Option<(i64, i64)>,
+}
+
+/// Read all bounded Projects in one grouped statement. Unlimited Projects and
+/// an empty input need no SQL. The dispatcher retains its uncached single read.
+pub async fn load_projects_slots(
+    db: &db::SqliteDb,
+    projects: &[Project],
+) -> Result<std::collections::HashMap<String, ProjectSlotsRead>> {
+    let mut result = std::collections::HashMap::with_capacity(projects.len());
+    let mut states = serde_json::Map::new();
+    for project in projects {
+        let settings: ProjectSettings =
+            serde_json::from_str(&project.settings).map_err(|error| {
+                ServiceError::invalid_operation(format!("invalid settings: {error}"))
+            })?;
+        result.insert(
+            project.id.clone(),
+            ProjectSlotsRead {
+                slots: ProjectSlots {
+                    limit: settings.max_active_tasks,
+                    ..ProjectSlots::default()
+                },
+                revision: None,
+            },
+        );
+        if settings.max_active_tasks != 0 {
+            states.insert(
+                project.id.clone(),
+                serde_json::Value::String(slot_states(&WorkflowEngine::resolve_workflow(
+                    &project.workflow_definition,
+                ))),
+            );
+        }
+    }
+    if states.is_empty() {
+        return Ok(result);
+    }
+    let mut pending: std::collections::HashSet<String> = states.keys().cloned().collect();
+    for counts in TaskRepo::count_projects_slots(
+        db,
+        &serde_json::Value::Object(states).to_string(),
+        &slot_states(&WorkflowEngine::resolve_subtask_workflow()),
+        &serde_json::json!(helpers::BLOCKING_ANNOTATION_KINDS).to_string(),
+    )
+    .await?
+    {
+        pending.remove(&counts.project_id);
+        let read = result.get_mut(&counts.project_id).expect("queried Project");
+        read.revision = Some((counts.list_revision, counts.project_version));
+        read.slots.active = u32::try_from(counts.active).unwrap_or(u32::MAX);
+        read.slots.parked = u32::try_from(counts.parked).unwrap_or(u32::MAX);
+        read.slots.queued = u32::try_from(counts.queued).unwrap_or(u32::MAX);
+    }
+    if let Some(id) = pending.into_iter().next() {
+        return Err(ServiceError::not_found("project", id));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use db::{CreateProject, CreateTask, ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus};
@@ -59,6 +124,16 @@ mod tests {
     use api_types::{Actor, StateKind, SystemComponent};
     use db::{PageRequest, SortBy, SortOrder, TaskListQuery};
     use std::collections::HashSet;
+
+    async fn assert_batch_matches(db: &db::SqliteDb, project: &Project) {
+        let batch = load_projects_slots(db, std::slice::from_ref(project))
+            .await
+            .unwrap();
+        assert_eq!(
+            batch[&project.id].slots,
+            load_project_slots(db, project).await.unwrap()
+        );
+    }
 
     async fn walk_project_slots(db: &db::SqliteDb, project: &Project) -> Result<ProjectSlots> {
         let settings: ProjectSettings =
@@ -286,6 +361,7 @@ mod tests {
                     .unwrap();
             }
         }
+        assert_batch_matches(&db, &project).await;
         assert_eq!(
             load_project_slots(&db, &project).await.unwrap(),
             ProjectSlots {
@@ -347,6 +423,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        assert_batch_matches(&db, &project).await;
         assert_eq!(
             load_project_slots(&db, &project).await.unwrap(),
             ProjectSlots {
@@ -380,6 +457,7 @@ mod tests {
         task(&db, &project, "in_progress", Some(&root.id)).await;
         task(&db, &project, "in_progress", None).await;
         task(&db, &project, "designing", None).await;
+        assert_batch_matches(&db, &project).await;
         assert_eq!(
             load_project_slots(&db, &project).await.unwrap(),
             ProjectSlots {
@@ -398,6 +476,7 @@ mod tests {
             task(&db, &project, "todo", None).await;
         }
         task(&db, &project, "planning", None).await;
+        assert_batch_matches(&db, &project).await;
         assert_eq!(
             load_project_slots(&db, &project).await.unwrap(),
             ProjectSlots {
@@ -466,6 +545,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        assert_batch_matches(&db, &project).await;
         assert_eq!(
             load_project_slots(&db, &project).await.unwrap(),
             walk_project_slots(&db, &project).await.unwrap()
@@ -509,6 +589,7 @@ mod tests {
         .await;
         let coordinating = task(&db, &project, "in_progress", None).await;
         task(&db, &project, "done", Some(&coordinating.id)).await;
+        assert_batch_matches(&db, &project).await;
         assert_eq!(load_project_slots(&db, &project).await.unwrap().active, 5);
         let parked_root = task(&db, &project, "review", None).await;
         task(&db, &project, "done", Some(&parked_root.id)).await;
@@ -631,6 +712,10 @@ mod tests {
         task(&db, &project, "todo", None).await;
         let aggregate = load_project_slots(&db, &project).await.unwrap();
         assert_eq!(aggregate, walk_project_slots(&db, &project).await.unwrap());
+        let batched = load_projects_slots(&db, std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        assert_eq!(batched[&project.id].slots, aggregate);
         assert_eq!(
             (aggregate.active, aggregate.parked, aggregate.queued),
             (0, 5, 1)
@@ -656,6 +741,78 @@ mod tests {
         );
         let aggregate = load_project_slots(&db, &project).await.unwrap();
         assert_eq!(aggregate, walk_project_slots(&db, &project).await.unwrap());
+        let batched = load_projects_slots(&db, std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        assert_eq!(batched[&project.id].slots, aggregate);
         assert_eq!((aggregate.active, aggregate.parked), (1, 4));
+    }
+    #[tokio::test]
+    async fn batched_slots_match_multiple_workflows_and_cross_project_children() {
+        let (db, mut first) = fixture().await;
+        let now = db::now_rfc3339();
+        let mut projects = vec![];
+        for settings in ["{}", "{}", r#"{"max_active_tasks":0}"#] {
+            projects.push(
+                ProjectRepo::create(
+                    &db,
+                    CreateProject {
+                        id: db::new_uuid_v4(),
+                        name: "Batch".to_owned(),
+                        settings: settings.to_owned(),
+                        workflow_definition: "{}".to_owned(),
+                        primary_repo_id: None,
+                        owner_id: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut workflow = crate::workflow::default_workflow::default_workflow();
+        workflow
+            .states
+            .iter_mut()
+            .find(|s| s.name == "planning")
+            .unwrap()
+            .name = "designing".to_owned();
+        workflow
+            .states
+            .iter_mut()
+            .find(|s| s.name == "in_progress")
+            .unwrap()
+            .kind = StateKind::Custom;
+        first.workflow_definition = serde_json::to_string(&workflow).unwrap();
+        task(&db, &first, "designing", None).await;
+        let custom = task(&db, &first, "in_progress", None).await;
+        task(&db, &first, "in_progress", Some(&custom.id)).await;
+        let root = task(&db, &first, "review", None).await;
+        // The single-Project SQL sees the child for existence, but only its
+        // own Project's visible children can displace root-owned work.
+        task(&db, &projects[0], "in_progress", Some(&root.id)).await;
+        for _ in 0..201 {
+            task(&db, &projects[0], "todo", None).await;
+        }
+        projects.push(first);
+        let batch = load_projects_slots(&db, &projects).await.unwrap();
+        for project in &projects {
+            assert_eq!(
+                batch[&project.id].slots,
+                load_project_slots(&db, project).await.unwrap()
+            );
+        }
+        assert_eq!(batch[&projects[0].id].slots.queued, 201);
+        assert_eq!(batch[&projects[3].id].slots.active, 3);
+        assert_eq!(batch[&projects[1].id].slots.active, 0);
+        let empty = db::SqliteDb::new(db::create_sqlite_pool("sqlite::memory:").await.unwrap());
+        assert!(load_projects_slots(&empty, &[]).await.unwrap().is_empty());
+        assert_eq!(
+            load_projects_slots(&empty, &projects[2..3]).await.unwrap()[&projects[2].id]
+                .slots
+                .limit,
+            0
+        );
     }
 }

@@ -1035,7 +1035,7 @@ impl AgentHandoffRepo for SqliteDb {
 
 /// Admit a chat message and queued turn using a caller-owned transaction.
 /// Wake disposition persistence uses this same primitive so a turn admission,
-/// its message-admitted event, the disposition, and the source-event receipt
+/// its message-admitted event, the disposition, and the source-event checkpoint
 /// share one commit boundary.
 pub(super) async fn admit_agent_chat_turn_in_tx(
     db: &SqliteDb,
@@ -2993,5 +2993,20 @@ fn map_chat_write_error(error: sqlx::Error) -> DbError {
         DbError::Check("duplicate Agent Chat id, sequence, or deduplication key".to_owned())
     } else {
         error.into()
+    }
+}
+
+impl SqliteDb {
+    pub async fn get_agent_chat_turn_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<AgentChatTurnJob>> {
+        sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_agent_chat_turn_job)
+            .transpose()
     }
 }

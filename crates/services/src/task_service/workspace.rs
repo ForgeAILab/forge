@@ -2726,7 +2726,10 @@ mod tests {
             .filter_map(|path| {
                 let name = path.file_name()?.to_str()?;
                 let version: i64 = name.strip_prefix('V')?.split_once("__")?.0.parse().ok()?;
-                (!matches!(version, 202610010400 | 202610010530)).then_some((version, path))
+                // Placement arrives after the legacy rows are seeded; migrations
+                // that read `workspace_placement` are applied with it below.
+                (!matches!(version, 202610010400 | 202610010530 | 202610020600))
+                    .then_some((version, path))
             })
             .collect::<Vec<_>>();
         historical.sort_by_key(|(version, _)| *version);
@@ -2818,6 +2821,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610010400__daemon_owned_workspaces.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610020600__project_machine_readiness.sql"
         ))
         .execute(db.pool())
         .await

@@ -13,33 +13,33 @@ use crate::{
     AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion,
     AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery, AgentWakeDisposition,
     AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
-    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
-    AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
-    CancelAgentChatTurn, CancelAgentChatTurnWithUsage, CancelAgentInquiryWithUsage, CiStepStats,
-    ClaimDomainEvents, ClaimExecutionLease, ClaimTask, ClaimedTask, CommandReceiptRepo,
-    CompleteAgentChatControlTransfer, CompleteAgentChatControlTransferWithUsage,
-    CompleteAgentChatTurn, CompleteAgentChatTurnWithUsage, CompleteAgentCommitment,
-    CompleteAgentInquiry, CompleteAgentInquiryWithUsage, CompleteClaimedWake, CompleteDomainEvent,
-    CompletedAgentChatTurn, CostCoverageReasonCode, CreateAccountMainAgentBinding, CreateAgent,
-    CreateAgentAction, CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat,
-    CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentCommitment,
-    CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem,
-    CreateAgentInquiry, CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition,
-    CreateAttentionProjection, CreateDomainEvent, CreateExecution, CreateNotification,
-    CreateProject, CreateProjectAdmissionReceipt, CreateProjectAgentBinding, CreateProjectHookRun,
-    CreateProjectIntegration, CreateProjectMediaAsset, CreateProjectMediaAttachment,
-    CreateProjectMediaAttachmentMutation, CreateProjectProvisioningError,
-    CreateProjectProvisioningOperation, CreateProjectReleaseMediaPin, CreateRepo, CreateReview,
-    CreateRuntime, CreateSkill, CreateTask, CreateTaskComment, CreateTaskExternalLink,
-    CreateTaskMedia, CreateTerminalSession, CreateUsageInvocation, CreateWorkspace,
-    CreateWorkspaceLease, CurrentProjectBindingAuthority, Daemon, DaemonRepo, DbError, DomainEvent,
-    DomainEventRepo, EventConsumerCursor, EventConsumerCutover, Execution,
-    ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionProgressWarningOutcome,
-    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, ExecutionTerminalReceipt,
-    ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn, FailAgentChatTurnWithUsage,
-    IntegrationRepo, LatestExecutionAuthority, MarkUsageInvocationPendingSettlement, MediaAsset,
-    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, ParkAgentChatTurn,
-    ParkAgentChatTurnWithUsage, Project, ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo,
+    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand, AttentionListQuery,
+    AttentionProjection, AttentionRepo, CancelAgentChatTurn, CancelAgentChatTurnWithUsage,
+    CancelAgentInquiryWithUsage, CiStepStats, ClaimExecutionLease, ClaimTask, ClaimedTask,
+    CommandReceiptRepo, CompleteAgentChatControlTransfer,
+    CompleteAgentChatControlTransferWithUsage, CompleteAgentChatTurn,
+    CompleteAgentChatTurnWithUsage, CompleteAgentCommitment, CompleteAgentInquiry,
+    CompleteAgentInquiryWithUsage, CompletedAgentChatTurn, CostCoverageReasonCode,
+    CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction, CreateAgentActionApproval,
+    CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob,
+    CreateAgentCommitment, CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity,
+    CreateAgentInboxItem, CreateAgentInquiry, CreateAgentProfile, CreateAgentQuestion,
+    CreateAgentWakeDisposition, CreateAttentionProjection, CreateDomainEvent, CreateExecution,
+    CreateNotification, CreateProject, CreateProjectAdmissionReceipt, CreateProjectAgentBinding,
+    CreateProjectHookRun, CreateProjectIntegration, CreateProjectMediaAsset,
+    CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
+    CreateProjectProvisioningError, CreateProjectProvisioningOperation,
+    CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
+    CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
+    CreateUsageInvocation, CreateWorkspace, CreateWorkspaceLease, CurrentProjectBindingAuthority,
+    Daemon, DaemonRepo, DbError, DomainEvent, DomainEventRepo, EventConsumerCursor,
+    EventConsumerCutover, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome,
+    ExecutionTerminalReceipt, ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn,
+    FailAgentChatTurnWithUsage, IntegrationRepo, LatestExecutionAuthority,
+    MarkUsageInvocationPendingSettlement, MediaAsset, Notification, NotificationListQuery,
+    NotificationRepo, Page, PageRequest, ParkAgentChatTurn, ParkAgentChatTurnWithUsage,
+    PersistAgentWake, Project, ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo,
     ProjectAgentBinding, ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectBindingCommandRepo,
     ProjectDeletionPaths, ProjectDeletionRepositoryPath, ProjectExecutionSetupCommandRepo,
     ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration,
@@ -58,8 +58,8 @@ use crate::{
     UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
     UpdateDaemonReport, UpdateExecution, UpdateProject, UpdateProjectHookRun,
     UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth,
-    UpsertDaemon, UpsertProjectProvisioningCheckpoint, UsageAnalyticsRepo, UsageCostKind,
+    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
+    UpsertProjectProvisioningCheckpoint, UsageAnalyticsRepo, UsageCostKind,
     UsageEventProvenanceKind, UsageInvocationLifecycle, UsageLedgerRepo, UsageLedgerSettlement,
     UsageSurface, UsageTelemetryState, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceStatus,
@@ -72,7 +72,8 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
+use tokio::sync::Notify;
 
 mod action;
 mod agent;
@@ -90,6 +91,7 @@ mod command_receipt;
 mod commitment;
 mod daemon;
 mod domain_event;
+pub use domain_event::EventSubscription;
 mod embedded_agent;
 pub(crate) mod environment_readiness;
 mod execution;
@@ -104,6 +106,7 @@ mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
 mod outbox;
+pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
 mod pricing;
 mod project;
@@ -139,6 +142,7 @@ mod workspace_placement;
 pub struct SqliteDb {
     pool: SqlitePool,
     readiness_decode_warnings: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,14 +152,23 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
+        let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
             readiness_decode_warnings: Default::default(),
+            domain_event_hooks,
         }
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Pool-scoped wakeup for workers that consume committed domain events.
+    /// Durable cursors remain authoritative; a missed notification only falls
+    /// back to the worker's bounded idle poll.
+    pub fn domain_event_notify(&self) -> Arc<Notify> {
+        self.domain_event_hooks.notify()
     }
 }
 
