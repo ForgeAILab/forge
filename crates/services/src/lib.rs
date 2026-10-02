@@ -30,6 +30,7 @@ pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod embedded_task_executor;
+pub mod environment_surfaces;
 pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;

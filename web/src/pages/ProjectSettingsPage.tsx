@@ -35,6 +35,7 @@ import { ErrorBanner } from '@/components/error-banner'
 import { McpInstallControls } from '@/components/mcp-install-controls'
 import { AnalyticsTab } from '@/components/settings/AnalyticsTab'
 import { DangerTab } from '@/components/settings/DangerTab'
+import { ProjectEnvironmentReadiness } from '@/components/settings/ProjectEnvironmentReadiness'
 import { EnvironmentTab } from '@/components/settings/EnvironmentTab'
 import {
   parseEnvironmentText,
@@ -465,24 +466,32 @@ export function ProjectSettingsPage({
           )}
 
           {initialTab === 'environment' && (
-            <EnvironmentTab
-              projectIsLoading={projectQuery.isLoading}
-              canSave={Boolean(project)}
-              isSaving={updateProject.isPending}
-              environmentText={environmentText}
-              recheckMinutes={environmentRecheckMinutes}
-              recheckIntervalError={recheckIntervalError}
-              saveError={environmentSaveError}
-              onRecheckMinutesChange={(environmentRecheckMinutes) => {
-                updateForm({ environmentRecheckMinutes })
-                setEnvironmentSaveError(null)
-              }}
-              onEnvironmentTextChange={(text) => {
-                setEnvironmentText(text)
-                setEnvironmentSaveError(null)
-              }}
-              onSave={saveEnvironment}
-            />
+            <div>
+              <ProjectEnvironmentReadiness
+                projectId={projectId}
+                rows={project?.environment_readiness ?? []}
+                hasRepository={Boolean(project?.primary_repo_id)}
+                isLoading={projectQuery.isLoading}
+              />
+              <EnvironmentTab
+                projectIsLoading={projectQuery.isLoading}
+                canSave={Boolean(project)}
+                isSaving={updateProject.isPending}
+                environmentText={environmentText}
+                recheckMinutes={environmentRecheckMinutes}
+                recheckIntervalError={recheckIntervalError}
+                saveError={environmentSaveError}
+                onRecheckMinutesChange={(environmentRecheckMinutes) => {
+                  updateForm({ environmentRecheckMinutes })
+                  setEnvironmentSaveError(null)
+                }}
+                onEnvironmentTextChange={(text) => {
+                  setEnvironmentText(text)
+                  setEnvironmentSaveError(null)
+                }}
+                onSave={saveEnvironment}
+              />
+            </div>
           )}
 
           {initialTab === 'analytics' && <AnalyticsTab projectId={projectId} />}

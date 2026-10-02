@@ -6,15 +6,22 @@ export function SettingsSection({
   description,
   children,
   danger,
+  layout = 'columns',
 }: {
   title: ReactNode
   description?: string
   children: ReactNode
   danger?: boolean
+  layout?: 'columns' | 'stacked'
 }) {
   return (
     <section className="border-b py-6 last:border-b-0">
-      <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-[220px_minmax(0,1fr)] sm:gap-8">
+      <div
+        className={cn(
+          'grid min-w-0 grid-cols-1 items-start gap-4',
+          layout === 'columns' && 'sm:grid-cols-[220px_minmax(0,1fr)] sm:gap-8',
+        )}
+      >
         <div>
           <h3
             className={cn(

@@ -843,7 +843,10 @@ dispatch rather than adding a `dispatch_failed` annotation.
 
 Internal `project.environment_pause_json` records the machine, workspace,
 checks, role, bounded output, and pause/last-check/next-check times. The public
-response keeps its shape in this build step. Migration V202610020600 infers an
+`environment_pause` now includes a readable machine identity; Project responses
+also expose the recorded `environment_readiness` rows to every Project reader.
+Settings show a per-machine readiness table with Check now; Projects without
+checks show an empty state. Migration V202610020600 infers an
 older pause's machine from its recorded workspace placement before falling
 back to the server; it preserves Projects and placements. The runner fills the
 canonical digest. Malformed settings leave rows `unknown` and produce one
@@ -890,16 +893,20 @@ paths in `task_service/execution/runner.rs`. These existing plan I/O paths are
 owned by the workflow/runtime refactor; this backend step verifies daemon
 re-dispatch through the execution path without plan I/O.
 
-`POST /projects/{id}/environment/recheck` runs every configured check immediately
-and returns per-check results plus the Project; all passing clears a matching
-environment pause. A manual check returns HTTP 409 immediately if another
-re-check is running. An empty check list never resumes automatically: asset-copy
+`POST /projects/{id}/environment/recheck` accepts an optional machine selector
+(`server` or daemon runtime ID), runs every configured check on the selected
+machine or all known targets, and returns `{machines, project}`. Each machine
+has its identity, check results, and nullable unavailable error. A manual check
+returns HTTP 409 if a selected machine is already being checked. A passing
+machine can clear a matching environment pause. An empty check list never resumes automatically: asset-copy
 failures and removed probes stay paused with an explicit manual-resume message.
 Unnamed failures stay paused until manual resume or Check now; timers never
 relaunch an unfixed setup failure.
-The manual endpoint retains its existing primary-checkout fallback when its
-recorded daemon workspace is unavailable; scheduled re-checks do not use that
-fallback. Manual resume and the existing compare-and-clear paths reset that
+The manual endpoint uses the same host checkout or recorded daemon failure
+workspace as readiness jobs. It never substitutes host results for a selected
+daemon. Daemons without a recorded ready failure workspace return an unavailable
+result until daemon probes are implemented. Transport and unavailable-target
+errors preserve facts and reschedule failed rows. Manual resume and the existing compare-and-clear paths reset that
 Project's `not_ready` rows to `unknown` in the same transaction. The next
 dispatcher host admission without assets probes immediately, then launches or
 pauses again without waiting for the old `next_check_at`. Direct/manual claims,
@@ -2681,6 +2688,18 @@ default location → server-owned → `(created_at, id)`. The selection reason r
 the winning rule and rejected candidates with filter codes. If no owner is
 eligible, claim returns structured `placement_unavailable`; there is no silent
 fallback.
+Agent `runnable_on` exposes executor-fit facts from the same inputs as placement:
+server adapter/native connection health, daemon runtime/connection, detected CLI
+authentication, enabled policy, Agent pause and explicit pin. Admins receive
+machine identities; other users receive only a count, and the pin remains
+admin-only. Agent list/detail warn on zero machines; admins can clear the pin.
+This read does not assert repository/environment fit or capacity. Task detail's
+separate placement diagnostics panel reads recorded environment waits, pending
+host probes, capacity waits and selection rejections without running admission.
+It names machines/checks where recorded and renders `machine_capacity` in the
+same component. CLI `project env-status` reads these Project readiness facts;
+`env-recheck --machine` selects one target.
+
 Machine saturation does not downgrade Agent availability or Project execution
 setup; the Agent availability precheck uses only its identity quota.
 
@@ -3139,10 +3158,11 @@ review CI use the workspace backend command path; remote starts perform the same
 preflight before their provider RPC. Environment pauses retain the failed
 workspace ID: scheduled and manual re-checks use the primary checkout for embedded
 work and the recorded ready daemon placement for remote work. Missing or unresolved
-workspaces, non-ready placements, and unreachable owners fall back to the primary
-checkout. An owner run-policy denial
-records `purpose_denied` and suppresses scheduled re-checks until an explicit check
-succeeds after the policy changes.
+daemon workspaces, non-ready placements and unreachable owners retain that
+machine's facts and report unavailability; they never use the host as a substitute.
+Named check failures retry on their machine. An unnamed launch failure needs
+manual resume or Check now, and an owner run-policy refusal during re-check
+retains the failure facts and reschedules the attempt.
 
 An admitted Task waiting for an owner keeps its active Project slot even before
 an Execution exists. Owner timeout, workspace reset and review-CI infrastructure

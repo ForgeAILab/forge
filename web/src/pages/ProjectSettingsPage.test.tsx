@@ -45,6 +45,7 @@ const project: Project = {
 }
 
 vi.mock('@/api/hooks', () => ({
+  useRecheckProjectEnvironment: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useProjectQuery: () => ({ data: query.data, isLoading: false, isError: false }),
   useWorkflowQuery: () => ({ data: { roles: [] }, isLoading: false }),
   useAgentsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),
@@ -128,9 +129,9 @@ describe('Project flow control settings', () => {
       fireEvent.change(screen.getByLabelText('Active task limit'), { target: { value } })
       expect(screen.getByRole('alert').textContent).toContain('integer from 0 to 1000')
       expect(screen.getByLabelText('Active task limit').getAttribute('aria-invalid')).toBe('true')
-      expect(
-        (screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled,
-      ).toBe(true)
+      expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(
+        true,
+      )
       expect(mutate).not.toHaveBeenCalled()
     },
   )

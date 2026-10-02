@@ -71,6 +71,8 @@ pub enum EffectiveCoderSource {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {
+    #[serde(default)]
+    pub placement_diagnostics: Vec<TaskPlacementDiagnostic>,
     pub id: String,
     pub project_id: String,
     pub parent_task_id: Option<String>,
@@ -287,6 +289,16 @@ pub struct TaskExecutionObservability {
     pub total_runtime_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
+#[ts(export)]
+pub struct AgentRunnableOn {
+    pub count: u32,
+    /// Present only for admins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub machines: Option<Vec<crate::MachineIdentity>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct AgentResponse {
@@ -306,6 +318,8 @@ pub struct AgentResponse {
     pub config_json: Value,
     pub credential_handle_id: Option<String>,
     pub daemon_id: Option<String>,
+    #[serde(default)]
+    pub runnable_on: AgentRunnableOn,
     pub max_concurrent_tasks: i64,
     pub status: AgentStatus,
     /// Assigned workload; see `Agent::active_assigned_task_count`.
@@ -494,4 +508,12 @@ fn deserialize_nullable_run_limit<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<u32>, D::Error> {
     Option::<u32>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskPlacementDiagnostic {
+    pub machine: Option<crate::MachineIdentity>,
+    pub filter_codes: Vec<String>,
+    pub failing_checks: Vec<String>,
 }

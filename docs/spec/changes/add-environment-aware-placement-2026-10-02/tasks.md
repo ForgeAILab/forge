@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T13:25:40Z
+updated_at: 2026-10-02T19:57:03Z
 completed_at:
 ---
 
@@ -10,16 +10,16 @@ completed_at:
 - [x] 1.3 `placement::selection`: `EnvironmentNotReady`, `EnvironmentProbePending` filter codes (`EnvironmentUnverified` is deferred to 3.5 for this build step); the candidate carries its machine's readiness; rejections carry failing check names; pure-function tests for every new scenario
 - [x] 1.4 Probe job: single-flight per (Project, machine), outside admission; server machine runs checks in the primary or managed checkout without writing; versioned result write; wake dispatch on completion
 - [x] 1.5 Dispatcher: `environment_probe_pending` is a transient refusal (Task stays queued, no version churn after the first deferral); Project PATCH that changes the digest marks rows `unknown` and starts probes
-- [ ] 1.6 Agent response `runnable_on` (admin: identities; others: count) from the placement executor facts
+- [x] 1.6 Agent response `runnable_on` (admin: identities; others: count) from the placement executor facts
 
 ## 2. Per-machine failure, pause as last resort, re-checks
 - [x] 2.1 `task_service/execution/environment.rs` failure branch: mark the machine `not_ready`; pause the Project only when no machine remains eligible; record the machine in `environment_pause`
 - [x] 2.2 Task-scoped Attention + durable wait for a placed Task on a `not_ready` machine; re-dispatch when the machine is `ready`
 - [x] 2.3 `environment_pause_sync` → per-machine re-check of recorded failing checks on the failing machine; compare-and-clear the Project pause; unreachable machines keep their row
-- [ ] 2.4 `POST /projects/{id}/environment/recheck`: optional machine, results grouped by machine (**breaking** response shape); Project response `environment_readiness`; `api-types`, generated TS, `docs/api.md`
-- [ ] 2.5 `forge-ctl project env-status` and `project env-recheck --machine`; `docs/cli.md`
-- [ ] 2.6 Web: readiness table with per-machine "Check now" in Project environment settings; Task placement panel shows environment rejections and "checking machine X"; Agent page shows `runnable_on`, the pin, and clear-pin
-- [ ] 2.7 `happy_path` named case for a single machine: check fails → Project paused → re-check passes → Task re-dispatches (behaviour unchanged)
+- [x] 2.4 `POST /projects/{id}/environment/recheck`: optional machine, results grouped by machine (**breaking** response shape); Project response `environment_readiness`; `api-types`, generated TS, `docs/api.md`
+- [x] 2.5 `forge-ctl project env-status` and `project env-recheck --machine`; `docs/cli.md`
+- [x] 2.6 Web: readiness table with per-machine "Check now" in Project environment settings; Task placement panel shows environment rejections and "checking machine X"; Agent page shows `runnable_on`, the pin, and clear-pin
+- [x] 2.7 `happy_path` named case for a single machine: check fails → Project paused → re-check passes → Task re-dispatches (behaviour unchanged)
 
 ## 3. Check scope, daemon probe, provisioning
 - [ ] 3.1 `EnvironmentCheck.scope` (`workspace` default, `machine`), validation, settings UI and `forge-ctl`
@@ -31,6 +31,8 @@ completed_at:
 
 ## 4. Docs and release notes
 - [ ] 4.1 `docs/architecture.md`: Workspace placement (readiness filter, provisioning), Project environment (per-machine failure, re-check), daemon command transport (two new operations)
+- [x] 4.1B Public readiness, manual re-check, Agent machines and Task diagnostics documentation in this build step; provisioning/transport remains step C
+- [x] 4.2B Release-note text drafted in `implementation-step-b.md` and final reply; CHANGELOG.md remains untouched by request
 - [ ] 4.2 `CHANGELOG.md` `### Breaking`: recheck response shape, `environment_pause` gains the machine, Project pauses only when no machine is eligible; `### Added` for the rest
 
 ### Backend build-step verification
@@ -51,3 +53,23 @@ completed_at:
 - [x] Offline alternatives never affect the pause decision; no-check initial dispatch returns before context assembly.
 - [x] Deleted daemon workspace resets its readiness to unknown and clears the wait.
 - [x] Ported audit parity cases, focused suites, strict validation and final crate/web checks.
+
+### Public surfaces build step B
+- Project readiness entries are visible to every Project reader, as explicitly required by the step B brief (overriding the delta's count-only non-admin sentence). Agent machine identities and pins remain admin-only.
+- Machine selectors are `server` or a daemon runtime ID; names use Server host or the daemon hostname. No new migration or daemon operation is added.
+- Manual grouped checks reuse Step A runners, readiness writes, fences and pause/wait clearing. Daemons without a recorded ready failure workspace return an unavailable result, never substitute host checks.
+- Task diagnostics expose recorded environment waits, host probes, capacity waits and selection rejections. Complete rejected identities are not persisted for every refusal, and a pure capacity wait does not record the machine; these limits are reported rather than adding placement behavior.
+- The single-machine smoke case is `single_machine_environment_recheck_resumes_task_dispatch`; it passed by exact name. Web states passed through Vitest; real Chrome launch was blocked by the sandbox, so screenshots/Lighthouse are unverified.
+- Final validation and exact results are recorded in `implementation-step-b.md`: all changed test modules/files passed; the named smoke passed; Rust check/clippy/fmt and web typecheck/focused ESLint passed.
+
+### Step B list-query correction
+- [x] Batch Project readiness for the page, including daemon names and legacy pause owner resolution; reuse the pure response assembly for single GET.
+- [x] Batch `runnable_on` facts for both Agent list routes; profile/session lists have no per-row Agent response.
+- [x] Permanent SQLx statement-count regression for 1/20 Projects (empty, server/daemon readiness, legacy pause) and batched CLI/native Agent facts; full requested modules/files, clippy and fmt.
+- Measured counts, per-Agent comparison with b34fe4c8 and final command/pass-count results: `list-query-correction.md`.
+
+### Step B live-UI correction
+- [x] Readiness uses the full content width with heading/description above its table, compact relative times with absolute titles, one-line badges/actions, and a focusable contained scroll region.
+- [x] Admin pins use the runnable machine name or an exact daemon lookup; embedded pins use Server host, absent pins display offline/unavailable/disabled status beside the name, and IDs are titles.
+- [x] A server recheck without a Project location retains 404 and identifies the missing repository location; no-repository settings empty state explains why checks cannot run.
+- Verification: full web typecheck/lint, four related Vitest files (40 tests), API environment_surfaces (5 tests), services environment_surfaces (2 tests), clippy/fmt for touched Rust crates. Browser QA uses installed Chromium in single-process mode because normal launch is sandbox-blocked; readiness screenshots at 1440/1280/768 have no horizontal overflow and fully visible actions.
