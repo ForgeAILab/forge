@@ -282,7 +282,8 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
     pub input: String,
-    /// Bounded server context, sent as a separate final user-role content part.
+    /// Bounded server context, contributed to each provider request of the
+    /// turn after the conversation and never written to the session history.
     /// Never populated by user text or inferred from labels in that text.
     pub server_state_card: Option<String>,
     /// Programs this turn's workspace commands may spawn, resolved by the
