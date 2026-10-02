@@ -739,7 +739,7 @@ impl ForgeRuntimeBuilder {
         let domain_event_broadcast = Arc::new(DomainEventBroadcastConsumer::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
-            0,
+            None,
         ));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
@@ -892,15 +892,6 @@ impl RuntimeSupervisor {
         }
         if self.started {
             return Ok(0);
-        }
-
-        if let Err(error) = self
-            .runtime
-            .domain_event_broadcast
-            .initialize_at_head()
-            .await
-        {
-            tracing::warn!(%error, "SSE tail head initialization failed; retaining its in-memory position");
         }
 
         let recovered = match self.runtime.crash_recovery.run().await {

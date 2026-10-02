@@ -4983,10 +4983,27 @@ pub struct DomainEventConsumerLag {
     pub lag: i64,
     pub last_advanced_at: Option<String>,
     pub oldest_unprocessed_at: Option<String>,
+    pub initialized_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteStorageStatus {
     pub incremental_vacuum: bool,
     pub free_pages: i64,
+}
+
+impl DomainEventConsumerLag {
+    pub fn stalled(&self, now: chrono::DateTime<chrono::Utc>, seconds: i64) -> bool {
+        let old = |date: &str| {
+            chrono::DateTime::parse_from_rfc3339(date)
+                .ok()
+                .is_some_and(|date| {
+                    (now - date.with_timezone(&chrono::Utc)).num_seconds() > seconds
+                })
+        };
+        self.lag > 0
+            && self.oldest_unprocessed_at.as_deref().is_some_and(old)
+            && self.last_advanced_at.as_deref().is_none_or(old)
+            && self.initialized_at.as_deref().is_none_or(old)
+    }
 }

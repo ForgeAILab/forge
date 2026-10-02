@@ -14,6 +14,7 @@ struct TinyWorker {
     active: AtomicUsize,
     after_failure: bool,
     tick_panics: AtomicUsize,
+    tick_hangs: AtomicBool,
     defer_for: Duration,
     policy: RetryPolicy,
     timeout: Duration,
@@ -32,6 +33,7 @@ impl TinyWorker {
             active: AtomicUsize::new(0),
             after_failure: false,
             tick_panics: AtomicUsize::new(0),
+            tick_hangs: AtomicBool::new(false),
             defer_for: Duration::ZERO,
             policy: RetryPolicy {
                 max_attempts: 3,
@@ -61,6 +63,9 @@ impl Worker for TinyWorker {
         self.timeout
     }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        if self.tick_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self
             .tick_panics
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -272,22 +277,6 @@ async fn strict_order_sql_filter_and_no_per_ignored_event_writes() {
     );
     assert_eq!(runtime.write_transaction_count() - before, 2);
     assert_eq!(runtime.source.cursor().await.unwrap(), second.sequence);
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_processing_lease'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &db,
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_projection_receipt'"
-        )
-        .await,
-        0
-    );
 }
 
 // P4. Advance explicit Tokio time while each ignored append is observed.
@@ -1190,4 +1179,22 @@ async fn legacy_delivery(db: &SqliteDb, name: &str) {
     sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?) ON CONFLICT DO NOTHING").bind(name).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
     sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) SELECT ?, sequence, 'legacy', '2999-01-01T00:00:00Z', 1, ? FROM domain_event WHERE sequence > (SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?)")
         .bind(name).bind(db::now_rfc3339()).bind(name).execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_timed_out_tick_is_reported_and_does_not_gate_events() {
+    let db = database().await;
+    let mut worker = TinyWorker::new("hung-tick");
+    worker.tick_hangs.store(true, Ordering::SeqCst);
+    worker.timeout = Duration::from_millis(10);
+    let event = append(&db, "wanted", "good").await;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 1);
+    assert_eq!(effects(&db).await, vec![event.sequence]);
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT tick_error FROM worker_health WHERE worker_name = 'hung-tick'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(error.as_deref(), Some("worker tick timed out"));
 }

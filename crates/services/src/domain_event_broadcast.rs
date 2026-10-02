@@ -7,26 +7,21 @@ use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
-const CONSUMER_NAME: &str = "sse-broadcast";
 const BATCH_LIMIT: i64 = 100;
 const MIN_IDLE: Duration = Duration::from_millis(250);
 const MAX_IDLE: Duration = Duration::from_secs(5);
 pub struct DomainEventBroadcastConsumer {
     db: Arc<SqliteDb>,
-    events: DomainEventService,
-    position: Mutex<i64>,
+    bus: Arc<EventBus>,
+    position: Mutex<Option<i64>>,
 }
 impl DomainEventBroadcastConsumer {
-    pub fn new(db: Arc<SqliteDb>, bus: Arc<EventBus>, after: i64) -> Self {
+    pub fn new(db: Arc<SqliteDb>, bus: Arc<EventBus>, after: Option<i64>) -> Self {
         Self {
-            events: DomainEventService::new(Arc::clone(&db), bus),
+            bus,
             db,
             position: Mutex::new(after),
         }
-    }
-    pub(crate) async fn initialize_at_head(&self) -> Result<()> {
-        *self.position.lock().await = self.db.domain_event_head().await?;
-        Ok(())
     }
     pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -58,21 +53,23 @@ impl DomainEventBroadcastConsumer {
     }
     pub async fn broadcast_once(&self, limit: i64) -> Result<usize> {
         let mut position = self.position.lock().await;
+        let Some(after) = *position else {
+            // Failure leaves None. Retry head initialization without ever
+            // interpreting a failed read as a request to replay from zero.
+            *position = Some(self.db.domain_event_head().await?);
+            return Ok(0);
+        };
         let rows = self
             .db
-            .list_events_after(*position, limit.clamp(1, BATCH_LIMIT))
+            .list_events_after(after, limit.clamp(1, BATCH_LIMIT))
             .await?;
         for row in &rows {
-            self.events.publish_committed(row);
-            *position = row.sequence;
+            self.bus.publish(DomainEventService::committed_frame(row));
+            *position = Some(row.sequence);
         }
         Ok(rows.len())
     }
 }
-pub fn domain_event_broadcast_consumer_name() -> &'static str {
-    CONSUMER_NAME
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,7 +86,8 @@ mod tests {
         let db = database().await;
         let bus = Arc::new(EventBus::new(16));
         let mut rx = bus.subscribe();
-        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), 0);
+        let consumer =
+            DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), Some(0));
 
         // Simulate the outbox pattern used by, e.g., project creation from a
         // Charter approval: the event row is inserted directly (standing in
@@ -145,7 +143,8 @@ mod tests {
         let db = database().await;
         let bus = Arc::new(EventBus::new(512));
         let mut rx = bus.subscribe();
-        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), 0);
+        let consumer =
+            DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), Some(0));
         let mut expected = Vec::new();
         for n in 0..250 {
             let event = db
@@ -188,5 +187,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health, 0);
+    }
+    #[tokio::test]
+    async fn audit_failed_startup_head_read_never_broadcasts_the_ledger() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+        let relay = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), None);
+        sqlx::query("ALTER TABLE domain_event RENAME TO unavailable_events")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(relay.broadcast_once(100).await.is_err());
+        assert_eq!(*relay.position.lock().await, None);
+        sqlx::query("ALTER TABLE unavailable_events RENAME TO domain_event")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.append_event(CreateDomainEvent {
+            id: "historical".into(),
+            event_type: "test".into(),
+            entity_type: "project".into(),
+            entity_id: "p".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: "p".into(),
+            correlation_id: "historical".into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
+        assert_eq!(relay.broadcast_once(100).await.unwrap(), 0);
+        assert!(rx.try_recv().is_err());
     }
 }

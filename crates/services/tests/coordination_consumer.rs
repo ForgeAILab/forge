@@ -265,6 +265,10 @@ async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_on
         .execute(db.pool())
         .await
         .unwrap();
+    sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
+        .execute(db.pool())
+        .await
+        .unwrap();
     let first = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
@@ -279,7 +283,6 @@ async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_on
             .processed_events,
         0
     );
-    assert_eq!(first.reconciled_events, 1);
     assert_eq!(first.processed_events, first.claimed_events);
 
     let stored = AgentCommitmentRepo::get_commitment(&*db, &commitment.id)
@@ -325,7 +328,6 @@ async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_on
         .await
         .unwrap();
     assert!(replay.claimed_events >= 1);
-    assert_eq!(replay.reconciled_events, 1);
     assert_eq!(
         AgentCommitmentRepo::list_commitment_evidence(&*db, &commitment.id)
             .await
@@ -659,11 +661,10 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     )
     .await
     .unwrap();
-    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db))
+    CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
-    assert_eq!(first.reconciled_events, 1);
 
     let old_inbox = AgentInboxRepo::list_inbox_items(
         &*db,
@@ -722,4 +723,228 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
         .len(),
         2
     );
+}
+
+async fn audit_outcome_failure_fixture(
+    status: db::AgentCommitmentStatus,
+    replay_conflict: bool,
+    concurrent: bool,
+) {
+    let database_path = format!(
+        "/Volumes/Data/tmp/forge-coordination-race-{}.sqlite",
+        new_uuid_v4()
+    );
+    let db = if concurrent {
+        let pool = create_sqlite_pool(&format!("sqlite://{database_path}"))
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        Arc::new(SqliteDb::new(pool))
+    } else {
+        database().await
+    };
+    let identity_id = "identity-wedge";
+    seed_identity(&db, identity_id).await;
+    let now = now_rfc3339();
+    let project_id = "project-wedge";
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.to_owned(),
+            name: "Wedge Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("user-1".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut tasks = Vec::new();
+    for id in ["task-wedge", "task-behind"] {
+        tasks.push(
+            TaskRepo::create(
+                &*db,
+                CreateTask {
+                    id: id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    parent_task_id: None,
+                    assignee_type: None,
+                    assignee_id: None,
+                    title: id.to_owned(),
+                    description: None,
+                    task_type: "task".to_owned(),
+                    status: "done".to_owned(),
+                    is_automation: false,
+                    priority: 0,
+                    subtask_order: None,
+                    task_state_config: None,
+                    merge_config: None,
+                    plan: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let commitments = CommitmentService::new(Arc::clone(&db));
+    let mut created = Vec::new();
+    for task in &tasks {
+        created.push(
+            commitments
+                .create(CreateCommitmentInput {
+                    id: Some(format!("commitment-{}", task.id)),
+                    owner_identity_id: identity_id.to_owned(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id.to_owned(),
+                    title: "Deliver".to_owned(),
+                    description: None,
+                    status: db::AgentCommitmentStatus::InProgress,
+                    due_at: None,
+                    correlation_id: format!("correlation-{}", task.id),
+                    originating_action_id: None,
+                    originating_task_id: Some(task.id.clone()),
+                    evidence_required: true,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    if status == db::AgentCommitmentStatus::Cancelled {
+        commitments
+            .cancel(
+                created[0].id.clone(),
+                created[0].version,
+                "no longer needed".into(),
+                "user".into(),
+                "user-1".into(),
+                "cancel-wedge".into(),
+            )
+            .await
+            .unwrap();
+    } else if status == db::AgentCommitmentStatus::Blocked {
+        sqlx::query(
+            "UPDATE agent_commitment SET status = 'blocked', version = version + 1 WHERE id = ?",
+        )
+        .bind(&created[0].id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    // ...and its Task still reaches done afterwards. Then another Task finishes.
+    let workflow = services::workflow::default_workflow::default_workflow();
+    for task in &tasks {
+        let snapshot = services::workflow::transition_event::transition_workflow_snapshot(
+            task,
+            &workflow,
+            "in_progress",
+            "done",
+        )
+        .unwrap();
+        DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent::task_transition(
+                format!("transition-{}", task.id),
+                task.id.clone(),
+                project_id,
+                "in_progress",
+                "done",
+                None,
+                "system:workflow",
+                "delivered",
+                false,
+                now_rfc3339(),
+                snapshot,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let consumer = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    if replay_conflict {
+        consumer.run_once(1).await.unwrap();
+        sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+            .bind(&tasks[0].id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 0 WHERE consumer_name = ?")
+            .bind(coordination_consumer_name())
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    if concurrent {
+        let other = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+        let (a, b) = tokio::join!(consumer.run_once(100), other.run_once(100));
+        assert!(a.is_ok() || b.is_ok());
+    }
+    consumer.run_once(100).await.unwrap();
+    let cursor = db
+        .get_consumer_cursor(coordination_consumer_name())
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    let (attempts, runtime_error, item_error): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT retry_attempts, runtime_error, item_error FROM worker_health WHERE worker_name = ?",
+    )
+    .bind(coordination_consumer_name())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let behind = db
+        .get_commitment(&created[1].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let last = db
+        .get_event("transition-task-behind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor, last.sequence);
+    assert_eq!(attempts, 0);
+    assert!(runtime_error.is_none() && item_error.is_none());
+    assert_eq!(
+        dead,
+        i64::from(status == db::AgentCommitmentStatus::Blocked || replay_conflict)
+    );
+    assert_eq!(behind, db::AgentCommitmentStatus::Completed);
+    if status == db::AgentCommitmentStatus::Cancelled {
+        assert_eq!(
+            db.get_commitment(&created[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            db::AgentCommitmentStatus::Cancelled
+        );
+    }
+}
+#[tokio::test]
+async fn audit_cancelled_commitment_is_noop_and_later_outcome_reconciles() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::Cancelled, false, false).await;
+}
+#[tokio::test]
+async fn audit_blocked_completion_is_terminal_and_later_outcome_reconciles() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::Blocked, false, false).await;
+}
+#[tokio::test]
+async fn audit_inbox_replay_dedupe_check_is_terminal() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::InProgress, true, false).await;
+}
+
+#[tokio::test]
+async fn audit_two_runtimes_race_coordination_outcomes_on_file_database() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::InProgress, false, true).await;
 }

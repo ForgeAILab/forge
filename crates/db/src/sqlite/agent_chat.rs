@@ -1035,7 +1035,7 @@ impl AgentHandoffRepo for SqliteDb {
 
 /// Admit a chat message and queued turn using a caller-owned transaction.
 /// Wake disposition persistence uses this same primitive so a turn admission,
-/// its message-admitted event, the disposition, and the source-event receipt
+/// its message-admitted event, the disposition, and the source-event checkpoint
 /// share one commit boundary.
 pub(super) async fn admit_agent_chat_turn_in_tx(
     db: &SqliteDb,

@@ -174,9 +174,7 @@ pub use default_agents::ensure_default_agents;
 pub use deferred_dispatch::wake_task_dispatch;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
-pub use domain_event_broadcast::{
-    domain_event_broadcast_consumer_name, DomainEventBroadcastConsumer,
-};
+pub use domain_event_broadcast::DomainEventBroadcastConsumer;
 pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;

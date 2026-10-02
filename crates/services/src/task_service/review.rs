@@ -168,11 +168,7 @@ impl TaskService {
             Some(finished_at.clone()),
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -261,11 +257,7 @@ impl TaskService {
             None,
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)

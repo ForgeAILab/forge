@@ -86,6 +86,8 @@ impl AgentWakeDispositionRepo for SqliteDb {
              LEFT JOIN attention_projection AS attention
                ON attention.id = disposition.attention_id
              WHERE current.consumer_name = ?
+               AND NOT EXISTS (SELECT 1 FROM worker_dead_letter dead
+                   WHERE dead.worker_name = current.consumer_name AND dead.source_key = 'wake-retry:' || disposition.id)
                AND disposition.attempt_number < disposition.max_attempts
                AND (
                    (disposition.disposition = 'deferred'
@@ -277,6 +279,12 @@ impl AgentWakeDispositionRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
+        self.settle_wake_decision_in_tx(
+            &mut transaction,
+            &input.disposition,
+            input.expected_attention.as_ref(),
+        )
+        .await?;
         let disposition = disposition_from_create(&input.disposition);
         transaction.commit().await?;
         Ok(disposition)
@@ -703,6 +711,29 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
 }
 
 impl SqliteDb {
+    async fn settle_wake_decision_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        disposition: &CreateAgentWakeDisposition,
+        expected: Option<&ExpectedAttentionSnapshot>,
+    ) -> Result<()> {
+        if disposition.disposition == AgentWakeDispositionKind::TurnAdmitted {
+            if let Some(expected) = expected.filter(|expected| {
+                expected
+                    .dedupe_key
+                    .starts_with("attention:decision_recorded:")
+            }) {
+                self.resolve_attention_by_dedupe_in_tx(
+                    tx,
+                    &expected.dedupe_key,
+                    &disposition.source_event_id,
+                    &disposition.updated_at,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
     pub async fn persist_agent_wake_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
@@ -825,6 +856,12 @@ impl SqliteDb {
             disposition_from_create(&input.disposition)
         };
 
+        self.settle_wake_decision_in_tx(
+            transaction,
+            &input.disposition,
+            input.expected_attention.as_ref(),
+        )
+        .await?;
         Ok(disposition)
     }
 }

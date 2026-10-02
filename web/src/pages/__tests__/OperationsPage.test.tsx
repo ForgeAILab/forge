@@ -74,7 +74,7 @@ const degradedStatus: OperatorStatusResponse = {
   database: { incremental_vacuum: false, free_pages: 42 },
   event_consumers: [
     {
-      consumer_name: 'sse-broadcast',
+      consumer_name: 'attention_projection',
       last_sequence: 10,
       lag: 5,
       last_advanced_at: '2026-04-29T11:50:00Z',
@@ -274,8 +274,8 @@ describe('OperationsPage', () => {
 
   it('renders consumer lag, stalled status and database reclamation diagnostics', () => {
     render(<OperationsPage />)
-    expect(screen.getByText('sse-broadcast')).toBeTruthy()
-    expect(screen.getByText('Sequence lag 5')).toBeTruthy()
+    expect(screen.getByText('attention_projection')).toBeTruthy()
+    expect(screen.getByText('Pending events 5')).toBeTruthy()
     expect(screen.getByText('Stalled')).toBeTruthy()
     expect(screen.getByText('Conversion required')).toBeTruthy()
     expect(screen.getByText('42')).toBeTruthy()

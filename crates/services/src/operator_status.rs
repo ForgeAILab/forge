@@ -250,18 +250,7 @@ impl OperatorStatusService {
         Ok(lag
             .into_iter()
             .map(|consumer| {
-                // Both clocks must be old. An idle consumer has an old cursor,
-                // so an event that arrived a moment ago is not a stall.
-                let threshold = f64::from(self.consumer_stall_seconds);
-                let stalled = consumer.lag > 0
-                    && consumer
-                        .oldest_unprocessed_at
-                        .as_deref()
-                        .is_some_and(|pending| seconds_since(pending, now) > threshold)
-                    && consumer
-                        .last_advanced_at
-                        .as_deref()
-                        .is_none_or(|last| seconds_since(last, now) > threshold);
+                let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
                 EventConsumerStatus {
                     consumer_name: consumer.consumer_name,
                     last_sequence: consumer.last_sequence,
@@ -1482,6 +1471,14 @@ mod tests {
             .bind(name).bind(&old).execute(db.pool()).await.unwrap();
         crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
             .run_once(1)
+            .await
+            .unwrap();
+        // Model a worker that has been running for ten minutes; a newly
+        // initialized worker gets time to drain an upgraded checkpoint.
+        sqlx::query("UPDATE worker_health SET created_at = ? WHERE worker_name = ?")
+            .bind(&old)
+            .bind(name)
+            .execute(db.pool())
             .await
             .unwrap();
         // No health update follows either append, as when a handler is hung.

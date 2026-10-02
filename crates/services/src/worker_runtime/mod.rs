@@ -7,7 +7,7 @@ mod supervisor;
 pub use db::EventSubscription as Subscription;
 pub use db::{FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem, WorkerHealth};
 pub use event_source::DurableEventSource;
-pub use policy::{Outcome, WorkerError, WorkerErrorKind};
+pub use policy::{consumer_error, Outcome, WorkerError, WorkerErrorKind};
 pub use supervisor::{SupervisorPolicy, WorkerSupervisor};
 
 use crate::{Result, ServiceError};
@@ -221,7 +221,16 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
         {
             return;
         }
-        match catch_worker(async { self.worker.tick().await }, "worker tick panicked").await {
+        match catch_worker(
+            async {
+                tokio::time::timeout(self.worker.handle_timeout(), self.worker.tick())
+                    .await
+                    .unwrap_or_else(|_| Err(WorkerError::new("worker tick timed out")))
+            },
+            "worker tick panicked",
+        )
+        .await
+        {
             Ok(()) => {
                 self.tick_schedule
                     .lock()
@@ -239,7 +248,11 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                 tracing::warn!(worker = self.worker.name(), %error, "worker tick failed");
                 if let Err(report) = self
                     .health
-                    .report_error_kind(HealthErrorKind::Tick, error.message())
+                    .report_classified_error(
+                        HealthErrorKind::Tick,
+                        error.kind.as_str(),
+                        error.message(),
+                    )
                     .await
                 {
                     tracing::warn!(worker = self.worker.name(), %report, "failed to report tick error");
@@ -372,7 +385,11 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                     tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
                     let _ = self
                         .health
-                        .report_error_kind(HealthErrorKind::AfterCommit, error.message())
+                        .report_classified_error(
+                            HealthErrorKind::AfterCommit,
+                            error.kind.as_str(),
+                            error.message(),
+                        )
                         .await;
                 }
                 Ok(PollResult::Progress)

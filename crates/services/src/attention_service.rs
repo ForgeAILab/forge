@@ -20,12 +20,12 @@ use db::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Acquire, Row, Sqlite, Transaction};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::{
-    worker_runtime::{Outcome, RetryPolicy, Subscription, Worker, WorkerError, WorkerRuntime},
+    worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result, ServiceError,
 };
 
@@ -405,24 +405,19 @@ impl AttentionService {
         }
 
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let result = self
+        let committed = self
             .admit_wake_in_tx(&mut transaction, &request, &context)
             .await?;
         transaction.commit().await?;
-        if matches!(
-            result,
-            WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::BudgetExhausted
-            }
-        ) {
+        if let Some((scope_type, scope_id)) = committed.stall_scope {
             self.publish_autonomy_stall(
-                &request.scope_type,
-                &request.scope_id,
+                &scope_type,
+                &scope_id,
                 "the Project Agent's hourly wake budget is exhausted",
             )
             .await;
         }
-        Ok(result)
+        Ok(committed.result)
     }
 
     async fn admit_wake_in_tx(
@@ -430,6 +425,22 @@ impl AttentionService {
         transaction: &mut Transaction<'_, Sqlite>,
         request: &WakeAdmissionRequest,
         context: &WakeDecisionContext,
+    ) -> Result<CommittedWakeAdmission> {
+        let mut stall_scope = None;
+        let result = self
+            .admit_wake_result_in_tx(transaction, request, context, &mut stall_scope)
+            .await?;
+        Ok(CommittedWakeAdmission {
+            result,
+            stall_scope,
+        })
+    }
+    async fn admit_wake_result_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+        stall_scope: &mut Option<(String, String)>,
     ) -> Result<WakeAdmissionResult> {
         let now = parse_rfc3339(&request.now).unwrap_or_else(Utc::now);
         let lease_seconds = request.lease_seconds.clamp(1, 300);
@@ -630,6 +641,7 @@ impl AttentionService {
         }
 
         if budget == Some(0) {
+            *stall_scope = Some((budget_scope_type.clone(), budget_scope_id.clone()));
             self.append_wake_decision_in_tx(
                 transaction,
                 request,
@@ -645,6 +657,7 @@ impl AttentionService {
             });
         }
 
+        let mut budget_attempt = transaction.begin().await?;
         let window_started =
             (parse_rfc3339(&now).unwrap_or_else(Utc::now) - Duration::hours(1)).to_rfc3339();
         let budget_remaining = if let Some(budget) = budget {
@@ -656,7 +669,7 @@ impl AttentionService {
             .bind(&request.identity_id)
             .bind(&budget_scope_type)
             .bind(&budget_scope_id)
-            .fetch_optional(&mut **transaction)
+            .fetch_optional(&mut *budget_attempt)
             .await?;
             let (admitted_count, in_window) = current
                 .map(|row| {
@@ -668,7 +681,7 @@ impl AttentionService {
                 .unwrap_or((0, false));
             if in_window && admitted_count >= budget {
                 self.append_wake_decision_in_tx(
-                    transaction,
+                    &mut budget_attempt,
                     request,
                     context,
                     WakeDecisionEvent::Suppressed(WakeSuppressionReason::BudgetExhausted),
@@ -677,6 +690,7 @@ impl AttentionService {
                     &now,
                 )
                 .await?;
+                budget_attempt.commit().await?;
                 return Ok(WakeAdmissionResult::Suppressed {
                     reason: WakeSuppressionReason::BudgetExhausted,
                 });
@@ -692,7 +706,7 @@ impl AttentionService {
                 .bind(&request.identity_id)
                 .bind(&budget_scope_type)
                 .bind(&budget_scope_id)
-                .execute(&mut **transaction)
+                .execute(&mut *budget_attempt)
                 .await?;
             } else {
                 sqlx::query(
@@ -711,7 +725,7 @@ impl AttentionService {
                 .bind(&budget_scope_id)
                 .bind(&now)
                 .bind(&now)
-                .execute(&mut **transaction)
+                .execute(&mut *budget_attempt)
                 .await?;
             }
             Some((budget - admitted_count - 1).max(0))
@@ -751,15 +765,29 @@ impl AttentionService {
         .bind(&now)
         .bind(&request.correlation_id)
         .bind(request.causation_id.as_deref())
-        .execute(&mut **transaction)
+        .execute(&mut *budget_attempt)
         .await?;
         if lease_result.rows_affected() == 0 {
             // This is normally covered by the global pre-check.  Keep the
             // compare-and-swap result authoritative for same-transaction
             // replays and classify an expired lease/cooldown conservatively.
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
+            budget_attempt.rollback().await?;
+            self.append_wake_decision_in_tx(
+                transaction,
+                request,
+                context,
+                WakeDecisionEvent::Suppressed(WakeSuppressionReason::DuplicateIncident),
+                None,
+                None,
+                &now,
+            )
+            .await?;
+            return Ok(WakeAdmissionResult::Suppressed {
+                reason: WakeSuppressionReason::DuplicateIncident,
+            });
         }
 
+        budget_attempt.commit().await?;
         // The lease, budget increment, and pre-admitted wake event share one
         // transaction.  No budget is consumed for suppressed/setup-required
         // decision events.
@@ -1213,7 +1241,15 @@ impl AttentionService {
             .await?;
         let agent_health = self.agent_health(user_id, project_id, limit).await?;
         let recent_outcomes = self.recent_outcomes(user_id, project_id, limit).await?;
-        let capacity = self.capacity(user_id, project_id).await?;
+        let capacity = self
+            .capacity(
+                user_id,
+                project_id,
+                !health
+                    .as_ref()
+                    .is_some_and(|health| health.stale || health.last_error_code.is_some()),
+            )
+            .await?;
         Ok(MissionControlHomeResponse {
             needs_attention: attention
                 .items
@@ -1553,28 +1589,33 @@ impl AttentionService {
     }
 
     pub async fn consumer_health(&self) -> Result<Option<AttentionConsumerHealthResponse>> {
-        let row = sqlx::query("SELECT h.*, COALESCE(c.last_sequence, 0) AS last_sequence,
-            (SELECT COUNT(*) FROM domain_event WHERE sequence <= COALESCE(c.last_sequence, 0)) AS processed_events
+        let row = sqlx::query("SELECT h.*, COALESCE(c.last_sequence, 0) AS last_sequence
             FROM worker_health h LEFT JOIN event_consumer_cursor c ON c.consumer_name = h.worker_name WHERE h.worker_name = ?")
             .bind(CONSUMER_NAME).fetch_optional(self.db.pool()).await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let last_success_at: Option<String> = row.try_get("last_success_at")?;
-        let stale = last_success_at
-            .as_deref()
-            .and_then(parse_rfc3339)
-            .map(|t| Utc::now() - t > Duration::seconds(CONSUMER_STALE_SECONDS))
-            .unwrap_or(true);
+        let lag = self.db.domain_event_consumer_lag(&[CONSUMER_NAME]).await?;
+        let stale = lag
+            .first()
+            .is_some_and(|lag| lag.stalled(Utc::now(), CONSUMER_STALE_SECONDS));
+        let mut last_error_code: Option<String> = row.try_get("last_error_kind")?;
+        let mut last_error_message: Option<String> = row.try_get("last_error")?;
+        if last_error_message.is_none() {
+            let recent: Option<(String, String)> = sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
+                .bind(CONSUMER_NAME).bind((Utc::now() - Duration::hours(1)).to_rfc3339()).fetch_optional(self.db.pool()).await?;
+            if let Some((kind, message)) = recent {
+                last_error_code = Some(kind);
+                last_error_message = Some(message);
+            }
+        }
         Ok(Some(AttentionConsumerHealthResponse {
             consumer_name: CONSUMER_NAME.to_owned(),
             last_sequence: row.try_get("last_sequence")?,
-            last_success_at,
-            last_error_code: row
-                .try_get::<Option<String>, _>("last_error")?
-                .map(|_| "worker".to_owned()),
+            last_success_at: row.try_get("last_success_at")?,
+            last_error_code,
+            last_error_message,
             stale,
-            processed_events: row.try_get("processed_events")?,
             updated_at: row.try_get("updated_at")?,
         }))
     }
@@ -1915,6 +1956,11 @@ impl AttentionService {
     ) -> Result<Option<(String, String)>> {
         let mut stall = None;
         if let Some(p) = &prepared.incident {
+            let admitted: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE causation_id = ? AND event_type = 'agent.wake.admitted')")
+                .bind(&event.id).fetch_one(&mut **tx).await?;
+            if admitted != 0 {
+                return Ok(None);
+            }
             let attention = self
                 .db
                 .insert_attention_in_tx(tx, p.projection.clone())
@@ -1954,15 +2000,8 @@ impl AttentionService {
             };
             match &p.decision {
                 PreparedWakeDecision::Admit => {
-                    let result = self.admit_wake_in_tx(tx, &p.request, &context).await?;
-                    if matches!(
-                        result,
-                        WakeAdmissionResult::Suppressed {
-                            reason: WakeSuppressionReason::BudgetExhausted
-                        }
-                    ) {
-                        stall = Some((p.request.scope_type.clone(), p.request.scope_id.clone()));
-                    }
+                    let committed = self.admit_wake_in_tx(tx, &p.request, &context).await?;
+                    stall = committed.stall_scope;
                 }
                 PreparedWakeDecision::Suppressed(reason) => {
                     self.append_wake_decision_in_tx(
@@ -2717,6 +2756,7 @@ impl AttentionService {
         &self,
         user_id: &str,
         project_id: Option<&str>,
+        healthy: bool,
     ) -> Result<MissionControlCapacity> {
         let (predicate, values) = self.project_visibility_predicate(user_id, project_id);
         // Keep the query construction below explicit; it avoids interpolating
@@ -2764,11 +2804,7 @@ impl AttentionService {
             active_executions: active,
             queued_tasks: queued,
             active_sessions,
-            healthy: self
-                .consumer_health()
-                .await?
-                .map(|health| !health.stale && health.last_error_code.is_none())
-                .unwrap_or(false),
+            healthy,
         })
     }
 
@@ -3524,6 +3560,10 @@ fn bounded_wake_ref(value: &str) -> String {
     value.chars().take(MAX_WAKE_REF_CHARS).collect()
 }
 
+struct CommittedWakeAdmission {
+    result: WakeAdmissionResult,
+    stall_scope: Option<(String, String)>,
+}
 pub struct PreparedAttention {
     incident: Option<PreparedAttentionIncident>,
     resolutions: Vec<String>,
@@ -3544,7 +3584,13 @@ enum PreparedWakeDecision {
     SetupRequired,
 }
 fn projection_worker_error(error: ServiceError) -> WorkerError {
-    WorkerError::transient(bounded_error_message(&error))
+    let message = bounded_error_message(&error);
+    let kind = crate::worker_runtime::consumer_error(error).kind;
+    match kind {
+        crate::worker_runtime::WorkerErrorKind::Failure => WorkerError::new(message),
+        crate::worker_runtime::WorkerErrorKind::Transient => WorkerError::transient(message),
+        crate::worker_runtime::WorkerErrorKind::Terminal => WorkerError::terminal(message),
+    }
 }
 #[async_trait]
 impl Worker<Option<(String, String)>> for AttentionService {
@@ -3554,12 +3600,6 @@ impl Worker<Option<(String, String)>> for AttentionService {
     }
     fn subscription(&self) -> Subscription {
         Subscription::All
-    }
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy::default()
-    }
-    fn handle_timeout(&self) -> StdDuration {
-        StdDuration::from_secs(300)
     }
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
         self.resolve_superseded_turn_incidents()
@@ -3832,6 +3872,10 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         sqlx::query("DROP TRIGGER fail_after_projection")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
             .execute(service.db.pool())
             .await
             .unwrap();

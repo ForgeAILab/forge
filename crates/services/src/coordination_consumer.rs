@@ -16,14 +16,11 @@ use db::{
 };
 use serde_json::{json, Value};
 use sqlx::{Row, Sqlite, Transaction};
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    worker_runtime::{Outcome, RetryPolicy, Subscription, Worker, WorkerError, WorkerRuntime},
+    worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     CommitmentService, Result, ServiceError,
 };
 
@@ -40,7 +37,6 @@ const EVENT_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinationOutcomeRun {
     pub claimed_events: usize,
-    pub reconciled_events: usize,
     pub processed_events: usize,
     pub last_sequence: i64,
 }
@@ -50,7 +46,6 @@ pub struct CoordinationOutcomeConsumer {
     db: Arc<SqliteDb>,
     commitments: CommitmentService,
     consumer_name: String,
-    reconciled: Arc<AtomicUsize>,
 }
 
 impl CoordinationOutcomeConsumer {
@@ -59,7 +54,6 @@ impl CoordinationOutcomeConsumer {
             commitments: CommitmentService::new(Arc::clone(&db)),
             db,
             consumer_name: CONSUMER_NAME.to_owned(),
-            reconciled: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -72,7 +66,6 @@ impl CoordinationOutcomeConsumer {
         Arc::new(WorkerRuntime::new(Arc::clone(&self.db), self)).start(shutdown)
     }
     pub async fn run_once(&self, limit: i64) -> Result<CoordinationOutcomeRun> {
-        let before = self.reconciled.load(Ordering::Relaxed);
         let processed_events = WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
             .run_once(limit.clamp(1, 100) as usize)
             .await?;
@@ -84,7 +77,6 @@ impl CoordinationOutcomeConsumer {
         Ok(CoordinationOutcomeRun {
             claimed_events: processed_events,
             processed_events,
-            reconciled_events: self.reconciled.load(Ordering::Relaxed) - before,
             last_sequence,
         })
     }
@@ -117,6 +109,9 @@ impl CoordinationOutcomeConsumer {
         let mut commitments = Vec::new();
         for commitment_id in commitment_ids {
             let commitment = self.commitments.get(&commitment_id).await?;
+            if commitment.status == AgentCommitmentStatus::Cancelled {
+                continue;
+            }
             if !self
                 .commitment_scope_matches_task(&commitment.scope_type, &commitment.scope_id, &task)
                 .await?
@@ -290,6 +285,9 @@ impl CoordinationOutcomeConsumer {
             .get_commitment_in_tx(tx, &commitment.id)
             .await?
             .ok_or(db::DbError::NotFound)?;
+        if current.status == AgentCommitmentStatus::Cancelled {
+            return Ok(());
+        }
         let dedupe_key = format!("task-outcome:{}:{}:commitment", task.id, event.id);
         match outcome {
             TaskOutcome::Delivered => {
@@ -525,12 +523,6 @@ impl Worker for CoordinationOutcomeConsumer {
     fn subscription(&self) -> Subscription {
         Subscription::Exact(EVENT_TYPES.iter().map(|s| s.to_string()).collect())
     }
-    fn retry_policy(&self) -> RetryPolicy {
-        RetryPolicy::default()
-    }
-    fn handle_timeout(&self) -> Duration {
-        Duration::from_secs(300)
-    }
     async fn handle(
         &self,
         event: &DomainEvent,
@@ -538,7 +530,7 @@ impl Worker for CoordinationOutcomeConsumer {
         self.prepare_event(event)
             .await
             .map(|p| p.map_or(Outcome::Skip, Outcome::Done))
-            .map_err(|e| WorkerError::transient(format!("coordination preparation failed: {e}")))
+            .map_err(crate::worker_runtime::consumer_error)
     }
     async fn commit(
         &self,
@@ -554,22 +546,23 @@ impl Worker for CoordinationOutcomeConsumer {
                     .await?;
             }
             for (recipient, source) in &p.recipients {
+                if let RecipientSource::Commitment(id) = source {
+                    if self
+                        .db
+                        .get_commitment_in_tx(tx, id)
+                        .await?
+                        .is_some_and(|current| current.status == AgentCommitmentStatus::Cancelled)
+                    {
+                        continue;
+                    }
+                }
                 self.deliver_outcome_in_tx(tx, recipient, source, &p.task, event, &p.outcome)
                     .await?;
             }
             Ok::<_, ServiceError>(())
         }
         .await
-        .map_err(|e| WorkerError::transient(format!("coordination persistence failed: {e}")))
-    }
-    async fn after_commit(
-        &self,
-        _: &DomainEvent,
-        _: &Self::Prepared,
-        _: &(),
-    ) -> std::result::Result<(), WorkerError> {
-        self.reconciled.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        .map_err(crate::worker_runtime::consumer_error)
     }
 }
 

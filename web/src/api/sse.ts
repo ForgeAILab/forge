@@ -13,7 +13,7 @@ import type { AgentChatTurn } from '@/features/agent-chat/types'
  * The backend sends SSE as one canonical envelope per frame (D20): every
  * frame is a default `message` event, and the JSON payload's `event_type`
  * field is the sole routing discriminator:
- *   id: <entity_id>
+ *   id: domain-event:<sequence> (durable frames only; other frames omit id)
  *   data: JSON { event_type, entity_id, timestamp, ...context_fields }
  *
  * Context fields vary by event type and are flattened via serde(flatten).

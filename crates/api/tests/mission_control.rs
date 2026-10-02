@@ -163,7 +163,8 @@ async fn mission_control_reports_visible_attention_count_and_stale_health() {
         .bind(&stale).bind(&stale).execute(&mut *tx).await.unwrap();
     sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 12 WHERE consumer_name = 'attention_projection'").execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
-    // This view derives completed counts from the retained checkpoint's ledger.
+    // Fill the ledger through the retained checkpoint: old success timestamps
+    // cannot mark a caught-up consumer stale or reduce healthy capacity.
     while harness.state.db.domain_event_head().await.unwrap() < 12 {
         harness
             .state
@@ -197,11 +198,11 @@ async fn mission_control_reports_visible_attention_count_and_stale_health() {
     .await;
 
     assert_eq!(home.needs_attention.len(), 1);
+    assert!(home.capacity.healthy);
     let health: AttentionConsumerHealthResponse =
         home.consumer_health.expect("consumer health is returned");
-    assert!(health.stale);
+    assert!(!health.stale);
     assert_eq!(health.last_sequence, 12);
-    assert_eq!(health.processed_events, 12);
 }
 
 #[tokio::test]

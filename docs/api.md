@@ -786,12 +786,14 @@ Entries carry actor, canonical scope, operation, input digest, policy result,
 status, correlation id, optional committed outcome, and occurrence time. The
 projection never returns an action payload body.
 
-The Attention `consumer_health` view now reads `worker_health` and its retained
-checkpoint. `processed_events` counts ledger rows through that checkpoint;
-`last_success_at` changes only when progress commits. Read-only idle polls write
-no heartbeat. Worker errors appear as `last_error_code: "worker"`; the bounded
-cause remains available in operator `recent_errors`. `stale` retains its existing
-90-second successful-progress threshold.
+The Attention `consumer_health` view reads `worker_health` and live checkpoint lag.
+`processed_events` is removed. `stale` means subscribed events are pending and
+both the oldest pending event and checkpoint/initialization progress are older
+than 90 seconds; caught-up idle and newly initialized consumers are not stale.
+`last_error_code` now reports the worker kind (`failure`, `transient`, `terminal`)
+and `last_error_message` supplies its bounded diagnostic. Recent quarantine
+records remain visible for the same one-hour window as operator issues.
+Read-only idle polls write no heartbeat.
 
 Without `project_id`, authorized account/Main activity and all visible Project
 activity are included. Account/Main Chat entries are visible only to the
@@ -3728,7 +3730,8 @@ historical ledger rows. Frame IDs are transport identifiers:
 A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that
 fits SQLite's signed 64-bit sequence range, requests replay after that sequence.
 Missing, entity-shaped, old event-ID-shaped, or malformed IDs produce live-only
-connections. No numeric sequence query parameter is introduced.
+connections. A durable cursor beyond the current ledger head emits one resync
+frame with `reason: "resume cursor beyond ledger head"` before continuing live. No numeric sequence query parameter is introduced.
 
 Resume subscribes to the live bus before capturing a ledger head. If at most
 1,000 rows were missed, it reads them in 100-row pages and emits them in sequence
@@ -3738,8 +3741,8 @@ exactly one `events.resync_required` frame with `reason: "replay limit exceeded"
 emits no replay frames, and continues live. The cap check visits at most 1,001
 sequence keys rather than counting or loading the whole backlog. Ledger-read
 failures also request resync. Bus-only events remain live-only; bus overflow still
-requests resync. Direct publisher plus relay invalidation may repeat a newly
-committed event, as before.
+requests resync. The ordered relay is the sole publisher of durable frames, including events
+from standalone appends and composite transactions.
 
 The web client routes `event.data` and does not inspect `lastEventId`; forge-ctl
 also routes JSON payloads rather than frame IDs. MCP's stream is separate from

@@ -472,7 +472,7 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
             <div className="min-w-0">
               <p className="break-all font-mono text-xs text-foreground">{item.consumer_name}</p>
               <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                <span>Sequence lag {item.lag}</span>
+                <span>Pending events {item.lag}</span>
                 <span>Cursor {item.last_sequence}</span>
                 <span>Last advanced {formatDate(item.last_advanced_at)}</span>
                 {item.oldest_unprocessed_age_seconds !== null ? (

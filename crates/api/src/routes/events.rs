@@ -35,6 +35,12 @@ pub async fn stream_events(
     let (replay, replay_through) = match resume {
         None => (Replay::None, None),
         Some(after) => match state.db.domain_event_head().await {
+            Ok(through) if after > through => (
+                Replay::Resync {
+                    reason: "resume cursor beyond ledger head",
+                },
+                Some(through),
+            ),
             Ok(through) => {
                 let replay = match state
                     .db

@@ -73,6 +73,7 @@ impl WorkerHealth {
                 PoisonDecision::DeadLettered
             )
         {
+            let source_key = item.source_key;
             self.dead_letter_in_tx(
                 tx,
                 item,
@@ -83,13 +84,15 @@ impl WorkerHealth {
                 &reason,
             )
             .await?;
+            sqlx::query("UPDATE worker_dead_letter SET error_kind = ? WHERE worker_name = ? AND source_key = ?")
+                .bind(if terminal { "terminal" } else { "failure" }).bind(&self.name).bind(source_key).execute(&mut **tx).await?;
             self.clear_pending_in_tx(tx).await?;
             self.clear_kind_in_tx(tx, HealthErrorKind::Item).await?;
             return Ok(PoisonDecision::DeadLettered);
         }
         let delay = policy.delay(attempts as u32);
         sqlx::query("UPDATE worker_health SET retry_source_key = ?, retry_attempts = ?,
-            retry_not_before = ?, retry_started_at = ?, item_error = ?, item_error_at = ?, updated_at = ?,
+            retry_not_before = ?, retry_started_at = ?, item_error = ?, item_error_at = ?, item_error_kind = 'failure', updated_at = ?,
             deferred_source_key = NULL, deferred_reason = NULL, deferred_since = NULL, defer_not_before = NULL
             WHERE worker_name = ?")
             .bind(item.source_key).bind(attempts).bind(not_before(delay)).bind(started)
@@ -153,7 +156,7 @@ impl WorkerHealth {
             "UPDATE worker_health SET retry_source_key = NULL, retry_attempts = 0,
             retry_not_before = NULL, retry_started_at = NULL, deferred_source_key = NULL,
             deferred_reason = NULL, deferred_since = NULL, defer_not_before = NULL,
-            item_error = NULL, item_error_at = NULL WHERE worker_name = ?",
+            item_error = NULL, item_error_at = NULL, item_error_kind = NULL WHERE worker_name = ?",
         )
         .bind(&self.name)
         .execute(&mut **tx)
@@ -167,8 +170,9 @@ impl WorkerHealth {
         source_key: &str,
     ) -> Result<()> {
         let now = now_rfc3339();
-        sqlx::query("UPDATE worker_health SET last_success_at = ?, updated_at = ?, after_commit_error = NULL, after_commit_error_at = NULL, item_error = CASE WHEN retry_source_key = ? THEN NULL ELSE item_error END, item_error_at = CASE WHEN retry_source_key = ? THEN NULL ELSE item_error_at END, retry_attempts = CASE WHEN retry_source_key = ? THEN 0 ELSE retry_attempts END, retry_not_before = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_not_before END, retry_started_at = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_started_at END, retry_source_key = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_source_key END, deferred_reason = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_reason END, deferred_since = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_since END, defer_not_before = CASE WHEN deferred_source_key = ? THEN NULL ELSE defer_not_before END, deferred_source_key = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_source_key END WHERE worker_name = ?")
+        sqlx::query("UPDATE worker_health SET last_success_at = ?, updated_at = ?, after_commit_error = NULL, after_commit_error_at = NULL, after_commit_error_kind = NULL, item_error = CASE WHEN retry_source_key = ? THEN NULL ELSE item_error END, item_error_kind = CASE WHEN retry_source_key = ? THEN NULL ELSE item_error_kind END, item_error_at = CASE WHEN retry_source_key = ? THEN NULL ELSE item_error_at END, retry_attempts = CASE WHEN retry_source_key = ? THEN 0 ELSE retry_attempts END, retry_not_before = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_not_before END, retry_started_at = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_started_at END, retry_source_key = CASE WHEN retry_source_key = ? THEN NULL ELSE retry_source_key END, deferred_reason = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_reason END, deferred_since = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_since END, defer_not_before = CASE WHEN deferred_source_key = ? THEN NULL ELSE defer_not_before END, deferred_source_key = CASE WHEN deferred_source_key = ? THEN NULL ELSE deferred_source_key END WHERE worker_name = ?")
             .bind(&now).bind(&now)
+            .bind(source_key)
             .bind(source_key)
             .bind(source_key)
             .bind(source_key)
@@ -192,13 +196,33 @@ impl WorkerHealth {
         kind: HealthErrorKind,
         reason: &str,
     ) -> Result<()> {
+        self.classified_error_in_tx(
+            tx,
+            kind,
+            if matches!(kind, HealthErrorKind::Runtime) {
+                "transient"
+            } else {
+                "failure"
+            },
+            reason,
+        )
+        .await
+    }
+    async fn classified_error_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        kind: HealthErrorKind,
+        class: &str,
+        reason: &str,
+    ) -> Result<()> {
         let (column, at) = kind.columns();
         let now = now_rfc3339();
         sqlx::query(&format!(
-            "UPDATE worker_health SET {column} = ?, {at} = ?, updated_at = ? WHERE worker_name = ?"
+            "UPDATE worker_health SET {column} = ?, {at} = ?, {column}_kind = ?, updated_at = ? WHERE worker_name = ?"
         ))
         .bind(bounded_error(reason))
         .bind(&now)
+        .bind(class)
         .bind(&now)
         .bind(&self.name)
         .execute(&mut **tx)
@@ -211,26 +235,46 @@ impl WorkerHealth {
         kind: HealthErrorKind,
     ) -> Result<()> {
         let (column, at) = kind.columns();
-        sqlx::query(&format!("UPDATE worker_health SET {column} = NULL, {at} = NULL WHERE worker_name = ? AND {column} IS NOT NULL"))
+        sqlx::query(&format!("UPDATE worker_health SET {column} = NULL, {at} = NULL, {column}_kind = NULL WHERE worker_name = ? AND {column} IS NOT NULL"))
             .bind(&self.name).execute(&mut **tx).await?;
         Ok(())
     }
     /// Repeated identical infrastructure/tick errors do not write again.
     pub async fn report_error_kind(&self, kind: HealthErrorKind, reason: &str) -> Result<()> {
+        self.report_classified_error(
+            kind,
+            if matches!(kind, HealthErrorKind::Runtime) {
+                "transient"
+            } else {
+                "failure"
+            },
+            reason,
+        )
+        .await
+    }
+    pub async fn report_classified_error(
+        &self,
+        kind: HealthErrorKind,
+        class: &str,
+        reason: &str,
+    ) -> Result<()> {
         let reason = bounded_error(reason);
         let (column, _) = kind.columns();
-        let stored: Option<Option<String>> = sqlx::query_scalar(&format!(
-            "SELECT {column} FROM worker_health WHERE worker_name = ?"
+        let stored: Option<(Option<String>, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT {column}, {column}_kind FROM worker_health WHERE worker_name = ?"
         ))
         .bind(&self.name)
         .fetch_optional(self.db.pool())
         .await?;
-        if stored.flatten().as_deref() == Some(&reason) {
+        if stored.is_some_and(|(message, kind)| {
+            message.as_deref() == Some(&reason) && kind.as_deref() == Some(class)
+        }) {
             return Ok(());
         }
         let mut tx = crate::begin_immediate(self.db.pool()).await?;
         self.ensure_in_tx(&mut tx).await?;
-        self.error_kind_in_tx(&mut tx, kind, &reason).await?;
+        self.classified_error_in_tx(&mut tx, kind, class, &reason)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -265,6 +309,71 @@ impl WorkerHealth {
             defer_key: row.try_get("deferred_source_key")?,
             defer_at: row.try_get("defer_not_before")?,
         })
+    }
+
+    pub async fn isolated_item_ready(&self, key: &str) -> Result<bool> {
+        let dead: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM worker_dead_letter WHERE worker_name = ? AND source_key = ?)")
+            .bind(&self.name).bind(key).fetch_one(self.db.pool()).await?;
+        if dead != 0 {
+            return Ok(false);
+        }
+        let due: Option<String> = sqlx::query_scalar("SELECT retry_not_before FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+            .bind(&self.name).bind(key).fetch_optional(self.db.pool()).await?;
+        Ok(due.is_none_or(|due| due <= now_rfc3339()))
+    }
+    pub async fn isolated_item_error(&self, key: &str) -> Result<Option<(String, String)>> {
+        Ok(sqlx::query_as("SELECT error_kind, last_error FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+            .bind(&self.name).bind(key).fetch_optional(self.db.pool()).await?)
+    }
+    pub async fn isolated_item_failed(
+        &self,
+        item: WorkItem<'_>,
+        policy: RetryPolicy,
+        class: &str,
+        reason: &str,
+    ) -> Result<PoisonDecision> {
+        let mut tx = crate::begin_immediate(self.db.pool()).await?;
+        let previous: Option<(i64, String)> = sqlx::query_as("SELECT attempts, first_failed_at FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+            .bind(&self.name).bind(item.source_key).fetch_optional(&mut *tx).await?;
+        let (attempts, started) = previous.unwrap_or((0, now_rfc3339()));
+        let attempts = attempts as u32 + 1;
+        let decision = if class == "terminal" {
+            PoisonDecision::DeadLettered
+        } else {
+            policy.decision(attempts)
+        };
+        if matches!(decision, PoisonDecision::DeadLettered) {
+            let key = item.source_key;
+            self.dead_letter_in_tx(
+                &mut tx,
+                item,
+                FailureState {
+                    attempts,
+                    first_failed_at: &started,
+                },
+                reason,
+            )
+            .await?;
+            sqlx::query("UPDATE worker_dead_letter SET error_kind = ? WHERE worker_name = ? AND source_key = ?").bind(class).bind(&self.name).bind(key).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+                .bind(&self.name)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("INSERT INTO worker_item_failure (worker_name, source_key, attempts, first_failed_at, last_error, error_kind, retry_not_before) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO UPDATE SET attempts = excluded.attempts, last_error = excluded.last_error, error_kind = excluded.error_kind, retry_not_before = excluded.retry_not_before")
+                .bind(&self.name).bind(item.source_key).bind(i64::from(attempts)).bind(started).bind(bounded_error(reason)).bind(class).bind(not_before(policy.delay(attempts))).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(decision)
+    }
+    pub async fn isolated_item_succeeded(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM worker_item_failure WHERE worker_name = ? AND source_key = ?")
+            .bind(&self.name)
+            .bind(key)
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
     }
     pub async fn record_restart(&self, reason: &str) -> Result<()> {
         let mut tx = crate::begin_immediate(self.db.pool()).await?;

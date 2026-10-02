@@ -74,3 +74,41 @@ pub(super) fn bounded_error(value: &str) -> String {
         .take(1_024)
         .collect()
 }
+
+impl WorkerErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Transient => "transient",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+/// Classification shared by the durable projections. Domain refusals cannot
+/// become valid by repeating the same event; availability and CAS races can.
+pub fn consumer_error(error: crate::ServiceError) -> WorkerError {
+    use crate::ServiceError as S;
+    use db::DbError as D;
+    let message = error.to_string();
+    match &error {
+        S::Db(e) if e.is_transient() => WorkerError::transient(message),
+        S::Db(
+            D::NotFound
+            | D::Check(_)
+            | D::IdempotencyConflict
+            | D::InvalidTransition
+            | D::InvalidTaskMove(_)
+            | D::TurnNotRetryable
+            | D::InvalidCursor,
+        )
+        | S::InvalidOperation { .. }
+        | S::NotFound { .. }
+        | S::AuthorizationDenied { .. } => WorkerError::terminal(message),
+        S::ExecutionAlreadyRunning { .. }
+        | S::RateLimited { .. }
+        | S::DaemonUnavailable { .. }
+        | S::DaemonNotReady { .. }
+        | S::DaemonTimeout { .. } => WorkerError::transient(message),
+        _ => WorkerError::new(message),
+    }
+}

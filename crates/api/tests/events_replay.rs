@@ -47,8 +47,9 @@ async fn append_many(db: &db::SqliteDb, count: usize) -> Vec<DomainEvent> {
     events
 }
 fn publish(h: &common::Harness, event: &DomainEvent) {
-    services::DomainEventService::new(Arc::clone(&h.state.db), Arc::clone(&h.state.event_bus))
-        .publish_committed(event);
+    h.state
+        .event_bus
+        .publish(services::DomainEventService::committed_frame(event));
 }
 async fn response_stream(h: &common::Harness, resume: Option<&str>) -> BodyDataStream {
     let mut request =
@@ -108,7 +109,7 @@ async fn plain_connect_is_live_only_and_frame_ids_distinguish_durable_and_bus_ev
     let relay = services::DomainEventBroadcastConsumer::new(
         Arc::clone(&h.state.db),
         Arc::clone(&h.state.event_bus),
-        historical.sequence,
+        Some(historical.sequence),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -337,4 +338,49 @@ async fn durable_cursor_survives_bus_only_frame_and_reconnect_replays_missed_eve
             .is_err(),
         "missed durable events replay exactly once"
     );
+}
+
+#[tokio::test]
+async fn audit_resume_beyond_head_requests_resync_then_goes_live() {
+    let workspace = common::TestDir::new("events-beyond-head");
+    let h = common::test_app(workspace.path(), "events-beyond-head").await;
+    append(&h.state.db, "only").await;
+    let mut stream = response_stream(&h, Some("domain-event:5000")).await;
+    let (id, payload) = next_event(&mut stream).await;
+    assert_eq!(id, None);
+    assert_eq!(payload["event_type"], "events.resync_required");
+    assert_eq!(payload["reason"], "resume cursor beyond ledger head");
+    let live = append(&h.state.db, "live-after").await;
+    publish(&h, &live);
+    assert_eq!(
+        next_event(&mut stream).await.0,
+        Some(format!("domain-event:{}", live.sequence))
+    );
+}
+#[tokio::test]
+async fn audit_composite_and_service_commits_are_published_in_order_by_the_relay() {
+    let workspace = common::TestDir::new("events-ordered-publisher");
+    let h = common::test_app(workspace.path(), "events-ordered-publisher").await;
+    let mut stream = response_stream(&h, None).await;
+    let pending = append_many(&h.state.db, 4).await;
+    let service = services::DomainEventService::new(Arc::clone(&h.state.db));
+    let fifth = service.append(input("fifth")).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stream.next())
+            .await
+            .is_err(),
+        "service append must not bypass the relay"
+    );
+    let relay = services::DomainEventBroadcastConsumer::new(
+        Arc::clone(&h.state.db),
+        Arc::clone(&h.state.event_bus),
+        Some(0),
+    );
+    assert_eq!(relay.broadcast_once(100).await.unwrap(), 5);
+    for event in pending.iter().chain(std::iter::once(&fifth)) {
+        assert_eq!(
+            next_event(&mut stream).await.0,
+            Some(format!("domain-event:{}", event.sequence))
+        );
+    }
 }

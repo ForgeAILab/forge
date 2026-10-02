@@ -103,14 +103,11 @@ impl SqliteDb {
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
             "WITH consumers(consumer_name) AS (SELECT CAST(NULL AS TEXT) WHERE 0",
         );
-        for name in expected_consumers
-            .iter()
-            .filter(|name| **name != "sse-broadcast")
-        {
+        for name in expected_consumers {
             query.push(" UNION SELECT ").push_bind(*name);
         }
         query.push(") SELECT consumers.consumer_name, COALESCE(cursor.last_sequence, 0) AS last_sequence,
-            cursor.updated_at, health.subscription_json FROM consumers
+            cursor.updated_at, health.subscription_json, health.created_at AS initialized_at FROM consumers
             LEFT JOIN event_consumer_cursor AS cursor USING (consumer_name)
             LEFT JOIN worker_health AS health ON health.worker_name = consumers.consumer_name ORDER BY consumer_name");
         let rows = query.build().fetch_all(&self.pool).await?;
@@ -130,6 +127,7 @@ impl SqliteDb {
             result.push(DomainEventConsumerLag {
                 consumer_name: row.try_get("consumer_name")?,
                 last_sequence: cursor,
+                initialized_at: row.try_get("initialized_at")?,
                 lag,
                 last_advanced_at: row.try_get("updated_at")?,
                 oldest_unprocessed_at,

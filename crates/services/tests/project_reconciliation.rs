@@ -239,8 +239,7 @@ fn resolve_request(
 async fn required_reconciliation_has_a_reachable_resolve_target() {
     let db = fixture().await;
     let reconciliation_id = seed_adaptive_boundary_reconciliation(&db).await;
-    let service =
-        ProjectReconciliationService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = ProjectReconciliationService::new(Arc::clone(&db));
 
     let listed = service
         .list(PROJECT_ID, USER_ID, None, 20)
@@ -305,8 +304,7 @@ async fn required_reconciliation_has_a_reachable_resolve_target() {
 async fn resolve_requires_an_interactive_user_principal() {
     let db = fixture().await;
     let reconciliation_id = seed_adaptive_boundary_reconciliation(&db).await;
-    let service =
-        ProjectReconciliationService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = ProjectReconciliationService::new(Arc::clone(&db));
 
     let mut request = resolve_request(
         ReconciliationResolutionAction::Retained,
@@ -331,8 +329,7 @@ async fn resolve_requires_an_interactive_user_principal() {
 async fn resolve_requires_an_exact_replacement_ref_for_revised_and_rejects_it_otherwise() {
     let db = fixture().await;
     let reconciliation_id = seed_adaptive_boundary_reconciliation(&db).await;
-    let service =
-        ProjectReconciliationService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = ProjectReconciliationService::new(Arc::clone(&db));
 
     let missing_replacement = service
         .resolve(
@@ -414,8 +411,7 @@ async fn resolve_requires_an_exact_replacement_ref_for_revised_and_rejects_it_ot
 async fn resolve_is_replay_exact_and_conflicts_on_a_stale_version() {
     let db = fixture().await;
     let reconciliation_id = seed_adaptive_boundary_reconciliation(&db).await;
-    let service =
-        ProjectReconciliationService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = ProjectReconciliationService::new(Arc::clone(&db));
 
     let request = resolve_request(
         ReconciliationResolutionAction::Cancelled,
@@ -455,8 +451,7 @@ async fn resolve_is_replay_exact_and_conflicts_on_a_stale_version() {
 async fn list_and_get_are_scoped_to_the_authorized_project() {
     let db = fixture().await;
     let reconciliation_id = seed_adaptive_boundary_reconciliation(&db).await;
-    let service =
-        ProjectReconciliationService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let service = ProjectReconciliationService::new(Arc::clone(&db));
 
     let wrong_project = service
         .get("not-this-project", USER_ID, &reconciliation_id)

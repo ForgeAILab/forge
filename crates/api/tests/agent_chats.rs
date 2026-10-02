@@ -1143,7 +1143,7 @@ async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
     let relay = services::DomainEventBroadcastConsumer::new(
         h.state.db.clone(),
         h.state.event_bus.clone(),
-        0,
+        Some(0),
     );
     let emitted = relay.broadcast_once(100).await.unwrap();
     let mut kinds = std::collections::HashSet::new();
