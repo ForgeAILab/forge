@@ -129,7 +129,7 @@ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   FORGE_SKIP_WEB_BUILD=1 cargo test -p services operator_status
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   FORGE_SKIP_WEB_BUILD=1 cargo test -p services turn_log_sink
-python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
 cargo fmt --all -- --check
 ```
 
@@ -143,3 +143,118 @@ Do not call a branch fully verified until its Rust checks and the actual
 interactive scenarios have completed. Python collector tests validate the
 collector only; they do not validate the Rust application or demonstrate an
 end-to-end speedup.
+
+## Reproducible build comparison
+
+Use Python 3.10+ (standard library only) and already-built release binaries.
+These tools talk only to a loopback server and SQLite; no fixture data, logs,
+credentials, or measurements leave the machine. No Rust build is needed.
+Build once with the oldest supported baseline (currently v0.13.12), then
+replay that fixture against each later build. The baseline binary initializes
+its own schema and registers `perf@example.test`; after stopping it, the
+builder inserts explicit, schema-checked SQL rows. An unknown required column
+without a default produces a table/column error. Foreign-key and integrity
+checks must succeed. Choose a new or empty fixture directory and new report
+files: the tools refuse to overwrite existing data/results.
+
+```bash
+export TMPDIR=/Volumes/Data/tmp CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
+# Optional explicit test HOME for child servers; otherwise each gets a scratch HOME.
+export FORGE_PERF_HOME=/Volumes/Data/tmp/test-home
+python3 scripts/perf_fixture.py build --baseline-binary /path/to/baseline/forge --out /Volumes/Data/tmp/perf/heavy/fixture --profile heavy --port 18101
+python3 scripts/perf_bench.py run --binary /path/to/baseline/forge --fixture /Volumes/Data/tmp/perf/heavy/fixture --label baseline --out /Volumes/Data/tmp/perf/heavy/baseline.json --port 18101
+python3 scripts/perf_bench.py run --binary /path/to/candidate/forge --fixture /Volumes/Data/tmp/perf/heavy/fixture --label candidate --out /Volumes/Data/tmp/perf/heavy/candidate.json --port 18102
+python3 scripts/perf_bench.py compare /Volumes/Data/tmp/perf/heavy/baseline.json /Volumes/Data/tmp/perf/heavy/candidate.json
+```
+
+The `heavy` profile contains one owned Project and repository, using the
+baseline's default workflow; 60 Tasks (12 roots, four subtasks each) across
+all nine baseline states; 600 terminal coder/reviewer executions; 180 review
+rounds with three CI step results each; 900 transitions; 180 role assignments;
+24 sibling dependencies; and 60 cleaned workspaces. Each execution has three
+settled usage invocations, pricing selections, and ledger events (1,800 of
+each) with substantial token counts and provider-reported costs. No external
+pricing catalog or provider is required. There are 50,000 domain events,
+200 Main-Agent chat messages and 100 successful turn jobs, plus the empty
+Project chat and setup binding that baseline SQL triggers create.
+
+Named constants in `perf_fixture.py` control the sizes. UUID5 identifiers and
+a fixed UTC epoch control inserted identities and timestamps. Baseline-created
+default agents and profiles retain their configuration, with normalized IDs
+and times; pristine immutable profiles are reinserted, with triggers enabled.
+The trigger-created Project chat and binding IDs are normalized too. The
+manifest records seeded table counts, version, byte size and a canonical row
+digest. The registered user's identity and timestamps and salted password
+hash are excluded from that digest; references to that identity are normalized.
+The password is the public test constant `PASSWORD` in the script.
+
+The fixture is deliberately idle: the Project has a manual pause, all default
+agents are paused and idle, no execution is running or holds a recovery lease,
+workspaces are cleaned without cleanup deadlines, chat turn jobs have succeeded,
+and consumer cursors point to the event head. A few Tasks carry real baseline
+blocked/failed interruption shapes, blocked entry barriers and deferred dispatch
+metadata; four reviews await a human while their executions remain terminal.
+There are no plan-publication claims. The repository path intentionally does
+not exist; a manual Project pause prevents checkout probing/dispatch. Main and
+Project agent bindings require setup, so no autonomous work can start.
+
+Each run copies the fixture into a temporary directory and starts the supplied
+binary there, with a test HOME and `--no-embedded-daemon` when supported. It
+stops and restarts the same copy, waits for `/healthz`, observes 60 idle seconds,
+logs in, measures requests, and stops the child even on exceptions. It validates
+the migrated DB, checks the original fixture hash, and removes the scratch copy.
+No real `~/.forge` is used. Table digests before/after idle and from before the
+second start through all GETs expose any unexpected task, execution, transition,
+workspace, event or chat activity. Consumer cursors and the event head are
+included in the result.
+
+Requests use one persistent HTTP connection, sequentially. Every available
+scenario has ten warmups and 100 measured requests (plus an untimed availability
+probe); timings include reading the complete response. The list scenarios use
+limits 20, 50 and 100, with separate conditional requests when an ETag is
+returned. Ten fixed root/subtask IDs exercise the ordinary Task route. Additional
+GETs mirror `web/src/api/hooks.ts`, `client.ts`, board workflow/agent reads and
+the task modal: consolidated detail and relations when present, executions,
+reviews, history, comments, media, workspace, dependencies and usage. Project
+and account analytics use fixed fixture dates. Chat list/messages/turns read
+the first page. Missing endpoints (404/405 or an HTML SPA fallback) and absent
+ETags get explicit skip reasons. Other errors are counted by status, including
+transport failures as status `0`; they do not abort a scenario. Error timings
+must not be mistaken for speedups.
+
+Interpret the nearest-rank p50/p95 and minimum as local request latency, and
+response bytes as decoded HTTP body bytes. Status counts and `share_304` show
+whether the comparison returned full responses or cache validations. `b/a`
+ratios below one indicate lower latency; there are no thresholds or pass/fail
+judgments. A conditional 304 saves payload transfer but can still require DB
+work. First-start time includes forward migrations **and** normal startup;
+second-start time uses the migrated copy. Their difference is not isolated
+migration time. These are warm-machine starts, not cold disk-cache measurements.
+
+Idle SQLite figures count observed `PRAGMA data_version` changes using one
+read-only connection at 50 Hz. This is a **lower bound** on commits per second:
+multiple transactions between polls count once, and neither checkpoints nor
+unchanged table digests imply an absence of writes elsewhere. CPU is the server
+process's `ps` cumulative CPU-time delta over idle; RSS is the largest sample
+once per second during that window, not the OS lifetime high-water mark. If
+process inspection is unavailable, these fields are null with a recorded reason
+and other measurements continue. DB sizes are checkpointed main-file bytes
+before and after; WAL churn is not disk growth in this figure.
+
+This is one machine, one sequential synthetic workload, not browser rendering,
+concurrent users, live model execution, long execution-log parsing, throughput,
+or production billing validation. Report machine/build context and compare the
+same canonical fixture digest. No scenario establishes general performance
+by itself, and very small differences need repeated runs before interpretation.
+
+To prove row determinism with the actual baseline, build a second fixture into
+another empty directory, then run the optional read-only comparison test:
+
+```bash
+PERF_FIXTURE_A=/Volumes/Data/tmp/perf/heavy/fixture \
+PERF_FIXTURE_B=/Volumes/Data/tmp/perf/heavy/fixture-repeat \
+  python3 -m unittest discover -s scripts -p test_perf_fixture.py -v
+```
+
+Ordinary `python3 -m unittest discover -s scripts -p 'test_*.py' -v` needs no
+server; it skips only this optional comparison of already-built fixtures.
