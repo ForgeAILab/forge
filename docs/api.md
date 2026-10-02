@@ -198,10 +198,13 @@ configuration reassignment even when the numeric task cap is unchanged.
 
 `status` is the identity's visible activity state: a persisted `idle` identity
 projects `busy` while `running_execution_count > 0`. `effective_status` remains
-the scheduling/availability projection (including capacity, pause, daemon, and
+the scheduling/availability projection (including the Agent's task quota, pause, daemon, and
 credential health), so it may be `active` below the concurrency cap while
-`status` is `busy`.
+`status` is `busy`. A full machine does not make `effective_status` busy: machine
+capacity is a placement wait, independent of Agent availability.
 
+| GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap applies live |
+| PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -2033,6 +2036,50 @@ UsageBreakdown[]` when usage is exposed; the MCP chat timeline uses that same
 typed response. MCP adds no pricing-refresh, binding/override, or
 retrospective mutation tool in this change.
 
+## Forge Settings
+
+`GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
+The response lists `value`, `effective_value` and `restart_required` per key.
+Other keys retain their startup value until restart.
+
+| Key | Configured value | Application |
+| --- | --- | --- |
+| `forge.data_dir` | Data-directory path | Restart |
+| `server.bind` | HTTP bind address | Restart |
+| `server.mcp_enabled` | Boolean | Restart |
+| `server.max_concurrent_runs` | `null`: automatic; `0`: unlimited; positive integer: ceiling | Live |
+| `workspace.root` | Workspace-directory path | Restart |
+| `workspace.cleanup_delay_seconds` | Positive seconds | Restart |
+| `agent.max_concurrent_tasks` | Positive task quota | Restart |
+| `agent.heartbeat_interval_seconds` | Positive seconds | Restart |
+| `agent.max_missed_heartbeats` | Positive count | Restart |
+
+`server.max_concurrent_runs` accepts a non-negative integer or `null`:
+`null` selects automatic half-logical-core capacity (at least 2), `0` selects
+unlimited, and positive values set a ceiling. Omit the field to leave it alone.
+The response setting has `value` for the configured value and `effective_value`
+for the cap in effect (`null` when unlimited), with `restart_required: false`.
+Updates apply to the next placement admission after the YAML write succeeds.
+
+A live update supersedes a CLI or environment override for the running process;
+that override takes effect again at the next restart under the usual precedence.
+
+### Daemon run limits
+
+Daemon registration and periodic report accept optional typed
+`max_concurrent_runs` (non-negative integer); omission/null preserves the last
+recorded cap. Daemon responses expose `max_concurrent_runs` (reported),
+`run_limit` (admin ceiling) and `effective_max_concurrent_runs`. Zero or missing
+reported cap contributes no ceiling. Positive reported and admin ceilings use
+the lower value; `null` effective cap means unlimited. Existing unreported
+old daemons with neither ceiling remain unlimited.
+
+`PATCH /api/v1/daemons/{id}` is administrator-only. Body:
+`{"version": 3, "run_limit": 2}`; `run_limit: null` clears the ceiling.
+Zero, negative and fractional limits are refused. Updates check the current
+row version and increment it; stale versions return HTTP 409. Reports also
+increment that version and cannot overwrite the admin limit.
+
 ## Repository locations
 
 A Repo is always integrated by direct merge. `POST /api/v1/projects/{id}/repos`
@@ -2721,7 +2768,7 @@ execution is running.
 
 `POST /api/v1/tasks/{id}/recover` returns `200` with the normal `TaskResponse`
 when the recovery can run immediately or its only refusal is agent capacity
-(including a configured daemon session cap). A capacity-bound recovery clears
+(including the machine's effective run cap). A capacity-bound recovery clears
 the blocking annotation and persists the selected action, reason, and context
 for the dispatcher to apply when a slot becomes available. Its
 `workflow_health.kind` is `waiting_for_agent` with label `Retry Queued`.
@@ -3113,6 +3160,12 @@ uses its existing 30-second status polling to notice a dead consumer.
 `POST /api/v1/operations/refresh` retains its existing dispatch-refresh behavior;
 storage maintenance runs only in the background worker or offline conversion
 command.
+
+Operations `daemon_pressure` lists one entry per execution machine, including
+`daemon_id: "server_host"` (the embedded daemon is included in that entry).
+Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
+`null` for unlimited), and `at_capacity`. `agent_pressure` uses
+`active_tasks` and `max_concurrent_tasks` fields for its per-Agent Task cap.
 
 ## Notifications
 
@@ -3827,6 +3880,20 @@ failure cause and open a `workspace_fence_rejected` attention item for inspectio
 A new reservation after `prepare_failed` advances the unprepared placement's
 generation, giving the new prepare attempt a fresh operation ID. Retransmission
 within one attempt keeps its operation ID and replays the owner's retained result.
+
+### Machine capacity and launch slots
+
+Each machine counts Running executions, live reservations (including a ready
+placement with a launch in flight), and leased/running chat turns. Expired
+reservations and idle ready placements count nothing. A launch retains its slot
+until its Running execution is inserted or it is abandoned; chat arrivals or a
+lower ceiling do not revoke an already-held slot. Ordinary new admissions still
+reject full machines with `machine_capacity`.
+
+Machine-capacity waiters use a current-version queued disposition and are parked
+in Project slot accounting, rather than holding an active Project slot. Repeated
+full-machine recovery ticks retain the marker, Task version and event stream.
+
 Every launch, follow-up, and resume uses reserve → prepare → start admission.
 The start transaction rechecks the prepared placement version and capacity before
 creating the Running Execution and its leases; a stale placement returns 409.
@@ -4535,7 +4602,7 @@ new review attempt. Attempt allocation and the Running reviewer execution/lease
 are one database admission boundary; the selected Task role assignment, Agent
 identity, workflow snapshot, and current candidate execution must still match
 when that boundary commits. Reviewer capacity counts live Running executions,
-with only an explicitly configured daemon session cap added to that check.
+plus the machine's effective run cap.
 The candidate must be a completed implementation execution at the insert
 boundary. Failed or cancelled remediation executions do not displace the last
 completed candidate, but a newer running implementation still fences review
@@ -4606,36 +4673,3 @@ before the script. No default shell PASS is generated. Model-backed native/CLI
 reviewers receive one copy of the equivalent frozen contract in their final
 assembled prompt. Native reviewer attempts do not reuse Task conversation history,
 checkpoints, or LCM state.
-
-### Machine run caps
-
-`GET /api/v1/settings` and `PUT /api/v1/settings` remain administrator-only.
-`server.max_concurrent_runs` accepts a non-negative integer or `null`:
-`null` selects automatic half-logical-core capacity (at least 2), `0` selects
-unlimited, and positive values set a ceiling. Omit the field to leave it alone.
-The response setting has `value` for the configured value and `effective_value`
-for the cap in effect (`null` when unlimited), with `restart_required: false`.
-Updates apply to the next placement admission after the YAML write succeeds.
-
-Daemon registration and periodic report accept optional typed
-`max_concurrent_runs` (non-negative integer); omission/null preserves the last
-recorded cap. Daemon responses expose `max_concurrent_runs` (reported),
-`run_limit` (admin ceiling) and `effective_max_concurrent_runs`. Zero or missing
-reported cap contributes no ceiling. Positive reported and admin ceilings use
-the lower value; `null` effective cap means unlimited. Existing unreported
-old daemons with neither ceiling remain unlimited.
-
-`PATCH /api/v1/daemons/{id}` is administrator-only. Body:
-`{"version": 3, "run_limit": 2}`; `run_limit: null` clears the ceiling.
-Zero, negative and fractional limits are refused. Updates check the current
-row version and increment it; stale versions return HTTP 409. Reports also
-increment that version and cannot overwrite the admin limit.
-
-Operations `daemon_pressure` lists one entry per execution machine, including
-`daemon_id: "server_host"` (the embedded daemon is included in that entry).
-Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
-`null` for unlimited), and `at_capacity`. `agent_pressure` uses the renamed
-`active_runs` and `max_concurrent_runs` fields for its per-Agent Task cap.
-The placement refusal code `machine_capacity` replaces `daemon_capacity` and
-includes the server host. Machines that are full leave Tasks visibly queued;
-no running work is pre-empted.

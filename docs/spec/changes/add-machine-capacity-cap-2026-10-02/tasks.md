@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-02T08:55:00Z
-updated_at: 2026-10-02T10:35:49Z
-completed_at: 2026-10-02T10:35:49Z
+updated_at: 2026-10-02T12:39:32Z
+completed_at: 2026-10-02T12:39:32Z
 ---
 
 ## 1. Server host cap
@@ -19,4 +19,11 @@ completed_at: 2026-10-02T10:35:49Z
 - [x] 3.2 Operations status: server host and daemons with occupied runs and effective cap
 - [x] 3.3 Docs (`api.md`, `architecture.md`, `cli.md`, `getting-started.md`) and CHANGELOG (`### Breaking`, `### Added`)
 
-Changelog text is delivered in `implementation-report.md` and the final reply, per the owner instruction to leave `CHANGELOG.md` unchanged.
+Changelog text is delivered in the final implementation report and reply, per the owner instruction to leave `CHANGELOG.md` unchanged.
+
+## 4. Independent audit follow-up
+- [x] 4.1 Quiet, read-only recovery capacity precheck and equivalent-marker reuse
+- [x] 4.2 Current-version parked machine waits, Project memo invalidation and automatic review recovery
+- [x] 4.3 Hold launch slots through start/abandonment; exclude expired reservations
+- [x] 4.4 Replace reserve probe with read-only routing/count prechecks; remove db/config coupling and cache identity
+- [x] 4.5 Port file-backed race/reproductions, correct names/docs, regenerate types and focused validation

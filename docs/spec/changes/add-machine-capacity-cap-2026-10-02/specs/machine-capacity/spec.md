@@ -1,6 +1,6 @@
 ## ADDED Requirements
 ### Requirement: Every machine has a run cap
-The system SHALL limit the number of concurrent runs on each machine, where a machine is the server host or one daemon, and a run is a Running Task execution, a workspace reservation that has no Running execution yet, or a leased or running Agent Chat turn, counted on the machine that executes it. A cap of `0` SHALL mean unlimited. When no cap is configured the cap SHALL be automatic: half the machine's logical cores, rounded down, and never less than 2.
+The system SHALL limit the number of concurrent runs on each machine, where a machine is the server host or one daemon, and a run is a Running Task execution, a live workspace reservation (including a ready placement whose launch has not started) that has no Running execution yet, or a leased or running Agent Chat turn, counted on the machine that executes it. A cap of `0` SHALL mean unlimited. When no cap is configured the cap SHALL be automatic: half the machine's logical cores, rounded down, and never less than 2.
 
 #### Scenario: Automatic cap on a machine with no configuration
 - **WHEN** a server host with 8 logical cores has no `server.max_concurrent_runs` configured
@@ -59,7 +59,7 @@ The system SHALL let an administrator set or clear a run limit for a daemon thro
 - **THEN** the effective cap is the daemon's reported cap
 
 ### Requirement: The cap is enforced at admission and at execution start
-The system SHALL reject a machine whose active runs have reached its effective cap as a placement candidate with the filter code `machine_capacity`, in the same transaction that records the reservation, and SHALL check again in the transaction that inserts the Running execution. The filter code `daemon_capacity` SHALL no longer be produced. Work that is already running SHALL never be stopped or failed because of the cap.
+The system SHALL reject a machine whose active runs have reached its effective cap as a placement candidate with the filter code `machine_capacity`, in the same transaction that records the reservation, and SHALL check again in the transaction that inserts the Running execution. The filter code `daemon_capacity` SHALL no longer be produced. A launch SHALL retain its reservation until its Running execution is inserted or the launch is abandoned. A valid slot holder SHALL NOT be refused at start because a chat turn or a lowered cap has filled the machine; an idle ready placement SHALL hold no slot. Expired reservations SHALL not count. Work that is already running SHALL never be stopped or failed because of the cap.
 
 #### Scenario: Server host at its cap, another machine free
 - **WHEN** the server host is at its cap and a connected daemon that satisfies every other filter has a free slot
@@ -69,6 +69,12 @@ The system SHALL reject a machine whose active runs have reached its effective c
 - **WHEN** two Tasks are admitted concurrently for a machine with one free slot
 - **THEN** exactly one of them is placed there
 
+#### Scenario: A launch holds its slot until it starts
+- **WHEN** a launch has reserved the last slot and its placement becomes ready
+- **THEN** it retains that slot until its Running execution is inserted or it is abandoned
+- **AND** a chat turn arriving during preparation does not refuse that launch at start
+- **AND** after insertion the reservation is not counted a second time
+
 ### Requirement: Tasks wait visibly when every machine is full
 When no machine is eligible for a Task and at least one otherwise eligible machine was rejected only for `machine_capacity`, the system SHALL leave the Task in its state with a queued dispatch reason that names machine capacity, SHALL NOT record a failure, a blocking annotation or an Attention item, SHALL NOT consume a retry budget, and SHALL start the Task once a run on an eligible machine ends.
 
@@ -76,6 +82,12 @@ When no machine is eligible for a Task and at least one otherwise eligible machi
 - **WHEN** a Task is ready to start while the only eligible machine is at its cap
 - **THEN** the Task shows a waiting reason for machine capacity
 - **AND** when a run on that machine ends the Task starts without operator action
+
+#### Scenario: A machine-capacity waiter does not hold a Project slot
+- **WHEN** a Task enters an active state but dispatch waits only for machine capacity
+- **THEN** it is counted as parked rather than active in both Project slot projections
+- **AND** its wait marker uses its final Task version and invalidates Project slot memos
+- **AND** queued recovery ticks preserve the same marker, Task version and event stream until a slot frees
 
 ### Requirement: Machine occupancy is visible to operators
 The operations status SHALL list the server host and every daemon with the number of active runs, the effective cap and whether the machine is at capacity.

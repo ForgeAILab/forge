@@ -289,7 +289,7 @@ function ServerTab({
       </div>
       <SettingsSection
         title="Max concurrent runs"
-        description="Limits agent runs on the server host. Blank uses half the logical cores (at least 2); 0 is unlimited. Applies immediately."
+        description="Limits agent runs on the server host. Blank uses half the logical cores (at least 2); 0 is unlimited. Applies immediately. CLI or environment overrides take effect again after a restart."
       >
         <Label htmlFor="server-run-cap" className="sr-only">Max concurrent runs</Label>
         <Input id="server-run-cap" type="number" min={0} step={1} className="w-24"

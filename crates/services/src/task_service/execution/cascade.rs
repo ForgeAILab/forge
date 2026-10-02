@@ -2660,7 +2660,7 @@ impl TaskService {
         }
     }
 
-    async fn try_dispatch_automatic_review_recovery(
+    pub(in crate::task_service) async fn try_dispatch_automatic_review_recovery(
         &self,
         project: &db::Project,
         task: &Task,
@@ -2726,6 +2726,20 @@ impl TaskService {
             )));
         }
 
+        if let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? {
+            if self.machine_capacity_blocked(task, &agent).await? {
+                self.defer_placement_refusal(task, &ServiceError::Db(DbError::MachineAtCapacity))
+                    .await?;
+                let waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
+        }
+
         let prompt = render_automatic_review_recovery_prompt(
             task,
             failure_reason,
@@ -2747,6 +2761,20 @@ impl TaskService {
             .await
         {
             Ok(execution) => execution,
+            Err(error) if crate::placement::is_machine_capacity_refusal(&error) => {
+                let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                self.defer_placement_refusal(&current, &error).await?;
+                let mut waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                crate::deferred_dispatch::refresh_machine_wait(&self.db, &mut waiting).await?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
             Err(error) => {
                 tracing::warn!(
                     task_id = %task.id,

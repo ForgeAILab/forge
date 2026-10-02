@@ -14,9 +14,14 @@ pub async fn count_machine_capacity(
     daemon_id: Option<&str>,
     cap: Option<i64>,
 ) -> crate::Result<MachineCapacity> {
-    db::machine_capacity::count_machine_capacity(transaction, daemon_id, cap)
-        .await
-        .map_err(Into::into)
+    db::machine_capacity::count_machine_capacity(
+        transaction,
+        daemon_id,
+        cap,
+        &config::embedded_machine_id(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 pub async fn server_machine_cap(
@@ -39,7 +44,7 @@ mod tests {
              CREATE TABLE execution (id TEXT, agent_id TEXT, workspace_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
              CREATE TABLE workspace_placement (
                  id TEXT, workspace_id TEXT, agent_id TEXT, daemon_id TEXT,
-                 execution_daemon_id TEXT, state TEXT);
+                 execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
              CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
              CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);",
         )
@@ -59,7 +64,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql("INSERT INTO agent_current VALUES ('local', NULL), ('embedded-chat', 'embedded'), ('remote-chat', 'remote');
-            INSERT INTO workspace_placement VALUES
+            INSERT INTO workspace_placement (id, workspace_id, agent_id, daemon_id, execution_daemon_id, state) VALUES
                 ('direct', 'direct', 'local', NULL, NULL, 'preparing'),
                 ('embedded', 'embedded', 'local', NULL, 'embedded', 'ready'),
                 ('reservation', 'reservation', 'local', NULL, NULL, 'reserved'),
@@ -89,6 +94,48 @@ mod tests {
         assert!(remote.has_capacity());
     }
 
+    #[tokio::test]
+    async fn machine_capacity_ready_launch_and_expired_reservations() {
+        let pool = pool().await;
+        let mut tx = db::begin_immediate(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO workspace_placement VALUES
+            ('ready-launch','one','agent',NULL,NULL,'ready','2099-01-01T00:00:00Z',CURRENT_TIMESTAMP),
+            ('idle','two','agent',NULL,NULL,'ready',NULL,CURRENT_TIMESTAMP),
+            ('expired','three','agent',NULL,NULL,'preparing','2020-01-01T00:00:00Z',CURRENT_TIMESTAMP),
+            ('orphan','four','agent',NULL,NULL,'reserved',NULL,'2020-01-01T00:00:00Z');")
+            .execute(&mut *tx).await.unwrap();
+        let count = count_machine_capacity(&mut tx, None, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(count.reservations, 1);
+        assert!(!count.has_capacity());
+        assert!(
+            db::machine_capacity::launch_holds_slot(&mut tx, Some("one"), Some("agent"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db::machine_capacity::launch_holds_slot(&mut tx, Some("two"), Some("agent"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            count_agent_capacity(&mut tx, "agent")
+                .await
+                .unwrap()
+                .reservations,
+            0
+        );
+        sqlx::query("INSERT INTO execution VALUES ('run','agent','one','running',NULL)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let count = count_machine_capacity(&mut tx, None, Some(1))
+            .await
+            .unwrap();
+        assert_eq!((count.running_executions, count.reservations), (1, 0));
+    }
+
     #[test]
     fn machine_capacity_effective_reported_and_admin_caps() {
         assert_eq!(effective_machine_cap(Some(6), Some(2)), Some(2));
@@ -103,7 +150,7 @@ mod tests {
         let pool = pool().await;
         let mut transaction = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO workspace_placement VALUES
+            "INSERT INTO workspace_placement (id, workspace_id, agent_id, daemon_id, execution_daemon_id, state) VALUES
                 ('preparing', 'one', 'agent', NULL, NULL, 'preparing'),
                 ('reserved', 'two', 'agent', NULL, NULL, 'reserved'),
                 ('ready', 'three', 'agent', NULL, NULL, 'ready'),
@@ -147,7 +194,7 @@ mod tests {
         let mut transaction = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO agent_current VALUES ('unpinned', NULL), ('chat', 'daemon');
-             INSERT INTO workspace_placement VALUES
+             INSERT INTO workspace_placement (id, workspace_id, agent_id, daemon_id, execution_daemon_id, state) VALUES
                 ('one', 'one', 'unpinned', 'daemon', NULL, 'ready'),
                 ('two', 'two', 'unpinned', 'daemon', NULL, 'preparing'),
                 ('three', 'three', 'unpinned', NULL, 'daemon', 'reserved'),

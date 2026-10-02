@@ -341,6 +341,19 @@ An unknown or incomplete cost is never printed as zero. `Cost unknown` means
 settled activity could not be priced; `$0.00` is reserved for complete,
 explicitly known zero.
 
+### Machine capacity flags
+
+`forge --max-concurrent-runs N` overrides `FORGE_SERVER_MAX_CONCURRENT_RUNS`,
+which overrides `server.max_concurrent_runs` in Forge YAML. Unset means
+`max(2, logical_cores / 2)`; `0` means unlimited. Administrators can change this
+setting live through Settings.
+
+`forge-daemon --max-concurrent-runs N` and
+`forge-ctl daemon link|start|report --max-concurrent-runs N` override the daemon's
+local `max_concurrent_runs` in `daemon.yaml` beside its credentials. The same
+automatic default is computed on the daemon machine. Each registration/report
+sends the resolved typed value. Legacy session-cap labels are no longer read.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge
@@ -613,17 +626,3 @@ forge-ctl --output json task list --project-id <ID> | jq '.items[].title'
 Every subcommand respects `--output json` and emits the same payload structure
 the REST API does — the tables shown in the default mode are just a render of
 that JSON.
-
-### Machine capacity flags
-
-`forge --max-concurrent-runs N` overrides `FORGE_SERVER_MAX_CONCURRENT_RUNS`,
-which overrides `server.max_concurrent_runs` in Forge YAML. Unset means
-`max(2, logical_cores / 2)`; `0` means unlimited. Administrators can change this
-setting live through Settings.
-
-`forge-daemon --max-concurrent-runs N` and
-`forge-ctl daemon link|start|report --max-concurrent-runs N` override the daemon's
-local `max_concurrent_runs` in `daemon.yaml` beside its credentials. The same
-automatic default is computed on the daemon machine. Each registration/report
-sends the resolved typed value. Legacy session-cap labels are no longer read.
-This clone has no daemon install subcommand.

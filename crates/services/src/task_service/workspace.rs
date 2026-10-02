@@ -40,6 +40,7 @@ async fn resolve_workspace_backend(
 const PLACEMENT_RESERVATION_SECONDS: i64 = 600;
 
 pub(super) struct WorkspaceAdmission {
+    _launch_slot: crate::placement::launch_slot::LaunchSlot,
     pub workspace: Workspace,
     claiming_task: Task,
     pub placement: db::WorkspacePlacement,
@@ -238,35 +239,26 @@ impl TaskService {
         Ok(false)
     }
 
+    pub(crate) async fn machine_capacity_blocked(
+        &self,
+        task: &Task,
+        agent: &Agent,
+    ) -> Result<bool> {
+        crate::placement::machine_precheck::task_blocked(
+            &self.db,
+            task,
+            agent,
+            self.daemon_connections.as_deref(),
+        )
+        .await
+    }
+
     pub(super) async fn reserve_claim_workspace(
         &self,
         task: &Task,
         agent: Option<&Agent>,
         role: &str,
     ) -> Result<WorkspaceAdmission> {
-        self.reserve_claim_workspace_inner(task, agent, role, false)
-            .await?
-            .ok_or_else(|| ServiceError::invalid_operation("workspace reservation missing"))
-    }
-
-    pub(crate) async fn preflight_machine_capacity(
-        &self,
-        task: &Task,
-        agent: &Agent,
-        role: &str,
-    ) -> Result<()> {
-        self.reserve_claim_workspace_inner(task, Some(agent), role, true)
-            .await
-            .map(|_| ())
-    }
-
-    async fn reserve_claim_workspace_inner(
-        &self,
-        task: &Task,
-        agent: Option<&Agent>,
-        role: &str,
-        capacity_probe: bool,
-    ) -> Result<Option<WorkspaceAdmission>> {
         use crate::placement::{load_selection_context, select_placement, SelectionLoadInput};
         if agent.is_some() {
             self.ensure_project_not_paused(task).await?;
@@ -529,7 +521,12 @@ impl TaskService {
             matches!(
                 placement.state,
                 PlacementState::Reserved | PlacementState::Preparing
-            )
+            ) || (placement.state == PlacementState::Ready
+                && placement
+                    .reserved_until
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| at > Utc::now()))
         }) {
             return Err(ServiceError::conflict(
                 "workspace preparation is already reserved",
@@ -595,6 +592,7 @@ impl TaskService {
                         project_settings: &settings,
                         server: &server_facts,
                         handshakes: &handshakes,
+                        starting_launch: false,
                     },
                 )
                 .await?,
@@ -611,10 +609,6 @@ impl TaskService {
             reason,
         ) = if let Some(context) = context.as_ref() {
             let selection = select_placement(context).into_result()?;
-            if capacity_probe {
-                transaction.rollback().await?;
-                return Ok(None);
-            }
             let location = selection.candidate.location;
             (
                 location.id,
@@ -718,6 +712,10 @@ impl TaskService {
             update.agent_id = Some(agent.map(|agent| agent.id.clone()));
             update.selected_by = Some(selected_by);
             update.selection_reason = Some(reason);
+            update.reserved_until = Some(Some(super::execution::rfc3339_after(
+                &now,
+                PLACEMENT_RESERVATION_SECONDS,
+            )));
             if prepared
                 && placement.owner_kind == PlacementOwnerKind::Server
                 && placement.execution_daemon_id.is_none()
@@ -801,7 +799,11 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
-        Ok(Some(WorkspaceAdmission {
+        Ok(WorkspaceAdmission {
+            _launch_slot: crate::placement::launch_slot::LaunchSlot::new(
+                self.db.clone(),
+                &placement,
+            ),
             claiming_task: task.clone(),
             workspace,
             placement,
@@ -810,7 +812,7 @@ impl TaskService {
             review_config,
             settings,
             task_owner_id: authority.project.owner_id,
-        }))
+        })
     }
 
     pub(super) async fn prepare_claim_workspace(
@@ -997,7 +999,6 @@ impl TaskService {
         let mut update = crate::placement::admission::placement_update(&admission.placement);
         update.state = Some(PlacementState::Ready);
         update.workspace_handle = Some(Some(prepared.handle.clone()));
-        update.reserved_until = Some(None);
         admission.placement =
             WorkspacePlacementRepo::update_in_tx(&*self.db, &mut transaction, update).await?;
         sqlx::query("UPDATE workspace SET status = 'ready', branch = ?, before_sha = COALESCE(before_sha, ?),
@@ -1066,6 +1067,7 @@ impl TaskService {
                     project_settings: &admission.settings,
                     server: &admission.server_facts,
                     handshakes: &handshakes,
+                    starting_launch: true,
                 },
             )
             .await?;
@@ -3337,6 +3339,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_capacity_abandoned_ready_launch_releases_slot() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let workspaces = TempDir::new().unwrap();
+        let (project, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let first = seed_task(&db, &project, None).await;
+        let second = seed_task(&db, &project, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        db.server_run_cap
+            .set(Some(1), 1, &::config::embedded_machine_id());
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(workspaces.path().to_path_buf());
+        let reservation = service
+            .reserve_claim_workspace(&first, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let ready = service.prepare_claim_workspace(reservation).await.unwrap();
+        let placement_id = ready.placement.id.clone();
+        assert!(ready.placement.reserved_until.is_some());
+        assert!(matches!(
+            service
+                .reserve_claim_workspace(&second, Some(&agent), "coder")
+                .await,
+            Err(ServiceError::PlacementUnavailable(_))
+        ));
+        drop(ready);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let placement = WorkspacePlacementRepo::get_by_id(&*db, &placement_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if placement.reserved_until.is_none() {
+                    assert_eq!(placement.state, PlacementState::Ready);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service
+            .reserve_claim_workspace(&second, Some(&agent), "coder")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn machine_capacity_precheck_is_read_only_without_full_machines() {
+        let data = TempDir::new().unwrap();
+        let pool = create_sqlite_pool(&format!(
+            "sqlite:{}",
+            data.path().join("forge.db").display()
+        ))
+        .await
+        .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let repo = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        db.server_run_cap
+            .set(Some(2), 2, &::config::embedded_machine_id());
+        let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+        let writer = db::begin_immediate(db.pool()).await.unwrap();
+        assert!(!tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            service.machine_capacity_blocked(&task, &agent)
+        )
+        .await
+        .unwrap()
+        .unwrap());
+        drop(writer);
+        let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap(),
+            task
+        );
+    }
+
+    #[tokio::test]
     async fn placement_admission_prepare_failure_keeps_retry_budget() {
         let db = Arc::new(sqlite_db().await);
         let repo_dir = TempDir::new().unwrap();
@@ -3461,16 +3550,18 @@ mod tests {
         assert!(execution_count(&db, &refused.id).await == 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn machine_capacity_reserve_race_for_last_slot() {
-        let db = Arc::new(sqlite_db().await);
+        let data = TempDir::new().unwrap();
+        let url = format!("sqlite:{}", data.path().join("forge.db").display());
+        let pool = create_sqlite_pool(&url).await.expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
         let repo_dir = TempDir::new().unwrap();
         let workspace_root = TempDir::new().unwrap();
         let (project_id, _) = seed_project_with_real_repo(&db, repo_dir.path()).await;
-        let first = seed_task(&db, &project_id, None).await;
-        let second = seed_task(&db, &project_id, None).await;
         let agent = seed_unpinned_claim_agent(&db).await;
-        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 100 WHERE id = ?")
             .bind(&agent.id)
             .execute(db.pool())
             .await
@@ -3479,43 +3570,63 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        db.server_run_cap.set(Some(1));
-        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
-            .with_workspace_root(workspace_root.path().to_path_buf());
-        let (first_result, second_result) = tokio::join!(
-            service.reserve_claim_workspace(&first, Some(&agent), "coder"),
-            service.reserve_claim_workspace(&second, Some(&agent), "coder"),
+        let service = Arc::new(
+            TaskService::new(db.clone(), Arc::new(EventBus::default()))
+                .with_workspace_root(workspace_root.path().to_path_buf()),
         );
-        let (mut admission, refused, error) = match (first_result, second_result) {
-            (Ok(admission), Err(ServiceError::PlacementUnavailable(error))) => {
-                (admission, &second, error)
+        let mut admitted = Vec::new();
+        let mut total_reserved = 0_i64;
+        for (round, cap) in [(0, 1_u32), (1, 3), (2, 4), (3, 4)] {
+            db.server_run_cap
+                .set(Some(cap), cap, &::config::embedded_machine_id());
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                tasks.push(seed_task(&db, &project_id, None).await);
             }
-            (Err(ServiceError::PlacementUnavailable(error)), Ok(admission)) => {
-                (admission, &first, error)
+            let mut handles = Vec::new();
+            for task in tasks {
+                let service = Arc::clone(&service);
+                let agent = agent.clone();
+                handles.push(tokio::spawn(async move {
+                    match service
+                        .reserve_claim_workspace(&task, Some(&agent), "coder")
+                        .await
+                    {
+                        Ok(admission) => Ok(admission),
+                        Err(ServiceError::PlacementUnavailable(refusal)) => Err(format!(
+                            "placement_unavailable:{:?}",
+                            refusal
+                                .rejected_candidates
+                                .iter()
+                                .map(|candidate| candidate.filter_codes.clone())
+                                .collect::<Vec<_>>()
+                        )),
+                        Err(error) => Err(format!("other:{error:?}")),
+                    }
+                }));
             }
-            _ => panic!("only one concurrent reservation may take the last machine slot"),
-        };
-        assert!(error.rejected_candidates.iter().all(|candidate| candidate
-            .filter_codes
-            .contains(&crate::placement::PlacementFilterCode::MachineCapacity)));
-        let mut update = crate::placement::admission::placement_update(&admission.placement);
-        update.state = Some(PlacementState::Preparing);
-        admission.placement = WorkspacePlacementRepo::update(&*db, update).await.unwrap();
-        let error = match service
-            .reserve_claim_workspace(refused, Some(&agent), "coder")
+            let mut won = 0;
+            let mut errors = std::collections::BTreeMap::<String, usize>::new();
+            for handle in handles {
+                match handle.await.unwrap() {
+                    Ok(admission) => {
+                        won += 1;
+                        admitted.push(admission);
+                    }
+                    Err(error) => *errors.entry(error).or_default() += 1,
+                }
+            }
+            total_reserved += won;
+            let reserved: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workspace_placement WHERE state IN ('reserved','preparing')",
+            )
+            .fetch_one(db.pool())
             .await
-        {
-            Err(ServiceError::PlacementUnavailable(error)) => error,
-            _ => panic!("a preparing reservation must hold the last machine slot"),
-        };
-        assert!(error.rejected_candidates.iter().all(|candidate| candidate
-            .filter_codes
-            .contains(&crate::placement::PlacementFilterCode::MachineCapacity)));
-        assert!(WorkspaceRepo::get_by_task_id(&*db, &refused.id)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(execution_count(&db, &refused.id).await == 0);
+            .unwrap();
+            assert_eq!(reserved, i64::from(cap), "round {round}: {errors:?}");
+            assert_eq!(reserved, total_reserved);
+            assert!(reserved <= i64::from(cap), "cap {cap} exceeded: {reserved}");
+        }
     }
 
     #[tokio::test]

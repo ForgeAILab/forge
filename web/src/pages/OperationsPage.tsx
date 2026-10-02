@@ -285,7 +285,7 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
               <p className="truncate text-sm font-medium text-foreground">{item.agent_name}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span>
-                  {item.active_runs}/{item.max_concurrent_runs} active runs
+                  {item.active_tasks}/{item.max_concurrent_tasks} active tasks
                 </span>
                 {item.daemon_id ? (
                   <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>

@@ -69,6 +69,7 @@ pub struct PlacementCandidate {
 
 #[derive(Debug, Clone)]
 pub struct SelectionContext {
+    pub starting_launch: bool,
     pub task: Task,
     pub repo: Repo,
     pub claiming_agent: WorktreeAgent,
@@ -472,15 +473,26 @@ fn filter_candidate(
             }
         }
     }
+    let owns_launch_slot = context.starting_launch
+        && context.binding().is_some_and(|p| {
+            p.repo_location_id == candidate.location.id
+                && p.agent_id.as_deref() == Some(&context.claiming_agent.agent.id)
+                && p.state == PlacementState::Ready
+                && p.reserved_until
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| at > chrono::Utc::now())
+        });
     if !context
         .agent_capacity
         .has_capacity(context.claiming_agent.agent.max_concurrent_tasks)
     {
         filters.insert(AgentCapacity);
     }
-    if candidate
-        .machine_capacity
-        .is_none_or(|capacity| !capacity.has_capacity())
+    if !owns_launch_slot
+        && candidate
+            .machine_capacity
+            .is_none_or(|capacity| !capacity.has_capacity())
     {
         filters.insert(MachineCapacity);
     }
@@ -547,6 +559,7 @@ pub struct ConnectionHandshake {
 }
 
 pub struct SelectionLoadInput<'a> {
+    pub starting_launch: bool,
     pub task: &'a Task,
     pub repo: &'a Repo,
     pub claiming_agent: &'a WorktreeAgent,
@@ -811,6 +824,7 @@ pub async fn load_selection_context(
         .map(|agent| agent.role.as_str())
         .collect::<Vec<_>>();
     Ok(SelectionContext {
+        starting_launch: input.starting_launch,
         task: input.task.clone(),
         repo: input.repo.clone(),
         claiming_agent: input.claiming_agent.clone(),
@@ -920,6 +934,7 @@ mod tests {
 
     fn context() -> SelectionContext {
         let mut context = SelectionContext {
+            starting_launch: false,
             task: Task {
                 id: "task".to_owned(),
                 project_id: "project".to_owned(),
@@ -1058,6 +1073,23 @@ mod tests {
                 .running_executions -= 1;
             selected(&context);
         }
+    }
+
+    #[test]
+    fn machine_capacity_start_uses_held_launch_slot() {
+        let mut context = context();
+        let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
+        capacity.max_concurrent_runs = Some(1);
+        capacity.reservations = 1;
+        capacity.active_chat_turns = 1;
+        let mut binding = placement(&context.candidates[0]);
+        binding.reserved_until = Some("2099-01-01T00:00:00Z".to_owned());
+        context.existing_placement = Some(binding);
+        rejected(&context, PlacementFilterCode::MachineCapacity);
+        context.starting_launch = true;
+        selected(&context);
+        context.existing_placement.as_mut().unwrap().reserved_until = None;
+        rejected(&context, PlacementFilterCode::MachineCapacity);
     }
 
     fn placement(candidate: &PlacementCandidate) -> WorkspacePlacement {
@@ -1612,6 +1644,7 @@ mod tests {
         handshakes: &'a BTreeMap<String, ConnectionHandshake>,
     ) -> SelectionLoadInput<'a> {
         SelectionLoadInput {
+            starting_launch: false,
             task: &context.task,
             repo: &context.repo,
             claiming_agent: &context.claiming_agent,

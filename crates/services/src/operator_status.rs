@@ -472,40 +472,17 @@ impl OperatorStatusService {
     }
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
-        let rows = sqlx::query("SELECT id, hostname, machine_id, max_concurrent_runs, run_limit FROM daemon ORDER BY updated_at DESC, id ASC")
-            .fetch_all(self.db.pool()).await?;
-        let mut tx = self.db.pool().begin().await?;
-        let cap = crate::placement::capacity::server_machine_cap(&self.db, &mut tx).await?;
-        let server = crate::placement::capacity::count_machine_capacity(&mut tx, None, cap).await?;
-        let mut pressure = vec![DaemonPressureSummary {
-            daemon_id: "server_host".to_owned(),
-            hostname: Some("Server host".to_owned()),
-            active_runs: server.active_runs().max(0) as u32,
-            max_concurrent_runs: cap,
-            at_capacity: !server.has_capacity(),
-        }];
-        for row in rows {
-            if crate::embedded_daemon::is_embedded_daemon_machine(
-                &row.try_get::<String, _>("machine_id")?,
-            ) {
-                continue;
-            }
-            let id: String = row.try_get("id")?;
-            let cap = crate::placement::capacity::effective_machine_cap(
-                row.try_get("max_concurrent_runs")?,
-                row.try_get("run_limit")?,
-            );
-            let count =
-                crate::placement::capacity::count_machine_capacity(&mut tx, Some(&id), cap).await?;
-            pressure.push(DaemonPressureSummary {
-                daemon_id: id,
-                hostname: row.try_get("hostname")?,
-                active_runs: count.active_runs().max(0) as u32,
-                max_concurrent_runs: cap,
-                at_capacity: !count.has_capacity(),
-            });
-        }
-        Ok(pressure)
+        Ok(crate::placement::machine_precheck::snapshot(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| DaemonPressureSummary {
+                daemon_id: row.daemon_id.unwrap_or_else(|| "server_host".to_owned()),
+                hostname: Some(row.hostname),
+                active_runs: row.capacity.active_runs().max(0) as u32,
+                max_concurrent_runs: row.capacity.max_concurrent_runs,
+                at_capacity: !row.capacity.has_capacity(),
+            })
+            .collect())
     }
 
     async fn agent_pressure(&self) -> Result<Vec<AgentPressureSummary>, ServiceError> {
@@ -533,25 +510,25 @@ impl OperatorStatusService {
 
         let mut pressure = Vec::new();
         for row in rows {
-            let active_runs = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
-            let max_concurrent_runs = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
-            let at_capacity = max_concurrent_runs > 0 && active_runs >= max_concurrent_runs;
-            if active_runs == 0 && !at_capacity {
+            let active_tasks = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
+            let max_concurrent_tasks = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
+            let at_capacity = max_concurrent_tasks > 0 && active_tasks >= max_concurrent_tasks;
+            if active_tasks == 0 && !at_capacity {
                 continue;
             }
             pressure.push(AgentPressureSummary {
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
                 daemon_id: row.try_get("daemon_id")?,
-                active_runs,
-                max_concurrent_runs,
+                active_tasks,
+                max_concurrent_tasks,
                 at_capacity,
             });
         }
         pressure.sort_by(|left, right| {
             right
-                .active_runs
-                .cmp(&left.active_runs)
+                .active_tasks
+                .cmp(&left.active_tasks)
                 .then_with(|| left.agent_name.cmp(&right.agent_name))
         });
         Ok(pressure)
@@ -882,7 +859,11 @@ mod tests {
     #[tokio::test]
     async fn machine_capacity_operations_includes_server_host() {
         let (db, service) = test_service().await;
-        db.server_run_cap.set(Some(4));
+        db.server_run_cap.set(
+            Some(4),
+            config::resolved_run_cap(Some(4)),
+            &config::embedded_machine_id(),
+        );
         let pressure = service.daemon_pressure().await.unwrap();
         assert_eq!(pressure.len(), 1);
         assert_eq!(pressure[0].daemon_id, "server_host");

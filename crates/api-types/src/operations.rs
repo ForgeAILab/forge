@@ -146,8 +146,8 @@ pub struct AgentPressureSummary {
     pub agent_id: String,
     pub agent_name: String,
     pub daemon_id: Option<String>,
-    pub active_runs: u32,
-    pub max_concurrent_runs: u32,
+    pub active_tasks: u32,
+    pub max_concurrent_tasks: u32,
     pub at_capacity: bool,
 }
 

@@ -139,8 +139,7 @@ mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
-    pub server_run_cap: Arc<config::MachineRunCap>,
-    pub settings_update_lock: Arc<tokio::sync::Mutex<()>>,
+    pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
     pool: SqlitePool,
     domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
@@ -156,8 +155,7 @@ impl SqliteDb {
         Self {
             pool,
             domain_event_hooks,
-            server_run_cap: Arc::new(config::MachineRunCap::default()),
-            settings_update_lock: Arc::new(tokio::sync::Mutex::new(())),
+            server_run_cap: Arc::new(crate::machine_capacity::MachineRunCap::default()),
         }
     }
 
@@ -955,6 +953,22 @@ impl SqliteDb {
         .bind(&input.updated_at)
         .execute(&mut **transaction)
         .await?;
+        if input.status == ExecutionStatus::Running {
+            sqlx::query(
+                "UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition')
+                 WHERE id = ? AND json_valid(metadata_json)
+                   AND json_extract(metadata_json, '$.dispatch_disposition.capability') = 'machine_capacity'",
+            )
+            .bind(&input.task_id)
+            .execute(&mut **transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE workspace_placement SET reserved_until = NULL WHERE workspace_id = ?",
+            )
+            .bind(&input.workspace_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         if let Some(recovery_id) = admission
             .filter(|_| input.status == ExecutionStatus::Running)
@@ -1407,22 +1421,22 @@ impl SqliteDb {
                 return Err(DbError::VersionConflict);
             }
         }
-        let occupied_slots = sqlx::query_scalar::<_, i64>(
-            "SELECT
-                (SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running') +
-                (SELECT COUNT(*) FROM workspace_placement p
-                 WHERE p.agent_id = ? AND p.state IN ('reserved', 'preparing')
-                   AND NOT EXISTS (SELECT 1 FROM execution e
-                                   WHERE e.workspace_id = p.workspace_id AND e.status = 'running'))",
-        )
-        .bind(agent_id)
-        .bind(agent_id)
-        .fetch_one(&mut **transaction)
-        .await?;
+        let occupied_slots = crate::machine_capacity::count_agent_capacity(transaction, agent_id)
+            .await?
+            .occupied_slots();
         if occupied_slots >= actual_max {
             return Err(DbError::AgentAtCapacity);
         }
 
+        if crate::machine_capacity::launch_holds_slot(
+            transaction,
+            input.workspace_id.as_deref(),
+            Some(agent_id),
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let daemon_id = match input.workspace_id.as_deref() {
             Some(workspace_id) => sqlx::query_scalar::<_, Option<String>>(
                 "SELECT COALESCE(execution_daemon_id, daemon_id)
@@ -1457,7 +1471,7 @@ impl SqliteDb {
         let server_host = daemon_id.is_none()
             || daemon.as_ref().is_some_and(|row| {
                 row.try_get::<String, _>("machine_id")
-                    .is_ok_and(|id| id == config::embedded_machine_id())
+                    .is_ok_and(|id| id == self.server_run_cap.embedded_machine_id())
             });
         let cap = if server_host {
             crate::machine_capacity::server_machine_cap(self, transaction).await?
@@ -1483,6 +1497,7 @@ impl SqliteDb {
                 daemon_id.as_deref()
             },
             cap,
+            &self.server_run_cap.embedded_machine_id(),
         )
         .await?
         .has_capacity()

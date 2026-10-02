@@ -11786,3 +11786,142 @@ async fn unbounded_execution_records_progress_and_progress_warnings() {
         "a stalled unbounded execution must raise a warning: {warning:?}"
     );
 }
+
+#[tokio::test]
+async fn machine_capacity_launch_keeps_slot_through_chat_and_start() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
+        .bind(&agent_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE daemon SET machine_id = ? WHERE id = ?")
+        .bind("db-test-host")
+        .bind(&daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.server_run_cap.set(Some(1), 1, "db-test-host");
+    let task_a = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "A",
+    )
+    .await;
+    let task_b = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "B",
+    )
+    .await;
+    let ws_a = seed_workspace_for_task(&db, &task_a, &repo_id).await;
+    let ws_b = seed_workspace_for_task(&db, &task_b, &repo_id).await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for (ws, task, state) in [(&ws_a, &task_a, "ready"), (&ws_b, &task_b, "reserved")] {
+        sqlx::query("DELETE FROM workspace_placement WHERE workspace_id = ?")
+            .bind(ws)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspace_placement (id, workspace_id, task_id, agent_id, owner_kind, daemon_id, runtime_id, repo_location_id, execution_daemon_id, workspace_handle, generation, state, selected_by, selection_reason, reserved_until, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'server', NULL, NULL, 'audit-location', NULL, NULL, 1, ?, 'scheduler', '{}', '2099-01-01T00:10:00Z', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')")
+            .bind(new_uuid_v4()).bind(ws).bind(task).bind(&agent_id).bind(state)
+            .execute(db.pool()).await.unwrap();
+    }
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = "2099-01-01T00:00:00Z";
+    let attempt = |id: String| {
+        (
+            CreateExecution {
+                id: id.clone(),
+                task_id: task_a.clone(),
+                agent_id: Some(agent_id.clone()),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: Some(ws_a.clone()),
+                created_at: now.to_owned(),
+                updated_at: now.to_owned(),
+            },
+            ClaimExecutionLease {
+                execution_id: id,
+                expected_version: 1,
+                owner: "embedded:audit".to_owned(),
+                lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+                hard_deadline_at: Some("2099-01-01T01:00:00Z".to_owned()),
+                now: now.to_owned(),
+            },
+        )
+    };
+    // Chat admission is deliberately independent: it may fill the machine
+    // after the launch has reserved a slot. The held launch still starts.
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP TABLE agent_chat_turn_job; CREATE TABLE agent_chat_turn_job (id TEXT PRIMARY KEY, responder_identity_id TEXT, status TEXT);").execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_chat_turn_job VALUES ('chat', ?, 'running')")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (execution, lease) = attempt(new_uuid_v4());
+    let running = ExecutionRepo::create_with_lease(&db, execution, lease)
+        .await
+        .unwrap();
+    assert_eq!(running.status, ExecutionStatus::Running);
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT reserved_until FROM workspace_placement WHERE workspace_id = ?")
+            .bind(&ws_a)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(marker, None);
+    let mut tx = db.pool().begin().await.unwrap();
+    let count =
+        crate::machine_capacity::count_machine_capacity(&mut tx, None, Some(1), "db-test-host")
+            .await
+            .unwrap();
+    assert_eq!(
+        (
+            count.running_executions,
+            count.reservations,
+            count.active_chat_turns
+        ),
+        (1, 1, 1)
+    );
+    assert!(!count.has_capacity());
+}

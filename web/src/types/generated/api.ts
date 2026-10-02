@@ -1652,8 +1652,8 @@ export interface AgentPressureSummary {
   agent_id: string
   agent_name: string
   daemon_id: string | null
-  active_runs: number
-  max_concurrent_runs: number
+  active_tasks: number
+  max_concurrent_tasks: number
   at_capacity: boolean
 }
 

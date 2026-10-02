@@ -7411,7 +7411,11 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
     seed_running_execution(&db, &running.id, &agent_id, "coder").await;
     let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
     assign_role(&db, &queued.id, "coder", &agent_id).await;
-    db.server_run_cap.set(Some(1));
+    db.server_run_cap.set(
+        Some(1),
+        config::resolved_run_cap(Some(1)),
+        &config::embedded_machine_id(),
+    );
     let project = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
@@ -7481,4 +7485,209 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
         .unwrap()
         .unwrap();
     assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
+}
+
+#[tokio::test]
+async fn machine_capacity_active_waiter_is_parked_at_final_version() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let running = seed_task(&db, &project_id, "RUN", "in_progress", 0).await;
+    seed_running_execution(&db, &running.id, &agent_id, "coder").await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    db.server_run_cap
+        .set(Some(1), 1, &config::embedded_machine_id());
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let revision_before: i64 = sqlx::query_scalar("SELECT list_revision FROM project WHERE id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    dispatcher
+        .task_service
+        .transition(
+            queued.id.clone(),
+            "in_progress".to_owned(),
+            crate::task_service::TransitionOptions {
+                version: queued.version,
+                reason: Some("manual start".to_owned()),
+                triggered_by: Actor::system(SystemComponent::TaskDispatcher),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+    let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let marker = deferred_dispatch::current_dispatch_disposition(&waiting).unwrap();
+    assert_eq!(marker.capability, "machine_capacity");
+    assert_eq!(marker.task_version, waiting.version);
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &waiting,
+        &workflow,
+        &[],
+        None,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(health.stale_reason.as_deref(), Some("machine_capacity"));
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let revision_after: i64 = sqlx::query_scalar("SELECT list_revision FROM project WHERE id = ?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(revision_after > revision_before);
+    let slots = super::slots::load_project_slots(&db, &current)
+        .await
+        .unwrap();
+    assert_eq!((slots.active, slots.parked), (1, 1));
+    let batch = super::slots::load_projects_slots(&db, std::slice::from_ref(&current))
+        .await
+        .unwrap();
+    assert_eq!(batch[&project_id].slots, slots);
+    assert_eq!(
+        batch[&project_id].revision,
+        Some((revision_after, current.version))
+    );
+    assert!(waiting.error_annotation.is_none());
+    for _ in 0..4 {
+        dispatcher.check_once().await.unwrap();
+    }
+    let stable = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stable.version, waiting.version);
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&running.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    dispatcher.check_once().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id,
+        queued.id
+    );
+}
+#[tokio::test]
+async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
+    let action = api_types::RecoveryAction::Reexecute;
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id =
+        seed_agent_with_executor(&db, 4, DaemonStatus::Online, AgentStatus::Idle, "codex").await;
+    let busy = seed_task(&db, &project_id, "occupies machine", "in_progress", 0).await;
+    assign_role(&db, &busy.id, "coder", &agent_id).await;
+    seed_running_execution(&db, &busy.id, &agent_id, "coder").await;
+    db.server_run_cap
+        .set(Some(1), 1, &config::embedded_machine_id());
+
+    let task = seed_task(&db, &project_id, "recover", "in_progress", 0).await;
+    assign_role(&db, &task.id, "coder", &agent_id).await;
+    let stopped = seed_cancelled_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        "coder",
+        Some(StopReason::UserCancelled),
+        Some(ResumePolicy::Manual),
+    )
+    .await;
+    let annotation = serde_json::json!({
+        "type": "recovery_required",
+        "blocking_reason": "crash_recovery",
+        "blocked_execution_id": serde_json::Value::Null,
+        "recovery_actions": [action],
+    });
+    let _ = stopped;
+    let task = TaskRepo::update(
+        &*db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation.to_string())),
+            blocked_json: Some(Some(
+                serde_json::json!({"kind": "recovery_required", "reason": "crash_recovery"})
+                    .to_string(),
+            )),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("interruption persists");
+    set_prompt_execution_snapshots(&db, &agent_id).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    let mut events = dispatcher.event_bus.subscribe();
+    let queued = dispatcher
+        .task_service
+        .recover_task(&task.id, action, Some("operator retry".to_owned()), None)
+        .await
+        .unwrap();
+    let marker = deferred_dispatch::queued_recovery(&queued).unwrap();
+    while events.try_recv().is_ok() {}
+    for _ in 0..4 {
+        dispatcher.check_once().await.unwrap();
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, queued.version);
+        assert_eq!(
+            deferred_dispatch::queued_recovery(&current).unwrap().id,
+            marker.id
+        );
+        assert_eq!(current.metadata_json, queued.metadata_json);
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.entity_id, task.id, "{}", event.event_type);
+        }
+    }
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&busy.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    dispatcher.check_once().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task.id
+    );
+    let started = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::queued_recovery(&started).is_none());
 }

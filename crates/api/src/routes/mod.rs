@@ -990,9 +990,7 @@ fn projected_agent_status(
 
 pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse {
     if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
-        daemon.max_concurrent_runs = Some(i64::from(config::resolved_run_cap(
-            db.server_run_cap.configured(),
-        )));
+        daemon.max_concurrent_runs = Some(db.server_run_cap.effective().unwrap_or(0));
     }
     DaemonResponse {
         max_concurrent_runs: daemon.max_concurrent_runs,

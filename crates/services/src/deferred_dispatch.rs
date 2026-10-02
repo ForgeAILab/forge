@@ -482,3 +482,32 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
     tracing::info!(task_id = %task_id, %reason, "task dispatch woken");
     Ok(())
 }
+
+pub(crate) async fn refresh_machine_wait(db: &db::SqliteDb, task: &mut Task) -> Result<()> {
+    if !dispatch_disposition(task).is_some_and(|d| d.capability == "machine_capacity") {
+        return Ok(());
+    }
+    let current = TaskRepo::get_by_id(db, &task.id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+    let running: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await?;
+    if running {
+        if dispatch_disposition(&current).is_some_and(|d| d.capability == "machine_capacity") {
+            clear_dispatch_disposition(db, &current).await?;
+        }
+    } else if let Some(disposition) = dispatch_disposition(&current)
+        .filter(|d| d.capability == "machine_capacity" && d.task_version != current.version)
+    {
+        record_dispatch_disposition(db, &current, "machine_capacity", &disposition.safe_message)
+            .await?;
+    }
+    *task = TaskRepo::get_by_id(db, &task.id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+    Ok(())
+}

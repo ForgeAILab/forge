@@ -996,7 +996,6 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
- "config",
  "db",
  "hex",
  "include_dir",

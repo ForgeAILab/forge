@@ -369,24 +369,25 @@ impl TaskDispatcher {
         )
         .await?;
 
-        if let Err(error) = self
-            .task_service
-            .preflight_machine_capacity(task, &agent, &target.role)
-            .await
-        {
-            if crate::placement::is_machine_capacity_refusal(&error) {
-                if deferred_dispatch::record_dispatch_disposition(
-                    &self.db,
-                    task,
-                    "machine_capacity",
-                    "machine_capacity: waiting for a machine run slot",
-                )
+        if self
+            .machine_at_capacity
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .task_service
+                .machine_capacity_blocked(task, &agent)
                 .await?
-                {
-                    self.publish_capacity_disposition_change(task);
-                }
-                return Ok(false);
+        {
+            if deferred_dispatch::record_dispatch_disposition(
+                &self.db,
+                task,
+                "machine_capacity",
+                "machine_capacity: waiting for a machine run slot",
+            )
+            .await?
+            {
+                self.publish_capacity_disposition_change(task);
             }
+            return Ok(false);
         }
 
         self.task_service

@@ -2,6 +2,8 @@
 
 pub mod admission;
 pub mod capacity;
+pub(crate) mod launch_slot;
+pub(crate) mod machine_precheck;
 pub mod selection;
 
 pub use selection::{

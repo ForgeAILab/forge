@@ -458,9 +458,20 @@ impl TaskService {
         original: &Task,
         request: QueuedRecoveryRequest,
     ) -> Result<Task> {
-        let task = TaskRepo::get_by_id(&*self.db, &original.id, false)
+        let mut task = TaskRepo::get_by_id(&*self.db, &original.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", original.id.clone()))?;
+        if let Some(existing) = crate::deferred_dispatch::queued_recovery(&task) {
+            if existing.target_state == task.status
+                && serde_json::to_value(&existing.request)
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?
+                    == serde_json::to_value(&request)
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?
+            {
+                crate::deferred_dispatch::refresh_machine_wait(&self.db, &mut task).await?;
+                return Ok(task);
+            }
+        }
         // Launch failure may have restored the interruption at a new version.
         // Never clear a different interruption installed by a concurrent writer.
         if task.error_annotation != original.error_annotation
@@ -470,8 +481,10 @@ impl TaskService {
             return Err(db::DbError::VersionConflict.into());
         }
         let agent_id = self.queued_recovery_agent(original, &request).await?;
-        self.ensure_queued_recovery_agent_available(&agent_id)
+        let agent = self
+            .ensure_queued_recovery_agent_available(&agent_id)
             .await?;
+        let machine_wait = self.machine_capacity_blocked(&task, &agent).await?;
         let queued = crate::deferred_dispatch::QueuedRecovery {
             id: new_uuid_v4(),
             request,
@@ -480,7 +493,7 @@ impl TaskService {
             blocked_json: task.blocked_json.clone(),
         };
         let now = now_rfc3339();
-        let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        let mut updated = TaskRepo::update_recovery_metadata_if_no_running_execution(
             &*self.db,
             &task.id,
             task.version,
@@ -507,6 +520,18 @@ impl TaskService {
             ],
         )
         .await?;
+        if machine_wait {
+            crate::deferred_dispatch::record_dispatch_disposition(
+                &self.db,
+                &updated,
+                "machine_capacity",
+                "machine_capacity: waiting for a machine run slot",
+            )
+            .await?;
+            updated = TaskRepo::get_by_id(&*self.db, &updated.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", &updated.id))?;
+        }
         self.publish(ForgeEvent {
             event_type: "task.recovery_action".to_owned(),
             entity_id: updated.id.clone(),
@@ -847,7 +872,11 @@ impl TaskService {
         let agent = self
             .ensure_queued_recovery_agent_available(&agent_id)
             .await?;
-        if !crate::agent_capacity::has_execution_capacity(&self.db, &agent).await? {
+        if !crate::agent_capacity::has_execution_capacity(&self.db, &agent).await?
+            || self
+                .machine_capacity_blocked(&recovery_task, &agent)
+                .await?
+        {
             return Ok(false);
         }
         // The short deferral and version CAS fence scans, while the admission
@@ -924,6 +953,9 @@ impl TaskService {
         match crate::deferred_dispatch::queued_recovery(&current) {
             None => Ok(true),
             Some(current_queue) if current_queue.id != queued.id => Ok(false),
+            Some(_) if crate::deferred_dispatch::is_pending(&current, chrono::Utc::now()) => {
+                Ok(false)
+            }
             Some(_) => {
                 // Non-execution recoveries can finish without an INSERT.
                 TaskRepo::mutate_metadata_and_bump_version(

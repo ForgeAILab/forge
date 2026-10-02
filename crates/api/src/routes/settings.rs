@@ -33,7 +33,8 @@ pub async fn update_settings(
 
     validate_update(&request)?;
 
-    let _guard = state.db.settings_update_lock.lock().await;
+    static SETTINGS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = SETTINGS_WRITE_LOCK.lock().await;
     let cap_update = request
         .server
         .as_ref()
@@ -43,7 +44,11 @@ pub async fn update_settings(
     apply_update(&mut config, request)?;
     write_yaml_config(path, &config).await?;
     if let Some(cap) = cap_update {
-        state.db.server_run_cap.set(cap);
+        state.db.server_run_cap.set(
+            cap,
+            config::resolved_run_cap(cap),
+            &config::embedded_machine_id(),
+        );
     }
 
     Ok(Json(settings_response(&state).await?))

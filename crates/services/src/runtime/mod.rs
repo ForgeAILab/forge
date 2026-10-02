@@ -267,9 +267,11 @@ impl ForgeRuntime {
     /// after constructing a compatibility AppState.  New callers should pass
     /// the final config to the builder up front.
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
-        self.db
-            .server_run_cap
-            .set(config.server.max_concurrent_runs);
+        self.db.server_run_cap.set(
+            config.server.max_concurrent_runs,
+            config::resolved_run_cap(config.server.max_concurrent_runs),
+            &config::embedded_machine_id(),
+        );
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service
@@ -559,9 +561,11 @@ impl ForgeRuntimeBuilder {
             ))
         });
         let effective_config = self.config;
-        self.db
-            .server_run_cap
-            .set(effective_config.server.max_concurrent_runs);
+        self.db.server_run_cap.set(
+            effective_config.server.max_concurrent_runs,
+            config::resolved_run_cap(effective_config.server.max_concurrent_runs),
+            &config::embedded_machine_id(),
+        );
         let pricing_repository = Arc::new(crate::pricing_db::SqlitePricingRepository::new(
             Arc::clone(&self.db),
         ));

@@ -1106,6 +1106,13 @@ impl TaskService {
         let execution = match create_result {
             Ok(execution) => execution,
             Err(error) => {
+                if crate::placement::is_machine_capacity_refusal(&error) {
+                    if let Some(task) =
+                        TaskRepo::get_by_id(&*self.db, &input.task_id, false).await?
+                    {
+                        self.defer_placement_refusal(&task, &error).await?;
+                    }
+                }
                 if workspace_created_by_attempt {
                     self.cleanup_fresh_execution_workspace_by_id(
                         &input.task_id,
