@@ -23,6 +23,8 @@ pub struct WorkerSupervisor {
     health: WorkerHealth,
     policy: SupervisorPolicy,
     #[cfg(test)]
+    child_abort: Option<Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>>,
+    #[cfg(test)]
     backoff_entered: Option<Arc<tokio::sync::Notify>>,
 }
 impl WorkerSupervisor {
@@ -31,12 +33,22 @@ impl WorkerSupervisor {
             health,
             policy,
             #[cfg(test)]
+            child_abort: None,
+            #[cfg(test)]
             backoff_entered: None,
         }
     }
     #[cfg(test)]
     pub(super) fn with_backoff_signal(mut self, signal: Arc<tokio::sync::Notify>) -> Self {
         self.backoff_entered = Some(signal);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn with_child_abort(
+        mut self,
+        slot: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    ) -> Self {
+        self.child_abort = Some(slot);
         self
     }
     pub fn start<F, Fut>(self, run: F, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()>
@@ -55,6 +67,11 @@ impl WorkerSupervisor {
                 let child_run = Arc::clone(&run);
                 let child_shutdown = shutdown.clone();
                 let mut child = tokio::spawn(async move { child_run(child_shutdown).await });
+                #[cfg(test)]
+                if let Some(slot) = &self.child_abort {
+                    *slot.lock().unwrap() = Some(child.abort_handle());
+                }
+
                 // A false watch change stays in this select with the SAME child.
                 let exit = tokio::select! {
                         _ = shutdown_signal(&mut shutdown) => {

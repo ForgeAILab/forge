@@ -21,6 +21,12 @@ pub(crate) struct EventHooks {
     notify: Arc<Notify>,
     #[cfg(test)]
     release_inspections: AtomicUsize,
+    // Marks and deliveries let a test wait until every committed append has
+    // been announced; releases run on a background task.
+    #[cfg(test)]
+    marks: AtomicUsize,
+    #[cfg(test)]
+    deliveries: AtomicUsize,
 }
 impl EventHooks {
     fn guard(&self) -> MutexGuard<'_, HashSet<usize>> {
@@ -31,7 +37,11 @@ impl EventHooks {
     }
     fn mark(&self, key: usize) {
         let mut committed = self.guard();
-        committed.insert(key);
+        let _inserted = committed.insert(key);
+        #[cfg(test)]
+        if _inserted {
+            self.marks.fetch_add(1, Ordering::Release);
+        }
         self.pending.store(committed.len(), Ordering::Release);
     }
     fn take(&self, key: usize) -> bool {
@@ -153,7 +163,10 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 // lock_handle queues behind any outstanding rollback/COMMIT;
                 // SQLx's own release check subsequently pings the connection.
                 let key = connection.lock_handle().await?.as_raw_handle().as_ptr() as usize;
-                if hooks.take(key) { hooks.notify.notify_waiters(); }
+                if hooks.take(key) {
+                    hooks.notify.notify_waiters();
+                    #[cfg(test)] hooks.deliveries.fetch_add(1, Ordering::Release);
+                }
                 Ok(true)
             })
         })
@@ -256,9 +269,22 @@ mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
 
-    async fn no_signal(signal: &Notify) {
+    /// Waits until every marked commit has been announced. A release runs on
+    /// a background task, so an earlier wake can otherwise land in a later
+    /// assertion's window.
+    async fn settled(hooks: &EventHooks) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hooks.deliveries.load(Ordering::Acquire) != hooks.marks.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("committed appends are announced");
+    }
+    async fn no_signal(hooks: &EventHooks) {
+        settled(hooks).await;
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), signal.notified())
+            tokio::time::timeout(Duration::from_secs(1), hooks.notify.notified())
                 .await
                 .is_err()
         );
@@ -298,7 +324,7 @@ mod tests {
             .await
             .unwrap();
         tx.rollback().await.unwrap();
-        no_signal(&hooks.notify).await;
+        no_signal(&hooks).await;
         {
             let mut tx = begin_immediate(&pool).await.unwrap();
             sqlx::query("INSERT INTO domain_event VALUES (1, 'dropped')")
@@ -306,15 +332,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        no_signal(&hooks.notify).await;
+        no_signal(&hooks).await;
         sqlx::query("INSERT INTO other VALUES ('after rollback')")
             .execute(&pool)
             .await
             .unwrap();
-        no_signal(&hooks.notify).await;
+        no_signal(&hooks).await;
 
         // Enable before commit, and immediately read from another connection
         // on delivery: a durable wake can never precede visibility.
+        settled(&hooks).await;
         let notified = hooks.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -334,9 +361,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        no_signal(&other_hooks.notify).await; // W4: no cross-database wake.
+        no_signal(&other_hooks).await; // W4: no cross-database wake.
 
         // W2: a prior commit survives a later rollback on a held connection.
+        settled(&hooks).await;
         let notified = hooks.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -367,6 +395,7 @@ mod tests {
             .unwrap();
 
         // W3: savepoint rollback cannot lose an earlier surviving insert.
+        settled(&hooks).await;
         let notified = hooks.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -392,7 +421,7 @@ mod tests {
             child.commit().await.unwrap();
         }
         tx.rollback().await.unwrap();
-        no_signal(&hooks.notify).await;
+        no_signal(&hooks).await;
 
         // A rolled-back savepoint may produce a harmless hint, never an event.
         let mut tx = begin_immediate(&pool).await.unwrap();
@@ -412,6 +441,7 @@ mod tests {
         drop(conn);
 
         // W1/W3 autocommit and failed statement; no stale dirty flag.
+        settled(&hooks).await;
         let notified = hooks.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -428,7 +458,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        no_signal(&hooks.notify).await;
+        no_signal(&hooks).await;
 
         // N5: poisoning is recovered, not translated by sqlx into ROLLBACK.
         let poisoned = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -436,6 +466,7 @@ mod tests {
             panic!("poison test");
         }));
         assert!(poisoned.is_err());
+        settled(&hooks).await;
         let notified = hooks.notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();

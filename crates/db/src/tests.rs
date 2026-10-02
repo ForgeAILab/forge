@@ -1,15 +1,15 @@
 use crate::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
     validate_uuid_v4, AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo,
-    AgentSessionRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents,
-    ClaimExecutionLease, ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CreateAgent,
-    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
-    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog,
-    CreateWorkspace, CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError,
-    DomainEventRepo, ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    AgentSessionRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimExecutionLease, ClaimTask,
+    CompareAndMoveTask, CreateAgent, CreateAgentContextScope, CreateAgentIdentity,
+    CreateAgentProfile, CreateAgentSession, CreateDomainEvent, CreateExecution, CreateProject,
+    CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
+    CreateProjectCharterRevisionAtomically, CreateProjectMember,
+    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateSkill, CreateTask,
+    CreateTaskRoleAssignment, CreateTerminalSession, CreateTransitionLog, CreateWorkspace,
+    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
+    ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
     ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, MemoryAccessQuery,
     MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
     MemorySourceType, MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery,
@@ -10439,394 +10439,86 @@ async fn test_normalize_failure_kinds_migration_backfill() {
 }
 
 #[tokio::test]
-async fn domain_event_claims_are_ordered_replay_safe_and_deduplicated() {
+async fn domain_event_checkpoints_are_ordered_and_deduplicated() {
     let db = sqlite_db().await;
-    let created_at = "2026-08-12T20:00:00Z".to_owned();
-    let first = CreateDomainEvent {
-        id: "event-first".to_owned(),
-        event_type: "task.transitioned".to_owned(),
-        entity_type: "task".to_owned(),
-        entity_id: "task-1".to_owned(),
-        actor_type: "system".to_owned(),
+    let make = |id: &str| crate::CreateDomainEvent {
+        id: id.into(),
+        event_type: "wanted".into(),
+        entity_type: "task".into(),
+        entity_id: "task".into(),
+        actor_type: "system".into(),
         actor_id: None,
-        scope_type: "task".to_owned(),
-        scope_id: "task-1".to_owned(),
-        correlation_id: "corr-1".to_owned(),
+        scope_type: "project".into(),
+        scope_id: "p".into(),
+        correlation_id: id.into(),
         causation_id: None,
         causation_depth: 0,
-        dedupe_key: Some("task-transition:1".to_owned()),
-        payload_json: r#"{"to_state":"review"}"#.to_owned(),
-        created_at: created_at.clone(),
+        dedupe_key: Some(id.into()),
+        payload_json: "{}".into(),
+        created_at: crate::now_rfc3339(),
     };
-    let first_row = DomainEventRepo::append_event(&db, first.clone())
+    let input = make("checkpoint-a");
+    let a = db.append_event(input.clone()).await.unwrap();
+    let duplicate = db
+        .append_event(CreateDomainEvent {
+            id: "duplicate-id".into(),
+            ..input.clone()
+        })
         .await
-        .expect("first event appends");
-    let duplicate = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-duplicate".to_owned(),
-            payload_json: r#"{"to_state":"review"}"#.to_owned(),
-            ..first
-        },
+        .unwrap();
+    assert_eq!(duplicate.id, a.id);
+    let conflict = db
+        .append_event(CreateDomainEvent {
+            id: "conflict-id".into(),
+            entity_id: "different-task".into(),
+            ..input
+        })
+        .await;
+    assert!(matches!(conflict, Err(DbError::Check(_))));
+    let b = db.append_event(make("checkpoint-b")).await.unwrap();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    db.ensure_domain_event_cursor_in_tx(&mut tx, "checkpoint-test", &crate::now_rfc3339())
+        .await
+        .unwrap();
+    assert!(db
+        .validate_event_worker_in_tx(
+            &mut tx,
+            "checkpoint-test",
+            0,
+            0,
+            b.sequence,
+            &crate::EventSubscription::All
+        )
+        .await
+        .is_err());
+    db.validate_event_worker_in_tx(
+        &mut tx,
+        "checkpoint-test",
+        0,
+        0,
+        a.sequence,
+        &crate::EventSubscription::All,
     )
     .await
-    .expect("dedupe returns the committed event");
-    assert_eq!(duplicate.id, first_row.id);
-    let conflicting_dedupe = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-conflicting-dedupe".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-other".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-other".to_owned(),
-            correlation_id: "corr-other".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:1".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:00:01Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(matches!(conflicting_dedupe, Err(DbError::Check(_))));
-
-    let second = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-second".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-2".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-2".to_owned(),
-            correlation_id: "corr-2".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:2".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at,
-        },
+    .unwrap();
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        "checkpoint-test",
+        0,
+        a.sequence,
+        &crate::now_rfc3339(),
     )
     .await
-    .expect("second event appends");
-
-    let claim_input = |owner: &str, now: &str, leased_until: &str| ClaimDomainEvents {
-        consumer_name: "projection".to_owned(),
-        lease_owner: owner.to_owned(),
-        now: now.to_owned(),
-        leased_until: leased_until.to_owned(),
-        limit: 10,
-    };
-    let claimed = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input("worker-a", "2026-08-12T20:01:00Z", "2026-08-12T20:02:00Z"),
-    )
-    .await
-    .expect("events claim");
+    .unwrap();
+    tx.commit().await.unwrap();
     assert_eq!(
-        claimed
-            .iter()
-            .map(|event| event.id.as_str())
-            .collect::<Vec<_>>(),
-        ["event-first", "event-second"]
-    );
-
-    let second_out_of_order = DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:01Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(second_out_of_order.is_err(), "cursor must remain ordered");
-
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: first_row.sequence,
-            event_id: first_row.id.clone(),
-            dedupe_key: first_row.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:02Z".to_owned(),
-        },
-    )
-    .await
-    .expect("first event completes"));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:03Z".to_owned(),
-        },
-    )
-    .await
-    .expect("second event completes"));
-    assert_eq!(
-        DomainEventRepo::get_consumer_cursor(&db, "projection")
+        db.get_consumer_cursor("checkpoint-test")
             .await
             .unwrap()
             .unwrap()
             .last_sequence,
-        second.sequence
+        a.sequence
     );
-    assert!(!DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: "task-transition:2".to_owned(),
-            completed_at: "2026-08-12T20:01:04Z".to_owned(),
-        },
-    )
-    .await
-    .expect("duplicate completion is idempotent"));
-
-    // A live lease at the cursor head blocks later sequences from being
-    // claimed by another worker; otherwise that worker could never
-    // checkpoint its out-of-order receipt.
-    let third = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-third".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-3".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-3".to_owned(),
-            correlation_id: "corr-3".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:3".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:01:05Z".to_owned(),
-        },
-    )
-    .await
-    .expect("third event appends");
-    let fourth = DomainEventRepo::append_event(
-        &db,
-        CreateDomainEvent {
-            id: "event-fourth".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-4".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-4".to_owned(),
-            correlation_id: "corr-4".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:4".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:01:06Z".to_owned(),
-        },
-    )
-    .await
-    .expect("fourth event appends");
-    let head_claim = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input(
-            "worker-head",
-            "2026-08-12T20:01:07Z",
-            "2026-08-12T20:02:07Z",
-        ),
-    )
-    .await
-    .expect("head events claim");
-    assert_eq!(head_claim.len(), 2);
-    assert_eq!(head_claim[0].id, third.id);
-    assert_eq!(head_claim[1].id, fourth.id);
-    // The same consumer cannot be claimed concurrently by another owner.
-    let blocked_claim = DomainEventRepo::claim_event_batch(
-        &db,
-        claim_input(
-            "worker-other",
-            "2026-08-12T20:01:08Z",
-            "2026-08-12T20:02:08Z",
-        ),
-    )
-    .await
-    .expect("blocked claim succeeds");
-    assert!(blocked_claim.is_empty());
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-head".to_owned(),
-            event_sequence: third.sequence,
-            event_id: third.id.clone(),
-            dedupe_key: third.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:09Z".to_owned(),
-        },
-    )
-    .await
-    .expect("third event completes"));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "projection".to_owned(),
-            lease_owner: "worker-head".to_owned(),
-            event_sequence: fourth.sequence,
-            event_id: fourth.id.clone(),
-            dedupe_key: fourth.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:01:10Z".to_owned(),
-        },
-    )
-    .await
-    .expect("fourth event completes"));
-
-    // Simulate a legacy crash after writing a projection receipt but before
-    // checkpointing the cursor. Claiming the next batch must repair the
-    // contiguous receipt prefix instead of getting stuck behind event-first.
-    sqlx::query(
-        "INSERT INTO event_consumer_cursor (consumer_name, last_sequence, version, updated_at)
-         VALUES ('repair', 0, 1, ?)",
-    )
-    .bind("2026-08-12T20:02:00Z")
-    .execute(db.pool())
-    .await
-    .expect("repair cursor inserts");
-    sqlx::query(
-        "INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
-         VALUES ('repair', ?, ?, ?)",
-    )
-    .bind(&first_row.id)
-    .bind(first_row.dedupe_key.as_deref().unwrap())
-    .bind("2026-08-12T20:02:00Z")
-    .execute(db.pool())
-    .await
-    .expect("orphan receipt inserts");
-    let repaired = DomainEventRepo::claim_event_batch(
-        &db,
-        ClaimDomainEvents {
-            consumer_name: "repair".to_owned(),
-            lease_owner: "repair-worker".to_owned(),
-            now: "2026-08-12T20:02:01Z".to_owned(),
-            leased_until: "2026-08-12T20:03:00Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .expect("repair claim succeeds");
-    assert_eq!(repaired.len(), 1);
-    assert_eq!(repaired[0].id, second.id);
-    assert_eq!(
-        DomainEventRepo::get_consumer_cursor(&db, "repair")
-            .await
-            .unwrap()
-            .unwrap()
-            .last_sequence,
-        first_row.sequence
-    );
-    assert!(DomainEventRepo::complete_claimed_event(
-        &db,
-        CompleteDomainEvent {
-            consumer_name: "repair".to_owned(),
-            lease_owner: "repair-worker".to_owned(),
-            event_sequence: second.sequence,
-            event_id: second.id.clone(),
-            dedupe_key: second.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:02:02Z".to_owned(),
-        },
-    )
-    .await
-    .expect("repaired cursor completes next event"));
-
-    let recovery_db = sqlite_db().await;
-    let stale_event = DomainEventRepo::append_event(
-        &recovery_db,
-        CreateDomainEvent {
-            id: "event-stale".to_owned(),
-            event_type: "task.transitioned".to_owned(),
-            entity_type: "task".to_owned(),
-            entity_id: "task-3".to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "task".to_owned(),
-            scope_id: "task-3".to_owned(),
-            correlation_id: "corr-3".to_owned(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("task-transition:3".to_owned()),
-            payload_json: "{}".to_owned(),
-            created_at: "2026-08-12T20:03:00Z".to_owned(),
-        },
-    )
-    .await
-    .unwrap();
-    let first_claim = DomainEventRepo::claim_event_batch(
-        &recovery_db,
-        ClaimDomainEvents {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            now: "2026-08-12T20:03:01Z".to_owned(),
-            leased_until: "2026-08-12T20:03:02Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(first_claim[0].id, stale_event.id);
-    let second_claim = DomainEventRepo::claim_event_batch(
-        &recovery_db,
-        ClaimDomainEvents {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-b".to_owned(),
-            now: "2026-08-12T20:03:03Z".to_owned(),
-            leased_until: "2026-08-12T20:03:04Z".to_owned(),
-            limit: 1,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(second_claim[0].id, stale_event.id);
-    let stale_completion = DomainEventRepo::complete_claimed_event(
-        &recovery_db,
-        CompleteDomainEvent {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-a".to_owned(),
-            event_sequence: stale_event.sequence,
-            event_id: stale_event.id.clone(),
-            dedupe_key: stale_event.dedupe_key.clone().unwrap(),
-            completed_at: "2026-08-12T20:03:03Z".to_owned(),
-        },
-    )
-    .await;
-    assert!(matches!(stale_completion, Err(DbError::VersionConflict)));
-    assert!(DomainEventRepo::complete_claimed_event(
-        &recovery_db,
-        CompleteDomainEvent {
-            consumer_name: "recovery".to_owned(),
-            lease_owner: "worker-b".to_owned(),
-            event_sequence: stale_event.sequence,
-            event_id: stale_event.id,
-            dedupe_key: "task-transition:3".to_owned(),
-            completed_at: "2026-08-12T20:03:04Z".to_owned(),
-        },
-    )
-    .await
-    .expect("replacement worker completes after lease expiry"));
 }
 
 #[tokio::test]

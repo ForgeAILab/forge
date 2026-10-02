@@ -2540,11 +2540,7 @@ impl TaskService {
             },
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
+
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id,

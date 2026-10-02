@@ -786,13 +786,14 @@ Entries carry actor, canonical scope, operation, input digest, policy result,
 status, correlation id, optional committed outcome, and occurrence time. The
 projection never returns an action payload body.
 
-The `consumer_health` projection flushes successful progress at an event boundary
-after five seconds or 100 events, with immediate writes on errors. Batch release
-flushes remaining progress and clears any published lease. New batch owners and
-lease renewals are buffered; empty polls write at most once every five seconds.
-Its processed-event counter is diagnostic and can lose up to 99 buffered increments on a crash;
-durable delivery cursors and receipts remain authoritative. `stale` continues
-to mean more than 90 seconds since the last successfully processed event.
+The Attention `consumer_health` view reads `worker_health` and live checkpoint lag.
+`processed_events` is removed. `stale` means subscribed events are pending and
+both the oldest pending event and checkpoint/initialization progress are older
+than 90 seconds; caught-up idle and newly initialized consumers are not stale.
+`last_error_code` now reports the worker kind (`failure`, `transient`, `terminal`)
+and `last_error_message` supplies its bounded diagnostic. Recent quarantine
+records remain visible for the same one-hour window as operator issues.
+Read-only idle polls write no heartbeat.
 
 Without `project_id`, authorized account/Main activity and all visible Project
 activity are included. Account/Main Chat entries are visible only to the
@@ -1211,8 +1212,8 @@ budgets, optimistic versions, and idempotency keys make retries observable
 and prevent duplicate assistant messages. A missing assistant message with a
 non-success turn is never rendered as a completed exchange.
 
-The durable wake consumer records exactly one disposition for every claimed
-wake: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
+The durable wake consumer records exactly one current disposition for each
+subscribed wake event: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
 `setup_required`. Those dispositions are delivery provenance, not a separate
 REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
@@ -3086,19 +3087,27 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | --- | --- |
 | `database.incremental_vacuum` | Whether SQLite `auto_vacuum` is `INCREMENTAL` (mode 2). |
 | `database.free_pages` | SQLite `freelist_count`; pages available for reuse or incremental reclamation. |
-| `event_consumers[]` | Durable consumers belonging to workers started by this process. Missing expected cursors are included with sequence 0; cursors for other workers are omitted. |
+| `event_consumers[]` | The four durable runtime workers started by this process. Missing expected cursors are included with sequence 0; unrelated cursors and the read-only SSE tail are omitted. |
 | `event_consumers[].consumer_name` | Durable consumer identity. |
 | `event_consumers[].last_sequence` | Last checkpointed sequence. |
-| `event_consumers[].lag` | For migrated workers (currently memory), the live count of pending events beyond the checkpoint matching the worker's stored subscription; deleted gaps and ignored types do not count. Legacy consumers retain `max(domain_event.sequence) - last_sequence`, clamped to zero, so their deleted gaps count. |
-| `event_consumers[].oldest_unprocessed_at` | Creation timestamp of the first pending subscribed sequence for migrated workers; earliest creation timestamp among all remaining events for legacy consumers. Computed live, `null` when caught up. |
+| `event_consumers[].lag` | Live count of pending events beyond the checkpoint matching the subscription in `worker_health`; deleted gaps and ignored types do not count. Attention subscribes to all types and classifies them in its handler. |
+| `event_consumers[].oldest_unprocessed_at` | Creation timestamp of the lowest pending subscribed sequence. Computed live, `null` when caught up. |
 | `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
-| `event_consumers[].stalled` | Remaining unprocessed events exist and the cursor has not advanced for more than `server.event_consumer_stall_seconds` (default 300). For a missing cursor, inactivity starts at the oldest pending event. Idle, caught-up consumers are never stalled. |
+| `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
+| `event_consumers[].dead_letter_count` | Total retained quarantines for that worker, without an age cutoff. |
+| `event_consumers[].recent_dead_letters` | Most recent five retained quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
+
+Dead-letter history remains visible after the one-hour degraded-health window.
+Replay and dismiss actions are not available in this slice. IDs are stable and
+opaque; the stored worker/item key identifies the source for later actions.
+Relay read errors or a stopped/restarting enabled relay raise attention.
 
 A stalled consumer raises `overall_severity` to at least `attention` and appears
 in the existing `recent_errors` operator issue list with `entity_type:
 "event_consumer"`, its consumer name as `entity_id`, and `severity: "attention"`.
-This current alert clears when the cursor recovers. Migrated workers also
+This current alert clears when the cursor recovers. All runtime workers also
 report bounded causes in the existing `recent_errors` list with the same
 consumer identity. Runtime causes clear on the next successful poll cycle,
 including empty cycles; event strikes remain until the event completes or is
@@ -3718,6 +3727,37 @@ Every committed `domain_event` row is also relayed as a
 "...", "domain_entity_id": "...", "entity_type": "...", "scope_type": "...",
 "scope_id": "..." }`; the frame's own `entity_id` is the domain event id.
 
+The relay is a supervised in-memory tail, not a durable consumer, and is omitted
+from operator `event_consumers`; its own `event_relay` object reports health and position. Plain connections are live-only and do not read
+historical ledger rows. Frame IDs are transport identifiers:
+
+- Durable `domain_event.committed` frames use `id: domain-event:<sequence>`.
+- Bus-only and ordinary `events.resync_required` frames omit the SSE `id` field entirely.
+  They preserve the client's last durable cursor; an empty `id` would reset it.
+- Keep-alive frames are comments and also carry no `id` field.
+- JSON `entity_id` and the other committed-envelope fields retain their meaning.
+
+A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that
+fits SQLite's signed 64-bit sequence range, requests replay after that sequence.
+Missing, entity-shaped, old event-ID-shaped, or malformed IDs produce live-only
+connections. A durable cursor beyond the current ledger head emits one resync
+frame with `reason: "resume cursor beyond ledger head"` and `id: domain-event:<head>` before continuing live. This exception resets a stale cursor so automatic reconnect does not repeat resync forever. No numeric sequence query parameter is introduced.
+
+Resume subscribes to the live bus before capturing a ledger head. If at most
+1,000 rows were missed, it reads them in 100-row pages and emits them in sequence
+order through that snapshot, filtering overlapping durable live frames. Appends
+beyond the snapshot continue live. If more than 1,000 rows were missed, it emits
+exactly one `events.resync_required` frame with `reason: "replay limit exceeded"`,
+emits no replay frames, and continues live. The cap check visits at most 1,001
+sequence keys rather than counting or loading the whole backlog. Ledger-read
+failures also request resync. Bus-only events remain live-only; bus overflow still
+requests resync. The ordered relay is the sole publisher of durable frames, including events
+from standalone appends and composite transactions.
+
+The web client routes `event.data` and does not inspect `lastEventId`; forge-ctl
+also routes JSON payloads rather than frame IDs. MCP's stream is separate from
+`GET /api/v1/events`. Their payload handling is unaffected by the ID namespace.
+
 | Event | Context payload |
 |-------|-----------------|
 | `product_genesis.started` | `{ "operation": "genesis.start", "session_id": "...", "main_chat_id": "...", "source_message_id": "...", "source_turn_id": "...|null", "admitted_turn_id": "..." }` |
@@ -4132,7 +4172,8 @@ into a known-tool `result` and do not use the orchestration envelope.
 ## Server-Sent Events
 
 `GET /api/v1/events` streams `ForgeEvent` payloads from the in-memory event
-bus. Useful for the web UI and for long-running scripts that want to react to
+bus. Plain connections are live-only; durable resume IDs and the 1,000-event
+replay cap are described in [SSE events](#sse-events). Useful for the web UI and for long-running scripts that want to react to
 state changes (`task.status_changed`, `task.moved`, `execution.completed`, …) without
 polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
 `daemon.offline` so clients can refresh daemon availability without waiting for

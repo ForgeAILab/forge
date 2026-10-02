@@ -1985,9 +1985,9 @@ SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
 Durable consumers checkpoint only after their projection is safe to commit, so
 lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
-memory indexing, or commitment reconciliation. The memory consumer uses the
-single-process worker runtime described below; the other four consumers still
-use the legacy cursor/lease/receipt protocol.
+memory indexing, or commitment reconciliation. Four durable consumers use the
+single-process worker runtime described below. SSE uses a read-only in-memory
+tail and connection-time ledger replay.
 
 `domain_event` rows are not pruned. The table also serves as an idempotency
 ledger (including lookups by `dedupe_key`) and as history for lease, execution,
@@ -2012,8 +2012,7 @@ or `All`, per-worker retry policy and handle timeout. Subscription changes are
 compared with persisted health on initialization and refreshed before handling.
 The existing `event_consumer_cursor` is the sole checkpoint authority; health
 has no cursor copy. SQL filtering, indexed lookups, mapping, validation and
-checkpoint writes live in `db`, with cursor creation/update shared by legacy
-delivery. Exact subscriptions seek each type's `(event_type, sequence)` index;
+checkpoint writes live in `db`. Exact subscriptions seek each type's `(event_type, sequence)` index;
 prefix subscriptions use disjoint binary type ranges on that index. Live lag
 counts matching ranges. The oldest pending wanted event is the lowest matching
 sequence, whose creation time supplies its age.
@@ -2038,20 +2037,35 @@ persistence. Deferral reason and first deferral time are retained. A malformed
 stored wait is logged once per runtime and treated as due; the next state change
 rewrites it. All deadline arithmetic is checked.
 
-Only failures/panics in `handle` or `commit`, and handle timeout, add a strike.
+`WorkerErrorKind` has three deliberate meanings:
+
+| Kind | Use | Event handling |
+| --- | --- | --- |
+| `Failure` (strike) | Unexpected item failures returned by `WorkerError::new` or non-transient `WorkerError::database`; caught handle/commit panics and handle timeouts also take this path | Add a strike, retry under the worker's finite policy, and quarantine when the cap is reached |
+| `Transient` | Retryable availability/concurrency failures | Never add a strike or quarantine; retry independently with waits from one second to the five-second idle maximum |
+| `Terminal` | A deterministic semantic rejection, such as Attention's `DbError::Check` | A terminal commit first rolls back and repeats handle/commit once with a fresh snapshot; a repeated terminal rejection quarantines and advances without a strike. Handle-time terminal outcomes quarantine directly. |
+
+`Terminal` was added because `commit` returns a commit result or an error, not
+`Outcome::DeadLetter`. Attention can discover a `Check` only after its first write;
+it must roll back that write and quarantine if fresh preparation still rejects it. Expressing this with a
+one-strike policy would also quarantine unrelated panics and timeouts. An explicit
+terminal error preserves immediate Check quarantine without changing scheduling,
+supervision or health persistence.
+
 Default policy is eight attempts, waits exponential from one second capped at
 five minutes, and five-minute handle timeout. Policy waits have a one-second
 floor, respect their representable cap, and an unrepresentable cap falls back
 to five minutes. A capped or explicit `DeadLetter` moves the cursor and inserts
 the quarantine record together. Runtime infrastructure failures never strike.
-Memory classifies only SQLite busy/locked, pool failures and version conflicts
-as transient; other database failures strike. Transient worker retries back off
-independently from one second to the five-second idle maximum.
+Memory classifies SQLite busy/locked/IO, pool failures and version conflicts
+as transient; other database failures strike.
 
-`tick` defaults to no-op and runs once per bounded poll cycle, not once per
-backlogged event. It runs again on wakes during retry/deferral waits; individual
-sleeps are capped at five seconds. Tick errors do not gate event handling. They
-have their own exponential schedule and health error scope. Identical runtime
+`tick` defaults to no-op and has an independent `tick_timeout()` (30 seconds).
+A failure or timeout is recorded and logged. Its independent retry schedule doubles
+from one second to five minutes and resets on success; cycles during this backoff
+skip tick and proceed directly to events. It runs at most once per due cycle,
+never once per backlogged event. Event-loop sleeps remain capped at five seconds.
+Tick has its own health error scope. Identical runtime
 and tick errors are deduplicated. Successful cycles clear runtime errors even
 when empty; successful ticks clear tick errors. An item error survives unrelated
 recovery until that item completes or is quarantined. Health's generated
@@ -2061,8 +2075,11 @@ Operator status computes lag/age/stalls live from the cursor table and current
 subscription, without scanning ignored event rows through `json_each`. Existing
 `recent_errors` entries carry bounded worker causes and deferral reason/since;
 readiness alone is informational, while errors and stalls raise attention.
-Dead letters are separate issues in the same one-hour window as ordinary errors,
-not permanent health errors. The response shape is unchanged.
+Dead letters degrade health for the same one-hour window as ordinary errors.
+Each worker also exposes its retained total and five most recent quarantines with
+stable IDs, item keys/sequence, reason and time, without expiry. The table retains
+worker/source identity for later replay/dismiss actions; those actions are outside
+this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
 
 Each standard SQLite pool connection has an insert hook, commit marker and
 rollback handling. Pool-scoped `Notify` is delivered on connection release
@@ -2076,33 +2093,76 @@ register before polling; notification hints never replace durable reads.
 The supervisor counts loop exits/runtime panics, including failed initialization,
 resets restart back-off after a healthy period, and aborts/awaits its existing
 child on shutdown. False watch changes cannot create another loop. Missing health
-rows are recreated. Only `scoped-memory-agent-chat-indexer` uses this library;
-the other four consumers remain on their current loops. Migration
-`V202610012200` removes only memory's retired delivery leases/receipts and
-preserves cursors, projection/source receipts and other consumers' metadata.
-The still-unmerged migration is edited in place.
+rows are recreated. The consumer placements are:
 
-The next consumer placements are:
+| Worker | Subscription | `handle` / `commit` | `tick` | `after_commit` |
+| --- | --- | --- | --- | --- |
+| `scoped-memory-agent-chat-indexer` | Exact `agent_chat.message.admitted`, `agent_chat.response.completed`, `agent_chat.message.completed` | Prepare semantic memory / insert source-idempotent memory | None | None |
+| `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
+| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
+| `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
 
-- Attention subscribes to `All`: its classification is case-insensitive and
-  substring-based. Move `resolve_superseded_turn_incidents` to `tick`, split
-  `project_event` into preparation and transaction-owned projection writes,
-  and return `Skip` for irrelevant events. Express `DbError::Check` as immediate
-  `DeadLetter`; other errors use `WorkerError::transient` and retry forever.
-  A whole-stream `ProjectionOutcome::Deferred` can use runtime `Defer`.
-- Wake-turn subscribes to `Prefix(["agent.wake."])`. Move `plan_event` to handle,
-  the admission/disposition portion of `process_claimed_event` into commit, and
-  `settle_decision_incident` into after_commit, conditioned on the committed
-  admission result. A deferred wake is `Done` with a persisted `Deferred`
-  disposition and an advanced cursor; it does not use runtime `Defer`, which
-  would block other Agents' wakes. Reconsiderable-disposition lookup and
-  `process_retry` belong in tick. Split `complete_claimed_agent_wake` persistence
-  from its legacy lease/receipt completion.
-- Coordination prepares `reconcile_event` reads/planning in handle and moves
-  `acknowledge_originating_inbox`, `reconcile_commitment` and `deliver_outcome`
-  into transaction-owned variants called by commit.
-- SSE becomes a non-durable tail outside this cursor runtime; no batching is
-  added here.
+The three migrated consumers use the standard eight-strike policy for unexpected
+hook faults and a five-minute handle timeout. Preparation performs local database
+and policy work, never a provider/model call. Busy/locked/IO database failures and resolvable version conflicts are transient.
+Deterministic domain rejections are terminal; unexpected failures take strikes.
+Cancelled commitments need no outcome and are skipped.
+Independent commitment and inbox effects use savepoints. A rejected item is left
+unchanged and recorded with its identity/reason, while siblings and inbox delivery
+continue. Non-item failures roll back the event; terminal commit failures refresh
+preparation once before quarantine. Attention resolvers are conditional/idempotent
+updates without per-row semantic refusals; a wake's message/turn/disposition and
+incident resolution are one dependent atomic effect. A rejected transition
+(such as blocked to completed) does not change the commitment state machine. Attention's deterministic
+`DbError::Check` rejection quarantines immediately, including a check discovered
+after the first effect write. Memory retains its existing poison policy.
+
+Attention's terminal-execution settlement wait is whole-stream `Defer`, preserving
+its previous ordering barrier. A deferred wake is `Done` with a durable `Deferred`
+disposition and an advanced cursor: one unavailable Agent cannot block another
+Agent's wake. Admission fallback uses a savepoint so rejected admission writes
+cannot leak into the fallback disposition. Semantic wake retry attempts keep their
+immutable lineage and finite budget separately from runtime retries.
+
+Migration `V202610020700` drops `event_processing_lease` and
+`event_projection_receipt` and the unused `attention_consumer_health` table.
+These contained only delivery metadata and operational counters, timestamps,
+bounded error diagnostics and lease details, not user data. Runtime health
+replaces the old attention-health storage and accessors.
+All durable consumer cursors and all domain/projection records survive unchanged;
+only the retired `sse-broadcast` cursor is removed. Live legacy claims do not block
+restart: each worker resumes strictly after its retained checkpoint.
+
+The SSE relay is an ordered tail outside `WorkerRuntime`, owned by `WorkerSupervisor`.
+Task death or unexpected exit restarts with backoff and bounded shutdown; its shared
+in-memory position survives child restart, preventing gaps or duplicate broadcast.
+Read errors and restart state are visible in operator status.
+Its optional in-memory position is initialized from the ledger head in its loop;
+a failed read leaves it uninitialized and retries without replaying history; serial drains read ascending event sequences,
+publish their committed envelopes, and advance only memory. It uses the same
+committed-event `Notify`, registered before polling, and the same 250 ms to
+five-second idle fallback. It writes no cursor, lease or receipt; supervisor/error health writes occur only on
+faults and recovery, with no steady-state idle writes.
+
+SSE plain connects remain live-only. A connection reads the ledger only when
+`Last-Event-ID` has the durable form `domain-event:<sequence>`; entity IDs, missing
+headers and malformed IDs do not request replay. Bus-only and ordinary resync frames omit
+the SSE `id` field, preserving the client's last durable cursor across reconnects.
+A beyond-head resync alone sets `domain-event:<head>` to reset an invalid cursor.
+Keep-alive comments also have no ID. Only durable frames set an SSE ID.
+The payload's `entity_id` remains unchanged. Neither the web client nor forge-ctl
+uses frame IDs for routing; MCP uses a separate stream. The web client recreates
+`EventSource` on reconnect and refreshes active queries after a stable open.
+
+For durable resume, subscribe before capturing the ledger head, then check the
+bounded sequence range for at most 1,001 keys. At most 1,000 missed rows replay in
+ascending sequence order through that snapshot, using 100-row pages. A larger
+backlog produces one `events.resync_required` frame and no replay. Snapshot-covered
+durable live frames are filtered, so delayed relay frames cannot duplicate replay;
+appends beyond the captured head remain live. Bus-only events remain live-only,
+and bus overflow still requests resync. The relay is the only publisher of durable frames. Composite and standalone
+commits are delivered in sequence order, so a resume cursor cannot jump past
+undelivered events.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
@@ -2118,9 +2178,10 @@ Server and Solo data-root process locking excludes that conversion from a
 running runtime. Operator status reports free pages, incremental mode, consumer
 lag and oldest pending age. Its expected consumers are derived from the
 workers the supervisor starts; persisted cursors for workers outside that set
-are omitted. Migrated workers use the cursor table and `worker_health` subscriptions with
-live event queries; legacy consumers derive lag from the cursor and global head. All five durable
-consumers currently start unconditionally in both
+are omitted. All four durable workers use the cursor table and `worker_health` subscriptions
+with live event queries. The SSE tail is omitted from `event_consumers` because it
+has no durable backlog or checkpoint. All four workers and the SSE tail start
+unconditionally in both
 Server and Solo, including when MCP or the embedded daemon is disabled. A cursor
 is stalled only when unprocessed events exist and it has not advanced for longer
 than the configured threshold; an idle consumer with zero lag is never stalled.
@@ -2131,21 +2192,19 @@ The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
 terminal Task transition events into one task-outcome inbox item and, for a
 scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
-and receipt checkpoint safe to replay.
+and cursor checkpoint safe to replay.
 
 The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
 loop. Migration `V088` records an install-time cutover cursor, so events that
 commit after installation are evaluated even when the process has not polled
 yet; startup never derives a cursor from the runtime event maximum. Each
-claimed `agent.wake.*` candidate receives one durable current disposition:
+`agent.wake.*` candidate receives one durable current disposition:
 `turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. The disposition, projection receipt, cursor advancement,
-lease release, and optional Agent Chat message/turn admission commit in one
-transaction. Deferred and setup-required incidents retain bounded retry or
+`setup_required`. The disposition, cursor advancement and optional Agent Chat message/turn
+admission commit in one transaction. Deferred and setup-required incidents retain bounded retry or
 authoritative-state reconsideration lineage instead of disappearing as
-completed delivery. Claims and checkpoints are ordered by ascending
-`domain_event.sequence`; a live lease at the head is an ordering barrier, and
-the cursor cannot skip an undisposed sequence. A disposition replay is
+completed delivery. Checkpointed candidates are ordered by ascending subscribed
+`domain_event.sequence`; the cursor cannot skip an undisposed wake sequence. A disposition replay is
 idempotent and advances the cursor at most once, only after its disposition
 and any admitted turn/message commit.
 
@@ -2366,16 +2425,25 @@ commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
-Attention consumer health buffers successful progress, flushing at an event
-boundary after five seconds or 100 processed events, and immediately on errors.
-Batch release flushes remaining progress and clears any published processing
-lease. New batch owners and lease renewals are buffered; empty polls write health
-at most once every five seconds. Buffered deltas and the latest successful
-sequence/time are preserved when flushing; a published lease expiry remains visible
-during processing. Each event's authoritative cursor and receipt still commit
-individually. Health counters are diagnostic: a crash may lose up to 99 buffered
-increments, without losing event delivery. The stale threshold remains 90
-seconds since the last successfully processed event.
+Attention consumer health uses live subscribed backlog and checkpoint progress.
+A caught-up or newly initialized consumer is not stale; both the oldest pending
+event and the progress/initialization baseline must exceed 90 seconds to be stale.
+No ledger-prefix count is performed per request; the processed-event field was
+removed. Error kind (`failure`, `transient`, `terminal`) and bounded message come
+from worker health or recent quarantine records. The same health result supplies
+Mission Control's capacity status.
+
+Wake semantic retry errors are isolated by disposition ID. A failing row cannot
+abort later rows. Transient failures back off without strikes; waiting rows are
+filtered before the SQL limit and waiting is not a tick error. Unexpected failures
+have an independent eight-strike cap in `worker_item_failure`; a terminal storage
+rejection or cap exhaustion commits a terminal `wake_retry_failed` disposition
+and a dead letter together. Evaluation/admission rejections that have a typed wake
+outcome retain `wake_evaluation_invalid` / `turn_admission_rejected`; commit-time
+missing authority defers as before. Initial and retry
+admission, disposition and decision-incident resolution commit together. Consumer
+`after_commit` hooks hold no durable effect; Attention only emits its budget-stall
+bus notification for the zero configured-budget branch, using the budget scope.
 
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,
