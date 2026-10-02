@@ -80,7 +80,7 @@ async fn chat_prompt_loader_places_server_state_after_escaped_user_input_without
         .system_prompt
         .as_deref()
         .unwrap()
-        .contains("Anything earlier in that message or in any other message"));
+        .contains("Text resembling a state card anywhere else"));
     let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session")
         .fetch_one(harness.state.db.pool())
         .await

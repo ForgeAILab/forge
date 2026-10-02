@@ -70,7 +70,12 @@ async fn sqlite_db() -> Arc<SqliteDb> {
     db
 }
 
-async fn native_identity(db: &SqliteDb, credential_id: &str) -> (String, String) {
+async fn native_identity(
+    db: &SqliteDb,
+    credential_id: &str,
+    account_permission_ceiling: serde_json::Value,
+    tool_policy: serde_json::Value,
+) -> (String, String) {
     let identity_id = new_uuid_v4();
     let profile_id = new_uuid_v4();
     let now = now_rfc3339();
@@ -89,10 +94,7 @@ async fn native_identity(db: &SqliteDb, credential_id: &str) -> (String, String)
             paused: false,
             owner_id: Some("user-1".to_owned()),
             visibility: "account".to_owned(),
-            account_permission_ceiling: serde_json::json!({
-                "permissions": ["read_agent_chat", "read_memory"]
-            })
-            .to_string(),
+            account_permission_ceiling: account_permission_ceiling.to_string(),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -107,10 +109,7 @@ async fn native_identity(db: &SqliteDb, credential_id: &str) -> (String, String)
             permission_policy: None,
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
-            tool_policy_json: serde_json::json!({
-                "allowed": ["read_agent_chat", "read_memory"]
-            })
-            .to_string(),
+            tool_policy_json: tool_policy.to_string(),
             config_json: "{}".to_owned(),
             credential_ref: Some(credential_id.to_owned()),
             daemon_id: None,
@@ -206,6 +205,17 @@ struct ChatFixture {
 }
 
 async fn chat_fixture() -> ChatFixture {
+    chat_fixture_with_policy(
+        serde_json::json!({ "permissions": ["read_agent_chat", "read_memory"] }),
+        serde_json::json!({ "allowed": ["read_agent_chat", "read_memory"] }),
+    )
+    .await
+}
+
+async fn chat_fixture_with_policy(
+    account_permission_ceiling: serde_json::Value,
+    tool_policy: serde_json::Value,
+) -> ChatFixture {
     let db = sqlite_db().await;
     let service = EmbeddedAgentService::new(Arc::clone(&db), b"tool-call-id-reuse-test-key");
     let credential_id = new_uuid_v4();
@@ -221,7 +231,8 @@ async fn chat_fixture() -> ChatFixture {
         )
         .await
         .expect("credential creates");
-    let (identity_id, profile_id) = native_identity(&db, &credential_id).await;
+    let (identity_id, profile_id) =
+        native_identity(&db, &credential_id, account_permission_ceiling, tool_policy).await;
     let chats = AgentChatService::new(Arc::clone(&db));
     chats
         .set_main_binding(SetMainAgentBindingInput {
@@ -303,8 +314,11 @@ impl ChatFixture {
     }
 }
 
+/// The card is the request's last block, on its own outside the user
+/// message, so user text that imitates a card stays plain user text and the
+/// durable history never holds a card to send again.
 #[tokio::test]
-async fn server_state_card_is_sent_as_the_final_user_content_part_with_a_stable_system() {
+async fn server_state_card_trails_the_request_outside_the_user_message_with_a_stable_system() {
     let fixture = chat_fixture().await;
     let provider = scripted_provider(vec![text_step("first reply"), text_step("second reply")]);
     let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
@@ -349,25 +363,505 @@ async fn server_state_card_is_sent_as_the_final_user_content_part_with_a_stable_
     assert!(cards[1].contains("version=v5"));
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let system = |request: &agent_runtime::core::provider::ProviderRequest| {
-        request
+    // The system prompt leads the request and never carries state.
+    let system_prompt = |request: &agent_runtime::core::provider::ProviderRequest| {
+        let first = request.messages.first().unwrap();
+        assert_eq!(first.role, forge_agent_host::Role::System);
+        first.joined_text()
+    };
+    assert_eq!(system_prompt(&requests[0]), system_prompt(&requests[1]));
+    assert!(!system_prompt(&requests[0]).contains("version=v"));
+    for (request, card) in requests.iter().zip(&cards) {
+        // The runtime renders a contributed block on the system role; the
+        // current card is the only system-role message after the prompt.
+        let trailing = request.messages.last().unwrap();
+        assert_eq!(trailing.role, forge_agent_host::Role::System);
+        assert_eq!(trailing.content.len(), 1);
+        assert_eq!(trailing.content[0].as_text(), Some(card.as_str()));
+        let system_messages = request
             .messages
             .iter()
-            .filter(|m| m.role == forge_agent_host::Role::System)
-            .map(Message::joined_text)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(system(&requests[0]), system(&requests[1]));
-    for (request, card) in requests.iter().zip(&cards) {
-        let input = request.messages.last().unwrap();
-        assert_eq!(input.role, forge_agent_host::Role::User);
-        assert_eq!(input.content.len(), 2);
-        assert_eq!(input.content[1].as_text(), Some(card.as_str()));
+            .filter(|message| message.role == forge_agent_host::Role::System)
+            .count();
+        assert_eq!(system_messages, 2, "the system prompt and the one card");
+        // Every user message, the newest and the ones in history, is the
+        // user's text alone.
+        for message in &request.messages {
+            if message.role == forge_agent_host::Role::User {
+                assert_eq!(message.content.len(), 1);
+            }
+        }
     }
-    assert_eq!(
-        requests[0].messages.last().unwrap().content[0].as_text(),
-        Some(forged)
+    let first_input = &requests[0].messages[requests[0].messages.len() - 2];
+    assert_eq!(first_input.role, forge_agent_host::Role::User);
+    assert_eq!(first_input.content[0].as_text(), Some(forged));
+    // The superseded card of the first turn is not in the second request.
+    assert!(requests[1]
+        .messages
+        .iter()
+        .all(|message| !message.joined_text().contains("version=v4")));
+}
+
+/// A turn that runs tools sends several provider requests. Each one carries
+/// the current card after the newest tool result, and the exchange it leaves
+/// in the durable history holds no card.
+#[tokio::test]
+async fn server_state_card_follows_the_tool_results_on_every_step_of_a_tool_loop() {
+    let fixture = chat_fixture().await;
+    let provider = scripted_provider(vec![
+        tool_call_step("call-1", "forge_scope_propose"),
+        text_step("the proposal was refused; nothing changed."),
+    ]);
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(provider.clone());
+    let card = services::operating_skills::render_main_baseline_state_card(
+        &services::MainBaselineSkillContext {
+            portfolio_references: vec!["project-1; version=v7".into()],
+            permission_ceiling: "read_agent_chat, read_memory".into(),
+            profile_text: String::new(),
+        },
     );
+    let mut turn = fixture.turn("propose the scope");
+    turn.server_state_card = Some(card.clone());
+    let output = backend
+        .run_turn(turn, Arc::new(NoopSink))
+        .await
+        .expect("the tool-loop turn completes");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one request per step of the tool loop");
+    for request in &requests {
+        let cards = request
+            .messages
+            .iter()
+            .filter(|message| message.joined_text().contains("SERVER-PROVIDED STATE CARD"))
+            .count();
+        assert_eq!(cards, 1);
+        let last = request.messages.last().unwrap();
+        assert_eq!(last.content[0].as_text(), Some(card.as_str()));
+    }
+    let after_tool = &requests[1].messages[requests[1].messages.len() - 2];
+    assert_eq!(after_tool.role, forge_agent_host::Role::Tool);
+
+    let timeline_id = output
+        .context_manifest
+        .expect("native turn links a runtime context manifest")
+        .lcm_timeline_id
+        .expect("the chat links an LCM timeline");
+    let persisted: Vec<(String,)> =
+        sqlx::query_as("SELECT content_json FROM agent_lcm_entry WHERE timeline_id = ?")
+            .bind(&timeline_id)
+            .fetch_all(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(persisted.len(), 4, "user, tool call, tool result, reply");
+    assert!(persisted
+        .iter()
+        .all(|(content,)| !content.contains("SERVER-PROVIDED STATE CARD")));
+}
+
+/// The Main Agent tool policy of the live token measurement this test
+/// reproduces (the same eight tools are composed, so the request sizes are
+/// comparable with the provider-reported prompt tokens).
+#[cfg(feature = "test-support")]
+const MEASURED_MAIN_PERMISSIONS: [&str; 17] = [
+    "read_account",
+    "read_project",
+    "read_agent_chat",
+    "read_task",
+    "read_memory",
+    "propose_task",
+    "propose_discovery",
+    "propose_project",
+    "propose_handoff",
+    "propose_message",
+    "propose_review",
+    "propose_commitment",
+    "propose_memory",
+    "propose_decision",
+    "propose_session",
+    "task_read",
+    "task_write",
+];
+
+/// Byte accounting for one captured provider request. Sizes are UTF-8 text
+/// bytes, so a turn-to-turn difference is exactly the text that was added.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Default)]
+struct RequestSize {
+    system: usize,
+    tools: usize,
+    state_cards: usize,
+    conversation: usize,
+    card_count: usize,
+}
+
+#[cfg(feature = "test-support")]
+impl RequestSize {
+    fn total(&self) -> usize {
+        self.system + self.tools + self.state_cards + self.conversation
+    }
+}
+
+/// Every text block of the request that is a server state card, wherever it
+/// travels: a part of a user message or a message of its own.
+#[cfg(feature = "test-support")]
+fn state_cards(request: &agent_runtime::core::provider::ProviderRequest) -> Vec<&str> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(ContentPart::as_text)
+        .filter(|text| text.starts_with(services::operating_skills::STATE_CARD_HEADER))
+        .collect()
+}
+
+#[cfg(feature = "test-support")]
+fn request_size(request: &agent_runtime::core::provider::ProviderRequest) -> RequestSize {
+    let mut size = RequestSize::default();
+    for tool in &request.tools {
+        size.tools +=
+            tool.name.len() + tool.description.len() + tool.input_schema.to_string().len();
+    }
+    for (index, message) in request.messages.iter().enumerate() {
+        for text in message.content.iter().filter_map(ContentPart::as_text) {
+            if text.starts_with(services::operating_skills::STATE_CARD_HEADER) {
+                size.state_cards += text.len();
+                size.card_count += 1;
+            } else if index == 0 && message.role == forge_agent_host::Role::System {
+                size.system += text.len();
+            } else {
+                size.conversation += text.len();
+            }
+        }
+    }
+    size
+}
+
+/// Points the bound Main Agent's profile at an endpoint the scripted provider
+/// replaces, which the worker path requires before it admits a native turn.
+#[cfg(feature = "test-support")]
+async fn main_agent_with_native_endpoint(fixture: &ChatFixture) -> db::Agent {
+    let identity = db::AccountMainAgentBindingRepo::get_active_main_binding(&*fixture.db, "user-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let agent = AgentRepo::get_by_id(&*fixture.db, &identity.identity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    AgentRepo::update(
+        &*fixture.db,
+        db::UpdateAgent {
+            id: agent.id.clone(),
+            expected_version: agent.version,
+            config_json: Some(r#"{"base_url":"https://unused.invalid/v1"}"#.into()),
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            daemon_id: None,
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    agent
+}
+
+/// The token regression this guards: the state card used to be a part of
+/// every user message, so each earlier turn's card stayed in the durable
+/// history and was sent again on every later request. Over the measured
+/// eight-turn Main chat that cost 14% more prompt tokens than the previous
+/// release, growing by one card per turn without bound.
+///
+/// Drives the production loader and the native backend through eight turns,
+/// with the portfolio changing before turns 4, 6 and 8, and reads what the
+/// provider was actually sent.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn main_chat_requests_carry_one_state_card_and_grow_only_by_the_conversation() {
+    const TURNS: [(&str, &str); 8] = [
+        (
+            "In two sentences, what can you help me with here? Please answer directly without using any tools.",
+            "As your Forge Main Agent I can help you explore ideas, start Product Genesis for a new Project, and route Project work to the right Project Agent. I can also explain the Forge state I have been given.",
+        ),
+        (
+            "In two sentences, what is the difference between a Project and a Task? No tools please.",
+            "A Project is a long-lived delivery effort governed by its own Charter and coordinated by a Project Agent. A Task is one bounded unit of work inside a Project that a worker implements and a reviewer checks.",
+        ),
+        (
+            "Give me one tip for writing a good task description. One sentence, no tools.",
+            "State the objective, the acceptance criteria and the explicit boundaries so the worker cannot misread the scope.",
+        ),
+        (
+            "In one sentence, what is a code review for? No tools.",
+            "A code review checks that a change is correct, maintainable and within scope before it merges.",
+        ),
+        (
+            "Name two benefits of small pull requests in one sentence. No tools.",
+            "Small pull requests are reviewed faster and more thoroughly, and they are easier to revert or debug.",
+        ),
+        (
+            "In one sentence, what does 'merge conflict' mean? No tools.",
+            "A merge conflict happens when two branches change the same lines and git cannot pick one automatically.",
+        ),
+        (
+            "In one sentence, what is a milestone? No tools.",
+            "A milestone is a checkpoint that groups related Tasks toward one deliverable goal.",
+        ),
+        (
+            "Summarize our conversation so far in two sentences. No tools.",
+            "We covered my role as the Forge Main Agent and several delivery basics: Projects and Tasks, task descriptions, code review, small pull requests, merge conflicts and milestones. Nothing was created or changed in Forge.",
+        ),
+    ];
+    const STATE_CHANGES_BEFORE: [usize; 3] = [4, 6, 8];
+
+    let fixture = chat_fixture_with_policy(
+        serde_json::json!({ "allowed": MEASURED_MAIN_PERMISSIONS }),
+        serde_json::json!({ "allowed": MEASURED_MAIN_PERMISSIONS }),
+    )
+    .await;
+    main_agent_with_native_endpoint(&fixture).await;
+    let chats = AgentChatService::new(fixture.db.clone());
+    let provider = scripted_provider(TURNS.iter().map(|(_, reply)| text_step(reply)).collect());
+    // The production composition: Forge's own tools and the account scratch
+    // directory, so the request carries the tool schemas a live turn sends.
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_forge_tool_provider(Arc::new(services::CoordinationToolProvider::new(
+            fixture.db.clone(),
+        )))
+        .with_provider_override(provider.clone());
+    let logs = tempfile::tempdir().unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    fixture.service.set_workspace_root(
+        workspaces.path().join("workspaces"),
+        workspaces.path().join("projects"),
+    );
+    let chat_id = fixture.scope.scope_id.clone();
+    let db = fixture.db.clone();
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        db.clone(),
+        Arc::new(fixture.service.with_native_backend(Arc::new(backend))),
+        Arc::new(UnreachableCli),
+        services::AgentChatTurnLogRoot::new(logs.path()),
+    );
+    let worker = services::AgentChatTurnWorker::with_runner(db.clone(), Arc::new(runner));
+
+    let alpha = new_uuid_v4();
+    let beta = new_uuid_v4();
+    let insert_project = |id: String, name: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO project (id, name, owner_id, version, created_at, updated_at)
+                 VALUES (?, ?, 'user-1', 1, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(now_rfc3339())
+            .bind(now_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    };
+    let rename_project = |id: String, name: &'static str| {
+        let db = db.clone();
+        async move {
+            sqlx::query(
+                "UPDATE project SET name = ?, version = version + 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(name)
+            .bind(now_rfc3339())
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    };
+
+    for (index, (message, _)) in TURNS.iter().enumerate() {
+        match index + 1 {
+            4 => insert_project(alpha.clone(), "Perf Alpha").await,
+            6 => rename_project(alpha.clone(), "Perf Alpha Renamed").await,
+            8 => {
+                rename_project(alpha.clone(), "Perf Alpha Third Name").await;
+                insert_project(beta.clone(), "Perf Beta").await;
+            }
+            _ => {}
+        }
+        let admitted = chats
+            .send_message(services::SendAgentChatMessageInput {
+                actor_user_id: "user-1".into(),
+                chat_id: chat_id.clone(),
+                content: (*message).into(),
+                dedupe_key: Some(format!("state-card-turn-{index}")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+        let turn = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.turn_job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            turn.status,
+            db::AgentChatTurnState::Succeeded,
+            "turn {} must complete: {:?}",
+            index + 1,
+            turn.error_message
+        );
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), TURNS.len(), "one provider request per turn");
+    let sizes: Vec<RequestSize> = requests.iter().map(request_size).collect();
+
+    // The numbers a reader compares before and after: estimated tokens are
+    // bytes / 4, the runtime's own sizing ratio.
+    eprintln!(
+        "turn | request bytes | est tokens | system | tools | state cards (n) | conversation"
+    );
+    for (index, size) in sizes.iter().enumerate() {
+        eprintln!(
+            "{:>4} | {:>13} | {:>10} | {:>6} | {:>5} | {:>11} ({}) | {:>12}",
+            index + 1,
+            size.total(),
+            size.total().div_ceil(4),
+            size.system,
+            size.tools,
+            size.state_cards,
+            size.card_count,
+            size.conversation,
+        );
+    }
+    eprintln!(
+        "total | {} bytes | {} est tokens",
+        sizes.iter().map(RequestSize::total).sum::<usize>(),
+        sizes
+            .iter()
+            .map(|size| size.total().div_ceil(4))
+            .sum::<usize>(),
+    );
+
+    // (a) One card's worth of volatile state per request, never a history of
+    // superseded cards, and it trails the conversation.
+    for (index, request) in requests.iter().enumerate() {
+        let cards = state_cards(request);
+        assert_eq!(
+            cards.len(),
+            1,
+            "request {} must carry exactly one state card",
+            index + 1
+        );
+        let header = services::operating_skills::STATE_CARD_HEADER.trim_end();
+        let header_mentions = request
+            .messages
+            .iter()
+            .skip(1)
+            .flat_map(|message| message.content.iter())
+            .filter_map(ContentPart::as_text)
+            .map(|text| text.matches(header).count())
+            .sum::<usize>();
+        assert_eq!(
+            header_mentions,
+            1,
+            "request {} must not embed a second card inside another block",
+            index + 1
+        );
+        let last = request.messages.last().unwrap();
+        assert_eq!(
+            last.content.last().and_then(ContentPart::as_text),
+            Some(cards[0]),
+            "request {} must end with the current state card",
+            index + 1
+        );
+    }
+
+    // (b) The system prompt is byte-identical on every turn, including the
+    // turns that follow a state change.
+    let system_prompt = |request: &agent_runtime::core::provider::ProviderRequest| {
+        let first = request.messages.first().unwrap();
+        assert_eq!(first.role, forge_agent_host::Role::System);
+        first.joined_text()
+    };
+    let first_system = system_prompt(&requests[0]);
+    assert!(first_system.contains("Forge Main Agent"));
+    assert!(!first_system.contains("- Permission ceiling:"));
+    assert!(!first_system.contains("version=v"));
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            system_prompt(request),
+            first_system,
+            "request {} changed the system prompt",
+            index + 1
+        );
+        assert_eq!(sizes[index].tools, sizes[0].tools, "tool schemas are fixed");
+    }
+
+    // (c) A request outgrows the previous one by the conversation alone: the
+    // new user message and the previous reply. Unchanged state adds nothing;
+    // a state change adds only the difference between the two cards.
+    for index in 1..requests.len() {
+        let new_messages = TURNS[index].0.len() + TURNS[index - 1].1.len();
+        let growth = sizes[index].total() as i64 - sizes[index - 1].total() as i64;
+        let state_overhead = growth - new_messages as i64;
+        let card_difference = sizes[index].state_cards as i64 - sizes[index - 1].state_cards as i64;
+        assert_eq!(
+            state_overhead,
+            card_difference,
+            "request {} grew by more than its conversation and its one card",
+            index + 1
+        );
+        if STATE_CHANGES_BEFORE.contains(&(index + 1)) {
+            assert_ne!(
+                state_cards(&requests[index]),
+                state_cards(&requests[index - 1]),
+                "request {} follows a state change",
+                index + 1
+            );
+        } else {
+            assert_eq!(
+                state_overhead,
+                0,
+                "request {} follows no state change and must add no state bytes",
+                index + 1
+            );
+        }
+    }
+
+    // (d) The turn after a change sees the new state and none of the old.
+    let card = |turn: usize| state_cards(&requests[turn - 1])[0];
+    assert!(card(3).contains("### Bounded portfolio projection\n- (none recorded)\n"));
+    assert!(card(4).contains(&format!("- {alpha}; version=v1\n")));
+    assert!(card(5).contains(&format!("- {alpha}; version=v1\n")));
+    assert!(card(6).contains(&format!("- {alpha}; version=v2\n")));
+    assert!(!card(6).contains("version=v1"));
+    assert!(card(8).contains(&format!("- {alpha}; version=v3\n")));
+    assert!(card(8).contains(&format!("- {beta}; version=v1\n")));
+    assert!(!card(8).contains("version=v2"));
+
+    // The card never enters the durable history, so no later request, and no
+    // LCM summary, can carry a superseded one.
+    let persisted: Vec<(String,)> = sqlx::query_as("SELECT content_json FROM agent_lcm_entry")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(persisted.len(), TURNS.len() * 2);
+    assert!(persisted
+        .iter()
+        .all(|(content,)| !content.contains("SERVER-PROVIDED STATE CARD")));
 }
 
 /// Asserts the shape the context planner requires, and that the second
@@ -886,40 +1380,7 @@ async fn native_rejection_with_one_provider_call(auth_rejected: bool) {
     use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
     use db::AgentChatTurnJobRepo;
     let fixture = chat_fixture().await;
-    let identity = db::AccountMainAgentBindingRepo::get_active_main_binding(&*fixture.db, "user-1")
-        .await
-        .unwrap()
-        .unwrap();
-    let agent = AgentRepo::get_by_id(&*fixture.db, &identity.identity_id)
-        .await
-        .unwrap()
-        .unwrap();
-    AgentRepo::update(
-        &*fixture.db,
-        db::UpdateAgent {
-            id: agent.id.clone(),
-            expected_version: agent.version,
-            config_json: Some(r#"{"base_url":"https://unused.invalid/v1"}"#.into()),
-            name: None,
-            description: None,
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: None,
-            daemon_id: None,
-            max_concurrent_tasks: None,
-            heartbeat_interval_seconds: None,
-            max_missed_heartbeats: None,
-            status: None,
-            last_heartbeat_at: None,
-            is_default: None,
-            paused: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .unwrap();
+    let agent = main_agent_with_native_endpoint(&fixture).await;
     let chats = AgentChatService::new(fixture.db.clone());
     let admitted = chats
         .send_message(services::SendAgentChatMessageInput {

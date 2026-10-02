@@ -158,7 +158,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   system prompt now holds only the operating skill, the server's rules and the
   agent's Profile (in full, as quoted text). Task counts, versions, milestones,
   open decisions and the permission ceiling arrive in a server-created state
-  card at the end of the turn's input. Content digests, the event watermark
+  card. Each request carries one card, after the conversation, and the card
+  is not stored in the chat's history, so a long chat sends the current card
+  only and never the earlier ones. The Gemini provider receives the card at
+  the end of its system instruction. Content digests, the event watermark
   and context-manifest references are no longer shown to the agent; they are
   still recorded in each turn's context manifest, and the agent reads current
   state through its tools.
