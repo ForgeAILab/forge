@@ -2432,10 +2432,10 @@ async fn annotate_owner_recovery(
                 Some("owner_disconnected_timeout" | "owner_lost_execution")
             ));
     let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
-        "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
-        "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
-        "message": format!("Workspace owner recovery required: {cause}"),
-});
+            "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
+            "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
+            "message": format!("Workspace owner recovery required: {cause}"),
+    });
     if can_annotate {
         let updated = sqlx::query("UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
             .bind(annotation.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version)
@@ -3921,10 +3921,7 @@ pub(crate) mod tests {
             annotation["message"],
             "Recovered after agent heartbeat timeout"
         );
-        assert_eq!(
-            annotation["recovery_actions"],
-            json!(["reexecute", "reset_to_initial", "cancel_task"])
-        );
+        assert!(annotation.get("recovery_actions").is_none());
 
         let mut event_types = Vec::new();
         let mut recovered_event_id = None;
@@ -6202,7 +6199,12 @@ pub(crate) mod tests {
         let error = service
             .test_apply_action(
                 ready.task_id,
-                api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
                 None,
                 None,
             )
@@ -7005,21 +7007,36 @@ pub(crate) mod tests {
             .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }));
+            .contains(&api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         let (_, _first) =
             owner_connection(&registry, placement.daemon_id.as_deref().unwrap(), false);
         assert!(!service
             .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }));
+            .contains(&api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         let (_, _second) =
             owner_connection(&registry, placement.daemon_id.as_deref().unwrap(), true);
         assert!(service
             .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }));
+            .contains(&api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         DaemonRepo::mark_offline(
             &*db,
             placement.daemon_id.as_deref().unwrap(),
@@ -7031,7 +7048,12 @@ pub(crate) mod tests {
             .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }));
+            .contains(&api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
     }
 
     #[tokio::test]
@@ -7079,7 +7101,17 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)))
             .with_daemon_connections(registry);
         service
-            .test_apply_action(&task.id, api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
         responder.await.unwrap();
@@ -8265,12 +8297,7 @@ pub(crate) mod tests {
         };
         if task_reset {
             let recovered = service
-                .test_apply_action(
-                    &task.id,
-                    api_types::TaskAction::Restart,
-                    None,
-                    None,
-                )
+                .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
                 .await
                 .unwrap();
             assert_eq!(recovered.status, crate::workflow::default_states::TODO);
@@ -8384,12 +8411,7 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             service
-                .test_apply_action(
-                    &task.id,
-                    api_types::TaskAction::Restart,
-                    None,
-                    None
-                )
+                .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
                 .await,
             Err(ServiceError::Db(db::DbError::VersionConflict))
         ));
@@ -8403,12 +8425,7 @@ pub(crate) mod tests {
             1
         );
         let recovered = service
-            .test_apply_action(
-                &task.id,
-                api_types::TaskAction::Restart,
-                None,
-                None,
-            )
+            .test_apply_action(&task.id, api_types::TaskAction::Restart, None, None)
             .await
             .unwrap();
         assert!(recovered.error_annotation.is_none());
@@ -8465,7 +8482,17 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let error = service
-            .test_apply_action(&task.id, api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .expect_err("explicit recovery preserves the base offline-agent refusal");
         assert!(
@@ -8493,12 +8520,27 @@ pub(crate) mod tests {
         assert_eq!(
             actions,
             vec![
-                api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None
+                },
                 api_types::TaskAction::Cancel
             ]
         );
         let retried = service
-            .test_apply_action(&task.id, api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(retried.status, task.status);

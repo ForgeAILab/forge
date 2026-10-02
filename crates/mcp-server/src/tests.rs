@@ -728,11 +728,7 @@ fn known_tool_version_conflict_is_an_in_band_structured_outcome() {
         scope: "repository".to_owned(),
         execution_id: "execution-2".to_owned(),
     })
-    .with_call_context(
-        "forge_reexecute_execution",
-        Some("project-1"),
-        Some("user-1"),
-    )
+    .with_call_context("task.action", Some("project-1"), Some("user-1"))
     .into_tool_response(json!(2));
     let db_result = db_response
         .result
@@ -2636,5 +2632,78 @@ fn forge_create_sub_tasks_nested_rejected() {
                 .and_then(Value::as_str),
             Some("NESTED_SUBTASK_UNSUPPORTED")
         );
+    });
+}
+
+#[test]
+fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let _agent = seed_agent(&state, "action-agent").await;
+        for condition in ["failed_review", "stored_annotation", "blocked_budget"] {
+            let task = seed_task(&state).await;
+            let execution_id = seed_execution(&state, task.id.clone()).await;
+            sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+                .bind(&execution_id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            let status = if condition == "failed_review" {
+                "review"
+            } else {
+                "in_progress"
+            };
+            sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(&task.id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            if condition == "failed_review" {
+                let now = now_rfc3339();
+                db::ReviewRepo::create(
+                    &*state.db,
+                    db::CreateReview {
+                        id: new_uuid_v4(),
+                        task_id: task.id.clone(),
+                        execution_id,
+                        attempt_number: 1,
+                        status: db::ReviewStatus::Failed,
+                        step_results_json: json!({"ci_steps":[{"command":"check","exit_code":1}]})
+                            .to_string(),
+                        started_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            } else if condition == "stored_annotation" {
+                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                    .bind(json!({"type":"executor_failed","blocking_reason":"fixture","recovery_actions":["return_to_implementation","retry_pr_publication"]}).to_string())
+                    .bind(&task.id).execute(state.db.pool()).await.unwrap();
+            } else {
+                sqlx::query("UPDATE task SET blocked_json = ? WHERE id = ?")
+                    .bind(json!({"kind":"retry_exhausted","reason":"spent","recovery_actions":["return_to_implementation"]}).to_string())
+                    .bind(&task.id).execute(state.db.pool()).await.unwrap();
+            }
+            let offers = state
+                .task_service
+                .task_action_offers(
+                    &task.id,
+                    &api_types::Actor::user(api_types::UserActionSource::Api),
+                )
+                .await
+                .unwrap();
+            let result = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+            assert_eq!(result["available_actions"], json!(offers.available_actions));
+            assert_eq!(result["execution_actions"], result["available_actions"]);
+            assert_eq!(
+                result["workflow_exception"]["actions"],
+                result["available_actions"]
+            );
+            assert!(result["error_annotation"].get("recovery_actions").is_none());
+            assert_eq!(result["version"], offers.version);
+        }
     });
 }

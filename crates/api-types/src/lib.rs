@@ -665,8 +665,16 @@ pub mod execution_outbox;
 #[test]
 fn export_bindings_remove_retired_action_types() {
     let root = std::env::var_os("TS_RS_EXPORT_DIR").expect("binding export directory");
-    for name in ["RecoveryAction", "ExecutionActionKind", "ExecutionAction", "WorkflowExceptionAction", "RecoverTaskRequest"] {
+    for name in [
+        "RecoveryAction",
+        "ExecutionActionKind",
+        "ExecutionAction",
+        "WorkflowExceptionAction",
+        "RecoverTaskRequest",
+    ] {
         let path = std::path::Path::new(&root).join(format!("{name}.ts"));
-        if path.exists() { std::fs::remove_file(path).expect("remove retired generated type"); }
+        if path.exists() {
+            std::fs::remove_file(path).expect("remove retired generated type");
+        }
     }
 }

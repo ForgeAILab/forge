@@ -124,8 +124,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let approve: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/approve"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "action": {"verb":"approve","override":false} }),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -134,8 +134,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let reject: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "not ready" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "action": {"verb":"send_back","guidance":"not ready"}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -159,8 +159,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let mark_reviewed: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{failed_task_id}/recover"),
-        json!({ "action": "mark_reviewed", "reason": "owner verified the change" }),
+        &format!("/api/v1/tasks/{failed_task_id}/actions"),
+        json!({ "action": {"verb":"approve","override":true}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;

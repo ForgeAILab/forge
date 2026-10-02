@@ -117,7 +117,11 @@ async fn project_pause_precedes_placement_on_every_execution_launch_path() {
             .err()
             .expect("paused Project refuses launch"),
     );
-    let accepted = service.perform_task_action(&task.id, api_types::TaskAction::retry(), task.version).await.expect("paused Project accepts a queued retry without launching").task;
+    let accepted = service
+        .perform_task_action(&task.id, api_types::TaskAction::retry(), task.version)
+        .await
+        .expect("paused Project accepts a queued retry without launching")
+        .task;
     assert!(crate::deferred_dispatch::queued_recovery(&accepted).is_some());
     for error in errors {
         assert!(
@@ -2673,8 +2677,14 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
     assert_eq!(annotation["hook"]["stdout"], "preflight-out\n");
     assert_eq!(annotation["hook"]["stderr"], "preflight-err\n");
     assert!(annotation.get("recovery_actions").is_none());
-    let offers = service.task_action_offers(&task.id, &Actor::user(UserActionSource::Test)).await.unwrap().available_actions;
-    assert!(offers.iter().any(|offer| offer.reason == "entry_barrier_blocked"));
+    let offers = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap()
+        .available_actions;
+    assert!(offers
+        .iter()
+        .any(|offer| offer.reason == "entry_barrier_blocked"));
     assert!(offers.iter().any(|offer| offer.action.verb() == "approve"));
     let interruption_payload: String = sqlx::query_scalar(
         "SELECT payload_json FROM domain_event
@@ -2779,12 +2789,7 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         .expect("project settings update");
 
     let recovered = service
-        .test_apply_action(
-            task.id.clone(),
-            api_types::TaskAction::retry(),
-            None,
-            None,
-        )
+        .test_apply_action(task.id.clone(), api_types::TaskAction::retry(), None, None)
         .await
         .expect("retry hook recovers");
 
@@ -2872,7 +2877,6 @@ async fn retry_hook_after_manual_merge_repair_returns_to_fresh_review_without_wo
         artifact: None,
         message: Some("repair and re-review".to_owned()),
         hook: None,
-
     });
     let task = TaskRepo::update(
         &*db,
@@ -3024,7 +3028,12 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: Some(true), reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: None,
+                refresh_workspace: Some(true),
+                reset_budget: None,
+                guidance: None,
+            },
             None,
             None,
         )
@@ -3120,7 +3129,9 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+            },
             None,
             None,
         )
@@ -4420,13 +4431,21 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
         .message
         .as_deref()
         .is_some_and(|message| message.contains("tsc and tauri are not installed")));
-    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
-    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 
     let missing_reason = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: false },
+            api_types::TaskAction::Approve {
+                override_checks: false,
+            },
             None,
             None,
         )
@@ -4439,7 +4458,9 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: false },
+            api_types::TaskAction::Approve {
+                override_checks: false,
+            },
             Some("Provider check was verified manually".to_owned()),
             None,
         )
@@ -4563,7 +4584,10 @@ async fn assert_owner_review_park(db: &SqliteDb, task_id: &str, message: &str) {
     );
     assert_eq!(annotation.blocking_reason, "review_needs_owner");
     assert_eq!(annotation.message.as_deref(), Some(message));
-    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
     let blocked: Value = serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
     assert_eq!(blocked["kind"], "review_needs_owner");
     assert!(task.failed_json.is_none());
@@ -4581,11 +4605,23 @@ async fn assert_owner_review_park(db: &SqliteDb, task_id: &str, message: &str) {
         1,
         "only the seeded candidate coder execution exists"
     );
-    let snapshot = crate::task_actions::load_snapshot(db, task.clone(), crate::workflow::default_workflow::default_workflow(), &Actor::user(UserActionSource::Test)).await.unwrap();
+    let snapshot = crate::task_actions::load_snapshot(
+        db,
+        task.clone(),
+        crate::workflow::default_workflow::default_workflow(),
+        &Actor::user(UserActionSource::Test),
+        None,
+    )
+    .await
+    .unwrap();
     let offers = crate::available_actions(&snapshot);
-    let exception = crate::task_diagnostics::task_exception(&snapshot, offers.clone()).expect("owner exception");
+    let exception = crate::task_diagnostics::task_exception(&snapshot, offers.clone())
+        .expect("owner exception");
     assert_eq!(exception.actions, offers);
-    assert!(exception.actions.iter().any(|offer| offer.reason == "review_needs_owner"));
+    assert!(exception
+        .actions
+        .iter()
+        .any(|offer| offer.reason == "review_needs_owner"));
 }
 
 #[tokio::test]
@@ -4842,7 +4878,9 @@ async fn review_finding_routing_owner_manual_pass_clears_the_park() {
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: false },
+            api_types::TaskAction::Approve {
+                override_checks: false,
+            },
             Some("Owner verified the hardware measurements".to_owned()),
             None,
         )
@@ -4919,7 +4957,9 @@ async fn review_finding_routing_defer_follow_up_is_charter_dispatchable() {
     service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+            },
             Some("Schedule the measurements separately".to_owned()),
             None,
         )
@@ -4964,7 +5004,9 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
         let error = service
             .test_apply_action(
                 task.id.clone(),
-                api_types::TaskAction::Approve { override_checks: true },
+                api_types::TaskAction::Approve {
+                    override_checks: true,
+                },
                 reason,
                 None,
             )
@@ -4978,7 +5020,9 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+            },
             Some("macOS/Windows runs need a human".to_owned()),
             None,
         )
@@ -5045,7 +5089,9 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
     assert!(service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true
+            },
             Some("duplicate defer".to_owned()),
             None
         )
@@ -5099,7 +5145,9 @@ async fn review_finding_routing_defer_uses_workflow_backlog_and_bounds_unicode_t
     service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+            },
             Some("Collect hardware evidence separately".to_owned()),
             None,
         )
@@ -5146,7 +5194,9 @@ async fn review_finding_routing_defer_rolls_back_follow_up_when_manual_pass_fail
     service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: true },
+            api_types::TaskAction::Approve {
+                override_checks: true,
+            },
             Some("human follow-up required".to_owned()),
             None,
         )
@@ -5342,8 +5392,14 @@ async fn assert_failed_reviewer_disposition(
             annotation.blocked_execution_id.as_deref(),
             Some(execution.id.as_str())
         );
-        assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
-    assert!(serde_json::to_value(&annotation).unwrap().get("recovery_actions").is_none());
+        assert!(serde_json::to_value(&annotation)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
+        assert!(serde_json::to_value(&annotation)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
         assert_eq!(metadata["execution_retry_count"], retry_count);
         assert!(metadata.get("deferred_dispatch").is_none());
         assert!(current.failed_json.is_none());
@@ -5564,7 +5620,12 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
         )
         .await
         .expect("bound Project Agent rejects human-required review");
-    assert_eq!(reviewed.action, api_types::TaskAction::SendBack { guidance: String::new() });
+    assert_eq!(
+        reviewed.action,
+        api_types::TaskAction::SendBack {
+            guidance: String::new()
+        }
+    );
     assert_eq!(
         reviewed.task.status,
         crate::workflow::default_states::IN_PROGRESS
@@ -5670,7 +5731,6 @@ async fn open_interactive_recovery_starts_the_created_execution() {
         artifact: None,
         message: Some("paused".to_owned()),
         hook: None,
-
     };
     let task = TaskRepo::update(
         &*db,
@@ -6931,7 +6991,12 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             .await
             .expect("recovery actions resolve"),
         vec![
-            api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            },
             api_types::TaskAction::Restart,
             api_types::TaskAction::Cancel,
         ]
@@ -6939,7 +7004,12 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
 
     for unadvertised in [
         api_types::TaskAction::retry(),
-        api_types::TaskAction::Retry { fresh_session: None, refresh_workspace: None, reset_budget: Some(true), guidance: None },
+        api_types::TaskAction::Retry {
+            fresh_session: None,
+            refresh_workspace: None,
+            reset_budget: Some(true),
+            guidance: None,
+        },
     ] {
         let error = service
             .test_apply_action(
@@ -6971,7 +7041,12 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             Some("test".to_owned()),
             Some("resume current work".to_owned()),
         )
@@ -7030,7 +7105,9 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .await
         .expect("never-run actions resolve");
     assert!(
-        !never_run_actions.contains(&api_types::TaskAction::Approve { override_checks: false }),
+        !never_run_actions.contains(&api_types::TaskAction::Approve {
+            override_checks: false
+        }),
         "an assigned Task must not skip its first coder execution"
     );
     let running = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
@@ -7039,12 +7116,16 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .test_action_values(task.id.clone())
         .await
         .expect("actions resolve");
-    assert!(!actions.contains(&api_types::TaskAction::Approve { override_checks: false }));
+    assert!(!actions.contains(&api_types::TaskAction::Approve {
+        override_checks: false
+    }));
 
     let error = service
         .test_apply_intent(
             task.id.clone(),
-            api_types::TaskAction::Approve { override_checks: false },
+            api_types::TaskAction::Approve {
+                override_checks: false,
+            },
             None,
             Some(task.version),
         )
@@ -7095,7 +7176,9 @@ async fn submit_does_not_reuse_a_completed_attempt_from_before_review_remediatio
         .test_action_values(task.id.clone())
         .await
         .expect("actions resolve");
-    assert!(!actions.contains(&api_types::TaskAction::Approve { override_checks: false }));
+    assert!(!actions.contains(&api_types::TaskAction::Approve {
+        override_checks: false
+    }));
 }
 
 #[tokio::test]
@@ -7158,7 +7241,9 @@ async fn submit_uses_latest_current_role_execution_not_later_interactive_history
         .test_action_values(task.id.clone())
         .await
         .expect("actions resolve");
-    assert!(actions.contains(&api_types::TaskAction::Approve { override_checks: false }));
+    assert!(actions.contains(&api_types::TaskAction::Approve {
+        override_checks: false
+    }));
 }
 
 #[tokio::test]
@@ -7202,7 +7287,6 @@ async fn resume_without_session_clears_manual_stop_before_reexecute() {
         artifact: None,
         message: Some("paused".to_owned()),
         hook: None,
-
     };
     let task = TaskRepo::update(
         &*db,
@@ -7312,7 +7396,6 @@ async fn reexecute_opens_a_fresh_review_attempt_when_the_last_one_settled() {
         artifact: None,
         message: Some("the reviewer executor died".to_owned()),
         hook: None,
-
     })
     .expect("annotation serializes");
     let task = TaskRepo::update(
@@ -7339,7 +7422,12 @@ async fn reexecute_opens_a_fresh_review_attempt_when_the_last_one_settled() {
     let recovered = service
         .test_apply_action(
             task.id.clone(),
-            api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             Some("test".to_owned()),
             None,
         )
@@ -7404,8 +7492,15 @@ async fn hard_failed_active_task_cannot_resume_or_submit() {
         .await
         .expect("actions resolve");
     assert!(!actions.contains(&api_types::TaskAction::Release));
-    assert!(!actions.contains(&api_types::TaskAction::Approve { override_checks: false }));
-    for action in [api_types::TaskAction::Release, api_types::TaskAction::Approve { override_checks: false }] {
+    assert!(!actions.contains(&api_types::TaskAction::Approve {
+        override_checks: false
+    }));
+    for action in [
+        api_types::TaskAction::Release,
+        api_types::TaskAction::Approve {
+            override_checks: false,
+        },
+    ] {
         let error = service
             .test_apply_intent(task.id.clone(), action, None, Some(task.version))
             .await

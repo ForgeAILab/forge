@@ -639,8 +639,15 @@ pub async fn raw_json_request(
     app: &Router,
     method: Method,
     uri: &str,
-    body: Value,
+    mut body: Value,
 ) -> axum::response::Response {
+    // Commands in lifecycle fixtures still use the real versioned endpoint.
+    // Preserve an explicit version so stale-version tests exercise the CAS.
+    if method == Method::POST && uri.ends_with("/actions") && body.get("version").is_none() {
+        let response = raw_empty_request(app, Method::GET, uri).await;
+        let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
+        body["version"] = json!(offers.version);
+    }
     app.clone()
         .oneshot(
             Request::builder()

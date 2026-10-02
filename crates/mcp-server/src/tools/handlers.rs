@@ -46,7 +46,7 @@ use crate::{
     state::AppState,
     values::{
         agent_page_value_for_user, agent_profile_value, agent_session_value, agent_value_for_user,
-        execution_page_value, execution_value, project_page_value, project_value, task_page_value,
+        execution_page_value, execution_value, project_page_value, project_value,
         task_role_assignment_value, task_value,
     },
 };
@@ -144,7 +144,7 @@ pub(super) async fn forge_create_task(
             ),
             other => other.into(),
         })?;
-    let mut result = task_value(task);
+    let mut result = task_with_offers(state, task).await?;
     if let Some(object) = result.as_object_mut() {
         object.insert("depends_on_ids".to_owned(), json!(dependency_ids));
     }
@@ -181,7 +181,7 @@ async fn tasks_with_role_assignments(
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
-        let mut value = task_value(task);
+        let mut value = task_with_offers(state, task).await?;
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "role_assignments".to_owned(),
@@ -402,18 +402,42 @@ pub(super) async fn forge_list_tasks(
         },
     )
     .await?;
-    Ok(task_page_value(page))
+    let has_more = page.next_cursor.is_some();
+    let items = tasks_with_role_assignments(state, page.items).await?;
+    Ok(
+        json!({ "items": items, "next_cursor": page.next_cursor, "has_more": has_more, "total_count": page.total_count }),
+    )
 }
 
 pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("task", params.task_id))?;
-    let offers = state.task_service.task_action_offers(&task.id, &api_types::Actor::user(api_types::UserActionSource::Api)).await?;
-    let mut value = task_value(task);
-    value["available_actions"] = json!(offers.available_actions);
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(
+            &params.task_id,
+            &Actor::user(api_types::UserActionSource::Api),
+        )
+        .await?;
+    task_snapshot_value(snapshot)
+}
+
+fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
+    let offers = services::available_actions(&snapshot);
+    let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+    let mut value = task_value(snapshot.task);
+    value["available_actions"] = json!(offers);
+    value["execution_actions"] = value["available_actions"].clone();
+    value["workflow_exception"] = serde_json::to_value(exception)
+        .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
     Ok(value)
+}
+
+async fn task_with_offers(state: &AppState, task: db::Task) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&task.id, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_preview_prompt(
@@ -583,13 +607,22 @@ pub(super) async fn forge_assign_agent(
     }))
 }
 
-pub(super) async fn task_action(state: &AppState, params: Value, _context: &McpContext) -> Result<Value, McpToolError> {
-    let task_id = params.get("task_id").and_then(Value::as_str).ok_or_else(|| invalid_field_error("task_id", "required", None))?;
-    let request: api_types::TaskActionRequest = parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
-    let result = state.task_service.perform_task_action(task_id, request.action, request.version).await?;
-    let mut value = task_value(result.task.clone());
-    value["available_actions"] = serde_json::to_value(state.task_service.task_action_offers(&result.task.id, &api_types::Actor::user(api_types::UserActionSource::Api)).await?.available_actions).map_err(|error| McpToolError::new(-32603, error.to_string()))?;
-    Ok(value)
+pub(super) async fn task_action(
+    state: &AppState,
+    params: Value,
+    _context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let task_id = params
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_field_error("task_id", "required", None))?;
+    let request: api_types::TaskActionRequest =
+        parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
+    let result = state
+        .task_service
+        .perform_task_action(task_id, request.action, request.version)
+        .await?;
+    task_with_offers(state, result.task).await
 }
 
 pub(super) async fn forge_get_task_diff(
@@ -645,7 +678,7 @@ pub(super) async fn forge_update_task(
         },
     )
     .await?;
-    Ok(task_value(task))
+    task_with_offers(state, task).await
 }
 
 pub(super) async fn forge_transition_task(
@@ -671,7 +704,7 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    Ok(task_value(task.task))
+    task_with_offers(state, task.task).await
 }
 
 pub(super) async fn forge_register_agent(
@@ -903,7 +936,7 @@ pub(super) async fn forge_follow_up_execution(
         .to_owned();
 
     Ok(json!({
-        "task": task_value(launched.task),
+        "task": task_with_offers(state, launched.task).await?,
         "execution": execution_value(launched.execution),
         "workspace": {
             "id": launched.workspace.id,

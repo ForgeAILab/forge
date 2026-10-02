@@ -1067,16 +1067,16 @@ impl SoloSessionService {
         }
         let reason = input.reason.and_then(|reason| safe_diagnostic(&reason));
         let action = match input.decision {
-            SoloReviewDecision::Accept => api_types::TaskAction::Approve { override_checks: false },
-            SoloReviewDecision::RequestChanges => api_types::TaskAction::SendBack { guidance: reason.clone().unwrap_or_default() },
+            SoloReviewDecision::Accept => api_types::TaskAction::Approve {
+                override_checks: false,
+            },
+            SoloReviewDecision::RequestChanges => api_types::TaskAction::SendBack {
+                guidance: reason.clone().unwrap_or_default(),
+            },
         };
         let result = self
             .task_service
-            .perform_task_action(
-                task.id.clone(),
-                action,
-                input.expected_task_version,
-            )
+            .perform_task_action(task.id.clone(), action, input.expected_task_version)
             .await?;
         Ok(SoloReviewDecisionResult {
             task_id: result.task.id,
@@ -1359,7 +1359,14 @@ impl SoloSessionService {
                     .then_with(|| left.created_at.cmp(&right.created_at))
                     .then_with(|| left.id.cmp(&right.id))
             });
-        let available_actions = self.task_service.task_action_offers(&task_id, &api_types::Actor::user(api_types::UserActionSource::Api)).await?.available_actions;
+        let available_actions = self
+            .task_service
+            .task_action_offers(
+                &task_id,
+                &api_types::Actor::user(api_types::UserActionSource::Api),
+            )
+            .await?
+            .available_actions;
         Ok(SoloTaskSnapshot {
             id: safe_identifier(&task.id),
             project_id: safe_identifier(&task.project_id),

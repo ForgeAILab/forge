@@ -598,7 +598,12 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
         task_service
             .test_apply_action(
                 recovery_task_id,
-                api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+                api_types::TaskAction::Retry {
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
                 Some("owner reconnected".into()),
                 None,
             )

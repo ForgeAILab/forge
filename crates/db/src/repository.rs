@@ -951,20 +951,11 @@ impl CreateDomainEvent {
             task.failed_json.as_deref(),
         );
         let interruption = if task.failed_json.is_some() {
-            Some(event_interruption_details(
-                "failed",
-                &failed,
-            ))
+            Some(event_interruption_details("failed", &failed))
         } else if task.blocked_json.is_some() {
-            Some(event_interruption_details(
-                "blocked",
-                &blocked,
-            ))
+            Some(event_interruption_details("blocked", &blocked))
         } else if task.error_annotation.is_some() {
-            Some(event_interruption_details(
-                "annotation",
-                &annotation,
-            ))
+            Some(event_interruption_details("annotation", &annotation))
         } else {
             None
         };
@@ -1061,10 +1052,7 @@ impl CreateDomainEvent {
     }
 }
 
-fn event_interruption_details(
-    source: &str,
-    value: &serde_json::Value,
-) -> serde_json::Value {
+fn event_interruption_details(source: &str, value: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "source": source,
         "kind": value
@@ -1101,7 +1089,16 @@ pub fn task_interruption_requires_intervention(
     let annotation = error_annotation
         .map(parse_event_json_object)
         .unwrap_or_default();
-    annotation.get("type").cloned().and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok()).is_some_and(|kind| !matches!(kind, api_types::FailureKind::ManualStop | api_types::FailureKind::Unknown))
+    annotation
+        .get("type")
+        .cloned()
+        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
+        .is_some_and(|kind| {
+            !matches!(
+                kind,
+                api_types::FailureKind::ManualStop | api_types::FailureKind::Unknown
+            )
+        })
 }
 
 fn parse_event_json_object(raw: &str) -> serde_json::Value {

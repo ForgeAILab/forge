@@ -30,6 +30,10 @@ pub struct DaemonWorkspaceClient {
 }
 
 impl DaemonWorkspaceClient {
+    pub(crate) fn registry(&self) -> &DaemonConnectionRegistry {
+        &self.registry
+    }
+
     pub fn new(registry: Arc<DaemonConnectionRegistry>) -> Self {
         Self {
             registry,

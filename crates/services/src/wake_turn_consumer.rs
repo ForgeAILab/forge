@@ -1618,7 +1618,13 @@ fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<Stri
                 .map(|actions| {
                     actions
                         .iter()
-                        .filter_map(|value| value.get("action").and_then(|action| action.get("verb")).and_then(Value::as_str).or_else(|| value.as_str()))
+                        .filter_map(|value| {
+                            value
+                                .get("action")
+                                .and_then(|action| action.get("verb"))
+                                .and_then(Value::as_str)
+                                .or_else(|| value.as_str())
+                        })
                         .filter(|action| !action.trim().is_empty())
                         .map(str::to_owned)
                         .collect()
@@ -1633,7 +1639,13 @@ fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<Stri
         Value::Array(actions) => (
             actions
                 .iter()
-                .filter_map(|value| value.get("action").and_then(|action| action.get("verb")).and_then(Value::as_str).or_else(|| value.as_str()))
+                .filter_map(|value| {
+                    value
+                        .get("action")
+                        .and_then(|action| action.get("verb"))
+                        .and_then(Value::as_str)
+                        .or_else(|| value.as_str())
+                })
                 .filter(|action| !action.trim().is_empty())
                 .map(str::to_owned)
                 .collect(),

@@ -22,9 +22,7 @@ use services::{
         compare_running_execution_authority, count_gate_rejections_since_boundary,
         derive_workflow_health,
     },
-    task_service::action_resolver::{
-        list_execution_action_authority,
-    },
+    task_service::action_resolver::list_execution_action_authority,
 };
 use sqlx::Row;
 
@@ -417,7 +415,14 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
-    let snapshot = services::task_actions::load_snapshot(db, task.clone(), workflow.clone(), &api_types::Actor::user(api_types::UserActionSource::Api)).await?;
+    let snapshot = services::task_actions::load_snapshot(
+        db,
+        task.clone(),
+        workflow.clone(),
+        &api_types::Actor::user(api_types::UserActionSource::Api),
+        router.daemon_connections(),
+    )
+    .await?;
     let offers = services::available_actions(&snapshot);
     let workflow_exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
     let execution_actions = offers.clone();
@@ -503,7 +508,10 @@ fn blocking_annotation_for_projection<'a>(
     if task.failed_json.is_some() {
         return None;
     }
-    error_annotation.filter(|annotation| annotation.annotation_type != api_types::FailureKind::Unknown).or(blocked_metadata).or(error_annotation)
+    error_annotation
+        .filter(|annotation| annotation.annotation_type != api_types::FailureKind::Unknown)
+        .or(blocked_metadata)
+        .or(error_annotation)
 }
 
 fn retry_budget_exhausted_for_state(
@@ -619,7 +627,10 @@ mod retry_projection_tests {
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("one blocker selected");
 
-        assert_eq!(selected.annotation_type, api_types::FailureKind::TargetRepoDirty);
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::TargetRepoDirty
+        );
     }
 
     #[test]
@@ -631,7 +642,10 @@ mod retry_projection_tests {
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("typed annotation remains authoritative");
 
-        assert_eq!(selected.annotation_type, api_types::FailureKind::RecoveryRequired);
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::RecoveryRequired
+        );
     }
 
     #[test]
@@ -649,7 +663,10 @@ mod retry_projection_tests {
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
         assert_eq!(parsed.annotation_type, api_types::FailureKind::Unknown);
-        assert!(serde_json::to_value(&parsed).unwrap().get("recovery_actions").is_none());
+        assert!(serde_json::to_value(&parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     #[test]
@@ -666,8 +683,14 @@ mod retry_projection_tests {
         };
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
-        assert_eq!(parsed.annotation_type, api_types::FailureKind::RetryExhausted);
-        assert!(serde_json::to_value(parsed).unwrap().get("recovery_actions").is_none());
+        assert_eq!(
+            parsed.annotation_type,
+            api_types::FailureKind::RetryExhausted
+        );
+        assert!(serde_json::to_value(parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     fn test_task() -> db::Task {
@@ -719,7 +742,6 @@ mod retry_projection_tests {
             artifact: None,
             message: None,
             hook: None,
-
         };
 
         assert!(retry_budget_exhausted_for_state(

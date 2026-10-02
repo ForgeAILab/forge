@@ -16,4 +16,35 @@ describe('WorkflowExceptionPanel offers', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry Review' })); fireEvent.change(screen.getByLabelText('Guidance'), { target: { value: 'Environment repaired' } }); fireEvent.click(screen.getByRole('button', { name: 'Apply' })); expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'retry', guidance: 'Environment repaired' })
   })
   it('renders the server cancellation offer without checking Task state', () => { render(<WorkflowExceptionPanel task={task([{ ...retry, action: { verb: 'cancel' }, label: 'Cancel Task' }])} />); expect(screen.getByRole('button', { name: 'Cancel Task' })).toBeTruthy() })
+  it('requires nonblank guidance for a send-back offer', () => {
+    render(<WorkflowExceptionPanel task={task([{ ...retry, action: { verb: 'send_back', guidance: '' }, parameters: [{ name: 'guidance', required: true, boolean_values: null }], label: 'Revise Candidate' }])} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Revise Candidate' }))
+    const apply = screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement
+    expect(apply.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Guidance'), { target: { value: '   ' } })
+    expect(apply.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Guidance'), { target: { value: 'Add the missing evidence' } })
+    fireEvent.click(apply)
+    expect(mutate.mock.calls[0][0]).toEqual({ taskId: 'task', version: 7, action: { verb: 'send_back', guidance: 'Add the missing evidence' } })
+  })
+  it('uses only server-declared retry flags and their defaults', () => {
+    render(<WorkflowExceptionPanel task={task([{ ...retry, action: { verb: 'retry', reset_budget: true }, parameters: [{ name: 'reset_budget', required: false, boolean_values: [true] }] }])} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))
+    const budget = screen.getByRole('checkbox', { name: 'reset budget' }) as HTMLInputElement
+    expect(budget.checked).toBe(true)
+    expect(budget.disabled).toBe(true)
+    expect(screen.queryByLabelText('fresh session')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'retry', reset_budget: true })
+  })
+  it('sends the explicit server override choice', () => {
+    render(<WorkflowExceptionPanel task={task([{ ...retry, action: { verb: 'approve', override: true }, parameters: [{ name: 'override', required: false, boolean_values: [true] }], label: 'Pass Review Manually' }])} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Pass Review Manually' }))
+    const override = screen.getByRole('checkbox', { name: 'Override checks' }) as HTMLInputElement
+    expect(override.checked).toBe(true)
+    expect(override.disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'approve', override: true })
+  })
+
 })

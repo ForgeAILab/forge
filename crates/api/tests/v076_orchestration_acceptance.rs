@@ -218,10 +218,10 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
         workspace_access: WorkspaceAccess::ProjectVerify,
     };
     for (operation, cause) in [
-        ("task.recover", "permission_missing(propose_task)"),
+        ("task.action", "permission_missing(propose_task)"),
         ("task.review", "operation_not_in_scope"),
         ("task.propose", "charter_not_adopted"),
-        ("task.cancel", "project_paused(old detail)"),
+        ("task.action", "project_paused(old detail)"),
         ("task.adaptive", "identity_paused"),
     ] {
         provider
@@ -256,7 +256,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
         .await
         .unwrap();
     let paused = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
-    assert!(paused.input_parts[1].contains("task.cancel (project_paused(environment_not_ready))"));
+    assert!(paused.input_parts[1].contains("task.action (project_paused(environment_not_ready))"));
     assert!(paused.input_parts[1].contains("task.adaptive (identity_paused)"));
     assert!(!paused.input_parts[1].contains("old detail"));
     assert_eq!(first.system_prompt, paused.system_prompt);
@@ -278,7 +278,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
     .await;
     let second = chat_preview(&harness, &fixture.project_chat_id, &second_turn).await;
     for entry in [
-        "task.recover (permission_missing(propose_task))",
+        "task.action (permission_missing(propose_task))",
         "task.propose (charter_not_adopted)",
     ] {
         assert!(
@@ -288,7 +288,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
     }
     assert!(second.input_parts[1].contains("### Unavailable in this session"));
     assert!(second.input_parts[1].contains("task.review (operation_not_in_scope)"));
-    assert!(!second.input_parts[1].contains("task.cancel (project_paused"));
+    assert!(!second.input_parts[1].contains("task.action (project_paused"));
     assert!(!second.input_parts[1].contains("task.adaptive (identity_paused)"));
     assert!(!second.input_parts[1].contains("message.send (operation_not_in_scope)"));
     assert_eq!(

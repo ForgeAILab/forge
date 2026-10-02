@@ -1,8 +1,8 @@
 mod common;
 
 use api_types::{
-    ErrorResponse, TaskAction, TaskActionsResponse, TaskAnnotation,
-    TaskBlockingAnnotation, TaskResponse, WorkflowDefinition,
+    ErrorResponse, TaskActionsResponse, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
+    WorkflowDefinition,
 };
 use axum::http::{Method, StatusCode};
 use db::{CreateExecution, ExecutionRepo, ExecutionStatus, TaskRepo, TransitionLogRepo};
@@ -32,13 +32,13 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
         let error: ErrorResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/submit", task.id),
-            json!({}),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"approve","override":false} }),
             StatusCode::CONFLICT,
         )
         .await;
 
-        assert_eq!(error.code, "task_action.unavailable");
+        assert_eq!(error.code, "action_unavailable");
         let details = error.details.expect("structured action details");
         assert!(details
             .get("reason")
@@ -71,7 +71,6 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         artifact: None,
         message: Some("Recovered after server restart".to_owned()),
         hook: None,
-
     });
     TaskRepo::update(
         &*harness.state.db,
@@ -103,17 +102,20 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         StatusCode::OK,
     )
     .await;
-    assert!(actions.available_actions.iter().any(|offer| offer.action.verb() == "retry"));
+    assert!(actions
+        .available_actions
+        .iter()
+        .any(|offer| offer.action.verb() == "retry"));
 
     let error: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/recover", task.id),
-        json!({ "action": "retry_hook" }),
-        StatusCode::BAD_REQUEST,
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "action": {"verb":"retry","fresh_session":false} }),
+        StatusCode::CONFLICT,
     )
     .await;
-    assert!(error.message.contains("not allowed"));
+    assert!(error.message.contains("unavailable"));
 
     let current: TaskResponse = common::empty_request(
         &harness.app,
@@ -127,7 +129,10 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
     else {
         panic!("expected typed blocking annotation");
     };
-    assert!(serde_json::to_value(current_annotation).unwrap().get("recovery_actions").is_none());
+    assert!(serde_json::to_value(current_annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 }
 
 #[tokio::test]
@@ -138,7 +143,15 @@ async fn task_response_action_projection_paginates_execution_history() {
     let harness = common::test_app(workspace_root.path(), "facade-execution-history").await;
     let (project_id, _) =
         common::create_project_and_repo(&harness.app, "Execution history", &repo_path).await;
+    let (agent_id, _) =
+        common::create_shell_agents(&harness.app, workspace_root.path(), "history-authority").await;
     let task = create_task(&harness.app, &project_id, "history action authority").await;
+    sqlx::query("UPDATE task SET assignee_type = 'agent', assignee_id = ? WHERE id = ?")
+        .bind(&agent_id)
+        .bind(&task.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let task = TaskRepo::update_status(
         &*harness.state.db,
         db::UpdateTaskStatus {
@@ -162,7 +175,7 @@ async fn task_response_action_projection_paginates_execution_history() {
         CreateExecution {
             id: old_execution_id.clone(),
             task_id: task.id.clone(),
-            agent_id: None,
+            agent_id: Some(agent_id.clone()),
             // Older persisted attempts used the historical executor role;
             // the current coder projection must still find this resumable
             // session beyond the newer history rows.
@@ -237,9 +250,9 @@ async fn task_response_action_projection_paginates_execution_history() {
         .as_array()
         .expect("execution actions array")
         .iter()
-        .find(|action| action["action"] == "session_follow_up")
+        .find(|offer| offer["action"]["verb"] == "retry")
         .expect("session follow-up action exists");
-    assert_eq!(action["enabled"], true);
+    assert_eq!(action["action"]["fresh_session"], false);
     assert_eq!(action["target_execution_id"], old_execution_id);
 
     // The facade route uses the same bounded execution authority as the Task
@@ -254,7 +267,8 @@ async fn task_response_action_projection_paginates_execution_history() {
     .await;
     assert!(facade_actions
         .available_actions
-        .iter().any(|offer| offer.action.verb() == "release"));
+        .iter()
+        .any(|offer| offer.action.verb() == "retry"));
 }
 
 #[tokio::test]
@@ -344,64 +358,46 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
     )
     .await
     .expect("recoverable task persists");
-    let url = format!("/api/v1/tasks/{}/recover", task.id);
+    let url = format!("/api/v1/tasks/{}/actions", task.id);
     let invalid: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
         &url,
-        json!({ "action": "resume_session" }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    assert!(invalid.message.contains("not allowed"));
-    let paused: ErrorResponse = common::json_request(
-        &harness.app,
-        Method::POST,
-        &url,
-        json!({ "action": "reexecute" }),
+        json!({ "action": {"verb":"retry","fresh_session":false} }),
         StatusCode::CONFLICT,
     )
     .await;
-    assert_eq!(paused.code, "agent_paused");
-    let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(
-        current.error_annotation.as_deref(),
-        Some(annotation.as_str())
-    );
-    let metadata: Value = current
-        .metadata_json
-        .as_deref()
-        .map(|raw| serde_json::from_str(raw).expect("metadata parses"))
-        .unwrap_or_else(|| json!({}));
-    assert!(metadata.get("queued_recovery").is_none());
-
+    assert!(invalid.message.contains("unavailable"));
+    let response: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        json!({ "action": {"verb":"retry","fresh_session":true,"guidance":"recovery guidance"} }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.id, task.id);
+    assert_eq!(response.status, "in_progress");
+    assert!(response.error_annotation.is_none());
+    assert!(response.blocked.is_none());
     sqlx::query("UPDATE agent_identity SET paused = 0, version = version + 1 WHERE id = ?")
         .bind(&agent_id)
         .execute(harness.state.db.pool())
         .await
         .expect("agent unpauses");
-    let response: TaskResponse = common::json_request(
-        &harness.app, Method::POST, &url,
-        json!({ "action": "reexecute", "reason": "operator retry", "context": "recovery guidance" }),
-        StatusCode::OK,
-    ).await;
-    assert_eq!(response.id, task.id);
-    assert_eq!(response.status, "in_progress");
-    assert!(response.error_annotation.is_none());
-    assert!(response.blocked.is_none());
     let queued = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .unwrap()
         .unwrap();
-    let repeated: TaskResponse = common::json_request(
-        &harness.app, Method::POST, &url,
-        json!({ "action": "reexecute", "reason": "operator retry", "context": "recovery guidance" }),
-        StatusCode::OK,
-    ).await;
-    assert_eq!(repeated.version, response.version);
+    let repeated: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &url,
+        json!({ "action": {"verb":"retry","fresh_session":true} }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(repeated.code, "action_unavailable");
     let current = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .unwrap()
@@ -475,8 +471,8 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
         let _submitted: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/submit", submit_task.id),
-            json!({ "reason": "facade submit" }),
+            &format!("/api/v1/tasks/{}/actions", submit_task.id),
+            json!({ "action": {"verb":"approve","override":false}}),
             StatusCode::OK,
         )
         .await;
@@ -487,8 +483,8 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
         let _requested: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/request-changes", gate_task.id),
-            json!({ "reason": "facade request changes" }),
+            &format!("/api/v1/tasks/{}/actions", gate_task.id),
+            json!({ "action": {"verb":"send_back","guidance":"facade request changes"}}),
             StatusCode::OK,
         )
         .await;
@@ -498,8 +494,8 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
         let _approved: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/approve", gate_task.id),
-            json!({ "reason": "facade approve" }),
+            &format!("/api/v1/tasks/{}/actions", gate_task.id),
+            json!({ "action": {"verb":"approve","override":false}}),
             StatusCode::OK,
         )
         .await;
@@ -509,8 +505,8 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
         let _cancelled: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/cancel", cancel_task.id),
-            json!({}),
+            &format!("/api/v1/tasks/{}/actions", cancel_task.id),
+            json!({ "action": {"verb":"cancel"} }),
             StatusCode::OK,
         )
         .await;
@@ -567,8 +563,22 @@ async fn execution_facade_actions_work_for_both_workflows() {
         let started: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/start", task.id),
-            json!({}),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"start"} }),
+            StatusCode::OK,
+        )
+        .await;
+        assert!(started.error_annotation.is_none());
+        harness
+            .state
+            .task_service
+            .test_dispatch_task_action(&task.id)
+            .await
+            .unwrap();
+        let started: TaskResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}", task.id),
             StatusCode::OK,
         )
         .await;
@@ -578,8 +588,8 @@ async fn execution_facade_actions_work_for_both_workflows() {
         let paused: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/pause", task.id),
-            json!({ "reason": "test pause" }),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"hold"}}),
             StatusCode::OK,
         )
         .await;
@@ -588,17 +598,23 @@ async fn execution_facade_actions_work_for_both_workflows() {
         let _resumed: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/resume", task.id),
-            json!({ "reason": "test resume" }),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"release"}}),
             StatusCode::OK,
         )
         .await;
 
+        harness
+            .state
+            .task_service
+            .test_dispatch_task_action(&task.id)
+            .await
+            .unwrap();
         let _paused_again: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/pause", task.id),
-            json!({}),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"hold"} }),
             StatusCode::OK,
         )
         .await;
@@ -606,8 +622,8 @@ async fn execution_facade_actions_work_for_both_workflows() {
         let _cancelled: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            json!({}),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({ "action": {"verb":"cancel"} }),
             StatusCode::OK,
         )
         .await;
@@ -712,8 +728,84 @@ async fn assert_api_transition(
         logs.iter().any(|log| {
             log.from_state == from_state
                 && log.to_state == to_state
-                && matches!(log.triggered_by.as_str(), "user:api" | "user:override:api")
+                && log.triggered_by.starts_with("user:action:")
         }),
         "expected {from_state} -> {to_state} by an API user, got {logs:?}"
     );
+}
+
+#[tokio::test]
+async fn task_actions_rest_diagnostics_and_execution_controls_share_one_offer_set() {
+    let workspace_root = common::TestDir::new("action-surface-parity");
+    let harness = common::test_app(workspace_root.path(), "action-surface-parity").await;
+    let repo = common::setup_git_repo(workspace_root.path());
+    let (project, _) = common::create_project_and_repo(&harness.app, "Action parity", &repo).await;
+    let _agents =
+        common::create_shell_agents(&harness.app, workspace_root.path(), "action-parity").await;
+    for scenario in ["failed_review", "stored_annotation", "blocked_budget"] {
+        let task = create_task(&harness.app, &project, scenario).await;
+        let state = if scenario == "failed_review" {
+            "review"
+        } else {
+            "in_progress"
+        };
+        set_status(&harness, &task.id, state).await;
+        seed_completed_role_execution(&harness, &task.id, "in_progress").await;
+        if scenario == "failed_review" {
+            let execution_id: String = sqlx::query_scalar(
+                "SELECT id FROM execution WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&task.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+            let now = db::now_rfc3339();
+            db::ReviewRepo::create(
+                &*harness.state.db,
+                db::CreateReview {
+                    id: db::new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    execution_id,
+                    attempt_number: 1,
+                    status: db::ReviewStatus::Failed,
+                    step_results_json: json!({"ci_steps":[{"command":"check","exit_code":1}]})
+                        .to_string(),
+                    started_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        } else if scenario == "stored_annotation" {
+            sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                .bind(json!({"type":"executor_failed","blocking_reason":"fixture","recovery_actions":["return_to_implementation","retry_pr_publication"]}).to_string())
+                .bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
+        } else {
+            sqlx::query("UPDATE task SET blocked_json = ? WHERE id = ?")
+                .bind(json!({"kind":"retry_exhausted","reason":"spent","recovery_actions":["return_to_implementation"]}).to_string())
+                .bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
+        }
+        let offers: TaskActionsResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            StatusCode::OK,
+        )
+        .await;
+        let response: TaskResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}", task.id),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(response.available_actions, offers.available_actions);
+        assert_eq!(response.execution_actions, offers.available_actions);
+        assert_eq!(
+            response.workflow_exception.unwrap().actions,
+            offers.available_actions
+        );
+        assert_eq!(response.version, offers.version);
+    }
 }

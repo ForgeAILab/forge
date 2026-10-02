@@ -283,8 +283,6 @@ pub async fn follow_up_execution(
     }))
 }
 
-
-
 fn map_follow_up_error(error: ServiceError) -> ApiError {
     match error {
         ServiceError::InvalidOperation { message } => {
@@ -303,8 +301,6 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
         other => ApiError::from(other),
     }
 }
-
-
 
 pub async fn get_usage_breakdowns(
     State(state): State<AppState>,

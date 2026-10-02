@@ -7,8 +7,7 @@ use crate::{
     LifecycleEvent,
 };
 use crate::{
-    InitialRoleAssignment, TaskAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
-    TaskType,
+    InitialRoleAssignment, ReviewConfig, TaskAction, TaskGovernanceRequest, TaskStatus, TaskType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

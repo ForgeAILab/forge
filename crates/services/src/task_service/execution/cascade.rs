@@ -1578,9 +1578,6 @@ impl TaskService {
     /// same identity/role checks as the WorkspaceLease it will request.  Keep
     /// impossible actions out of the durable annotation instead of inviting a
     /// coordinator to call a recovery route that is guaranteed to fail.
-
-
-
     async fn maybe_schedule_execution_retry(
         &self,
         execution: &Execution,
@@ -2870,9 +2867,6 @@ pub(crate) fn exact_review_for_execution<'a>(
 /// multiple reviewer attempts may inspect the same candidate, while only the
 /// durable reviewer/auditor execution binding identifies the attempt whose
 /// session a recovery request would resume.
-
-
-
 fn exact_review_binding_matches(execution: &Execution, review: &Review) -> bool {
     if review.reviewer_execution_id.is_some() || review.auditor_execution_id.is_some() {
         review.reviewer_execution_id.as_deref() == Some(execution.id.as_str())
@@ -3104,8 +3098,6 @@ fn truncate_on_char_boundary(value: &str, limit: usize) -> &str {
     }
     &value[..end]
 }
-
-
 
 #[cfg(test)]
 mod reviewer_message_tests {

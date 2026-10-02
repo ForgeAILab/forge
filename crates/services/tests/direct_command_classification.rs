@@ -1290,9 +1290,9 @@ async fn terminal_native_task_commands_preserve_evaluator_permission_and_identit
             AGENT_ID,
             &fixture.project_scope,
             RUNTIME_SESSION_ID,
-            "task.recover",
-            json!({"operation":"task.recover", "payload":{
-            "task_id":task.id, "action":"reexecute", "reason":"Fix the original cause"},
+            "task.action",
+            json!({"operation":"task.action", "payload":{
+            "task_id":task.id, "action":{"verb":"retry","fresh_session":true}, "version":task.version},
             "dedupe_key":"denied-recover", "correlation_id":"denied-recover"}),
         )
         .await
@@ -1825,7 +1825,7 @@ async fn terminal_denial_success_without_card_read_does_not_delete_and_unknown_p
                 AGENT_ID,
                 &scope,
                 RUNTIME_SESSION_ID,
-                "task.recover",
+                "task.action",
                 &api_types::DeniedBy::PermissionMissing(permission.to_owned()),
             )
             .await
@@ -1937,13 +1937,18 @@ async fn recovery_fixture() -> (Fixture, tempfile::TempDir, String, String, Stri
     (fixture, temp, worker, tasks.remove(0), tasks.remove(0))
 }
 
-fn recovery_arguments(task: &str, action: &str, key: &str) -> Value {
-    json!({"operation":"task.recover", "payload":{"task_id":task,"action":action,"reason":"Address the interruption"},
+async fn recovery_arguments(fixture: &Fixture, task: &str, action: &str, key: &str) -> Value {
+    let version = db::TaskRepo::get_by_id(&*fixture.db, task, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    json!({"operation":"task.action", "payload":{"task_id":task,"action":{"verb":action},"version":version},
         "dedupe_key":key,"correlation_id":key})
 }
 
 #[tokio::test]
-async fn terminal_denial_paused_target_worker_does_not_withdraw_recovery_for_another_task() {
+async fn queued_retry_for_paused_worker_does_not_withdraw_cancellation_for_another_task() {
     let (fixture, _temp, worker, task_a, task_b) = recovery_fixture().await;
     let (scope, _) = project_chat_session(&fixture).await;
     let tool = native_tool(&fixture, scope, true, "forge_scope_propose");
@@ -1954,20 +1959,20 @@ async fn terminal_denial_paused_target_worker_does_not_withdraw_recovery_for_ano
         .unwrap();
     let refused = invoke_native(
         &*tool,
-        recovery_arguments(&task_a, "reexecute", "paused-worker"),
+        recovery_arguments(&fixture, &task_a, "retry", "paused-worker").await,
         "same-turn",
         "paused-worker",
     )
     .await;
-    assert!(refused.is_error, "{refused:?}");
-    assert_eq!(
-        refused.value["denied_by"], "target_agent_paused",
-        "{refused:?}"
-    );
-    assert_eq!(refused.value["retry"]["scope"], "turn");
+    assert!(!refused.is_error, "the accepted retry queues: {refused:?}");
+    assert!(refused.value["result"]["available_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|offer| offer["action"]["verb"] != "retry"));
     let recovered = invoke_native(
         &*tool,
-        recovery_arguments(&task_b, "cancel_task", "other-task"),
+        recovery_arguments(&fixture, &task_b, "cancel", "other-task").await,
         "same-turn",
         "other-task",
     )
@@ -1977,7 +1982,7 @@ async fn terminal_denial_paused_target_worker_does_not_withdraw_recovery_for_ano
 }
 
 #[tokio::test]
-async fn terminal_denial_project_pause_does_not_withdraw_other_recovery_actions() {
+async fn queued_retry_for_paused_project_does_not_withdraw_cancellation() {
     let (fixture, _temp, _worker, task_a, _) = recovery_fixture().await;
     let (scope, _) = project_chat_session(&fixture).await;
     let tool = native_tool(&fixture, scope, true, "forge_scope_propose");
@@ -1985,20 +1990,18 @@ async fn terminal_denial_project_pause_does_not_withdraw_other_recovery_actions(
         .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
     let refused = invoke_native(
         &*tool,
-        recovery_arguments(&task_a, "reexecute", "paused-project"),
+        recovery_arguments(&fixture, &task_a, "retry", "paused-project").await,
         "same-turn",
         "paused-project",
     )
     .await;
-    assert!(refused.is_error, "{refused:?}");
-    assert_eq!(
-        refused.value["denied_by"], "project_paused(environment_not_ready)",
-        "{refused:?}"
+    assert!(
+        !refused.is_error,
+        "paused Project retains the queued intent: {refused:?}"
     );
-    assert_eq!(refused.value["retry"]["scope"], "turn");
     let recovered = invoke_native(
         &*tool,
-        recovery_arguments(&task_a, "cancel_task", "cancel-paused-task"),
+        recovery_arguments(&fixture, &task_a, "cancel", "cancel-paused-task").await,
         "same-turn",
         "cancel-paused-task",
     )

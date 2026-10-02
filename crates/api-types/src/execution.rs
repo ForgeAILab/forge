@@ -5,9 +5,9 @@ use ts_rs::TS;
 use crate::{
     AgentStatus, CanonicalPhase, ExecutionBehavior, ExecutionBlockerProjection,
     ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary,  ResumePolicy, StopReason,
-    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
-    UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
+    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
+    TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate, UsageBreakdown,
+    WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
     WorkspacePlacementResponse, WorkspaceResponse,
 };
 
@@ -61,8 +61,13 @@ pub enum TaskAction {
         #[ts(optional)]
         guidance: Option<String>,
     },
-    SendBack { guidance: String },
-    Approve { #[serde(rename = "override")] override_checks: bool },
+    SendBack {
+        guidance: String,
+    },
+    Approve {
+        #[serde(rename = "override")]
+        override_checks: bool,
+    },
     Restart,
     Cancel,
 }
@@ -82,18 +87,30 @@ impl TaskAction {
     }
 
     pub fn retry() -> Self {
-        Self::Retry { fresh_session: None, refresh_workspace: None, reset_budget: None, guidance: None }
+        Self::Retry {
+            fresh_session: None,
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+        }
     }
 }
 
 impl std::fmt::Display for TaskAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.verb()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.verb())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum ActionAuthority { Owner, AssignedAgent, ProjectAgent, Reviewer }
+pub enum ActionAuthority {
+    Owner,
+    AssignedAgent,
+    ProjectAgent,
+    Reviewer,
+}
 
 /// One executable offer. Parameters name the inputs meaningful in this snapshot;
 /// `action` supplies defaults. Authority is filtered before this value is exposed.

@@ -168,6 +168,7 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
     health_writes: Arc<Mutex<ConsumerHealthWrites>>,
 }
@@ -185,8 +186,19 @@ impl AttentionService {
         Self {
             db,
             event_bus: None,
+            action_connections: None,
             health_writes: Arc::new(Mutex::new(ConsumerHealthWrites::default())),
         }
+    }
+
+    /// Offer construction uses the same live owner resume facts as Task reads.
+    #[must_use]
+    pub fn with_action_connections(
+        mut self,
+        connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    ) -> Self {
+        self.action_connections = Some(connections);
+        self
     }
 
     /// Attach the event bus so an autonomy stall reaches the user. Without it
@@ -1929,15 +1941,37 @@ impl AttentionService {
                 .cloned()
                 .unwrap_or(Value::Null);
             let available_actions = if event.entity_type == "task" {
-                if let Some(task) = db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await? {
-                    if let Some(project) = db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
+                if let Some(task) =
+                    db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await?
+                {
+                    if let Some(project) =
+                        db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await?
+                    {
                         let actor = api_types::Actor::user(api_types::UserActionSource::Api);
-                        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
-                        let snapshot = crate::task_actions::load_snapshot(&self.db, task, workflow, &actor).await?;
+                        let workflow =
+                            crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                                &task,
+                                &project.workflow_definition,
+                                &actor,
+                            );
+                        let snapshot = crate::task_actions::load_snapshot(
+                            &self.db,
+                            task,
+                            workflow,
+                            &actor,
+                            self.action_connections.as_deref(),
+                        )
+                        .await?;
                         crate::available_actions(&snapshot)
-                    } else { Vec::new() }
-                } else { Vec::new() }
-            } else { Vec::new() };
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let requires_intervention = event_payload
                 .get("requires_intervention")
                 .and_then(Value::as_bool)

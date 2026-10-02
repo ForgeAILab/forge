@@ -249,7 +249,7 @@ forge-ctl agent register --name "Claude" --executor-type shell
 forge-ctl task list --project-id <ID>
 forge-ctl task show <TASK_ID>
 forge-ctl task prompt-preview <TASK_ID> --role coder
-forge-ctl task cancel <TASK_ID>
+forge-ctl task action <TASK_ID> cancel
 ```
 
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`

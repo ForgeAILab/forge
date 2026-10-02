@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
 
 use api_types::{
-    FailingStepSummary, HealthSeverity, RelatedEvidence, StateKind,
-    TaskBlockingAnnotation, WorkflowDefinition,
-    WorkflowExceptionSummary, WorkflowHealthKind, WorkflowHealthSummary,
+    FailingStepSummary, HealthSeverity, RelatedEvidence, StateKind, TaskBlockingAnnotation,
+    WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthKind, WorkflowHealthSummary,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -413,25 +412,65 @@ pub fn derive_workflow_health(
 
 /// Diagnostic evidence is independent of command eligibility. The supplied
 /// offers come exclusively from `available_actions` for the same snapshot.
-pub fn task_exception(snapshot: &crate::TaskSnapshot, offers: Vec<api_types::Offer>) -> Option<WorkflowExceptionSummary> {
+pub fn task_exception(
+    snapshot: &crate::TaskSnapshot,
+    offers: Vec<api_types::Offer>,
+) -> Option<WorkflowExceptionSummary> {
     let task = &snapshot.task;
     let annotation = snapshot.annotation();
     let latest_review = snapshot.latest_review.as_ref();
-    let latest_execution = snapshot.executions.iter().max_by_key(|execution| (&execution.created_at, &execution.id));
+    let latest_execution = snapshot
+        .executions
+        .iter()
+        .max_by_key(|execution| (&execution.created_at, &execution.id));
     let kind = snapshot.condition();
     let failed_review = latest_failed_review(latest_review);
-    if kind.is_none() && failed_review.is_none() && task.entry_barrier_json.is_none() { return None; }
-    let role = snapshot.workflow.states.iter().find(|state| state.name == task.status).and_then(effective_role).map(str::to_owned);
+    if kind.is_none() && failed_review.is_none() && task.entry_barrier_json.is_none() {
+        return None;
+    }
+    let role = snapshot
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .and_then(effective_role)
+        .map(str::to_owned);
     Some(WorkflowExceptionSummary {
-        exception_type: kind.map(|kind| kind.to_string()).unwrap_or_else(|| "review_failed".to_owned()),
-        message: annotation.as_ref().and_then(|annotation| annotation.message.clone().or_else(|| Some(annotation.blocking_reason.clone())))
-            .or_else(|| interruption_message(task.failed_json.as_deref().or(task.blocked_json.as_deref()), "Task interrupted"))
+        exception_type: if task.failed_json.is_some() {
+            "task_failed".to_owned()
+        } else {
+            kind.map(|kind| kind.to_string())
+                .unwrap_or_else(|| "review_failed".to_owned())
+        },
+        message: annotation
+            .as_ref()
+            .and_then(|annotation| {
+                annotation
+                    .message
+                    .clone()
+                    .or_else(|| Some(annotation.blocking_reason.clone()))
+            })
+            .or_else(|| {
+                interruption_message(
+                    task.failed_json.as_deref().or(task.blocked_json.as_deref()),
+                    "Task interrupted",
+                )
+            })
             .unwrap_or_else(|| "Review requires attention".to_owned()),
         review_id: failed_review.map(|review| review.id.clone()),
-        execution_id: annotation.as_ref().and_then(|annotation| annotation.blocked_execution_id.clone()).or_else(|| latest_execution.map(|execution| execution.id.clone())),
-        state: Some(task.status.clone()), role: role.clone(), target_state: None, target_role: role,
-        failing_step: failed_review.and_then(parse_failing_step).or_else(|| annotation.as_ref().and_then(annotation_hook_failing_step)),
-        related_evidence: related_failed_review(latest_review), actions: offers,
+        execution_id: annotation
+            .as_ref()
+            .and_then(|annotation| annotation.blocked_execution_id.clone())
+            .or_else(|| latest_execution.map(|execution| execution.id.clone())),
+        state: Some(task.status.clone()),
+        role: role.clone(),
+        target_state: None,
+        target_role: role,
+        failing_step: failed_review
+            .and_then(parse_failing_step)
+            .or_else(|| annotation.as_ref().and_then(annotation_hook_failing_step)),
+        related_evidence: related_failed_review(latest_review),
+        actions: offers,
     })
 }
 
@@ -591,8 +630,23 @@ pub fn entries_since_retry_window_boundary<'a>(
     let boundary = entries.iter().rposition(|entry| {
         !entry.rejection
             && gate_state.is_none_or(|state| entry.from_state == state)
-            && (matches!(entry.trigger_name.as_deref(), Some("restart" | "reset_to_initial" | "reset_retry_window"))
-                || (entry.trigger_name.as_deref() == Some("retry") && entry.hook_results_json.as_deref().and_then(|raw| serde_json::from_str::<Vec<api_types::HookResultEntry>>(raw).ok()).is_some_and(|results| results.iter().any(|result| result.action == "retry" && result.phase == "action" && result.outcome == "reset_budget"))))
+            && (matches!(
+                entry.trigger_name.as_deref(),
+                Some("restart" | "reset_to_initial" | "reset_retry_window")
+            ) || (entry.trigger_name.as_deref() == Some("retry")
+                && entry
+                    .hook_results_json
+                    .as_deref()
+                    .and_then(|raw| {
+                        serde_json::from_str::<Vec<api_types::HookResultEntry>>(raw).ok()
+                    })
+                    .is_some_and(|results| {
+                        results.iter().any(|result| {
+                            result.action == "retry"
+                                && result.phase == "action"
+                                && result.outcome == "reset_budget"
+                        })
+                    })))
     });
     boundary
         .and_then(|index| entries.get(index + 1..))
@@ -641,8 +695,6 @@ fn latest_failed_review(review: Option<&Review>) -> Option<&Review> {
     review.filter(|review| review.status == ReviewStatus::Failed)
 }
 
-
-
 fn related_failed_review(review: Option<&Review>) -> Vec<RelatedEvidence> {
     latest_failed_review(review)
         .map(|review| RelatedEvidence {
@@ -687,8 +739,6 @@ fn parse_failing_step(review: &Review) -> Option<FailingStepSummary> {
     })
 }
 
-
-
 fn non_empty_string(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
@@ -707,12 +757,6 @@ fn interruption_message(raw: Option<&str>, fallback: &str) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| Some(fallback.to_owned()))
 }
-
-
-
-
-
-
 
 // Disabled along with Stuck health labeling — kept for future reuse.
 // fn dispatch_missing_after_grace(

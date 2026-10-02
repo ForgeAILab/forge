@@ -684,7 +684,12 @@ impl TaskService {
     }
 
     fn publish(&self, event: ForgeEvent) {
-        if matches!(event.event_type.as_str(), "execution.completed" | "execution.failed" | "execution.cancelled") { self.dispatch_wake.notify_one(); }
+        if matches!(
+            event.event_type.as_str(),
+            "execution.completed" | "execution.failed" | "execution.cancelled"
+        ) {
+            self.dispatch_wake.notify_one();
+        }
         self.event_bus.publish(event);
     }
 

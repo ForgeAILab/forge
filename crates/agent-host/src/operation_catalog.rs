@@ -767,7 +767,7 @@ pub fn operation_permission(
 /// directly under `requested_permission`.
 ///
 /// This used to be a hand-written list of operation names in the policy
-/// layer, and its own comment recorded the cost: `task.recover` was declared,
+/// layer, and its own comment recorded the cost: `task.action` was declared,
 /// implemented end to end, and omitted from that list, so it was refused at
 /// runtime with a message that named nothing. The catalog row already carries
 /// every fact the decision needs — a coordination surface, the generic
@@ -909,7 +909,10 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // envelope: the doctrine directs the Agent to absorb a
         // verification-shaped Task by cancelling it and settling its checks
         // itself.
-        TASK_ACTION_OPERATION => payload.get("action").and_then(|action| serde_json::from_value::<api_types::TaskAction>(action.clone()).ok()).is_some(),
+        TASK_ACTION_OPERATION => payload
+            .get("action")
+            .and_then(|action| serde_json::from_value::<api_types::TaskAction>(action.clone()).ok())
+            .is_some(),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It
         // must retain an AgentAction until the user-facing approval contract

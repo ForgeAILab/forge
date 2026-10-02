@@ -3137,9 +3137,33 @@ async fn dispatcher_skips_task_when_agent_offline() {
 #[tokio::test]
 async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
     for (action, bind_execution) in [
-        (api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, false),
-        (api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, true),
-        (api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }, true),
+        (
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            false,
+        ),
+        (
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            true,
+        ),
+        (
+            api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            true,
+        ),
     ] {
         let db = Arc::new(sqlite_db().await);
         let repo_dir = TempDir::new().expect("repo dir creates");
@@ -3220,7 +3244,9 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         let intent = deferred_dispatch::queued_recovery(&queued).expect("intent persists");
         let request = &intent.request;
         assert_eq!(request.action, action);
-        assert!(matches!(&request.action, api_types::TaskAction::Retry { guidance: Some(guidance), .. } if guidance == "keep this recovery guidance"));
+        assert!(
+            matches!(&request.action, api_types::TaskAction::Retry { guidance: Some(guidance), .. } if guidance == "keep this recovery guidance")
+        );
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
             .await
             .expect("assignments load");
@@ -3268,7 +3294,14 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
             .as_deref()
             .unwrap_or_default()
             .contains("keep this recovery guidance"));
-        if action == (api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }) {
+        if action
+            == (api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            })
+        {
             assert_eq!(
                 execution.agent_session_id.as_deref(),
                 Some("recovery-session")
@@ -3301,7 +3334,13 @@ async fn seed_capacity_recovery(
     crate::test_support::set_test_agent_capacity(db, &agent_id, 1).await;
     let task = seed_task(db, project_id, "recover", "in_progress", 0).await;
     assign_role(db, &task.id, "coder", &agent_id).await;
-    let blocked_execution_id = if action == (api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None }) {
+    let blocked_execution_id = if action
+        == (api_types::TaskAction::Retry {
+            fresh_session: Some(false),
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+        }) {
         let stopped = seed_cancelled_execution(
             db,
             &task.id,
@@ -3354,9 +3393,24 @@ async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
         let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let action = match failure {
-            "interactive" => api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None },
-            "session" | "unassigned_session" => api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None },
-            _ => api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+            "interactive" => api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            "session" | "unassigned_session" => api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            _ => api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
         };
         let (queued, agent_id, busy_id) =
             seed_capacity_recovery(&db, &dispatcher, &project_id, action.clone()).await;
@@ -3665,7 +3719,12 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
     let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     for (action, message) in [
         (
-            api_types::TaskAction::Retry { fresh_session: Some(false), refresh_workspace: None, reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             "no resumable session",
         ),
         (api_types::TaskAction::retry(), "not allowed"),
@@ -3693,7 +3752,17 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
         .expect("agent pauses");
     let error = dispatcher
         .task_service
-        .test_apply_action(&task.id, api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, None, None)
+        .test_apply_action(
+            &task.id,
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            None,
+            None,
+        )
         .await
         .expect_err("paused agent is refused even at capacity");
     assert!(matches!(error, crate::ServiceError::AgentPaused { .. }));
@@ -3719,7 +3788,17 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
         .unwrap();
     let error = dispatcher
         .task_service
-        .test_apply_action(&task.id, api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None }, None, None)
+        .test_apply_action(
+            &task.id,
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            None,
+            None,
+        )
         .await
         .expect_err("offline agent is refused even at capacity");
     assert!(
@@ -6911,7 +6990,12 @@ async fn dispatcher_owner_reexecute_resumes_over_project_limit() {
         .task_service
         .test_apply_action(
             &parked.id,
-            api_types::TaskAction::Retry { fresh_session: Some(true), refresh_workspace: None, reset_budget: None, guidance: None },
+            api_types::TaskAction::Retry {
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             Some("host is ready".to_owned()),
             None,
         )

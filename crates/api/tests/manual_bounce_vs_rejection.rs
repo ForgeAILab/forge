@@ -59,7 +59,9 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
         State(api_state),
         Path(rejected_task_id.clone()),
         Json(TaskActionRequest {
-            action: api_types::TaskAction::SendBack { guidance: "failed CI".to_owned() },
+            action: api_types::TaskAction::SendBack {
+                guidance: "failed CI".to_owned(),
+            },
             version: rejected_review.version,
         }),
     )
@@ -67,8 +69,7 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     .expect("gate reject endpoint succeeds");
 
     assert_eq!(rejection.status, default_states::IN_PROGRESS);
-    let rejection_log =
-        transition_log_for_reason(&db, &rejected_task_id, "failed CI").await;
+    let rejection_log = transition_log_for_reason(&db, &rejected_task_id, "failed CI").await;
     assert_eq!(rejection_log.from_state, default_states::REVIEW);
     assert_eq!(rejection_log.to_state, default_states::IN_PROGRESS);
     assert!(

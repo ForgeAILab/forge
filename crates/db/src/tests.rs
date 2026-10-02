@@ -11146,7 +11146,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("OPERATING DOCTRINE (on-demand skill sections)"));
     assert!(body.contains("skill.section"));
     assert!(body.contains("read `project.charter` and `project.current_state`"));
-    assert!(body.contains("cancel a non-terminal Task only through versioned `task.cancel`"));
+    assert!(body.contains("cancel a non-terminal Task only through versioned `task.action`"));
     assert!(body.contains("`parent_task_id` establishes one-level coordination"));
     assert!(
         body.contains("Dependency edges only gate execution, never hierarchy or Workspace sharing")

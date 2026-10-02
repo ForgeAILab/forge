@@ -477,7 +477,13 @@ impl TransitionLogRepo for SqliteDb {
                    WHERE boundary.task_id = rejection.task_id
                      AND boundary.from_state = rejection.from_state
                      AND boundary.rejection = 0
-                     AND boundary.trigger_name IN ('reset_retry_window', 'reset_to_initial')
+                     AND (boundary.trigger_name IN ('restart', 'reset_retry_window', 'reset_to_initial')
+                          OR (boundary.trigger_name = 'retry' AND EXISTS (
+                              SELECT 1 FROM json_each(CASE WHEN json_valid(boundary.hook_results_json) THEN boundary.hook_results_json ELSE '[]' END) AS result
+                              WHERE json_extract(result.value, '$.action') = 'retry'
+                                AND json_extract(result.value, '$.phase') = 'action'
+                                AND json_extract(result.value, '$.outcome') = 'reset_budget'
+                          )))
                      AND (
                          boundary.created_at > rejection.created_at
                          OR (

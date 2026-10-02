@@ -122,14 +122,8 @@ database for historical provenance.
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
-| GET    | `/api/v1/tasks/{id}/actions` | List ordinary intent actions and typed exception recovery actions (`{"available_actions": [...], "recovery_actions": [...]}`) |
-| POST   | `/api/v1/tasks/{id}/start` | Start standalone or eligible child work; coordination roots never start implementation |
-| POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
-| POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
-| POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
-| POST   | `/api/v1/tasks/{id}/request-changes` | Reject the current review/gate and resume its configured worker path |
-| POST   | `/api/v1/tasks/{id}/approve` | Approve an awaiting-human review or an approval-required gate |
-| POST   | `/api/v1/tasks/{id}/cancel` | Cancel task (idempotent) |
+| GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
+| POST   | `/api/v1/tasks/{id}/actions` | Apply one offered closed verb and parameters at an exact Task version |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
@@ -138,7 +132,6 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/dependencies` | Add one prerequisite dependency edge |
 | DELETE | `/api/v1/tasks/{id}/dependencies/{dep_id}` | Remove one prerequisite dependency edge |
 | GET    | `/api/v1/tasks/{id}/dependents` | List Tasks that depend on this prerequisite |
-| POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the configured review and apply its workflow outcome |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
@@ -961,18 +954,14 @@ mutable governance is rechecked; a changed payload under the same key is an
 idempotency conflict. This is a native operation only; no REST or MCP dotted
 operation is added.
 
-The ReadyOnly native `task.cancel` operation cancels a healthy or stopped
-non-terminal Task without treating cancellation as failure recovery. Its
-closed payload is `action: "cancel"`, `task_id`, `expected_task_version`, and
-a non-empty `reason`. Forge derives the Project and current Project Agent from
-the authenticated binding, rejects a Task from another Project as unavailable,
-and runs the ordinary Task cancellation lifecycle, including stopping an
-active execution. A stale version returns the current Task version with a
-refresh-and-retry instruction; retrying after the Task already reached the
-cancellation state succeeds without another transition. `task.recover`
-remains the command for stopped work that should run again. This is a native
-operation only; the existing `POST /api/v1/tasks/{id}/cancel` endpoint remains
-the human/API surface.
+The ReadyOnly native `task.action` command uses the same offers and versioned
+Task command as REST. Its payload carries `task_id`, `version`, and an `action`
+object with a closed verb and meaningful parameters. The bound Project Agent
+may cancel non-terminal work, retry or restart permitted interruptions, and
+decide human-required review gates. Gate overrides remain owner-only. An
+unauthorized or absent offer returns `action_unavailable` with current offers;
+a stale Task version returns a version conflict. Retry work queues independently
+of the Agent's current capacity.
 
 The ReadyOnly native `task.dependency` operation adds or removes one
 prerequisite edge between two Tasks in the bound Project. Its closed payload is
@@ -2462,7 +2451,7 @@ removing a coordination root's `coder` also wakes children without an own
 `coder`. When that role
 selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
-separate `POST /resume` action.
+separate `release` command.
 
 ## Task hierarchy, workspaces, and prerequisite dependencies
 
@@ -2579,9 +2568,9 @@ command/request timeouts. The same `overrides` object can carry `model_id`,
 An execution follow-up always creates a non-propagating side session. It keeps
 the selected agent's session context, but it does not settle a Review or advance
 the Task. For an active `workflow_exception`, clients must use the typed action
-from `POST /api/v1/tasks/{id}/recover`. A review `reexecute` action that reports
-`requires_guidance: true` accepts the user's instructions in `context` and
-launches a new authoritative reviewer attempt.
+from `POST /api/v1/tasks/{id}/actions`. A review `retry` offer that declares
+`guidance` accepts the user's instructions there and queues an authoritative
+reviewer attempt for dispatcher admission.
 
 The two `discovered-options` endpoints return the adapter's selectable
 `models`, `permission_policies`, adapter-specific capability metadata under
@@ -2655,11 +2644,11 @@ state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
 
-`POST /api/v1/tasks/{id}/gates/{state_name}/approve` and `/reject` accept the
+`approve` and `send_back` at `POST /api/v1/tasks/{id}/actions` accept the
 current Task `version`. A gate with blocking entry checks is not decision-ready
 until its entry barrier settles: Task responses keep `awaiting_human = false`
 for that Task snapshot, and an early decision returns HTTP 409 with
-`code: "validation_error"`. The response's `awaiting_human` value and `version`
+`code: "action_unavailable"` and current offers. The response's `awaiting_human` value and `version`
 are derived from the same Task snapshot so a barrier-clear write cannot expose
 readiness paired with the version it just invalidated. The default planning
 gate does not require this decision: after a successful planner execution has
@@ -2682,11 +2671,11 @@ The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `rest
 
 Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Unknown verbs and malformed payloads are schema errors.
 
-Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate.
+Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. When only a side session is running, its pinned `hold` offer stops that current session and leaves the workflow condition unchanged. Workflow `hold` parks normal Task work.
 
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
-MCP and native coordination use `task.action` with `task_id`, the action object, and `version`. Task reads include caller-filtered offers. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
+MCP and native coordination use `task.action` with `task_id`, the action object, and `version`. Task reads and task lists include caller-filtered offers; MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
 
 ## Task board snapshots and moves
 
@@ -3941,7 +3930,7 @@ pauses apply only while their current cause holds. Other specific refusals
 are turn-scoped and never cached or recorded. A paused target Agent uses
 `target_agent_paused`. Workspace target refusals use `placement_unavailable`,
 `daemon_upgrade_required`, or `workspace_reset_required`; they remain tool results
-with turn scope and never withdraw the caller's operation. A Project pause on `task.recover` is also turn-scoped:
+with turn scope and never withdraw the caller's operation. A Project pause on `task.action` is also turn-scoped:
 re-execution may be refused while cancellation remains available. An unknown
 refusal uses `denied_by: unspecified`, `retry.action: none`, and neutral text:
 "Refused for this request. Repeating the identical call will be refused again."

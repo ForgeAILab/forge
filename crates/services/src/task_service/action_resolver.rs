@@ -1,7 +1,6 @@
 use db::{AssigneeKind, ExecutionRepo, TaskRoleAssignment};
 use sqlx::Row;
 
-
 fn role_matches(role: &str, execution_role: &str) -> bool {
     role == execution_role
         || (role == crate::workflow::default_roles::CODER && execution_role == "executor")
@@ -255,4 +254,3 @@ pub fn has_open_interactive_launch_authority(
 
     assigned_agent || blocked_agent || previous_agent
 }
-

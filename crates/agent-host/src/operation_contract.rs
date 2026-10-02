@@ -19,9 +19,8 @@ use crate::operation_catalog::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_ACTION_OPERATION,
-    TASK_WORKLOG_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -561,7 +560,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             "Capture one artifact this Task run actually produced and register it as authoritative evidence bound to this Task. Supply exactly one of `path` (a file in the Task workspace) or `content` (verbatim captured output). The server stores the bytes, computes the checksum, and returns the asset id a milestone evidence attachment references. Never describe an observation you did not make: this records what the run produced, not what you expect it to produce.",
         ),
 
-
         TASK_DEPENDENCY_OPERATION => described_object_schema(
             json!({
                 "action":{"type":"string","enum":["add","remove"]},
@@ -912,8 +910,6 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
         lines.push("task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n");
     }
 
-
-
     if operations.contains(TASK_DEPENDENCY_OPERATION) {
         lines.push(concat!(
             "task.dependency — add or remove one prerequisite edge between two Tasks in the ",
@@ -1004,7 +1000,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "action": {
                 "type": ["string", "object", "null"],
-                "description": "task.action: an offered closed verb object, including its parameters. Other operations use their documented action string."
+                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
             },
             "capability_class": {
                 "type": ["string", "null"],
@@ -1094,8 +1090,10 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream."
         });
     }
-    if operations.contains(TASK_ADAPTIVE_OPERATION)
-    {
+    if operations.contains(TASK_ACTION_OPERATION) {
+        properties["version"] = json!({"type":["integer","null"], "description":"task.action: required current Task version from the offered actions."});
+    }
+    if operations.contains(TASK_ADAPTIVE_OPERATION) {
         properties["expected_task_version"] = json!({
             "type": ["integer", "null"],
             "description": "task.adaptive: Task version precondition. task.action uses version."
@@ -1729,7 +1727,7 @@ mod tests {
             (TASK_ADAPTIVE_OPERATION, "split"),
             (TASK_ACTION_OPERATION, "cancel"),
             (TASK_DEPENDENCY_OPERATION, "add"),
-            (TASK_ACTION_OPERATION, "resume_session"),
+            (TASK_ACTION_OPERATION, "retry"),
             (TASK_PLAN_OPERATION, "write"),
             (TASK_WORKLOG_OPERATION, "append"),
             (TASK_EVIDENCE_OPERATION, "capture"),
@@ -1739,15 +1737,21 @@ mod tests {
         for (operation, expected_action) in cases {
             let schema = orchestration_payload_schema(operation);
             let action = &schema["properties"]["action"];
-            let admits = action
-                .get("const")
-                .and_then(Value::as_str)
-                .map(|value| value == expected_action)
-                .unwrap_or_else(|| {
-                    action["enum"]
-                        .as_array()
-                        .is_some_and(|values| values.iter().any(|v| v == expected_action))
-                });
+            let admits = if operation == TASK_ACTION_OPERATION {
+                jsonschema::validator_for(action)
+                    .expect("closed Task action schema")
+                    .is_valid(&json!({"verb": expected_action}))
+            } else {
+                action
+                    .get("const")
+                    .and_then(Value::as_str)
+                    .map(|value| value == expected_action)
+                    .unwrap_or_else(|| {
+                        action["enum"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|v| v == expected_action))
+                    })
+            };
             assert!(
                 admits,
                 "{operation} resolved a schema whose action does not admit \
@@ -1892,7 +1896,6 @@ mod tests {
         let operations = [
             TASK_ADAPTIVE_OPERATION.to_owned(),
             TASK_ACTION_OPERATION.to_owned(),
-            TASK_ACTION_OPERATION.to_owned(),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1902,10 +1905,10 @@ mod tests {
             .expect("action guidance");
 
         for discriminator in [
-            "task.recover: required",
-            "\"resume_session\"",
+            "task.action: required closed verb object",
+            "retry",
             "task.adaptive: \"split\", \"sequence\", or \"replace\"",
-            "task.cancel: \"cancel\"",
+            "cancel",
         ] {
             assert!(
                 action_description.contains(discriminator),

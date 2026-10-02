@@ -537,7 +537,7 @@ impl OrchestrationOutcome {
         // Recovery actions have different pause gates: cancellation and retry
         // window reset remain available while re-execution is blocked.
         let lifetime =
-            if operation == "task.recover" && matches!(denied_by, DeniedBy::ProjectPaused(_)) {
+            if operation == "task.action" && matches!(denied_by, DeniedBy::ProjectPaused(_)) {
                 RetryScope::Turn
             } else {
                 denied_by.scope()

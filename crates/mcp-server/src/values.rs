@@ -1,16 +1,6 @@
 use db::{Agent, AgentProfile, AgentSession, Execution, Page, Project, Task, TaskRoleAssignment};
 use serde_json::{json, Value};
 
-pub(crate) fn task_page_value(page: Page<Task>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "data": page.items.into_iter().map(task_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
-
 pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
     let has_more = page.next_cursor.is_some();
     json!({
@@ -46,6 +36,10 @@ pub(crate) fn project_page_value(page: Page<Project>) -> Value {
 }
 
 pub(crate) fn task_value(task: Task) -> Value {
+    let mut annotation = json_string(task.error_annotation.clone());
+    if let Some(object) = annotation.as_object_mut() {
+        object.remove("recovery_actions");
+    }
     json!({
         "id": task.id,
         "project_id": task.project_id,
@@ -59,7 +53,7 @@ pub(crate) fn task_value(task: Task) -> Value {
         "priority": task.priority,
         "merge_config": json_string(task.merge_config),
         "plan": task.plan,
-        "error_annotation": json_string(task.error_annotation),
+        "error_annotation": annotation,
         "deleted_at": task.deleted_at,
         "version": task.version,
         "created_at": task.created_at,

@@ -43,17 +43,43 @@ async fn test_resolve_execution_actions_targets_current_role() {
         artifact: None,
         message: None,
         hook: None,
-
     };
 
     task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
-    let snapshot = crate::TaskSnapshot { task, workflow, executions: executions.clone(), latest_review: None, role_assignments: Vec::new(), transition_logs: Vec::new(), caller: crate::ActionCaller::owner(), has_agent: true, dependencies_satisfied: true, owner_supports_resume: true, coordination_root: false };
+    let snapshot = crate::TaskSnapshot {
+        task,
+        workflow,
+        executions: executions.clone(),
+        latest_review: None,
+        role_assignments: Vec::new(),
+        transition_logs: Vec::new(),
+        caller: crate::ActionCaller::owner(),
+        has_agent: true,
+        dependencies_satisfied: true,
+        owner_supports_resume: true,
+        coordination_root: false,
+    };
     let offers = crate::available_actions(&snapshot);
     assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
-    assert!(!offers.iter().any(|offer| offer.action.verb() == "open_interactive"));
-    let role = snapshot.workflow.states.iter().find(|state| state.name == snapshot.task.status).and_then(crate::workflow::effective_role);
-    let target = crate::task_service::action_resolver::select_open_interactive_target(&snapshot.executions, role, annotation.blocked_execution_id.as_deref());
-    if let Some(target) = target { assert!(role.is_some_and(|role| target.role == role || (role == "coder" && target.role == "executor"))); }
+    assert!(!offers
+        .iter()
+        .any(|offer| offer.action.verb() == "open_interactive"));
+    let role = snapshot
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == snapshot.task.status)
+        .and_then(crate::workflow::effective_role);
+    let target = crate::task_service::action_resolver::select_open_interactive_target(
+        &snapshot.executions,
+        role,
+        annotation.blocked_execution_id.as_deref(),
+    );
+    if let Some(target) = target {
+        assert!(role.is_some_and(
+            |role| target.role == role || (role == "coder" && target.role == "executor")
+        ));
+    }
 }
 
 #[tokio::test]
@@ -246,15 +272,47 @@ async fn test_resolve_execution_actions_disables_resume_for_terminal_bound_revie
         artifact: None,
         message: None,
         hook: None,
-
     };
 
     task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
-    let snapshot = crate::TaskSnapshot { task, workflow: crate::workflow::default_workflow::default_workflow(), executions: vec![execution.clone()], latest_review: Some(review.clone()), role_assignments: Vec::new(), transition_logs: Vec::new(), caller: crate::ActionCaller::owner(), has_agent: true, dependencies_satisfied: true, owner_supports_resume: true, coordination_root: false };
+    let snapshot = crate::TaskSnapshot {
+        task,
+        workflow: crate::workflow::default_workflow::default_workflow(),
+        executions: vec![execution.clone()],
+        latest_review: Some(review.clone()),
+        role_assignments: Vec::new(),
+        transition_logs: Vec::new(),
+        caller: crate::ActionCaller::owner(),
+        has_agent: true,
+        dependencies_satisfied: true,
+        owner_supports_resume: true,
+        coordination_root: false,
+    };
     let offers = crate::available_actions(&snapshot);
-    assert!(!offers.iter().any(|offer| matches!(offer.action, api_types::TaskAction::Retry { fresh_session: Some(false), .. })));
-    assert!(!offers.iter().any(|offer| offer.action.verb() == "open_interactive"));
-    let role = snapshot.workflow.states.iter().find(|state| state.name == snapshot.task.status).and_then(crate::workflow::effective_role);
-    let target = crate::task_service::action_resolver::select_open_interactive_target(&snapshot.executions, role, annotation.blocked_execution_id.as_deref());
-    if let Some(target) = target { assert!(role.is_some_and(|role| target.role == role || (role == "coder" && target.role == "executor"))); }
+    assert!(!offers.iter().any(|offer| matches!(
+        offer.action,
+        api_types::TaskAction::Retry {
+            fresh_session: Some(false),
+            ..
+        }
+    )));
+    assert!(!offers
+        .iter()
+        .any(|offer| offer.action.verb() == "open_interactive"));
+    let role = snapshot
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == snapshot.task.status)
+        .and_then(crate::workflow::effective_role);
+    let target = crate::task_service::action_resolver::select_open_interactive_target(
+        &snapshot.executions,
+        role,
+        annotation.blocked_execution_id.as_deref(),
+    );
+    if let Some(target) = target {
+        assert!(role.is_some_and(
+            |role| target.role == role || (role == "coder" && target.role == "executor")
+        ));
+    }
 }

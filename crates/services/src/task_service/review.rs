@@ -306,7 +306,10 @@ impl TaskService {
             crate::workflow::default_roles::CODER,
         )
         .await?;
-        if remaining_retries > 0 && !follow_up_already_dispatched {
+        if remaining_retries > 0
+            && !follow_up_already_dispatched
+            && !Self::task_action_command_active()
+        {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },

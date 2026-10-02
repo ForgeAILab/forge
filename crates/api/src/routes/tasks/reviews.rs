@@ -12,4 +12,3 @@ pub async fn list_reviews(
         .collect::<ApiResult<Vec<_>>>()?;
     Ok(Json(responses))
 }
-

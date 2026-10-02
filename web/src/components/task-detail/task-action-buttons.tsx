@@ -44,7 +44,7 @@ export function TaskActionButtons({ taskId, version, offers }: { taskId: string;
             return null
           })}
         </div>
-        <DialogFooter><Button variant="outline" onClick={() => setSelected(null)}>Close</Button><Button disabled={command.isPending || !action} onClick={() => { if (action) apply(action) }}>Apply</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" onClick={() => setSelected(null)}>Close</Button><Button disabled={command.isPending || !action || (selected?.parameters.some((spec) => spec.name === 'guidance' && spec.required) === true && (action.verb === 'retry' || action.verb === 'send_back') && !action.guidance?.trim())} onClick={() => { if (action) apply(action) }}>Apply</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   </>

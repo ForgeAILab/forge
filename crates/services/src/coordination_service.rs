@@ -1294,7 +1294,7 @@ async fn authorize_action_approver(
 ///
 /// This is a second gate in front of the catalog: an operation the catalog
 /// classifies as `DirectCommand` still executes only if it appears here.
-/// `task.recover` was declared, implemented end to end, and named by the
+/// `task.action` was declared, implemented end to end, and named by the
 /// Project operating skill -- but omitted from this list, so every recovery
 /// attempt was refused as an unadmitted direct command. That left a Task
 /// which fails by construction retrying forever with no reachable remedy,
@@ -1315,7 +1315,7 @@ pub(crate) fn is_admitted_direct_command(
     // Derived from the operation's own catalog row rather than re-listed
     // here. A command that is declared and implemented but missing from a
     // second list is refused at runtime with a message that names nothing,
-    // which is exactly how `task.recover` and `task.dependency` each failed.
+    // which is exactly how `task.action` and `task.dependency` each failed.
     is_coordination_direct_command(operation, requested_permission)
 }
 
@@ -2396,7 +2396,7 @@ mod tests {
     /// Every operation the catalog classifies as a Coordination
     /// `DirectCommand` must also be admitted by the direct-command gate with
     /// its own canonical permission. These are two independent lists, and
-    /// when they drifted the result was silent and expensive: `task.recover`
+    /// when they drifted the result was silent and expensive: `task.action`
     /// was declared, implemented, and documented, yet every call was refused
     /// as "not admitted for this permission or payload" — so a Task that
     /// fails by construction retried indefinitely with no reachable remedy.

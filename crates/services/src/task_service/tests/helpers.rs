@@ -368,7 +368,6 @@ pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> 
         artifact: None,
         message: Some("review retry budget exhausted".to_owned()),
         hook: None,
-
     });
     TaskRepo::update(
         db,

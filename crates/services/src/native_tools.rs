@@ -43,9 +43,9 @@ use forge_agent_host::{
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, 
+    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
     TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_ACTION_OPERATION,  TASK_WORKLOG_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -153,7 +153,6 @@ impl TaskDependencyPayload {
         }
     }
 }
-
 
 impl AdaptiveTaskPayload {
     fn into_command_parts(self) -> (String, i64, i64, AdaptiveTaskOperation, String) {
@@ -507,8 +506,17 @@ impl CoordinationToolProvider {
         }
         if scope.scope_type == CanonicalScopeType::Task {
             if let Some(service) = self.task_service_handle() {
-                let offers = service.task_action_offers(&scope.scope_id, &api_types::Actor::agent(actor_identity_id)).await.map_err(service_error)?;
-                result.insert("available_actions".to_owned(), json!(offers.available_actions));
+                let offers = service
+                    .task_action_offers(
+                        &scope.scope_id,
+                        &api_types::Actor::agent(actor_identity_id),
+                    )
+                    .await
+                    .map_err(service_error)?;
+                result.insert(
+                    "available_actions".to_owned(),
+                    json!(offers.available_actions),
+                );
                 result.insert("version".to_owned(), json!(offers.version));
             }
         }
@@ -2447,7 +2455,10 @@ impl CoordinationToolProvider {
         let mut offers_by_task = std::collections::HashMap::new();
         if let Some(service) = self.task_service_handle() {
             for id in &ids {
-                let offers = service.task_action_offers(id, &api_types::Actor::agent(actor_identity_id)).await.map_err(service_error)?;
+                let offers = service
+                    .task_action_offers(id, &api_types::Actor::agent(actor_identity_id))
+                    .await
+                    .map_err(service_error)?;
                 offers_by_task.insert(id.clone(), offers.available_actions);
             }
         }
@@ -3027,16 +3038,60 @@ impl CoordinationToolProvider {
         causation_depth: i64,
     ) -> Result<Value, AgentHostError> {
         if operation == TASK_ACTION_OPERATION {
-            let task_service = self.task_service_handle().ok_or_else(|| AgentHostError::Configuration("Task actions are not wired".to_owned()))?;
-            let project_id = target_id.ok_or_else(|| AgentHostError::Authority("Task action has no canonical Project".to_owned()))?;
-            let task_id = payload.get("task_id").and_then(Value::as_str).ok_or_else(|| invalid_arguments("task_id is required".to_owned()))?;
-            let task = db::TaskRepo::get_by_id(&*self.db, task_id, false).await.map_err(|error| AgentHostError::Runtime(error.to_string()))?.filter(|task| task.project_id == project_id).ok_or_else(|| invalid_arguments("task_id must name a Task in this Project".to_owned()))?;
-            let request: api_types::TaskActionRequest = serde_json::from_value(json!({ "action": payload.get("action"), "version": payload.get("version") })).map_err(|error| invalid_arguments(error.to_string()))?;
-            let (policy, reason) = self.actions.evaluate_direct_command_policy(actor_identity_id, scope_type_name(scope.scope_type), &scope.scope_id, requested_permission, operation, None).await.map_err(service_error)?;
-            if !matches!(policy, AgentActionPolicyResult::Allowed) { return Err(AgentHostError::Authority(reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()))); }
-            let result = task_service.perform_task_action_as(task.id, request.action, request.version, api_types::Actor::agent(actor_identity_id)).await.map_err(service_error)?;
-            let offers = task_service.task_action_offers(&result.task.id, &api_types::Actor::agent(actor_identity_id)).await.map_err(service_error)?;
-            return Ok(json!({ "operation": operation, "status": "succeeded", "replayed": false, "materialized": true, "domain_committed": true, "correlation_id": correlation_id, "task_id": result.task.id, "task_status": result.task.status, "task_version": result.task.version, "available_actions": offers.available_actions, "requires_user_authorization": false }));
+            let task_service = self.task_service_handle().ok_or_else(|| {
+                AgentHostError::Configuration("Task actions are not wired".to_owned())
+            })?;
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority("Task action has no canonical Project".to_owned())
+            })?;
+            let task_id = payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_arguments("task_id is required".to_owned()))?;
+            let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
+                .await
+                .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+                .filter(|task| task.project_id == project_id)
+                .ok_or_else(|| {
+                    invalid_arguments("task_id must name a Task in this Project".to_owned())
+                })?;
+            let request: api_types::TaskActionRequest = serde_json::from_value(
+                json!({ "action": payload.get("action"), "version": payload.get("version") }),
+            )
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+            let (policy, reason) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    None,
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy, AgentActionPolicyResult::Allowed) {
+                return Err(AgentHostError::Authority(
+                    reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
+                ));
+            }
+            let result = task_service
+                .perform_task_action_as(
+                    task.id,
+                    request.action,
+                    request.version,
+                    api_types::Actor::agent(actor_identity_id),
+                )
+                .await
+                .map_err(service_error)?;
+            let offers = task_service
+                .task_action_offers(&result.task.id, &api_types::Actor::agent(actor_identity_id))
+                .await
+                .map_err(service_error)?;
+            return Ok(
+                json!({ "operation": operation, "status": "succeeded", "replayed": false, "materialized": true, "domain_committed": true, "correlation_id": correlation_id, "task_id": result.task.id, "task_status": result.task.status, "task_version": result.task.version, "available_actions": offers.available_actions, "requires_user_authorization": false }),
+            );
         }
 
         if operation == TASK_DEPENDENCY_OPERATION {
@@ -4931,7 +4986,12 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
         })?;
     }
     if operation == TASK_ACTION_OPERATION {
-        serde_json::from_value::<api_types::TaskActionRequest>(json!({ "action": payload.get("action"), "version": payload.get("version") })).map_err(|_| invalid_arguments("Task action requires a closed verb and exact version".to_owned()))?;
+        serde_json::from_value::<api_types::TaskActionRequest>(
+            json!({ "action": payload.get("action"), "version": payload.get("version") }),
+        )
+        .map_err(|_| {
+            invalid_arguments("Task action requires a closed verb and exact version".to_owned())
+        })?;
     }
     if operation == TASK_DEPENDENCY_OPERATION {
         serde_json::from_value::<TaskDependencyPayload>(payload.clone()).map_err(|_| {
@@ -5106,8 +5166,18 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
     if let crate::ServiceError::TurnFailure { error, .. } = error {
         return service_error(*error);
     }
-    if let crate::ServiceError::TaskActionUnavailable { available_actions, reason } = &error {
-        let mut outcome = OrchestrationOutcome::failed(OutcomeCode::ActionUnavailable, "task.action", OutcomeScopeRef::new(OutcomeScopeType::Account, ""), "", reason.clone());
+    if let crate::ServiceError::TaskActionUnavailable {
+        available_actions,
+        reason,
+    } = &error
+    {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::ActionUnavailable,
+            "task.action",
+            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+            "",
+            reason.clone(),
+        );
         outcome.details = Some(json!({ "available_actions": available_actions }));
         outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
         return AgentHostError::StructuredOutcome(Box::new(outcome));
@@ -6795,14 +6865,14 @@ mod tests {
         // change cannot silently turn a capability denial into an unknown one.
         for (operation, permission, paused, permissions, expected) in [
             (
-                "task.recover",
+                "task.action",
                 "propose_task",
                 false,
                 r#"{"permissions":[]}"#,
                 DeniedBy::PermissionMissing("propose_task".to_owned()),
             ),
             (
-                "task.recover",
+                "task.action",
                 "propose_task",
                 true,
                 r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
@@ -6837,7 +6907,7 @@ mod tests {
                 DeniedBy::ReadBoundaryRequired,
             ),
             (
-                "task.recover",
+                "task.action",
                 "read_project",
                 false,
                 r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
@@ -7228,21 +7298,17 @@ mod tests {
 
     #[test]
     fn argument_shape_rejections_are_correctable_validation_outcomes() {
-        // A Project Agent that sends `task.recover` with an unknown action
+        // A Project Agent that sends `task.action` with an unknown action
         // must learn which field to fix; an opaque internal failure leaves it
         // retrying the same shape or abandoning a repair its doctrine requires.
-        let error = invalid_arguments(
-            "action must be resume_session, reexecute, reset_to_initial, reset_retry_window, \
-             or cancel_task"
-                .to_owned(),
-        );
+        let error = invalid_arguments("action must use a current closed Task verb".to_owned());
         match error {
             AgentHostError::StructuredOutcome(outcome) => {
                 assert_eq!(outcome.code, OutcomeCode::ValidationError);
                 assert_eq!(outcome.status, OutcomeStatus::Failed);
                 assert!(outcome
                     .safe_message
-                    .contains("action must be resume_session"));
+                    .contains("action must use a current closed Task verb"));
                 assert_eq!(
                     outcome.retry.as_ref().map(|retry| retry.action),
                     Some(RetryAction::CorrectInput)

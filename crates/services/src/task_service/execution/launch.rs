@@ -619,8 +619,6 @@ impl TaskService {
             .await
     }
 
-
-
     async fn re_execute_execution_with_context_inner(
         &self,
         parent_execution_id: impl Into<String>,

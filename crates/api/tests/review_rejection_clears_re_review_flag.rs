@@ -116,8 +116,8 @@ async fn reviewer_rejection_clears_review_passed_at_and_next_review_runs_full_au
     let rejected: ReviewDecisionResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "needs a targeted follow-up" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "action": {"verb":"send_back","guidance":"needs a targeted follow-up"}}),
         StatusCode::OK,
     )
     .await;

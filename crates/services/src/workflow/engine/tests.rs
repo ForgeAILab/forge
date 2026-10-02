@@ -726,7 +726,7 @@ async fn reset_to_initial_rejects_stale_project_workflow_authority_without_mutat
     .expect("workflow update wins the race");
 
     let result = engine(Arc::clone(&db), event_bus)
-        .reset_to_initial_with_authority(
+        .restart_with_authority(
             task_id,
             default_states::TODO,
             task_before.version,
@@ -2398,10 +2398,7 @@ async fn before_work_workspace_reset_required_keeps_typed_recovery_annotation() 
         .as_str()
         .expect("annotation message is text")
         .contains("workspace reset required"));
-    assert_eq!(
-        annotation["recovery_actions"],
-        json!(["reset_to_initial", "cancel_task"])
-    );
+    assert!(annotation.get("recovery_actions").is_none());
     assert!(
         WorkspaceRepo::get_by_id(&*fixture.db, &fixture.workspace.id)
             .await

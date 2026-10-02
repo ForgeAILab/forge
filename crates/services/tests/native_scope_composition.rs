@@ -35,9 +35,9 @@ use forge_agent_host::{
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_ACTION_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -588,10 +588,9 @@ fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -
     json!({
         "operation": TASK_ACTION_OPERATION,
         "payload": {
-            "action": "cancel",
+            "action": {"verb":"cancel"},
             "task_id": task_id,
-            "expected_task_version": expected_task_version,
-            "reason": "This Task is no longer needed."
+            "version": expected_task_version
         },
         "dedupe_key": key,
         "correlation_id": format!("correlation-{key}")
@@ -1051,7 +1050,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         TASK_ACTION_OPERATION,
     )
     .await
-    .expect("task.cancel composition call");
+    .expect("task.action composition call");
     assert_outcome_operation(&cancelled, TASK_ACTION_OPERATION);
     assert!(
         !cancelled.is_error,
@@ -1104,9 +1103,8 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             "operation": TASK_ACTION_OPERATION,
             "payload": {
                 "task_id": source_task_id,
-                "decision": "reject",
-                "expected_task_version": review_task_version,
-                "reason": "Exercise the Project Agent human-review decision."
+                "action": {"verb":"send_back","guidance":"Exercise the Project Agent human-review decision."},
+                "version": review_task_version
             },
             "dedupe_key": "matrix-task-review",
             "correlation_id": "correlation-matrix-task-review"
@@ -1165,7 +1163,7 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     covered_operations.insert(PROJECT_CHARTER_ADOPTION_OPERATION.to_owned());
 
     // The remaining migrated contracts are asserted by composition exposure
-    // rather than by invocation. `project.observations` and `task.recover` are
+    // rather than by invocation. `project.observations` and `task.action` are
     // Project-scoped; `task.plan`, `task.worklog`, and `task.evidence` are
     // Task-scoped and need a leased Task session this fixture does not build.
     // Exposure is the property this test is named for: every migrated contract

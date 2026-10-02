@@ -188,10 +188,26 @@ impl McpToolError {
             .data
             .as_ref()
             .and_then(safe_execution_already_running_details);
-        let action_unavailable_offers = self.details.data.as_ref().filter(|data| data["code"] == "action_unavailable").and_then(|data| serde_json::from_value::<Vec<api_types::Offer>>(data["available_actions"].clone()).ok());
-        let (outcome_code, safe_message, retry_action, retryable) = if action_unavailable_offers.is_some() {
-            (OutcomeCode::ActionUnavailable, "the requested Task action is unavailable; use the current offers", Some(RetryAction::CorrectInput), false)
-        } else { self.outcome_classification() };
+        let action_unavailable_offers = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| {
+                serde_json::from_value::<Vec<api_types::Offer>>(data["available_actions"].clone())
+                    .ok()
+            });
+        let (outcome_code, safe_message, retry_action, retryable) =
+            if action_unavailable_offers.is_some() {
+                (
+                    OutcomeCode::ActionUnavailable,
+                    "the requested Task action is unavailable; use the current offers",
+                    Some(RetryAction::CorrectInput),
+                    false,
+                )
+            } else {
+                self.outcome_classification()
+            };
         let mut outcome = OrchestrationOutcome::new(
             outcome_code,
             OrchestrationOutcome::status_for_code(outcome_code),
@@ -221,7 +237,9 @@ impl McpToolError {
             }
             outcome.retry = Some(retry);
         }
-        outcome.details = action_unavailable_offers.map(|offers| json!({"available_actions": offers})).or(execution_already_running_details);
+        outcome.details = action_unavailable_offers
+            .map(|offers| json!({"available_actions": offers}))
+            .or(execution_already_running_details);
         serde_json::to_value(outcome).unwrap_or_else(|_| {
             json!({
                 "code": "internal_failure",
