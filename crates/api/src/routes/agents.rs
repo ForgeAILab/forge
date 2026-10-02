@@ -109,23 +109,7 @@ pub async fn list_agents(
     )
     .await?;
     let has_more = page.next_cursor.is_some();
-    let mut runnable = services::environment_surfaces::runnable_on_for_agents(
-        &state.db,
-        &page.items,
-        &state.adapter_registry,
-        &state.daemon_connections,
-        user.is_admin,
-    )
-    .await?;
-    let mut items = Vec::with_capacity(page.items.len());
-    for agent in page.items {
-        let active_assigned_task_count =
-            AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
-        let runnable_on = runnable.remove(&agent.id).expect("requested Agent");
-        let response =
-            build_agent_response(&state, agent, Some(active_assigned_task_count)).await?;
-        items.push(agent_response_for_user(response, runnable_on, &user));
-    }
+    let items = build_agent_responses_for_user(&state, page.items, &user).await?;
     Ok(Json(PaginatedResponse {
         items,
         next_cursor: page.next_cursor,
@@ -471,6 +455,7 @@ async fn build_agent_response(
     state: &AppState,
     agent: Agent,
     active_assigned_task_count: Option<i64>,
+    usage: api_types::UsageAggregate,
 ) -> ApiResult<AgentResponse> {
     let effective_status =
         compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
@@ -478,7 +463,6 @@ async fn build_agent_response(
             .as_str()
             .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
     // Derived here rather than threaded through every caller: this is the
     // quantity `max_concurrent_tasks` actually bounds, so it should always be
     // present wherever the cap is.
@@ -508,7 +492,8 @@ async fn build_agent_response_for_user(
         user.is_admin,
     )
     .await?;
-    let response = build_agent_response(state, agent, active_assigned_task_count).await?;
+    let usage = state.usage_ledger_index.agent(&agent.id).await?;
+    let response = build_agent_response(state, agent, active_assigned_task_count, usage).await?;
     Ok(agent_response_for_user(response, runnable_on, user))
 }
 
@@ -522,6 +507,73 @@ fn agent_response_for_user(
         response.daemon_id = None;
     }
     response
+}
+
+/// Share incremental usage and execution statistics across either Agent page.
+pub(super) async fn build_agent_responses_for_user(
+    state: &AppState,
+    agents: Vec<Agent>,
+    user: &AuthenticatedUser,
+) -> ApiResult<Vec<AgentResponse>> {
+    let ids = agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    let mut runnable = services::environment_surfaces::runnable_on_for_agents(
+        &state.db,
+        &agents,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        user.is_admin,
+    )
+    .await?;
+    let mut usage = state.usage_ledger_index.agents(&ids).await?;
+    let mut stats = state.usage_ledger_index.agent_execution_stats(&ids).await?;
+    let mut assignments = state.db.agent_list_active_assignments(&ids).await?;
+    let running = stats
+        .iter()
+        .map(|(id, value)| (id.clone(), value.1))
+        .collect();
+    let mut effective = services::agent_service::compute_effective_status_for_agents(
+        &state.db,
+        &agents,
+        &running,
+        &state.daemon_connections,
+    )
+    .await?;
+    let mut responses = Vec::with_capacity(agents.len());
+    for agent in agents {
+        let aggregate = match usage.remove(&agent.id) {
+            Some(value) => value,
+            None => {
+                services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?
+            }
+        };
+        let live = match stats.remove(&agent.id) {
+            Some(value) => value,
+            None => (
+                db::ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?,
+                db::AgentRepo::count_running_executions(&*state.db, &agent.id).await?,
+            ),
+        };
+        let effective_status = effective
+            .remove(&agent.id)
+            .expect("requested Agent")
+            .as_str()
+            .to_owned();
+        let assigned = assignments.remove(&agent.id).unwrap_or(0);
+        let response = agent_response(
+            agent,
+            Some(assigned),
+            Some(live.1),
+            Some(effective_status),
+            live.0,
+            aggregate,
+        );
+        let runnable_on = runnable.remove(&response.id).expect("requested Agent");
+        responses.push(agent_response_for_user(response, runnable_on, user));
+    }
+    Ok(responses)
 }
 
 #[derive(Debug, serde::Deserialize)]

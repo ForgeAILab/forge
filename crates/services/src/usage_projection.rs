@@ -17,11 +17,17 @@ use api_types::{
     UsageTelemetryState,
 };
 use db::{
-    CostCoverageReasonCode as DbCostCoverageReasonCode, CostEstimateRevisionState,
-    RetrospectiveEstimateRepo, UsageCostKind, UsageEvent, UsageEventProvenanceKind,
-    UsageInvocation, UsageInvocationLifecycle, UsageLedgerRepo, UsageSurface as DbUsageSurface,
-    UsageTelemetryState as DbUsageTelemetryState,
+    CostCoverageReasonCode as DbCostCoverageReasonCode, CostEstimateRevisionState, UsageCostKind,
+    UsageEvent, UsageEventProvenanceKind, UsageInvocation, UsageInvocationLifecycle,
+    UsageLedgerRepo, UsageSurface as DbUsageSurface, UsageTelemetryState as DbUsageTelemetryState,
 };
+
+#[cfg(test)]
+mod reference_readers;
+#[cfg(test)]
+pub(crate) use reference_readers::per_invocation_usage_aggregate_for_operations;
+#[cfg(test)]
+use reference_readers::{list_effective_usage_events, old_usage_aggregate_for_task};
 
 use crate::{Result, ServiceError};
 
@@ -93,7 +99,12 @@ pub async fn usage_aggregate_for_source_state(
     pending: bool,
 ) -> Result<UsageAggregate> {
     let invocations = UsageLedgerRepo::list_usage_invocations_for_source(db, source_id).await?;
-    let events_by_invocation = effective_usage_events_for_invocations(db, &invocations).await?;
+    let events_by_invocation = if invocations.is_empty() {
+        HashMap::new()
+    } else {
+        let mut connection = db.pool().acquire().await?;
+        effective_usage_events_for_invocations(&mut connection, &invocations).await?
+    };
     let surface = invocations
         .first()
         .map(|invocation| invocation.surface)
@@ -117,7 +128,12 @@ pub async fn usage_breakdowns_for_source(
     source_id: &str,
 ) -> Result<Vec<UsageBreakdown>> {
     let invocations = UsageLedgerRepo::list_usage_invocations_for_source(db, source_id).await?;
-    let mut events_by_invocation = effective_usage_events_for_invocations(db, &invocations).await?;
+    if invocations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut connection = db.pool().acquire().await?;
+    let mut events_by_invocation =
+        effective_usage_events_for_invocations(&mut connection, &invocations).await?;
     let mut rows = Vec::new();
     for invocation in invocations {
         let events = events_by_invocation
@@ -131,95 +147,6 @@ pub async fn usage_breakdowns_for_source(
     Ok(rows)
 }
 
-/// Overlay the latest applied retrospective estimate without mutating the
-/// immutable usage event. The broad analytics repository performs this join
-/// in its dataset query; these smaller public projections use the repository
-/// list methods and apply the same effective-cost rule per event.
-async fn list_effective_usage_events(
-    db: &db::SqliteDb,
-    invocation: &UsageInvocation,
-) -> Result<Vec<EffectiveUsageEvent>> {
-    let events = UsageLedgerRepo::list_usage_events_for_invocation(db, &invocation.id).await?;
-    // Batched per invocation: an agent's lifetime aggregate walks every event
-    // it ever produced, so per-event queries made list endpoints linear in
-    // usage history.
-    let mut applied_by_event = HashMap::new();
-    for revision in
-        RetrospectiveEstimateRepo::list_cost_estimate_revisions_for_invocation(db, &invocation.id)
-            .await?
-    {
-        if revision.state == CostEstimateRevisionState::Applied {
-            applied_by_event
-                .entry(revision.usage_event_id.clone())
-                .or_insert(revision);
-        }
-    }
-    let mut metadata_cache = HashMap::new();
-    let mut effective = Vec::with_capacity(events.len());
-    for event in events {
-        if let Some(revision) = applied_by_event.remove(&event.id) {
-            if event.cost_kind == UsageCostKind::ProviderReported {
-                return Err(invalid_transition());
-            }
-            let Some(estimated_nano_usd) = revision.estimated_nano_usd else {
-                return Err(invalid_transition());
-            };
-            let mut event = event;
-            event.estimated_nano_usd = Some(estimated_nano_usd);
-            event.cost_kind = UsageCostKind::Estimated;
-            event.rate_revision_id = revision.rate_revision_id.or(event.rate_revision_id);
-            event.catalog_snapshot_id = revision.catalog_snapshot_id.or(event.catalog_snapshot_id);
-            event.formula_revision = revision.formula_revision.or(event.formula_revision);
-            event.retrospective = revision.retrospective;
-            let source_metadata = cached_event_source_metadata(
-                &mut metadata_cache,
-                db,
-                invocation,
-                &event,
-                Some(&revision.id),
-            )
-            .await?;
-            effective.push(EffectiveUsageEvent {
-                source: event_source_with_metadata(&event, Some(&source_metadata))?,
-                event,
-            });
-        } else {
-            let source_metadata =
-                cached_event_source_metadata(&mut metadata_cache, db, invocation, &event, None)
-                    .await?;
-            effective.push(EffectiveUsageEvent {
-                source: event_source_with_metadata(&event, Some(&source_metadata))?,
-                event,
-            });
-        }
-    }
-    Ok(effective)
-}
-
-/// The metadata join depends only on the invocation plus these three ids, and
-/// an invocation's events almost always share them.
-type EventSourceMetadataKey = (Option<String>, Option<String>, Option<String>);
-
-async fn cached_event_source_metadata(
-    cache: &mut HashMap<EventSourceMetadataKey, EventSourceMetadata>,
-    db: &db::SqliteDb,
-    invocation: &UsageInvocation,
-    event: &UsageEvent,
-    applied_revision_id: Option<&str>,
-) -> Result<EventSourceMetadata> {
-    let key = (
-        event.rate_revision_id.clone(),
-        event.catalog_snapshot_id.clone(),
-        applied_revision_id.map(str::to_owned),
-    );
-    if let Some(metadata) = cache.get(&key) {
-        return Ok(metadata.clone());
-    }
-    let metadata = load_event_source_metadata(db, invocation, event, applied_revision_id).await?;
-    cache.insert(key, metadata.clone());
-    Ok(metadata)
-}
-
 #[derive(Debug, Clone)]
 struct EventSourceMetadata {
     source_kind: Option<CostSourceKind>,
@@ -229,49 +156,6 @@ struct EventSourceMetadata {
     effective_at: Option<String>,
     fetched_at: Option<String>,
     freshness: Option<CostSourceFreshness>,
-}
-
-/// Read the immutable pricing provenance attached to an invocation/event.
-/// Selection freshness is admission-time truth; retrospective estimates use
-/// the immutable preview freshness instead. Rate/snapshot fields are joined by
-/// their frozen IDs and never re-resolved from current mutable bindings.
-async fn load_event_source_metadata(
-    db: &db::SqliteDb,
-    invocation: &UsageInvocation,
-    event: &UsageEvent,
-    applied_revision_id: Option<&str>,
-) -> Result<EventSourceMetadata> {
-    let row = sqlx::query(
-        "SELECT
-             ps.source_kind AS selection_source_kind,
-             ps.catalog_freshness AS selection_catalog_freshness,
-             ps.rate_revision_id AS selection_rate_revision_id,
-             ps.catalog_snapshot_id AS selection_catalog_snapshot_id,
-             r.source_kind AS rate_source_kind,
-             r.catalog_snapshot_id AS rate_catalog_snapshot_id,
-             r.effective_at AS rate_effective_at,
-             c.revision_digest AS catalog_digest,
-             c.fetched_at AS catalog_fetched_at,
-             ep.catalog_freshness AS estimate_catalog_freshness
-         FROM usage_invocation i
-         LEFT JOIN pricing_selection ps ON ps.id = i.pricing_selection_id
-         LEFT JOIN cost_estimate_revision er ON er.id = ?
-         LEFT JOIN cost_estimation_run erun ON erun.id = er.run_id
-         LEFT JOIN cost_estimation_preview ep ON ep.id = erun.preview_id
-         LEFT JOIN pricing_rate_revision r
-           ON r.id = COALESCE(?, ps.rate_revision_id)
-         LEFT JOIN pricing_catalog_snapshot c
-           ON c.id = COALESCE(?, r.catalog_snapshot_id, ps.catalog_snapshot_id)
-         WHERE i.id = ?",
-    )
-    .bind(applied_revision_id)
-    .bind(event.rate_revision_id.as_deref())
-    .bind(event.catalog_snapshot_id.as_deref())
-    .bind(&invocation.id)
-    .fetch_one(db.pool())
-    .await?;
-
-    event_source_metadata_from_row(&row, event)
 }
 
 fn event_source_metadata_from_row(
@@ -766,166 +650,99 @@ fn aggregate_usage_with_sources(
     })
 }
 
-/// Everything `usage_aggregate_for_agent` reads, reduced to counters that move
-/// whenever any input does. Usage events and cost estimate revisions are
-/// append-only, an invocation bumps `version` on every update, and pricing
-/// provenance is joined by frozen ids, so an unchanged fingerprint means an
-/// unchanged aggregate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentUsageFingerprint {
-    event_count: i64,
-    event_max_rowid: i64,
-    invocation_count: i64,
-    invocation_version_sum: i64,
-    revision_max_rowid: i64,
-    execution_count: i64,
-    running_execution_count: i64,
-}
+mod ledger_index;
+pub use ledger_index::UsageLedgerIndex;
 
-async fn agent_usage_fingerprint(
-    db: &db::SqliteDb,
-    identity_id: &str,
-) -> Result<AgentUsageFingerprint> {
-    let row = sqlx::query(
-        "WITH sources AS (
-             SELECT source_id FROM usage_invocation WHERE agent_id = ?1
-             UNION SELECT source_id FROM usage_event WHERE agent_id = ?1
-         )
-         SELECT
-             (SELECT COUNT(*) FROM usage_event
-               WHERE source_id IN sources) AS event_count,
-             (SELECT COALESCE(MAX(rowid), 0) FROM usage_event
-               WHERE source_id IN sources) AS event_max_rowid,
-             (SELECT COUNT(*) FROM usage_invocation
-               WHERE source_id IN sources) AS invocation_count,
-             (SELECT COALESCE(SUM(version), 0) FROM usage_invocation
-               WHERE source_id IN sources) AS invocation_version_sum,
-             (SELECT COALESCE(MAX(rowid), 0) FROM cost_estimate_revision) AS revision_max_rowid,
-             (SELECT COUNT(*) FROM execution WHERE agent_id = ?1) AS execution_count,
-             (SELECT COUNT(*) FROM execution
-               WHERE agent_id = ?1 AND status = 'running') AS running_execution_count",
-    )
-    .bind(identity_id)
-    .fetch_one(db.pool())
-    .await?;
-    Ok(AgentUsageFingerprint {
-        event_count: sqlx::Row::try_get(&row, "event_count")?,
-        event_max_rowid: sqlx::Row::try_get(&row, "event_max_rowid")?,
-        invocation_count: sqlx::Row::try_get(&row, "invocation_count")?,
-        invocation_version_sum: sqlx::Row::try_get(&row, "invocation_version_sum")?,
-        revision_max_rowid: sqlx::Row::try_get(&row, "revision_max_rowid")?,
-        execution_count: sqlx::Row::try_get(&row, "execution_count")?,
-        running_execution_count: sqlx::Row::try_get(&row, "running_execution_count")?,
-    })
-}
-
-/// Process-local memo of each agent's lifetime usage aggregate. The aggregate
-/// walks every event the agent ever produced, so agent list and detail routes
-/// reuse it until the fingerprint moves rather than recomputing it per request.
-#[derive(Debug, Default)]
-pub struct AgentUsageAggregateCache {
-    entries: std::sync::Mutex<HashMap<String, (AgentUsageFingerprint, UsageAggregate)>>,
-}
-
-impl AgentUsageAggregateCache {
-    pub async fn get(&self, db: &db::SqliteDb, identity_id: &str) -> Result<UsageAggregate> {
-        let fingerprint = agent_usage_fingerprint(db, identity_id).await?;
-        if let Some((cached, aggregate)) = self
-            .entries
-            .lock()
-            .expect("agent usage cache lock")
-            .get(identity_id)
-        {
-            if *cached == fingerprint {
-                return Ok(aggregate.clone());
-            }
-        }
-        let aggregate = usage_aggregate_for_agent(db, identity_id).await?;
-        self.entries
-            .lock()
-            .expect("agent usage cache lock")
-            .insert(identity_id.to_owned(), (fingerprint, aggregate.clone()));
-        Ok(aggregate)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_cached_aggregate(&self, identity_id: &str, aggregate: UsageAggregate) {
-        if let Some(entry) = self
-            .entries
-            .lock()
-            .expect("agent usage cache lock")
-            .get_mut(identity_id)
-        {
-            entry.1 = aggregate;
-        }
-    }
-}
-
-/// Collect all ledger rows attributed to an Agent identity and build its
-/// shared aggregate.  This is intentionally scoped to immutable invocation
-/// and event attribution; mutable `agent_current`/chat token JSON are not
-/// used as accounting authority.
+/// Fresh lifetime usage for one identity, using the same batch reader as pages.
 pub async fn usage_aggregate_for_agent(
     db: &db::SqliteDb,
     identity_id: &str,
 ) -> Result<UsageAggregate> {
-    let source_rows = sqlx::query(
-        "SELECT DISTINCT source_id FROM usage_invocation WHERE agent_id = ?
-         UNION SELECT DISTINCT source_id FROM usage_event WHERE agent_id = ?
-         ORDER BY source_id ASC",
-    )
-    .bind(identity_id)
-    .bind(identity_id)
-    .fetch_all(db.pool())
-    .await?;
-    let mut invocations = Vec::new();
-    let mut events_by_invocation = HashMap::new();
-    for row in source_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
-        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
-        {
-            let events = list_effective_usage_events(db, &invocation).await?;
-            let invocation_matches = invocation.agent_id.as_deref() == Some(identity_id);
-            let matching_events = events
-                .iter()
-                .any(|effective| effective.event.agent_id.as_deref() == Some(identity_id));
-            if !invocation_matches && !matching_events {
-                continue;
-            }
-            let events = if invocation_matches {
-                events
-            } else {
-                events
-                    .into_iter()
-                    .filter(|effective| effective.event.agent_id.as_deref() == Some(identity_id))
-                    .collect()
-            };
-            events_by_invocation.insert(invocation.id.clone(), events);
-            invocations.push(invocation);
-        }
+    let mut transaction = db.pool().begin().await?;
+    let mut aggregates =
+        agent_usage_in_snapshot(&mut transaction, &[identity_id.to_owned()]).await?;
+    transaction.commit().await?;
+    aggregates
+        .remove(identity_id)
+        .ok_or_else(invalid_transition)
+}
+
+async fn agent_usage_in_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+    identity_ids: &[String],
+) -> Result<HashMap<String, UsageAggregate>> {
+    if identity_ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    let mut domain_runs = invocations
-        .iter()
-        .map(|invocation| UsageDomainRun {
-            surface: invocation.surface,
-            source_id: invocation.source_id.clone(),
-            pending: false,
-        })
-        .collect::<Vec<_>>();
-    let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE agent_id = ?")
-        .bind(identity_id)
-        .fetch_all(db.pool())
-        .await?;
-    for row in execution_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "id")?;
-        let status: String = sqlx::Row::try_get(&row, "status")?;
-        domain_runs.push(UsageDomainRun {
+    let ids_json = serde_json::to_string(identity_ids).map_err(|_| invalid_transition())?;
+    let source_rows = sqlx::query(
+        "SELECT agent_id, source_id FROM usage_invocation WHERE agent_id IN (SELECT value FROM json_each(?1))
+         UNION SELECT agent_id, source_id FROM usage_event WHERE agent_id IN (SELECT value FROM json_each(?1))
+         ORDER BY agent_id, source_id",
+    ).bind(&ids_json).fetch_all(&mut *connection).await?;
+    let mut sources_by_agent = HashMap::<String, HashSet<String>>::new();
+    let mut all_sources = BTreeSet::<String>::new();
+    for row in source_rows {
+        let agent_id: String = sqlx::Row::try_get(&row, "agent_id")?;
+        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
+        all_sources.insert(source_id.clone());
+        sources_by_agent
+            .entry(agent_id)
+            .or_default()
+            .insert(source_id);
+    }
+    let invocations = db::SqliteDb::usage_invocations_for_sources(
+        connection,
+        &all_sources.into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
+    let events = effective_usage_events_for_invocations(connection, &invocations).await?;
+    let mut runs_by_agent = HashMap::<String, Vec<UsageDomainRun>>::new();
+    for row in sqlx::query("SELECT agent_id, id, status FROM execution WHERE agent_id IN (SELECT value FROM json_each(?))")
+        .bind(ids_json).fetch_all(&mut *connection).await? {
+        let agent_id: String = sqlx::Row::try_get(&row, "agent_id")?;
+        runs_by_agent.entry(agent_id).or_default().push(UsageDomainRun {
             surface: DbUsageSurface::TaskExecution,
-            source_id,
-            pending: status == "running",
+            source_id: sqlx::Row::try_get(&row, "id")?,
+            pending: sqlx::Row::try_get::<String, _>(&row, "status")? == "running",
         });
     }
-    aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
+    let mut aggregates = HashMap::new();
+    for id in identity_ids {
+        let mut matching_invocations = Vec::new();
+        let mut matching_events = HashMap::new();
+        for invocation in &invocations {
+            if !sources_by_agent
+                .get(id)
+                .is_some_and(|sources| sources.contains(&invocation.source_id))
+            {
+                continue;
+            }
+            let invocation_matches = invocation.agent_id.as_deref() == Some(id);
+            let filtered_events = events
+                .get(&invocation.id)
+                .into_iter()
+                .flatten()
+                .filter(|effective| {
+                    invocation_matches || effective.event.agent_id.as_deref() == Some(id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !invocation_matches && filtered_events.is_empty() {
+                continue;
+            }
+            matching_invocations.push(invocation.clone());
+            matching_events.insert(invocation.id.clone(), filtered_events);
+        }
+        // aggregate_usage_with_sources also inserts each included invocation's
+        // logical run. Domain executions supply no-invocation and pending runs.
+        let domain_runs = runs_by_agent.remove(id).unwrap_or_default();
+        aggregates.insert(
+            id.clone(),
+            aggregate_usage_with_sources(&matching_invocations, &matching_events, &domain_runs)?,
+        );
+    }
+    Ok(aggregates)
 }
 
 /// Collect the execution attempts belonging to one Task.  Runtime rows are
@@ -942,13 +759,13 @@ const TASK_USAGE_SOURCES_SQL: &str = "
     ORDER BY source_id";
 
 async fn effective_usage_events_for_invocations(
-    db: &db::SqliteDb,
+    connection: &mut sqlx::SqliteConnection,
     invocations: &[UsageInvocation],
 ) -> Result<HashMap<String, Vec<EffectiveUsageEvent>>> {
     let ids = invocations.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
-    let events = db.usage_events_for_invocations(&ids).await?;
+    let events = db::SqliteDb::usage_events_for_invocations(connection, &ids).await?;
     let mut applied = HashMap::new();
-    for revision in db.cost_estimate_revisions_for_invocations(&ids).await? {
+    for revision in db::SqliteDb::cost_estimate_revisions_for_invocations(connection, &ids).await? {
         if revision.state == CostEstimateRevisionState::Applied {
             applied
                 .entry(revision.usage_event_id.clone())
@@ -1004,7 +821,7 @@ async fn effective_usage_events_for_invocations(
          LEFT JOIN cost_estimation_preview ep ON ep.id = erun.preview_id
          LEFT JOIN pricing_rate_revision r ON r.id = COALESCE(requested.rate_id, ps.rate_revision_id)
          LEFT JOIN pricing_catalog_snapshot c ON c.id = COALESCE(requested.catalog_id, r.catalog_snapshot_id, ps.catalog_snapshot_id)");
-        for row in query.build().fetch_all(db.pool()).await? {
+        for row in query.build().fetch_all(&mut *connection).await? {
             let id: String = sqlx::Row::try_get(&row, "event_id")?;
             metadata.insert(id, row);
         }
@@ -1025,9 +842,10 @@ async fn effective_usage_events_for_invocations(
 }
 
 pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Result<UsageAggregate> {
+    let mut connection = db.pool().acquire().await?;
     let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE task_id = ?")
         .bind(task_id)
-        .fetch_all(db.pool())
+        .fetch_all(&mut *connection)
         .await?;
     let mut execution_ids = BTreeSet::new();
     let mut domain_runs = Vec::with_capacity(execution_rows.len());
@@ -1049,14 +867,16 @@ pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Resul
         .bind(task_id)
         .bind(task_id)
         .bind(task_id)
-        .fetch_all(db.pool())
+        .fetch_all(&mut *connection)
         .await?;
     let source_ids = source_rows
         .iter()
         .map(|row| sqlx::Row::try_get(row, "source_id"))
         .collect::<std::result::Result<Vec<String>, _>>()?;
-    let candidates = db.usage_invocations_for_sources(&source_ids).await?;
-    let mut batched_events = effective_usage_events_for_invocations(db, &candidates).await?;
+    let candidates =
+        db::SqliteDb::usage_invocations_for_sources(&mut connection, &source_ids).await?;
+    let mut batched_events =
+        effective_usage_events_for_invocations(&mut connection, &candidates).await?;
     let mut invocations = Vec::new();
     let mut events_by_invocation = HashMap::new();
     for invocation in candidates {
@@ -1088,12 +908,21 @@ pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Resul
 /// mirrors the whole-account projection rather than accepting an unscoped
 /// caller-provided identity.
 pub async fn usage_aggregate_for_operations(db: &db::SqliteDb) -> Result<UsageAggregate> {
+    let mut transaction = db.pool().begin().await?;
+    let aggregate = operations_usage_in_snapshot(&mut transaction).await?;
+    transaction.commit().await?;
+    Ok(aggregate)
+}
+
+async fn operations_usage_in_snapshot(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<UsageAggregate> {
     let source_rows = sqlx::query(
         "SELECT DISTINCT source_id FROM usage_invocation
          UNION SELECT DISTINCT source_id FROM usage_event
          ORDER BY source_id ASC",
     )
-    .fetch_all(db.pool())
+    .fetch_all(&mut *connection)
     .await?;
     let source_ids = source_rows
         .iter()
@@ -1101,8 +930,9 @@ pub async fn usage_aggregate_for_operations(db: &db::SqliteDb) -> Result<UsageAg
         .collect::<std::result::Result<Vec<String>, _>>()?;
     // Operations is polled: read the ledger in id batches (the Task path's
     // readers) instead of four statements per invocation.
-    let invocations = db.usage_invocations_for_sources(&source_ids).await?;
-    let mut batched_events = effective_usage_events_for_invocations(db, &invocations).await?;
+    let invocations = db::SqliteDb::usage_invocations_for_sources(connection, &source_ids).await?;
+    let mut batched_events =
+        effective_usage_events_for_invocations(connection, &invocations).await?;
     let events_by_invocation = invocations
         .iter()
         .map(|invocation| {
@@ -1121,7 +951,7 @@ pub async fn usage_aggregate_for_operations(db: &db::SqliteDb) -> Result<UsageAg
         })
         .collect::<Vec<_>>();
     let execution_rows = sqlx::query("SELECT id, status FROM execution")
-        .fetch_all(db.pool())
+        .fetch_all(&mut *connection)
         .await?;
     for row in execution_rows {
         let source_id: String = sqlx::Row::try_get(&row, "id")?;
@@ -1898,120 +1728,6 @@ mod tests {
 }
 
 #[cfg(test)]
-async fn old_usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Result<UsageAggregate> {
-    let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE task_id = ?")
-        .bind(task_id)
-        .fetch_all(db.pool())
-        .await?;
-    let mut execution_ids = BTreeSet::new();
-    let mut domain_runs = Vec::with_capacity(execution_rows.len());
-    for row in execution_rows {
-        let id: String = sqlx::Row::try_get(&row, "id")?;
-        let status: String = sqlx::Row::try_get(&row, "status")?;
-        execution_ids.insert(id.clone());
-        domain_runs.push(UsageDomainRun {
-            surface: DbUsageSurface::TaskExecution,
-            source_id: id,
-            pending: status == "running",
-        });
-    }
-
-    let source_rows = sqlx::query(
-        "SELECT DISTINCT source_id FROM usage_invocation
-         WHERE task_id = ?
-            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
-         UNION SELECT DISTINCT source_id FROM usage_event
-         WHERE task_id = ?
-            OR execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-            OR source_id IN (SELECT id FROM execution WHERE task_id = ?)
-         ORDER BY source_id ASC",
-    )
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .bind(task_id)
-    .fetch_all(db.pool())
-    .await?;
-    let mut invocations = Vec::new();
-    let mut events_by_invocation = HashMap::new();
-    for row in source_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
-        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
-        {
-            let invocation_matches = invocation.task_id.as_deref() == Some(task_id)
-                || execution_ids.contains(&invocation.source_id);
-            let events = list_effective_usage_events(db, &invocation).await?;
-            let events = if invocation_matches {
-                events
-            } else {
-                events
-                    .into_iter()
-                    .filter(|effective| {
-                        effective.event.task_id.as_deref() == Some(task_id)
-                            || execution_ids.contains(&effective.event.source_id)
-                    })
-                    .collect()
-            };
-            if !invocation_matches && events.is_empty() {
-                continue;
-            }
-            events_by_invocation.insert(invocation.id.clone(), events);
-            invocations.push(invocation);
-        }
-    }
-    aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
-}
-
-/// The per-invocation walk the Operations summary used before it was batched.
-#[cfg(test)]
-pub(crate) async fn per_invocation_usage_aggregate_for_operations(
-    db: &db::SqliteDb,
-) -> Result<UsageAggregate> {
-    let source_rows = sqlx::query(
-        "SELECT DISTINCT source_id FROM usage_invocation
-         UNION SELECT DISTINCT source_id FROM usage_event
-         ORDER BY source_id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
-    let mut invocations = Vec::new();
-    let mut events_by_invocation = HashMap::new();
-    for row in source_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
-        for invocation in UsageLedgerRepo::list_usage_invocations_for_source(db, &source_id).await?
-        {
-            let events = list_effective_usage_events(db, &invocation).await?;
-            events_by_invocation.insert(invocation.id.clone(), events);
-            invocations.push(invocation);
-        }
-    }
-    let mut domain_runs = invocations
-        .iter()
-        .map(|invocation| UsageDomainRun {
-            surface: invocation.surface,
-            source_id: invocation.source_id.clone(),
-            pending: false,
-        })
-        .collect::<Vec<_>>();
-    let execution_rows = sqlx::query("SELECT id, status FROM execution")
-        .fetch_all(db.pool())
-        .await?;
-    for row in execution_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "id")?;
-        let status: String = sqlx::Row::try_get(&row, "status")?;
-        domain_runs.push(UsageDomainRun {
-            surface: DbUsageSurface::TaskExecution,
-            source_id,
-            pending: status == "running",
-        });
-    }
-    aggregate_usage_with_sources(&invocations, &events_by_invocation, &domain_runs)
-}
-
-#[cfg(test)]
 mod task_read_tests {
     use super::*;
 
@@ -2141,5 +1857,42 @@ mod task_read_tests {
         ] {
             assert!(plans.iter().any(|p| p.contains(index)), "missing {index}");
         }
+    }
+}
+
+#[cfg(test)]
+mod source_read_tests {
+    use super::*;
+    #[tokio::test]
+    async fn empty_sources_do_not_acquire_a_second_connection() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+        let observed = acquisitions.clone();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .before_acquire(move |_, _| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(true) })
+            })
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        acquisitions.store(0, Ordering::Relaxed);
+        assert!(usage_breakdowns_for_source(&db, "empty")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 1);
+        acquisitions.store(0, Ordering::Relaxed);
+        let aggregate = usage_aggregate_for_source_state(&db, "empty", true)
+            .await
+            .unwrap();
+        assert_eq!(aggregate.counts.task_execution_count, 1);
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 1);
     }
 }

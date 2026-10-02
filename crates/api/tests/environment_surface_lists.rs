@@ -152,6 +152,7 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
         }
         counts.push((mode, by_size));
     }
+    let mut agent_counts = std::collections::BTreeMap::<_, Vec<_>>::new();
     for kind in ["cli", "native"] {
         for count in [1, 20] {
             let root = tempfile::tempdir().unwrap();
@@ -164,6 +165,11 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
                 StatusCode::OK,
             )
             .await;
+            // Keep both collection sizes exactly 1/20: global defaults would
+            // otherwise add seven unrelated Agents to the Project page.
+            sqlx::query("UPDATE agent_identity SET archived_at=?,paused=1,is_default=0,status='offline',version=version+1,updated_at=? WHERE archived_at IS NULL")
+                .bind(db::now_rfc3339()).bind(db::now_rfc3339())
+                .execute(h.state.db.pool()).await.unwrap();
             for n in 0..count {
                 let agent: api_types::AgentResponse = common::json_request(&h.app,Method::POST,"/api/v1/agents",json!({"name":format!("Agent {n}"),"executor_type":"shell","capabilities":["query-counter"]}),StatusCode::OK).await;
                 if kind == "native" {
@@ -196,7 +202,7 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
                         &*h.state.db,
                         profile,
                         db::SelectAgentProfile {
-                            identity_id: agent.id,
+                            identity_id: agent.id.clone(),
                             profile_id: profile_id.clone(),
                             expected_version: agent.version,
                             updated_at: now,
@@ -206,6 +212,15 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
                     .unwrap();
                     sqlx::query("INSERT INTO agent_connection_health(profile_id,status,updated_at) VALUES (?,'healthy','now')").bind(&profile_id).execute(h.state.db.pool()).await.unwrap();
                 }
+                // Nonempty execution and assignment inputs exercise all of the
+                // shared page reads, rather than only the empty-ledger shortcut.
+                let task = db::new_uuid_v4();
+                sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES (?,?,'Counted task','in_progress','2026-10-01T00:00:00Z','2026-10-01T00:00:01Z')")
+                    .bind(&task).bind(&project.id).execute(h.state.db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES (?,?,'coder','agent',?,'2026-10-01T00:00:00Z','2026-10-01T00:00:01Z')")
+                    .bind(db::new_uuid_v4()).bind(&task).bind(&agent.id).execute(h.state.db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO execution(id,task_id,agent_id,role,status,created_at,updated_at) VALUES (?,?,?,'coder','completed','2026-10-01T00:00:00Z','2026-10-01T00:00:01Z')")
+                    .bind(db::new_uuid_v4()).bind(&task).bind(&agent.id).execute(h.state.db.pool()).await.unwrap();
             }
             for (label, path) in [
                 (
@@ -223,7 +238,60 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
                 } else {
                     body.as_array().unwrap().len()
                 };
+                assert_eq!(size, count, "{kind} {label}");
+                let items = body.get("items").unwrap_or(&body).as_array().unwrap();
+                for item in items {
+                    let id = item["id"].as_str().unwrap();
+                    let agent = db::AgentRepo::get_by_id(&*h.state.db, id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let expected = services::agent_service::compute_effective_status(
+                        &h.state.db,
+                        &agent,
+                        Some(&h.state.daemon_connections),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(item["effective_status"], expected.as_str());
+                    assert_eq!(
+                        item["active_assigned_task_count"],
+                        db::AgentRepo::count_active_assigned_tasks(&*h.state.db, id)
+                            .await
+                            .unwrap()
+                    );
+                }
                 let (warm, _) = measured_get(&h.app, &queries, &path).await;
+                for (component, needle, expected) in [
+                    (
+                        "usage and statistics headers",
+                        "SELECT * FROM usage_ledger_revision WHERE id = 1",
+                        2,
+                    ),
+                    ("assignments", "workflow_states AS MATERIALIZED", 1),
+                    (
+                        "effective status and reservations",
+                        "AS credential_enabled",
+                        1,
+                    ),
+                ] {
+                    assert_eq!(
+                        warm.iter().filter(|sql| sql.contains(needle)).count(),
+                        expected,
+                        "{component} must be batched: {warm:?}"
+                    );
+                }
+                assert!(
+                    !warm.iter().any(|sql| sql.contains("FROM usage_event")
+                        || sql.contains("FROM usage_invocation")
+                        || sql.contains("AVG(CASE WHEN")
+                        || sql.contains("COUNT(*) FROM execution WHERE agent_id = ?")),
+                    "warm page must not reread historical ledger/stats: {warm:?}"
+                );
+                agent_counts
+                    .entry((kind, label))
+                    .or_default()
+                    .push(warm.len());
                 let fits = warm
                     .iter()
                     .filter(|sql| {
@@ -254,6 +322,11 @@ async fn project_and_agent_list_environment_queries_are_bounded_by_page_not_rows
             );
             }
         }
+    }
+    for ((kind, route), counts) in agent_counts {
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0], counts[1],
+            "{kind} {route}: usage, stats, assignments and placement statements must not grow per Agent");
     }
     for (mode, by_size) in counts {
         assert!(by_size[0].0 > 0, "counter must capture SQL");
