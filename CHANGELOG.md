@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- `POST /api/v1/projects/{id}/environment/recheck` accepts an optional
+  `machine` (`server` or a daemon runtime id) and returns
+  `{ machines: [{ machine, checks, error }], project }`; it used to return
+  `{ checks, project }`. Without `machine` it checks every machine the
+  Project has a repository on. `forge-ctl project env-recheck` prints results
+  per machine.
+- Project `environment_pause` now includes the `machine` the pause refers to.
 - Every machine (the server host and each daemon) now has a cap on concurrent
   runs, and the default is no longer unlimited: half the machine's logical
   cores, never less than 2. A run is a Running Task execution, a workspace
@@ -179,6 +186,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- An administrator can clear an Agent's machine pin by sending
+  `daemon_id: null` in the Agent update, or with "Clear pin" on the Agent
+  page, which names the pinned machine. Omitting `daemon_id` leaves the pin
+  unchanged.
 - Planner, coder and worker executions now run on daemon-owned workspaces.
   Until now only reviewer and interactive runs worked there: a coder or
   worker on an existing workspace was never started and showed no reason,
@@ -384,6 +395,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Per-machine environment readiness is visible.
+  - Project responses carry `environment_readiness`: one entry per machine
+    with its status (`ready`, `not_ready`, `unknown`), the failing checks and
+    the last and next check times.
+  - Project settings, Environment tab: a readiness table with "Check now"
+    for each machine.
+  - `forge-ctl project env-status <project>` and
+    `forge-ctl project env-recheck <project> --machine <id>`.
+  - Task responses carry `placement_diagnostics`, and the Task page shows why
+    a Task is waiting for a machine: the machine, the failing checks, a
+    pending probe, or machine capacity.
+  - Agent responses carry `runnable_on`: the machines that have the Agent's
+    executor (administrators see the machines; other users see a count). The
+    Agents page shows it, and "Cannot run" when there is none.
 - Machine run caps.
   - Server host: `server.max_concurrent_runs` in the config file,
     `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
