@@ -1117,3 +1117,146 @@ fn run_git(path: &Path, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
+
+#[tokio::test]
+async fn single_machine_environment_recheck_resumes_task_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = common::setup_git_repo(root.path());
+    let harness = test_app(root.path()).await;
+    let (project_id, repo_id) =
+        common::create_project_and_repo(&harness.app, "Environment smoke", &repo).await;
+    let (agent_id, _) =
+        common::create_shell_agents(&harness.app, root.path(), "environment-smoke").await;
+    let agent: AgentResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agents/{agent_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent.id,
+        &agent.id,
+    )
+    .await;
+    let project = db::ProjectRepo::get_by_id(&*harness.state.db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings: Value = serde_json::from_str(&project.settings).unwrap();
+    settings["environment"] = json!({"checks":[{"name":"disk","command":"test -f recovered"}]});
+    db::ProjectRepo::update_at_version(
+        &*harness.state.db,
+        db::UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(settings.to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: db::now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
+    let task: TaskResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{project_id}/tasks"), json!({"title":"Environment smoke","description":"sleep 3","role_assignments":[{"role_name":"coder","assignee_type":"agent","assignee_id":agent.id}]}), StatusCode::OK).await;
+    // Direct claim reaches preflight on an unknown host, as in the single-machine base.
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let paused = db::ProjectRepo::get_by_id(&*harness.state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if paused.system_pause_reason.as_deref() == Some("environment_not_ready") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "environment did not pause"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let before = db::ExecutionRepo::list_by_task(
+        &*harness.state.db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 20,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(before.items.len(), 1);
+    assert_eq!(before.items[0].status, db::ExecutionStatus::Failed);
+    // Restore the same host's primary checkout and existing Task workspace.
+    std::fs::write(repo.join("recovered"), "ready").unwrap();
+    let workspace = db::WorkspaceRepo::get_by_task_id(&*harness.state.db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let placement =
+        db::WorkspacePlacementRepo::get_by_workspace_id(&*harness.state.db, &workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+    std::fs::write(
+        std::path::Path::new(placement.workspace_handle.as_deref().unwrap()).join("recovered"),
+        "ready",
+    )
+    .unwrap();
+    let checked: api_types::ProjectEnvironmentRecheckResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/environment/recheck"),
+        json!({"machine":"server"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(!checked.project.paused);
+    assert!(checked.machines[0].checks[0].passed);
+    let dispatcher = services::TaskDispatcher::new(
+        harness.state.db.clone(),
+        harness.event_bus.clone(),
+        harness.state.task_service.clone(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        dispatcher.check_once().await.unwrap();
+        let executions = db::ExecutionRepo::list_by_task(
+            &*harness.state.db,
+            &task.id,
+            db::PageRequest {
+                cursor: None,
+                limit: 20,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await
+        .unwrap();
+        if executions.items.len() > 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task did not re-dispatch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

@@ -212,6 +212,7 @@ async fn seed_daemon(db: &db::SqliteDb, machine_id: &str) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: machine_id.to_owned(),
             hostname: "test-host".to_owned(),
@@ -449,7 +450,7 @@ async fn daemon_transport_registry_timeout_returns_daemon_timeout() {
 }
 
 #[tokio::test]
-async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
+async fn below_minimum_handshake_is_visible_upgrade_refusal() {
     let registry = make_registry();
     let (connection, mut outbound) = DaemonConnection::new("daemon-incompatible".to_owned());
     let connection_id = connection.id();
@@ -472,15 +473,15 @@ async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
         panic!("expected protocol rejection error");
     };
     assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
-    assert!(!registry.is_connected("daemon-incompatible"));
+    assert!(registry.is_connected("daemon-incompatible"));
+    assert!(registry.get("daemon-incompatible").unwrap().needs_upgrade());
 
     let result: Result<TestResponse, ServiceError> = registry
         .send_request("daemon-incompatible", "execution.start", json!({}), 1)
         .await;
     assert!(matches!(
         result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+        Err(ServiceError::DaemonUpgradeRequired { daemon_id }) if daemon_id == "daemon-incompatible"
     ));
 }
 
@@ -933,8 +934,8 @@ async fn connection_snapshot_retains_handshake_facts_only_for_current_incarnatio
     let (connection, _outbound) = DaemonConnection::new("snapshot-owner".to_owned());
     let first_id = connection.id();
     registry.register("snapshot-owner".to_owned(), connection.clone());
-    let handshake = json!({"protocol_revision": 3,
-        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+    let handshake = json!({"protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+        "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],
         "executor_capabilities": {"codex": {"resume": true, "usage": true}},
         "workspace_run_policy": {"allowed_purposes": ["ci_step", "hook"]}});
     registry.dispatch_incoming_for_connection(

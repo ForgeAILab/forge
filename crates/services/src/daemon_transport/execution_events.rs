@@ -1345,6 +1345,7 @@ mod tests {
             db::DaemonRepo::upsert_by_machine_id(
                 &*db,
                 db::UpsertDaemon {
+                    max_concurrent_runs: None,
                     id: daemon_id.to_owned(),
                     machine_id: daemon_id.to_owned(),
                     hostname: "terminal-owner".into(),

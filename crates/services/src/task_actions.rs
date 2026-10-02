@@ -429,7 +429,72 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         );
         return offers;
     }
+    let decision_ready = awaiting_human
+        || (state.kind == StateKind::Active
+            && latest.is_some_and(|execution| execution.status == ExecutionStatus::Completed))
+        || (task.status == "review"
+            && (manual_review_candidate || target(WorkflowTrigger::Accept).is_some()))
+        || (task.status == "planning" && snapshot.planning_approval_ready);
+    let placement_wait = condition.is_none()
+        && (queued
+            || (snapshot.project_paused && !decision_ready)
+            || metadata.get("environment_wait").is_some()
+            || metadata.get("deferred_dispatch").is_some_and(|deferred| {
+                deferred["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("environment_"))
+            })
+            || crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(
+                |disposition| {
+                    matches!(
+                        disposition.capability.as_str(),
+                        "machine_capacity" | "project_capacity"
+                    )
+                },
+            ));
+    if placement_wait {
+        offer(
+            TaskAction::Hold { reason: None },
+            &[],
+            &[Owner],
+            "dispatch_wait",
+            "Hold Task",
+        );
+        return offers;
+    }
     if barrier_running || queued {
+        return offers;
+    }
+    if condition == Some(FailureKind::DispatchFailed)
+        && metadata["placement_refusal"]["annotation"]
+            == task
+                .error_annotation
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .unwrap_or_default()
+        && metadata.get("placement_refusal").is_some()
+    {
+        offer(
+            TaskAction::retry(),
+            &[],
+            &[Owner],
+            "placement_retry",
+            "Retry Placement",
+        );
+        if workflow
+            .states
+            .iter()
+            .any(|state| state.kind == StateKind::Initial)
+        {
+            offer(
+                TaskAction::Restart { reason: None },
+                &[],
+                &[Owner, ProjectAgent],
+                "interrupted_restart",
+                "Restart Task",
+            );
+        }
+        append_owner_advance(snapshot, &mut offers);
         return offers;
     }
     if held {
@@ -1207,7 +1272,7 @@ pub async fn load_snapshot(
             })
             .next()
     });
-    let action_agent_id = select_action_agent(db, &task, selected_role).await?;
+    let action_agent_id = select_action_agent(db, &task, selected_role, connections).await?;
     let has_agent = action_agent_id.is_some();
     let project_paused = db::ProjectRepo::get_by_id(db, &task.project_id)
         .await?
@@ -1218,18 +1283,25 @@ pub async fn load_snapshot(
             executions.push(execution);
         }
     }
-    let owner_supports_resume =
-        owner_supports_resume(db, &task, &executions, role, &workflow, connections).await?;
+    let placement = db::WorkspacePlacementRepo::get_for_task(db, &task.id).await?;
+    let owner_supports_resume = owner_supports_resume(
+        db,
+        &task,
+        &executions,
+        role,
+        &workflow,
+        placement.as_ref(),
+        connections,
+    )
+    .await?;
     let coordination_root =
         crate::task_hierarchy::coordination_root_has_subtasks(db, &task).await?;
-    let owner_disconnected = db::WorkspacePlacementRepo::get_for_task(db, &task.id)
-        .await?
-        .is_some_and(|placement| {
-            placement.state == db::PlacementState::Disconnected
-                || (placement.state == db::PlacementState::Failed
-                    && placement.failure_cause
-                        == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout))
-        });
+    let owner_disconnected = placement.as_ref().is_some_and(|placement| {
+        placement.state == db::PlacementState::Disconnected
+            || (placement.state == db::PlacementState::Failed
+                && placement.failure_cause
+                    == Some(db::PlacementFailureCause::OwnerDisconnectedTimeout))
+    });
     let planning_approval_ready = if task.status != "planning" {
         true
     } else {
@@ -1330,6 +1402,7 @@ async fn select_action_agent(
     db: &db::SqliteDb,
     task: &Task,
     role: Option<&str>,
+    connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> crate::Result<Option<String>> {
     use db::{AgentRepo, ExecutionRepo};
     let pinned = if let Some(role) = role {
@@ -1364,7 +1437,9 @@ async fn select_action_agent(
         let Some(agent) = AgentRepo::get_by_id(db, &id).await? else {
             return Ok(None);
         };
-        return Ok(action_agent_available(db, &agent).await?.then_some(id));
+        return Ok(action_agent_available(db, &agent, connections)
+            .await?
+            .then_some(id));
     }
     let agents = AgentRepo::list(
         db,
@@ -1387,7 +1462,7 @@ async fn select_action_agent(
         for agent in &agents {
             if (!require_default || agent.is_default)
                 && (agent.executor_type != "gemini" || agent.credential_ref.is_some())
-                && action_agent_available(db, agent).await?
+                && action_agent_available(db, agent, connections).await?
             {
                 return Ok(Some(agent.id.clone()));
             }
@@ -1396,10 +1471,14 @@ async fn select_action_agent(
     Ok(None)
 }
 
-async fn action_agent_available(db: &db::SqliteDb, agent: &db::Agent) -> crate::Result<bool> {
+async fn action_agent_available(
+    db: &db::SqliteDb,
+    agent: &db::Agent,
+    connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
+) -> crate::Result<bool> {
     Ok(agent.status != db::AgentStatus::Offline
         && matches!(
-            crate::agent_service::compute_effective_status(db, agent, None).await?,
+            crate::agent_service::compute_effective_status(db, agent, connections).await?,
             crate::agent_service::EffectiveStatus::Active
                 | crate::agent_service::EffectiveStatus::Busy
         ))
@@ -1411,6 +1490,7 @@ async fn owner_supports_resume(
     executions: &[Execution],
     role: Option<&str>,
     workflow: &WorkflowDefinition,
+    placement: Option<&db::WorkspacePlacement>,
     connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> crate::Result<bool> {
     let logical_thread = workflow
@@ -1422,7 +1502,7 @@ async fn owner_supports_resume(
             dispatch.execution_policy
                 == Some(api_types::WorkflowExecutionPolicy::ResumeLatestTargetRoleThread)
         });
-    let Some(placement) = db::WorkspacePlacementRepo::get_for_task(db, &task.id).await? else {
+    let Some(placement) = placement else {
         return Ok(true);
     };
     let Some(execution_id) = task
@@ -1450,7 +1530,10 @@ async fn owner_supports_resume(
     else {
         return Ok(false);
     };
-    let Some(execution) = db::ExecutionRepo::get_by_id(db, &execution_id).await? else {
+    let Some(execution) = executions
+        .iter()
+        .find(|execution| execution.id == execution_id)
+    else {
         return Ok(false);
     };
     if (!logical_thread && execution.agent_session_id.is_none()) || execution.task_id != task.id {
@@ -1525,6 +1608,13 @@ async fn owner_supports_resume(
         })
         .is_some_and(|capabilities| capabilities.resume))
 }
+#[cfg(test)]
+pub(crate) fn action_test_evidence_dir() -> std::path::PathBuf {
+    std::env::var_os("FORGE_TASK_ACTION_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("forge-task-actions"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2020,11 +2110,9 @@ mod condition_matrix {
                 }
             }
         }
-        std::fs::create_dir_all(std::env::temp_dir().join("task-actions-fixA")).unwrap();
+        std::fs::create_dir_all(action_test_evidence_dir()).unwrap();
         std::fs::write(
-            std::env::temp_dir()
-                .join("task-actions-fixA")
-                .join("pure-matrix-full.tsv"),
+            action_test_evidence_dir().join("pure-matrix-full.tsv"),
             full,
         )
         .unwrap();
@@ -2054,12 +2142,6 @@ mod condition_matrix {
                 );
             }
         }
-        std::fs::write(
-            std::env::temp_dir()
-                .join("task-actions-fixA")
-                .join("pure-matrix-dead.tsv"),
-            out,
-        )
-        .unwrap();
+        std::fs::write(action_test_evidence_dir().join("pure-matrix-dead.tsv"), out).unwrap();
     }
 }

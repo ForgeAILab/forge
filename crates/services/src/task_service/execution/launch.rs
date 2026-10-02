@@ -26,16 +26,18 @@ impl TaskService {
             .ok_or_else(|| ServiceError::invalid_operation("retry state no longer exists"))?;
         let dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
         let selection = effective_prompt_selection(role, None, dispatch.as_ref());
-        let context = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role,
-            &task.status,
-            state.config.clone(),
-            Some(selection.execution_policy.as_str()),
-            workflow,
-        )
-        .await?;
+        let context =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role,
+                state_name: &task.status,
+                state_config: state.config.clone(),
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
         let mut admission = crate::task_service::execution_admission_for_task(
             &self.db,
             task,
@@ -97,16 +99,18 @@ impl TaskService {
         };
         let selection =
             effective_prompt_selection(role, trigger_dispatch.as_ref(), state_dispatch.as_ref());
-        let context = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role,
-            &task.status,
-            state.config.clone(),
-            Some(selection.execution_policy.as_str()),
-            workflow,
-        )
-        .await?;
+        let context =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role,
+                state_name: &task.status,
+                state_config: state.config.clone(),
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
         let (prompt, _) =
             build_effective_prompt(&context, trigger_dispatch.as_ref(), state_dispatch.as_ref());
         let guidance = match action {
@@ -978,13 +982,16 @@ impl TaskService {
             dispatch_intent_from_workflow_dispatch(state.and_then(|state| state.dispatch.as_ref()));
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
         let dispatch_ctx = match load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &task.status,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            &workflow,
+            crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role: role_name,
+                state_name: &task.status,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow: &workflow,
+            },
         )
         .await
         {
@@ -1429,11 +1436,10 @@ impl TaskService {
 }
 
 fn stop_execution_role_matches(execution_role: &str, current_role: Option<&str>) -> bool {
-    // Interactive executions are deliberately outside the workflow role
-    // contract, but still belong to the current Task state. Their manual-stop
-    // annotation must survive a concurrent Task write just like a role run.
+    // A side session has its own stop resource and does not interrupt the
+    // workflow, whether or not a workflow execution currently runs beside it.
     if execution_role == crate::workflow::default_roles::INTERACTIVE {
-        return current_role.is_some();
+        return false;
     }
     current_role.is_some_and(|role| {
         execution_role == role

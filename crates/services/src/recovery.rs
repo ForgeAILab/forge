@@ -3395,6 +3395,7 @@ pub(crate) mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),
@@ -4965,6 +4966,7 @@ pub(crate) mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: machine_id.to_owned(),
                 hostname: "test-host".to_owned(),
@@ -5306,6 +5308,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),
@@ -5351,6 +5354,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),
@@ -5401,6 +5405,7 @@ pub(crate) mod tests {
             .ingest_report(
                 &daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: None,
                     detected_clis: vec![DetectedCliInput {
                         kind: "shell".to_owned(),
                         availability: "authenticated".to_owned(),
@@ -5795,8 +5800,8 @@ pub(crate) mod tests {
         registry.register(daemon_id.to_owned(), connection);
         registry.dispatch_incoming_for_connection(daemon_id, id, api_types::DaemonFrame::Notification {
             method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
-            params: json!({"protocol_revision": 3,
-                "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1"],
+            params: json!({"protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+                "capabilities": [api_types::DAEMON_CAPABILITY_USAGE_REPORTS, api_types::DAEMON_CAPABILITY_JOURNAL_ACK, "workspace.v1", api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],
                 "executor_capabilities": {"shell": {"resume": resume}}, "workspace_run_policy": {"allowed_purposes": ["ci_step"]}}),
         });
         (id, outbound)
@@ -6950,6 +6955,12 @@ pub(crate) mod tests {
     async fn daemon_owned_workspace_resume_requires_current_online_owner_capability() {
         let db = Arc::new(sqlite_db().await);
         let (_, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE daemon SET detected_clis_json = ? WHERE id = ?")
+            .bind(json!([{"kind":"shell","availability":"authenticated"}]).to_string())
+            .bind(placement.daemon_id.as_deref().unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
         let bus = Arc::new(EventBus::new(16));
         fail_owned_execution(

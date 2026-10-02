@@ -5,6 +5,8 @@ mod error;
 mod file;
 mod jwt_secret;
 mod loader;
+mod machine_capacity;
+pub use machine_capacity::{automatic_run_cap_for_cores, embedded_machine_id, resolved_run_cap};
 mod path;
 mod runtime;
 #[cfg(test)]

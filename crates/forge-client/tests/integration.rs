@@ -268,6 +268,7 @@ async fn create_project_route(
 ) -> Json<ProjectResponse> {
     let mut data = state.inner.lock().expect("lock test state");
     let project = ProjectResponse {
+        environment_readiness: vec![],
         id: data.next_id("project"),
         name: request.name,
         settings: request.settings.unwrap_or_else(|| serde_json::json!({})),
@@ -420,6 +421,7 @@ async fn create_agent_route(
 ) -> Json<AgentResponse> {
     let mut data = state.inner.lock().expect("lock test state");
     Json(AgentResponse {
+        runnable_on: Default::default(),
         id: data.next_id("agent"),
         name: request.name,
         description: request.description,
@@ -550,6 +552,7 @@ fn task_response(
     status: &str,
 ) -> TaskResponse {
     TaskResponse {
+        placement_diagnostics: vec![],
         id,
         project_id,
         parent_task_id: None,
@@ -685,6 +688,9 @@ fn canonical_phase_for_status(status: &str) -> CanonicalPhase {
 
 fn daemon_response() -> DaemonResponse {
     DaemonResponse {
+        max_concurrent_runs: None,
+        run_limit: None,
+        effective_max_concurrent_runs: None,
         id: "daemon-1".to_owned(),
         machine_id: "machine-daemon-1".to_owned(),
         hostname: "test-host".to_owned(),

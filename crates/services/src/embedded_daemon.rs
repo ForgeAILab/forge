@@ -31,6 +31,7 @@ const TEMP_FILE_ATTEMPTS: usize = 8;
 
 #[derive(Clone)]
 pub struct EmbeddedDaemon {
+    server_run_cap: Arc<db::machine_capacity::MachineRunCap>,
     service: DaemonService,
     adapter_registry: Arc<AdapterRegistry>,
     forge_home: PathBuf,
@@ -73,6 +74,7 @@ impl EmbeddedDaemon {
         report_interval: Duration,
     ) -> Self {
         Self {
+            server_run_cap: Arc::clone(&db.server_run_cap),
             service: DaemonService::new(db, event_bus),
             adapter_registry,
             forge_home,
@@ -116,6 +118,7 @@ impl EmbeddedDaemon {
             .ingest_report(
                 &credentials.daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: Some(self.server_run_cap.effective().unwrap_or(0) as u32),
                     detected_clis,
                     runtimes,
                     labels: None,
@@ -186,6 +189,7 @@ impl EmbeddedDaemon {
     fn registration_input(&self) -> DaemonRegisterInput {
         let hostname = local_hostname();
         DaemonRegisterInput {
+            max_concurrent_runs: Some(self.server_run_cap.effective().unwrap_or(0) as u32),
             machine_id: embedded_machine_id(),
             hostname,
             os: std::env::consts::OS.to_owned(),
@@ -231,12 +235,7 @@ impl EmbeddedDaemon {
 }
 
 pub fn embedded_machine_id() -> String {
-    format!(
-        "embedded:{}:{}:{}",
-        local_hostname(),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    config::embedded_machine_id()
 }
 
 pub fn is_embedded_daemon_machine(machine_id: &str) -> bool {

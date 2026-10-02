@@ -27,15 +27,16 @@ import type {
   ErrorResponse,
 } from '@/types/generated'
 import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
-import type { ProjectEnvironmentCheckResult } from '@/types/generated/bindings/ProjectEnvironmentCheckResult'
+import type { MachineEnvironmentRecheckResult } from '@/types/generated/bindings/MachineEnvironmentRecheckResult'
 import { refreshAccess, RefreshUnavailableError, useAuthStore } from '@/stores/auth'
 
 const API_BASE = '/api/v1'
 
-export function recheckProjectEnvironment(projectId: string) {
-  return apiFetch<{ checks: ProjectEnvironmentCheckResult[]; project: Project }>(
+export function recheckProjectEnvironment(input: { projectId: string; machine?: string }) {
+  const { projectId, machine } = input
+  return apiFetch<{ machines: MachineEnvironmentRecheckResult[]; project: Project }>(
     `/projects/${projectId}/environment/recheck`,
-    { method: 'POST', body: JSON.stringify({}) },
+    { method: 'POST', body: JSON.stringify({ machine }) },
   )
 }
 

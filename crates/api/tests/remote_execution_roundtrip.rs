@@ -750,6 +750,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
             retry_at: Some(retry_at),
             resolved_candidate: None,

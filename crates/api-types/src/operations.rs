@@ -135,8 +135,9 @@ pub struct DaemonIssueSummary {
 pub struct DaemonPressureSummary {
     pub daemon_id: String,
     pub hostname: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: Option<u32>,
+    pub active_runs: u32,
+    #[ts(type = "number | null")]
+    pub max_concurrent_runs: Option<i64>,
     pub at_capacity: bool,
 }
 
@@ -146,8 +147,8 @@ pub struct AgentPressureSummary {
     pub agent_id: String,
     pub agent_name: String,
     pub daemon_id: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: u32,
+    pub active_tasks: u32,
+    pub max_concurrent_tasks: u32,
     pub at_capacity: bool,
 }
 

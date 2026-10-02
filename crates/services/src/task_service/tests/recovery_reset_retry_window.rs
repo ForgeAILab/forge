@@ -492,7 +492,7 @@ async fn test_continue_task_process_moves_failed_review_back_to_in_progress() {
         &task.id,
         &execution.id,
         1,
-        json!({ "ci_steps": [{"command": "cargo test", "exit_code": 1}] }),
+        json!({ "ci_steps": [{"index":0,"command":"cargo test","exit_code":1,"stderr_tail":"validation failed"}] }),
     )
     .await;
 

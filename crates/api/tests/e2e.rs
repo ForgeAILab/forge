@@ -699,6 +699,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::upsert_by_machine_id(
         &db_instance,
         db::UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
@@ -719,6 +720,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::update_report(
         &db_instance,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             last_report_at: now.clone(),
             status: db::DaemonStatus::Online,

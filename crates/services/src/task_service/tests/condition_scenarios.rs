@@ -740,11 +740,9 @@ async fn condition_queue_scenarios() {
             .iter()
             .any(|offer| offer.action.verb() != "cancel"));
     }
-    std::fs::create_dir_all(std::env::temp_dir().join("task-actions-fixA")).unwrap();
+    std::fs::create_dir_all(crate::task_actions::action_test_evidence_dir()).unwrap();
     std::fs::write(
-        std::env::temp_dir()
-            .join("task-actions-fixA")
-            .join("scenarios-queue.txt"),
+        crate::task_actions::action_test_evidence_dir().join("scenarios-queue.txt"),
         out,
     )
     .unwrap();
@@ -1049,9 +1047,7 @@ async fn condition_stored_data_scenarios() {
     }
 
     std::fs::write(
-        std::env::temp_dir()
-            .join("task-actions-fixA")
-            .join("scenarios-stored.txt"),
+        crate::task_actions::action_test_evidence_dir().join("scenarios-stored.txt"),
         out,
     )
     .unwrap();
@@ -1194,9 +1190,7 @@ async fn condition_send_back_prompt_scenarios() {
         }
     }
     std::fs::write(
-        std::env::temp_dir()
-            .join("task-actions-fixA")
-            .join("scenarios-sendback.txt"),
+        crate::task_actions::action_test_evidence_dir().join("scenarios-sendback.txt"),
         out,
     )
     .unwrap();

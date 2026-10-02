@@ -389,7 +389,14 @@ async fn open_interactive_targets_current_role_resumable_session_not_newest_revi
     )
     .await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
-    let task = create_task(&harness, &project_id, "role-aware interactive target").await;
+    let task = create_task_with_role(
+        &harness,
+        &project_id,
+        "role-aware interactive target",
+        "coder",
+        &agent_id,
+    )
+    .await;
     let task = TaskRepo::update_status(
         &*harness.state.db,
         db::UpdateTaskStatus {
@@ -681,6 +688,11 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
     let workspace_root = common::TestDir::new("ec-blocked-actions");
     let harness = common::test_app(workspace_root.path(), "execution-controls-blocked").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    sqlx::query("UPDATE agent_identity SET paused = 0 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let task = create_task_with_role(
         &harness,
         &project_id,
@@ -772,15 +784,15 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
     )
     .await;
     let actions = task
-        .get("execution_actions")
+        .get("available_actions")
         .and_then(Value::as_array)
-        .expect("task includes execution actions");
+        .expect("task includes available offers");
     let retry = actions
         .iter()
         .find(|offer| offer["action"]["verb"] == "retry")
         .expect("budget retry offer");
     assert_eq!(retry["action"]["reset_budget"], true);
-    assert_eq!(retry["reason"], "execution_retry_exhausted");
+    assert_eq!(retry["reason"], "retry_budget_exhausted");
     assert!(retry["parameters"]
         .as_array()
         .unwrap()
@@ -1048,14 +1060,29 @@ async fn assert_task_list_diagnostics_match(
         .iter()
         .find(|item| item["id"] == task["id"])
         .unwrap();
-    for field in [
-        "workflow_health",
-        "workflow_exception",
-        "remaining_retries",
-        "role_assignments",
-    ] {
+    for field in ["workflow_health", "remaining_retries", "role_assignments"] {
         assert_eq!(listed[field], task[field], "list/detail agree on {field}");
     }
+    let mut listed_exception = listed["workflow_exception"].clone();
+    let mut detail_exception = task["workflow_exception"].clone();
+    if let Some(exception) = listed_exception.as_object_mut() {
+        assert_eq!(
+            exception.remove("actions"),
+            Some(json!([])),
+            "list rows omit offers"
+        );
+    }
+    if let Some(exception) = detail_exception.as_object_mut() {
+        assert_eq!(
+            exception.remove("actions"),
+            Some(task["available_actions"].clone()),
+            "detail diagnostics use the shared live offers"
+        );
+    }
+    assert_eq!(
+        listed_exception, detail_exception,
+        "list/detail diagnostic facts agree"
+    );
     assert_eq!(
         listed["execution_observability"]["latest_execution_id"],
         task["execution_observability"]["latest_execution_id"]

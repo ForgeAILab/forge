@@ -3508,7 +3508,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "execution_failed" => AttentionCategory::ExecutionFailed,
         "delivery_followup" => AttentionCategory::DeliveryFollowup,
         "decision_recorded" => AttentionCategory::DecisionRecorded,
-        "runtime_offline" => AttentionCategory::RuntimeOffline,
+        "runtime_offline" | "environment_not_ready" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
         other => {

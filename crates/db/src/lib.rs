@@ -3,8 +3,10 @@
 mod agent_chat_topic_repository;
 mod chat_session_denials;
 mod connection;
+mod environment_readiness;
 mod error;
 mod ids;
+pub mod machine_capacity;
 mod migration;
 mod models;
 mod orchestration;
@@ -28,6 +30,7 @@ pub use connection::{
     begin_immediate, convert_sqlite_to_incremental, create_sqlite_pool, incremental_vacuum,
     sqlite_storage_status,
 };
+pub use environment_readiness::*;
 pub use error::{DbError, Result};
 pub use ids::{new_uuid_v4, validate_uuid_v4};
 pub use migration::{run_migrations, run_migrations_from};

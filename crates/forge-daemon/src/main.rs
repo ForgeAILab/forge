@@ -29,6 +29,9 @@ const DEFAULT_LOG_FILTER: &str =
 #[derive(Parser)]
 #[command(name = "forge-daemon", about = "Forge standalone remote daemon")]
 struct Cli {
+    /// Maximum concurrent runs (default: automatic; 0: unlimited).
+    #[arg(long)]
+    max_concurrent_runs: Option<u32>,
     /// Forge server URL, for example https://forge.example.com.
     #[arg(long)]
     server: String,
@@ -77,8 +80,9 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| credentials::default_path(&cli.server));
     let owner_token = resolve_owner_token(cli.token.as_deref());
-    let run_policy =
-        forge_client::daemon_config::DaemonConfig::load(&credentials_path)?.run_policy();
+    let daemon_config = forge_client::daemon_config::DaemonConfig::load(&credentials_path)?;
+    let run_policy = daemon_config.run_policy();
+    let max_concurrent_runs = daemon_config.run_cap(cli.max_concurrent_runs);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -94,6 +98,7 @@ async fn main() -> Result<()> {
         &machine_id,
         &hostname,
         &labels,
+        max_concurrent_runs,
         owner_token.as_deref(),
         shutdown_rx.clone(),
     )
@@ -110,6 +115,7 @@ async fn main() -> Result<()> {
         Arc::clone(&client),
         workspace_root.clone(),
         labels.clone(),
+        max_concurrent_runs,
         cli.interval_seconds,
         active_executions.clone(),
         shutdown_rx.clone(),
@@ -156,6 +162,7 @@ async fn register_or_load_credentials(
     machine_id: &str,
     hostname: &str,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     owner_token: Option<&str>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<Option<DaemonCredentials>> {
@@ -169,6 +176,7 @@ async fn register_or_load_credentials(
                 client,
                 workspace_root,
                 labels,
+                max_concurrent_runs,
                 &forge_client::daemon_runtime::ActiveExecutionTracker::default(),
             )
             .await
@@ -208,7 +216,13 @@ async fn register_or_load_credentials(
             return Ok(None);
         }
 
-        let request = registration_request(machine_id, hostname, workspace_root, labels);
+        let request = registration_request(
+            machine_id,
+            hostname,
+            workspace_root,
+            labels,
+            max_concurrent_runs,
+        );
         tokio::select! {
             result = register_with_retry(client, &request, owner_token) => {
                 match result {
@@ -257,8 +271,10 @@ fn registration_request(
     hostname: &str,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
 ) -> DaemonRegisterRequest {
     DaemonRegisterRequest {
+        max_concurrent_runs: Some(max_concurrent_runs),
         machine_id: machine_id.to_owned(),
         hostname: hostname.to_owned(),
         os: std::env::consts::OS.to_owned(),

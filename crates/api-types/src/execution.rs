@@ -189,6 +189,8 @@ pub enum EffectiveCoderSource {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskResponse {
+    #[serde(default)]
+    pub placement_diagnostics: Vec<TaskPlacementDiagnostic>,
     pub id: String,
     pub project_id: String,
     pub parent_task_id: Option<String>,
@@ -405,6 +407,16 @@ pub struct TaskExecutionObservability {
     pub total_runtime_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
+#[ts(export)]
+pub struct AgentRunnableOn {
+    pub count: u32,
+    /// Present only for admins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub machines: Option<Vec<crate::MachineIdentity>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct AgentResponse {
@@ -424,6 +436,8 @@ pub struct AgentResponse {
     pub config_json: Value,
     pub credential_handle_id: Option<String>,
     pub daemon_id: Option<String>,
+    #[serde(default)]
+    pub runnable_on: AgentRunnableOn,
     pub max_concurrent_tasks: i64,
     pub status: AgentStatus,
     /// Assigned workload; see `Agent::active_assigned_task_count`.
@@ -445,6 +459,9 @@ pub struct AgentResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonResponse {
+    pub max_concurrent_runs: Option<i64>,
+    pub run_limit: Option<u32>,
+    pub effective_max_concurrent_runs: Option<i64>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -473,6 +490,8 @@ pub struct DetectedCli {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonRegisterRequest {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
     pub machine_id: String,
     pub hostname: String,
     pub os: String,
@@ -490,6 +509,8 @@ pub struct DaemonRegisterResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonReportRequest {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
     pub detected_clis: Vec<DetectedCli>,
     pub runtimes: Option<Vec<RuntimeReport>>,
     pub labels: Option<Value>,
@@ -605,4 +626,27 @@ pub fn task_action_schema() -> serde_json::Value {
     variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string","minLength":1}}, "required":["verb","guidance"], "additionalProperties":false}));
     variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb","override"], "additionalProperties":false}));
     json!({"oneOf":variants})
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub struct UpdateDaemonRequest {
+    #[ts(type = "number")]
+    pub version: i64,
+    #[serde(deserialize_with = "deserialize_nullable_run_limit")]
+    pub run_limit: Option<u32>,
+}
+
+fn deserialize_nullable_run_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error> {
+    Option::<u32>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskPlacementDiagnostic {
+    pub machine: Option<crate::MachineIdentity>,
+    pub filter_codes: Vec<String>,
+    pub failing_checks: Vec<String>,
 }

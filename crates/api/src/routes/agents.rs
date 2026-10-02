@@ -109,14 +109,22 @@ pub async fn list_agents(
     )
     .await?;
     let has_more = page.next_cursor.is_some();
+    let mut runnable = services::environment_surfaces::runnable_on_for_agents(
+        &state.db,
+        &page.items,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        user.is_admin,
+    )
+    .await?;
     let mut items = Vec::with_capacity(page.items.len());
     for agent in page.items {
         let active_assigned_task_count =
             AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
-        items.push(
-            build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
-                .await?,
-        );
+        let runnable_on = runnable.remove(&agent.id).expect("requested Agent");
+        let response =
+            build_agent_response(&state, agent, Some(active_assigned_task_count)).await?;
+        items.push(agent_response_for_user(response, runnable_on, &user));
     }
     Ok(Json(PaginatedResponse {
         items,
@@ -207,13 +215,7 @@ pub async fn update_agent(
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_manageable(&existing, &user, &id)?;
     validate_agent_config_json(request.config_json.as_ref())?;
-    if !user.is_admin
-        && request
-            .daemon_id
-            .as_ref()
-            .and_then(|id| id.as_ref())
-            .is_some()
-    {
+    if !user.is_admin && request.daemon_id.is_some() {
         return Err(ApiError::forbidden_with_code(
             "admin_required",
             "Admin access required to pin an agent to a daemon",
@@ -498,11 +500,28 @@ async fn build_agent_response_for_user(
     active_assigned_task_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
-    let mut response = build_agent_response(state, agent, active_assigned_task_count).await?;
+    let runnable_on = services::environment_surfaces::runnable_on(
+        &state.db,
+        &agent,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        user.is_admin,
+    )
+    .await?;
+    let response = build_agent_response(state, agent, active_assigned_task_count).await?;
+    Ok(agent_response_for_user(response, runnable_on, user))
+}
+
+fn agent_response_for_user(
+    mut response: AgentResponse,
+    runnable_on: api_types::AgentRunnableOn,
+    user: &AuthenticatedUser,
+) -> AgentResponse {
+    response.runnable_on = runnable_on;
     if !user.is_admin {
         response.daemon_id = None;
     }
-    Ok(response)
+    response
 }
 
 #[derive(Debug, serde::Deserialize)]

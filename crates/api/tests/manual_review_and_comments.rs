@@ -1009,6 +1009,7 @@ async fn seed_codex_agent(db: &db::SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "manual-review-host".to_owned(),
@@ -1029,6 +1030,7 @@ async fn seed_codex_agent(db: &db::SqliteDb) -> String {
     DaemonRepo::update_report(
         db,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#.to_owned(),
             labels_json: None,

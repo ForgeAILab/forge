@@ -730,10 +730,10 @@ async fn audit_outcome_failure_fixture(
     replay_conflict: bool,
     concurrent: bool,
 ) {
-    let database_path = format!(
-        "/Volumes/Data/tmp/forge-coordination-race-{}.sqlite",
-        new_uuid_v4()
-    );
+    let database_path = std::env::temp_dir()
+        .join(format!("forge-coordination-race-{}.sqlite", new_uuid_v4()))
+        .display()
+        .to_string();
     let db = if concurrent {
         let pool = create_sqlite_pool(&format!("sqlite://{database_path}"))
             .await

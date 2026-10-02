@@ -34,6 +34,7 @@ export type ProjectAgentBindingInput = Omit<
 }
 
 export interface FederatedAgent {
+  runnable_on?: import('@/types/generated/bindings/AgentRunnableOn').AgentRunnableOn
   id: string
   name: string
   description: string | null

@@ -5,14 +5,17 @@ use api_types::{
     ReviewConfig, WorkspaceRunPurpose,
 };
 use db::{
-    Agent, PlacementOwnerKind, PlacementSelectedBy, PlacementState, Repo, RepoLocation,
+    Agent, EnvironmentMachine, EnvironmentReadinessStatus, PlacementOwnerKind, PlacementSelectedBy,
+    PlacementState, ProjectMachineReadiness, ProjectMachineReadinessRepo, Repo, RepoLocation,
     RepoLocationKind, RepoLocationOwnerKind, RepoLocationStatus, SqliteDb, Task,
     WorkspacePlacement, WorkspacePlacementRepo,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
 
-use super::capacity::{count_agent_capacity, count_daemon_capacity, AgentCapacity, DaemonCapacity};
+use super::capacity::{
+    count_agent_capacity, count_machine_capacity, AgentCapacity, MachineCapacity,
+};
 use crate::daemon_transport::DaemonConnectionRegistry;
 use crate::Result;
 
@@ -48,6 +51,7 @@ impl ExecutorFacts {
 
 #[derive(Debug, Clone)]
 pub struct PlacementCandidate {
+    pub environment_readiness: Option<ProjectMachineReadiness>,
     pub location: RepoLocation,
     pub execution_daemon_id: Option<String>,
     /// Only this server's registered embedded machine may execute a server
@@ -56,17 +60,29 @@ pub struct PlacementCandidate {
     pub connected: bool,
     pub negotiated_revision: Option<u32>,
     pub workspace_v1: bool,
+    pub plan_transport: bool,
     pub runtime_ready: bool,
     pub visible: bool,
     /// Availability is resolved per Agent, including its owner-scoped enable
     /// policy. Capability facts come from that Agent's executor on this owner.
     pub executors: BTreeMap<String, ExecutorFacts>,
     pub allowed_run_purposes: Vec<WorkspaceRunPurpose>,
-    pub daemon_capacity: Option<DaemonCapacity>,
+    pub machine_capacity: Option<MachineCapacity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentAdmission {
+    Dispatcher,
+    LaunchPreflight,
 }
 
 #[derive(Debug, Clone)]
 pub struct SelectionContext {
+    pub(crate) environment_admission: EnvironmentAdmission,
+    pub(crate) environment_has_assets: bool,
+    /// None means this Project has no checks; no rows or probes are needed.
+    pub environment_digest: Option<String>,
+    pub environment_checks: Vec<api_types::EnvironmentCheck>,
     pub task: Task,
     pub repo: Repo,
     pub claiming_agent: WorktreeAgent,
@@ -79,11 +95,11 @@ pub struct SelectionContext {
 }
 
 impl SelectionContext {
-    fn agents(&self) -> impl Iterator<Item = &WorktreeAgent> {
+    pub(crate) fn agents(&self) -> impl Iterator<Item = &WorktreeAgent> {
         std::iter::once(&self.claiming_agent).chain(self.worktree_agents.iter())
     }
 
-    fn binding(&self) -> Option<&WorkspacePlacement> {
+    pub(crate) fn binding(&self) -> Option<&WorkspacePlacement> {
         self.existing_placement
             .as_ref()
             .filter(|placement| {
@@ -112,14 +128,18 @@ pub enum PlacementFilterCode {
     CapabilityMissing,
     PinMismatch,
     AgentCapacity,
-    DaemonCapacity,
+    MachineCapacity,
     NativeBackendUnsupported,
     RunPurposeDenied,
     NotVisible,
+    EnvironmentNotReady,
+    EnvironmentProbePending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateRejection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing_checks: Vec<String>,
     pub repo_location_id: String,
     pub owner_kind: String,
     pub daemon_id: Option<String>,
@@ -176,6 +196,26 @@ pub struct PlacementUnavailable {
 }
 
 impl PlacementUnavailable {
+    pub fn is_deterministic(&self) -> bool {
+        !self.rejected_candidates.is_empty()
+            && self.rejected_candidates.iter().all(|candidate| {
+                !candidate.filter_codes.is_empty()
+                    && candidate.filter_codes.iter().all(|code| {
+                        // Capacity, reachability and environment readiness all
+                        // change without the Task changing, so a refusal for
+                        // them is retried on the next scan.
+                        !matches!(
+                            code,
+                            PlacementFilterCode::OwnerUnreachable
+                                | PlacementFilterCode::AgentCapacity
+                                | PlacementFilterCode::MachineCapacity
+                                | PlacementFilterCode::EnvironmentProbePending
+                                | PlacementFilterCode::EnvironmentNotReady
+                        )
+                    })
+            })
+    }
+
     pub fn needs_daemon_upgrade(&self) -> bool {
         use PlacementFilterCode::*;
         let upgrade_only = self
@@ -189,7 +229,12 @@ impl PlacementUnavailable {
                 && candidate.filter_codes.iter().all(|code| {
                     matches!(
                         code,
-                        OwnerUnreachable | LocationNotReady | AgentCapacity | DaemonCapacity
+                        OwnerUnreachable
+                            | LocationNotReady
+                            | AgentCapacity
+                            | MachineCapacity
+                            | EnvironmentProbePending
+                            | EnvironmentNotReady
                     ) || (handshake_missing
                         && matches!(
                             code,
@@ -254,6 +299,7 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
             eligible.push(candidate);
         } else {
             rejected_candidates.push(CandidateRejection {
+                failing_checks: applicable_failing_checks(context, candidate),
                 repo_location_id: candidate.location.id.clone(),
                 owner_kind: candidate.location.owner_kind.to_string(),
                 daemon_id: candidate
@@ -356,6 +402,14 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
             },
         )
     };
+    // Unknown readiness does not demote a preferred owner. Wait for its
+    // server probe rather than changing the established placement order.
+    if context.candidates.iter().any(|pending| {
+        filter_candidate(context, pending) == [PlacementFilterCode::EnvironmentProbePending]
+            && preference_key(context, pending) < preference_key(context, candidate)
+    }) {
+        return unavailable();
+    }
     SelectionOutcome::Selected(Box::new(PlacementSelection {
         candidate: candidate.clone(),
         reused_placement,
@@ -365,6 +419,180 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
             rejected_candidates,
         },
     }))
+}
+
+/// Step A probes only the server. Daemon facts come from launch checks:
+/// unknown, missing and stale facts pass at both reserve and claim. Step 3's
+/// machine.probe replaces this one policy function; never probe a Task workspace.
+pub(crate) fn environment_filter(
+    context: &SelectionContext,
+    candidate: &PlacementCandidate,
+) -> Option<PlacementFilterCode> {
+    let digest = context.environment_digest.as_ref()?;
+    let current = candidate
+        .environment_readiness
+        .as_ref()
+        .filter(|row| &row.checks_digest == digest);
+    match current {
+        Some(row) if row.status == EnvironmentReadinessStatus::Ready => None,
+        Some(row)
+            if row.status == EnvironmentReadinessStatus::NotReady
+                && (!context.environment_has_assets
+                    || row.workspace_id.is_some()
+                    || row.role.is_some()) =>
+        {
+            let unnamed_applies = row.failing_checks.is_empty()
+                && row
+                    .role
+                    .as_ref()
+                    .is_none_or(|role| &context.claiming_agent.role == role);
+            (unnamed_applies || !applicable_failing_checks(context, candidate).is_empty())
+                .then_some(PlacementFilterCode::EnvironmentNotReady)
+        }
+        _ if candidate.location.owner_kind == RepoLocationOwnerKind::Daemon
+            || context.environment_has_assets
+            || context.environment_admission == EnvironmentAdmission::LaunchPreflight =>
+        {
+            None
+        }
+        _ => Some(PlacementFilterCode::EnvironmentProbePending),
+    }
+}
+
+pub(crate) fn applicable_failing_checks(
+    context: &SelectionContext,
+    candidate: &PlacementCandidate,
+) -> Vec<String> {
+    let Some(row) = candidate
+        .environment_readiness
+        .as_ref()
+        .filter(|row| context.environment_digest.as_ref() == Some(&row.checks_digest))
+    else {
+        return Vec::new();
+    };
+    let names: BTreeSet<&str> = row
+        .failing_checks
+        .iter()
+        .map(|failure| failure.name.as_str())
+        .chain(
+            row.check_results
+                .iter()
+                .filter(|result| !result.passed)
+                .map(|result| result.name.as_str()),
+        )
+        .collect();
+    names
+        .into_iter()
+        .filter(|name| {
+            context
+                .environment_checks
+                .iter()
+                .find(|check| check.name == *name)
+                .is_none_or(|check| check.applies_to(&context.claiming_agent.role))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Project pause decisions ignore a Task's sticky/pinned restriction, but use
+/// the same concrete executor, visibility, policy, roles and readiness filters.
+pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&PlacementCandidate> {
+    let mut unrestricted = context.clone();
+    unrestricted.existing_placement = None;
+    unrestricted.inherited_root_placement = None;
+    unrestricted.claiming_agent.agent.daemon_id = None;
+    for role in &mut unrestricted.worktree_agents {
+        role.agent.daemon_id = None;
+    }
+    let specific =
+        context.binding().is_some() || context.agents().any(|role| role.agent.daemon_id.is_some());
+    if specific
+        && context.candidates.iter().any(|candidate| {
+            candidate.location.status == RepoLocationStatus::Ready
+                && candidate.connected
+                && candidate.runtime_ready
+                && candidate.visible
+                && (candidate.location.owner_kind == RepoLocationOwnerKind::Server
+                    || (candidate.workspace_v1
+                        && candidate.negotiated_revision.is_some_and(|revision| {
+                            revision >= api_types::DAEMON_MIN_PROTOCOL_REVISION
+                        })))
+                && environment_filter(context, candidate)
+                    != Some(PlacementFilterCode::EnvironmentNotReady)
+        })
+    {
+        // A pinned/placed Task cannot pause work using another Agent/executor
+        // on a healthy owner. Task-specific executor and policy mismatches on
+        // that other owner therefore cannot establish a whole-Project pause.
+        return Vec::new();
+    }
+    let mut unfit = Vec::new();
+    for candidate in &context.candidates {
+        if candidate.location.status != RepoLocationStatus::Ready || !candidate.connected {
+            continue;
+        }
+        let codes = filter_candidate(&unrestricted, candidate);
+        // Capacity/outage/pending are independent transient possibilities,
+        // never evidence for an environment-owned whole-Project pause.
+        if codes.is_empty()
+            || codes.iter().all(|code| {
+                matches!(
+                    code,
+                    PlacementFilterCode::EnvironmentNotReady
+                        | PlacementFilterCode::EnvironmentProbePending
+                        | PlacementFilterCode::AgentCapacity
+                        | PlacementFilterCode::MachineCapacity
+                        | PlacementFilterCode::OwnerUnreachable
+                )
+            }) && codes != [PlacementFilterCode::EnvironmentNotReady]
+        {
+            return Vec::new();
+        }
+        if codes == [PlacementFilterCode::EnvironmentNotReady] {
+            unfit.push(candidate);
+        }
+    }
+    unfit
+}
+
+fn preference_key<'a>(
+    context: &SelectionContext,
+    candidate: &'a PlacementCandidate,
+) -> (u8, bool, bool, &'a str, &'a str) {
+    let existing = context
+        .existing_placement
+        .as_ref()
+        .filter(|placement| {
+            placement.state != PlacementState::Cleaned
+                && (placement.state != PlacementState::Failed
+                    || placement.workspace_handle.is_some())
+        })
+        .is_some_and(|placement| matches_placement(candidate, placement));
+    let inherited = context
+        .inherited_root_placement
+        .as_ref()
+        .is_some_and(|placement| matches_placement(candidate, placement));
+    let pinned = context.agents().any(|role| role.agent.daemon_id.is_some());
+    let rank = if existing {
+        0
+    } else if inherited {
+        1
+    } else if pinned {
+        2
+    } else if candidate.location.is_default {
+        3
+    } else if candidate.location.owner_kind == RepoLocationOwnerKind::Server {
+        4
+    } else {
+        5
+    };
+    (
+        rank,
+        !candidate.location.is_default,
+        candidate.location.owner_kind != RepoLocationOwnerKind::Server,
+        &candidate.location.created_at,
+        &candidate.location.id,
+    )
 }
 
 fn matches_placement(candidate: &PlacementCandidate, placement: &WorkspacePlacement) -> bool {
@@ -387,6 +615,9 @@ fn filter_candidate(
     use PlacementFilterCode::*;
 
     let mut filters = BTreeSet::new();
+    if let Some(code) = environment_filter(context, candidate) {
+        filters.insert(code);
+    }
     let daemon_owned = candidate.location.owner_kind == RepoLocationOwnerKind::Daemon;
     // An offline owner's missing handshake is unknown capability/policy
     // evidence, not a permanent refusal. Admission still fails closed below.
@@ -416,6 +647,14 @@ fn filter_candidate(
             || !candidate.workspace_v1)
     {
         filters.insert(WorkspaceProtocolMissing);
+    }
+    if daemon_owned
+        && owner_facts_known
+        && !needs_upgrade
+        && !candidate.plan_transport
+        && executors::task_role_can_write_plan(Some(&context.claiming_agent.role))
+    {
+        filters.insert(CapabilityMissing);
     }
     if candidate.location.status != RepoLocationStatus::Ready
         || candidate.location.repo_id != context.repo.id
@@ -476,12 +715,11 @@ fn filter_candidate(
     {
         filters.insert(AgentCapacity);
     }
-    if candidate.execution_daemon_id.is_some()
-        && candidate
-            .daemon_capacity
-            .is_none_or(|capacity| !capacity.has_capacity())
+    if candidate
+        .machine_capacity
+        .is_none_or(|capacity| !capacity.has_capacity())
     {
-        filters.insert(DaemonCapacity);
+        filters.insert(MachineCapacity);
     }
     if (!daemon_owned || owner_facts_known)
         && context
@@ -559,6 +797,7 @@ pub struct SelectionLoadInput<'a> {
     /// Retained negotiated facts, accepted only for the current compatible
     /// connection incarnation.
     pub handshakes: &'a BTreeMap<String, ConnectionHandshake>,
+    pub fallback_server_location: Option<RepoLocation>,
 }
 
 /// Load without opening a second transaction or doing owner I/O. The caller
@@ -569,6 +808,15 @@ pub async fn load_selection_context(
     registry: &DaemonConnectionRegistry,
     input: SelectionLoadInput<'_>,
 ) -> Result<SelectionContext> {
+    let environment = &input.project_settings.environment;
+    let environment_digest =
+        (!environment.checks.is_empty()).then(|| db::environment_checks_digest(environment));
+    let readiness = if environment_digest.is_some() {
+        db.list_readiness_in_tx(transaction, &input.task.project_id)
+            .await?
+    } else {
+        Vec::new()
+    };
     let mut existing_placement = match input.workspace_id {
         Some(id) => WorkspacePlacementRepo::get_by_workspace_id_in_tx(db, transaction, id).await?,
         None => None,
@@ -596,9 +844,15 @@ pub async fn load_selection_context(
         .bind(&input.repo.id)
         .fetch_all(&mut **transaction)
         .await?;
-    let mut candidates = Vec::with_capacity(rows.len());
-    for row in rows {
-        let location = map_location(row)?;
+    let mut locations = rows
+        .into_iter()
+        .map(map_location)
+        .collect::<Result<Vec<_>>>()?;
+    if locations.is_empty() {
+        locations.extend(input.fallback_server_location);
+    }
+    let mut candidates = Vec::with_capacity(locations.len());
+    for location in locations {
         let daemon_owned = location.owner_kind == RepoLocationOwnerKind::Daemon;
         let reused = existing_placement
             .as_ref()
@@ -620,7 +874,7 @@ pub async fn load_selection_context(
             input.server.execution_daemon_id.clone()
         };
         let daemon = match execution_daemon_id.as_deref() {
-            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, labels_json, detected_clis_json FROM daemon WHERE id = ?")
+            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json FROM daemon WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&mut **transaction)
                 .await?,
@@ -630,7 +884,7 @@ pub async fn load_selection_context(
             && (execution_daemon_id.is_none()
                 || daemon.as_ref().is_some_and(|row| {
                     row.try_get::<String, _>("machine_id")
-                        .is_ok_and(|id| crate::embedded_daemon::is_embedded_daemon_machine(&id))
+                        .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
                 }));
         let remote_execution =
             daemon_owned || location.kind == RepoLocationKind::SharedMount || !embedded_execution;
@@ -739,16 +993,43 @@ pub async fn load_selection_context(
             }
             executors.insert(agent.id.clone(), facts);
         }
-        let max_sessions = daemon
-            .as_ref()
-            .map(|row| row.try_get::<String, _>("labels_json"))
-            .transpose()?
-            .and_then(|labels| crate::agent_capacity::daemon_session_cap_from_labels(&labels));
-        let daemon_capacity = match execution_daemon_id.as_deref() {
-            Some(id) => Some(count_daemon_capacity(transaction, id, max_sessions).await?),
-            None => None,
+        let machine_id = if execution_daemon_id.is_none()
+            || daemon.as_ref().is_some_and(|row| {
+                row.try_get::<String, _>("machine_id")
+                    .is_ok_and(|id| id == db.server_run_cap.embedded_machine_id())
+            }) {
+            None
+        } else {
+            execution_daemon_id.as_deref()
         };
+        let cap = if machine_id.is_none() {
+            super::capacity::server_machine_cap(db, transaction).await?
+        } else {
+            let reported = daemon
+                .as_ref()
+                .map(|row| row.try_get::<Option<i64>, _>("max_concurrent_runs"))
+                .transpose()?
+                .flatten();
+            let admin = daemon
+                .as_ref()
+                .map(|row| row.try_get::<Option<u32>, _>("run_limit"))
+                .transpose()?
+                .flatten();
+            super::capacity::effective_machine_cap(reported, admin)
+        };
+        let machine_capacity = Some(
+            count_machine_capacity(
+                transaction,
+                machine_id,
+                cap,
+                &db.server_run_cap.embedded_machine_id(),
+            )
+            .await?,
+        );
+        let machine = EnvironmentMachine::from_location(&location);
+        let environment_readiness = readiness.iter().find(|row| row.machine == machine).cloned();
         candidates.push(PlacementCandidate {
+            environment_readiness,
             location,
             execution_daemon_id,
             embedded_execution,
@@ -765,6 +1046,13 @@ pub async fn load_selection_context(
                     .capabilities
                     .iter()
                     .any(|capability| capability == "workspace.v1")
+            }),
+            plan_transport: handshake.is_some_and(|facts| {
+                facts
+                    .handshake
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT)
             }),
             runtime_ready,
             visible,
@@ -786,14 +1074,14 @@ pub async fn load_selection_context(
                     WorkspaceRunPurpose::CiStep,
                 ]
             },
-            daemon_capacity,
+            machine_capacity,
         });
     }
-    let roles = std::iter::once(input.claiming_agent)
-        .chain(input.worktree_agents.iter())
-        .map(|agent| agent.role.as_str())
-        .collect::<Vec<_>>();
     Ok(SelectionContext {
+        environment_admission: EnvironmentAdmission::Dispatcher,
+        environment_has_assets: !environment.assets.is_empty(),
+        environment_checks: environment.checks.clone(),
+        environment_digest,
         task: input.task.clone(),
         repo: input.repo.clone(),
         claiming_agent: input.claiming_agent.clone(),
@@ -804,7 +1092,7 @@ pub async fn load_selection_context(
         needed_run_purposes: needed_run_purposes(
             input.review_config,
             input.project_settings,
-            &roles,
+            &[input.claiming_agent.role.as_str()],
         ),
         agent_capacity: count_agent_capacity(transaction, &input.claiming_agent.agent.id).await?,
     })
@@ -903,6 +1191,10 @@ mod tests {
 
     fn context() -> SelectionContext {
         let mut context = SelectionContext {
+            environment_admission: EnvironmentAdmission::Dispatcher,
+            environment_has_assets: false,
+            environment_digest: None,
+            environment_checks: Vec::new(),
             task: Task {
                 id: "task".to_owned(),
                 project_id: "project".to_owned(),
@@ -958,6 +1250,7 @@ mod tests {
 
     fn candidate(context: &SelectionContext, id: &str, daemon: Option<&str>) -> PlacementCandidate {
         PlacementCandidate {
+            environment_readiness: None,
             location: RepoLocation {
                 id: id.to_owned(),
                 repo_id: context.repo.id.clone(),
@@ -981,8 +1274,9 @@ mod tests {
             execution_daemon_id: daemon.map(str::to_owned),
             embedded_execution: daemon.is_none(),
             connected: true,
-            negotiated_revision: Some(3),
+            negotiated_revision: Some(api_types::DAEMON_PROTOCOL_REVISION),
             workspace_v1: true,
+            plan_transport: true,
             runtime_ready: true,
             visible: true,
             executors: context
@@ -990,11 +1284,73 @@ mod tests {
                 .map(|role| (role.agent.id.clone(), executor()))
                 .collect(),
             allowed_run_purposes: vec![WorkspaceRunPurpose::CiStep],
-            daemon_capacity: daemon.map(|_| DaemonCapacity {
-                max_sessions: Some(2),
-                ..DaemonCapacity::default()
+            machine_capacity: Some(MachineCapacity {
+                max_concurrent_runs: Some(2),
+                ..MachineCapacity::default()
             }),
         }
+    }
+
+    #[test]
+    fn machine_capacity_full_server_selects_free_daemon_and_zero_is_unlimited() {
+        let mut context = context();
+        let mut server = candidate(&context, "server", None);
+        server.machine_capacity.as_mut().unwrap().running_executions = 2;
+        context.candidates.insert(0, server);
+        let result = selected(&context);
+        assert_eq!(result.candidate.execution_daemon_id.as_deref(), Some("mac"));
+        assert_eq!(
+            result.selection_reason.rejected_candidates[0].filter_codes,
+            vec![PlacementFilterCode::MachineCapacity]
+        );
+        context.candidates.remove(1);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .max_concurrent_runs = Some(0);
+        assert!(matches!(
+            select_placement(&context),
+            SelectionOutcome::Selected(_)
+        ));
+    }
+
+    #[test]
+    fn machine_capacity_selection_enforces_effective_caps() {
+        for (reported, admin, expected) in [
+            (Some(6), Some(2), 2),
+            (Some(3), Some(8), 3),
+            (Some(3), None, 3),
+        ] {
+            let mut context = context();
+            let cap = super::super::capacity::effective_machine_cap(reported, admin);
+            let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
+            capacity.max_concurrent_runs = cap;
+            capacity.running_executions = expected;
+            rejected(&context, PlacementFilterCode::MachineCapacity);
+            context.candidates[0]
+                .machine_capacity
+                .as_mut()
+                .unwrap()
+                .running_executions -= 1;
+            selected(&context);
+        }
+    }
+
+    #[test]
+    fn machine_capacity_start_rechecks_ready_placement() {
+        let mut context = context();
+        let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
+        capacity.max_concurrent_runs = Some(1);
+        capacity.active_chat_turns = 1;
+        context.existing_placement = Some(placement(&context.candidates[0]));
+        rejected(&context, PlacementFilterCode::MachineCapacity);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .active_chat_turns = 0;
+        selected(&context);
     }
 
     fn placement(candidate: &PlacementCandidate) -> WorkspacePlacement {
@@ -1028,6 +1384,338 @@ mod tests {
 
     fn selected(context: &SelectionContext) -> PlacementSelection {
         select_placement(context).into_result().unwrap()
+    }
+
+    fn readiness(
+        context: &SelectionContext,
+        index: usize,
+        status: EnvironmentReadinessStatus,
+    ) -> ProjectMachineReadiness {
+        let mut row = super::super::environment::unknown_record(
+            &context.task.project_id,
+            EnvironmentMachine::from_location(&context.candidates[index].location),
+            &api_types::ProjectEnvironment::default(),
+        );
+        row.checks_digest = context.environment_digest.clone().unwrap_or_default();
+        row.status = status;
+        row.failing_checks = vec![db::ReadinessCheckFailure {
+            name: "cargo".into(),
+            output_tail: "command not found".into(),
+        }];
+        row
+    }
+
+    #[test]
+    fn readiness_ready_machine_passes() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::Ready));
+        assert_eq!(selected(&context).candidate.location.id, "mac-location");
+    }
+
+    #[test]
+    fn readiness_unfit_machine_rejected_with_checks_and_server_wins() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context
+            .candidates
+            .push(candidate(&context, "server-location", None));
+        context.candidates[1].environment_readiness =
+            Some(readiness(&context, 1, EnvironmentReadinessStatus::Ready));
+        let selection = selected(&context);
+        assert_eq!(selection.candidate.location.id, "server-location");
+        let rejection = &selection.selection_reason.rejected_candidates[0];
+        assert_eq!(
+            rejection.filter_codes,
+            vec![PlacementFilterCode::EnvironmentNotReady]
+        );
+        assert_eq!(rejection.failing_checks, vec!["cargo"]);
+        assert_eq!(
+            serde_json::to_value(rejection).unwrap()["filter_codes"][0],
+            "environment_not_ready"
+        );
+    }
+
+    #[test]
+    fn machine_capacity_and_environment_failure_do_not_pause_project() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 2;
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert_eq!(
+            refusal.rejected_candidates[0].filter_codes,
+            vec![
+                PlacementFilterCode::MachineCapacity,
+                PlacementFilterCode::EnvironmentNotReady
+            ]
+        );
+        assert!(environment_pause_candidates(&context).is_empty());
+        assert!(!super::super::machine_precheck::capacity_only_wait(
+            &refusal
+        ));
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 0;
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
+    }
+
+    #[test]
+    fn machine_capacity_wait_ignores_environment_failed_alternative() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context
+            .candidates
+            .push(candidate(&context, "server-location", None));
+        context.candidates[1].environment_readiness =
+            Some(readiness(&context, 1, EnvironmentReadinessStatus::Ready));
+        context.candidates[1]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 2;
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(environment_pause_candidates(&context).is_empty());
+        assert!(super::super::machine_precheck::capacity_only_wait(&refusal));
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::Unknown));
+        // Remote unknown readiness is resolved at launch, so it remains a
+        // possible free candidate and cannot establish a machine wait.
+        assert!(matches!(
+            select_placement(&context),
+            SelectionOutcome::Selected(_)
+        ));
+    }
+
+    #[test]
+    fn readiness_missing_unknown_and_stale_records_defer() {
+        let mut context = context();
+        context.candidates = vec![candidate(&context, "server-location", None)];
+        context.environment_digest = Some("current".into());
+        for row in [
+            None,
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::Unknown)),
+            Some({
+                let mut row = readiness(&context, 0, EnvironmentReadinessStatus::Ready);
+                row.checks_digest = "old".into();
+                row
+            }),
+        ] {
+            context.candidates[0].environment_readiness = row;
+            let refusal = select_placement(&context).into_result().unwrap_err();
+            assert_eq!(
+                refusal.rejected_candidates[0].filter_codes,
+                vec![PlacementFilterCode::EnvironmentProbePending]
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_no_checks_preserves_selection() {
+        let mut context = context();
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        assert_eq!(selected(&context).candidate.location.id, "mac-location");
+    }
+
+    #[test]
+    fn readiness_pinned_unfit_machine_has_no_fallback() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.claiming_agent.agent.daemon_id = Some("mac".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context
+            .candidates
+            .push(candidate(&context, "server-location", None));
+        context.candidates[1].environment_readiness =
+            Some(readiness(&context, 1, EnvironmentReadinessStatus::Ready));
+        let refusal = select_placement(&context).into_result().unwrap_err();
+        assert!(refusal
+            .rejected_candidates
+            .iter()
+            .any(|rejection| rejection.daemon_id.as_deref() == Some("mac")
+                && rejection.filter_codes == vec![PlacementFilterCode::EnvironmentNotReady]));
+    }
+
+    #[test]
+    fn readiness_daemon_missing_unknown_and_stale_pass_at_reserve_and_claim() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        for row in [
+            None,
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::Unknown)),
+            Some({
+                let mut row = readiness(&context, 0, EnvironmentReadinessStatus::NotReady);
+                row.checks_digest = "old".into();
+                row
+            }),
+        ] {
+            context.candidates[0].environment_readiness = row;
+            context.existing_placement = None;
+            let reserved = selected(&context);
+            assert_eq!(reserved.candidate.location.id, "mac-location");
+            context.existing_placement = Some(placement(&reserved.candidate));
+            assert_eq!(
+                selected(&context).selection_reason.rule,
+                SelectionRule::ExistingPlacement
+            );
+        }
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        for placed in [false, true] {
+            context.existing_placement = placed.then(|| placement(&context.candidates[0]));
+            assert_eq!(
+                select_placement(&context)
+                    .into_result()
+                    .unwrap_err()
+                    .rejected_candidates[0]
+                    .filter_codes,
+                vec![PlacementFilterCode::EnvironmentNotReady]
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_pending_preserves_preference_order() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context
+            .candidates
+            .push(candidate(&context, "server-location", None));
+        assert!(
+            select_placement(&context).into_result().is_err(),
+            "preferred server pending cannot divert to daemon"
+        );
+        context.candidates[0].location.is_default = true;
+        assert_eq!(
+            selected(&context).candidate.location.id,
+            "mac-location",
+            "a lower-preference pending host does not block the default daemon"
+        );
+        context.candidates[1].location.is_default = true;
+        context.candidates[0].location.is_default = false;
+        assert!(
+            select_placement(&context).into_result().is_err(),
+            "default server pending preserves preference"
+        );
+        context.candidates[0].location.is_default = true;
+        context.candidates[1].location.is_default = false;
+        let mut released = placement(&context.candidates[1]);
+        released.state = PlacementState::Failed;
+        released.workspace_handle = None;
+        context.existing_placement = Some(released);
+        assert_eq!(
+            selected(&context).candidate.location.id,
+            "mac-location",
+            "a released failed reservation cannot promote a pending server over the default daemon"
+        );
+    }
+
+    #[test]
+    fn readiness_failures_and_last_resort_pause_apply_to_task_roles() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.environment_checks = serde_json::from_value(
+            serde_json::json!([{"name":"cargo","command":"false","roles":["reviewer"]}]),
+        )
+        .unwrap();
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        assert_eq!(context.claiming_agent.role, "coder");
+        assert!(select_placement(&context).into_result().is_ok());
+        assert!(environment_pause_candidates(&context).is_empty());
+        context.claiming_agent.role = "reviewer".into();
+        assert_eq!(
+            select_placement(&context)
+                .into_result()
+                .unwrap_err()
+                .rejected_candidates[0]
+                .failing_checks,
+            vec!["cargo"]
+        );
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
+    }
+
+    #[test]
+    fn readiness_pinned_wait_does_not_pause_an_owner_available_to_other_agents() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.claiming_agent.agent.daemon_id = Some("mac".into());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context.candidates.push(candidate(&context, "server", None));
+        context.candidates[1].environment_readiness =
+            Some(readiness(&context, 1, EnvironmentReadinessStatus::Ready));
+        for executor in context.candidates[1].executors.values_mut() {
+            executor.installed = false;
+        }
+        assert!(
+            select_placement(&context).into_result().is_err(),
+            "the pinned Task still cannot fall back"
+        );
+        assert!(
+            environment_pause_candidates(&context).is_empty(),
+            "other Agents can run on the healthy server"
+        );
+    }
+
+    #[test]
+    fn readiness_asset_projects_use_launch_facts_and_direct_claims_skip_pending() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates = vec![candidate(&context, "server", None)];
+        context.environment_admission = EnvironmentAdmission::LaunchPreflight;
+        assert!(select_placement(&context).into_result().is_ok());
+        context.environment_admission = EnvironmentAdmission::Dispatcher;
+        assert!(select_placement(&context).into_result().is_err());
+        context.environment_has_assets = true;
+        assert!(select_placement(&context).into_result().is_ok());
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        assert!(
+            select_placement(&context).into_result().is_ok(),
+            "a primary checkout cannot validate staged assets"
+        );
+        context.candidates[0]
+            .environment_readiness
+            .as_mut()
+            .unwrap()
+            .role = Some("coder".into());
+        assert!(
+            select_placement(&context).into_result().is_err(),
+            "actual launch failures remain placement facts"
+        );
+    }
+
+    #[test]
+    fn readiness_offline_alternative_never_changes_pause_with_cached_handshake() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates = vec![
+            candidate(&context, "server", None),
+            candidate(&context, "offline", Some("offline")),
+        ];
+        context.candidates[0].environment_readiness =
+            Some(readiness(&context, 0, EnvironmentReadinessStatus::NotReady));
+        context.candidates[1].connected = false;
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
+        context.candidates[1].negotiated_revision = None;
+        context.candidates[1].workspace_v1 = false;
+        context.candidates[1].executors.clear();
+        assert_eq!(environment_pause_candidates(&context).len(), 1);
     }
 
     fn rejected(context: &SelectionContext, code: PlacementFilterCode) -> PlacementUnavailable {
@@ -1173,21 +1861,21 @@ mod tests {
     fn two_unpinned_running_placements_fill_daemon_session_cap() {
         let mut context = context();
         context.candidates[0]
-            .daemon_capacity
+            .machine_capacity
             .as_mut()
             .unwrap()
             .running_executions = 2;
         assert!(context.agents().all(|role| role.agent.daemon_id.is_none()));
-        rejected(&context, PlacementFilterCode::DaemonCapacity);
+        rejected(&context, PlacementFilterCode::MachineCapacity);
     }
 
     #[test]
     fn daemon_reservations_and_chat_turns_share_the_session_cap() {
         let mut context = context();
-        let capacity = context.candidates[0].daemon_capacity.as_mut().unwrap();
+        let capacity = context.candidates[0].machine_capacity.as_mut().unwrap();
         capacity.reservations = 1;
         capacity.active_chat_turns = 1;
-        rejected(&context, PlacementFilterCode::DaemonCapacity);
+        rejected(&context, PlacementFilterCode::MachineCapacity);
     }
 
     #[test]
@@ -1262,6 +1950,24 @@ mod tests {
     }
 
     #[test]
+    fn revision_three_non_plan_roles_do_not_require_plan_transport() {
+        for role in ["reviewer", "auditor", "interactive"] {
+            let mut context = context();
+            context.candidates[0].negotiated_revision = Some(3);
+            context.candidates[0].plan_transport = false;
+            context.worktree_agents.push(context.claiming_agent.clone());
+            context.claiming_agent.role = role.into();
+            assert!(
+                select_placement(&context).into_result().is_ok(),
+                "{role} remains supported with a coder assigned"
+            );
+        }
+        let mut context = context();
+        context.candidates[0].plan_transport = false;
+        rejected(&context, PlacementFilterCode::CapabilityMissing);
+    }
+
+    #[test]
     fn offline_owner_missing_handshake_is_a_retryable_placement_refusal() {
         let mut context = context();
         let owner = &mut context.candidates[0];
@@ -1281,7 +1987,7 @@ mod tests {
         // requires intervention and must not stay queued indefinitely.
         let owner = &mut context.candidates[0];
         owner.connected = true;
-        owner.negotiated_revision = Some(3);
+        owner.negotiated_revision = Some(api_types::DAEMON_PROTOCOL_REVISION);
         owner.workspace_v1 = true;
         let refusal = select_placement(&context).into_result().unwrap_err();
         assert!(!super::super::is_retryable_admission_refusal(
@@ -1335,15 +2041,16 @@ mod tests {
     }
 
     #[test]
-    fn shared_mount_requires_revision_three_and_a_ready_location() {
+    fn shared_mount_requires_current_revision_and_a_ready_location() {
         let mut context = context();
         context.candidates[0].location.owner_kind = RepoLocationOwnerKind::Server;
         context.candidates[0].location.kind = RepoLocationKind::SharedMount;
+        context.candidates[0].plan_transport = false;
         context.candidates[0].negotiated_revision = Some(2);
         context.candidates[0].workspace_v1 = false;
         context.candidates[0].connected = false;
         rejected(&context, PlacementFilterCode::DaemonUpgradeRequired);
-        context.candidates[0].negotiated_revision = Some(3);
+        context.candidates[0].negotiated_revision = Some(api_types::DAEMON_PROTOCOL_REVISION);
         context.candidates[0].connected = true;
         selected(&context);
         context.candidates[0].location.status = RepoLocationStatus::Unverified;
@@ -1358,7 +2065,7 @@ mod tests {
         let mut context = context();
         let mut server = candidate(&context, "server", None);
         server.execution_daemon_id = Some("embedded".to_owned());
-        server.daemon_capacity = Some(DaemonCapacity::default());
+        server.machine_capacity = Some(MachineCapacity::default());
         context.candidates = vec![server];
         context.claiming_agent.agent.daemon_id = Some("embedded".to_owned());
         let selection = selected(&context);
@@ -1379,7 +2086,7 @@ mod tests {
         let mut server = candidate(&context, "server", None);
         server.execution_daemon_id = Some("mac".to_owned());
         server.embedded_execution = false;
-        server.daemon_capacity = Some(DaemonCapacity::default());
+        server.machine_capacity = Some(MachineCapacity::default());
         context.existing_placement = Some(placement(&server));
         context.candidates = vec![server];
         context.claiming_agent.agent.daemon_id = Some("mac".to_owned());
@@ -1560,6 +2267,7 @@ mod tests {
             project_settings: settings,
             server,
             handshakes,
+            fallback_server_location: None,
         }
     }
 
@@ -1568,12 +2276,14 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
+        db.server_run_cap
+            .set(Some(0), 0, &config::embedded_machine_id());
         sqlx::raw_sql(
             "INSERT INTO daemon (id, machine_id, hostname, os, arch, status, owner_id,
-                                 visibility, detected_clis_json, labels_json, created_at, updated_at)
+                                 visibility, detected_clis_json, labels_json, created_at, updated_at, max_concurrent_runs)
              VALUES ('mac', 'mac-machine', 'Mac', 'macos', 'aarch64', 'online', NULL,
                      'global', '[{\"kind\":\"codex\",\"availability\":\"authenticated\"}]',
-                     '{\"max_sessions\":2}', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');
+                     '{}', '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z', 2);
              INSERT INTO runtime (id, daemon_id, kind, workspace_root, status, created_at, updated_at)
              VALUES ('runtime-mac', 'mac', 'local', '/checkout', 'ready',
                      '2026-09-29T00:00:00Z', '2026-09-29T00:00:00Z');",
@@ -1608,11 +2318,14 @@ mod tests {
             crate::daemon_transport::DaemonConnection::new("mac".to_owned());
         registry.register("mac".to_owned(), connection.clone());
         let handshake = DaemonHandshakeNotification {
-            protocol_revision: 3,
+            protocol_revision: api_types::DAEMON_PROTOCOL_REVISION,
             capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
                 .iter()
                 .map(|name| (*name).to_owned())
-                .chain(std::iter::once("workspace.v1".to_owned()))
+                .chain([
+                    api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned(),
+                    api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
+                ])
                 .collect(),
             executor_capabilities: BTreeMap::from([("codex".to_owned(), capabilities())]),
             workspace_run_policy: api_types::WorkspaceRunPolicy {
@@ -1654,7 +2367,10 @@ mod tests {
             Some("mac")
         );
         assert_eq!(
-            loaded.candidates[0].daemon_capacity.unwrap().max_sessions,
+            loaded.candidates[0]
+                .machine_capacity
+                .unwrap()
+                .max_concurrent_runs,
             Some(2)
         );
 
@@ -1683,5 +2399,30 @@ mod tests {
         .await
         .unwrap();
         rejected(&loaded, PlacementFilterCode::OwnerUnreachable);
+    }
+    #[test]
+    fn environment_and_capacity_refusals_are_not_deterministic() {
+        let refusal = |codes: Vec<PlacementFilterCode>| PlacementUnavailable {
+            task_id: "task".to_owned(),
+            repo_id: "repo".to_owned(),
+            rejected_candidates: vec![CandidateRejection {
+                failing_checks: Vec::new(),
+                repo_location_id: "location".to_owned(),
+                owner_kind: "server".to_owned(),
+                daemon_id: None,
+                runtime_id: None,
+                filter_codes: codes,
+            }],
+        };
+        for code in [
+            PlacementFilterCode::EnvironmentProbePending,
+            PlacementFilterCode::EnvironmentNotReady,
+            PlacementFilterCode::AgentCapacity,
+            PlacementFilterCode::MachineCapacity,
+            PlacementFilterCode::OwnerUnreachable,
+        ] {
+            assert!(!refusal(vec![code]).is_deterministic(), "{code:?}");
+        }
+        assert!(refusal(vec![PlacementFilterCode::CapabilityMissing]).is_deterministic());
     }
 }

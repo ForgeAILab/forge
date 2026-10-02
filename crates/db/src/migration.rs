@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610021051 (stable dead-letter identity and transient retry backoff).
+// Embedded migration bundle revision: V202610021051 (stable dead-letter identity and transient retry backoff; also V202610020600 Project machine readiness, V202610020800 execution plan transport and V202610020900 machine run caps).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -74,6 +74,7 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     }
 
     reconcile_project_admission_bindings(pool).await?;
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
 
     Ok(())
 }
@@ -343,6 +344,7 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         apply_migration(pool, &migration).await?;
     }
 
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
     Ok(())
 }
 
@@ -660,6 +662,47 @@ mod tests {
                 "migration `{name}` uses version {version}; migrations after V{LAST_SEQUENTIAL_VERSION} \
                  must use their UTC creation time (VYYYYMMDDHHMM__name.sql)"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod machine_capacity_tests {
+    #[tokio::test]
+    async fn machine_capacity_migration_carries_label_priority_and_preserves_null() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE daemon (id TEXT, labels_json TEXT); INSERT INTO daemon VALUES
+            ('priority', '{\"max_concurrent_sessions\":6,\"max_sessions\":2}'),
+            ('fallback', '{\"max_concurrent_sessions\":0,\"active_session_cap\":3}'),
+            ('empty', '{}'), ('invalid', 'not-json'), ('string', '{\"max_sessions\":\"5\"}'), ('oversized', '{\"max_sessions\":18446744073709551615}');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610020900__machine_run_caps.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT id, max_concurrent_runs, run_limit FROM daemon ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        for row in rows {
+            let id: String = row.get("id");
+            let cap: Option<i64> = row.get("max_concurrent_runs");
+            assert_eq!(
+                cap,
+                match id.as_str() {
+                    "priority" => Some(6),
+                    "fallback" => Some(3),
+                    _ => None,
+                }
+            );
+            assert_eq!(row.get::<Option<i64>, _>("run_limit"), None);
         }
     }
 }

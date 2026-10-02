@@ -162,6 +162,10 @@ impl TaskService {
                 actor.clone(),
                 Box::pin(async {
                     Ok::<Task, ServiceError>(match &action {
+                        TaskAction::Retry { reason, .. } if offer.reason == "placement_retry" => {
+                            self.retry_recorded_placement(&snapshot, reason.as_deref())
+                                .await?
+                        }
                         TaskAction::Retry { .. } if offer.reason == "owner_reconcile" => {
                             self.reconcile_task_action_owner(task, action.clone())
                                 .await?
@@ -191,6 +195,9 @@ impl TaskService {
                                     )),
                                 )
                                 .await?
+                        }
+                        TaskAction::Hold { reason } if offer.reason == "dispatch_wait" => {
+                            self.hold_waiting_task(&snapshot, reason.as_deref()).await?
                         }
                         TaskAction::Hold { reason } => {
                             TaskRepo::mutate_metadata_and_bump_version(
@@ -486,6 +493,107 @@ impl TaskService {
         })
     }
 
+    fn workflow_execution_roles(snapshot: &TaskSnapshot) -> Vec<String> {
+        let mut roles = snapshot
+            .workflow
+            .states
+            .iter()
+            .filter_map(crate::workflow::effective_role)
+            .filter(|role| *role != "interactive")
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for role in [
+            "coder", "planner", "reviewer", "auditor", "worker", "assignee", "executor",
+        ] {
+            if !roles.iter().any(|candidate| candidate == role) {
+                roles.push(role.to_owned());
+            }
+        }
+        roles
+    }
+
+    async fn hold_waiting_task(
+        &self,
+        snapshot: &TaskSnapshot,
+        reason: Option<&str>,
+    ) -> Result<Task> {
+        let task = &snapshot.task;
+        let reason = reason.unwrap_or("held by owner");
+        let now = now_rfc3339();
+        let held = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            Some(
+                json!({"type":"manual_stop", "blocking_reason":reason, "blocked_by":"user",
+                "blocked_at":now, "blocked_execution_id":null})
+                .to_string(),
+            ),
+            Some(json!({"kind":"manual_stop", "reason":reason, "created_at":now}).to_string()),
+            None,
+            &now,
+            None,
+            Self::workflow_execution_roles(snapshot),
+            [
+                "queued_recovery",
+                "deferred_dispatch",
+                "dispatch_disposition",
+                "environment_wait",
+                "owner_wait",
+            ]
+            .into_iter()
+            .map(|key| db::TaskMetadataMutation::Remove {
+                key: key.to_owned(),
+            })
+            .collect(),
+        )
+        .await?;
+        self.create_system_comment(&task.id, format!("Task paused by user: {reason}"))
+            .await?;
+        Ok(held)
+    }
+
+    async fn retry_recorded_placement(
+        &self,
+        snapshot: &TaskSnapshot,
+        reason: Option<&str>,
+    ) -> Result<Task> {
+        let task = &snapshot.task;
+        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let mut mutations = Vec::new();
+        for key in ["placement_refusal", "dispatch_disposition"] {
+            if let Some(value) = metadata.extra.get(key) {
+                mutations.push(db::TaskMetadataMutation::RemoveIf {
+                    key: key.to_owned(),
+                    expected: value.clone(),
+                });
+            }
+        }
+        let retried = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            None,
+            task.blocked_json.clone(),
+            task.failed_json.clone(),
+            &now_rfc3339(),
+            None,
+            Self::workflow_execution_roles(snapshot),
+            mutations,
+        )
+        .await?;
+        self.create_system_comment(
+            &task.id,
+            reason
+                .map(|reason| format!("Placement retry requested: {reason}"))
+                .unwrap_or_else(|| "Placement retry requested".to_owned()),
+        )
+        .await?;
+        self.publish_recovery_applied(&retried, "retry", Some(&retried.status), None);
+        Ok(retried)
+    }
+
     pub(crate) async fn apply_gate_decision(
         &self,
         task: &Task,
@@ -604,6 +712,17 @@ impl TaskService {
         actor: Actor,
     ) -> Result<Task> {
         let task = &snapshot.task;
+        // A replay fallback retains its accepted authority and intent, even
+        // when admission loses the race after an advisory capacity read.
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+        if Self::is_replaying_recovery(&task.id)
+            && crate::deferred_dispatch::queued_recovery(&current)
+                .is_some_and(|existing| existing.target_state == current.status)
+        {
+            return Ok(current);
+        }
         let agent_id = if matches!(
             offer.reason.as_str(),
             "ready_to_start"
@@ -692,26 +811,45 @@ impl TaskService {
             blocked_json: task.blocked_json.clone(),
             failed_json: task.failed_json.clone(),
         };
-        let now = now_rfc3339();
-        let mut repository_roles = snapshot
-            .workflow
-            .states
-            .iter()
-            .filter_map(crate::workflow::effective_role)
-            .filter(|role| *role != "interactive")
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        for role in [
-            "coder", "planner", "reviewer", "auditor", "worker", "assignee", "executor",
-        ] {
-            if !repository_roles.iter().any(|candidate| candidate == role) {
-                repository_roles.push(role.to_owned());
+        if let Some(existing) = crate::deferred_dispatch::queued_recovery(&current) {
+            if existing.target_state == queued.target_state
+                && serde_json::to_value(&existing.request)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+                    == serde_json::to_value(&queued.request)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+            {
+                return Ok(current);
             }
         }
+        let machine_wait = if let Some(agent_id) = queued.request.agent_id.as_deref() {
+            let agent = db::AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id))?;
+            self.machine_capacity_blocked(task, &agent, queued.request.role_name.as_deref())
+                .await?
+        } else {
+            false
+        };
+        let now = now_rfc3339();
+        let repository_roles = Self::workflow_execution_roles(snapshot);
         let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(&*self.db, &task.id, task.version, None, None, None, &now, None, repository_roles, vec![
             db::TaskMetadataMutation::Set { key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(), value: serde_json::to_value(&queued).map_err(|error| ServiceError::invalid_operation(error.to_string()))? },
             db::TaskMetadataMutation::Set { key: "deferred_dispatch".to_owned(), value: json!({ "not_before": now, "reason": "task action queued", "target_state": task.status }) },
         ]).await?;
+        let updated = if machine_wait {
+            crate::deferred_dispatch::record_dispatch_disposition(
+                &self.db,
+                &updated,
+                "machine_capacity",
+                "machine_capacity: waiting for a machine run slot",
+            )
+            .await?;
+            TaskRepo::get_by_id(&*self.db, &updated.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", &updated.id))?
+        } else {
+            updated
+        };
         if task.blocked_json.is_some() {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),

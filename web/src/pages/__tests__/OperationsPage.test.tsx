@@ -163,11 +163,12 @@ const degradedStatus: OperatorStatusResponse = {
     },
   ],
   daemon_pressure: [
+    { daemon_id: 'server_host', hostname: 'Server host', active_runs: 2, max_concurrent_runs: 4, at_capacity: false },
     {
       daemon_id: 'daemon-1',
       hostname: 'worker-01',
-      active_sessions: 2,
-      max_sessions: 4,
+      active_runs: 2,
+      max_concurrent_runs: 4,
       at_capacity: false,
     },
   ],
@@ -176,8 +177,8 @@ const degradedStatus: OperatorStatusResponse = {
       agent_id: 'agent-1',
       agent_name: 'Agent One',
       daemon_id: 'daemon-1',
-      active_sessions: 1,
-      max_sessions: 2,
+      active_tasks: 1,
+      max_concurrent_tasks: 2,
       at_capacity: false,
     },
   ],
@@ -220,6 +221,12 @@ describe('OperationsPage', () => {
     } as unknown as ReturnType<typeof useRefreshOperationsMutation>)
   })
 
+
+it('lists server-host occupancy and links it to live settings', () => {
+  render(<OperationsPage />)
+  expect(screen.getByRole('link', { name: 'Server host' }).getAttribute('href')).toBe('/settings')
+  expect(screen.getByRole('link', { name: 'Server host' }).parentElement?.textContent).toContain('2/4 active runs')
+})
   it('renders summary counters with correct counts', () => {
     render(<OperationsPage />)
 
@@ -276,7 +283,7 @@ describe('OperationsPage', () => {
   it('renders pressure and active execution observability fields', () => {
     render(<OperationsPage />)
 
-    expect(screen.getByText('Runtime Pressure')).toBeTruthy()
+    expect(screen.getByText('Machine Pressure')).toBeTruthy()
     expect(screen.getByText('Agent Pressure')).toBeTruthy()
     expect(screen.getByText('3 turns')).toBeTruthy()
     expect(screen.getByText('Agent Agent One')).toBeTruthy()

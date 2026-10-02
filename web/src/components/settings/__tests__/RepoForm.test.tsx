@@ -17,6 +17,9 @@ const localRepoForm: RepoFormState = {
 const daemons: Daemon[] = [
   {
     id: 'daemon-1',
+    max_concurrent_runs: null,
+    run_limit: null,
+    effective_max_concurrent_runs: null,
     machine_id: 'machine-1',
     hostname: 'alpha',
     os: 'linux',
@@ -30,6 +33,9 @@ const daemons: Daemon[] = [
   },
   {
     id: 'daemon-2',
+    max_concurrent_runs: null,
+    run_limit: null,
+    effective_max_concurrent_runs: null,
     machine_id: 'machine-2',
     hostname: 'beta',
     os: 'linux',

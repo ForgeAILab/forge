@@ -5130,10 +5130,14 @@ async fn daemon_migrations_arriving_after_integration_preserve_existing_workspac
     for entry in fs::read_dir(&source).unwrap() {
         let path = entry.unwrap().path();
         let filename = path.file_name().unwrap().to_str().unwrap();
+        // The integration branch held migrations up to 202610010600 when the
+        // two daemon migrations arrived late. Everything written after that
+        // point may depend on them and has only ever run after them.
         if matches!(
             migration_version(filename),
             Some(202_610_010_400 | 202_610_010_530)
-        ) {
+        ) || migration_version(filename).is_some_and(|version| version > 202_610_010_600)
+        {
             continue;
         }
         fs::copy(&path, dir.join(filename)).unwrap();
@@ -5145,11 +5149,12 @@ async fn daemon_migrations_arriving_after_integration_preserve_existing_workspac
         INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('late-task', 'late-project', 'keep task', 'task', 'in_progress', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
         INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES ('late-workspace', 'late-task', 'late-repo', '/existing/worktree', 'task/keep', 'ready', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');")
         .execute(&pool).await.unwrap();
-    for filename in [
-        "V202610010400__daemon_owned_workspaces.sql",
-        "V202610010530__workspace_expected_head.sql",
-    ] {
-        fs::copy(source.join(filename), dir.join(filename)).unwrap();
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if !dir.join(filename).exists() {
+            fs::copy(&path, dir.join(filename)).unwrap();
+        }
     }
     run_migrations_from(&pool, &dir).await.unwrap();
     let preserved: (String, String, String) = sqlx::query_as("SELECT t.title, p.workspace_handle, l.path FROM task t JOIN workspace_placement p ON p.task_id = t.id JOIN repo_location l ON l.id = p.repo_location_id WHERE t.id = 'late-task'")

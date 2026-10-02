@@ -685,11 +685,9 @@ async fn condition_offer_apply_dispatch_matrix() {
         }
     }
     let _ = writeln!(out, "MATRIX_RESULT snapshots={snapshots} accepted={accepted} applied={applied} restored_with_error={restored} dead_ends={dead_ends} command_errors={command_errors}");
-    std::fs::create_dir_all(std::env::temp_dir().join("task-actions-fixA")).unwrap();
+    std::fs::create_dir_all(crate::task_actions::action_test_evidence_dir()).unwrap();
     std::fs::write(
-        std::env::temp_dir()
-            .join("task-actions-fixA")
-            .join("db-matrix.txt"),
+        crate::task_actions::action_test_evidence_dir().join("db-matrix.txt"),
         out,
     )
     .unwrap();
