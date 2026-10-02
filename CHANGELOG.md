@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Every machine (the server host and each daemon) now has a cap on concurrent
+  runs, and the default is no longer unlimited: half the machine's logical
+  cores, never less than 2. A run is a Running Task execution, a workspace
+  reservation that has not started, or an in-flight Agent Chat turn. Set
+  `server.max_concurrent_runs` to `0` for the old behaviour on the server
+  host. A daemon that has never reported a cap and has no administrator limit
+  stays unlimited until it is upgraded.
+- A daemon's cap is no longer read from its labels
+  (`max_concurrent_sessions`, `max_sessions`, `active_session_cap`,
+  `max_concurrent_tasks`). Migration V202610020900 copies an existing
+  positive label value into the daemon's recorded cap; after that the cap
+  comes from the daemon's own `max_concurrent_runs` setting.
+- The placement filter code `daemon_capacity` is renamed `machine_capacity`
+  and now also applies to the server host.
+- Operator status: machine entries (which now include the server host) report
+  `active_runs` and `max_concurrent_runs` instead of `active_sessions` and
+  `max_sessions`; Agent pressure entries report `active_tasks` and
+  `max_concurrent_tasks`.
 - A failing environment check no longer pauses the Project when another
   machine can run the work. The failure marks that machine not ready for the
   Project; placement skips it (filter code `environment_not_ready`) and a
@@ -366,6 +384,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Machine run caps.
+  - Server host: `server.max_concurrent_runs` in the config file,
+    `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
+    Settings API and the Forge Settings page. Unset is automatic, `0` is
+    unlimited. A change made in Settings applies to the next admission without
+    a restart; an environment or command-line override applies again at the
+    next start.
+  - Daemons: `max_concurrent_runs` in `daemon.yaml` or
+    `--max-concurrent-runs N` on `forge-daemon` and
+    `forge-ctl daemon link|start|report`, reported to the server at
+    registration and in status reports. An administrator can also set a limit
+    for a daemon with `PATCH /api/v1/daemons/{id}` (`run_limit`) or on the
+    Machines page; the lower of the two applies. Daemon responses carry
+    `max_concurrent_runs`, `run_limit` and `effective_max_concurrent_runs`.
+  - When every machine a Task could run on is at its cap, the Task waits in
+    its state with a machine-capacity reason. It gets no failure annotation,
+    no Attention item and no retry-budget charge, does not hold one of its
+    Project's `max_active_tasks` slots, and starts on a dispatcher tick after
+    a run ends. Work that is already running is never stopped, including when
+    the cap is lowered below the current load.
+  - Limits: Agent Chat turns count towards a machine's load but are never
+    refused; review check runs and merges do not take a slot; a freed slot
+    goes to the first Task the dispatcher reaches, with no fairness across
+    Projects.
 - Operator status exposes the SSE relay as `event_relay { running, position,
   head, last_error, last_error_at }`, and each worker's dead letters as a
   total plus the five most recent (`id`, item key, event sequence, reason,
