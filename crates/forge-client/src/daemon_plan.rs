@@ -29,7 +29,8 @@ fn read(path: &Path, root: &Path) -> anyhow::Result<Option<String>> {
     );
     anyhow::ensure!(
         metadata.len() <= MAX_EXECUTION_PLAN_BYTES,
-        "plan exceeds {MAX_EXECUTION_PLAN_BYTES} bytes"
+        "plan exceeds the {MAX_EXECUTION_PLAN_BYTES}-byte limit: {} bytes",
+        metadata.len()
     );
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -59,7 +60,8 @@ fn read(path: &Path, root: &Path) -> anyhow::Result<Option<String>> {
 pub(crate) fn validate(content: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         content.len() as u64 <= MAX_EXECUTION_PLAN_BYTES,
-        "plan exceeds {MAX_EXECUTION_PLAN_BYTES} bytes"
+        "plan exceeds the {MAX_EXECUTION_PLAN_BYTES}-byte limit: {} bytes",
+        content.len()
     );
     Ok(())
 }
@@ -106,21 +108,6 @@ pub(crate) fn harvest(worktree: &Path, execution_id: &str) -> anyhow::Result<Opt
         return Ok(None);
     };
     let content = read(&outbox.join(executors::OUTBOX_PLAN_FILE), &outbox)?;
-    if let Some(content) = &content {
-        anyhow::ensure!(
-            content.lines().any(|line| {
-                let bytes = line.trim_start_matches(' ').as_bytes();
-                bytes.len() >= 6
-                    && matches!(bytes[0], b'-' | b'*')
-                    && bytes[1] == b' '
-                    && bytes[2] == b'['
-                    && matches!(bytes[3], b' ' | b'x' | b'X')
-                    && bytes[4] == b']'
-                    && bytes[5] == b' '
-            }),
-            "execution plan has no checklist items"
-        );
-    }
     Ok(content)
 }
 
@@ -223,7 +210,25 @@ pub(crate) fn restore(worktree: &Path, execution_id: &str) -> anyhow::Result<()>
 }
 
 pub(crate) fn discard(worktree: &Path, execution_id: &str) -> anyhow::Result<()> {
-    match fs::remove_file(snapshot(worktree, execution_id)?) {
+    anyhow::ensure!(
+        executors::execution_id_is_path_safe(execution_id),
+        "invalid execution id"
+    );
+    let root = worktree
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workspace has no parent"))?;
+    if !root.exists() {
+        return Ok(());
+    }
+    let stage = root.join(".forge-plan-staging");
+    if stage.exists() {
+        anyhow::ensure!(
+            fs::symlink_metadata(&stage)?.is_dir()
+                && stage.canonicalize()?.starts_with(root.canonicalize()?),
+            "invalid plan staging directory"
+        );
+    }
+    match fs::remove_file(stage.join(format!("{execution_id}.transport.json"))) {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(error.into()),

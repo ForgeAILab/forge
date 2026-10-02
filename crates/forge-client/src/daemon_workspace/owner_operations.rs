@@ -22,12 +22,18 @@ impl DaemonWorkspaceBackend {
         if !matches!(
             &params.operation,
             WorkspaceOwnerOperation::ReleaseReviewCheckout
+                | WorkspaceOwnerOperation::DiscardPlan { .. }
         ) {
             owned = self
                 .live_workspace(&reference(&params.fence, &params.workspace_handle))
                 .await?;
         }
-        if !owned.cleaned {
+        if !owned.cleaned
+            && !matches!(
+                &params.operation,
+                WorkspaceOwnerOperation::DiscardPlan { .. }
+            )
+        {
             self.check_expected(&owned, &params.fence.expected).await?;
         }
         let outcome = match params.operation {

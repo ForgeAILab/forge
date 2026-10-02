@@ -138,7 +138,7 @@ placement skips steps 1–2 and only runs `describe` as a cheap precondition.
 
 Hard filters (candidate = one ready repo location):
 
-1. The owner is reachable. For a `daemon` owner: connected, protocol ≥ 4
+1. The owner is reachable. For a `daemon` owner: connected, protocol ≥ 3
    with `workspace.v1`, visible to the Task owner, runtime `ready`.
 2. The Agent's executor is installed, authenticated, and enabled on that
    owner, and the owner's advertised adapter capability facts for that
@@ -232,7 +232,7 @@ cleanup(placement)       -> CleanupAck
   and cleanup. The server sends the start seed in `execution.start.plan_text`;
   the daemon initializes its own outbox and returns `execution.terminal.plan_text`
   with the terminal journal record. The terminal CAS freezes the returned text
-  in the execution snapshot; the existing publication claim authorizes fenced
+  in private execution artifact storage; the existing publication claim authorizes fenced
   owner operations (`publish_plan`, `restore_plan`, `discard_plan`). The daemon
   retains a private prior-plan snapshot until workflow settlement, preserving
   publication and rollback replay. The capability `execution.plan_transport`
@@ -240,12 +240,26 @@ cleanup(placement)       -> CleanupAck
   `capability_missing`, while older protocol revisions yield
   `daemon_upgrade_required`. Remote candidates have a 128 KiB byte bound;
   capture failure fails the execution explicitly. Server-owned and shared-mount
-  plan storage remains unchanged.
+  plan storage retains the canonical/outbox layout. Both owners use the same
+  implementation-only checklist seed policy; planners never receive a seed.
+  Missing/invalid/unchanged required candidates use the existing workflow guard
+  rejection. Oversized candidates fail terminally and are acknowledged; plan
+  errors never replace failed/cancelled outcomes. Private transported storage is
+  redacted, inaccessible through the Execution API and excluded from config
+  snapshots and receipt bodies (digest/length only).
+  `.forge-plan-staging/` is a Task sibling containing frozen local candidates,
+  previous-plan/absent markers on the server, or per-execution
+  candidate/previous-plan publication snapshots on the daemon. Settlement,
+  abandon cleanup or workspace cleanup removes those execution files.
+  Owner errors persist backoff and a visible wait; disconnection uses the same
+  durable runtime-offline wait. Plan operations wait behind long workspace
+  commands and discard of missing/cleaned state succeeds.
 
-### D7. Daemon protocol revision 4
+### D7. Daemon protocol revision 3
 
-- `DAEMON_PROTOCOL_REVISION` becomes 4, and the handshake gains the
-  capability `workspace.v1`. The minimum command revision is 4. Revision-2 and revision-3
+- `DAEMON_PROTOCOL_REVISION` remains 3, and the handshake retains the
+  capability `workspace.v1`. Plan transport adds only the capability
+  `execution.plan_transport`; it does not raise the protocol revision. The minimum command revision is 3. Revision-1 and revision-2
   sockets remain visible for upgrade diagnostics but every command RPC is
   refused, including execution, filesystem browsing, verification, and PTY
   terminals. `daemon_upgrade_required` is a human-action refusal on Task
@@ -254,6 +268,10 @@ cleanup(placement)       -> CleanupAck
   and no capacity-only or transient-only alternative; the accepted upgraded handshake
   clears that refusal and wakes dispatch automatically. Reservation writes no Task
   annotation. A socket awaiting its handshake is not ready, not outdated.
+  A revision-3 daemon without plan transport remains eligible for reviewer,
+  interactive, server-owned shared-mount, filesystem and PTY work. Deterministic
+  capability refusals visibly identify the machine, stay parked without repeated
+  placement attempts, and wake when eligibility facts change.
   Upgrade the server first, then every daemon from the same release.
 - Every mutating request carries `{workspace_handle | placement_id,
   operation_id, generation, expected}`. The daemon records

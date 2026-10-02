@@ -2175,3 +2175,117 @@ async fn remote_plan_owner_publication_restore_and_discard_are_fenced() {
         .contains(&"active-next-turn".into()));
     fixture.assert_server_cannot_resolve_workspace();
 }
+
+#[tokio::test]
+async fn remote_plan_operations_wait_for_workspace_run_and_discard_cleaned_state() {
+    let fixture = Fixture::new("forge-plan-command-queue").await;
+    let placement = &fixture.resolved.placement;
+    let daemon = placement.daemon_id.as_deref().unwrap();
+    let client = fixture
+        .resolved
+        .backend
+        .daemon_client()
+        .unwrap()
+        .clone()
+        .with_timeout(Duration::from_millis(10));
+    let params = |operation| WorkspaceOwnerOperationParams {
+        fence: WorkspaceMutationFence {
+            daemon_id: daemon.into(),
+            runtime_id: placement.runtime_id.clone().unwrap(),
+            placement_id: placement.id.clone(),
+            operation_id: db::new_uuid_v4(),
+            generation: placement.generation as u64,
+            expected: WorkspaceOperationExpected::BaseSha {
+                sha: fixture.base_sha.clone(),
+            },
+        },
+        workspace_handle: placement.workspace_handle.clone().unwrap(),
+        operation,
+    };
+    let (path, _) = fixture.resolved.owner_paths().await.unwrap();
+    let worktree = PathBuf::from(path);
+    for (index, operation) in [
+        WorkspaceOwnerOperation::PublishPlan {
+            execution_id: "queued-plan".into(),
+            content: "- [ ] queued\n".into(),
+        },
+        WorkspaceOwnerOperation::RestorePlan {
+            execution_id: "queued-plan".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = format!("touch queue-ready-{index}; while [ ! -e queue-release-{index} ]; do sleep 0.01; done; printf 'owner command finished'");
+        let run = fixture.run(&command);
+        let settlement = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !worktree.join(format!("queue-ready-{index}")).exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "owner command acquired the lock"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let request = client.owner_operation(daemon, params(operation));
+            tokio::pin!(request);
+            let waiting = tokio::time::timeout(Duration::from_millis(50), &mut request).await;
+            let blocked = waiting.is_err();
+            std::fs::write(worktree.join(format!("queue-release-{index}")), "release").unwrap();
+            let result = match waiting {
+                Ok(result) => result,
+                Err(_) => request.await,
+            }
+            .unwrap();
+            assert!(blocked, "plan RPC waited beyond the ordinary 10ms timeout");
+            assert!(matches!(
+                result.outcome,
+                WorkspaceOwnerOperationOutcome::Applied
+            ));
+        };
+        let (run, ()) = tokio::join!(run, settlement);
+        assert_eq!(run.stdout_tail, "owner command finished");
+    }
+    let cleanup = params(WorkspaceOwnerOperation::DiscardPlan {
+        execution_id: "queued-plan".into(),
+    });
+    let normal = fixture.resolved.backend.daemon_client().unwrap();
+    let clean: WorkspaceCleanupResult = normal
+        .cleanup(
+            daemon,
+            WorkspaceCleanupParams {
+                fence: cleanup.fence.clone(),
+                workspace_handle: cleanup.workspace_handle.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(clean.cleaned);
+    let discard = || {
+        params(WorkspaceOwnerOperation::DiscardPlan {
+            execution_id: "queued-plan".into(),
+        })
+    };
+    assert!(matches!(
+        client
+            .owner_operation(daemon, discard())
+            .await
+            .unwrap()
+            .outcome,
+        WorkspaceOwnerOperationOutcome::Applied
+    ));
+    normal
+        .acknowledge(daemon, clean.entry_id.clone())
+        .await
+        .unwrap();
+    normal.retry_acknowledgements(daemon).await.unwrap();
+    fixture.wait_until_journal_empty().await;
+    assert!(matches!(
+        client
+            .owner_operation(daemon, discard())
+            .await
+            .unwrap()
+            .outcome,
+        WorkspaceOwnerOperationOutcome::Applied
+    ));
+}

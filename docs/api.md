@@ -2003,14 +2003,14 @@ the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
 conflict. The minimum command protocol revision is 3. A revision-2 daemon
 receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
-from the server's release (protocol revision 4 or newer). Every command RPC is
+from the server's release (protocol revision 3 or newer). Every command RPC is
 refused, including execution, repository verification, `fs.list`, `fs.branches`,
 workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
 `409 daemon_upgrade_required` with `needs_human: true`; placement rejection
 includes that filter code in `rejected_candidates`. An upgrade-only dispatch
 refusal records an actionable blocker and creates no Execution; reservation
 returns the typed error without modifying the Task. The heartbeat sweep clears
-upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 4.
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 3.
 Repository locations retain the upgrade reason in `last_error` after a verification
 attempt, without changing their verification status; pinned Agents expose
 `effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
@@ -3814,7 +3814,7 @@ blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
 The dispatch-failure annotation and Task metadata record the refused daemon IDs.
 The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
-daemon reconnects at revision 4, even when a blocking annotation was preserved.
+daemon reconnects at revision 3, even when a blocking annotation was preserved.
 Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
 `recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
 `before_work_hook_failed`, and `before_work_hook_timeout` annotations.
@@ -3867,30 +3867,41 @@ Task, Workspace, and Execution plan-artifact reads use the same owner router as
 dispatch. A daemon workspace handle is never interpreted as a server path.
 
 `execution.start.plan_text: string | null` carries the canonical plan for a
-plan-writing implementation role, falling back to `task.plan`; a planner revision
-receives the current `task.plan`. On daemon-owned placements the daemon prepares
+plan-writing implementation role, falling back to `task.plan`; planners receive no seed. On daemon-owned placements the daemon prepares
 `FORGE_PLAN_PATH` in its own execution outbox. `execution.terminal.plan_text:
 string | null` carries the exact candidate alongside `outbox_entries`, under the
 same report identity, journal, digest, replay, and acknowledgement rules.
 An absent terminal plan field is omitted, preserving retained report payloads
 that contain no plan. Remote plans are limited to 128 KiB; capture failures become explicit failed terminal
-reports. The server stores a successful candidate in the terminal execution
-snapshot and publishes through its owner after acquiring the existing publication
+reports. The server stores a successful candidate in private execution artifact storage and publishes through its owner after acquiring the existing publication
 claim. `workspace.reset.operation` supports `publish_plan { execution_id,
 content }`, `restore_plan { execution_id }`, and `discard_plan { execution_id }`.
 These operations retain owner/generation/HEAD fencing and private rollback
 snapshots. They can settle while another CLI turn runs because they affect
 sibling artifacts and the completed execution's private files.
-Plan-writing roles require `execution.plan_transport`; a revision-4 owner that
+Candidates are redacted against Project environment values and stored in the
+private `execution_plan_transport` table, never executor configuration snapshots,
+Execution API responses or receipt bodies. Receipts contain only the digest and
+byte length. Empty, checklist-free and unchanged-seed candidates use the ordinary
+workflow guard rejection; oversized candidates fail terminally and are acknowledged.
+Publication failures persist exponential backoff and a visible wait annotation;
+unreachable owners use the durable `runtime_offline` owner wait. Plan operations
+wait behind running owner checks, and discard of missing/cleaned state succeeds.
+
+Plan-writing roles require `execution.plan_transport`; a revision-3 owner that
 omits it is refused at placement with `capability_missing`, before an Execution
-exists. Server-owned and verified shared-mount plan files retain their layout and
+exists. Dispatcher refusals name the machine and missing capability, remain
+quiescent until eligibility changes, and clear automatically when a machine
+becomes eligible. Revision-3 daemons without this capability continue reviewer,
+interactive, server-owned shared-mount, filesystem and PTY work.
+Server-owned and verified shared-mount plan files retain their layout and
 1 MiB size limit.
 
 ### Workspace daemon protocol
 
-Protocol revision 4 negotiates `workspace.v1` and `execution.plan_transport` and is required for every command
+Protocol revision 3 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
-Revision-2 and revision-3 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Revision-1 and revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
 automatically after the daemon upgrade. Existing placements disconnect
 and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
@@ -3925,7 +3936,7 @@ limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
 of size truncation. These booleans default to false when absent.
 
 The single daemon journal retains terminal reports with bounded plan/worklog/evidence
-outbox content, operation results, and cleanup acknowledgements. Revision 4 uses
+outbox content, operation results, and cleanup acknowledgements. Revision 3 uses
 `journal.ack { entry_id }`. Retained terminal and cleanup results replay after
 reconnect until the server durably records their result and acknowledges it.
 Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt

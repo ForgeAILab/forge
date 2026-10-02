@@ -347,6 +347,59 @@ impl ResolvedWorkspace {
         }
     }
 
+    pub(crate) async fn apply_plan_operation(
+        &self,
+        operation: WorkspaceOwnerOperation,
+    ) -> Result<WorkspaceOwnerOperationOutcome> {
+        let discard = matches!(&operation, WorkspaceOwnerOperation::DiscardPlan { .. });
+        if discard && self.placement.state == db::PlacementState::Cleaned {
+            return Ok(WorkspaceOwnerOperationOutcome::Applied);
+        }
+        let reference = self.owner_reference()?;
+        let state = self
+            .owner_client()?
+            .describe_for_plan(
+                &reference.daemon_id,
+                api_types::WorkspaceDescribeParams {
+                    workspace: reference.clone(),
+                },
+            )
+            .await
+            .map_err(|error| self.owner_error(error));
+        let head = match state {
+            Ok(state) if discard && !state.exists => {
+                return Ok(WorkspaceOwnerOperationOutcome::Applied)
+            }
+            Ok(state) => state.head_sha.unwrap_or_default(),
+            Err(error)
+                if discard && crate::workspace_backend::is_unknown_workspace_handle(&error) =>
+            {
+                return Ok(WorkspaceOwnerOperationOutcome::Applied)
+            }
+            Err(error) => return Err(error),
+        };
+        let result = self
+            .owner_client()?
+            .owner_operation(
+                &reference.daemon_id,
+                WorkspaceOwnerOperationParams {
+                    fence: WorkspaceMutationFence {
+                        daemon_id: reference.daemon_id.clone(),
+                        runtime_id: reference.runtime_id,
+                        placement_id: reference.placement_id,
+                        operation_id: db::new_uuid_v4(),
+                        generation: reference.generation,
+                        expected: WorkspaceOperationExpected::BaseSha { sha: head },
+                    },
+                    workspace_handle: reference.workspace_handle,
+                    operation,
+                },
+            )
+            .await
+            .map_err(|error| self.owner_error(error))?;
+        Ok(result.outcome)
+    }
+
     pub(crate) async fn apply_owner_operation(
         &self,
         operation: WorkspaceOwnerOperation,

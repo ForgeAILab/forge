@@ -102,9 +102,11 @@ pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
         .is_some_and(|text| text.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES)
     {
         report.plan_text = None;
-        report.status = Some("failed".into());
-        report.exit_code = Some(1);
-        report.error = Some("execution plan exceeds transport size bound".into());
+        if report.status.as_deref() == Some("completed") {
+            report.status = Some("failed".into());
+            report.exit_code = Some(1);
+            report.error = Some("execution plan exceeds transport size bound".into());
+        }
     }
     let mut dropped = 0;
     while serde_json::to_vec(report)
@@ -137,10 +139,12 @@ pub(crate) fn fit_report(report: &mut ExecutionTerminalNotification) {
             .unwrap_or(true)
         {
             report.plan_text = None;
-            report.status = Some("failed".into());
-            report.exit_code = Some(1);
-            report.error =
-                Some("execution plan cannot fit in the terminal report size bound".into());
+            if report.status.as_deref() == Some("completed") {
+                report.status = Some("failed".into());
+                report.exit_code = Some(1);
+                report.error =
+                    Some("execution plan cannot fit in the terminal report size bound".into());
+            }
         }
     }
 }

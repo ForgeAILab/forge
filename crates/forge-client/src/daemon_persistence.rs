@@ -689,6 +689,17 @@ pub(crate) fn journal_request(request: &Value) -> Value {
                 }
             }
         }
+        if let Some(operation) = object
+            .get_mut("operation")
+            .filter(|op| op["kind"] == "publish_plan")
+        {
+            if let Some(content) = operation["content"].as_str().map(str::to_owned) {
+                operation["content_digest"] =
+                    Value::String(format!("{:x}", Sha256::digest(content.as_bytes())));
+                operation["content_length"] = serde_json::json!(content.len());
+                operation.as_object_mut().unwrap().remove("content");
+            }
+        }
         let digest = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&retained).expect("JSON value serializes"))
@@ -731,6 +742,9 @@ pub(crate) fn sanitize_terminal_report(
         .into_iter()
         .flatten()
     {
+        *text = executors::environment::redact_environment_values(text, env);
+    }
+    if let Some(text) = &mut report.plan_text {
         *text = executors::environment::redact_environment_values(text, env);
     }
     for entry in &mut report.outbox_entries {
@@ -1621,6 +1635,7 @@ mod tests {
         let mut report = notification("report-1");
         report.summary = Some("printed 1".into());
         report.error = Some("error 1".into());
+        report.plan_text = Some("- [ ] secret 1".into());
         report
             .outbox_entries
             .push(api_types::ExecutionOutboxEntry::Worklog {
@@ -1640,6 +1655,7 @@ mod tests {
         assert_eq!(stored.execution_id, "execution-1");
         assert_eq!(stored.summary.as_deref(), Some("printed [REDACTED]"));
         assert_eq!(stored.error.as_deref(), Some("error [REDACTED]"));
+        assert_eq!(stored.plan_text.as_deref(), Some("- [ ] secret [REDACTED]"));
         let api_types::ExecutionOutboxEntry::Worklog {
             position, summary, ..
         } = &stored.outbox_entries[0]

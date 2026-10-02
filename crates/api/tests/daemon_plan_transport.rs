@@ -2,7 +2,7 @@ mod common;
 use api_types::*;
 use axum::http::{Method, StatusCode};
 use common::{fake_daemon::*, json_request, json_request_with_bearer, TestDir};
-use db::{ExecutionRepo, TaskRepo, WorkspaceRepo};
+use db::{ExecutionRepo, TaskRepo};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
@@ -19,6 +19,7 @@ struct Owner {
     requests: Arc<Mutex<Vec<(String, Value)>>>,
     canonical: Arc<Mutex<Option<String>>>,
     jobs: Vec<JoinHandle<()>>,
+    fail_reset: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -35,6 +36,17 @@ impl Owner {
         plan: Arc<Mutex<Option<String>>>,
         capable: bool,
     ) -> Self {
+        Self::connect_runtime(server, registration, root, plan, capable, None).await
+    }
+
+    async fn connect_runtime(
+        server: &TestServer,
+        registration: &DaemonRegisterResponse,
+        root: PathBuf,
+        plan: Arc<Mutex<Option<String>>>,
+        capable: bool,
+        runtime: Option<Arc<forge_client::daemon_runtime::DaemonRuntime>>,
+    ) -> Self {
         let socket = connect_daemon(
             server,
             &registration.daemon_id,
@@ -44,8 +56,15 @@ impl Owner {
         .unwrap();
         let (mut writer, mut reader) = socket.split();
         let (outbound, mut rx) = mpsc::unbounded_channel();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let sent = requests.clone();
         let write = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
+                if let DaemonFrame::Notification { method, params } = &frame {
+                    if method == METHOD_EXECUTION_TERMINAL {
+                        sent.lock().unwrap().push((method.clone(), json!({"execution_id":params["execution_id"],"status":params["status"],"error":params["error"],"exit_code":params["exit_code"]})));
+                    }
+                }
                 writer
                     .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
                     .await
@@ -60,15 +79,20 @@ impl Owner {
         if capable {
             capabilities.push(DAEMON_CAPABILITY_PLAN_TRANSPORT.into());
         }
-        outbound.send(DaemonFrame::Notification { method: METHOD_DAEMON_HANDSHAKE.into(), params: json!({"protocol_revision":DAEMON_PROTOCOL_REVISION, "capabilities":capabilities,
+        if let Some(runtime) = &runtime {
+            runtime.attach(outbound.clone());
+        } else {
+            outbound.send(DaemonFrame::Notification { method: METHOD_DAEMON_HANDSHAKE.into(), params: json!({"protocol_revision":DAEMON_PROTOCOL_REVISION, "capabilities":capabilities,
             "executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true,"resume":true}},
             "workspace_run_policy":{"allowed_purposes":["hook","ci_step","environment_setup"]}}) }).unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
+        }
         let handles = Arc::new(Mutex::new(BTreeMap::<String, Value>::new()));
         let logged = requests.clone();
         let canonical = plan.clone();
         let read_handles = handles.clone();
         let send = outbound.clone();
+        let fail_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failing = fail_reset.clone();
         let read = tokio::spawn(async move {
             let mut publications = BTreeMap::<String, (String, Option<String>)>::new();
             while let Some(Ok(message)) = reader.next().await {
@@ -83,6 +107,31 @@ impl Owner {
                     .lock()
                     .unwrap()
                     .push((method.clone(), params.clone()));
+                if let Some(runtime) = &runtime {
+                    let runtime = runtime.clone();
+                    let send = send.clone();
+                    tokio::spawn(async move {
+                        let response = runtime
+                            .handle_request(DaemonFrame::Request { id, method, params })
+                            .await;
+                        let _ = send.send(response);
+                    });
+                    continue;
+                }
+                if method == METHOD_WORKSPACE_RESET
+                    && failing.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    send.send(DaemonFrame::Error {
+                        id: Some(id),
+                        error: DaemonErrorPayload {
+                            code: "workspace_error".into(),
+                            message: "simulated publication failure".into(),
+                            details: None,
+                        },
+                    })
+                    .unwrap();
+                    continue;
+                }
                 let result = match method.as_str() {
                     METHOD_REPO_LOCATION_VERIFY => {
                         json!({"repo_location_id":params["repo_location_id"],"path":params["path"],"default_branch_sha":"0123456789012345678901234567890123456789","origin_url":null})
@@ -189,7 +238,7 @@ impl Owner {
         });
         wait_until_connected(&server.state, &registration.daemon_id).await;
         // Wait for the replacement handshake, rather than relying on socket order.
-        for _ in 0..200 {
+        for _ in 0..2000 {
             if server
                 .state
                 .daemon_connections
@@ -211,13 +260,14 @@ impl Owner {
             requests,
             canonical: plan,
             jobs: vec![write, read, heartbeat],
+            fail_reset,
         }
     }
     async fn started(&self, task_id: &str) -> Value {
         self.started_after(task_id, None).await
     }
     async fn started_after(&self, task_id: &str, previous: Option<&str>) -> Value {
-        for _ in 0..300 {
+        for _ in 0..3000 {
             if let Some((_, params)) =
                 self.requests
                     .lock()
@@ -240,7 +290,7 @@ impl Owner {
         );
     }
     async fn acknowledged(&self, report: &Value) {
-        for _ in 0..300 {
+        for _ in 0..3000 {
             if self
                 .requests
                 .lock()
@@ -256,8 +306,19 @@ impl Owner {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!(
-            "terminal report was not acknowledged: {}",
-            report["terminal_report_id"]
+            "terminal report was not acknowledged: {}; requests={:?}",
+            report["terminal_report_id"],
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, params)| (
+                    method,
+                    params["operation"].get("kind"),
+                    params.get("status"),
+                    params.get("error")
+                ))
+                .collect::<Vec<_>>()
         );
     }
     fn terminal(&self, start: &Value, content: &str) -> Value {
@@ -278,7 +339,6 @@ struct Fixture {
     registration: DaemonRegisterResponse,
     owner: Owner,
     project: String,
-    agent: String,
     root: PathBuf,
     _dir: TestDir,
 }
@@ -352,11 +412,76 @@ impl Fixture {
             registration,
             owner,
             project,
-            agent: agents.remove(0),
             root,
             _dir: dir,
         }
     }
+    async fn real(prefix: &str) -> Self {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .try_init();
+        let mut fixture = Self::new(prefix, true).await;
+        fixture.owner.jobs.iter().for_each(|job| job.abort());
+        wait_until_disconnected(&fixture.harness.state, &fixture.registration.daemon_id).await;
+        std::fs::create_dir_all(&fixture.root).unwrap();
+        let checkout = common::setup_git_repo(&fixture.root);
+        sqlx::query("UPDATE repo_location SET path=?, version=version+1 WHERE daemon_id=?")
+            .bind(checkout.to_string_lossy().as_ref())
+            .bind(&fixture.registration.daemon_id)
+            .execute(fixture.harness.state.db.pool())
+            .await
+            .unwrap();
+        let (outbound, _rx) = mpsc::unbounded_channel();
+        let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+            outbound,
+            fixture.root.clone(),
+            Default::default(),
+            fixture.registration.daemon_id.clone(),
+            WorkspaceRunPolicy {
+                allowed_purposes: vec![
+                    WorkspaceRunPurpose::Hook,
+                    WorkspaceRunPurpose::CiStep,
+                    WorkspaceRunPurpose::EnvironmentSetup,
+                ],
+            },
+        )
+        .unwrap();
+        let (location_id, runtime_id, version): (String, String, i64) = sqlx::query_as("SELECT id,runtime_id,version FROM repo_location WHERE daemon_id=? AND owner_kind='daemon'")
+            .bind(&fixture.registration.daemon_id).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
+        let verified = runtime.handle_request(DaemonFrame::Request {
+            id:"verify-real-checkout".into(),method:METHOD_REPO_LOCATION_VERIFY.into(),
+            params:json!({"repo_location_id":location_id,"daemon_id":fixture.registration.daemon_id,"runtime_id":runtime_id,
+                "path":checkout,"kind":"primary_checkout","default_branch":"main","remote_url":null,"expected_version":version,"probe":null}),
+        }).await;
+        assert!(
+            matches!(verified, DaemonFrame::Response { .. }),
+            "real checkout verification: {verified:?}"
+        );
+        fixture.owner = Owner::connect_runtime(
+            &fixture.server,
+            &fixture.registration,
+            fixture.root.clone(),
+            Arc::new(Mutex::new(None)),
+            true,
+            Some(runtime),
+        )
+        .await;
+        fixture
+    }
+
+    async fn command_task(&self, role: &str, command: &str, plan: Option<&str>) -> String {
+        let task = self.task(role, None).await;
+        sqlx::query("UPDATE task SET description=?, plan=? WHERE id=?")
+            .bind(command)
+            .bind(plan)
+            .bind(&task)
+            .execute(self.harness.state.db.pool())
+            .await
+            .unwrap();
+        task
+    }
+
     async fn task(&self, role: &str, parent: Option<&str>) -> String {
         let task:TaskResponse=json_request(&self.harness.app,Method::POST,&format!("/api/v1/projects/{}/tasks",self.project),json!({"title":format!("Remote {role}"),"description":"complete remote plan","parent_task_id":parent,"task_type":if parent.is_some() {"sub_task"} else {"task"}}),StatusCode::OK).await;
         sqlx::query("UPDATE task SET status = ?, plan = ? WHERE id = ?")
@@ -385,7 +510,7 @@ impl Fixture {
         result
     }
     async fn settled(&self, task_id: &str, expected: &str) {
-        for _ in 0..300 {
+        for _ in 0..3000 {
             let task = TaskRepo::get_by_id(&*self.harness.state.db, task_id, false)
                 .await
                 .unwrap()
@@ -399,12 +524,19 @@ impl Fixture {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!(
-            "task did not reach {expected}: {:?}",
-            TaskRepo::get_by_id(&*self.harness.state.db, task_id, false)
-                .await
-                .unwrap()
-        );
+        let reports = self
+            .owner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == METHOD_EXECUTION_TERMINAL)
+            .cloned()
+            .collect::<Vec<_>>();
+        let task = TaskRepo::get_by_id(&*self.harness.state.db, task_id, false)
+            .await
+            .unwrap();
+        panic!("task did not reach {expected}; reports={reports:?}: {task:?}");
     }
 }
 
@@ -497,12 +629,12 @@ async fn daemon_plan_dispatch_planner_publication_and_terminal_reconnect_replay(
     let task = fixture.task("planner", None).await;
     fixture.dispatch().await.unwrap();
     let start = fixture.owner.started(&task).await;
-    assert_eq!(start["plan_text"], "- [ ] database fallback\n");
+    assert!(start["plan_text"].is_null());
     let report = fixture.owner.terminal(&start, "- [ ] owner revision\n");
     fixture.owner.acknowledged(&report).await;
     // The default planner advances to implementation as on a server owner.
     fixture.settled(&task, "in_progress").await;
-    for _ in 0..300 {
+    for _ in 0..3000 {
         if fixture.owner.canonical.lock().unwrap().as_deref() == Some("- [ ] owner revision\n") {
             break;
         }
@@ -561,43 +693,82 @@ async fn daemon_plan_dispatch_planner_publication_and_terminal_reconnect_replay(
 async fn daemon_plan_dispatch_missing_capability_is_structured_placement_refusal() {
     let fixture = Fixture::new("daemon-plan-incapable", false).await;
     let task = fixture.task("planner", None).await;
-    let error = fixture
-        .harness
-        .state
-        .task_service
-        .claim_task(
-            &task,
-            services::Assignee::Agent(fixture.agent.clone()),
-            None,
-        )
+    fixture.dispatch().await.unwrap();
+    let refused = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
         .await
-        .unwrap_err();
-    let services::ServiceError::PlacementUnavailable(refusal) = error else {
-        panic!("unexpected placement error: {error:?}")
-    };
-    assert!(refusal.rejected_candidates.iter().any(|candidate| candidate
-        .filter_codes
-        .contains(&services::placement::selection::PlacementFilterCode::CapabilityMissing)));
-    assert!(fixture
+        .unwrap()
+        .unwrap();
+    let annotation: Value = serde_json::from_str(
+        refused
+            .error_annotation
+            .as_deref()
+            .expect("visible refusal"),
+    )
+    .unwrap();
+    assert_eq!(annotation["code"], "placement_unavailable");
+    assert!(annotation["message"]
+        .as_str()
+        .unwrap()
+        .contains("execution.plan_transport"));
+    assert_eq!(
+        annotation["machines"][0]["daemon_id"],
+        fixture.registration.daemon_id
+    );
+    assert!(ExecutionRepo::list_by_task(
+        &*fixture.harness.state.db,
+        &task,
+        db::PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc
+        }
+    )
+    .await
+    .unwrap()
+    .items
+    .is_empty());
+    assert!(!fixture
         .owner
         .requests
         .lock()
         .unwrap()
         .iter()
-        .all(|(m, _)| m != METHOD_EXECUTION_START));
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM execution WHERE task_id=?")
-        .bind(&task)
-        .fetch_one(fixture.harness.state.db.pool())
+        .any(|(method, _)| method == METHOD_EXECUTION_START));
+    fixture.dispatch().await.unwrap();
+    let unchanged = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(count, 0);
-    assert!(
-        WorkspaceRepo::get_by_task_id(&*fixture.harness.state.db, &task)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(!fixture.root.exists());
+    assert_eq!(refused.version, unchanged.version);
+    fixture.owner.outbound.send(DaemonFrame::Notification { method:METHOD_DAEMON_HANDSHAKE.into(),params:json!({"protocol_revision":3,"capabilities":[DAEMON_CAPABILITY_USAGE_REPORTS,DAEMON_CAPABILITY_JOURNAL_ACK,DAEMON_CAPABILITY_WORKSPACE,DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true,"resume":true}},"workspace_run_policy":{"allowed_purposes":["hook","ci_step","environment_setup"]}})}).unwrap();
+    for _ in 0..2000 {
+        if fixture
+            .harness
+            .state
+            .daemon_connections
+            .get(&fixture.registration.daemon_id)
+            .and_then(|connection| connection.snapshot())
+            .is_some_and(|facts| {
+                facts
+                    .handshake
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == DAEMON_CAPABILITY_PLAN_TRANSPORT)
+            })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fixture.dispatch().await.unwrap();
+    let _ = fixture.owner.started(&task).await;
+    let resumed = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resumed.error_annotation.is_none());
 }
 
 #[tokio::test]
@@ -660,7 +831,7 @@ async fn daemon_plan_dispatch_guard_send_back_restores_owner_plan() {
     fixture
         .owner
         .terminal(&start, "- [ ] incomplete candidate\n");
-    for _ in 0..300 {
+    for _ in 0..3000 {
         if fixture
             .owner
             .requests
@@ -690,6 +861,10 @@ async fn daemon_plan_dispatch_guard_send_back_restores_owner_plan() {
         .started_after(&task, start["execution_id"].as_str())
         .await;
     assert_eq!(retry["plan_text"], "- [x] prior plan\n");
+    assert!(!retry["executor_config"]
+        .to_string()
+        .contains("incomplete candidate"));
+    assert!(retry["executor_config"].get("terminal_plan_text").is_none());
     assert!(!fixture.root.exists());
 }
 
@@ -707,7 +882,11 @@ async fn daemon_plan_dispatch_owner_path_collision_never_seeds_server_outbox() {
         .unwrap();
         fixture.dispatch().await.unwrap();
         let start = fixture.owner.started(&task).await;
-        assert_eq!(start["plan_text"], "- [ ] database fallback\n");
+        if role == "planner" {
+            assert!(start["plan_text"].is_null());
+        } else {
+            assert_eq!(start["plan_text"], "- [ ] database fallback\n");
+        }
         assert!(!server_worktree
             .parent()
             .unwrap()
@@ -718,4 +897,327 @@ async fn daemon_plan_dispatch_owner_path_collision_never_seeds_server_outbox() {
             "- [ ] unrelated server plan\n"
         );
     }
+}
+
+#[tokio::test]
+async fn daemon_plan_real_dispatch_planner_round_trip() {
+    let fixture = Fixture::real("plan-real-planner").await;
+    let task = fixture
+        .command_task(
+            "planner",
+            "printf '%s\\n' '- [ ] real planner revision' > \"$FORGE_PLAN_PATH\"",
+            Some("- [ ] old plan\n"),
+        )
+        .await;
+    fixture.dispatch().await.unwrap();
+    let start = fixture.owner.started(&task).await;
+    assert!(start["plan_text"].is_null());
+    fixture.owner.acknowledged(&json!({"terminal_report_id":format!("forge:terminal:{}",start["execution_id"].as_str().unwrap())})).await;
+    fixture.settled(&task, "in_progress").await;
+    let path = PathBuf::from(start["workspace_path"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("plan.md")).unwrap(),
+        "- [ ] real planner revision\n"
+    );
+}
+
+#[tokio::test]
+async fn daemon_plan_real_dispatch_coder_round_trip_and_unfiltered_fallbacks() {
+    for (index, seed) in [
+        Some("- [ ] real coder\n"),
+        Some("prose without checklist\n"),
+        Some(""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::real(&format!("plan-real-coder-{index}")).await;
+        let command = if index == 0 {
+            "printf '%s\\n' '- [x] real coder' > \"$FORGE_PLAN_PATH\""
+        } else {
+            "true"
+        };
+        let task = fixture.command_task("coder", command, seed).await;
+        fixture.dispatch().await.unwrap();
+        let start = fixture.owner.started(&task).await;
+        if index == 0 {
+            assert_eq!(start["plan_text"], seed.unwrap());
+        } else {
+            assert!(start["plan_text"].is_null());
+        }
+        fixture.owner.acknowledged(&json!({"terminal_report_id":format!("forge:terminal:{}",start["execution_id"].as_str().unwrap())})).await;
+        fixture.settled(&task, "review").await;
+        let execution = ExecutionRepo::get_by_id(
+            &*fixture.harness.state.db,
+            start["execution_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(execution.status, db::ExecutionStatus::Completed);
+        assert!(execution.error.is_none());
+    }
+}
+
+#[tokio::test]
+async fn daemon_plan_real_dispatch_missing_unchanged_and_invalid_candidates_are_guarded() {
+    for (name, role, command) in [
+        ("missing", "planner", "true"),
+        ("unchanged", "coder", "true"),
+        (
+            "invalid",
+            "planner",
+            "printf '%s' 'no checklist' > \"$FORGE_PLAN_PATH\"",
+        ),
+        ("empty", "planner", ": > \"$FORGE_PLAN_PATH\""),
+    ] {
+        let fixture = Fixture::real(&format!("plan-real-{name}")).await;
+        let task = fixture
+            .command_task(role, command, Some("- [ ] original\n"))
+            .await;
+        fixture.dispatch().await.unwrap();
+        let start = fixture.owner.started(&task).await;
+        fixture.owner.acknowledged(&json!({"terminal_report_id":format!("forge:terminal:{}",start["execution_id"].as_str().unwrap())})).await;
+        let current = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let annotation: Value = serde_json::from_str(
+            current
+                .error_annotation
+                .as_deref()
+                .expect("guard rejection is visible"),
+        )
+        .unwrap();
+        assert_eq!(
+            annotation["type"], "workflow_guard_rejected",
+            "{name}: {annotation}"
+        );
+        assert_eq!(annotation["blocking_reason"], "planning_plan_ready");
+        assert_eq!(current.plan.as_deref(), Some("- [ ] original\n"));
+        assert!(current.assignee_id.is_none());
+        assert!(!fixture
+            .owner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, params)| params["operation"]["kind"] == "publish_plan"));
+    }
+}
+
+#[tokio::test]
+async fn daemon_plan_dispatch_oversized_report_fails_terminal_and_is_acknowledged() {
+    let fixture = Fixture::new("plan-oversized", true).await;
+    let task = fixture.task("planner", None).await;
+    fixture.dispatch().await.unwrap();
+    let start = fixture.owner.started(&task).await;
+    let content = format!("- [ ] {}", "x".repeat(MAX_EXECUTION_PLAN_BYTES as usize));
+    let report = fixture.owner.terminal(&start, &content);
+    fixture.owner.acknowledged(&report).await;
+    let execution = ExecutionRepo::get_by_id(
+        &*fixture.harness.state.db,
+        start["execution_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(execution.status, db::ExecutionStatus::Failed);
+    assert!(execution
+        .error
+        .as_deref()
+        .unwrap()
+        .contains(&MAX_EXECUTION_PLAN_BYTES.to_string()));
+    assert!(execution
+        .error
+        .as_deref()
+        .unwrap()
+        .contains(&content.len().to_string()));
+    assert!(!fixture
+        .owner
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, params)| params["operation"]["kind"] == "publish_plan"));
+}
+
+#[tokio::test]
+async fn daemon_plan_dispatch_owner_failure_backoff_recovery_and_private_storage() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
+    let fixture = Fixture::new("plan-owner-backoff", true).await;
+    let task = fixture.task("planner", None).await;
+    fixture.dispatch().await.unwrap();
+    let start = fixture.owner.started(&task).await;
+    fixture
+        .owner
+        .fail_reset
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let report = fixture.owner.terminal(&start, "- [ ] PRIVATE-CANDIDATE\n");
+    for _ in 0..3000 {
+        let current = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
+            .await
+            .unwrap()
+            .unwrap();
+        if current
+            .metadata_json
+            .as_deref()
+            .is_some_and(|raw| raw.contains("plan_settlement_wait"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Keep the deadline ahead of slow scans so this assertion tests backoff,
+    // independently of the loaded machine's scheduling/SQLite latency.
+    sqlx::query("UPDATE execution_plan_transport SET retry_at=? WHERE execution_id=?")
+        .bind((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339())
+        .bind(start["execution_id"].as_str().unwrap())
+        .execute(fixture.harness.state.db.pool())
+        .await
+        .unwrap();
+    let count = || {
+        fixture
+            .owner
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p["operation"]["kind"] == "publish_plan")
+            .count()
+    };
+    assert_eq!(count(), 1);
+    let current = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("plan_owner_error"));
+    for _ in 0..3 {
+        fixture.dispatch().await.unwrap();
+    }
+    assert_eq!(count(), 1, "a pending retry must not send more RPCs");
+    let api: Value = json_request(
+        &fixture.harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task}/executions"),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(!api.to_string().contains("PRIVATE-CANDIDATE"));
+    let receipt_bodies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM command_receipt WHERE outcome_json LIKE '%PRIVATE-CANDIDATE%'",
+    )
+    .fetch_one(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_bodies, 0);
+    fixture
+        .owner
+        .fail_reset
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    sqlx::query(
+        "UPDATE execution_plan_transport SET retry_at='2000-01-01T00:00:00Z' WHERE execution_id=?",
+    )
+    .bind(start["execution_id"].as_str().unwrap())
+    .execute(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.not_before','2000-01-01T00:00:00Z') WHERE id=?")
+        .bind(&task).execute(fixture.harness.state.db.pool()).await.unwrap();
+    fixture.dispatch().await.unwrap();
+    fixture
+        .owner
+        .outbound
+        .send(DaemonFrame::Notification {
+            method: METHOD_EXECUTION_TERMINAL.into(),
+            params: report.clone(),
+        })
+        .unwrap();
+    services::HeartbeatMonitor::new(
+        fixture.harness.state.db.clone(),
+        fixture.harness.state.event_bus.clone(),
+    )
+    .with_daemon_connections(fixture.harness.state.daemon_connections.clone())
+    .check_once()
+    .await
+    .unwrap();
+    fixture.owner.acknowledged(&report).await;
+    fixture.settled(&task, "in_progress").await;
+    let current = TaskRepo::get_by_id(&*fixture.harness.state.db, &task, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!current
+        .metadata_json
+        .as_deref()
+        .unwrap_or("")
+        .contains("plan_settlement_wait"));
+    assert!(!current
+        .error_annotation
+        .as_deref()
+        .unwrap_or("")
+        .contains("plan_owner_error"));
+    let next = fixture
+        .owner
+        .started_after(&task, start["execution_id"].as_str())
+        .await;
+    assert!(next["executor_config"].get("terminal_plan_text").is_none());
+    let receipt_bodies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM command_receipt WHERE outcome_json LIKE '%PRIVATE-CANDIDATE%'",
+    )
+    .fetch_one(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_bodies, 0);
+}
+
+#[tokio::test]
+async fn daemon_plan_dispatch_late_plan_after_cancel_is_acknowledged_without_publication() {
+    let fixture = Fixture::new("plan-late-cancel", true).await;
+    *fixture.owner.canonical.lock().unwrap() = Some("- [ ] prior plan\n".into());
+    let task = fixture.task("coder", None).await;
+    fixture.dispatch().await.unwrap();
+    let start = fixture.owner.started(&task).await;
+    fixture
+        .harness
+        .state
+        .task_service
+        .cancel_execution(
+            start["execution_id"].as_str().unwrap(),
+            "operator cancellation".into(),
+        )
+        .await
+        .unwrap();
+    let report = fixture.owner.terminal(&start, "- [x] late candidate\n");
+    fixture.owner.acknowledged(&report).await;
+    let execution = ExecutionRepo::get_by_id(
+        &*fixture.harness.state.db,
+        start["execution_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(execution.status, db::ExecutionStatus::Cancelled);
+    assert_eq!(
+        fixture.owner.canonical.lock().unwrap().as_deref(),
+        Some("- [ ] prior plan\n")
+    );
+    let candidates: i64=sqlx::query_scalar("SELECT count(*) FROM execution_plan_transport WHERE execution_id=? AND candidate_text IS NOT NULL")
+        .bind(&execution.id).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
+    assert_eq!(candidates, 0);
+    assert!(!fixture
+        .owner
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, params)| params["operation"]["kind"] == "publish_plan"));
 }

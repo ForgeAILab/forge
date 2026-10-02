@@ -603,13 +603,30 @@ For a server-owned workspace (including verified shared mounts), this broker
 uses the same local sibling and staging files. For a daemon-owned workspace,
 the server reads canonical text through the owner router and sends it in
 `execution.start.plan_text`; implementation roles use the canonical plan with
-`task.plan` as fallback, while a planner revision receives the current `task.plan`.
-The daemon seeds its private outbox locally and returns the exact candidate in
+`task.plan` as fallback, and only valid checklists are seeded; planners are never seeded.
+The daemon prepares its private outbox locally and returns the exact candidate in
 `execution.terminal.plan_text`. The winning terminal CAS stores that candidate
-in the execution snapshot (`terminal_plan_text`), together with the existing
-terminal receipt. The publication claim then authorizes a fenced owner-local
+in the private `execution_plan_transport` table, in the same transaction as the
+terminal receipt. Plan bodies are redacted against Project environment values
+and absent from executor snapshots, the Execution API, and operation receipt
+bodies; receipts retain only the digest and byte length. The publication claim then authorizes a fenced owner-local
 `publish_plan` operation. The owner preserves the prior canonical plan in a
 private snapshot for idempotent publication, compare-safe rollback, and cleanup.
+The private Task sibling `.forge-plan-staging/` holds frozen server candidates,
+and prior canonical plan bytes (or an absent-plan marker). On a daemon it holds `<execution>.transport.json` with the candidate and
+prior canonical text for idempotent publication and compare-safe rollback.
+Settlement or abandoned-publication cleanup removes each execution's files;
+workspace cleanup removes the entire Task directory. The private database table
+retains the winning transported artifact until its Execution is deleted.
+Empty, checklist-free and missing required candidates use the existing bounded
+workflow guard rejection. Unchanged daemon seed content uses that same guard. Oversized remote
+candidates terminalize as failed and are acknowledged with the actual byte size
+and limit. Failed or cancelled executor outcomes retain their original reason.
+Owner settlement errors persist exponential retry backoff and a visible Task
+wait annotation; unreachable owners also carry `runtime_offline`, `owner_wait`,
+and `deferred_dispatch`. Successful settlement clears that wait. Plan RPCs wait
+behind long owner `workspace.run` commands, and discarding an already cleaned
+workspace succeeds.
 These artifact operations preserve owner/generation/HEAD fences and can settle
 while the next CLI turn runs; they do not mutate tracked repository files.
 The server never opens the daemon's worktree or outbox path; there is no
@@ -2528,13 +2545,19 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 4 retains `workspace.v1` and adds `execution.plan_transport`: `repo_location.verify`,
+Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
+Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
+A revision-3 daemon without it can still run reviewers, interactive executions,
+server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
+placement refusals record a structured Task annotation naming the machine and
+missing capability. Dispatch waits until eligibility facts change, then clears
+the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 4 or newer), restarting each with its existing
+release (protocol revision 3 or newer), restarting each with its existing
 `--workspace-root`.
-A revision-2 or revision-3 connection receives `daemon_upgrade_required` and cannot use any
+A connection below revision 3 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -2542,10 +2565,10 @@ shows `upgrade_required`; pinned Agents and refused Task admissions carry
 server's release. Repository locations retain upgrade reasons after a verification
 attempt, without changing their verification status. Task admission is an upgrade refusal only
 when an otherwise eligible owner is blocked solely by the upgrade (disregarding
-facts absent from the revision-3 handshake), and no owner is blocked solely by
+facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

@@ -179,7 +179,7 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         return Ok(());
     };
     let resolved = router.resolve(db, &workspace).await?;
-    crate::plan_artifact::ExecutionPlan::new(&resolved)
+    crate::plan_artifact::ExecutionPlan::new(db, &resolved)
         .discard(execution_id)
         .await
         .map_err(|error| {

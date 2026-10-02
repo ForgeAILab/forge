@@ -45,11 +45,11 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 4 adds owner-local plan delivery and terminal plan transport.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 4;
-/// Every command RPC requires revision 4.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 4;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 4 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 3 provides workspace operations; plan transport is capability-gated.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 3;
+/// Every command RPC requires revision 3.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 3;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 3 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -1239,8 +1239,8 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 4);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 4);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 3);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 3);
     }
 
     #[test]

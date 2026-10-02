@@ -367,7 +367,7 @@ impl TaskService {
                     crate::plan_artifact::prepare_execution_plan_outbox(
                         std::path::Path::new(&params.workspace_path),
                         &execution.id,
-                        matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                        &execution.role,
                         task.plan.as_deref(),
                     )
                     .map_err(|error| {
@@ -774,7 +774,7 @@ impl TaskService {
                 )
                 .await?,
                 &execution_id,
-                matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                &execution.role,
                 task.plan.as_deref(),
             ) {
                 if let Some(outbox) = executors::execution_outbox_path(
@@ -2328,6 +2328,9 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        if let Some(config) = executor_config.as_object_mut() {
+            config.remove("terminal_plan_text");
+        }
         executor_config["_forge_plan_transport"] =
             json!(resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon);
         if read_only_execution_role(&execution.role)
@@ -2366,27 +2369,38 @@ impl TaskService {
         .map_err(ServiceError::invalid_operation)?;
         let max_turns = self.resolve_max_turns(&task).await?;
 
+        let canonical = if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+            && matches!(execution.role.as_str(), "worker" | "coder" | "executor")
+        {
+            crate::plan_artifact::read_plan_text_with_router(
+                &self.db,
+                &self.workspace_backend_router,
+                workspace_id,
+            )
+            .await
+            .map_err(|error| error.into_service_error("canonical plan artifact is unreadable"))?
+        } else {
+            None
+        };
+        let plan_text = executors::execution_plan_seed(
+            Some(&execution.role),
+            canonical.as_deref(),
+            task.plan.as_deref(),
+        )
+        .map(str::to_owned);
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            crate::plan_artifact::transport::remember_seed(
+                &self.db,
+                &execution.id,
+                plan_text.as_deref(),
+                &environment.env,
+            )
+            .await?;
+        }
         Ok(api_types::ExecutionStartParams {
-            plan_text: if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
-                && executors::task_role_can_write_plan(Some(&execution.role))
-            {
-                if execution.role == crate::workflow::default_roles::PLANNER {
-                    task.plan.clone()
-                } else {
-                    crate::plan_artifact::read_plan_text_with_router(
-                        &self.db,
-                        &self.workspace_backend_router,
-                        workspace_id,
-                    )
-                    .await
-                    .map_err(|error| {
-                        error.into_service_error("canonical plan artifact is unreadable")
-                    })?
-                    .or_else(|| task.plan.clone())
-                }
-            } else {
-                None
-            },
+            plan_text: (resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon)
+                .then_some(plan_text)
+                .flatten(),
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             workspace_path,

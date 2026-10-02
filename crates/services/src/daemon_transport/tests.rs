@@ -449,7 +449,7 @@ async fn daemon_transport_registry_timeout_returns_daemon_timeout() {
 }
 
 #[tokio::test]
-async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
+async fn below_minimum_handshake_is_visible_upgrade_refusal() {
     let registry = make_registry();
     let (connection, mut outbound) = DaemonConnection::new("daemon-incompatible".to_owned());
     let connection_id = connection.id();
@@ -472,15 +472,15 @@ async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
         panic!("expected protocol rejection error");
     };
     assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
-    assert!(!registry.is_connected("daemon-incompatible"));
+    assert!(registry.is_connected("daemon-incompatible"));
+    assert!(registry.get("daemon-incompatible").unwrap().needs_upgrade());
 
     let result: Result<TestResponse, ServiceError> = registry
         .send_request("daemon-incompatible", "execution.start", json!({}), 1)
         .await;
     assert!(matches!(
         result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+        Err(ServiceError::DaemonUpgradeRequired { daemon_id }) if daemon_id == "daemon-incompatible"
     ));
 }
 

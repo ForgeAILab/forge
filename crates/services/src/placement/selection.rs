@@ -177,6 +177,21 @@ pub struct PlacementUnavailable {
 }
 
 impl PlacementUnavailable {
+    pub fn is_deterministic(&self) -> bool {
+        !self.rejected_candidates.is_empty()
+            && self.rejected_candidates.iter().all(|candidate| {
+                !candidate.filter_codes.is_empty()
+                    && candidate.filter_codes.iter().all(|code| {
+                        !matches!(
+                            code,
+                            PlacementFilterCode::OwnerUnreachable
+                                | PlacementFilterCode::AgentCapacity
+                                | PlacementFilterCode::DaemonCapacity
+                        )
+                    })
+            })
+    }
+
     pub fn needs_daemon_upgrade(&self) -> bool {
         use PlacementFilterCode::*;
         let upgrade_only = self
@@ -422,9 +437,7 @@ fn filter_candidate(
         && owner_facts_known
         && !needs_upgrade
         && !candidate.plan_transport
-        && context
-            .agents()
-            .any(|role| executors::task_role_can_write_plan(Some(&role.role)))
+        && executors::task_role_can_write_plan(Some(&context.claiming_agent.role))
     {
         filters.insert(CapabilityMissing);
     }
@@ -1277,6 +1290,24 @@ mod tests {
             .get_mut("coder")
             .unwrap()
             .capabilities = ExecutorAdapterCapabilityFacts::default();
+        rejected(&context, PlacementFilterCode::CapabilityMissing);
+    }
+
+    #[test]
+    fn revision_three_non_plan_roles_do_not_require_plan_transport() {
+        for role in ["reviewer", "auditor", "interactive"] {
+            let mut context = context();
+            context.candidates[0].negotiated_revision = Some(3);
+            context.candidates[0].plan_transport = false;
+            context.worktree_agents.push(context.claiming_agent.clone());
+            context.claiming_agent.role = role.into();
+            assert!(
+                select_placement(&context).into_result().is_ok(),
+                "{role} remains supported with a coder assigned"
+            );
+        }
+        let mut context = context();
+        context.candidates[0].plan_transport = false;
         rejected(&context, PlacementFilterCode::CapabilityMissing);
     }
 

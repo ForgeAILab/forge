@@ -56,14 +56,16 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
 
     let workflow = default_workflow::default_workflow();
     let ctx = load_agent_dispatch_context(
-        Arc::clone(&db),
-        &service.workspace_backend_router(),
-        &task_id,
-        default_roles::CODER,
-        default_states::IN_PROGRESS,
-        json!({}),
-        Some("new_execution"),
-        &workflow,
+        services::workflow::dispatch::loader::DispatchContextParams {
+            db: Arc::clone(&db),
+            router: &service.workspace_backend_router(),
+            task_id: &task_id,
+            role: default_roles::CODER,
+            state_name: default_states::IN_PROGRESS,
+            state_config: json!({}),
+            execution_policy: Some("new_execution"),
+            workflow: &workflow,
+        },
     )
     .await
     .expect("dispatch context loads");

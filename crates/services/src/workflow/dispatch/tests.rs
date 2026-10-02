@@ -1008,14 +1008,16 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         .expect("assessment persists");
 
     let context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
-        db.clone(),
-        &crate::diff::embedded_read_router_for_test(db.clone()),
-        &task.id,
-        default_roles::CODER,
-        default_states::IN_PROGRESS,
-        json!({}),
-        None,
-        &crate::workflow::default_workflow::default_workflow(),
+        crate::workflow::dispatch::loader::DispatchContextParams {
+            db: db.clone(),
+            router: &crate::diff::embedded_read_router_for_test(db.clone()),
+            task_id: &task.id,
+            role: default_roles::CODER,
+            state_name: default_states::IN_PROGRESS,
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &crate::workflow::default_workflow::default_workflow(),
+        },
     )
     .await
     .expect("dispatch context loads");

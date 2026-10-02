@@ -13,7 +13,7 @@ use executors::environment::{
 };
 
 impl TaskService {
-    pub(super) async fn project_environment(
+    pub(crate) async fn project_environment(
         &self,
         project_id: &str,
     ) -> Result<api_types::ProjectEnvironment> {

@@ -13,17 +13,30 @@ use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
 
-#[allow(clippy::too_many_arguments)]
+pub struct DispatchContextParams<'a> {
+    pub db: Arc<db::SqliteDb>,
+    pub router: &'a crate::workspace_backend::WorkspaceBackendRouter,
+    pub task_id: &'a str,
+    pub role: &'a str,
+    pub state_name: &'a str,
+    pub state_config: Value,
+    pub execution_policy: Option<&'a str>,
+    pub workflow: &'a WorkflowDefinition,
+}
+
 pub async fn load_agent_dispatch_context(
-    db: Arc<db::SqliteDb>,
-    router: &crate::workspace_backend::WorkspaceBackendRouter,
-    task_id: &str,
-    role: &str,
-    state_name: &str,
-    state_config: Value,
-    execution_policy: Option<&str>,
-    workflow: &WorkflowDefinition,
+    params: DispatchContextParams<'_>,
 ) -> Result<AgentDispatchContext> {
+    let DispatchContextParams {
+        db,
+        router,
+        task_id,
+        role,
+        state_name,
+        state_config,
+        execution_policy,
+        workflow,
+    } = params;
     let task = TaskRepo::get_by_id(&*db, task_id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task_id.to_string()))?;

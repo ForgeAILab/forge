@@ -402,18 +402,29 @@ impl TaskService {
                 .workspace_backend_router
                 .resolve(&self.db, workspace)
                 .await?;
-            let plan = crate::plan_artifact::ExecutionPlan::new(&resolved);
+            let plan = crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved);
             match plan.publish(&execution).await {
-                Ok(true) => {}
+                Ok(true) => {
+                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                }
                 Ok(false) => {
-                    let candidate_required = execution.role
-                        == crate::workflow::default_roles::PLANNER
-                        || task.plan.as_deref().is_some_and(|plan| {
-                            !crate::plan_artifact::parse_plan_markdown(plan)
-                                .items
-                                .is_empty()
-                        })
-                        || crate::plan_artifact::read_plan_text_for_resolved_workspace(&resolved)
+                    let candidate_required =
+                        plan.rejected_candidate(&execution.id)
+                            .await
+                            .map_err(|error| {
+                                error.into_service_error("execution plan candidate is unreadable")
+                            })?
+                            || execution.role == crate::workflow::default_roles::PLANNER
+                            || task.plan.as_deref().is_some_and(|plan| {
+                                !crate::plan_artifact::parse_plan_markdown(plan)
+                                    .items
+                                    .is_empty()
+                            })
+                            || crate::plan_artifact::read_plan_text_for_resolved_workspace(
+                                &resolved,
+                            )
                             .await
                             .map_err(|error| {
                                 ServiceError::invalid_operation(format!(
@@ -712,7 +723,7 @@ impl TaskService {
             .workspace_backend_router
             .resolve(&self.db, &workspace)
             .await?;
-        crate::plan_artifact::ExecutionPlan::new(&resolved)
+        crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved)
             .discard(&execution.id)
             .await
             .map_err(|error| {
@@ -773,7 +784,7 @@ impl TaskService {
                 .workspace_backend_router
                 .resolve(&self.db, workspace)
                 .await?;
-            crate::plan_artifact::ExecutionPlan::new(&resolved).restore(execution_id).await
+            crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved).restore(execution_id).await
             .map_err(|_| {
                 ServiceError::invalid_operation(
                     "failed to restore the prior plan while abandoning an invalid publication claim",
@@ -838,7 +849,7 @@ impl TaskService {
                 .workspace_backend_router
                 .resolve(&self.db, &workspace)
                 .await?;
-            crate::plan_artifact::ExecutionPlan::new(&resolved)
+            crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved)
                 .restore(&execution.id)
                 .await
                 .map_err(|error| {

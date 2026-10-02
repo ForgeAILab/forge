@@ -44,17 +44,18 @@ pub async fn preview_effective_prompt(
     let state_dispatch = dispatch_intent_from_workflow_dispatch(preview_state.dispatch.as_ref());
     let selection =
         effective_prompt_selection(role, trigger_dispatch.as_ref(), state_dispatch.as_ref());
-    let dispatch_ctx = load_agent_dispatch_context(
-        Arc::clone(&db),
-        router,
-        task_id,
-        role,
-        &preview_state.name,
-        state_config,
-        Some(selection.execution_policy.as_str()),
-        &workflow,
-    )
-    .await?;
+    let dispatch_ctx =
+        load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+            db: Arc::clone(&db),
+            router,
+            task_id,
+            role,
+            state_name: &preview_state.name,
+            state_config,
+            execution_policy: Some(selection.execution_policy.as_str()),
+            workflow: &workflow,
+        })
+        .await?;
     let (mut prompt, selection) = build_effective_prompt(
         &dispatch_ctx,
         trigger_dispatch.as_ref(),

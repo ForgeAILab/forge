@@ -156,6 +156,8 @@ impl DaemonWorkspaceBackend {
         let fence: WorkspaceMutationFence = decode(params.clone())?;
         let owner_operation = method == METHOD_WORKSPACE_RESET && params.get("operation").is_some();
         let recreating = method == METHOD_WORKSPACE_RESET && !owner_operation;
+        let discard_plan = owner_operation
+            && params.pointer("/operation/kind").and_then(Value::as_str) == Some("discard_plan");
         match method {
             METHOD_WORKSPACE_PREPARE => {
                 decode::<WorkspacePrepareParams>(params.clone()).map(|_| ())?
@@ -209,7 +211,9 @@ impl DaemonWorkspaceBackend {
                 self.check_generation(fence.generation, workspace.generation, recreating)?;
             }
             if let Some(handle) = handle {
-                self.workspace(&reference(&fence, handle), recreating)?;
+                if !discard_plan || existing.is_some() {
+                    self.workspace(&reference(&fence, handle), recreating)?;
+                }
             }
             let operation = JournalOperation {
                 entry_id: operation_entry_id(&fence.operation_id),
@@ -229,30 +233,42 @@ impl DaemonWorkspaceBackend {
             false
         };
         if let Some(handle) = handle {
-            self.workspace(&reference(&fence, handle), recreating)?;
-        }
-        let mut outcome = match method {
-            METHOD_WORKSPACE_PREPARE => {
-                self.prepare(decode(params.clone())?).await.and_then(encode)
+            if !discard_plan || existing.is_some() {
+                self.workspace(&reference(&fence, handle), recreating)?;
             }
-            METHOD_WORKSPACE_RUN => self.run(decode(params.clone())?).await.and_then(encode),
-            METHOD_WORKSPACE_MERGE => self.merge(decode(params.clone())?).await.and_then(encode),
-            METHOD_WORKSPACE_RESET if owner_operation => self
-                .owner_operation(decode(params.clone())?, &active_ids)
-                .await
-                .and_then(encode),
-            METHOD_WORKSPACE_RESET => self
-                .reset(decode(params.clone())?, &active_ids, resuming)
-                .await
-                .and_then(encode),
-            METHOD_WORKSPACE_CLEANUP => self
-                .cleanup(decode(params.clone())?, &active_ids)
-                .await
-                .and_then(encode),
-            _ => Err(error(
-                UNSUPPORTED_METHOD,
-                format!("unsupported workspace method: {method}"),
-            )),
+        }
+        let mut outcome = if discard_plan && existing.is_none() {
+            encode(WorkspaceOwnerOperationResult {
+                entry_id: operation_entry_id(&fence.operation_id),
+                operation_id: fence.operation_id.clone(),
+                outcome: WorkspaceOwnerOperationOutcome::Applied,
+            })
+        } else {
+            match method {
+                METHOD_WORKSPACE_PREPARE => {
+                    self.prepare(decode(params.clone())?).await.and_then(encode)
+                }
+                METHOD_WORKSPACE_RUN => self.run(decode(params.clone())?).await.and_then(encode),
+                METHOD_WORKSPACE_MERGE => {
+                    self.merge(decode(params.clone())?).await.and_then(encode)
+                }
+                METHOD_WORKSPACE_RESET if owner_operation => self
+                    .owner_operation(decode(params.clone())?, &active_ids)
+                    .await
+                    .and_then(encode),
+                METHOD_WORKSPACE_RESET => self
+                    .reset(decode(params.clone())?, &active_ids, resuming)
+                    .await
+                    .and_then(encode),
+                METHOD_WORKSPACE_CLEANUP => self
+                    .cleanup(decode(params.clone())?, &active_ids)
+                    .await
+                    .and_then(encode),
+                _ => Err(error(
+                    UNSUPPORTED_METHOD,
+                    format!("unsupported workspace method: {method}"),
+                )),
+            }
         };
         if let Err(error) = &mut outcome {
             error.details = Some(serde_json::json!({

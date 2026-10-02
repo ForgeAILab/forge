@@ -1,10 +1,10 @@
 ## ADDED Requirements
 
 ### Requirement: Workspace protocol capability
-The daemon protocol SHALL advance to revision 4 and advertise `workspace.v1` and `execution.plan_transport`. The server SHALL refuse every command RPC from revision 2 and revision 3 daemons, including execution, verification, filesystem browsing, and PTY terminals, with the actionable `daemon_upgrade_required` reason. Their sockets SHALL remain visible for upgrade diagnostics. A socket awaiting its handshake SHALL be reported as not ready.
+The daemon protocol SHALL remain at revision 3 and advertise `workspace.v1`. Plan transport SHALL be negotiated independently with `execution.plan_transport`. The server SHALL refuse every command RPC from daemons below revision 3, including execution, verification, filesystem browsing, and PTY terminals, with the actionable `daemon_upgrade_required` reason. Their sockets SHALL remain visible for upgrade diagnostics. A socket awaiting its handshake SHALL be reported as not ready.
 
 #### Scenario: Old daemon connects
-- **WHEN** a revision 2 or revision 3 daemon completes the handshake
+- **WHEN** a daemon below revision 3 completes the handshake
 - **THEN** its socket remains visible and receives `daemon_upgrade_required`
 - **AND** otherwise eligible upgrade-only admission, with no transient or capacity alternative, rejects it with filter `daemon_upgrade_required`, without creating an Execution
 - **AND** dispatch records the human-action blocker and clears it automatically after that owner's supported handshake
@@ -58,13 +58,14 @@ A daemon SHALL enforce a local run policy, from its own configuration, that list
 ### Requirement: Execution outbox travels with the terminal report
 For a daemon-owned placement, the daemon SHALL read the execution's outbox after the CLI exits and embed its bounded plan candidate, worklog and evidence entries in the `execution.terminal` report. The server SHALL ingest outbox entries from the terminal report for every placement, and SHALL NOT read the outbox from its own filesystem for a daemon placement. Content SHALL be retained, replayed, and acknowledged together with the report.
 The server SHALL resolve start plan text through the workspace owner with
-`task.plan` as fallback, and send `execution.start.plan_text`. A planner revision
-SHALL receive the current `task.plan`. The daemon SHALL prepare its plan outbox
+`task.plan` as fallback, and send `execution.start.plan_text`. Only implementation roles SHALL receive a valid checklist seed; planners SHALL NOT be seeded. The daemon SHALL prepare its plan outbox
 locally. A successful terminal CAS SHALL preserve `execution.terminal.plan_text`
-in the execution snapshot and publish those exact bytes through the owner only
+in private execution artifact storage and publish those exact bytes through the owner only
 after the existing publication claim succeeds. Publication, compare-safe
 rollback and cleanup SHALL be owner-aware. Remote plan content SHALL be bounded
-to 128 KiB; invalid capture or excess size SHALL produce a clear execution failure.
+to 128 KiB; capture I/O or excess size SHALL produce a clear terminal failure,
+without overwriting an already failed/cancelled outcome. Empty, checklist-free or
+unchanged-seed content SHALL use the ordinary workflow guard rejection.
 Plan-writing roles SHALL require `execution.plan_transport` at placement and SHALL
 NOT be silently parked with an owner-unsupported dispatch disposition.
 
@@ -94,7 +95,7 @@ NOT be silently parked with an owner-unsupported dispatch disposition.
 - **AND** a guard rejection or abandoned publication restores the prior plan through the owner before re-planning or send-back dispatch
 
 #### Scenario: Plan transport unsupported at placement
-- **WHEN** a revision-4 daemon lacks `execution.plan_transport` and a planner is admitted
+- **WHEN** a revision-3 daemon lacks `execution.plan_transport` and a planner is admitted
 - **THEN** placement rejects it with `capability_missing` and creates no Execution
 - **AND** older protocol revisions receive `daemon_upgrade_required`
 
@@ -108,3 +109,30 @@ Terminal reports, workspace operation results, and cleanup acknowledgements SHAL
 #### Scenario: Resume unsupported on owner
 - **WHEN** a daemon-owned execution fails and the owner's CLI does not report `resume`
 - **THEN** the recovery actions for that Task omit `resume_session`
+
+#### Scenario: Capability refusal remains visible until eligibility changes
+- **WHEN** dispatch finds only machines missing `execution.plan_transport`
+- **THEN** the Task records the machine, missing capability and upgrade instruction
+- **AND** unchanged scans do not retry placement; eligible capability facts clear the refusal
+- **AND** reviewer, interactive, shared-mount, filesystem and PTY use continue at revision 3
+
+#### Scenario: Seed parity and unwritten plan
+- **WHEN** an implementation role starts with prose/empty fallback or a planner starts with an old checklist
+- **THEN** neither receives a plan seed
+- **AND** a returned unchanged implementation seed, missing required plan, empty plan or checklist-free plan uses the bounded guard rejection
+
+#### Scenario: Private terminal storage and replay
+- **WHEN** a winning terminal report contains a plan with a Project environment secret
+- **THEN** its redacted content is stored privately in the terminal transaction
+- **AND** snapshots, retry configuration, Execution API responses and receipt bodies exclude the candidate
+- **AND** replay cannot replace the winning artifact; receipt metadata may contain its digest and length
+
+#### Scenario: Owner unavailable during settlement
+- **WHEN** publication or restore cannot reach the owner
+- **THEN** a durable runtime-offline wait and exponential retry backoff remain visible until success
+- **AND** repeated scans do not resend before the retry deadline
+
+#### Scenario: Plan settlement waits for checks
+- **WHEN** publish or restore queues behind a long `workspace.run`
+- **THEN** it waits for the owner lock without the ordinary command timeout failing the Task
+- **AND** discard after workspace cleanup succeeds even when the handle has been retired
