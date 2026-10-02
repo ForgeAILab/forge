@@ -14,6 +14,7 @@ use crate::ServiceError;
 pub use crate::merge_service::MergeOutcome;
 pub use api_types::{ExecutionOutboxEntry, WorkspaceRunPurpose};
 pub use daemon::DaemonWorkspaceBackend;
+pub(crate) use embedded::run_at as run_environment_checkout;
 pub use embedded::EmbeddedWorkspaceBackend;
 
 mod daemon;

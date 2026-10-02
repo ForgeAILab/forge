@@ -217,7 +217,11 @@ mod tests {
                     .map(|review| review.task_id)
                     .collect();
             for task in eligible {
-                if helpers::has_blocking_annotation(task) || awaiting_human.contains(&task.id) {
+                if helpers::has_blocking_annotation(task)
+                    || awaiting_human.contains(&task.id)
+                    || db::TaskMetadata::parse(task.metadata_json.as_deref())
+                        .is_ok_and(|metadata| metadata.extra.contains_key("environment_wait"))
+                {
                     slots.parked += 1;
                 } else if !roots.contains(&task.id) {
                     slots.active += 1;
@@ -671,6 +675,77 @@ mod tests {
         let slots = load_project_slots(&db, &project).await.unwrap();
         assert_eq!((slots.active, slots.parked), (2, annotations.len() as u32));
         assert_eq!(slots, walk_project_slots(&db, &project).await.unwrap());
+    }
+    #[tokio::test]
+    async fn environment_waiters_are_parked_and_invalidate_list_revision() {
+        let (db, mut project) = fixture().await;
+        sqlx::query("UPDATE project SET settings = '{\"max_active_tasks\":5}' WHERE id = ?")
+            .bind(&project.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        project = ProjectRepo::get_by_id(&db, &project.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let waiter = task(&db, &project, "in_progress", None).await;
+            let before =
+                sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
+                    .bind(&project.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.environment_wait',json(?)) WHERE id=?")
+                .bind(serde_json::json!({"machine":{"owner_kind":"daemon","daemon_id":"offline","runtime_id":"one"},"checks":["cargo"]}).to_string())
+                .bind(&waiter.id).execute(db.pool()).await.unwrap();
+            let after =
+                sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
+                    .bind(&project.id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert!(after > before, "metadata marker invalidates memoized slots");
+            ids.push(waiter.id);
+        }
+        task(&db, &project, "todo", None).await;
+        let aggregate = load_project_slots(&db, &project).await.unwrap();
+        assert_eq!(aggregate, walk_project_slots(&db, &project).await.unwrap());
+        let batched = load_projects_slots(&db, std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        assert_eq!(batched[&project.id].slots, aggregate);
+        assert_eq!(
+            (aggregate.active, aggregate.parked, aggregate.queued),
+            (0, 5, 1)
+        );
+        assert!(
+            aggregate.active < aggregate.limit,
+            "sixth Task can enter a healthy owner"
+        );
+        let before = sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
+            .bind(&project.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE id=?")
+            .bind(&ids[0]).execute(db.pool()).await.unwrap();
+        assert!(
+            sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
+                .bind(&project.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+                > before
+        );
+        let aggregate = load_project_slots(&db, &project).await.unwrap();
+        assert_eq!(aggregate, walk_project_slots(&db, &project).await.unwrap());
+        let batched = load_projects_slots(&db, std::slice::from_ref(&project))
+            .await
+            .unwrap();
+        assert_eq!(batched[&project.id].slots, aggregate);
+        assert_eq!((aggregate.active, aggregate.parked), (1, 4));
     }
     #[tokio::test]
     async fn batched_slots_match_multiple_workflows_and_cross_project_children() {

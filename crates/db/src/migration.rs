@@ -74,6 +74,7 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
     }
 
     reconcile_project_admission_bindings(pool).await?;
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
 
     Ok(())
 }
@@ -343,6 +344,7 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         apply_migration(pool, &migration).await?;
     }
 
+    crate::sqlite::environment_readiness::fill_migrated_digests(pool).await?;
     Ok(())
 }
 

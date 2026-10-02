@@ -551,12 +551,6 @@ async fn claim_shell_task_with_environment(
     let (project_id, _repo_id, repo_dir) = seed_project_repo(db).await;
     // The repository directory must outlive the test's executions.
     std::mem::forget(repo_dir);
-    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
-        .bind(json!({ "environment": environment }).to_string())
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("environment sets");
     let agent_id = seed_agent(db).await;
     let task = service
         .create_task(
@@ -572,6 +566,12 @@ async fn claim_shell_task_with_environment(
         )
         .await
         .expect("task creates");
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(json!({ "environment": environment }).to_string())
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .expect("environment sets");
     let claimed = service
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
@@ -647,6 +647,26 @@ async fn run_execution_applies_the_project_environment() {
             .filter_map(|entry| entry.payload.get("line"))
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn run_execution_passes_checks_configured_before_direct_claim() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(16)));
+    let (_, execution, _) = claim_shell_task_with_environment(
+        &db,
+        &service,
+        "true",
+        json!({"checks":[{"name":"tool","command":"true"}]}),
+    )
+    .await;
+    let executor =
+        executors::AdapterExecutor::new(Arc::new(cli_adapters::test_support::test_registry()));
+    let completed = service
+        .run_execution(execution.id, &executor)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
 }
 
 #[tokio::test]
