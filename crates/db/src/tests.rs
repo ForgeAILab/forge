@@ -9553,6 +9553,49 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
             .unwrap(),
         2
     );
+    let grouped = db
+        .agent_list_read_stats(&[agent_id.clone(), "missing".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(grouped[&agent_id].active_assigned_task_count, 2);
+    assert_eq!(grouped[&agent_id].running_execution_count, 0);
+    assert_eq!(grouped["missing"].active_assigned_task_count, 0);
+    assert_eq!(grouped["missing"].execution_stats.success_rate, None);
+    let fallback = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "fallback active",
+    )
+    .await;
+    for (id, status) in [
+        ("grouped-running", "running"),
+        ("grouped-completed", "completed"),
+    ] {
+        sqlx::query("INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at) VALUES (?, ?, ?, 'coder', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:02Z')")
+            .bind(id).bind(&fallback).bind(&agent_id).bind(status).execute(db.pool()).await.unwrap();
+    }
+    let grouped = db
+        .agent_list_read_stats(std::slice::from_ref(&agent_id))
+        .await
+        .unwrap();
+    let original = ExecutionRepo::stats_by_agent(&db, &agent_id).await.unwrap();
+    assert_eq!(
+        grouped[&agent_id].active_assigned_task_count,
+        AgentRepo::count_active_assigned_tasks(&db, &agent_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(grouped[&agent_id].running_execution_count, 1);
+    assert_eq!(
+        grouped[&agent_id].execution_stats.avg_duration_ms,
+        original.avg_duration_ms
+    );
+    assert_eq!(
+        grouped[&agent_id].execution_stats.success_rate,
+        original.success_rate
+    );
 }
 
 #[tokio::test]
@@ -11784,4 +11827,82 @@ async fn unbounded_execution_records_progress_and_progress_warnings() {
         matches!(warning, ExecutionProgressWarningOutcome::Committed { .. }),
         "a stalled unbounded execution must raise a warning: {warning:?}"
     );
+}
+
+#[tokio::test]
+async fn usage_ledger_revision_tracks_terminal_edits_and_rolls_back() {
+    let db = sqlite_db().await;
+    let (project, _, agent) = seed_project_repo_agent(&db).await;
+    let task = seed_task(&db, &project, None, "todo".into(), "revision").await;
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("INSERT INTO execution (id,task_id,agent_id,role,status,created_at,updated_at) VALUES ('usage-delta',?,?,'coder','completed','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z')").bind(&task).bind(&agent).execute(&mut *tx).await.unwrap();
+    let inside: i64 =
+        sqlx::query_scalar("SELECT execution_rowid FROM usage_ledger_revision WHERE id=1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert!(inside > 0);
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_rowid FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query("INSERT INTO execution (id,task_id,agent_id,role,status,created_at,updated_at) VALUES ('usage-delta',?,?,'coder','completed','2026-01-01T00:00:00Z','2026-01-01T00:00:01Z')").bind(task).bind(agent).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE execution SET agent_id=NULL WHERE id='usage-delta'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_revision FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT revision FROM usage_changed_execution WHERE id='usage-delta'"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    sqlx::query("DELETE FROM execution WHERE id='usage-delta'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT deletion_generation FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT execution_rowid FROM usage_ledger_revision WHERE id=1"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    for (query, expected) in [
+        ("EXPLAIN QUERY PLAN SELECT id,error FROM execution INDEXED BY idx_execution_usage_failed_recent WHERE status='failed' AND COALESCE(stopped_at,updated_at)>='2026-01-01' ORDER BY COALESCE(stopped_at,updated_at) DESC,id ASC", "idx_execution_usage_failed_recent"),
+        ("EXPLAIN QUERY PLAN SELECT error FROM execution INDEXED BY idx_execution_usage_failed_task WHERE status='failed' AND task_id='task' ORDER BY COALESCE(stopped_at,updated_at) DESC,id DESC LIMIT 1", "idx_execution_usage_failed_task"),
+    ] {
+        let rows=sqlx::query(query).fetch_all(db.pool()).await.unwrap();
+        let plan=rows.iter().map(|r|sqlx::Row::get::<String,_>(r, "detail")).collect::<Vec<_>>().join(" ");
+        assert!(plan.contains(expected), "{plan}");assert!(!plan.contains("TEMP B-TREE"),"{plan}");
+    }
 }

@@ -3550,10 +3550,10 @@ impl RetrospectiveEstimateRepo for SqliteDb {
     }
 }
 
-// Narrow concrete batch readers for task observability; no ledger rollup or trait changes.
+// Narrow batch readers share the caller's connection, including read snapshots.
 impl SqliteDb {
     pub async fn usage_invocations_for_sources(
-        &self,
+        connection: &mut sqlx::SqliteConnection,
         source_ids: &[String],
     ) -> Result<Vec<UsageInvocation>> {
         let mut result = Vec::new();
@@ -3569,7 +3569,7 @@ impl SqliteDb {
             result.extend(
                 query
                     .build()
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *connection)
                     .await?
                     .into_iter()
                     .map(map_invocation)
@@ -3579,7 +3579,7 @@ impl SqliteDb {
         Ok(result)
     }
     pub async fn usage_events_for_invocations(
-        &self,
+        connection: &mut sqlx::SqliteConnection,
         invocation_ids: &[String],
     ) -> Result<Vec<UsageEvent>> {
         let mut result = Vec::new();
@@ -3595,7 +3595,7 @@ impl SqliteDb {
             result.extend(
                 query
                     .build()
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *connection)
                     .await?
                     .into_iter()
                     .map(map_usage_event)
@@ -3605,7 +3605,7 @@ impl SqliteDb {
         Ok(result)
     }
     pub async fn cost_estimate_revisions_for_invocations(
-        &self,
+        connection: &mut sqlx::SqliteConnection,
         invocation_ids: &[String],
     ) -> Result<Vec<CostEstimateRevision>> {
         let mut result = Vec::new();
@@ -3619,11 +3619,76 @@ impl SqliteDb {
             result.extend(
                 query
                     .build()
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *connection)
                     .await?
                     .into_iter()
                     .map(map_estimate_revision)
                     .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(result)
+    }
+}
+
+// Bounded payload readers for the process-local usage index. Rowid ranges are
+// backed by the table's integer rowid; changed IDs use primary-key lookups.
+impl SqliteDb {
+    pub async fn usage_invocation_slice(
+        connection: &mut sqlx::SqliteConnection,
+        after: i64,
+        through: i64,
+    ) -> Result<Vec<(i64, UsageInvocation)>> {
+        sqlx::query("SELECT rowid AS ledger_rowid, * FROM usage_invocation WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT 400")
+            .bind(after).bind(through).fetch_all(connection).await?.into_iter()
+            .map(|row| Ok((row.try_get("ledger_rowid")?, map_invocation(row)?))).collect()
+    }
+    pub async fn usage_event_slice(
+        connection: &mut sqlx::SqliteConnection,
+        after: i64,
+        through: i64,
+    ) -> Result<Vec<(i64, UsageEvent)>> {
+        sqlx::query("SELECT rowid AS ledger_rowid, * FROM usage_event WHERE rowid > ? AND rowid <= ? ORDER BY rowid LIMIT 400")
+            .bind(after).bind(through).fetch_all(connection).await?.into_iter()
+            .map(|row| Ok((row.try_get("ledger_rowid")?, map_usage_event(row)?))).collect()
+    }
+    pub async fn usage_invocations_by_ids(
+        connection: &mut sqlx::SqliteConnection,
+        ids: &[String],
+    ) -> Result<Vec<UsageInvocation>> {
+        let mut result = Vec::new();
+        for chunk in ids.chunks(400) {
+            let json = serde_json::to_string(chunk).map_err(|_| DbError::InvalidTransition)?;
+            result.extend(
+                sqlx::query(
+                    "SELECT * FROM usage_invocation WHERE id IN (SELECT value FROM json_each(?))",
+                )
+                .bind(json)
+                .fetch_all(&mut *connection)
+                .await?
+                .into_iter()
+                .map(map_invocation)
+                .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(result)
+    }
+    pub async fn usage_events_by_ids(
+        connection: &mut sqlx::SqliteConnection,
+        ids: &[String],
+    ) -> Result<Vec<UsageEvent>> {
+        let mut result = Vec::new();
+        for chunk in ids.chunks(400) {
+            let json = serde_json::to_string(chunk).map_err(|_| DbError::InvalidTransition)?;
+            result.extend(
+                sqlx::query(
+                    "SELECT * FROM usage_event WHERE id IN (SELECT value FROM json_each(?))",
+                )
+                .bind(json)
+                .fetch_all(&mut *connection)
+                .await?
+                .into_iter()
+                .map(map_usage_event)
+                .collect::<Result<Vec<_>>>()?,
             );
         }
         Ok(result)

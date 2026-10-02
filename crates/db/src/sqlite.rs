@@ -76,6 +76,7 @@ use std::str::FromStr;
 
 mod action;
 mod agent;
+pub use agent::AgentListReadStats;
 mod agent_chat;
 mod chat_ledger;
 mod chat_read_events;

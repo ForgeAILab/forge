@@ -109,15 +109,7 @@ pub async fn list_agents(
     )
     .await?;
     let has_more = page.next_cursor.is_some();
-    let mut items = Vec::with_capacity(page.items.len());
-    for agent in page.items {
-        let active_assigned_task_count =
-            AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
-        items.push(
-            build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
-                .await?,
-        );
-    }
+    let items = build_agent_responses_for_user(&state, page.items, &user).await?;
     Ok(Json(PaginatedResponse {
         items,
         next_cursor: page.next_cursor,
@@ -469,6 +461,7 @@ async fn build_agent_response(
     state: &AppState,
     agent: Agent,
     active_assigned_task_count: Option<i64>,
+    usage: api_types::UsageAggregate,
 ) -> ApiResult<AgentResponse> {
     let effective_status =
         compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
@@ -476,7 +469,6 @@ async fn build_agent_response(
             .as_str()
             .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
     // Derived here rather than threaded through every caller: this is the
     // quantity `max_concurrent_tasks` actually bounds, so it should always be
     // present wherever the cap is.
@@ -498,11 +490,58 @@ async fn build_agent_response_for_user(
     active_assigned_task_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
-    let mut response = build_agent_response(state, agent, active_assigned_task_count).await?;
+    let usage = state.agent_usage_cache.agent(&agent.id).await?;
+    let mut response =
+        build_agent_response(state, agent, active_assigned_task_count, usage).await?;
     if !user.is_admin {
         response.daemon_id = None;
     }
     Ok(response)
+}
+
+/// Share the usage fingerprint and miss load across either Agent list page.
+pub(super) async fn build_agent_responses_for_user(
+    state: &AppState,
+    agents: Vec<Agent>,
+    user: &AuthenticatedUser,
+) -> ApiResult<Vec<AgentResponse>> {
+    let ids = agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    let mut usage = state.agent_usage_cache.agents(&ids).await?;
+    let mut stats = state.agent_usage_cache.agent_execution_stats(&ids).await?;
+    let mut assignments = state.db.agent_list_active_assignments(&ids).await?;
+    let mut responses = Vec::with_capacity(agents.len());
+    for agent in agents {
+        let aggregate = usage
+            .remove(&agent.id)
+            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
+        let live = stats
+            .remove(&agent.id)
+            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
+        let effective_status =
+            compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
+                .await?
+                .as_str()
+                .to_owned();
+        let assigned = assignments
+            .remove(&agent.id)
+            .ok_or_else(|| ApiError::from(db::DbError::InvalidTransition))?;
+        let mut response = agent_response(
+            agent,
+            Some(assigned),
+            Some(live.1),
+            Some(effective_status),
+            live.0,
+            aggregate,
+        );
+        if !user.is_admin {
+            response.daemon_id = None;
+        }
+        responses.push(response);
+    }
+    Ok(responses)
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -3,12 +3,11 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use db::{AgentRepo, ExecutionRepo, ProjectMember, ProjectMemberRepo};
-use services::agent_service::compute_effective_status;
+use db::{ProjectMember, ProjectMemberRepo};
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{agent_response, auth::AuthenticatedUser},
+    routes::{agents::build_agent_responses_for_user, auth::AuthenticatedUser},
     state::AppState,
 };
 
@@ -26,28 +25,7 @@ pub async fn list_project_agents(
         .await
         .map_err(ApiError::from)?;
 
-    let mut responses = Vec::with_capacity(agents.len());
-    for agent in agents {
-        let active_assigned_task_count =
-            AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
-        let running_execution_count =
-            AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
-        let effective_status =
-            compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
-                .await?
-                .as_str()
-                .to_owned();
-        let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-        let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
-        responses.push(agent_response(
-            agent,
-            Some(active_assigned_task_count),
-            Some(running_execution_count),
-            Some(effective_status),
-            stats,
-            usage,
-        ));
-    }
+    let responses = build_agent_responses_for_user(&state, agents, &user).await?;
 
     Ok(Json(responses))
 }

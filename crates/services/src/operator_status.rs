@@ -17,7 +17,7 @@ use sqlx::Row;
 use crate::{
     agent_capacity::daemon_session_cap_from_labels,
     plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
-    usage_projection::{usage_aggregate_for_operations, usage_aggregate_for_source_state},
+    usage_projection::{usage_aggregate_for_source_state, UsageLedgerIndex},
     workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
     ServiceError,
 };
@@ -29,6 +29,7 @@ use log_snapshot::ExecutionLogSnapshots;
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
     log_snapshots: ExecutionLogSnapshots,
+    usage_cache: Arc<UsageLedgerIndex>,
     consumer_stall_seconds: u32,
     expected_event_consumers: RwLock<Vec<&'static str>>,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
@@ -41,8 +42,9 @@ impl OperatorStatusService {
         workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     ) -> Self {
         Self {
-            db,
+            db: Arc::clone(&db),
             log_snapshots: ExecutionLogSnapshots::default(),
+            usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
             daemon_connections: None,
@@ -59,12 +61,17 @@ impl OperatorStatusService {
     pub fn new_for_test(db: Arc<SqliteDb>) -> Self {
         Self {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
-            db,
+            db: Arc::clone(&db),
             log_snapshots: ExecutionLogSnapshots::default(),
+            usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
             daemon_connections: None,
         }
+    }
+
+    pub fn usage_ledger_index(&self) -> Arc<UsageLedgerIndex> {
+        Arc::clone(&self.usage_cache)
     }
 
     pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
@@ -572,7 +579,7 @@ impl OperatorStatusService {
                 COUNT(tl.id) AS attempt_count,
                 (
                     SELECT e.error
-                    FROM execution e
+                    FROM execution e INDEXED BY idx_execution_usage_failed_task
                     WHERE e.task_id = t.id AND e.status = 'failed'
                     ORDER BY COALESCE(e.stopped_at, e.updated_at) DESC, e.id DESC
                     LIMIT 1
@@ -635,7 +642,7 @@ impl OperatorStatusService {
         &self,
         active_execution_count: u32,
     ) -> Result<UsageSummary, ServiceError> {
-        let usage = usage_aggregate_for_operations(&self.db).await?;
+        let usage = self.usage_cache.operations().await?;
         Ok(UsageSummary {
             counts: usage.counts,
             tokens: usage.tokens,
@@ -655,7 +662,7 @@ impl OperatorStatusService {
                 e.task_id,
                 e.error,
                 COALESCE(e.stopped_at, e.updated_at) AS occurred_at
-             FROM execution e
+             FROM execution e INDEXED BY idx_execution_usage_failed_recent
              JOIN task t ON t.id = e.task_id
              WHERE e.status = 'failed'
                AND t.deleted_at IS NULL
@@ -1033,6 +1040,19 @@ mod tests {
         assert!(status.workspace_cleanup.is_empty());
         assert!(status.retry_pressure.is_empty());
         assert!(status.recent_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_summary_keeps_active_count_live_on_a_memo_hit() {
+        let (_db, service) = test_service().await;
+        let first = service.usage_summary(0).await.unwrap();
+        let second = service.usage_summary(17).await.unwrap();
+        assert_eq!(first.active_execution_count, 0);
+        assert_eq!(second.active_execution_count, 17);
+        assert_eq!(
+            serde_json::to_value(first.cost).unwrap(),
+            serde_json::to_value(second.cost).unwrap()
+        );
     }
 
     #[tokio::test]
