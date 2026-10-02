@@ -91,6 +91,7 @@ mod command_receipt;
 mod commitment;
 mod daemon;
 mod domain_event;
+pub use domain_event::EventSubscription;
 mod embedded_agent;
 mod execution;
 mod external_link;
@@ -150,7 +151,7 @@ impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            domain_event_notify: Arc::new(Notify::new()),
+            domain_event_notify: crate::connection::domain_event_notify(),
         }
     }
 
@@ -163,13 +164,6 @@ impl SqliteDb {
     /// back to the worker's bounded idle poll.
     pub fn domain_event_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.domain_event_notify)
-    }
-
-    /// Wake durable-event workers after the transaction containing an event
-    /// has committed. Callers that append inside a larger transaction must
-    /// invoke this only after their own commit succeeds.
-    pub fn notify_domain_event_committed(&self) {
-        self.domain_event_notify.notify_waiters();
     }
 }
 

@@ -65,7 +65,8 @@ async fn seed_project_and_task(db: &SqliteDb, status: &str) -> (Uuid, String) {
 }
 
 #[tokio::test]
-async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after_restart() {
+async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_lease_and_handles_once()
+{
     let db = sqlite_db().await;
     let (project_id, _task_id) = seed_project_and_task(&db, "review").await;
     let message_id = new_uuid_v4();
@@ -77,6 +78,27 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
         .expect("project creation provisions the singular chat")
         .id;
 
+    let old_event = DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "agent_chat.message.admitted".to_owned(),
+            entity_type: "agent_chat_message".to_owned(),
+            entity_id: "deleted-before-upgrade".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
     // Simulate an upgrade from the lease/receipt consumer. The new runtime
     // must reuse this exact stable cursor and begin strictly after it.
     let pre_upgrade_cursor: i64 =
@@ -95,10 +117,11 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     .await
     .expect("legacy cursor seeds");
 
-    // Append the durable event before its source row to simulate a process
-    // crash between event admission and projection. The first consumer run
-    // cannot complete it and leaves the cursor at the legacy checkpoint.
-    DomainEventRepo::append_event(
+    // A wanted event at/below the saved cursor must never be revisited, even
+    // though its source has been deleted. A live legacy lease after the cursor
+    // must neither block nor duplicate projection.
+    assert!(old_event.sequence <= pre_upgrade_cursor);
+    let wanted = DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent {
             id: event_id.clone(),
@@ -122,29 +145,16 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     )
     .await
     .expect("event appends");
-    let first = AgentChatMemoryConsumer::new(Arc::clone(&db))
-        .run_once(10)
-        .await
-        .expect("failed projection is retryable");
-    assert_eq!(first, 0);
-    let cursor_after_failure: i64 = sqlx::query_scalar(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
+    sqlx::query(
+        "INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner,
+        leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)",
     )
     .bind(services::memory_consumer_name())
-    .fetch_one(db.pool())
+    .bind(wanted.sequence)
+    .bind(now)
+    .execute(db.pool())
     .await
-    .expect("missing source remains uncheckpointed");
-    assert_eq!(cursor_after_failure, pre_upgrade_cursor);
-    for table in ["event_processing_lease", "event_projection_receipt"] {
-        let query = format!("SELECT COUNT(*) FROM {table} WHERE consumer_name = ?");
-        let rows: i64 = sqlx::query_scalar(&query)
-            .bind(services::memory_consumer_name())
-            .fetch_one(db.pool())
-            .await
-            .expect("legacy delivery rows count");
-        assert_eq!(rows, 0, "the migrated worker writes no {table} rows");
-    }
-
+    .unwrap();
     sqlx::query(
         "INSERT INTO agent_chat_message (
             id, chat_id, sequence, author_type, content, status, correlation_id,
@@ -159,12 +169,11 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     .execute(db.pool())
     .await
     .expect("message inserts after source recovery");
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let second = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
         .await
-        .expect("event retries after runtime backoff");
+        .expect("event projects after the legacy cursor");
     assert_eq!(second, 1);
     let third = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
@@ -188,10 +197,25 @@ async fn agent_chat_memory_consumer_replays_expired_lease_and_deduplicates_after
     .await
     .expect("Agent Chat memory scope count loads");
     assert_eq!(canonical_scope_count, 1);
+    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, 0, "wanted event below the cursor is not revisited");
+    let leases: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = ?")
+            .bind(services::memory_consumer_name())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        leases, 1,
+        "generic source does not touch seeded legacy leases"
+    );
 }
 
 #[tokio::test]
-async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying_them() {
+async fn agent_chat_memory_consumer_skips_unsubscribed_failure_events_without_projection() {
     let db = sqlite_db().await;
     let (project_id, _task_id) = seed_project_and_task(&db, "review").await;
     let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
@@ -228,8 +252,119 @@ async fn agent_chat_memory_consumer_checkpoints_failure_events_without_replaying
     .expect("failure event appends");
 
     let consumer = AgentChatMemoryConsumer::new(Arc::clone(&db));
-    assert!(consumer.run_once(10).await.expect("failure event consumes") >= 1);
+    assert_eq!(consumer.run_once(10).await.expect("failure event skips"), 0);
     assert_eq!(consumer.run_once(10).await.expect("replay is empty"), 0);
+}
+
+#[tokio::test]
+async fn agent_chat_memory_consumer_deleted_sources_are_terminal_without_strikes() {
+    let db = sqlite_db().await;
+    let (project_id, _) = seed_project_and_task(&db, "review").await;
+    let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    for scope_id in [chat_id, "deleted-chat".to_owned()] {
+        DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "agent_chat.message.admitted".to_owned(),
+                entity_type: "agent_chat_message".to_owned(),
+                entity_id: new_uuid_v4(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "agent_chat".to_owned(),
+                scope_id,
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let consumer = AgentChatMemoryConsumer::new(Arc::clone(&db));
+    assert_eq!(consumer.run_once(10).await.unwrap(), 2);
+    assert_eq!(consumer.run_once(10).await.unwrap(), 0);
+    let attempts: Vec<i64> =
+        sqlx::query_scalar("SELECT attempts FROM worker_dead_letter ORDER BY source_key")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, [0, 0]);
+}
+
+#[tokio::test]
+async fn agent_chat_memory_consumer_database_read_errors_are_transient() {
+    let db = sqlite_db().await;
+    let (project_id, _) = seed_project_and_task(&db, "review").await;
+    let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id.to_string())
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "agent_chat.message.admitted".to_owned(),
+            entity_type: "agent_chat_message".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat_id,
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE agent_chat_message RENAME TO unavailable_message")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        assert_eq!(
+            AgentChatMemoryConsumer::new(Arc::clone(&db))
+                .run_once(1)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+    let attempts: i64 =
+        sqlx::query_scalar("SELECT retry_attempts FROM worker_health WHERE worker_name = ?")
+            .bind(services::memory_consumer_name())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(attempts, 0);
+    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, 0);
+    sqlx::query("ALTER TABLE unavailable_message RENAME TO agent_chat_message")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(1)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]

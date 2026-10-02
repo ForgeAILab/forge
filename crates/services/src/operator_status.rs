@@ -132,6 +132,19 @@ impl OperatorStatusService {
             free_pages: storage.free_pages,
         };
         let mut recent_errors = self.recent_errors(now).await?;
+        let names: Vec<&str> = event_consumers
+            .iter()
+            .map(|consumer| consumer.consumer_name.as_str())
+            .collect();
+        for (worker, error, occurred_at) in self.db.domain_event_worker_errors(&names).await? {
+            recent_errors.push(RecentErrorSummary {
+                entity_type: "event_consumer".to_owned(),
+                entity_id: worker,
+                error,
+                occurred_at,
+                severity: OperatorSeverity::Attention,
+            });
+        }
         // Reuse the existing operator issue/severity surface. These current
         // alerts disappear on cursor recovery; no new alert ledger is needed.
         for consumer in event_consumers.iter().filter(|consumer| consumer.stalled) {
@@ -1412,6 +1425,56 @@ mod tests {
             .event_consumers
             .iter()
             .all(|c| c.lag == 0 && !c.stalled));
+    }
+
+    #[tokio::test]
+    async fn consumer_migrated_health_reports_live_lag_and_age_without_worker_updates() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        let now = Utc::now();
+        let old = (now - Duration::minutes(10)).to_rfc3339();
+        let name = crate::memory_consumer_name();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?)")
+            .bind(name).bind(&old).execute(db.pool()).await.unwrap();
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(1)
+            .await
+            .unwrap();
+        // No health update follows either append, as when a handler is hung.
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type,
+            scope_type, scope_id, correlation_id, created_at) VALUES
+            ('wanted', 'agent_chat.message.admitted', 'test', 'test', 'system', 'system', 'system', 'test', ?),
+            ('ignored', 'irrelevant', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
+            .bind(&old).bind(&old).execute(db.pool()).await.unwrap();
+        let status = service.event_consumers(now).await.unwrap();
+        let memory = status.iter().find(|c| c.consumer_name == name).unwrap();
+        assert_eq!(memory.lag, 1);
+        assert_eq!(memory.oldest_unprocessed_at.as_deref(), Some(old.as_str()));
+        assert!(memory.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
+        assert!(memory.stalled);
+        let later = service
+            .event_consumers(now + Duration::minutes(1))
+            .await
+            .unwrap();
+        let memory = later.iter().find(|c| c.consumer_name == name).unwrap();
+        assert!(memory.oldest_unprocessed_age_seconds.unwrap() >= 660.0);
+        crate::worker_runtime::WorkerHealth::new(Arc::clone(&db), name)
+            .report_error("persistent worker failure")
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|issue| issue.entity_id == name && issue.error == "persistent worker failure"));
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
     }
 
     #[tokio::test]

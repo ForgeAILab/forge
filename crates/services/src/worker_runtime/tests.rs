@@ -1,106 +1,158 @@
+use super::*;
+use db::{
+    create_sqlite_pool, new_uuid_v4, run_migrations, ClaimDomainEvents, CreateDomainEvent,
+    DomainEventRepo,
+};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
-use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
-
-use super::*;
-
 struct TinyWorker {
     name: &'static str,
     seen: Mutex<Vec<i64>>,
     commit_failures: AtomicUsize,
-    retry_entity: Option<&'static str>,
-    panic_once: AtomicBool,
-    always_panic: bool,
+    transient: AtomicBool,
+    commit_transient: AtomicBool,
+    active: AtomicUsize,
+    after_failure: bool,
+    tick_panics: AtomicUsize,
+    defer_for: Duration,
+    policy: RetryPolicy,
+    timeout: Duration,
+    subscription: Subscription,
+    entered: Notify,
+    release: Notify,
+    append_in_commit: bool,
 }
-
 impl TinyWorker {
     fn new(name: &'static str) -> Self {
         Self {
             name,
             seen: Mutex::new(Vec::new()),
             commit_failures: AtomicUsize::new(0),
-            retry_entity: None,
-            panic_once: AtomicBool::new(false),
-            always_panic: false,
+            transient: AtomicBool::new(false),
+            commit_transient: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            after_failure: false,
+            tick_panics: AtomicUsize::new(0),
+            defer_for: Duration::ZERO,
+            policy: RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            },
+            timeout: Duration::from_secs(300),
+            subscription: Subscription::Exact(vec!["wanted".into()]),
+            entered: Notify::new(),
+            release: Notify::new(),
+            append_in_commit: false,
         }
     }
-
-    fn with_commit_failure(mut self) -> Self {
-        self.commit_failures = AtomicUsize::new(1);
-        self
-    }
-
-    fn retrying(mut self, entity: &'static str) -> Self {
-        self.retry_entity = Some(entity);
-        self
-    }
-
-    fn panics_once(mut self) -> Self {
-        self.panic_once = AtomicBool::new(true);
-        self
-    }
-
-    fn always_panics(mut self) -> Self {
-        self.always_panic = true;
-        self
-    }
 }
-
 #[async_trait]
 impl Worker for TinyWorker {
     type Prepared = i64;
-
     fn name(&self) -> &str {
         self.name
     }
-
-    fn event_types(&self) -> &'static [&'static str] {
-        &["wanted"]
+    fn subscription(&self) -> Subscription {
+        self.subscription.clone()
     }
-
-    async fn handle(
-        &self,
-        event: &DomainEvent,
-    ) -> std::result::Result<WorkerOutcome<Self::Prepared>, WorkerError> {
+    fn retry_policy(&self) -> RetryPolicy {
+        self.policy
+    }
+    fn handle_timeout(&self) -> Duration {
+        self.timeout
+    }
+    async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        if self
+            .tick_panics
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            panic!("runtime hook panic");
+        }
+        Ok(())
+    }
+    async fn handle(&self, event: &DomainEvent) -> std::result::Result<Outcome<i64>, WorkerError> {
         self.seen.lock().unwrap().push(event.sequence);
-        assert_ne!(event.event_type, "ignored");
-        assert!(!event.payload_json.contains("secret"));
-        if self.always_panic || self.panic_once.swap(false, Ordering::SeqCst) {
-            panic!("test worker panic");
+        self.entered.notify_one();
+        if self.transient.load(Ordering::SeqCst) {
+            return Err(WorkerError::transient("database unavailable"));
         }
-        if self.retry_entity == Some(event.entity_id.as_str()) {
-            return Ok(WorkerOutcome::RetryAfter(Duration::from_millis(1)));
+        match event.entity_id.as_str() {
+            "panic" => panic!("poison handler"),
+            "poison" => Err(WorkerError::new("bad event")),
+            "defer" => Ok(Outcome::Defer {
+                after: self.defer_for,
+                reason: "waiting for readiness".into(),
+            }),
+            "terminal" => Ok(Outcome::DeadLetter {
+                reason: "deleted source".into(),
+            }),
+            "hang" => {
+                self.active.fetch_add(1, Ordering::SeqCst);
+                struct Active<'a>(&'a AtomicUsize);
+                impl Drop for Active<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let _active = Active(&self.active);
+                self.release.notified().await;
+                Ok(Outcome::Done(event.sequence))
+            }
+            _ => Ok(Outcome::Done(event.sequence)),
         }
-        Ok(WorkerOutcome::Done(event.sequence))
     }
-
     async fn commit(
         &self,
-        transaction: &mut Transaction<'_, Sqlite>,
-        _event: &DomainEvent,
-        prepared: &Self::Prepared,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        prepared: &i64,
     ) -> std::result::Result<(), WorkerError> {
         sqlx::query("INSERT INTO worker_test_effect (sequence) VALUES (?)")
             .bind(prepared)
-            .execute(&mut **transaction)
+            .execute(&mut **tx)
             .await
-            .map_err(|error| WorkerError::new(format!("test effect write failed: {error}")))?;
+            .map_err(|e| WorkerError::transient(e.to_string()))?;
+        if self.commit_transient.load(Ordering::SeqCst) {
+            return Err(WorkerError::transient("commit concurrency conflict"));
+        }
+        if event.entity_id == "commit-panic" {
+            panic!("poison commit");
+        }
         if self
             .commit_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
             return Err(WorkerError::new("failure after effect write"));
         }
+        if self.append_in_commit {
+            // Same event append implementation used by main_genesis_commands:
+            // caller-owned transaction, no explicit notifier at the call site.
+            sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id,
+                actor_type, scope_type, scope_id, correlation_id, created_at)
+                VALUES (?, 'emitted', 'test', 'from-commit', 'system', 'system', 'test', 'test', ?)")
+                .bind(new_uuid_v4()).bind(db::now_rfc3339()).execute(&mut **tx).await
+                .map_err(|e| WorkerError::transient(e.to_string()))?;
+        }
         Ok(())
     }
+    async fn after_commit(
+        &self,
+        _event: &DomainEvent,
+        _prepared: &i64,
+    ) -> std::result::Result<(), WorkerError> {
+        if self.after_failure {
+            Err(WorkerError::new("post-commit failed"))
+        } else {
+            Ok(())
+        }
+    }
 }
-
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
     run_migrations(&pool).await.unwrap();
@@ -110,292 +162,990 @@ async fn database() -> Arc<SqliteDb> {
         .unwrap();
     Arc::new(SqliteDb::new(pool))
 }
-
-async fn append_event(
-    db: &SqliteDb,
-    event_type: &str,
-    entity_id: &str,
-    created_at: &str,
-) -> DomainEvent {
+fn input(event_type: &str, entity: &str) -> CreateDomainEvent {
     let id = new_uuid_v4();
-    DomainEventRepo::append_event(
-        db,
-        CreateDomainEvent {
-            id: id.clone(),
-            event_type: event_type.to_owned(),
-            entity_type: "test".to_owned(),
-            entity_id: entity_id.to_owned(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            scope_type: "system".to_owned(),
-            scope_id: "worker-runtime-test".to_owned(),
-            correlation_id: id,
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: None,
-            payload_json: if event_type == "ignored" {
-                r#"{"marker":"secret payload never reaches ignored handlers"}"#.to_owned()
-            } else {
-                "{}".to_owned()
-            },
-            created_at: created_at.to_owned(),
-        },
-    )
-    .await
-    .unwrap()
-}
-
-fn fast_options(max_attempts: u32) -> WorkerRuntimeOptions {
-    WorkerRuntimeOptions {
-        max_attempts,
-        min_backoff: Duration::from_millis(1),
-        max_backoff: Duration::from_millis(5),
+    CreateDomainEvent {
+        id: id.clone(),
+        event_type: event_type.into(),
+        entity_type: "test".into(),
+        entity_id: entity.into(),
+        actor_type: "system".into(),
+        actor_id: None,
+        scope_type: "system".into(),
+        scope_id: "test".into(),
+        correlation_id: id,
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: None,
+        payload_json: "{}".into(),
+        created_at: "2000-01-01T00:00:00Z".into(),
     }
+}
+async fn append(db: &SqliteDb, kind: &str, entity: &str) -> DomainEvent {
+    db.append_event(input(kind, entity)).await.unwrap()
+}
+async fn scalar(db: &SqliteDb, query: &str) -> i64 {
+    sqlx::query_scalar(query)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+async fn effects(db: &SqliteDb) -> Vec<i64> {
+    sqlx::query_scalar("SELECT sequence FROM worker_test_effect ORDER BY sequence")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+}
+async fn stop(tx: watch::Sender<bool>, handle: JoinHandle<()>) {
+    tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("prompt shutdown")
+        .unwrap();
+}
+async fn wait_for<F, Fut>(mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !check().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("condition reached");
 }
 
 #[tokio::test]
 async fn effect_and_cursor_commit_together() {
     let db = database().await;
-    let event = append_event(&db, "wanted", "atomic", "2026-10-01T21:00:00Z").await;
-    let worker = Arc::new(TinyWorker::new("atomic-worker").with_commit_failure());
-    let runtime = WorkerRuntime::new(Arc::clone(&db), worker).with_options(fast_options(3));
-
+    let event = append(&db, "wanted", "atomic").await;
+    let mut worker = TinyWorker::new("atomic");
+    worker.commit_failures = AtomicUsize::new(1);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
     assert_eq!(runtime.run_once(1).await.unwrap(), 0);
-    let effects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_test_effect")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = 'atomic-worker'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(effects, 0);
-    assert_eq!(cursor, 0);
-
-    tokio::time::sleep(Duration::from_millis(3)).await;
+    assert!(effects(&db).await.is_empty());
+    assert_eq!(runtime.source.cursor().await.unwrap(), 0);
     assert_eq!(runtime.run_once(1).await.unwrap(), 1);
-    let stored: i64 = sqlx::query_scalar("SELECT sequence FROM worker_test_effect")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = 'atomic-worker'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(stored, event.sequence);
-    assert_eq!(cursor, event.sequence);
+    assert_eq!(effects(&db).await, [event.sequence]);
+    assert_eq!(runtime.source.cursor().await.unwrap(), event.sequence);
 }
 
 #[tokio::test]
-async fn strict_order_filters_in_sql_and_skips_without_delivery_rows() {
+async fn strict_order_sql_filter_and_no_per_ignored_event_writes() {
     let db = database().await;
-    for index in 0..25 {
-        append_event(
-            &db,
-            "ignored",
-            &format!("ignored-{index}"),
-            "2026-10-01T21:00:00Z",
-        )
-        .await;
+    for _ in 0..25 {
+        append(&db, "ignored", "ignored").await;
     }
-    let first = append_event(&db, "wanted", "first", "2026-10-01T21:01:00Z").await;
-    for index in 0..25 {
-        append_event(
-            &db,
-            "ignored",
-            &format!("middle-{index}"),
-            "2026-10-01T21:02:00Z",
-        )
-        .await;
+    let first = append(&db, "wanted", "first").await;
+    for _ in 0..25 {
+        append(&db, "ignored", "ignored").await;
     }
-    let second = append_event(&db, "wanted", "second", "2026-10-01T21:03:00Z").await;
-    let tail = append_event(&db, "ignored", "tail", "2026-10-01T21:04:00Z").await;
-    let worker = Arc::new(TinyWorker::new("filtered-worker"));
+    let second = append(&db, "wanted", "second").await;
+    append(&db, "ignored", "tail").await;
+    let worker = Arc::new(TinyWorker::new("filtered"));
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
-
-    assert_eq!(runtime.run_once(10).await.unwrap(), 3);
+    runtime.initialize().await.unwrap();
+    let before = runtime.write_transaction_count();
+    assert_eq!(runtime.run_once(10).await.unwrap(), 2);
     assert_eq!(
         *worker.seen.lock().unwrap(),
         [first.sequence, second.sequence]
     );
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = 'filtered-worker'",
+    assert_eq!(runtime.write_transaction_count() - before, 2);
+    assert_eq!(runtime.source.cursor().await.unwrap(), second.sequence);
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = 'filtered'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM event_projection_receipt WHERE consumer_name = 'filtered'"
+        )
+        .await,
+        0
+    );
+}
+
+// P4. Advance explicit Tokio time while each ignored append is observed.
+#[tokio::test]
+async fn trickled_ignored_events_are_checkpointed_at_most_once_per_idle_interval() {
+    let db = database().await;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("trickle")));
+    runtime.initialize().await.unwrap();
+    let before = runtime.write_transaction_count();
+    tokio::time::pause();
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    for _ in 0..20 {
+        append(&db, "ignored", "ignored").await;
+        assert!(matches!(
+            runtime.poll_once().await.unwrap(),
+            PollResult::Idle
+        ));
+        tokio::time::advance(Duration::from_millis(40)).await;
+    }
+    assert_eq!(runtime.write_transaction_count(), before);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(matches!(
+        runtime.poll_once().await.unwrap(),
+        PollResult::Progress
+    ));
+    assert_eq!(runtime.write_transaction_count() - before, 1);
+    assert_eq!(runtime.source.cursor().await.unwrap(), 20);
+    clock_guard.abort();
+}
+
+#[tokio::test]
+async fn retry_attempts_survive_new_runtime_then_cap_and_process_next() {
+    let db = database().await;
+    let first = append(&db, "wanted", "poison").await;
+    let second = append(&db, "wanted", "next").await;
+    let worker = Arc::new(TinyWorker::new("retry"));
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    drop(runtime);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), worker);
+    assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'retry'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(runtime.run_once(10).await.unwrap(), 2);
+    let dead: (String, i64) = sqlx::query_as("SELECT source_key, attempts FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, (first.sequence.to_string(), 3));
+    assert_eq!(effects(&db).await, [second.sequence]);
+}
+
+// P2 replaces the old test that enshrined infinite supervisor restarts.
+#[tokio::test]
+async fn panicking_handle_and_commit_are_capped_without_supervisor_restarts() {
+    for poison in ["panic", "commit-panic"] {
+        let db = database().await;
+        let bad = append(&db, "wanted", poison).await;
+        let next = append(&db, "wanted", "next").await;
+        let worker = Arc::new(TinyWorker::new("panic"));
+        let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+        for _ in 0..2 {
+            assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+        }
+        assert_eq!(runtime.run_once(10).await.unwrap(), 2);
+        let dead: (String, i64, String) =
+            sqlx::query_as("SELECT source_key, attempts, last_error FROM worker_dead_letter")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(dead.0, bad.sequence.to_string());
+        assert_eq!(dead.1, 3);
+        assert!(dead.2.contains("panicked"));
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT restart_count FROM worker_health WHERE worker_name = 'panic'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(effects(&db).await, [next.sequence]);
+    }
+}
+
+// P3. Failing the runtime's health update rolls back the worker effect and
+// acknowledgement, WITHOUT incrementing attempts even after exceeding the cap.
+#[tokio::test]
+async fn runtime_internal_failures_never_strike_and_recovery_applies_effect_once() {
+    let db = database().await;
+    let event = append(&db, "wanted", "good").await;
+    let worker = Arc::new(TinyWorker::new("infra"));
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    runtime.initialize().await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER infra_failure BEFORE UPDATE OF last_success_at ON worker_health
+        BEGIN SELECT RAISE(ABORT, 'simulated disk I/O error'); END",
     )
-    .fetch_one(db.pool())
+    .execute(db.pool())
     .await
     .unwrap();
-    assert_eq!(cursor, tail.sequence);
-    for table in ["event_processing_lease", "event_projection_receipt"] {
-        let query = format!("SELECT COUNT(*) FROM {table} WHERE consumer_name = ?");
-        let rows: i64 = sqlx::query_scalar(&query)
-            .bind("filtered-worker")
+    for _ in 0..10 {
+        assert!(runtime.run_once(1).await.is_err());
+    }
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'infra'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
+        0
+    );
+    assert_eq!(runtime.source.cursor().await.unwrap(), 0);
+    assert!(effects(&db).await.is_empty());
+    sqlx::query("DROP TRIGGER infra_failure")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runtime.run_once(10).await.unwrap(), 1);
+    assert_eq!(effects(&db).await, [event.sequence]);
+    assert_eq!(worker.seen.lock().unwrap().len(), 11);
+}
+
+#[tokio::test]
+async fn transient_worker_errors_never_strike_or_dead_letter() {
+    let db = database().await;
+    let event = append(&db, "wanted", "good").await;
+    let worker = Arc::new(TinyWorker::new("transient"));
+    worker.transient.store(true, Ordering::SeqCst);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    for _ in 0..10 {
+        assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+    }
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'transient'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
+        0
+    );
+    worker.transient.store(false, Ordering::SeqCst);
+    worker.commit_transient.store(true, Ordering::SeqCst);
+    for _ in 0..10 {
+        assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+    }
+    assert!(effects(&db).await.is_empty());
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'transient'"
+        )
+        .await,
+        0
+    );
+    worker.commit_transient.store(false, Ordering::SeqCst);
+    assert_eq!(runtime.run_once(1).await.unwrap(), 1);
+    assert_eq!(effects(&db).await, [event.sequence]);
+}
+
+#[tokio::test]
+async fn defer_is_uncapped_keeps_order_reason_and_first_time() {
+    let db = database().await;
+    let first = append(&db, "wanted", "defer").await;
+    append(&db, "wanted", "next").await;
+    let worker = Arc::new(TinyWorker::new("defer"));
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    let initial: String =
+        sqlx::query_scalar("SELECT deferred_since FROM worker_health WHERE worker_name = 'defer'")
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(rows, 0, "{table} must stay empty");
+    for _ in 0..20 {
+        assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    }
+    let state: (i64, String, String, Option<String>) = sqlx::query_as(
+        "SELECT retry_attempts, deferred_reason, deferred_since, last_error FROM worker_health WHERE worker_name = 'defer'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(state, (0, "waiting for readiness".into(), initial, None));
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
+        0
+    );
+    assert_eq!(runtime.source.cursor().await.unwrap(), 0);
+    assert!(worker
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|s| *s == first.sequence));
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_deferral_and_strike_backoff() {
+    for (name, entity) in [("defer-shutdown", "defer"), ("strike-shutdown", "poison")] {
+        let db = database().await;
+        append(&db, "wanted", entity).await;
+        let mut worker = TinyWorker::new(name);
+        worker.defer_for = Duration::from_secs(3600);
+        worker.policy.initial_backoff = Duration::from_secs(300);
+        worker.policy.max_backoff = Duration::from_secs(300);
+        let runtime = Arc::new(WorkerRuntime::new(Arc::clone(&db), Arc::new(worker)));
+        let (tx, rx) = watch::channel(false);
+        let handle = runtime.start(rx);
+        wait_for(|| async { scalar(&db, "SELECT COUNT(*) FROM worker_health WHERE retry_attempts > 0 OR deferred_since IS NOT NULL").await == 1 }).await;
+        stop(tx, handle).await;
     }
 }
 
 #[tokio::test]
-async fn retry_cap_dead_letters_once_then_processes_next_event() {
+async fn direct_dead_letter_advances_without_a_strike() {
     let db = database().await;
-    let first = append_event(&db, "wanted", "retry", "2026-10-01T21:00:00Z").await;
-    let second = append_event(&db, "wanted", "next", "2026-10-01T21:01:00Z").await;
-    let worker = Arc::new(TinyWorker::new("retry-worker").retrying("retry"));
-    let runtime =
-        WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker)).with_options(fast_options(2));
-
-    assert_eq!(runtime.run_once(10).await.unwrap(), 0);
-    tokio::time::sleep(Duration::from_millis(3)).await;
+    let bad = append(&db, "wanted", "terminal").await;
+    let next = append(&db, "wanted", "next").await;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("terminal")));
     assert_eq!(runtime.run_once(10).await.unwrap(), 2);
-
-    let dead_letter: (i64, i64, String) = sqlx::query_as(
-        "SELECT event_sequence, attempts, event_type FROM worker_dead_letter
-         WHERE worker_name = 'retry-worker'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(dead_letter, (first.sequence, 2, "wanted".to_owned()));
-    let cursor: i64 = sqlx::query_scalar(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = 'retry-worker'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(cursor, second.sequence);
+    let dead: (String, i64) = sqlx::query_as("SELECT source_key, attempts FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, (bad.sequence.to_string(), 0));
+    assert_eq!(effects(&db).await, [next.sequence]);
 }
 
 #[tokio::test]
-async fn health_error_persists_until_success_and_backlog_is_exact() {
+async fn health_error_persists_until_success_and_backlog_is_live() {
     let db = database().await;
-    let first = append_event(&db, "wanted", "first", "2026-10-01T20:00:00Z").await;
-    append_event(&db, "ignored", "ignored", "2026-10-01T20:01:00Z").await;
-    let second = append_event(&db, "wanted", "second", "2026-10-01T20:02:00Z").await;
-    let worker = Arc::new(TinyWorker::new("health-worker").with_commit_failure());
-    let runtime = WorkerRuntime::new(Arc::clone(&db), worker).with_options(fast_options(3));
-
+    let first = append(&db, "wanted", "first").await;
+    append(&db, "ignored", "ignored").await;
+    let second = append(&db, "wanted", "second").await;
+    let mut worker = TinyWorker::new("health");
+    worker.commit_failures = AtomicUsize::new(1);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
     assert_eq!(runtime.run_once(1).await.unwrap(), 0);
-    let failed: (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT lag, oldest_pending_at, last_error FROM worker_health
-         WHERE worker_name = 'health-worker'",
+    runtime.initialize().await.unwrap();
+    assert!(sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_error FROM worker_health WHERE worker_name = 'health'"
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .unwrap()
+    .contains("failure after effect write"));
+    let lag = db.domain_event_consumer_lag(&["health"]).await.unwrap();
+    assert_eq!(lag[0].lag, 2);
+    assert_eq!(
+        lag[0].oldest_unprocessed_at.as_deref(),
+        Some("2000-01-01T00:00:00Z")
+    );
+    assert_eq!(runtime.run_once(10).await.unwrap(), 2);
+    let lag = db.domain_event_consumer_lag(&["health"]).await.unwrap();
+    assert_eq!(lag[0].lag, 0);
+    assert!(lag[0].oldest_unprocessed_at.is_none());
+    let state: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT last_error, last_success_at FROM worker_health WHERE worker_name = 'health'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(failed.0, 2);
-    assert_eq!(failed.1.as_deref(), Some("2026-10-01T20:00:00Z"));
-    assert!(failed.2.is_some());
+    assert!(state.0.is_none());
+    assert!(state.1.is_some());
+    assert_eq!(effects(&db).await, [first.sequence, second.sequence]);
+}
 
-    let operator = db
-        .domain_event_consumer_lag(&["health-worker"])
+// P1 and P5. Explicit entry barrier, then paused time for the timeout. A false
+// shutdown-channel update cannot create a second concurrent handler.
+#[tokio::test]
+async fn hung_handler_has_live_lag_timeout_strikes_and_false_watch_does_not_duplicate() {
+    let db = database().await;
+    append(&db, "wanted", "hang").await;
+    let mut tiny = TinyWorker::new("hung");
+    tiny.timeout = Duration::from_secs(300);
+    tiny.policy.initial_backoff = Duration::from_secs(300);
+    tiny.policy.max_backoff = Duration::from_secs(300);
+    let worker = Arc::new(tiny);
+    let runtime = Arc::new(WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker)));
+    let (tx, rx) = watch::channel(false);
+    let handle = runtime.start(rx);
+    tokio::time::timeout(Duration::from_secs(10), worker.entered.notified())
         .await
         .unwrap();
-    assert_eq!(operator[0].lag, 2);
-    assert_eq!(operator[0].oldest_unprocessed_at, failed.1);
-
-    tokio::time::sleep(Duration::from_millis(3)).await;
-    assert_eq!(runtime.run_once(2).await.unwrap(), 2);
-    let healthy: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT lag, oldest_pending_at, last_error, last_success_at
-         FROM worker_health WHERE worker_name = 'health-worker'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(healthy.0, 0);
-    assert!(healthy.1.is_none());
-    assert!(healthy.2.is_none());
-    assert!(healthy.3.is_some());
-    let effects: Vec<i64> =
-        sqlx::query_scalar("SELECT sequence FROM worker_test_effect ORDER BY sequence")
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(effects, [first.sequence, second.sequence]);
+    let reported = db.domain_event_consumer_lag(&["hung"]).await.unwrap();
+    assert_eq!(reported[0].lag, 1);
+    assert_eq!(
+        reported[0].oldest_unprocessed_at.as_deref(),
+        Some("2000-01-01T00:00:00Z")
+    );
+    assert_eq!(worker.active.load(Ordering::SeqCst), 1);
+    tx.send_replace(false);
+    // Synchronize through the supervisor: paused time gives it time to react
+    // to false while the handler remains blocked.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(worker.seen.lock().unwrap().len(), 1);
+    tokio::time::advance(Duration::from_secs(300)).await;
+    // Resume for DB persistence, avoiding paused-time auto-advance during SQLx IO.
+    tokio::time::resume();
+    wait_for(|| async {
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'hung'",
+        )
+        .await
+            == 1
+    })
+    .await;
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT restart_count FROM worker_health WHERE worker_name = 'hung'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        worker.active.load(Ordering::SeqCst),
+        0,
+        "timeout drops the hung future"
+    );
+    stop(tx, handle).await;
 }
 
 #[tokio::test]
-async fn panic_is_restarted_and_shutdown_during_backoff_is_prompt() {
+async fn after_commit_failure_reports_health_without_rollback_or_strike() {
     let db = database().await;
-    let event = append_event(&db, "wanted", "panic", "2026-10-01T21:00:00Z").await;
-    let worker = Arc::new(TinyWorker::new("panic-worker").panics_once());
-    let runtime =
-        Arc::new(WorkerRuntime::new(Arc::clone(&db), worker).with_options(fast_options(3)));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = Arc::clone(&runtime).start(shutdown_rx);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let state = sqlx::query_as::<_, (i64, i64)>(
-                "SELECT restart_count, cursor_sequence FROM worker_health
-                 WHERE worker_name = 'panic-worker'",
-            )
-            .fetch_optional(db.pool())
-            .await
-            .unwrap();
-            if state.is_some_and(|(restarts, cursor)| restarts >= 1 && cursor == event.sequence) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    let event = append(&db, "wanted", "good").await;
+    let mut tiny = TinyWorker::new("after");
+    tiny.after_failure = true;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(tiny));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 1);
+    assert_eq!(effects(&db).await, [event.sequence]);
+    assert_eq!(runtime.source.cursor().await.unwrap(), event.sequence);
+    let state: (i64, String) = sqlx::query_as(
+        "SELECT retry_attempts, last_error FROM worker_health WHERE worker_name = 'after'",
+    )
+    .fetch_one(db.pool())
     .await
     .unwrap();
-    shutdown_tx.send_replace(true);
-    tokio::time::timeout(Duration::from_millis(100), handle)
-        .await
-        .expect("supervised worker stops promptly")
-        .unwrap();
-
-    let backoff_worker = Arc::new(TinyWorker::new("backoff-worker").always_panics());
-    let backoff_runtime = Arc::new(
-        WorkerRuntime::new(Arc::clone(&db), backoff_worker).with_options(WorkerRuntimeOptions {
-            max_attempts: 3,
-            min_backoff: Duration::from_secs(5),
-            max_backoff: Duration::from_secs(5),
-        }),
+    assert_eq!(state, (0, "post-commit failed".into()));
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
+        0
     );
-    append_event(&db, "wanted", "backoff", "2026-10-01T21:01:00Z").await;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = backoff_runtime.start(shutdown_rx);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let restarts = sqlx::query_scalar::<_, i64>(
-                "SELECT restart_count FROM worker_health WHERE worker_name = 'backoff-worker'",
-            )
-            .fetch_optional(db.pool())
+}
+
+#[tokio::test]
+async fn prefix_and_all_subscriptions_and_tick_support_non_event_work() {
+    for subscription in [
+        Subscription::Prefix(vec!["agent.wake.".into()]),
+        Subscription::All,
+    ] {
+        let db = database().await;
+        append(&db, "ignored", "ignored").await;
+        let wanted = append(&db, "agent.wake.ready", "good").await;
+        let mut tiny = TinyWorker::new("subscription");
+        tiny.subscription = subscription.clone();
+        tiny.tick_panics = AtomicUsize::new(1);
+        let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(tiny));
+        assert_eq!(runtime.run_once(10).await.unwrap(), 0); // tick runs even before next event
+        let expected = if matches!(subscription, Subscription::All) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(runtime.run_once(10).await.unwrap(), expected);
+        assert!(effects(&db).await.contains(&wanted.sequence));
+        assert_eq!(
+            scalar(&db, "SELECT retry_attempts FROM worker_health").await,
+            0
+        );
+    }
+}
+
+// P6. SQLite VM instruction counts include every poll/commit statement, not
+// wall time. Reintroducing COUNT(backlog) in a write transaction fails this.
+#[tokio::test]
+async fn per_event_commit_cost_is_independent_of_wanted_backlog() {
+    let mut counts = Vec::new();
+    for backlog in [10, 20_000] {
+        let db = database().await;
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type,
+            scope_type, scope_id, correlation_id, created_at)
+            WITH RECURSIVE counter(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM counter WHERE x < ?)
+            SELECT 'event-' || x, CASE WHEN x % 3 = 0 THEN 'wanted-two' ELSE 'wanted' END, 'test', 'good', 'system', 'system', 'test', 'test', '2000-01-01T00:00:00Z' FROM counter")
+            .bind(backlog).execute(db.pool()).await.unwrap();
+        let mut worker = TinyWorker::new("cost");
+        worker.subscription = Subscription::Exact(vec![
+            "wanted".into(),
+            "wanted-two".into(),
+            "wanted-three".into(),
+        ]);
+        let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(worker));
+        runtime.initialize().await.unwrap();
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&steps);
+        let mut connection = db.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
             .await
             .unwrap()
-            .unwrap_or(0);
-            if restarts >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    shutdown_tx.send_replace(true);
-    tokio::time::timeout(Duration::from_millis(100), handle)
-        .await
-        .expect("shutdown interrupts restart backoff")
-        .unwrap();
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        drop(connection);
+        assert_eq!(runtime.run_once(1).await.unwrap(), 1);
+        counts.push(steps.load(Ordering::Relaxed));
+    }
+    assert!(
+        counts[1] <= counts[0] + 100,
+        "VM work must not scale with backlog: {counts:?}"
+    );
 }
 
 #[tokio::test]
-async fn caught_up_idle_poll_opens_no_write_transaction() {
+async fn caught_up_idle_poll_opens_no_write_transaction_or_pool_write() {
     let db = database().await;
-    let worker = Arc::new(TinyWorker::new("idle-worker"));
-    let runtime = WorkerRuntime::new(db, worker);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("idle")));
     runtime.initialize().await.unwrap();
     let before = runtime.write_transaction_count();
-    assert!(matches!(
-        runtime.poll_once().await.unwrap(),
-        PollResult::Idle
-    ));
+    let updates = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&updates);
+    let mut connection = db.pool().acquire().await.unwrap();
+    connection
+        .lock_handle()
+        .await
+        .unwrap()
+        .set_update_hook(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+    drop(connection);
+    for _ in 0..10 {
+        assert!(matches!(
+            runtime.poll_once().await.unwrap(),
+            PollResult::Idle
+        ));
+    }
     assert_eq!(runtime.write_transaction_count(), before);
+    assert_eq!(updates.load(Ordering::Relaxed), 0);
+}
+
+// P8: old live leases neither block nor duplicate delivery; cleanup belongs to
+// the memory-only migration (the generic library preserves other names).
+#[tokio::test]
+async fn upgrade_reuses_cursor_ignores_legacy_leases_and_handles_once() {
+    let db = database().await;
+    let old = append(&db, "wanted", "old").await;
+    let next = append(&db, "wanted", "new").await;
+    sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('upgrade', ?, ?)")
+        .bind(old.sequence).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
+    let claimed = db
+        .claim_event_batch(ClaimDomainEvents {
+            consumer_name: "upgrade".into(),
+            lease_owner: "legacy".into(),
+            now: db::now_rfc3339(),
+            leased_until: "2999-01-01T00:00:00Z".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("upgrade")));
+    assert_eq!(runtime.run_once(10).await.unwrap(), 1);
+    assert_eq!(runtime.run_once(10).await.unwrap(), 0);
+    assert_eq!(effects(&db).await, [next.sequence]);
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = 'upgrade'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn deleted_health_is_recreated_and_retry_policy_defaults_are_real() {
+    let db = database().await;
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("recreated")));
+    runtime.initialize().await.unwrap();
+    sqlx::query("DELETE FROM worker_health")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    append(&db, "wanted", "good").await;
+    assert_eq!(runtime.run_once(1).await.unwrap(), 1);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM worker_health").await, 1);
+    let policy = RetryPolicy::default();
+    assert_eq!(policy.max_attempts, 8);
+    assert_eq!(policy.delay(1), Duration::from_secs(1));
+    assert_eq!(policy.delay(50), Duration::from_secs(300));
+}
+
+#[tokio::test]
+async fn supervisor_restarts_runtime_panics_counts_initialization_failures_and_stops_in_backoff() {
+    let db = database().await;
+    let health = WorkerHealth::new(Arc::clone(&db), "supervised");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let (tx, rx) = watch::channel(false);
+    let handle = WorkerSupervisor::new(
+        health,
+        SupervisorPolicy {
+            initial_backoff: Duration::from_secs(300),
+            max_backoff: Duration::from_secs(300),
+            healthy_period: Duration::from_secs(60),
+        },
+    )
+    .start(
+        move |_| {
+            let count = Arc::clone(&count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                panic!("runtime-level panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            }
+        },
+        rx,
+    );
+    wait_for(|| async {
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM worker_health WHERE restart_count = 1",
+        )
+        .await
+            == 1
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    stop(tx, handle).await;
+
+    // Fail event-source initialization, while the source-neutral health table
+    // remains available. The restart must still be persisted.
+    sqlx::query(
+        "CREATE TRIGGER bad_init BEFORE INSERT ON event_consumer_cursor
+        BEGIN SELECT RAISE(ABORT, 'initialization fails'); END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let runtime = Arc::new(WorkerRuntime::new(
+        Arc::clone(&db),
+        Arc::new(TinyWorker::new("bad-init")),
+    ));
+    let (tx, rx) = watch::channel(false);
+    let handle = runtime.start(rx);
+    wait_for(|| async { scalar(&db, "SELECT COUNT(*) FROM worker_health WHERE worker_name = 'bad-init' AND restart_count >= 1").await == 1 }).await;
+    stop(tx, handle).await;
+}
+
+// A new append path has NO notify call. Hold the loop at maximum idle backoff,
+// append in a caller-owned transaction, and require entry before that timer.
+#[tokio::test]
+async fn append_in_caller_transaction_and_runtime_commit_wake_without_callsite_notify() {
+    for from_runtime in [false, true] {
+        // Multiple connections expose the pre-visibility wake-up race that
+        // an in-memory, single-connection pool would mask.
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("wake.sqlite").display()
+        );
+        let pool = create_sqlite_pool(&url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE worker_test_effect (sequence INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let mut receiving = TinyWorker::new("receiver");
+        receiving.subscription = Subscription::Exact(vec!["emitted".into()]);
+        let receiver = Arc::new(receiving);
+        let runtime = Arc::new(WorkerRuntime::new(Arc::clone(&db), Arc::clone(&receiver)));
+        runtime.initialize().await.unwrap();
+        let (tx, rx) = watch::channel(false);
+        let running = Arc::clone(&runtime);
+        let handle = tokio::spawn(async move {
+            running.run_loop_with_idle(rx, MAX_IDLE).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(10), runtime.idle_entered.notified())
+            .await
+            .unwrap();
+        if from_runtime {
+            let mut emitting = TinyWorker::new("emitter");
+            emitting.append_in_commit = true;
+            let emit_runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(emitting));
+            append(&db, "wanted", "good").await;
+            // Consume the setup append's wake and return the receiver to its
+            // maximum idle wait. Only the runtime commit can wake it next.
+            tokio::time::timeout(Duration::from_secs(10), runtime.idle_entered.notified())
+                .await
+                .unwrap();
+            assert_eq!(emit_runtime.run_once(1).await.unwrap(), 1);
+        } else {
+            let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+            db.append_event_in_tx(&mut transaction, &input("emitted", "from-new-path"))
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), receiver.entered.notified())
+            .await
+            .expect("connection hook wakes inside maximum 5-second idle backoff");
+        stop(tx, handle).await;
+    }
+}
+
+#[tokio::test]
+async fn source_neutral_poison_policy_accepts_step_keys_without_event_cursor() {
+    let db = database().await;
+    let health = WorkerHealth::new(Arc::clone(&db), "steps");
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    let decision = health
+        .failure_in_tx(
+            &mut tx,
+            WorkItem {
+                source_key: "task/a/step/b",
+                item_type: "step",
+            },
+            RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            },
+            "step failed",
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(decision, PoisonDecision::DeadLettered));
+    assert!(matches!(
+        RetryPolicy::default().decision(8),
+        PoisonDecision::DeadLettered
+    ));
+    // A leased source can supply its own accounting without touching the
+    // serial event adapter's retry state.
+    health
+        .dead_letter_in_tx(
+            &mut tx,
+            WorkItem {
+                source_key: "task/c/step/d",
+                item_type: "step",
+            },
+            FailureState {
+                attempts: 8,
+                first_failed_at: "2000-01-01T00:00:00Z",
+            },
+            "leased step failed",
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let key: String =
+        sqlx::query_scalar("SELECT source_key FROM worker_dead_letter ORDER BY source_key LIMIT 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(key, "task/a/step/b");
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM event_consumer_cursor WHERE consumer_name = 'steps'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn supervisor_backoff_resets_after_a_healthy_period() {
+    let db = database().await;
+    let health = WorkerHealth::new(Arc::clone(&db), "reset");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let backoff = Arc::new(Notify::new());
+    let count = Arc::clone(&calls);
+    let started = Arc::clone(&entered);
+    let release = Arc::clone(&finish);
+    let (tx, rx) = watch::channel(false);
+    let handle = WorkerSupervisor::new(
+        health,
+        SupervisorPolicy {
+            initial_backoff: Duration::from_secs(10),
+            max_backoff: Duration::from_secs(60),
+            healthy_period: Duration::from_secs(60),
+        },
+    )
+    .with_backoff_signal(Arc::clone(&backoff))
+    .start(
+        move |_| {
+            let count = Arc::clone(&count);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            async move {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                if call > 0 {
+                    release.notified().await;
+                }
+                Ok(())
+            }
+        },
+        rx,
+    );
+    entered.notified().await;
+    backoff.notified().await;
+    // Pause only the pure timer/notification portion. SQLite persistence runs
+    // with real time so SQLx acquisition timers cannot auto-advance during IO.
+    tokio::time::pause();
+    entered.notified().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    finish.notify_one();
+    backoff.notified().await;
+    tokio::time::pause();
+    let waiting_since = Instant::now();
+    entered.notified().await;
+    // Reset waits ten seconds; an accumulated restart backoff would be twenty.
+    assert!(waiting_since.elapsed() < Duration::from_secs(15));
+    tokio::time::resume();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    stop(tx, handle).await;
+}
+
+#[tokio::test]
+async fn worker_runtime_migration_removes_only_memory_delivery_metadata() {
+    let db = database().await;
+    let event = append(&db, "wanted", "legacy").await;
+    for name in [crate::memory_consumer_name(), "unmigrated"] {
+        db.claim_event_batch(ClaimDomainEvents {
+            consumer_name: name.into(),
+            lease_owner: "legacy".into(),
+            now: db::now_rfc3339(),
+            leased_until: "2999-01-01T00:00:00Z".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at) VALUES (?, ?, ?, ?)")
+            .bind(name).bind(&event.id).bind(&event.id).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
+    }
+    let cursors_before: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name")
+        .fetch_all(db.pool()).await.unwrap();
+    // Replay ONLY this unreleased migration against the legacy seeded state.
+    sqlx::raw_sql("DROP TABLE worker_health; DROP TABLE worker_dead_letter;")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../db/migrations/V202610012200__worker_runtime.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for table in ["event_processing_lease", "event_projection_receipt"] {
+        let query = format!("SELECT COUNT(*) FROM {table} WHERE consumer_name = ?");
+        let memory: i64 = sqlx::query_scalar(&query)
+            .bind(crate::memory_consumer_name())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let unmigrated: i64 = sqlx::query_scalar(&query)
+            .bind("unmigrated")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(memory, 0);
+        assert_eq!(unmigrated, 1);
+    }
+    let cursors_after: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(cursors_after, cursors_before);
+    assert!(db.get_event(&event.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn shutdown_aborts_a_hung_handle_and_drops_its_future() {
+    let db = database().await;
+    append(&db, "wanted", "hang").await;
+    let worker = Arc::new(TinyWorker::new("abort"));
+    let runtime = Arc::new(WorkerRuntime::new(db, Arc::clone(&worker)));
+    let (tx, rx) = watch::channel(false);
+    let handle = runtime.start(rx);
+    tokio::time::timeout(Duration::from_secs(10), worker.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(worker.active.load(Ordering::SeqCst), 1);
+    stop(tx, handle).await;
+    assert_eq!(worker.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn supervisor_shutdown_interrupts_restart_health_persistence() {
+    let db = database().await;
+    let health = WorkerHealth::new(Arc::clone(&db), "blocked-health");
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let started = Arc::clone(&entered);
+    let finish = Arc::clone(&release);
+    let (tx, rx) = watch::channel(false);
+    let handle = WorkerSupervisor::new(health, SupervisorPolicy::default()).start(
+        move |_| {
+            let started = Arc::clone(&started);
+            let finish = Arc::clone(&finish);
+            async move {
+                started.notify_one();
+                finish.notified().await;
+                Ok(())
+            }
+        },
+        rx,
+    );
+    entered.notified().await;
+    let connection = db.pool().acquire().await.unwrap();
+    release.notify_one();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    stop(tx, handle).await;
+    drop(connection);
+}
+
+#[tokio::test]
+async fn invalid_retry_timestamp_is_runtime_error_without_a_strike() {
+    let db = database().await;
+    append(&db, "wanted", "poison").await;
+    let worker = Arc::new(TinyWorker::new("timestamp"));
+    let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::clone(&worker));
+    assert_eq!(runtime.run_once(1).await.unwrap(), 0);
+    sqlx::query(
+        "UPDATE worker_health SET retry_not_before = 'invalid' WHERE worker_name = 'timestamp'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let runtime = WorkerRuntime::new(Arc::clone(&db), worker);
+    assert!(matches!(
+        runtime.run_once(1).await,
+        Err(ServiceError::Db(db::DbError::Check(_)))
+    ));
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT retry_attempts FROM worker_health WHERE worker_name = 'timestamp'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM worker_dead_letter").await,
+        0
+    );
 }

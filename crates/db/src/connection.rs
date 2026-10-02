@@ -3,7 +3,21 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Connection, Sqlite, SqliteConnection, SqlitePool, Transaction,
 };
-use std::{str::FromStr, time::Duration};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::Duration,
+};
+use tokio::sync::Notify;
+
+pub(crate) fn domain_event_notify() -> Arc<Notify> {
+    static NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+    Arc::clone(NOTIFY.get_or_init(|| Arc::new(Notify::new())))
+}
 
 pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
     let max_connections = if database_url.contains(":memory:") {
@@ -13,10 +27,19 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
     };
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
 
+    // Connection identities are opaque keys only; no pointer is dereferenced.
+    // SQLite's commit hook is BEFORE visibility. It only marks a connection;
+    // SQLx release delivers the notification AFTER the commit has completed.
+    let committed = Arc::new(Mutex::new(HashSet::<usize>::new()));
+    let on_connect = Arc::clone(&committed);
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
+        // A release must pass through the notification hook rather than the
+        // lifetime-expiry close path. Idle connections can still be recycled.
+        .max_lifetime(None)
         .acquire_timeout(Duration::from_secs(30))
-        .after_connect(|connection, _metadata| {
+        .after_connect(move |connection, _metadata| {
+            let committed = Arc::clone(&on_connect);
             Box::pin(async move {
                 // Only empty databases can enable auto-vacuum without a full
                 // rebuild. Set this before WAL, which dirties even an empty
@@ -44,7 +67,43 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 sqlx::query("PRAGMA busy_timeout = 30000")
                     .execute(&mut *connection)
                     .await?;
+                let dirty = Arc::new(AtomicBool::new(false));
+                let mut handle = connection.lock_handle().await?;
+                let key = handle.as_raw_handle().as_ptr() as usize;
+                committed.lock().expect("event hook lock").remove(&key);
+                let updated = Arc::clone(&dirty);
+                handle.set_update_hook(move |update| {
+                    if update.table == "domain_event" && update.operation == sqlx::sqlite::SqliteOperation::Insert {
+                        updated.store(true, Ordering::Relaxed);
+                    }
+                });
+                let rollback_dirty = Arc::clone(&dirty);
+                handle.set_rollback_hook(move || {
+                    rollback_dirty.store(false, Ordering::Relaxed);
+                    // Preserve an earlier committed append on a connection
+                    // retained across transactions. A failed COMMIT can cause
+                    // a harmless extra wake, never a lost committed append.
+                });
+                handle.set_commit_hook(move || {
+                    if dirty.swap(false, Ordering::Relaxed) {
+                        committed.lock().expect("event hook lock").insert(key);
+                    }
+                    true
+                });
                 Ok(())
+            })
+        })
+        .after_release(move |connection, _metadata| {
+            let committed = Arc::clone(&committed);
+            Box::pin(async move {
+                // Flush an aborted transaction's queued rollback before reading
+                // its marker. Ordinary rollbacks never set a commit marker.
+                connection.ping().await?;
+                let key = connection.lock_handle().await?.as_raw_handle().as_ptr() as usize;
+                if committed.lock().expect("event hook lock").remove(&key) {
+                    domain_event_notify().notify_waiters();
+                }
+                Ok(true)
             })
         })
         .connect_with(options)

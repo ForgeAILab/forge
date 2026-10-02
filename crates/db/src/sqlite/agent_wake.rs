@@ -289,9 +289,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
 
         complete_event_in_tx(&mut transaction, &input.completion).await?;
         transaction.commit().await?;
-        if admitted_turn {
-            self.notify_domain_event_committed();
-        }
         Ok(disposition)
     }
 
@@ -312,7 +309,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
         if let Some(expected_attention) = input.expected_attention.as_ref() {
             validate_expected_attention_in_tx(&mut transaction, expected_attention).await?;
         }
-        let admitted_turn = input.disposition.disposition == AgentWakeDispositionKind::TurnAdmitted;
         match input.disposition.disposition {
             AgentWakeDispositionKind::TurnAdmitted => {
                 let admission = input.admission.clone().ok_or_else(|| {
@@ -356,9 +352,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
                 return Err(DbError::IdempotencyConflict);
             }
             transaction.commit().await?;
-            if admitted_turn {
-                self.notify_domain_event_committed();
-            }
             return Ok(existing);
         }
 
@@ -416,9 +409,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
 
         let disposition = disposition_from_create(&input.disposition);
         transaction.commit().await?;
-        if admitted_turn {
-            self.notify_domain_event_committed();
-        }
         Ok(disposition)
     }
 }

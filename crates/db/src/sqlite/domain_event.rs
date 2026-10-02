@@ -11,23 +11,97 @@ pub(super) async fn next_existing_sequence(
     next_existing_sequence_for_types(transaction, cursor, &[]).await
 }
 
+/// SQL-filtered subscription. Prefix values are literal prefixes (no glob).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "values", rename_all = "snake_case")]
+pub enum EventSubscription {
+    Exact(Vec<String>),
+    Prefix(Vec<String>),
+    All,
+}
+
+pub(super) fn push_subscription<'a>(
+    query: &mut sqlx::QueryBuilder<'a, Sqlite>,
+    subscription: &'a EventSubscription,
+) {
+    match subscription {
+        EventSubscription::All => {}
+        EventSubscription::Exact(types) => {
+            query.push(" AND event_type IN (");
+            let mut separated = query.separated(", ");
+            for value in types {
+                separated.push_bind(value);
+            }
+            // Empty exact lists subscribe to nothing.
+            separated.push_unseparated(")");
+        }
+        EventSubscription::Prefix(prefixes) => {
+            query.push(" AND (0");
+            for prefix in prefixes {
+                query
+                    .push(" OR substr(event_type, 1, length(")
+                    .push_bind(prefix)
+                    .push(")) = ")
+                    .push_bind(prefix);
+            }
+            query.push(")");
+        }
+    }
+}
+
 async fn next_existing_sequence_for_types(
     transaction: &mut Transaction<'_, Sqlite>,
     cursor: i64,
     event_types: &[&str],
 ) -> Result<Option<i64>> {
-    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-        "SELECT MIN(sequence) FROM domain_event WHERE sequence > ",
-    );
-    query.push_bind(cursor);
-    if !event_types.is_empty() {
-        query.push(" AND event_type IN (");
-        let mut separated = query.separated(", ");
-        for event_type in event_types {
-            separated.push_bind(*event_type);
+    let subscription = if event_types.is_empty() {
+        EventSubscription::All
+    } else {
+        EventSubscription::Exact(event_types.iter().map(|s| s.to_string()).collect())
+    };
+    next_subscribed_sequence(transaction, cursor, &subscription).await
+}
+
+fn push_next_sequence<'a>(
+    query: &mut sqlx::QueryBuilder<'a, Sqlite>,
+    cursor: i64,
+    subscription: &'a EventSubscription,
+) {
+    if let EventSubscription::Exact(types) = subscription {
+        if types.is_empty() {
+            query.push("SELECT NULL");
+            return;
+        }
+        // IN(list) + ORDER BY can sort the entire wanted backlog. Each scalar
+        // MIN below instead seeks the existing (event_type, sequence) index;
+        // the outer MIN visits at most one row per subscribed type.
+        query.push("SELECT MIN(sequence) FROM (");
+        let mut separated = query.separated(" UNION ALL ");
+        for event_type in types {
+            separated
+                .push("SELECT MIN(sequence) AS sequence FROM domain_event WHERE event_type = ")
+                .push_bind_unseparated(event_type)
+                .push_unseparated(" AND sequence > ")
+                .push_bind_unseparated(cursor);
         }
         separated.push_unseparated(")");
+    } else {
+        query
+            .push("SELECT sequence FROM domain_event WHERE sequence > ")
+            .push_bind(cursor);
+        push_subscription(query, subscription);
+        query.push(" ORDER BY sequence LIMIT 1");
     }
+}
+
+async fn next_subscribed_sequence(
+    transaction: &mut Transaction<'_, Sqlite>,
+    cursor: i64,
+    subscription: &EventSubscription,
+) -> Result<Option<i64>> {
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT (");
+    push_next_sequence(&mut query, cursor, subscription);
+    query.push(")");
     Ok(query
         .build_query_scalar::<Option<i64>>()
         .fetch_one(&mut **transaction)
@@ -35,15 +109,55 @@ async fn next_existing_sequence_for_types(
 }
 
 impl SqliteDb {
-    /// Gap-tolerant ordered lookup shared by the legacy delivery code and the
-    /// filtered single-process worker runtime.
-    pub async fn next_existing_domain_event_sequence_in_tx(
+    pub async fn next_subscribed_domain_event(
+        &self,
+        cursor: i64,
+        subscription: &EventSubscription,
+    ) -> Result<Option<DomainEvent>> {
+        let mut query =
+            sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM domain_event WHERE sequence = (");
+        push_next_sequence(&mut query, cursor, subscription);
+        query.push(")");
+        query
+            .build()
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| map_domain_event(row).map_err(DbError::from))
+            .transpose()
+    }
+
+    pub async fn next_subscribed_domain_event_sequence_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         cursor: i64,
-        event_types: &[&str],
+        subscription: &EventSubscription,
     ) -> Result<Option<i64>> {
-        next_existing_sequence_for_types(transaction, cursor, event_types).await
+        next_subscribed_sequence(transaction, cursor, subscription).await
+    }
+
+    /// Shared optimistic cursor update for legacy delivery and event workers.
+    pub async fn advance_domain_event_cursor_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        consumer: &str,
+        expected: i64,
+        sequence: i64,
+        now: &str,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE event_consumer_cursor SET last_sequence = ?, version = version + 1,
+                updated_at = ? WHERE consumer_name = ? AND last_sequence = ?",
+        )
+        .bind(sequence)
+        .bind(now)
+        .bind(consumer)
+        .bind(expected)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        Ok(())
     }
 }
 
@@ -53,7 +167,6 @@ impl DomainEventRepo for SqliteDb {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let event = self.append_event_in_tx(&mut transaction, &input).await?;
         transaction.commit().await?;
-        self.notify_domain_event_committed();
         Ok(event)
     }
 
@@ -235,16 +348,13 @@ impl DomainEventRepo for SqliteDb {
             if !has_receipt {
                 break;
             }
-            sqlx::query(
-                "UPDATE event_consumer_cursor
-                 SET last_sequence = ?, version = version + 1, updated_at = ?
-                 WHERE consumer_name = ? AND last_sequence = ?",
+            self.advance_domain_event_cursor_in_tx(
+                &mut transaction,
+                &input.consumer_name,
+                last_sequence,
+                next_sequence,
+                &input.now,
             )
-            .bind(next_sequence)
-            .bind(&input.now)
-            .bind(&input.consumer_name)
-            .bind(last_sequence)
-            .execute(&mut *transaction)
             .await?;
             last_sequence = next_sequence;
         }
@@ -389,16 +499,13 @@ impl DomainEventRepo for SqliteDb {
             == 1;
 
         if Some(input.event_sequence) == next_existing_sequence(&mut transaction, cursor).await? {
-            sqlx::query(
-                "UPDATE event_consumer_cursor
-                 SET last_sequence = ?, version = version + 1, updated_at = ?
-                 WHERE consumer_name = ? AND last_sequence = ?",
+            self.advance_domain_event_cursor_in_tx(
+                &mut transaction,
+                &input.consumer_name,
+                cursor,
+                input.event_sequence,
+                &input.completed_at,
             )
-            .bind(input.event_sequence)
-            .bind(&input.completed_at)
-            .bind(&input.consumer_name)
-            .bind(cursor)
-            .execute(&mut *transaction)
             .await?;
         }
 

@@ -647,26 +647,6 @@ where
         };
         Ok(Some(item))
     }
-
-    /// Index one finalized Agent Chat message in the chat's canonical memory
-    /// scope. Direct callers retain the repository's source-receipt
-    /// idempotency; the durable worker uses the prepared form above so its
-    /// effect and cursor can commit together.
-    pub async fn record_agent_chat_message_event(
-        &self,
-        event: &DomainEvent,
-        chat: &AgentChat,
-        message: &AgentChatMessage,
-    ) -> Result<Option<MemoryItem>> {
-        let Some(item) = self.prepare_agent_chat_message_event(event, chat, message)? else {
-            return Ok(None);
-        };
-        let (item, inserted) = self
-            .db
-            .insert_memory_item_if_source_absent(&item, "agent_chat", &message.id)
-            .await?;
-        Ok(inserted.then_some(item))
-    }
 }
 
 impl<R> MemoryService<R>

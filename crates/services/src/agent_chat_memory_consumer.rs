@@ -8,7 +8,7 @@ use sqlx::{Sqlite, Transaction};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    worker_runtime::{Worker, WorkerError, WorkerOutcome, WorkerRuntime},
+    worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     MemoryService, Result,
 };
 
@@ -66,37 +66,48 @@ impl Worker for AgentChatMemoryConsumer {
         &self.consumer_name
     }
 
-    fn event_types(&self) -> &'static [&'static str] {
-        EVENT_TYPES
+    fn subscription(&self) -> Subscription {
+        Subscription::Exact(EVENT_TYPES.iter().map(|s| s.to_string()).collect())
     }
 
     async fn handle(
         &self,
         event: &DomainEvent,
-    ) -> std::result::Result<WorkerOutcome<Self::Prepared>, WorkerError> {
+    ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
         if event.entity_type != "agent_chat_message" {
-            return Ok(WorkerOutcome::Done(PreparedMemoryProjection {
+            return Ok(Outcome::Done(PreparedMemoryProjection {
                 item: None,
                 source_ref: event.entity_id.clone(),
             }));
         }
-        let chat = AgentChatRepo::get_agent_chat(&*self.db, &event.scope_id)
-            .await
-            .map_err(|error| WorkerError::new(format!("Agent Chat lookup failed: {error}")))?
-            .ok_or_else(|| WorkerError::new("Agent Chat source was not found"))?;
-        let message = AgentChatMessageRepo::get_agent_chat_message(&*self.db, &event.entity_id)
+        let Some(chat) = AgentChatRepo::get_agent_chat(&*self.db, &event.scope_id)
             .await
             .map_err(|error| {
-                WorkerError::new(format!("Agent Chat message lookup failed: {error}"))
+                WorkerError::transient(format!("Agent Chat lookup failed: {error}"))
             })?
-            .ok_or_else(|| WorkerError::new("Agent Chat message source was not found"))?;
+        else {
+            return Ok(Outcome::DeadLetter {
+                reason: "Agent Chat source was deleted".to_owned(),
+            });
+        };
+        let Some(message) =
+            AgentChatMessageRepo::get_agent_chat_message(&*self.db, &event.entity_id)
+                .await
+                .map_err(|error| {
+                    WorkerError::transient(format!("Agent Chat message lookup failed: {error}"))
+                })?
+        else {
+            return Ok(Outcome::DeadLetter {
+                reason: "Agent Chat message source was deleted".to_owned(),
+            });
+        };
         let item = self
             .memory
             .prepare_agent_chat_message_event(event, &chat, &message)
             .map_err(|error| {
                 WorkerError::new(format!("Agent Chat memory preparation failed: {error}"))
             })?;
-        Ok(WorkerOutcome::Done(PreparedMemoryProjection {
+        Ok(Outcome::Done(PreparedMemoryProjection {
             item,
             source_ref: message.id,
         }))
@@ -120,7 +131,7 @@ impl Worker for AgentChatMemoryConsumer {
             )
             .await
             .map_err(|error| {
-                WorkerError::new(format!("Agent Chat memory write failed: {error}"))
+                WorkerError::transient(format!("Agent Chat memory write failed: {error}"))
             })?;
         Ok(())
     }

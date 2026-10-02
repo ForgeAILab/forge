@@ -29,7 +29,7 @@ sha2 = "0.11"
 # Keep the same libsqlite3-sys version as sqlx 0.8; no raw/unsafe handles.
 rusqlite = { version = "0.32.1", default-features = false, features = ["backup"], optional = true }
 tempfile = { version = "3", optional = true }
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 db = { path = ".", features = ["test-template"] }
