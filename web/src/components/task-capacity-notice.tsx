@@ -4,7 +4,8 @@ export function TaskCapacityNotice({ task }: { task: Pick<Task, 'workflow_health
   const health = task.workflow_health
   if (
     health?.stale_reason !== 'project_at_capacity' &&
-    health?.stale_reason !== 'project_waiting_on_owner'
+    health?.stale_reason !== 'project_waiting_on_owner' &&
+    health?.stale_reason !== 'machine_capacity'
   ) {
     return null
   }

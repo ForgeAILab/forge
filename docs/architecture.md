@@ -598,10 +598,42 @@ those two Unix properties. Reviewer and stale execution output cannot publish a
 plan. Non-regular files, symlinks, invalid UTF-8, oversized content, and plans
 without a checklist are rejected; a rejected candidate is retained in its
 execution outbox for diagnosis. After successful staging, Forge removes the
-agent-writable outbox and settles from the frozen copy. This broker shares the
-managed-daemon filesystem requirement: the API server and execution host must
-see the Task directory at the same absolute path through a shared workspace
-mount; separate-filesystem daemon sync is not implemented. A read-only role
+agent-writable outbox and settles from the frozen copy.
+For a server-owned workspace (including verified shared mounts), this broker
+uses the same local sibling and staging files. For a daemon-owned workspace,
+the server reads canonical text through the owner router and sends it in
+`execution.start.plan_text`; implementation roles use the canonical plan with
+`task.plan` as fallback, and only valid checklists are seeded; planners are never seeded.
+The daemon prepares its private outbox locally and returns the exact candidate in
+`execution.terminal.plan_text`. The winning terminal CAS stores that candidate
+in the private `execution_plan_transport` table, in the same transaction as the
+terminal receipt. Plan bodies are redacted against Project environment values
+and absent from executor snapshots, the Execution API, and operation receipt
+bodies; receipts retain only the digest and byte length. The publication claim then authorizes a fenced owner-local
+`publish_plan` operation. The owner preserves the prior canonical plan in a
+private snapshot for idempotent publication, compare-safe rollback, and cleanup.
+The private Task sibling `.forge-plan-staging/` holds frozen server candidates,
+and prior canonical plan bytes (or an absent-plan marker). On a daemon it holds `<execution>.transport.json` with the candidate and
+prior canonical text for idempotent publication and compare-safe rollback.
+Settlement or abandoned-publication cleanup removes each execution's files;
+workspace cleanup removes the entire Task directory. The private database table
+retains the winning transported artifact until its Execution is deleted.
+Empty, checklist-free and missing required candidates use the existing bounded
+workflow guard rejection. Unchanged daemon seed content uses that same guard. Oversized remote
+candidates terminalize as failed and are acknowledged with the actual byte size
+and limit. When terminal status is omitted, capture uses the same outcome
+inference as the server: exit code zero with no signal or error means completed.
+An oversized plan then produces a failed capture. Explicit or inferred failed
+or cancelled executor outcomes retain their original reason.
+Owner settlement errors persist exponential retry backoff and a visible Task
+wait annotation; unreachable owners also carry `runtime_offline`, `owner_wait`,
+and `deferred_dispatch`. Successful settlement clears that wait. Plan RPCs wait
+behind long owner `workspace.run` commands, and discarding an already cleaned
+workspace succeeds.
+These artifact operations preserve owner/generation/HEAD fences and can settle
+while the next CLI turn runs; they do not mutate tracked repository files.
+The server never opens the daemon's worktree or outbox path; there is no
+workspace filesystem sync. A read-only role
 still cannot deliver code: Forge skips
 its finalization, fails any execution that changed a tracked file or moved HEAD,
 and resets the worktree afterwards. An unexpected authority-bearing input in that managed home
@@ -774,40 +806,113 @@ executor set it on the child process before Forge's own variables. Assets are
 copied through a sibling staging path and atomically renamed only when the
 target is absent; symlink traversal and recursive/overlapping declarations are
 refused. A failing check terminalizes the execution through the dedicated
-pre-dispatch environment failure path and pauses the Project with
-`system_pause_reason = "environment_not_ready"`, without changing the Task's
-workflow state or adding a Task annotation. No provider call or retry budget
-is spent. The stopped execution is tagged as an environment pre-dispatch
-failure so it does not block re-dispatch after resume. User and repository
-pauses are never overwritten. Pause detail (workspace ID, check names, triggering role,
-bounded output, pause/last-check/next-check times) persists in
-`project.environment_pause_json` and is returned as `environment_pause`.
-Migration V202610010410 clears legacy Task environment annotations without deleting
-Tasks or their execution history.
+pre-dispatch environment failure path. No provider call or retry budget is
+spent, and the Task keeps its workflow state with no blocking annotation. The
+workspace owner is recorded `not_ready` in `project_machine_readiness`, with
+its current checks digest, failing check names, role, bounded redacted output,
+and next-check time. The key is the Project plus the server host, or the daemon
+and runtime IDs of a daemon-owned placement. An embedded execution daemon or a
+shared-mount execution provider does not change a server workspace's owner key.
 
-`environment_pause_sync` starts a background job for recorded failing checks
-when due on the recorded ready daemon placement, with Project `env` and without
-assets. Embedded work, missing or unresolved workspaces, and daemon placements
-that are not ready or whose owner is unreachable use the primary checkout. The tick
-only starts or observes a job; operations refresh does not wait for host checks.
-Scheduled and manual re-checks share single-flight ownership per Project. Results
-use the original Project version and pause timestamp in the existing CAS, so a
-new pause, settings edit, or user pause wins over stale results. Check timeouts
-accept 1–300 seconds (default 120); execution clamps legacy stored values too.
-The interval defaults to 600 seconds (60–86400). Failure, including a re-check
-error, refreshes detail and schedules another check; an error is logged once at
-warn and does not skip the Project's plan-publication reconciliation;
-success compare-and-clears only the environment pause and publishes a Project
-resumed event. The next tick re-dispatches Tasks in their current states.
-`POST /projects/{id}/environment/recheck` runs every configured check immediately
-and returns per-check results plus the Project; all passing clears a matching
-environment pause. A manual check returns HTTP 409 immediately if another
-re-check is running. An empty check list never resumes automatically: asset-copy
+Admission and launch failure share a last-resort pause decision for the concrete
+Task and the role being launched. A failed check filters only the launching role to which
+`EnvironmentCheck::applies_to` applies. If every otherwise eligible connected ready
+location is rejected only for `environment_not_ready`, Forge compare-and-sets
+an environment pause before initial state entry. The Task retains its state
+without a `dispatch_failed` annotation or transition. The same decision follows
+a launch failure; readiness versions fence concurrent results and user or
+repository pauses are never overwritten. Other eligible owners allow new work.
+An Agent pin or existing/inherited placement on an unfit owner instead waits
+there when another owner is healthy for other Tasks, even if those Tasks use
+another Agent or executor.
+
+Offline transport retains an existing environment-owned wait while its current
+not-ready fact still applies, without creating a recovery incident.
+
+Machine-specific waits live in `metadata_json.environment_wait` and
+`deferred_dispatch`, with Task-linked Attention of kind `environment_not_ready`
+naming the machine and checks. They use the existing runtime-offline category
+and recommend waiting, emit no `task.execution_failed` event, and clear when the
+machine becomes ready or admission moves on. Waiting Tasks count as parked for
+Project slots. Changes to `metadata_json` already advance `list_revision`, so
+Project slot caches observe both setting and clearing the marker. On a
+single-machine paused Project there is no additional Task Attention: existing
+environment Task Attention and wait markers are resolved in the pause transaction.
+The Project pause remains the sole signal. An environment Project pause defers
+dispatch rather than adding a `dispatch_failed` annotation.
+
+Internal `project.environment_pause_json` records the machine, workspace,
+checks, role, bounded output, and pause/last-check/next-check times. The public
+`environment_pause` now includes a readable machine identity; Project responses
+also expose the recorded `environment_readiness` rows to every Project reader.
+Settings show a per-machine readiness table with Check now; Projects without
+checks show an empty state. Migration V202610020600 infers an
+older pause's machine from its recorded workspace placement before falling
+back to the server; it preserves Projects and placements. The runner fills the
+canonical digest. Malformed settings leave rows `unknown` and produce one
+startup diagnostic instead of preventing startup. Asset-only Projects with no checks keep their
+pause without a readiness row. Migration V202610010410
+clears legacy Task environment annotations without deleting history.
+
+`environment_pause_sync` starts independent jobs from one query for due
+`not_ready` rows per dispatcher pass. Named failures re-run their recorded
+checks. Rows with no named failing check
+are never rechecked on a schedule: they require manual resume or Check now,
+because passing checks do not verify asset staging or run-policy repair. Project env is applied without
+asset staging. Host checks use the repository's primary or managed server
+checkout. Daemon re-checks use only the ready workspace recorded with that
+failure through `workspace.run`, never another Task's workspace or the server
+as a substitute. These commands must be read-only: like the base's scheduled
+re-check, host checks run in the primary checkout and are not filesystem
+sandboxed against writes. Output is bounded while collecting both streams,
+then redacted before storage.
+
+Every completed attempt advances `next_check_at`, including missing workspaces,
+unreachable owners, transport/policy errors and version conflicts in command
+execution. Such errors preserve the machine's check facts and never fail
+another Task's run. Actual failing check results update output and check times.
+Success marks the machine ready, clears its waits, re-reads the Project and
+compare-and-clears the matching current environment pause and publishes `project.resumed`. Readiness writes
+compare both the row version and current digest. A harmless Project-version
+change retries the pause clear only for the same pause epoch, digest and result
+version; intervening user/repository pauses or newer facts win. The tick never waits for
+command I/O. Jobs are single-flight per Project/machine; host scheduled checks
+also share the manual-check guard. Completion releases the guard and wakes the
+in-process dispatcher `Notify`, without waiting for its ten-second timer.
+Finished job errors and undecodable rows are logged once and rescheduled
+individually; they do not abort dispatch for healthy Projects. A daemon whose
+recorded workspace was deleted becomes unknown and its wait clears, allowing
+a new launch to decide. Check timeouts remain 1–300 seconds (default 120), and re-check intervals remain
+60–86400 seconds (default 600).
+
+Readiness success removes the machine wait and wakes dispatch; independent
+execution blockers still apply. Current daemon coder prompt loading uses a
+server-only canonical-plan accessor in `workflow/dispatch/loader.rs`, and
+coder/planner start prepares plan outboxes on the server using daemon-local
+paths in `task_service/execution/runner.rs`. These existing plan I/O paths are
+owned by the workflow/runtime refactor; this backend step verifies daemon
+re-dispatch through the execution path without plan I/O.
+
+`POST /projects/{id}/environment/recheck` accepts an optional machine selector
+(`server` or daemon runtime ID), runs every configured check on the selected
+machine or all known targets, and returns `{machines, project}`. Each machine
+has its identity, check results, and nullable unavailable error. A manual check
+returns HTTP 409 if a selected machine is already being checked. A passing
+machine can clear a matching environment pause. An empty check list never resumes automatically: asset-copy
 failures and removed probes stay paused with an explicit manual-resume message.
-Checks that were already passing do not resume such a pause on a timer; the
-owner's own "Check now" runs every configured check and resumes when all pass.
-Manual resume clears the pause too; another failing launch pauses the Project
-again. Running executions are left to finish.
+Unnamed failures stay paused until manual resume or Check now; timers never
+relaunch an unfixed setup failure.
+The manual endpoint uses the same host checkout or recorded daemon failure
+workspace as readiness jobs. It never substitutes host results for a selected
+daemon. Daemons without a recorded ready failure workspace return an unavailable
+result until daemon probes are implemented. Transport and unavailable-target
+errors preserve facts and reschedule failed rows. Manual resume and the existing compare-and-clear paths reset that
+Project's `not_ready` rows to `unknown` in the same transaction. The next
+dispatcher host admission without assets probes immediately, then launches or
+pauses again without waiting for the old `next_check_at`. Direct/manual claims,
+asset-backed Projects and daemon unknown rows proceed to launch preflight. Digest edits with checks remaining also retire an obsolete named-check
+environment pause transactionally, so the old pause cannot veto the new unknown
+facts. Removing all checks retains the existing manual-resume rule. Running executions are left to finish.
 
 Review steps and conformance checks
 (`review::contract::project_environment`) and lifecycle hooks
@@ -1726,14 +1831,42 @@ configuration, credentials, bindings, or history. Re-enabling recomputes health
 normally. Task concurrency counts Running executions plus `reserved`/`preparing`
 placements that have no Running execution yet. Assigned Tasks without a
 reservation and Main/Project Agent chat turns do not consume the identity's
-`max_concurrent_tasks` quota. A daemon may independently
-advertise a positive session cap through `labels_json` under
-`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
-`max_concurrent_tasks` key. That daemon cap counts Running Task executions on
-the daemon as identified by placement, including unpinned Agents, plus workspace
-reservations and leased/running Agent Chat turns. A ready placement without a
-Running execution holds no slot. Both caps are checked in the
-`BEGIN IMMEDIATE` reserve transaction and rechecked at execution start;
+`max_concurrent_tasks` quota. Every execution machine also has a run cap:
+`server.max_concurrent_runs` for the server host, or the daemon's typed
+`max_concurrent_runs`, limited further by its positive `run_limit` when set.
+Unset configuration resolves to `max(2, logical_cores / 2)` on that machine;
+zero means unlimited. The embedded daemon and direct server execution share
+the server setting and any admin limit on the embedded row. A daemon record with no reported cap and no admin limit
+is unlimited until it reports a value; omitted registration/report fields retain
+the last recorded cap. Labels no longer configure capacity. Migration
+`V202610020900` carries the first positive integer label cap in
+`max_concurrent_sessions`, `max_sessions`, `active_session_cap`,
+`max_concurrent_tasks` order into the typed column.
+
+Machine occupancy uses execution placement, including unpinned Agents:
+Running executions plus `reserved`/`preparing` placements without a Running
+execution for the same Workspace, plus leased/running Agent Chat turns.
+Expired reservations are excluded directly by the occupancy SQL, including
+Operations and execution-start reads; no sweep is needed to release their count.
+Server host occupancy combines placements with no execution daemon and those
+routed to this host's embedded daemon; chats of unpinned or embedded-daemon
+Agents use that same slot pool. Workspace-less executions use their frozen
+executor daemon id, falling back to the Agent pin. Ready placements use no slot. Capacity is rechecked at start; a refusal
+leaves the workspace ready and parks the Task for a later tick. Review check runs and merges do not consume slots: running checks
+currently have no durable record to count. This is a known limit pending the
+workflow refactor.
+
+The resolved server configuration initializes one shared `MachineRunCap`
+plain handle defined by `db` during runtime composition. Bare `SqliteDb::new`
+instances are unlimited. The runtime resolves the automatic default and cached
+embedded identity; `db` has no configuration/hardware-discovery dependency.
+The settings route owns its write mutex. Settings writes are serialized;
+only after the YAML write succeeds does the route update that handle.
+Placement reads the handle afresh in each reserve/start transaction rather than
+reading the startup snapshot. This setting never requires restart; other
+settings retain their existing restart behavior. Both Agent and machine caps
+are checked in the `BEGIN IMMEDIATE` reserve transaction and rechecked at
+execution start. No running work is stopped when a cap is lowered;
 dispatcher/service prechecks are only early filters. The
 transaction also rejects an identity paused or switched to a newer selected
 profile after dispatch preflight. Profile replacement covers daemon, provider,
@@ -1954,9 +2087,11 @@ change authentication or the peer address.
 Agent-critical mutations commit a monotonic `domain_event` row in the same
 SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
-Consumers claim durable cursors/leases and checkpoint only after idempotent
-projection, so lag and restart replay cannot duplicate chat turn jobs,
-Attention rows, actions, memory indexing, or commitment reconciliation.
+Durable consumers checkpoint only after their projection is safe to commit, so
+lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
+memory indexing, or commitment reconciliation. Four durable consumers use the
+single-process worker runtime described below. SSE uses a read-only in-memory
+tail and connection-time ledger replay.
 
 `domain_event` rows are not pruned. The table also serves as an idempotency
 ledger (including lookups by `dedupe_key`) and as history for lease, execution,
@@ -1964,6 +2099,174 @@ milestone, and project logic. Age and consumer progress alone cannot establish
 that a row is safe to delete. Event retention is planned with the outbox redesign,
 which will first separate the idempotency ledger and domain history from delivery
 bookkeeping.
+
+#### Worker runtime contract
+
+`services::worker_runtime::WorkerRuntime` combines a source-independent
+`WorkerSupervisor` with `db::WorkerHealth`, poison policy and an ordered
+`DurableEventSource`. Health, retry and dead-letter persistence live in `db`;
+services contains scheduling and worker hooks. Dead letters use
+`(worker_name, source_key)` text identity and item type, so a future leased-step
+source can supply its own `FailureState` to `dead_letter_in_tx` and use
+`RetryPolicy::decision`. Leases, concurrency and per-task ordering are outside
+this slice.
+
+An event worker declares a stable name, `Subscription::Exact`, literal `Prefix`
+or `All`, per-worker retry policy and handle timeout. Subscription changes are
+compared with persisted health on initialization and refreshed before handling.
+The existing `event_consumer_cursor` is the sole checkpoint authority; health
+has no cursor copy. SQL filtering, indexed lookups, mapping, validation and
+checkpoint writes live in `db`. Exact subscriptions seek each type's `(event_type, sequence)` index;
+prefix subscriptions use disjoint binary type ranges on that index. Live lag
+counts matching ranges. The oldest pending wanted event is the lowest matching
+sequence, whose creation time supplies its age.
+
+`Worker<C = ()>` uses a defaulted generic commit-result type because the stable
+Rust compiler does not support associated type defaults. `handle(event)` returns
+`Result<Outcome<Prepared>, WorkerError>` outside a transaction. `Done(prepared)`
+opens one short `BEGIN IMMEDIATE`, validates the checkpoint and next candidate,
+calls `commit(transaction, event, prepared) -> Result<C, WorkerError>`, and commits
+effect, cursor and item health atomically. `commit` may await only database work.
+`after_commit(event, prepared, committed)` receives the actual committed result,
+so the worker can condition its post-step on successful admission. Its failure
+is logged and reported but cannot undo or strike the acknowledged event.
+
+`Skip` means this event is not for the worker. It writes no effect or per-event
+transaction; its advance is buffered with ignored events, folded into the next
+handled checkpoint or flushed at most once per five seconds. A restart can
+reclassify that small buffered prefix. Wanted events remain strictly ordered.
+`Defer { after, reason }` suspends the whole stream without a strike or an
+attempt cap; individual waits are clamped to one second through one hour before
+persistence. Deferral reason and first deferral time are retained. A malformed
+stored wait is logged once per runtime and treated as due; the next state change
+rewrites it. All deadline arithmetic is checked.
+
+`WorkerErrorKind` has three deliberate meanings:
+
+| Kind | Use | Event handling |
+| --- | --- | --- |
+| `Failure` (strike) | Unexpected item failures returned by `WorkerError::new` or non-transient `WorkerError::database`; caught handle/commit panics and handle timeouts also take this path | Add a strike, retry under the worker's finite policy, and quarantine when the cap is reached |
+| `Transient` | Retryable availability/concurrency failures | Never add a strike or quarantine; retry independently with waits from one second to the five-second idle maximum |
+| `Terminal` | A deterministic semantic rejection, such as Attention's `DbError::Check` | A terminal commit first rolls back and repeats handle/commit once with a fresh snapshot; a repeated terminal rejection quarantines and advances without a strike. Handle-time terminal outcomes quarantine directly. |
+
+`Terminal` was added because `commit` returns a commit result or an error, not
+`Outcome::DeadLetter`. Attention can discover a `Check` only after its first write;
+it must roll back that write and quarantine if fresh preparation still rejects it. Expressing this with a
+one-strike policy would also quarantine unrelated panics and timeouts. An explicit
+terminal error preserves immediate Check quarantine without changing scheduling,
+supervision or health persistence.
+
+Default policy is eight attempts, waits exponential from one second capped at
+five minutes, and five-minute handle timeout. Policy waits have a one-second
+floor, respect their representable cap, and an unrepresentable cap falls back
+to five minutes. A capped or explicit `DeadLetter` moves the cursor and inserts
+the quarantine record together. Runtime infrastructure failures never strike.
+Memory classifies SQLite busy/locked/IO, pool failures and version conflicts
+as transient; other database failures strike.
+
+`tick` defaults to no-op and has an independent `tick_timeout()` (30 seconds).
+A failure or timeout is recorded and logged. Its independent retry schedule doubles
+from one second to five minutes and resets on success; cycles during this backoff
+skip tick and proceed directly to events. It runs at most once per due cycle,
+never once per backlogged event. Event-loop sleeps remain capped at five seconds.
+Tick has its own health error scope. Identical runtime
+and tick errors are deduplicated. Successful cycles clear runtime errors even
+when empty; successful ticks clear tick errors. An item error survives unrelated
+recovery until that item completes or is quarantined. Health's generated
+`last_error` exposes the latest of the independently retained causes.
+
+Operator status computes lag/age/stalls live from the cursor table and current
+subscription, without scanning ignored event rows through `json_each`. Existing
+`recent_errors` entries carry bounded worker causes and deferral reason/since;
+readiness alone is informational, while errors and stalls raise attention.
+Dead letters degrade health for the same one-hour window as ordinary errors.
+Each worker also exposes its retained total and five most recent quarantines with
+stable IDs, item keys/sequence, reason and time, without expiry. The table retains
+worker/source identity for later replay/dismiss actions; those actions are outside
+this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+
+Each standard SQLite pool connection has an insert hook, commit marker and
+rollback handling. Pool-scoped `Notify` is delivered on connection release
+after COMMIT is visible. A pending-marker atomic gives ordinary releases an
+immediate fast path, with no extra ping or lock-handle round trip. Hook mutexes
+recover poisoning. `max_lifetime(None)` remains necessary because SQLx's expiry
+close path bypasses the release hook; idle connection recycling is retained.
+Explicitly held connections deliver their commit hint when released. Waiters
+register before polling; notification hints never replace durable reads.
+
+The supervisor counts loop exits/runtime panics, including failed initialization,
+resets restart back-off after a healthy period, and aborts/awaits its existing
+child on shutdown. False watch changes cannot create another loop. Missing health
+rows are recreated. The consumer placements are:
+
+| Worker | Subscription | `handle` / `commit` | `tick` | `after_commit` |
+| --- | --- | --- | --- | --- |
+| `scoped-memory-agent-chat-indexer` | Exact `agent_chat.message.admitted`, `agent_chat.response.completed`, `agent_chat.message.completed` | Prepare semantic memory / insert source-idempotent memory | None | None |
+| `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
+| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
+| `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
+
+The three migrated consumers use the standard eight-strike policy for unexpected
+hook faults and a five-minute handle timeout. Preparation performs local database
+and policy work, never a provider/model call. Busy/locked/IO database failures and resolvable version conflicts are transient.
+Deterministic domain rejections are terminal; unexpected failures take strikes.
+Cancelled commitments need no outcome and are skipped.
+Independent commitment and inbox effects use savepoints. A rejected item is left
+unchanged and recorded with its identity/reason, while siblings and inbox delivery
+continue. Non-item failures roll back the event; terminal commit failures refresh
+preparation once before quarantine. Attention resolvers are conditional/idempotent
+updates without per-row semantic refusals; a wake's message/turn/disposition and
+incident resolution are one dependent atomic effect. A rejected transition
+(such as blocked to completed) does not change the commitment state machine. Attention's deterministic
+`DbError::Check` rejection quarantines immediately, including a check discovered
+after the first effect write. Memory retains its existing poison policy.
+
+Attention's terminal-execution settlement wait is whole-stream `Defer`, preserving
+its previous ordering barrier. A deferred wake is `Done` with a durable `Deferred`
+disposition and an advanced cursor: one unavailable Agent cannot block another
+Agent's wake. Admission fallback uses a savepoint so rejected admission writes
+cannot leak into the fallback disposition. Semantic wake retry attempts keep their
+immutable lineage and finite budget separately from runtime retries.
+
+Migration `V202610020700` drops `event_processing_lease` and
+`event_projection_receipt` and the unused `attention_consumer_health` table.
+These contained only delivery metadata and operational counters, timestamps,
+bounded error diagnostics and lease details, not user data. Runtime health
+replaces the old attention-health storage and accessors.
+All durable consumer cursors and all domain/projection records survive unchanged;
+only the retired `sse-broadcast` cursor is removed. Live legacy claims do not block
+restart: each worker resumes strictly after its retained checkpoint.
+
+The SSE relay is an ordered tail outside `WorkerRuntime`, owned by `WorkerSupervisor`.
+Task death or unexpected exit restarts with backoff and bounded shutdown; its shared
+in-memory position survives child restart, preventing gaps or duplicate broadcast.
+Read errors and restart state are visible in operator status.
+Its optional in-memory position is initialized from the ledger head in its loop;
+a failed read leaves it uninitialized and retries without replaying history; serial drains read ascending event sequences,
+publish their committed envelopes, and advance only memory. It uses the same
+committed-event `Notify`, registered before polling, and the same 250 ms to
+five-second idle fallback. It writes no cursor, lease or receipt; supervisor/error health writes occur only on
+faults and recovery, with no steady-state idle writes.
+
+SSE plain connects remain live-only. A connection reads the ledger only when
+`Last-Event-ID` has the durable form `domain-event:<sequence>`; entity IDs, missing
+headers and malformed IDs do not request replay. Bus-only and ordinary resync frames omit
+the SSE `id` field, preserving the client's last durable cursor across reconnects.
+A beyond-head resync alone sets `domain-event:<head>` to reset an invalid cursor.
+Keep-alive comments also have no ID. Only durable frames set an SSE ID.
+The payload's `entity_id` remains unchanged. Neither the web client nor forge-ctl
+uses frame IDs for routing; MCP uses a separate stream. The web client recreates
+`EventSource` on reconnect and refreshes active queries after a stable open.
+
+For durable resume, subscribe before capturing the ledger head, then check the
+bounded sequence range for at most 1,001 keys. At most 1,000 missed rows replay in
+ascending sequence order through that snapshot, using 100-row pages. A larger
+backlog produces one `events.resync_required` frame and no replay. Snapshot-covered
+durable live frames are filtered, so delayed relay frames cannot duplicate replay;
+appends beyond the captured head remain live. Bus-only events remain live-only,
+and bus overflow still requests resync. The relay is the only publisher of durable frames. Composite and standalone
+commits are delivered in sequence order, so a resume cursor cannot jump past
+undelivered events.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
@@ -1999,9 +2302,12 @@ first table. WAL pool connections use `synchronous=NORMAL`. Existing files retai
 their mode until an operator runs the explicit offline full-VACUUM conversion.
 Server and Solo data-root process locking excludes that conversion from a
 running runtime. Operator status reports free pages, incremental mode, consumer
-sequence lag and oldest pending age. Its expected consumers are derived from the
+lag and oldest pending age. Its expected consumers are derived from the
 workers the supervisor starts; persisted cursors for workers outside that set
-are omitted. All five durable consumers currently start unconditionally in both
+are omitted. All four durable workers use the cursor table and `worker_health` subscriptions
+with live event queries. The SSE tail is omitted from `event_consumers` because it
+has no durable backlog or checkpoint. All four workers and the SSE tail start
+unconditionally in both
 Server and Solo, including when MCP or the embedded daemon is disabled. A cursor
 is stalled only when unprocessed events exist and it has not advanced for longer
 than the configured threshold; an idle consumer with zero lag is never stalled.
@@ -2012,21 +2318,19 @@ The `agent-coordination-outcomes` consumer is started by `forge-cli`; it turns
 terminal Task transition events into one task-outcome inbox item and, for a
 scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
-and receipt checkpoint safe to replay.
+and cursor checkpoint safe to replay.
 
 The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
 loop. Migration `V088` records an install-time cutover cursor, so events that
 commit after installation are evaluated even when the process has not polled
 yet; startup never derives a cursor from the runtime event maximum. Each
-claimed `agent.wake.*` candidate receives one durable current disposition:
+`agent.wake.*` candidate receives one durable current disposition:
 `turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. The disposition, projection receipt, cursor advancement,
-lease release, and optional Agent Chat message/turn admission commit in one
-transaction. Deferred and setup-required incidents retain bounded retry or
+`setup_required`. The disposition, cursor advancement and optional Agent Chat message/turn
+admission commit in one transaction. Deferred and setup-required incidents retain bounded retry or
 authoritative-state reconsideration lineage instead of disappearing as
-completed delivery. Claims and checkpoints are ordered by ascending
-`domain_event.sequence`; a live lease at the head is an ordering barrier, and
-the cursor cannot skip an undisposed sequence. A disposition replay is
+completed delivery. Checkpointed candidates are ordered by ascending subscribed
+`domain_event.sequence`; the cursor cannot skip an undisposed wake sequence. A disposition replay is
 idempotent and advances the cursor at most once, only after its disposition
 and any admitted turn/message commit.
 
@@ -2247,16 +2551,25 @@ commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
-Attention consumer health buffers successful progress, flushing at an event
-boundary after five seconds or 100 processed events, and immediately on errors.
-Batch release flushes remaining progress and clears any published processing
-lease. New batch owners and lease renewals are buffered; empty polls write health
-at most once every five seconds. Buffered deltas and the latest successful
-sequence/time are preserved when flushing; a published lease expiry remains visible
-during processing. Each event's authoritative cursor and receipt still commit
-individually. Health counters are diagnostic: a crash may lose up to 99 buffered
-increments, without losing event delivery. The stale threshold remains 90
-seconds since the last successfully processed event.
+Attention consumer health uses live subscribed backlog and checkpoint progress.
+A caught-up or newly initialized consumer is not stale; both the oldest pending
+event and the progress/initialization baseline must exceed 90 seconds to be stale.
+No ledger-prefix count is performed per request; the processed-event field was
+removed. Error kind (`failure`, `transient`, `terminal`) and bounded message come
+from worker health or recent quarantine records. The same health result supplies
+Mission Control's capacity status.
+
+Wake semantic retry errors are isolated by disposition ID. A failing row cannot
+abort later rows. Transient failures back off without strikes; waiting rows are
+filtered before the SQL limit and waiting is not a tick error. Unexpected failures
+have an independent eight-strike cap in `worker_item_failure`; a terminal storage
+rejection or cap exhaustion commits a terminal `wake_retry_failed` disposition
+and a dead letter together. Evaluation/admission rejections that have a typed wake
+outcome retain `wake_evaluation_invalid` / `turn_admission_rejected`; commit-time
+missing authority defers as before. Initial and retry
+admission, disposition and decision-incident resolution commit together. Consumer
+`after_commit` hooks hold no durable effect; Attention only emits its budget-stall
+bus notification for the zero configured-budget branch, using the budget scope.
 
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,
@@ -2302,7 +2615,11 @@ placement without a shared mount. Admission records that embedded daemon as
 recorded provider; the workspace owner and handle stay on the server.
 Daemon placements require CLI Agents for every assigned worktree role (coder,
 reviewer, planner); native Agents are rejected with
-`native_backend_unsupported`.
+`native_backend_unsupported`. Plan-writing roles (`planner`, `coder`, `worker`,
+`executor`) also require the owner's `execution.plan_transport` capability;
+a missing capability is a structured `capability_missing` placement refusal.
+Revision-3 and older owners receive `daemon_upgrade_required` at admission.
+No plan-writing role is parked with `owner_unsupported`.
 
 Agent claims, initial launches, ordinary re-execution, and resume refuse a
 paused Project with `ProjectPaused` before placement selection, reservation,
@@ -2325,14 +2642,18 @@ unit tests also compile the constructor. Production builds omit the fixture regi
 Claim admission runs **reserve → prepare → start**:
 
 1. Under `BEGIN IMMEDIATE`, select a compatible ready location and persist a
-   `reserved` placement with `reserved_until`. It consumes Agent and daemon
+   `reserved` placement with `reserved_until`. It consumes Agent and machine
    capacity, but creates no Execution, lease, or Task status change.
 2. Outside the transaction, the owner prepares the workspace idempotently.
    Versioned updates move `reserved → preparing → ready` and record the handle
    and base SHA. Failed or expired preparation releases capacity, records
    `prepare_failed`, and spends no Task retry budget.
 3. A claim transaction checks the ready placement's version and capacity, then
-   creates the Task claim, Running Execution, and lease together.
+   creates the Task claim, Running Execution, and lease together. A ready placement
+   holds no slot. A capacity refusal leaves it ready and records an ordinary
+   parked machine waiter, without an Execution or retry-budget charge. Ready
+   reclaim, missing-worktree recreation and restart relaunch use the normal
+   version fence.
 
 Backfilled `preparing` reservations expire after ten minutes. The reservation
 sweep also reclaims crash-orphaned `reserved` or `preparing` rows without an
@@ -2340,7 +2661,46 @@ explicit expiry after ten minutes from their last update.
 
 Candidates must pass reachability and visibility, executor availability and
 adapter capability facts, daemon `workspace.v1` support, run policy, Agent pin,
-capacity, and the daemon placement limits. Missing adapter facts mean unsupported.
+capacity, the daemon placement limits, and Project environment readiness.
+Missing adapter facts mean unsupported. Readiness is a fact per Project and
+workspace-owner machine, with a SHA-256 digest covering only `environment.env`
+and `environment.checks`; asset and interval edits do not invalidate it. Pure
+selection reads the candidate's readiness and per-check results for the Task's
+launching role. Current `ready` passes; a current `not_ready` row rejects only
+when a failing check applies to that launching role (an unnamed launch failure applies
+to its recorded role). Host missing, unknown or stale records return transient
+`environment_probe_pending`. Daemon missing, unknown or stale records pass:
+only current applicable launch-time failures reject daemon admission. This
+single temporary policy lives in `placement/selection.rs::environment_filter`
+and is removed by step 3's `machine.probe`. It applies identically at reserve
+and claim, regardless of whether a workspace has just been prepared.
+Projects with no checks ignore readiness, never probe and write no new rows;
+removing checks deletes existing rows and resolves machine waits.
+
+Only check-only Projects on the server are proactively probed in this build step.
+When assets are configured, a primary-checkout probe cannot see staged assets:
+admission uses launch-time preflight and ignores primary-checkout probe facts.
+Actual launch-time not-ready facts still filter the machine. Direct/manual
+claims also bypass probe-pending and check at launch; dispatcher admissions
+retain probe deferral. Probes run every
+configured check with Project env in the server repository checkout, outside
+admission's transaction, without assets or workspace preparation. Each result
+retains its check name and pass/fail status; role applicability is evaluated by
+pure selection rather than by collapsing the result into a Project-wide fact.
+Probes are single-flight per Project/server and write with a digest/version
+fence, then wake dispatch through the in-process dispatcher `Notify`. Settings
+edits invalidate rows transactionally; the Project event observer starts host
+probes for existing host rows or ready host locations without waiting for a
+Task. A digest edit colliding with an older flight is re-probed on completion,
+even without a queued Task; retained host rows can use the server checkout
+without a location row. A passing host probe compare-and-clears a matching
+environment pause against the current Project snapshot after its result, so a settings edit
+cannot leave a ready host behind an old pause. Daemon facts come only from launch-time results; there is no proactive
+`workspace.run` through a live Task. Initial dispatch returns early before assembly when there are no checks, and
+otherwise uses the same shared, read-only admission context builder as reservation. An environment refusal
+keeps the Task queued with at most one version change. A preferred candidate
+that is only probe-pending defers selection rather than diverting work to a
+lower-preference passing owner; existing placement order is preserved.
 The embedded provider supplies the server host's adapter facts, including session
 resume for its session-capable executors. Recovery uses those facts for embedded
 execution and the current owner's handshake for daemon execution; no command
@@ -2350,8 +2710,60 @@ default location → server-owned → `(created_at, id)`. The selection reason r
 the winning rule and rejected candidates with filter codes. If no owner is
 eligible, claim returns structured `placement_unavailable`; there is no silent
 fallback.
-Automatic dispatch keeps transient owner-unreachable or capacity refusals queued
-on the same owner. Before the first placement exists, an offline owner creates
+Agent `runnable_on` exposes executor-fit facts from the same inputs as placement:
+server adapter/native connection health, daemon runtime/connection, detected CLI
+authentication, enabled policy, Agent pause and explicit pin. Admins receive
+machine identities; other users receive only a count, and the pin remains
+admin-only. Agent list/detail warn on zero machines; admins can clear the pin.
+This read does not assert repository/environment fit or capacity. Task detail's
+separate placement diagnostics panel reads recorded environment waits, pending
+host probes, capacity waits and selection rejections without running admission.
+It names machines/checks where recorded and renders `machine_capacity` in the
+same component. CLI `project env-status` reads these Project readiness facts;
+`env-recheck --machine` selects one target.
+
+Machine saturation does not downgrade Agent availability or Project execution
+setup; the Agent availability precheck uses only its identity quota.
+
+A Task with no eligible machine and at least one candidate rejected only for
+`machine_capacity` records a `machine_capacity` queued dispatch disposition,
+without an annotation, Attention, failure or retry-budget charge. Initial
+scheduling checks fresh read-only machine counts for every candidate before the
+expensive Task gates, including runs dispatched earlier in the tick. The check
+examines all potentially usable locations, including unverified clones; unknown
+facts, a possibly free machine or another placement refusal delegate to reserve.
+It uses the placement filters and server executor availability, without clone
+verification, persisted location writes, a sweep or a writer lock.
+The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
+counts as parked until dispatch observes a different outcome; a plain edit does
+not un-park it, and its metadata change moves the Project list revision used by
+slot memos. Queued recovery checks machine capacity before claiming its marker,
+so full-machine ticks do not rewrite Tasks or publish recovery events. Automatic
+review recovery checks before its barrier claim as well. A handled capacity wait
+stops the active scan quietly. Its explicit dispatch owns the state-entry hook
+so an ordinary coder run cannot take its slot or lease first. Queued replay claims
+metadata only and checks its original queued token at Running insertion; a lost
+capacity race preserves the clear blocker and marker, emits no recovery event
+and retries next tick.
+Capacity waits are retried by the existing dispatcher tick
+(ten seconds by default); this path has no completion-event kick. Capacity
+checks count Agent Chat turns, but do not change chat admission: a new chat
+turn may still be leased/run when its machine is full, making subsequent Task
+admissions wait.
+
+There is no fairness guarantee across Projects: Projects are scanned oldest first,
+active work is scanned before `todo`, and follow-ups or chat turns can take a freed
+slot before the next dispatcher tick. Waiters resume on that tick. Review check
+runs and merges take no slot because there is no durable running-check record.
+
+Automatic dispatch keeps transient owner-unreachable, capacity, and
+`environment_probe_pending` refusals queued. Initial dispatch reads the same
+selection context before its workflow transition and defers an otherwise
+viable probe refusal without entering the target state. The queued marker
+creates no Execution or Task version change. Repeated probe waits refresh
+only their retry time. Probe completion clears the delay without another Task
+version change, so the next tick can enter the target state and launch.
+Before the first placement exists, an offline owner creates
 Task-scoped `runtime_offline` Attention and a durable wait bounded by
 `workspace.max_disconnect_seconds`; expiry blocks the Task visibly. Repeated
 identical waits update only their retry time; events, Attention, and Task version
@@ -2363,7 +2775,7 @@ uses `queued_recovery`; permanent replay refusals restore its original blocker.
 The active scan retries structural placement refusals, because location,
 executor, handshake, and run-policy changes can fix them without editing a Task.
 On state entry, a structural refusal still rolls the transition back with
-`dispatch_failed`; only retryable owner/capacity refusals defer dispatch.
+`dispatch_failed`; retryable owner, capacity, and environment-probe refusals defer dispatch.
 Stable governance refusals use `metadata.dispatch_disposition` with the safe
 reason, and remain parked until their authority changes or dispatch is woken.
 
@@ -2422,13 +2834,19 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 3 adds `workspace.v1`: `repo_location.verify`,
+Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
+Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
+A revision-3 daemon without it can still run reviewers, interactive executions,
+server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
+placement refusals record a structured Task annotation naming the machine and
+missing capability. Dispatch waits until eligibility facts change, then clears
+the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
 release (protocol revision 3 or newer), restarting each with its existing
 `--workspace-root`.
-A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+A connection below revision 3 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -2436,7 +2854,7 @@ shows `upgrade_required`; pinned Agents and refused Task admissions carry
 server's release. Repository locations retain upgrade reasons after a verification
 attempt, without changing their verification status. Task admission is an upgrade refusal only
 when an otherwise eligible owner is blocked solely by the upgrade (disregarding
-facts absent from the revision-3 handshake), and no owner is blocked solely by
+facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
 reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
@@ -2483,13 +2901,20 @@ the exact frozen candidate was integrated, with a diffstat reconstructed from
 the original target SHA. Interrupted errors carry `entry_id`, `operation_id`,
 and `interrupted: true` in their details.
 
-Terminal reports, bounded worklog/evidence outbox entries, operation results,
+Terminal reports, bounded plan/worklog/evidence outbox content, operation results,
 and cleanup acknowledgements share one daemon journal. Both owner harvesters
 accept newline-delimited, concatenated, and pretty-printed JSON objects, resume
 at the next physical line after malformed input, and retain unknown evidence
 kinds as `other` with the original kind in the caption. Entry positions use
 stable `line` or `line:column` strings for ingestion receipts. Terminal and cleanup
-results replay after reconnect until `journal.ack { entry_id }`. The server must
+results replay after reconnect until `journal.ack { entry_id }`.
+Daemon plan candidates have a 128 KiB UTF-8 byte limit, leaving room for JSON
+escaping within the 1 MiB terminal journal bound. Oversized, unreadable,
+non-regular, symlinked, multiply linked (on Unix), or checklist-free candidates produce an explicit failed
+terminal report, rather than truncating or omitting a successful plan. Plans
+are retained with the same report identity and digest as worklog and evidence;
+replay cannot substitute a different candidate. Server-owned plans retain
+their existing 1 MiB limit and file layout. The server must
 persist a result, including a terminal operation error, before acknowledging it.
 Exact terminal replays are coalesced while retained so a describe-triggered replay
 cannot compete with the reconciliation drain. The daemon then deletes the receipt; repeated acks are
@@ -2755,10 +3180,11 @@ review CI use the workspace backend command path; remote starts perform the same
 preflight before their provider RPC. Environment pauses retain the failed
 workspace ID: scheduled and manual re-checks use the primary checkout for embedded
 work and the recorded ready daemon placement for remote work. Missing or unresolved
-workspaces, non-ready placements, and unreachable owners fall back to the primary
-checkout. An owner run-policy denial
-records `purpose_denied` and suppresses scheduled re-checks until an explicit check
-succeeds after the policy changes.
+daemon workspaces, non-ready placements and unreachable owners retain that
+machine's facts and report unavailability; they never use the host as a substitute.
+Named check failures retry on their machine. An unnamed launch failure needs
+manual resume or Check now, and an owner run-policy refusal during re-check
+retains the failure facts and reschedules the attempt.
 
 An admitted Task waiting for an owner keeps its active Project slot even before
 an Execution exists. Owner timeout, workspace reset and review-CI infrastructure
@@ -3068,8 +3494,9 @@ whose children hold active slots do not consume another slot; once no child is
 active, a root's own running execution, review, or merge holds one slot.
 Planning, implementation, review, merging, and conflict repair therefore hold
 slots, even without a running execution. Agent concurrency remains a separate
-limit. Recovery and re-dispatch of already-admitted work never fail for Project
-capacity, even if un-parking temporarily exceeds the limit.
+limit. Ordinary already-admitted work retains its Project slot. A parked machine waiter
+must obtain Project room before it un-parks; a full Project replaces the machine
+reason with a parked `project_capacity` wait and retries on later ticks.
 
 The Project response exposes `{limit, active, parked, queued}` as `slots`.
 Capacity waits record `project_capacity` dispatch dispositions with
@@ -3364,7 +3791,7 @@ implementation execution, while the reviewer and auditor children point at
 that same candidate. Task/Project/workflow, role assignment, selected Agent
 identity/version, and the latest Review snapshot are rechecked at that insert
 boundary; reviewer capacity counts running executions and workspace reservations
-(plus any explicitly configured daemon session cap). The candidate must be a
+plus the machine's effective run cap. The candidate must be a
 completed implementation execution at that insert boundary. Failed or cancelled
 remediation executions do not displace the last completed candidate, but a
 newer running implementation still fences review admission. If Task/Project/workflow

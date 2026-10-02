@@ -306,6 +306,7 @@ async fn seed_agent_with_executor(
     let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
@@ -327,6 +328,7 @@ async fn seed_agent_with_executor(
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json:
                 serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])

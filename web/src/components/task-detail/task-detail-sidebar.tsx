@@ -18,6 +18,7 @@ import {
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
+import { TaskPlacementDiagnostics } from '@/components/task-detail/task-placement-diagnostics'
 import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { productTerm } from '@/lib/i18n'
@@ -312,9 +313,10 @@ export function TaskDetailSidebar({
               />
             </SidebarField>
 
-            {task.placement ?? task.workspace?.placement ? (
+            {(task.placement ?? task.workspace?.placement) ? (
               <div className="pb-4">
                 <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
+                <TaskPlacementDiagnostics diagnostics={task.placement_diagnostics ?? []} />
               </div>
             ) : null}
 
@@ -583,7 +585,10 @@ export function useParentTaskCandidatesQuery(projectId: string, search: string, 
   })
 }
 
-export function filterParentTaskCandidates(candidates: TaskListItem[], taskId: string): TaskListItem[] {
+export function filterParentTaskCandidates(
+  candidates: TaskListItem[],
+  taskId: string,
+): TaskListItem[] {
   return candidates.filter(
     (candidate) => candidate.parent_task_id == null && candidate.id !== taskId,
   )

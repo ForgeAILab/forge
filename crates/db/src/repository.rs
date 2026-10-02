@@ -28,6 +28,14 @@ pub trait TaskRepo: Send + Sync {
         subtask_states_json: &str,
         blocking_kinds_json: &str,
     ) -> Result<(i64, i64, i64)>;
+    /// One grouped statement for a JSON object mapping Project IDs to state maps.
+    /// Revision fences come from the same SQLite snapshot as the counts.
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
     /// independently of the current workflow's state classification.
@@ -826,11 +834,10 @@ pub trait DomainEventRepo: Send + Sync {
         &self,
         consumer_name: &str,
     ) -> Result<Option<EventConsumerCutover>>;
-    async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>>;
-    async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool>;
 }
 
-/// Durable wake dispositions and their atomic event checkpoint boundary.
+/// Durable wake dispositions and semantic retry lineage. Initial persistence
+/// uses SqliteDb::persist_agent_wake_in_tx inside the runtime checkpoint boundary.
 /// Disposition attempts are immutable; deferred/setup-required retry paths
 /// append a later attempt and move the current pointer.
 #[async_trait]
@@ -863,13 +870,6 @@ pub trait AgentWakeDispositionRepo: Send + Sync {
         now: &str,
         limit: i64,
     ) -> Result<Vec<AgentWakeDisposition>>;
-    /// Persist the first disposition and complete the claimed source event
-    /// in one transaction.  A replay of the same attempt is exact and does
-    /// not create a second row or advance the cursor twice.
-    async fn complete_claimed_agent_wake(
-        &self,
-        input: CompleteClaimedWake,
-    ) -> Result<AgentWakeDisposition>;
     /// Append a due deferred/setup-required retry attempt and move the
     /// current pointer without rewriting the prior immutable attempt.
     async fn retry_agent_wake(
@@ -896,14 +896,6 @@ pub trait AttentionRepo: Send + Sync {
         source_event_id: &str,
         updated_at: &str,
     ) -> Result<Option<AttentionProjection>>;
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>>;
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1147,25 +1139,6 @@ fn bounded_event_text(value: &str, max_bytes: usize) -> String {
     output
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimDomainEvents {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub now: String,
-    pub leased_until: String,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteDomainEvent {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub event_sequence: i64,
-    pub event_id: String,
-    pub dedupe_key: String,
-    pub completed_at: String,
-}
-
 #[async_trait]
 pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
@@ -1320,6 +1293,12 @@ pub trait DaemonRepo: Send + Sync {
     async fn list_visible(&self, user_id: Option<&str>, page: PageRequest) -> Result<Page<Daemon>>;
     async fn get_visible(&self, id: &str, user_id: Option<&str>) -> Result<Option<Daemon>>;
     async fn update_report(&self, input: UpdateDaemonReport) -> Result<Daemon>;
+    async fn update_run_limit(
+        &self,
+        id: &str,
+        version: i64,
+        run_limit: Option<u32>,
+    ) -> Result<Daemon>;
     async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon>;
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon>;
     async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>>;
@@ -1797,12 +1776,6 @@ pub trait MemoryRepository: Send + Sync {
 /// authorization context when it is migrated to scoped retrieval.
 #[async_trait]
 pub trait ScopedMemoryRepository: Send + Sync {
-    async fn insert_memory_item_if_source_absent(
-        &self,
-        item: &MemoryItem,
-        source_type: &str,
-        source_ref: &str,
-    ) -> std::result::Result<(MemoryItem, bool), DbError>;
     async fn get_memory_item_scoped(
         &self,
         query: MemoryGetQuery,
@@ -2879,6 +2852,7 @@ pub struct CreateWorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpsertDaemon {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -2896,6 +2870,7 @@ pub struct UpsertDaemon {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateDaemonReport {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub last_report_at: String,
     pub status: DaemonStatus,

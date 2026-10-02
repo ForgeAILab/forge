@@ -34,6 +34,7 @@ export type ProjectAgentBindingInput = Omit<
 }
 
 export interface FederatedAgent {
+  runnable_on?: import('@/types/generated/bindings/AgentRunnableOn').AgentRunnableOn
   id: string
   name: string
   description: string | null
@@ -265,7 +266,7 @@ export interface AttentionConsumerHealth {
   last_success_at: string | null
   last_error_code: string | null
   stale: boolean
-  processed_events: number
+  last_error_message: string | null
   updated_at: string
 }
 

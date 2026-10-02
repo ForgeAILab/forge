@@ -135,19 +135,39 @@ impl DaemonWorkspaceClient {
         .await
     }
 
+    pub async fn describe_for_plan(
+        &self,
+        daemon_id: &str,
+        params: WorkspaceDescribeParams,
+    ) -> Result<WorkspaceDescribeResult> {
+        self.request_with_timeout(daemon_id, METHOD_WORKSPACE_DESCRIBE, &params, None, false)
+            .await
+    }
+
     pub async fn owner_operation(
         &self,
         daemon_id: &str,
         params: WorkspaceOwnerOperationParams,
     ) -> Result<WorkspaceOwnerOperationResult> {
-        self.request(
-            daemon_id,
-            METHOD_WORKSPACE_RESET,
-            &params,
-            self.timeout,
-            true,
-        )
-        .await
+        if matches!(
+            &params.operation,
+            WorkspaceOwnerOperation::PublishPlan { .. }
+                | WorkspaceOwnerOperation::RestorePlan { .. }
+                | WorkspaceOwnerOperation::DiscardPlan { .. }
+        ) {
+            // Metadata RPCs may wait behind an unbounded owner CI operation.
+            self.request_with_timeout(daemon_id, METHOD_WORKSPACE_RESET, &params, None, false)
+                .await
+        } else {
+            self.request(
+                daemon_id,
+                METHOD_WORKSPACE_RESET,
+                &params,
+                self.timeout,
+                true,
+            )
+            .await
+        }
     }
 
     pub async fn merge(
@@ -426,7 +446,16 @@ impl DaemonWorkspaceClient {
             if mutation_identity(method, request) == mutation_identity(method, &params)
                 && saved["owner_result"]["implementation_execution_id"].as_str() == execution_id
             {
-                return Ok(request.clone());
+                let mut restored = request.clone();
+                if let Some(content) = params.pointer("/operation/content") {
+                    restored["operation"]["content"] = content.clone();
+                    let operation = restored["operation"]
+                        .as_object_mut()
+                        .expect("plan operation object");
+                    operation.remove("content_digest");
+                    operation.remove("content_length");
+                }
+                return Ok(restored);
             }
         }
         let operation_id = params["operation_id"]
@@ -999,11 +1028,34 @@ fn redact_result(value: &Value, params: &Value) -> Value {
             ));
         }
     }
+    if let Some(request) = result.get_mut("request") {
+        *request = plan_request_metadata(request);
+    }
     result
 }
 
+fn plan_request_metadata(params: &Value) -> Value {
+    let mut metadata = params.clone();
+    if metadata.pointer("/operation/kind").and_then(Value::as_str) == Some("publish_plan") {
+        if let Some(content) = metadata
+            .pointer("/operation/content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            metadata["operation"]["content_digest"] =
+                Value::String(hex::encode(Sha256::digest(content.as_bytes())));
+            metadata["operation"]["content_length"] = serde_json::json!(content.len());
+            metadata["operation"]
+                .as_object_mut()
+                .unwrap()
+                .remove("content");
+        }
+    }
+    metadata
+}
+
 fn mutation_identity(method: &str, params: &Value) -> Value {
-    let mut identity = params.clone();
+    let mut identity = plan_request_metadata(params);
     if let Some(object) = identity.as_object_mut() {
         object.remove("operation_id");
         if method == METHOD_WORKSPACE_MERGE {

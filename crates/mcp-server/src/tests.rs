@@ -514,6 +514,7 @@ async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
     let host = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -542,6 +543,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -563,6 +565,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     DaemonRepo::update_report(
         &*state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id.clone(),
             last_report_at: now.clone(),
             status: DaemonStatus::Online,

@@ -77,11 +77,70 @@ pub struct ProjectEnvironmentPause {
     pub next_check_at: String,
 }
 
-/// The re-check endpoint takes no options: every configured check runs.
+/// Run every configured check on all known targets or one requested machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
-pub struct ProjectEnvironmentRecheckRequest {}
+pub struct ProjectEnvironmentRecheckRequest {
+    /// `server` or a daemon runtime ID; omitted checks every known target.
+    pub machine: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct MachineIdentity {
+    pub id: String,
+    pub name: String,
+    pub owner_kind: crate::RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct EnvironmentPauseResponse {
+    #[serde(flatten)]
+    pub detail: ProjectEnvironmentPause,
+    pub machine: MachineIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EnvironmentReadinessStatus {
+    Ready,
+    NotReady,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct EnvironmentCheckFailure {
+    pub name: String,
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentReadiness {
+    pub machine: MachineIdentity,
+    pub status: EnvironmentReadinessStatus,
+    pub failing_checks: Vec<EnvironmentCheckFailure>,
+    /// Includes unnamed launch failures.
+    pub output_tail: String,
+    pub scope_covered: String,
+    pub checked_at: Option<String>,
+    pub next_check_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MachineEnvironmentRecheckResult {
+    pub machine: MachineIdentity,
+    pub checks: Vec<ProjectEnvironmentCheckResult>,
+    /// No result is asserted when the machine cannot be checked.
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
@@ -95,7 +154,7 @@ pub struct ProjectEnvironmentCheckResult {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProjectEnvironmentRecheckResponse {
-    pub checks: Vec<ProjectEnvironmentCheckResult>,
+    pub machines: Vec<MachineEnvironmentRecheckResult>,
     pub project: ProjectResponse,
 }
 
@@ -148,7 +207,9 @@ pub struct ProjectResponse {
     #[serde(default)]
     pub system_pause_reason: Option<String>,
     #[serde(default)]
-    pub environment_pause: Option<ProjectEnvironmentPause>,
+    pub environment_pause: Option<EnvironmentPauseResponse>,
+    #[serde(default)]
+    pub environment_readiness: Vec<ProjectEnvironmentReadiness>,
     #[serde(default)]
     pub slots: ProjectSlots,
     #[serde(default)]

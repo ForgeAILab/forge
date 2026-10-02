@@ -41,6 +41,13 @@ pub struct UpdateForgePathsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
 #[ts(export)]
 pub struct UpdateServerSettingsRequest {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_run_cap_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "number | null")]
+    pub max_concurrent_runs: Option<Option<u32>>,
     pub bind: Option<String>,
     pub mcp_enabled: Option<bool>,
 }
@@ -58,4 +65,10 @@ pub struct UpdateAgentSettingsRequest {
     pub max_concurrent_tasks: Option<u32>,
     pub heartbeat_interval_seconds: Option<u64>,
     pub max_missed_heartbeats: Option<u32>,
+}
+
+fn deserialize_run_cap_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u32>>, D::Error> {
+    Option::<u32>::deserialize(deserializer).map(Some)
 }

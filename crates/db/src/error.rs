@@ -49,6 +49,8 @@ pub enum DbError {
 
     #[error("agent at capacity")]
     AgentAtCapacity,
+    #[error("machine has no available run capacity")]
+    MachineAtCapacity,
 
     #[error("agent {agent_id} is paused")]
     AgentPaused { agent_id: String },
@@ -118,4 +120,26 @@ pub enum DbError {
         applied: String,
         bundled: String,
     },
+}
+
+impl DbError {
+    /// Worker retry classification, deliberately narrower than "any DB error".
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::VersionConflict
+            | Self::TaskVersionConflict { .. }
+            | Self::BoardRevisionConflict { .. } => true,
+            Self::Sqlx(
+                sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed
+                | sqlx::Error::Io(_),
+            ) => true,
+            Self::Sqlx(sqlx::Error::Database(error)) => error
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6 | 10 | 14)),
+            _ => false,
+        }
+    }
 }

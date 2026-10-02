@@ -272,6 +272,7 @@ fn terminal_input(
     digest: &str,
 ) -> TerminalizeExecutionWithLedger {
     TerminalizeExecutionWithLedger {
+        plan: None,
         terminal: TerminalizeExecution {
             execution_id: execution_id.to_owned(),
             expected_version: 1,
@@ -716,4 +717,55 @@ async fn settled_invocation_replay_compares_terminal_fields_and_all_event_fields
         db::UsageLedgerRepo::settle_usage_invocations_with_events(&db, vec![changed_event]).await,
         Err(DbError::IdempotencyConflict)
     ));
+}
+
+#[tokio::test]
+async fn transported_plan_commits_with_winning_terminal_and_replay_cannot_replace_it() {
+    let db = db().await;
+    seed_base(&db).await;
+    seed_execution(&db, "private-plan-execution").await;
+    let mut input = terminal_input(
+        "private-plan-execution",
+        "private-plan-report",
+        &"a".repeat(64),
+    );
+    input.plan = Some(db::TransportedExecutionPlan {
+        content: Some("- [ ] winning artifact\n".into()),
+        error: None,
+        size: Some(23),
+    });
+    let result = ExecutionRepo::terminalize_with_ledger(&db, input.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ExecutionTerminalOutcome::Committed {
+            replayed: false,
+            ..
+        }
+    ));
+    input.plan.as_mut().unwrap().content = Some("- [ ] cannot replace winning artifact\n".into());
+    let result = ExecutionRepo::terminalize_with_ledger(&db, input)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        ExecutionTerminalOutcome::Committed { replayed: true, .. }
+    ));
+    let candidate: String = sqlx::query_scalar(
+        "SELECT candidate_text FROM execution_plan_transport WHERE execution_id=?",
+    )
+    .bind("private-plan-execution")
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(candidate, "- [ ] winning artifact\n");
+    let execution = ExecutionRepo::get_by_id(&db, "private-plan-execution")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!execution
+        .executor_config_snapshot_json
+        .unwrap_or_default()
+        .contains("winning artifact"));
 }

@@ -17,6 +17,7 @@ pub async fn prompt_preview(
 
     let prompt = services::preview_effective_prompt(
         std::sync::Arc::clone(&state.db),
+        &state.task_service.workspace_backend_router(),
         &id,
         params.role.trim(),
         params.trigger,

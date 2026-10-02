@@ -1,9 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use crate::pagination::PageRequest;
-use crate::repository::{
-    AdmitAgentChatTurn, CompleteDomainEvent, CreateAgentActionExecution, CreateCommandReceipt,
-};
+use crate::repository::{AdmitAgentChatTurn, CreateAgentActionExecution, CreateCommandReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row};
@@ -42,6 +40,24 @@ pub struct Project {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Project response inputs and the display revision from the same SELECT.
+#[derive(Debug, Clone)]
+pub struct ProjectSlotRead {
+    pub project: Project,
+    pub list_revision: i64,
+}
+
+/// Counts and revision fences read together by the batched slot statement.
+#[derive(Debug)]
+pub struct ProjectSlotCounts {
+    pub project_id: String,
+    pub project_version: i64,
+    pub list_revision: i64,
+    pub active: i64,
+    pub parked: i64,
+    pub queued: i64,
 }
 
 /// Durable, retryable work that reconciles a Project's repository and
@@ -822,12 +838,10 @@ pub struct CreateAgentWakeDisposition {
     pub updated_at: String,
 }
 
-/// Atomically persists the first disposition for a claimed event, its
-/// current-pointer row, and the event projection receipt/cursor checkpoint.
+/// Transaction-owned first wake disposition, current pointer and optional admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteClaimedWake {
+pub struct PersistAgentWake {
     pub disposition: CreateAgentWakeDisposition,
-    pub completion: CompleteDomainEvent,
     /// Required for `turn_admitted`.  The DB inserts/replays this message and
     /// turn inside the same transaction as the disposition and source-event
     /// checkpoint, closing the crash seam between admission and delivery.
@@ -993,37 +1007,6 @@ pub struct AttentionListQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events: i64,
-    pub version: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpsertAttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events_delta: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventConsumerCursor {
     pub consumer_name: String,
     pub last_sequence: i64,
@@ -1169,6 +1152,8 @@ pub struct WorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Daemon {
+    pub run_limit: Option<u32>,
+    pub max_concurrent_runs: Option<i64>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -2041,12 +2026,21 @@ pub struct UsageLedgerSettlement {
     pub events: Vec<CreateUsageEvent>,
 }
 
+/// Private artifact content committed only by the winning terminal CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportedExecutionPlan {
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub size: Option<i64>,
+}
+
 /// Composite terminalization input for Task execution. The optional receipt
 /// identity is used by remote daemon delivery: it is persisted in the
 /// terminal domain event and lets a post-restart duplicate be acknowledged
 /// without mutating the execution or appending usage a second time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalizeExecutionWithLedger {
+    pub plan: Option<TransportedExecutionPlan>,
     pub terminal: TerminalizeExecution,
     pub settlements: Vec<UsageLedgerSettlement>,
     pub terminal_report_id: Option<String>,
@@ -5000,10 +4994,35 @@ pub struct DomainEventConsumerLag {
     pub lag: i64,
     pub last_advanced_at: Option<String>,
     pub oldest_unprocessed_at: Option<String>,
+    pub initialized_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqliteStorageStatus {
     pub incremental_vacuum: bool,
     pub free_pages: i64,
+}
+
+impl DomainEventConsumerLag {
+    pub fn stalled(&self, now: chrono::DateTime<chrono::Utc>, seconds: i64) -> bool {
+        let old = |date: &str| {
+            chrono::DateTime::parse_from_rfc3339(date)
+                .ok()
+                .is_some_and(|date| {
+                    (now - date.with_timezone(&chrono::Utc)).num_seconds() > seconds
+                })
+        };
+        self.lag > 0
+            && self.oldest_unprocessed_at.as_deref().is_some_and(old)
+            && self.last_advanced_at.as_deref().is_none_or(old)
+            && self.initialized_at.as_deref().is_none_or(old)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerDeadLetterRecord {
+    pub id: String,
+    pub source_key: String,
+    pub reason: String,
+    pub occurred_at: String,
 }

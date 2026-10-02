@@ -174,7 +174,12 @@ impl TaskService {
         });
         let previous_status = task.status.clone();
         let workspace_admission = self
-            .reserve_claim_workspace(&task, agent.as_ref(), &claim_execution_role)
+            .reserve_workspace_admission(
+                &task,
+                agent.as_ref(),
+                &claim_execution_role,
+                crate::placement::selection::EnvironmentAdmission::LaunchPreflight,
+            )
             .await?;
         let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
         let workspace = &workspace_admission.workspace;

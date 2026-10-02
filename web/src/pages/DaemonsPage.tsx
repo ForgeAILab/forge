@@ -6,6 +6,7 @@ import {
   useAgentsQuery,
   useCreatePat,
   useDaemonsQuery,
+  useUpdateDaemonRunLimit,
   useSettingsQuery,
   useUpdateSettings,
 } from '@/api/hooks'
@@ -26,6 +27,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
+import { useAuthStore } from '@/stores/auth'
 import type { Agent, Daemon, ForgeSettingResponse } from '@/types/generated'
 
 const EMPTY_DAEMONS: Daemon[] = []
@@ -622,6 +624,8 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
           </div>
         </section>
 
+        <MachineRunCapacity daemon={daemon} />
+
         {/* Workspace */}
         <WorkspaceSection />
 
@@ -769,5 +773,42 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
         </section>
       </div>
     </div>
+  )
+}
+
+export function MachineRunCapacity({ daemon }: { daemon: Daemon }) {
+  const isAdmin = useAuthStore((state) => state.user?.is_admin === true)
+  const mutation = useUpdateDaemonRunLimit()
+  const [limit, setLimit] = useState(String(daemon.run_limit ?? ''))
+  useEffect(() => { setLimit(String(daemon.run_limit ?? '')) }, [daemon.id, daemon.run_limit])
+  const displayCap = (cap: number | null) => cap == null || cap === 0 ? 'Unlimited' : String(cap)
+  function save() {
+    const value = limit.trim() ? Number(limit) : null
+    if (value != null && (!Number.isInteger(value) || value < 1 || value > 4294967295)) {
+      toast.error('Admin limit must be a positive integer, or blank to clear')
+      return
+    }
+    mutation.mutate({ id: daemon.id, version: daemon.version, run_limit: value }, {
+      onSuccess: () => toast.success('Machine run limit saved'),
+      onError: (error) => toast.error(getApiErrorMessage(error, 'Failed to save machine run limit')),
+    })
+  }
+  return (
+    <section aria-label="Machine run capacity">
+      <h3 className="mb-3 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">Run capacity</h3>
+      <div className="space-y-3 rounded-lg border p-4">
+        <p className="text-sm">Reported cap: <strong>{displayCap(daemon.max_concurrent_runs)}</strong></p>
+        <p className="text-sm">Effective cap: <strong>{displayCap(daemon.effective_max_concurrent_runs)}</strong></p>
+        {isAdmin ? <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1">
+            <Label htmlFor={`run-limit-${daemon.id}`}>Admin limit</Label>
+            <Input id={`run-limit-${daemon.id}`} type="number" min={1} step={1} className="w-32"
+              placeholder="No limit" value={limit} onChange={(event) => setLimit(event.target.value)} />
+          </div>
+          <Button onClick={save} disabled={mutation.isPending}>{mutation.isPending ? 'Saving…' : 'Save limit'}</Button>
+        </div> : <p className="text-sm">Admin limit: {daemon.run_limit ?? 'No limit'}</p>}
+        <p className="text-xs text-muted-foreground">The lower of the reported cap and admin limit applies. Clear the input to remove the admin limit. Running work continues.</p>
+      </div>
+    </section>
   )
 }

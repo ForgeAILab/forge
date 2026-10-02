@@ -181,13 +181,32 @@ pub async fn list_projects(
     user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ProjectResponse>>> {
-    let page = ProjectRepo::list_visible(&*state.db, &user.user_id, page_request(&params)?).await?;
+    let page = state
+        .db
+        .list_visible_project_slot_reads(&user.user_id, page_request(&params)?)
+        .await
+        .map_err(ServiceError::from)?;
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, &page.items)
+        .await?;
+    let projects: Vec<_> = page.items.iter().map(|read| read.project.clone()).collect();
+    let mut environment =
+        services::environment_surfaces::project_environments(&state.db, &projects).await?;
     let mut items = Vec::with_capacity(page.items.len());
-    for project in page.items {
-        items.push(project_response(&state.db, project).await?);
+    for read in page.items {
+        let counts = slots.remove(&read.project.id).expect("requested Project");
+        let environment = environment
+            .remove(&read.project.id)
+            .expect("requested Project");
+        items.push(super::project_response_from_environment(
+            read.project,
+            counts,
+            environment,
+        )?);
     }
     let response = PaginatedResponse {
         items,
@@ -203,8 +222,24 @@ pub async fn get_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = require_project_visible(&state, &id, &user.user_id).await?;
-    Ok(Json(project_response(&state.db, project).await?))
+    let read = state
+        .db
+        .get_visible_project_slot_read(&id, &user.user_id)
+        .await
+        .map_err(ServiceError::from)?
+        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, std::slice::from_ref(&read))
+        .await?;
+    Ok(Json(
+        super::project_response_with_slots(
+            &state.db,
+            read.project,
+            slots.remove(&id).expect("requested Project"),
+        )
+        .await?,
+    ))
 }
 
 pub async fn list_project_hook_runs(
@@ -884,10 +919,19 @@ pub async fn pause_project(
 pub async fn recheck_project_environment(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    request: Option<Json<api_types::ProjectEnvironmentRecheckRequest>>,
 ) -> ApiResult<Json<api_types::ProjectEnvironmentRecheckResponse>> {
-    let (checks, project) = state.task_service.recheck_project_environment(&id).await?;
+    let request = request.map(|Json(request)| request).unwrap_or_default();
+    let (machines, project) = services::environment_surfaces::recheck(
+        &state.task_service,
+        &state.db,
+        &state.event_bus,
+        &id,
+        request.machine.as_deref(),
+    )
+    .await?;
     Ok(Json(api_types::ProjectEnvironmentRecheckResponse {
-        checks,
+        machines,
         project: project_response(&state.db, project).await?,
     }))
 }

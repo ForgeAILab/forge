@@ -156,6 +156,7 @@ pub(crate) fn pending_plan_publication_cleanup_owner(task: &Task) -> Result<Opti
 /// failure remains recoverable by the dispatcher.
 pub(crate) async fn cleanup_execution_plan_private_files(
     db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
     task: &Task,
     execution_id: &str,
 ) -> Result<()> {
@@ -177,35 +178,23 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         // retired without inventing an untrusted filesystem path.
         return Ok(());
     };
-    crate::plan_artifact::discard_staged_execution_plan(
-        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(db, &workspace)
-            .await?,
-        execution_id,
-    )
-    .map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "failed to remove settled execution plan stage: {error}"
-        ))
-    })?;
-    if let Some(outbox) = executors::execution_outbox_path(
-        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(db, &workspace)
-            .await?,
-        execution_id,
-    ) {
-        match std::fs::remove_dir_all(&outbox) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "failed to remove settled execution plan outbox: {error}"
-                )));
-            }
-        }
-    }
+    let resolved = router.resolve(db, &workspace).await?;
+    crate::plan_artifact::ExecutionPlan::new(db, &resolved)
+        .discard(execution_id)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to remove settled execution plan stage: {error}"
+            ))
+        })?;
     Ok(())
 }
 
-pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Task) -> Result<Task> {
+pub(crate) async fn clear_stale_plan_publication_claim(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    task: &Task,
+) -> Result<Task> {
     let Some(claim) = parse_plan_publication_claim(task)? else {
         return Ok(task.clone());
     };
@@ -217,7 +206,7 @@ pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Tas
     // published for the state that created them. Remove them before the
     // marker: a crash between these steps leaves a harmless marker that the
     // next dispatcher pass can finish clearing, never an unowned candidate.
-    cleanup_execution_plan_private_files(db, task, &claim.execution_id).await?;
+    cleanup_execution_plan_private_files(db, router, task, &claim.execution_id).await?;
 
     TaskRepo::mutate_metadata(
         db,

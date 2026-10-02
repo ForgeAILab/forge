@@ -58,6 +58,7 @@ impl ForgeConfig {
         }
 
         if let Some(server) = file.server {
+            self.server.max_concurrent_runs = server.max_concurrent_runs;
             if let Some(bind) = server.bind {
                 self.server.bind = bind;
             }
@@ -201,6 +202,10 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_MAX_CONCURRENT_RUNS") {
+            self.server.max_concurrent_runs =
+                Some(parse_env_u32("FORGE_SERVER_MAX_CONCURRENT_RUNS", &value)?);
+        }
         if let Some(value) = env_value("FORGE_EVENT_CONSUMER_STALL_SECONDS") {
             self.server.event_consumer_stall_seconds =
                 parse_env_u32("FORGE_EVENT_CONSUMER_STALL_SECONDS", &value)?;
@@ -272,6 +277,9 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(cap) = overrides.server_max_concurrent_runs {
+            self.server.max_concurrent_runs = Some(cap);
+        }
         if let Some(seconds) = overrides.event_consumer_stall_seconds {
             self.server.event_consumer_stall_seconds = seconds;
         }

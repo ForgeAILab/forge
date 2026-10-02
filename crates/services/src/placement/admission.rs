@@ -32,6 +32,11 @@ pub(crate) fn placement_update(placement: &WorkspacePlacement) -> UpdateWorkspac
 }
 
 pub async fn sweep_expired_reservations(db: &SqliteDb, now: &str) -> Result<u64> {
+    let expired: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_placement WHERE state IN ('reserved', 'preparing') AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?))")
+        .bind(now).fetch_one(db.pool()).await?;
+    if !expired {
+        return Ok(0);
+    }
     let mut transaction = db::begin_immediate(db.pool()).await?;
     let expired = sweep_expired_reservations_in_tx(&mut transaction, now).await?;
     transaction.commit().await?;
@@ -164,9 +169,13 @@ pub(crate) async fn resolve_workspace_attention_in_tx(
     task_id: &str,
 ) -> Result<()> {
     let now = db::now_rfc3339();
+    // Existing successful admission and move-on paths already call this resolver.
+    // Clear only the machine wait's own deferral, preserving unrelated blockers.
+    sqlx::query("UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
+        .bind(task_id).execute(&mut **tx).await?;
     sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
-        WHERE status <> 'resolved' AND (dedupe_key IN (?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))")
-        .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).bind(format!("task-owner-wait:{task_id}")).bind(task_id)
+        WHERE status <> 'resolved' AND (dedupe_key IN (?, ?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))")
+        .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).bind(format!("task-owner-wait:{task_id}")).bind(format!("task-environment-wait:{task_id}")).bind(task_id)
         .execute(&mut **tx).await?;
     Ok(())
 }
@@ -307,5 +316,89 @@ mod tests {
         let row: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT status, acknowledged_at, snoozed_until, resolved_at FROM attention_projection WHERE dedupe_key = ?")
             .bind(&key).fetch_one(db.pool()).await.unwrap();
         assert_eq!(row, ("open".into(), None, None, None));
+    }
+    #[tokio::test]
+    async fn environment_wait_move_on_resolves_attention_and_exact_marker() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let (task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let machine = db::EnvironmentMachine::from_placement(&placement);
+        use db::ProjectMachineReadinessRepo;
+        let environment: api_types::ProjectEnvironment =
+            serde_json::from_value(json!({"checks":[{"name":"cargo","command":"true"}]})).unwrap();
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(json!({"environment":environment}).to_string())
+            .bind(&task.project_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut row = crate::placement::environment::unknown_record(
+            &task.project_id,
+            machine.clone(),
+            &environment,
+        );
+        row.status = db::EnvironmentReadinessStatus::NotReady;
+        row.failing_checks = vec![db::ReadinessCheckFailure {
+            name: "cargo".into(),
+            output_tail: "missing".into(),
+        }];
+        db.put_readiness(row, None).await.unwrap();
+        crate::placement::environment::persist_machine_wait(
+            &db,
+            &task,
+            &machine,
+            &["cargo".into()],
+        )
+        .await
+        .unwrap();
+        let current = db::TaskRepo::get_by_id(&db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::placement::environment::defer_refusal(
+                &db,
+                &current,
+                &crate::ServiceError::DaemonUnavailable {
+                    daemon_id: placement.daemon_id.clone().unwrap()
+                }
+            )
+            .await
+            .unwrap(),
+            Some(true)
+        );
+        let metadata = db::TaskMetadata::parse(
+            db::TaskRepo::get_by_id(&db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .metadata_json
+                .as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.extra["deferred_dispatch"]["kind"], "environment_not_ready",
+            "offline transport retains the environmental wait"
+        );
+        let failed:i64=sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE entity_id=? AND event_type='task.execution_failed'").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(failed, 0);
+        resolve_workspace_attention(&db, &task.id).await.unwrap();
+        let metadata: Option<String> =
+            sqlx::query_scalar("SELECT metadata_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let metadata = db::TaskMetadata::parse(metadata.as_deref()).unwrap();
+        assert!(!metadata.extra.contains_key("environment_wait"));
+        assert!(!metadata.extra.contains_key("deferred_dispatch"));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key=?")
+                .bind(format!("task-environment-wait:{}", task.id))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "resolved");
     }
 }

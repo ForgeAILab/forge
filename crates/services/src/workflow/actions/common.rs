@@ -14,13 +14,6 @@ use crate::workflow::{
     inherited_subtask_workflow, HookContext, HookResult,
 };
 
-pub(super) async fn publish_domain_event(ctx: &HookContext, dedupe_key: &str) {
-    let service = crate::DomainEventService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
-    if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-        tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
-    }
-}
-
 pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
@@ -638,17 +631,7 @@ pub(super) async fn cancel_review_after_authority_loss(
     )
     .await
     {
-        Ok(Some(cancelled)) => {
-            publish_domain_event(
-                ctx,
-                &format!(
-                    "review-status:{}:{}:{}",
-                    cancelled.id, cancelled.status, now
-                ),
-            )
-            .await;
-        }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) => {}
         Err(error) => {
             tracing::warn!(
                 review_id = %review.id,
@@ -829,11 +812,7 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
         candidate_execution_id,
     )
     .await?;
-    publish_domain_event(
-        ctx,
-        &format!("review-status:{}:{}:{}", review.id, review.status, now),
-    )
-    .await;
+
     let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
     if let Err(error) = memory_service
         .record_review_result_if_final(&ctx.project_id, &review)

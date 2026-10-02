@@ -8,19 +8,53 @@ impl DaemonWorkspaceBackend {
     ) -> CommandResult<WorkspaceOwnerOperationResult> {
         let mut owned =
             self.workspace(&reference(&params.fence, &params.workspace_handle), false)?;
-        ensure_inactive(&owned, active_ids)?;
+        // Artifact settlement is independent of an active CLI turn. It also
+        // must not overwrite registrations made by the next execution.
+        let plan_operation = matches!(
+            &params.operation,
+            WorkspaceOwnerOperation::PublishPlan { .. }
+                | WorkspaceOwnerOperation::RestorePlan { .. }
+                | WorkspaceOwnerOperation::DiscardPlan { .. }
+        );
+        if !plan_operation {
+            ensure_inactive(&owned, active_ids)?;
+        }
         if !matches!(
             &params.operation,
             WorkspaceOwnerOperation::ReleaseReviewCheckout
+                | WorkspaceOwnerOperation::DiscardPlan { .. }
         ) {
             owned = self
                 .live_workspace(&reference(&params.fence, &params.workspace_handle))
                 .await?;
         }
-        if !owned.cleaned {
+        if !owned.cleaned
+            && !matches!(
+                &params.operation,
+                WorkspaceOwnerOperation::DiscardPlan { .. }
+            )
+        {
             self.check_expected(&owned, &params.fence.expected).await?;
         }
         let outcome = match params.operation {
+            WorkspaceOwnerOperation::PublishPlan {
+                execution_id,
+                content,
+            } => {
+                crate::daemon_plan::publish(&owned.path, &execution_id, &content)
+                    .map_err(|failure| error(WORKSPACE_ERROR, failure.to_string()))?;
+                WorkspaceOwnerOperationOutcome::Applied
+            }
+            WorkspaceOwnerOperation::RestorePlan { execution_id } => {
+                crate::daemon_plan::restore(&owned.path, &execution_id)
+                    .map_err(|failure| error(WORKSPACE_ERROR, failure.to_string()))?;
+                WorkspaceOwnerOperationOutcome::Applied
+            }
+            WorkspaceOwnerOperation::DiscardPlan { execution_id } => {
+                crate::daemon_plan::discard(&owned.path, &execution_id)
+                    .map_err(|failure| error(WORKSPACE_ERROR, failure.to_string()))?;
+                WorkspaceOwnerOperationOutcome::Applied
+            }
             WorkspaceOwnerOperation::MaterializeAssets { environment } => {
                 self.materialize_assets(&owned.path, &environment).await?;
                 WorkspaceOwnerOperationOutcome::Applied
@@ -125,8 +159,10 @@ impl DaemonWorkspaceBackend {
                 }
             }
         };
-        owned.version += 1;
-        self.save_workspace(&params.workspace_handle, owned)?;
+        if !plan_operation {
+            owned.version += 1;
+            self.save_workspace(&params.workspace_handle, owned)?;
+        }
         Ok(WorkspaceOwnerOperationResult {
             entry_id: operation_entry_id(&params.fence.operation_id),
             operation_id: params.fence.operation_id,

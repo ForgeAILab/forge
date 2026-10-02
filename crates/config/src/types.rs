@@ -109,6 +109,8 @@ pub struct ForgePaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -239,6 +241,7 @@ pub struct ProjectSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
+    pub server_max_concurrent_runs: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -377,6 +380,7 @@ impl ForgeConfig {
         Self {
             forge: ForgePaths { data_dir },
             server: ServerConfig {
+                max_concurrent_runs: None,
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,

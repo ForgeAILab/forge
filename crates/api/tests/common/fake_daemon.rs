@@ -182,6 +182,7 @@ fn daemon_handshake() -> DaemonHandshakeNotification {
         capabilities: vec![
             DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
             DAEMON_CAPABILITY_JOURNAL_ACK.to_owned(),
+            api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT.to_owned(),
         ],
         executor_capabilities: std::collections::BTreeMap::from([(
             "shell".to_owned(),
@@ -483,6 +484,7 @@ pub async fn send_execution_terminal_completed(
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -513,6 +515,7 @@ pub async fn send_execution_terminal_failed(
             after_sha: None,
             usage_reports: Vec::new(),
             outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -818,6 +821,7 @@ pub async fn seed_startable_execution_for_daemon(
     DaemonRepo::update_report(
         &*state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.to_owned(),
             last_report_at: report_at.clone(),
             status: DaemonStatus::Online,
@@ -1292,6 +1296,7 @@ pub async fn seed_embedded_daemon(state: &AppState) -> String {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: uuid::Uuid::new_v4().to_string(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "embedded-test-host".to_owned(),

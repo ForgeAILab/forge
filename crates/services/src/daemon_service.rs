@@ -22,6 +22,7 @@ pub struct DaemonService {
 
 #[derive(Debug, Clone)]
 pub struct DaemonRegisterInput {
+    pub max_concurrent_runs: Option<u32>,
     pub machine_id: String,
     pub hostname: String,
     pub os: String,
@@ -41,6 +42,7 @@ pub struct DaemonRegistration {
 
 #[derive(Debug, Clone)]
 pub struct DaemonReportInput {
+    pub max_concurrent_runs: Option<u32>,
     pub detected_clis: Vec<DetectedCliInput>,
     pub runtimes: Vec<RuntimeReportInput>,
     pub labels: Option<Value>,
@@ -94,6 +96,7 @@ impl DaemonService {
         let daemon = DaemonRepo::upsert_by_machine_id(
             &*self.db,
             UpsertDaemon {
+                max_concurrent_runs: input.max_concurrent_runs,
                 id: new_uuid_v4(),
                 machine_id: input.machine_id,
                 hostname: input.hostname,
@@ -162,6 +165,7 @@ impl DaemonService {
         let daemon = DaemonRepo::update_report(
             &*self.db,
             UpdateDaemonReport {
+                max_concurrent_runs: input.max_concurrent_runs,
                 id: daemon_id.to_owned(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,
@@ -417,6 +421,22 @@ impl DaemonService {
             .map_err(Into::into)
     }
 
+    pub async fn update_run_limit(
+        &self,
+        id: &str,
+        version: i64,
+        run_limit: Option<u32>,
+    ) -> Result<Daemon> {
+        if run_limit == Some(0) {
+            return Err(ServiceError::invalid_operation(
+                "run_limit must be positive or null",
+            ));
+        }
+        DaemonRepo::update_run_limit(&*self.db, id, version, run_limit)
+            .await
+            .map_err(Into::into)
+    }
+
     #[tracing::instrument(skip(self), fields(daemon_id = %id))]
     pub async fn get(&self, id: &str) -> Result<Option<Daemon>> {
         validate_required("daemon_id", id)?;
@@ -558,6 +578,7 @@ mod tests {
 
     fn register_input(machine_id: &str) -> DaemonRegisterInput {
         DaemonRegisterInput {
+            max_concurrent_runs: None,
             machine_id: machine_id.to_owned(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
@@ -637,6 +658,7 @@ mod tests {
         let registration = service.register(input).await.expect("register succeeds");
 
         let report = || DaemonReportInput {
+            max_concurrent_runs: None,
             detected_clis: [
                 "claude_code",
                 "codex",

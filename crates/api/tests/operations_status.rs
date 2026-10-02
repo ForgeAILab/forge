@@ -144,13 +144,42 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
 async fn operations_status_reports_stalled_consumer_and_database_storage() {
     let workspace_root = common::TestDir::new("operations-status-outbox");
     let harness = common::test_app(workspace_root.path(), "operations-status-outbox").await;
-    // This route harness has no supervisor; model one started broadcast worker.
+    // This route harness has no supervisor; model a started durable coordination worker.
     harness
         .state
         .operator_status_service
-        .set_runtime_workers(&[services::RuntimeWorker::DomainEventBroadcast]);
+        .set_runtime_workers(&[services::RuntimeWorker::Coordination]);
     let old = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-    sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(old).execute(harness.state.db.pool()).await.unwrap();
+    let health = db::WorkerHealth::new(
+        harness.state.db.clone(),
+        services::coordination_consumer_name(),
+    );
+    let mut tx = db::begin_immediate(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .initialize_event_worker_in_tx(
+            &mut tx,
+            &health,
+            &db::EventSubscription::Exact(vec!["task.done".into()]),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_health SET created_at = ? WHERE worker_name = ?")
+        .bind(&old)
+        .bind(services::coordination_consumer_name())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE event_consumer_cursor SET updated_at = ? WHERE consumer_name = ?")
+        .bind(&old)
+        .bind(services::coordination_consumer_name())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('pending', 'task.done', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(old).execute(harness.state.db.pool()).await.unwrap();
     let status: OperatorStatusResponse = common::empty_request_with_bearer(
         &harness.app,
         Method::GET,
@@ -162,17 +191,15 @@ async fn operations_status_reports_stalled_consumer_and_database_storage() {
     let consumer = status
         .event_consumers
         .iter()
-        .find(|c| c.consumer_name == "sse-broadcast")
+        .find(|c| c.consumer_name == services::coordination_consumer_name())
         .unwrap();
     assert_eq!(consumer.lag, 1);
     assert!(consumer.stalled);
     assert!(consumer.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
     assert_eq!(status.overall_severity, OperatorSeverity::Attention);
-    assert!(status
-        .recent_errors
-        .iter()
-        .any(|alert| alert.entity_id == "sse-broadcast"
-            && alert.severity == OperatorSeverity::Attention));
+    assert!(status.recent_errors.iter().any(|alert| alert.entity_id
+        == services::coordination_consumer_name()
+        && alert.severity == OperatorSeverity::Attention));
     assert!(status.database.incremental_vacuum);
     assert!(status.database.free_pages >= 0);
 }

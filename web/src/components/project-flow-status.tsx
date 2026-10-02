@@ -48,6 +48,7 @@ export function ProjectEnvironmentPauseNotice({ project }: { project: Project })
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="break-words text-xs" role="status">
             <span className="font-semibold">Environment paused</span>
+            {pause?.machine ? ` · ${pause.machine.name}` : ''}
             {pause?.checks.length ? ` · ${pause.checks.join(', ')}` : ''}
             {Number.isFinite(nextCheckAt) ? (
               <span title={new Date(nextCheckAt).toLocaleString()}>
@@ -59,7 +60,7 @@ export function ProjectEnvironmentPauseNotice({ project }: { project: Project })
             size="sm"
             variant="outline"
             disabled={recheck.isPending}
-            onClick={() => recheck.mutate(project.id)}
+            onClick={() => recheck.mutate({ projectId: project.id })}
           >
             {recheck.isPending ? 'Checking…' : 'Check now'}
           </Button>
@@ -87,26 +88,34 @@ export function ProjectEnvironmentPauseNotice({ project }: { project: Project })
               ? 'Environment is still paused.'
               : recheck.data.project.paused
                 ? 'Checks finished. Project remains paused.'
-                : recheck.data.checks.some((check) => !check.passed)
+                : recheck.data.machines.some(
+                      (machine) => machine.error || machine.checks.some((check) => !check.passed),
+                    )
                   ? 'Some environment checks failed.'
-                  : 'Checks passed. Project is resumed.'}
+                  : 'Checks finished. Project is running.'}
           </p>
-          {recheck.data.checks.map((check) => (
-            <div key={check.name}>
-              <p className={check.passed ? 'text-success' : 'text-destructive'}>
-                {check.name}: {check.passed ? 'Passed' : 'Failed'}
-                {check.exit_code !== null ? ` (exit ${check.exit_code})` : ''}
-              </p>
-              {check.output_tail ? (
-                <details>
-                  <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-                    {check.name} output
-                  </summary>
-                  <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono">
-                    {check.output_tail}
-                  </pre>
-                </details>
-              ) : null}
+          {recheck.data.machines.map((machine) => (
+            <div key={machine.machine.id} className="space-y-2">
+              <p className="font-medium">{machine.machine.name}</p>
+              {machine.error ? <p role="alert">{machine.error}</p> : null}
+              {machine.checks.map((check) => (
+                <div key={check.name}>
+                  <p className={check.passed ? 'text-success' : 'text-destructive'}>
+                    {check.name}: {check.passed ? 'Passed' : 'Failed'}
+                    {check.exit_code !== null ? ` (exit ${check.exit_code})` : ''}
+                  </p>
+                  {check.output_tail ? (
+                    <details>
+                      <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                        {check.name} output
+                      </summary>
+                      <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono">
+                        {check.output_tail}
+                      </pre>
+                    </details>
+                  ) : null}
+                </div>
+              ))}
             </div>
           ))}
         </div>

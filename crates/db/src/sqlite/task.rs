@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProjectSlotCounts;
 use crate::{
     AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, RestoreQueuedRecovery,
     TaskRoleAssignment,
@@ -821,6 +822,11 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
                        (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
                         OR CASE WHEN json_valid(t.error_annotation) THEN
                             COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
                            ELSE 0 END
@@ -848,6 +854,79 @@ impl TaskRepo for SqliteDb {
         )
         .bind(project_states_json).bind(subtask_states_json).bind(blocking_kinds_json).bind(project_id)
         .fetch_one(self.pool()).await?)
+    }
+
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>> {
+        let rows = sqlx::query(
+            "WITH projects AS MATERIALIZED (
+                SELECT key AS id, value AS states FROM json_each(?)
+             ), project_states AS (
+                SELECT projects.id AS project_id, states.key AS name, json_extract(states.value, '$.kind') AS kind,
+                       json_extract(states.value, '$.owns_work') AS owns_work FROM projects, json_each(projects.states) states
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.project_id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
+                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
+                        OR CASE WHEN json_valid(t.error_annotation) THEN
+                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
+                           ELSE 0 END
+                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
+                                     WHERE r.task_id = t.id
+                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       THEN 1 ELSE 0 END AS parked
+                FROM projects JOIN task t ON t.project_id = projects.id
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.project_id = t.project_id AND p.name = t.status
+                WHERE t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT project.id AS project_id, project.version AS project_version, project.list_revision,
+               COALESCE(SUM(CASE WHEN kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.project_id = visible.project_id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               ) THEN 1 ELSE 0 END), 0) AS active,
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0) AS parked,
+               COALESCE(SUM(kind = 'initial'), 0) AS queued
+             FROM projects JOIN project ON project.id = projects.id
+             LEFT JOIN visible ON visible.project_id = projects.id
+             GROUP BY project.id",
+        )
+        .bind(project_states_json)
+        .bind(subtask_states_json)
+        .bind(blocking_kinds_json)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProjectSlotCounts {
+                    project_id: row.try_get("project_id")?,
+                    project_version: row.try_get("project_version")?,
+                    list_revision: row.try_get("list_revision")?,
+                    active: row.try_get("active")?,
+                    parked: row.try_get("parked")?,
+                    queued: row.try_get("queued")?,
+                })
+            })
+            .collect()
     }
 
     async fn create(&self, input: CreateTask) -> Result<Task> {
@@ -1947,12 +2026,9 @@ impl TaskRepo for SqliteDb {
             Self::ensure_task_execution_admission_in_tx(transaction, &input.execution, admission)
                 .await?;
         }
-        let mut execution = Self::create_execution_in_tx(
-            transaction,
-            &input.execution,
-            execution_admission.as_ref(),
-        )
-        .await?;
+        let mut execution = self
+            .create_execution_in_tx(transaction, &input.execution, execution_admission.as_ref())
+            .await?;
         // A reviewer/auditor claim owns the selected Review attempt in the
         // same transaction as the Task mutation, Running execution, and
         // initial lease. This keeps claim admission from bypassing the

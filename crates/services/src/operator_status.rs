@@ -1,13 +1,17 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Instant,
 };
 
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
     DaemonPressureSummary, DatabaseStorageStatus, EffectiveExecutionPolicy, EventConsumerStatus,
-    OperatorSeverity, OperatorStatusResponse, PlanProgressSummary, RecentErrorSummary,
-    RetryPressureSummary, TokenTotalsSummary, UsageSummary, WorkspaceCleanupSummary,
+    EventRelayStatus, OperatorSeverity, OperatorStatusResponse, PlanProgressSummary,
+    RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
+    WorkerDeadLetterSummary, WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{SqliteDb, WorkspaceRepo};
@@ -15,7 +19,6 @@ use serde_json::Value;
 use sqlx::Row;
 
 use crate::{
-    agent_capacity::daemon_session_cap_from_labels,
     plan_artifact::{read_plan_for_resolved_workspace, PlanArtifactError},
     usage_projection::{usage_aggregate_for_source_state, UsageLedgerIndex},
     workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
@@ -32,6 +35,8 @@ pub struct OperatorStatusService {
     usage_cache: Arc<UsageLedgerIndex>,
     consumer_stall_seconds: u32,
     expected_event_consumers: RwLock<Vec<&'static str>>,
+    event_relay: RwLock<Option<Arc<crate::DomainEventBroadcastConsumer>>>,
+    relay_enabled: AtomicBool,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
@@ -47,6 +52,8 @@ impl OperatorStatusService {
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            event_relay: RwLock::new(None),
+            relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
             workspace_backend_router,
         }
@@ -59,6 +66,8 @@ impl OperatorStatusService {
 
     /// Embedded-only fixture constructor.
     pub fn new_for_test(db: Arc<SqliteDb>) -> Self {
+        db.server_run_cap
+            .initialize_identity(&config::embedded_machine_id());
         Self {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db: Arc::clone(&db),
@@ -66,6 +75,8 @@ impl OperatorStatusService {
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            event_relay: RwLock::new(None),
+            relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
         }
     }
@@ -95,6 +106,11 @@ impl OperatorStatusService {
     /// Monitor only durable consumers owned by the process's started workers.
     /// Persisted cursors from other assemblies are not evidence of a live worker.
     pub fn set_runtime_workers(&self, workers: &[crate::runtime::RuntimeWorker]) {
+        self.relay_enabled.store(
+            workers.contains(&crate::runtime::RuntimeWorker::DomainEventBroadcast),
+            Ordering::SeqCst,
+        );
+
         *self
             .expected_event_consumers
             .write()
@@ -104,6 +120,22 @@ impl OperatorStatusService {
             .collect();
     }
 
+    pub fn set_event_relay(&self, relay: Arc<crate::DomainEventBroadcastConsumer>) {
+        *self.event_relay.write().expect("relay status lock") = Some(relay);
+    }
+    async fn event_relay_status(&self) -> Result<EventRelayStatus, ServiceError> {
+        let relay = self.event_relay.read().expect("relay status lock").clone();
+        if let Some(relay) = relay {
+            return relay.status().await;
+        }
+        Ok(EventRelayStatus {
+            running: false,
+            position: None,
+            head: self.db.domain_event_head().await.ok(),
+            last_error: None,
+            last_error_at: None,
+        })
+    }
     pub async fn compute_status(&self) -> Result<OperatorStatusResponse, ServiceError> {
         let started = Instant::now();
         let result = self.compute_status_inner().await;
@@ -139,18 +171,101 @@ impl OperatorStatusService {
             free_pages: storage.free_pages,
         };
         let mut recent_errors = self.recent_errors(now).await?;
-        // Reuse the existing operator issue/severity surface. These current
-        // alerts disappear on cursor recovery; no new alert ledger is needed.
-        for consumer in event_consumers.iter().filter(|consumer| consumer.stalled) {
+        let names: Vec<&str> = event_consumers
+            .iter()
+            .map(|consumer| consumer.consumer_name.as_str())
+            .collect();
+        let diagnostics = self.db.worker_operator_diagnostics(&names).await?;
+        for consumer in &event_consumers {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|row| row.worker_name == consumer.consumer_name);
+            let mut messages = Vec::new();
+            let mut occurred_at = None;
+            let mut attention = consumer.stalled;
+            if let Some(diagnostic) = diagnostic {
+                for (kind, cause, time) in &diagnostic.errors {
+                    let label = match kind {
+                        db::HealthErrorKind::Runtime => "Runtime",
+                        db::HealthErrorKind::Item => "Event",
+                        db::HealthErrorKind::Tick => "Tick",
+                        db::HealthErrorKind::AfterCommit => "After commit",
+                    };
+                    messages.push(format!("{label}: {cause}"));
+                    occurred_at = Some(time.clone());
+                    attention = true;
+                }
+                if let (Some(reason), Some(since)) =
+                    (&diagnostic.deferred_reason, &diagnostic.deferred_since)
+                {
+                    messages.push(format!("Deferred since {since}: {reason}"));
+                    occurred_at.get_or_insert_with(|| since.clone());
+                }
+            }
+            if consumer.stalled {
+                messages.push(format!("Event consumer stalled: cursor has not advanced for more than {} seconds; lag {}",
+                    self.consumer_stall_seconds, consumer.lag));
+            }
+            if !messages.is_empty() {
+                recent_errors.push(RecentErrorSummary {
+                    entity_type: "event_consumer".to_owned(),
+                    entity_id: consumer.consumer_name.clone(),
+                    error: messages.join("; "),
+                    occurred_at: occurred_at
+                        .or_else(|| consumer.last_advanced_at.clone())
+                        .or_else(|| consumer.oldest_unprocessed_at.clone())
+                        .unwrap_or_else(|| computed_at.clone()),
+                    severity: if attention {
+                        OperatorSeverity::Attention
+                    } else {
+                        OperatorSeverity::Healthy
+                    },
+                });
+            }
+        }
+        for dead in self
+            .db
+            .worker_dead_letter_issues(&names, &(now - Duration::hours(1)).to_rfc3339())
+            .await?
+        {
             recent_errors.push(RecentErrorSummary {
-                entity_type: "event_consumer".to_owned(),
-                entity_id: consumer.consumer_name.clone(),
-                error: format!("Event consumer stalled: cursor has not advanced for more than {} seconds; sequence lag {}", self.consumer_stall_seconds, consumer.lag),
-                occurred_at: consumer.last_advanced_at.clone().or_else(|| consumer.oldest_unprocessed_at.clone()).unwrap_or_else(|| computed_at.clone()),
+                entity_type: "worker_dead_letter".to_owned(),
+                entity_id: format!("{}:{}", dead.worker_name, dead.source_key),
+                error: format!(
+                    "{} quarantined {} {}: {}",
+                    dead.worker_name, dead.item_type, dead.source_key, dead.reason
+                ),
+                occurred_at: dead.occurred_at,
                 severity: OperatorSeverity::Attention,
             });
         }
 
+        let event_relay = self.event_relay_status().await?;
+        // A process that declares the relay but has not attached one (a
+        // service built without the runtime) has nothing to report on.
+        let relay_attached = self
+            .event_relay
+            .read()
+            .expect("relay status lock")
+            .is_some();
+        if self.relay_enabled.load(Ordering::SeqCst)
+            && relay_attached
+            && (!event_relay.running || event_relay.last_error.is_some())
+        {
+            recent_errors.push(RecentErrorSummary {
+                entity_type: "event_relay".into(),
+                entity_id: "domain-event-relay".into(),
+                error: event_relay
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "event relay is restarting or stopped".into()),
+                occurred_at: event_relay
+                    .last_error_at
+                    .clone()
+                    .unwrap_or_else(|| computed_at.clone()),
+                severity: OperatorSeverity::Attention,
+            });
+        }
         let mut overall_severity = OperatorSeverity::Healthy;
         if !daemon_issues.is_empty() || !workspace_cleanup.is_empty() {
             raise_severity(&mut overall_severity, OperatorSeverity::Attention);
@@ -182,6 +297,7 @@ impl OperatorStatusService {
             usage_summary,
             recent_errors,
             event_consumers,
+            event_relay,
             database,
             computed_at,
         })
@@ -197,35 +313,49 @@ impl OperatorStatusService {
             .expect("event consumer set lock")
             .clone();
         let lag = self.db.domain_event_consumer_lag(&expected).await?;
-        Ok(lag
-            .into_iter()
-            .map(|consumer| {
-                // Both clocks must be old. An idle consumer has an old cursor,
-                // so an event that arrived a moment ago is not a stall.
-                let threshold = f64::from(self.consumer_stall_seconds);
-                let stalled = consumer.lag > 0
-                    && consumer
-                        .oldest_unprocessed_at
-                        .as_deref()
-                        .is_some_and(|pending| seconds_since(pending, now) > threshold)
-                    && consumer
-                        .last_advanced_at
-                        .as_deref()
-                        .is_none_or(|last| seconds_since(last, now) > threshold);
-                EventConsumerStatus {
-                    consumer_name: consumer.consumer_name,
-                    last_sequence: consumer.last_sequence,
-                    lag: consumer.lag,
-                    oldest_unprocessed_age_seconds: consumer
-                        .oldest_unprocessed_at
-                        .as_deref()
-                        .map(|created| seconds_since(created, now)),
-                    oldest_unprocessed_at: consumer.oldest_unprocessed_at,
-                    last_advanced_at: consumer.last_advanced_at,
-                    stalled,
-                }
-            })
-            .collect())
+        let mut statuses = Vec::with_capacity(lag.len());
+        for consumer in lag {
+            let (dead_letter_count, recent_dead_letters) = self
+                .db
+                .worker_dead_letter_history(&consumer.consumer_name)
+                .await?;
+            let recent_dead_letters = recent_dead_letters
+                .into_iter()
+                .map(|dead| {
+                    let event_sequence = dead.source_key.parse().ok().or_else(|| {
+                        dead.source_key
+                            .strip_prefix("event:")?
+                            .split(':')
+                            .next()?
+                            .parse()
+                            .ok()
+                    });
+                    WorkerDeadLetterSummary {
+                        id: dead.id,
+                        item_key: dead.source_key,
+                        event_sequence,
+                        reason: dead.reason,
+                        occurred_at: dead.occurred_at,
+                    }
+                })
+                .collect();
+            let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
+            statuses.push(EventConsumerStatus {
+                consumer_name: consumer.consumer_name,
+                last_sequence: consumer.last_sequence,
+                lag: consumer.lag,
+                oldest_unprocessed_age_seconds: consumer
+                    .oldest_unprocessed_at
+                    .as_deref()
+                    .map(|created| seconds_since(created, now)),
+                oldest_unprocessed_at: consumer.oldest_unprocessed_at,
+                last_advanced_at: consumer.last_advanced_at,
+                stalled,
+                dead_letter_count,
+                recent_dead_letters,
+            });
+        }
+        Ok(statuses)
     }
 
     async fn active_executions(
@@ -423,65 +553,17 @@ impl OperatorStatusService {
     }
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT
-                d.id AS daemon_id,
-                d.hostname,
-                d.labels_json,
-                (
-                    SELECT COUNT(*)
-                    FROM execution e
-                    LEFT JOIN workspace_placement placement ON placement.workspace_id = e.workspace_id
-                    LEFT JOIN agent_current a ON a.id = e.agent_id
-                    WHERE CASE WHEN e.workspace_id IS NOT NULL
-                        THEN COALESCE(placement.execution_daemon_id, placement.daemon_id)
-                        ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json)
-                          THEN json_extract(e.executor_config_snapshot_json, '$.daemon_id') END, a.daemon_id)
-                        END = d.id
-                      AND e.status = 'running'
-                ) + (
-                    SELECT COUNT(*) FROM workspace_placement p
-                    WHERE COALESCE(p.execution_daemon_id, p.daemon_id) = d.id
-                      AND p.state IN ('reserved', 'preparing')
-                      AND NOT EXISTS (SELECT 1 FROM execution e
-                          WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
-                ) AS running_executions,
-                (
-                    SELECT COUNT(*)
-                    FROM agent_chat_turn_job turn_job
-                    JOIN agent_current a ON a.id = turn_job.responder_identity_id
-                    WHERE a.daemon_id = d.id
-                      AND turn_job.status IN ('leased', 'running')
-                ) AS active_agent_chat_turns
-             FROM daemon d
-             ORDER BY d.updated_at DESC, d.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
-
-        let mut pressure = Vec::new();
-        for row in rows {
-            let running_executions: i64 = row.try_get("running_executions")?;
-            let active_agent_chat_turns: i64 = row.try_get("active_agent_chat_turns")?;
-            let active_sessions = running_executions
-                .saturating_add(active_agent_chat_turns)
-                .max(0) as u32;
-            let labels_json: String = row.try_get("labels_json")?;
-            let max_sessions = daemon_session_cap_from_labels(&labels_json)
-                .and_then(|value| u32::try_from(value).ok());
-            let at_capacity = max_sessions.is_some_and(|max| active_sessions >= max);
-            if active_sessions == 0 && max_sessions.is_none() {
-                continue;
-            }
-            pressure.push(DaemonPressureSummary {
-                daemon_id: row.try_get("daemon_id")?,
-                hostname: row.try_get("hostname")?,
-                active_sessions,
-                max_sessions,
-                at_capacity,
-            });
-        }
-        Ok(pressure)
+        Ok(crate::placement::machine_precheck::snapshot(&self.db)
+            .await?
+            .into_iter()
+            .map(|row| DaemonPressureSummary {
+                daemon_id: row.daemon_id.unwrap_or_else(|| "server_host".to_owned()),
+                hostname: Some(row.hostname),
+                active_runs: row.capacity.active_runs().max(0) as u32,
+                max_concurrent_runs: row.capacity.max_concurrent_runs,
+                at_capacity: !row.capacity.has_capacity(),
+            })
+            .collect())
     }
 
     async fn agent_pressure(&self) -> Result<Vec<AgentPressureSummary>, ServiceError> {
@@ -498,6 +580,7 @@ impl OperatorStatusService {
                 ) + (
                     SELECT COUNT(*) FROM workspace_placement p
                     WHERE p.agent_id = a.id AND p.state IN ('reserved', 'preparing')
+                       AND julianday(COALESCE(p.reserved_until, datetime(p.updated_at, '+10 minutes'))) > julianday('now')
                       AND NOT EXISTS (SELECT 1 FROM execution e
                           WHERE e.workspace_id = p.workspace_id AND e.status = 'running')
                 ) AS running_executions
@@ -509,25 +592,25 @@ impl OperatorStatusService {
 
         let mut pressure = Vec::new();
         for row in rows {
-            let active_sessions = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
-            let max_sessions = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
-            let at_capacity = max_sessions > 0 && active_sessions >= max_sessions;
-            if active_sessions == 0 && !at_capacity {
+            let active_tasks = row.try_get::<i64, _>("running_executions")?.max(0) as u32;
+            let max_concurrent_tasks = row.try_get::<i64, _>("max_concurrent_tasks")?.max(0) as u32;
+            let at_capacity = max_concurrent_tasks > 0 && active_tasks >= max_concurrent_tasks;
+            if active_tasks == 0 && !at_capacity {
                 continue;
             }
             pressure.push(AgentPressureSummary {
                 agent_id: row.try_get("agent_id")?,
                 agent_name: row.try_get("agent_name")?,
                 daemon_id: row.try_get("daemon_id")?,
-                active_sessions,
-                max_sessions,
+                active_tasks,
+                max_concurrent_tasks,
                 at_capacity,
             });
         }
         pressure.sort_by(|left, right| {
             right
-                .active_sessions
-                .cmp(&left.active_sessions)
+                .active_tasks
+                .cmp(&left.active_tasks)
                 .then_with(|| left.agent_name.cmp(&right.agent_name))
         });
         Ok(pressure)
@@ -855,6 +938,22 @@ mod tests {
     use db::{create_sqlite_pool, new_uuid_v4, run_migrations};
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn machine_capacity_operations_includes_server_host() {
+        let (db, service) = test_service().await;
+        db.server_run_cap.set(
+            Some(4),
+            config::resolved_run_cap(Some(4)),
+            &config::embedded_machine_id(),
+        );
+        let pressure = service.daemon_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].daemon_id, "server_host");
+        assert_eq!(pressure[0].active_runs, 0);
+        assert_eq!(pressure[0].max_concurrent_runs, Some(4));
+        assert!(!pressure[0].at_capacity);
+    }
+
     async fn test_service() -> (Arc<SqliteDb>, OperatorStatusService) {
         let pool = create_sqlite_pool("sqlite::memory:")
             .await
@@ -864,6 +963,46 @@ mod tests {
         let service = OperatorStatusService::new(Arc::clone(&db));
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_agent_pressure_excludes_expired_reservations() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE agent_current (id TEXT, name TEXT, daemon_id TEXT, max_concurrent_tasks INTEGER);
+            CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
+            CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT);
+            INSERT INTO agent_current VALUES ('agent','Agent',NULL,2);
+            INSERT INTO workspace_placement VALUES ('expired','agent','reserved','2020-01-01T00:00:00Z',CURRENT_TIMESTAMP),
+              ('orphan','agent','preparing',NULL,'2020-01-01T00:00:00Z'),
+              ('live','agent','reserved','2099-01-01T00:00:00Z',CURRENT_TIMESTAMP);")
+            .execute(&pool).await.unwrap();
+        let service = OperatorStatusService::new_for_test(Arc::new(SqliteDb::new(pool)));
+        let pressure = service.agent_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].active_tasks, 1);
+        assert!(!pressure[0].at_capacity);
+    }
+
+    #[tokio::test]
+    async fn machine_capacity_operations_uses_handle_identity() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(r#"CREATE TABLE daemon (id TEXT, hostname TEXT, machine_id TEXT, max_concurrent_runs INTEGER, run_limit INTEGER);
+            CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, daemon_id TEXT, execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
+            CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
+            CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
+            CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
+            INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL);
+            INSERT INTO execution VALUES (NULL,NULL,'running','{"daemon_id":"provider"}');"#)
+            .execute(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        db.server_run_cap.set(Some(1), 1, "capacity-test-host");
+        let service = OperatorStatusService::new_for_test(db.clone());
+        let pressure = service.daemon_pressure().await.unwrap();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].daemon_id, "server_host");
+        assert_eq!(pressure[0].active_runs, 1);
+        assert_eq!(pressure[0].max_concurrent_runs, Some(1));
+        assert!(pressure[0].at_capacity);
     }
 
     async fn seed_project_repo(db: &SqliteDb) -> (String, String) {
@@ -1384,7 +1523,7 @@ mod tests {
             .is_empty());
     }
     #[tokio::test]
-    async fn consumer_lag_uses_sequence_distance_and_stalls_use_existing_attention_alerts() {
+    async fn consumer_lag_counts_live_rows_and_stalls_use_existing_attention_alerts() {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let old = (now - Duration::minutes(10)).to_rfc3339();
@@ -1397,14 +1536,14 @@ mod tests {
             sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 10, ?) ON CONFLICT(consumer_name) DO UPDATE SET last_sequence = 10, updated_at = excluded.updated_at")
                 .bind(consumer).bind(&old).execute(db.pool()).await.unwrap();
         }
-        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'sse-broadcast'").execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
         let status = service.compute_status().await.unwrap();
         let stalled = status
             .event_consumers
             .iter()
-            .find(|c| c.consumer_name == "sse-broadcast")
+            .find(|c| c.consumer_name == "attention_projection")
             .unwrap();
-        assert_eq!(stalled.lag, 9); // Only one row is pending; gaps count in the metric.
+        assert_eq!(stalled.lag, 1); // Deleted sequence gaps do not count.
         assert!(stalled.stalled);
         assert!(stalled.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
@@ -1415,16 +1554,16 @@ mod tests {
             OperatorSeverity::Attention
         );
         assert!(status.database.incremental_vacuum);
-        assert_eq!(status.event_consumers.len(), 5);
+        assert_eq!(status.event_consumers.len(), 4);
         assert!(status
             .event_consumers
             .iter()
-            .filter(|c| c.consumer_name != "sse-broadcast")
+            .filter(|c| c.consumer_name != "attention_projection")
             .all(|c| c.lag == 0
                 && !c.stalled
                 && c.oldest_unprocessed_at.is_none()
                 && c.last_advanced_at.as_deref() == Some(old.as_str())));
-        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'sse-broadcast'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'attention_projection'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
         let recovered = service.compute_status().await.unwrap();
         assert_eq!(recovered.overall_severity, OperatorSeverity::Healthy);
         assert!(recovered.recent_errors.is_empty());
@@ -1435,28 +1574,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_migrated_health_reports_live_lag_and_age_without_worker_updates() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        let now = Utc::now();
+        let old = (now - Duration::minutes(10)).to_rfc3339();
+        let name = crate::memory_consumer_name();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?)")
+            .bind(name).bind(&old).execute(db.pool()).await.unwrap();
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(1)
+            .await
+            .unwrap();
+        // Model a worker that has been running for ten minutes; a newly
+        // initialized worker gets time to drain an upgraded checkpoint.
+        sqlx::query("UPDATE worker_health SET created_at = ? WHERE worker_name = ?")
+            .bind(&old)
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // No health update follows either append, as when a handler is hung.
+        sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type,
+            scope_type, scope_id, correlation_id, created_at) VALUES
+            ('wanted', 'agent_chat.message.admitted', 'test', 'test', 'system', 'system', 'system', 'test', ?),
+            ('ignored', 'irrelevant', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
+            .bind(&old).bind(&old).execute(db.pool()).await.unwrap();
+        let status = service.event_consumers(now).await.unwrap();
+        let memory = status.iter().find(|c| c.consumer_name == name).unwrap();
+        assert_eq!(memory.lag, 1);
+        assert_eq!(memory.oldest_unprocessed_at.as_deref(), Some(old.as_str()));
+        assert!(memory.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
+        assert!(memory.stalled);
+        let later = service
+            .event_consumers(now + Duration::minutes(1))
+            .await
+            .unwrap();
+        let memory = later.iter().find(|c| c.consumer_name == name).unwrap();
+        assert!(memory.oldest_unprocessed_age_seconds.unwrap() >= 660.0);
+        crate::worker_runtime::WorkerHealth::new(Arc::clone(&db), name)
+            .report_error("persistent worker failure")
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|issue| issue.entity_id == name
+                && issue.error.contains("persistent worker failure")));
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(10)
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(!status
+            .recent_errors
+            .iter()
+            .any(|issue| issue.error.contains("persistent worker failure")));
+        // Skip has a lazy checkpoint. Simulate that subsequent flush to test
+        // recovery against the sole cursor authority, not a health copy.
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        db.advance_domain_event_cursor_in_tx(&mut tx, name, 0, 2, &now.to_rfc3339())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    }
+
+    #[tokio::test]
+    async fn consumer_deferral_text_and_dead_letters_have_distinct_operator_lifetimes() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        let name = crate::memory_consumer_name();
+        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
+            .run_once(1)
+            .await
+            .unwrap();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health
+            .defer_in_tx(
+                &mut tx,
+                "1",
+                std::time::Duration::from_secs(3600),
+                "waiting for settlement",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        let issue = status
+            .recent_errors
+            .iter()
+            .find(|i| i.entity_id == name)
+            .unwrap();
+        assert!(issue.error.contains("waiting for settlement"));
+        assert!(issue.error.contains("Deferred since"));
+        assert_eq!(issue.severity, OperatorSeverity::Healthy);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.clear_pending_in_tx(&mut tx).await.unwrap();
+        health
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "1",
+                    item_type: "test",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: "2000-01-01T00:00:00Z",
+                },
+                "poison event",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|i| i.entity_type == "worker_dead_letter" && i.error.contains("poison event")));
+        sqlx::query("UPDATE worker_dead_letter SET dead_lettered_at = ?")
+            .bind((Utc::now() - Duration::hours(2)).to_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    }
+
+    #[tokio::test]
     async fn consumer_stall_threshold_missing_cursors_and_empty_outbox_are_visible() {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let empty = service.event_consumers(now).await.unwrap();
-        assert_eq!(empty.len(), 5);
+        assert_eq!(empty.len(), 4);
         assert!(empty.iter().all(|c| c.lag == 0 && !c.stalled));
         let old = (now - Duration::seconds(301)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(&old).execute(db.pool()).await.unwrap();
         let missing = service.event_consumers(now).await.unwrap();
         let consumer = missing
             .iter()
-            .find(|c| c.consumer_name == "sse-broadcast")
+            .find(|c| c.consumer_name == "attention_projection")
             .unwrap();
         assert_eq!(consumer.lag, 1);
         assert_eq!(consumer.last_advanced_at, None);
         assert!(consumer.stalled);
-        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 0, ?)").bind((now - Duration::seconds(300)).to_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 0, ?)").bind((now - Duration::seconds(300)).to_rfc3339()).execute(db.pool()).await.unwrap();
         let at_threshold = service.event_consumers(now).await.unwrap();
         assert!(
             !at_threshold
                 .iter()
-                .find(|c| c.consumer_name == "sse-broadcast")
+                .find(|c| c.consumer_name == "attention_projection")
                 .unwrap()
                 .stalled
         );
@@ -1468,7 +1741,7 @@ mod tests {
         assert!(
             shorter
                 .iter()
-                .find(|c| c.consumer_name == "sse-broadcast")
+                .find(|c| c.consumer_name == "attention_projection")
                 .unwrap()
                 .stalled
         );
@@ -1477,9 +1750,9 @@ mod tests {
     #[tokio::test]
     async fn idle_consumer_with_old_cursor_is_never_stalled() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Attention]);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers.len(), 1);
         let consumer = &status.event_consumers[0];
@@ -1504,5 +1777,72 @@ mod tests {
         assert_eq!(status.event_consumers[0].lag, 1);
         assert!(!status.event_consumers[0].stalled);
         assert!(status.recent_errors.is_empty());
+    }
+    #[tokio::test]
+    async fn consumer_tail_has_no_durable_lag_entry_or_stall() {
+        let (_, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        assert!(service
+            .compute_status()
+            .await
+            .unwrap()
+            .event_consumers
+            .is_empty());
+    }
+    #[tokio::test]
+    async fn audit2_dead_letter_history_does_not_expire_or_degrade_old_failures() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        let name = crate::coordination_consumer_name();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.ensure_in_tx(&mut tx).await.unwrap();
+        for n in 0..7 {
+            let key = format!("event:{n}:commitment:c-{n}");
+            health
+                .dead_letter_in_tx(
+                    &mut tx,
+                    db::WorkItem {
+                        source_key: &key,
+                        item_type: "coordination_commitment",
+                    },
+                    db::FailureState {
+                        attempts: 0,
+                        first_failed_at: "2000-01-01T00:00:00Z",
+                    },
+                    "domain rejection",
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE worker_dead_letter SET dead_lettered_at = '2000-01-01T00:00:00Z'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        let worker = &status.event_consumers[0];
+        assert_eq!(worker.dead_letter_count, 7);
+        assert_eq!(worker.recent_dead_letters.len(), 5);
+        assert!(worker
+            .recent_dead_letters
+            .iter()
+            .all(|item| !item.id.is_empty() && item.event_sequence.is_some()));
+        let ids: Vec<_> = worker
+            .recent_dead_letters
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        let again = service.compute_status().await.unwrap();
+        assert_eq!(
+            again.event_consumers[0]
+                .recent_dead_letters
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(status.recent_errors.is_empty());
+        assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
     }
 }

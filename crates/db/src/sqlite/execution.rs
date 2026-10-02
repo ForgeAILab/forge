@@ -8,7 +8,9 @@ use std::collections::HashSet;
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        let execution = self
+            .create_execution_in_tx(&mut transaction, &input, None)
+            .await?;
         transaction.commit().await?;
         Ok(execution)
     }
@@ -58,7 +60,8 @@ impl ExecutionRepo for SqliteDb {
                     .to_owned(),
             ));
         }
-        Self::create_execution_in_tx(transaction, &input, admission.as_ref()).await?;
+        self.create_execution_in_tx(transaction, &input, admission.as_ref())
+            .await?;
         // Reviewer/auditor executions are durably owned by the exact Review
         // attempt selected by the admission snapshot. Keep this binding in
         // the same writer transaction as the execution row and lease
@@ -1801,6 +1804,18 @@ impl ExecutionRepo for SqliteDb {
                 },
             )
             .await?;
+        }
+        // Late accounting may settle after cancellation; only the winning
+        // terminal update owns an execution's plan candidate.
+        if let Some(plan) = input.plan.as_ref().filter(|_| terminal_cas_won) {
+            sqlx::query("INSERT INTO execution_plan_transport (execution_id, candidate_text, candidate_error, candidate_size, terminal_report_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_id) DO UPDATE SET
+                candidate_text=excluded.candidate_text, candidate_error=excluded.candidate_error,
+                candidate_size=excluded.candidate_size, terminal_report_id=excluded.terminal_report_id,
+                updated_at=excluded.updated_at")
+                .bind(&terminal.execution_id).bind(&plan.content).bind(&plan.error).bind(plan.size)
+                .bind(&input.terminal_report_id).bind(&terminal.updated_at)
+                .execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {

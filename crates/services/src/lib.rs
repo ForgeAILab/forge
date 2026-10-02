@@ -30,6 +30,7 @@ pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod embedded_task_executor;
+pub mod environment_surfaces;
 pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;
@@ -95,6 +96,7 @@ pub mod turn_log_sink;
 pub mod types;
 pub mod usage_projection;
 pub mod wake_turn_consumer;
+pub mod worker_runtime;
 pub mod workflow;
 pub mod workspace_backend;
 pub mod workspace_cleanup;
@@ -114,9 +116,7 @@ pub use adaptive_task_operations::{
     adaptive_task_operation_supported_values, parse_persisted_adaptive_envelope,
     validate_adaptive_task_operations, ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
 };
-pub use agent_chat_memory_consumer::{
-    memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
-};
+pub use agent_chat_memory_consumer::{memory_consumer_name, AgentChatMemoryConsumer};
 pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
 pub use agent_chat_service::{
     append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,
@@ -154,8 +154,7 @@ pub use context_manifest::{
     fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
 };
 pub use coordination_consumer::{
-    coordination_consumer_lease_owner, coordination_consumer_name, CoordinationOutcomeConsumer,
-    CoordinationOutcomeRun,
+    coordination_consumer_name, CoordinationOutcomeConsumer, CoordinationOutcomeRun,
 };
 pub use coordination_service::{
     AgentActionService, AgentInboxService, ApproveActionInput, AskQuestionInput,
@@ -176,10 +175,7 @@ pub use default_agents::ensure_default_agents;
 pub use deferred_dispatch::wake_task_dispatch;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
-pub use domain_event_broadcast::{
-    domain_event_broadcast_consumer_name, domain_event_broadcast_lease_owner,
-    DomainEventBroadcastConsumer,
-};
+pub use domain_event_broadcast::DomainEventBroadcastConsumer;
 pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
@@ -335,9 +331,7 @@ pub use usage_projection::{
     usage_aggregate_for_source, usage_aggregate_for_source_state, usage_aggregate_for_task,
     usage_breakdowns_for_invocation, usage_breakdowns_for_source, UsageDomainRun,
 };
-pub use wake_turn_consumer::{
-    wake_turn_consumer_lease_owner, wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun,
-};
+pub use wake_turn_consumer::{wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun};
 pub use workflow::template_service::WorkflowTemplateService;
 pub use workspace_cleanup::WorkspaceCleanupScheduler;
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;

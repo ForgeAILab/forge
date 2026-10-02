@@ -221,7 +221,8 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
                   <span>
                     {execution.token_totals.cost.coverage === 'pending'
                       ? 'Cost pending'
-                      : execution.token_totals.cost.coverage === 'complete' && execution.token_totals.cost.complete_total
+                      : execution.token_totals.cost.coverage === 'complete' &&
+                          execution.token_totals.cost.complete_total
                         ? formatMoneyAmount(execution.token_totals.cost.complete_total)
                         : execution.token_totals.cost.coverage === 'no_usage'
                           ? 'No usage'
@@ -249,7 +250,7 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
 
 function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
   return (
-    <Section title={`${productTerm('runtime')} Pressure`} count={items.length}>
+    <Section title="Machine Pressure" count={items.length}>
       <div className="divide-y">
         {items.map((item) => (
           <div
@@ -257,11 +258,11 @@ function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
             className="flex min-w-0 items-center justify-between gap-4 px-4 py-3 transition-colors hover:bg-muted/20"
           >
             <div className="min-w-0">
-              <EntityLink href={`/daemons/${item.daemon_id}`}>
+              <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
                 {item.hostname ?? item.daemon_id}
               </EntityLink>
               <p className="mt-1 text-xs text-muted-foreground">
-                {item.active_sessions}/{item.max_sessions ?? '-'} active sessions
+                {item.active_runs}/{item.max_concurrent_runs ?? 'Unlimited'} active runs
               </p>
             </div>
             <CapacityBadge atCapacity={item.at_capacity} />
@@ -285,10 +286,10 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
               <p className="truncate text-sm font-medium text-foreground">{item.agent_name}</p>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                 <span>
-                  {item.active_sessions}/{item.max_sessions} active sessions
+                  {item.active_tasks}/{item.max_concurrent_tasks} active tasks
                 </span>
                 {item.daemon_id ? (
-                  <EntityLink href={`/daemons/${item.daemon_id}`}>
+                  <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
                     Daemon {item.daemon_id}
                   </EntityLink>
                 ) : null}
@@ -472,8 +473,9 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
             <div className="min-w-0">
               <p className="break-all font-mono text-xs text-foreground">{item.consumer_name}</p>
               <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground">
-                <span>Sequence lag {item.lag}</span>
+                <span>Pending events {item.lag}</span>
                 <span>Cursor {item.last_sequence}</span>
+                <span>Dead letters {item.dead_letter_count}</span>
                 <span>Last advanced {formatDate(item.last_advanced_at)}</span>
                 {item.oldest_unprocessed_age_seconds !== null ? (
                   <span>
@@ -481,6 +483,11 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
                   </span>
                 ) : null}
               </div>
+              {item.recent_dead_letters.map((dead) => (
+                <p key={dead.id} className="mt-1 break-words text-xs text-muted-foreground">
+                  {dead.item_key}: {dead.reason} · {formatDate(dead.occurred_at)}
+                </p>
+              ))}
             </div>
             <div className="flex items-center gap-2 text-xs">
               <span>
@@ -618,6 +625,11 @@ export function OperationsPage() {
         />
         <StatCard label="Database free pages" value={status.database.free_pages} />
       </div>
+      <p className="text-xs text-muted-foreground">
+        Event relay {status.event_relay.running ? 'Running' : 'Stopped'} · Position{' '}
+        {status.event_relay.position ?? '-'} · Head {status.event_relay.head ?? '-'}
+        {status.event_relay.last_error ? ` · ${status.event_relay.last_error}` : ''}
+      </p>
       <EventConsumersSection items={status.event_consumers} />
 
       {status.usage_summary ? (

@@ -11,7 +11,13 @@ afterEach(() => vi.restoreAllMocks())
 describe('Project environment re-check', () => {
   it('POSTs an empty request and returns each check result with the updated project', async () => {
     const response = {
-      checks: [{ name: 'disk', passed: true, exit_code: 0, output_tail: 'root free: 17G' }],
+      machines: [
+        {
+          machine: { id: 'server', name: 'Server host' },
+          error: null,
+          checks: [{ name: 'disk', passed: true, exit_code: 0, output_tail: 'root free: 17G' }],
+        },
+      ],
       project: { id: 'project-1', paused: false, environment_pause: null },
     }
     const fetchMock = vi.spyOn(window, 'fetch').mockResolvedValue(
@@ -20,7 +26,7 @@ describe('Project environment re-check', () => {
         headers: { 'content-type': 'application/json' },
       }),
     )
-    expect(await recheckProjectEnvironment('project-1')).toEqual(response)
+    expect(await recheckProjectEnvironment({ projectId: 'project-1' })).toEqual(response)
     const [url, init] = fetchMock.mock.calls[0]
     expect((url as URL).pathname).toBe('/api/v1/projects/project-1/environment/recheck')
     expect(init?.method).toBe('POST')
@@ -31,7 +37,7 @@ describe('Project environment re-check', () => {
     vi.spyOn(window, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
-          checks: [],
+          machines: [],
           project: { id: 'project-1' },
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
@@ -47,7 +53,7 @@ describe('Project environment re-check', () => {
     )
     const { result, unmount } = renderHook(() => useRecheckProjectEnvironment(), { wrapper })
     await act(async () => {
-      await result.current.mutateAsync('project-1')
+      await result.current.mutateAsync({ projectId: 'project-1' })
     })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.project('project-1') })
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.projects })

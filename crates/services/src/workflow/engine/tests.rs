@@ -1306,6 +1306,7 @@ async fn entry_barrier_stays_running_through_inline_role_dispatch() {
     DaemonRepo::upsert_by_machine_id(
         &*db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.to_owned(),
             machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
@@ -1326,6 +1327,7 @@ async fn entry_barrier_stays_running_through_inline_role_dispatch() {
     DaemonRepo::update_report(
         &*db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.to_owned(),
             detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
             labels_json: None,

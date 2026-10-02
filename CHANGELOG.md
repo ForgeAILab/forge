@@ -8,6 +8,65 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- `POST /api/v1/projects/{id}/environment/recheck` accepts an optional
+  `machine` (`server` or a daemon runtime id) and returns
+  `{ machines: [{ machine, checks, error }], project }`; it used to return
+  `{ checks, project }`. Without `machine` it checks every machine the
+  Project has a repository on. `forge-ctl project env-recheck` prints results
+  per machine.
+- Project `environment_pause` now includes the `machine` the pause refers to.
+- Every machine (the server host and each daemon) now has a cap on concurrent
+  runs, and the default is no longer unlimited: half the machine's logical
+  cores, never less than 2. A run is a Running Task execution, a workspace
+  reservation that has not started, or an in-flight Agent Chat turn. Set
+  `server.max_concurrent_runs` to `0` for the old behaviour on the server
+  host. A daemon that has never reported a cap and has no administrator limit
+  stays unlimited until it is upgraded.
+- A daemon's cap is no longer read from its labels
+  (`max_concurrent_sessions`, `max_sessions`, `active_session_cap`,
+  `max_concurrent_tasks`). Migration V202610020900 copies an existing
+  positive label value into the daemon's recorded cap; after that the cap
+  comes from the daemon's own `max_concurrent_runs` setting.
+- The placement filter code `daemon_capacity` is renamed `machine_capacity`
+  and now also applies to the server host.
+- Operator status: machine entries (which now include the server host) report
+  `active_runs` and `max_concurrent_runs` instead of `active_sessions` and
+  `max_sessions`; Agent pressure entries report `active_tasks` and
+  `max_concurrent_tasks`.
+- A failing environment check no longer pauses the Project when another
+  machine can run the work. The failure marks that machine not ready for the
+  Project; placement skips it (filter code `environment_not_ready`) and a
+  Task goes to another connected machine that passes. A Task that is bound to
+  the failing machine waits there with an environment Attention item. The
+  Project is paused with `environment_not_ready` only when no machine is left
+  for the Task being placed. With a single machine the outcome is the same as
+  before: the Project pauses and the Task keeps its state without a failure
+  annotation. API response shapes are unchanged.
+- `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
+  `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
+  and keep-alive comments carry no id, so a reconnecting client keeps its last
+  durable cursor. A connection without `Last-Event-ID`, or with one that is not
+  a durable cursor, is live only. Resuming from a durable cursor replays at most
+  1,000 missed events, in pages of 100; a larger gap, a failed read or a cursor
+  beyond the ledger head gets one `events.resync_required` frame instead (for a
+  cursor beyond the head that frame carries `id: domain-event:<head>`).
+  Frame ids were previously the entity id.
+- Operator status `event_consumers` lists four workers (memory, coordination,
+  attention, wake-turn) and no longer lists `sse-broadcast`. For all four,
+  `lag` and `oldest_unprocessed_at` describe pending events of the types the
+  worker subscribes to, not the distance between its cursor and the newest
+  event.
+- Mission Control `consumer_health`: `processed_events` is removed;
+  `last_error_code` is now `failure`, `transient` or `terminal` (was
+  `version_conflict`, `not_found`, `database_error`, `projection_error`) and
+  `last_error_message` is added; `stale` now means subscribed events have been
+  pending for longer than the threshold with no checkpoint progress, so an
+  idle or newly started consumer is healthy.
+- Migration V202610020700 drops `event_processing_lease`,
+  `event_projection_receipt` and `attention_consumer_health` and deletes the
+  `sse-broadcast` cursor. These are delivery metadata, not user data: consumer
+  cursors, wake dispositions, Attention incidents and coordination records are
+  kept, and no event is processed twice or skipped on upgrade.
 - Assigning `coder` on a coordination root now sets the default worker for
   subtasks instead of returning an error; converting a Task into a
   coordination root keeps its `coder` assignment instead of deleting it.
@@ -126,6 +185,96 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   every other hook.
 
 ### Changed
+
+- An administrator can clear an Agent's machine pin by sending
+  `daemon_id: null` in the Agent update, or with "Clear pin" on the Agent
+  page, which names the pinned machine. Omitting `daemon_id` leaves the pin
+  unchanged.
+- Planner, coder and worker executions now run on daemon-owned workspaces.
+  Until now only reviewer and interactive runs worked there: a coder or
+  worker on an existing workspace was never started and showed no reason,
+  and a planner failed with "failed to prepare the remote execution plan
+  outbox", because the server read and wrote the plan at the daemon's path on
+  its own disk. The plan now travels to the daemon in `execution.start` and
+  back with the terminal report, and publishing, restoring and discarding a
+  plan go through the machine that owns the workspace.
+  - Daemons advertise the capability `execution.plan_transport`, which these
+    roles require on a daemon-owned workspace. The protocol revision stays at
+    3, so a daemon that has not been upgraded keeps reviewer, interactive,
+    shared-mount, file and terminal use. A Task whose only machine lacks the
+    capability shows a reason naming the machine and the capability, and is
+    dispatched once an eligible machine appears.
+  - An empty or unchanged plan from a planner is rejected by the planning
+    guard, as on a server-owned workspace. A plan larger than 128 KiB fails
+    the execution with the limit and the actual size. If the owning machine
+    is unreachable when a plan must be published, the Task waits with a
+    visible reason and retries with back-off.
+  - Migration V202610020800 adds `execution_plan_transport`, where a plan
+    returned by a daemon is kept. It is not part of the execution's config
+    snapshot or of the execution API.
+  - A daemon below the minimum protocol revision is reported as needing an
+    upgrade (`daemon_upgrade_required`) whatever its revision; previously
+    only revision 2 was recognised.
+- Environment readiness is recorded per Project and machine (the server host
+  or a daemon) in `project_machine_readiness`. Migration V202610020600 adds
+  the table and carries each environment-paused Project over as a not-ready
+  record for the machine it failed on.
+  - When a Project has environment checks and no environment assets, the
+    dispatcher runs the checks on the server host before the first launch
+    there, once, and waits for the result (`environment_probe_pending`)
+    rather than sending the Task to a less preferred machine. A failure
+    pauses the Project before any execution is created; previously the first
+    launch failed and then paused it. Projects with environment assets,
+    direct claims through the API, and daemons are judged by the launch-time
+    preflight, as before.
+  - Only the checks that apply to the role being launched gate that launch.
+  - Resuming a Project clears its not-ready records, so the next dispatch
+    checks again at once instead of waiting for the scheduled re-check. A
+    failure with no named check (asset staging, a denied run purpose) is not
+    re-checked on a schedule; it waits for a manual resume or "Check now".
+  - Changing a Project's checks while it is paused for a named check ends
+    that pause and checks again with the new set.
+  - A Task waiting for a machine's environment does not hold one of the
+    Project's `max_active_tasks` slots.
+  - A dispatch refused because the Project is paused for its environment
+    waits; it no longer records a `dispatch_failed` annotation.
+- The coordination, Attention and wake-turn consumers run on the supervised
+  worker runtime, like the memory indexer. Each event's effects and the cursor
+  advance commit in one transaction. Idle polling backs off from 250 ms to
+  5 s and is woken by committed events (it was a fixed 1 s). An unexpected
+  failure, a panic or a handle timeout counts a strike against the event, and
+  the event is quarantined after eight. A worker's periodic `tick` has its own
+  30 s timeout and its own back-off (1 s to 5 min); while a tick is backing
+  off, events are still handled every cycle.
+- The SSE relay is the only publisher of durable event frames. Services no
+  longer publish a durable event directly after their own commit; the relay
+  reads the ledger in order and is woken by the commit hook (measured: 72 µs
+  median from commit to broadcast, was 9 µs). It runs under the supervisor,
+  keeps its position across restarts of the task, and never broadcasts
+  historical events when its first read of the ledger head fails.
+- Operator status `event_consumers[].lag` for the Agent Chat memory indexer is
+  now the live count of pending events of the types it subscribes to, not the
+  distance between its cursor and the newest event. `recent_errors` gains
+  entries for that worker: its last runtime, event, tick or post-commit error,
+  a current deferral with its reason, and a quarantined event (shown for one
+  hour).
+- The Agent Chat memory indexer runs on a supervised worker runtime. A worker
+  that exits or panics is restarted with back-off; an event that keeps failing
+  is retried eight times over about two minutes and then recorded in
+  `worker_dead_letter` so later events are not blocked; database and other
+  infrastructure failures never count against an event. An idle worker writes
+  nothing, and an event of a type it ignores costs no write. Migration
+  V202610012200 adds `worker_health` and `worker_dead_letter` and deletes the
+  indexer's old delivery lease and receipt rows; its cursor is kept, so no
+  event is skipped or indexed twice.
+- Committed domain events wake waiting workers through one database-connection
+  hook instead of a call at each write site.
+- Project GET and Project list responses reuse slot counts while the Project's
+  Tasks, reviews, executions, workflow and settings are unchanged, and the
+  Project list loads counts for the whole page in one query. Migration
+  V202610020410 adds triggers so a child Task in another Project also
+  invalidates its parent's Project. Dispatcher admission still reads fresh
+  counts.
 
 - Agents now get guidance that keeps a Project easy to merge. Charter
   discovery asks for small modules with clear ownership and no hub file that
@@ -246,6 +395,51 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Per-machine environment readiness is visible.
+  - Project responses carry `environment_readiness`: one entry per machine
+    with its status (`ready`, `not_ready`, `unknown`), the failing checks and
+    the last and next check times.
+  - Project settings, Environment tab: a readiness table with "Check now"
+    for each machine.
+  - `forge-ctl project env-status <project>` and
+    `forge-ctl project env-recheck <project> --machine <id>`.
+  - Task responses carry `placement_diagnostics`, and the Task page shows why
+    a Task is waiting for a machine: the machine, the failing checks, a
+    pending probe, or machine capacity.
+  - Agent responses carry `runnable_on`: the machines that have the Agent's
+    executor (administrators see the machines; other users see a count). The
+    Agents page shows it, and "Cannot run" when there is none.
+- Machine run caps.
+  - Server host: `server.max_concurrent_runs` in the config file,
+    `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
+    Settings API and the Forge Settings page. Unset is automatic, `0` is
+    unlimited. A change made in Settings applies to the next admission without
+    a restart; an environment or command-line override applies again at the
+    next start.
+  - Daemons: `max_concurrent_runs` in `daemon.yaml` or
+    `--max-concurrent-runs N` on `forge-daemon` and
+    `forge-ctl daemon link|start|report`, reported to the server at
+    registration and in status reports. An administrator can also set a limit
+    for a daemon with `PATCH /api/v1/daemons/{id}` (`run_limit`) or on the
+    Machines page; the lower of the two applies. Daemon responses carry
+    `max_concurrent_runs`, `run_limit` and `effective_max_concurrent_runs`.
+  - When every machine a Task could run on is at its cap, the Task waits in
+    its state with a machine-capacity reason. It gets no failure annotation,
+    no Attention item and no retry-budget charge, does not hold one of its
+    Project's `max_active_tasks` slots, and starts on a dispatcher tick after
+    a run ends. Work that is already running is never stopped, including when
+    the cap is lowered below the current load.
+  - Limits: Agent Chat turns count towards a machine's load but are never
+    refused; review check runs and merges do not take a slot; a freed slot
+    goes to the first Task the dispatcher reaches, with no fairness across
+    Projects.
+- Operator status exposes the SSE relay as `event_relay { running, position,
+  head, last_error, last_error_at }`, and each worker's dead letters as a
+  total plus the five most recent (`id`, item key, event sequence, reason,
+  time). The list does not expire; the degraded-health signal still covers
+  only the last hour. Migrations V202610020859 and V202610021051 add the error
+  kind, per-item retry state and a stable id to the worker tables. Replay and
+  dismiss actions for dead letters are not available yet.
 - Persisted Project environment pause detail, automatic re-check and resume,
   `POST /api/v1/projects/{id}/environment/recheck`, and
   `forge-ctl project env-recheck`. Project cards/list and headers show the
@@ -277,6 +471,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An event that a consumer can never apply no longer blocks every later event
+  for that consumer. Previously a Task outcome for a commitment that had been
+  cancelled was retried forever, and every later outcome for every Agent
+  waited behind it. Now a cancelled commitment needs
+  no outcome; a commitment or inbox delivery that is rejected is recorded as
+  a dead letter on its own while the other commitments and inbox items of the
+  same event are applied; and a rejection at commit time is retried once with
+  fresh data before the event is quarantined.
+- Wake retries: one retry row that keeps failing no longer stops the retries
+  behind it. Database-busy failures back off without counting against the
+  row, rows that are still waiting are skipped in the query, and a row that
+  exhausts its attempts ends with a `wake_retry_failed` disposition and a
+  dead letter. Resolving the "decision recorded" Attention item now commits
+  with the wake's admission instead of after it.
 - Token and cost figures for embedded Agents were too high. Each chat turn
   recorded its own provider calls and, again, every earlier call of the same
   chat session, so a chat of `n` single-call turns was counted as

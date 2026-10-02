@@ -128,6 +128,14 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     LifecycleHookDef::export().expect("export LifecycleHookDef");
     ProjectSettings::export().expect("export ProjectSettings");
     ProjectEnvironment::export().expect("export ProjectEnvironment");
+    TaskPlacementDiagnostic::export().expect("export TaskPlacementDiagnostic");
+    MachineIdentity::export().expect("export MachineIdentity");
+    EnvironmentPauseResponse::export().expect("export EnvironmentPauseResponse");
+    EnvironmentReadinessStatus::export().expect("export EnvironmentReadinessStatus");
+    EnvironmentCheckFailure::export().expect("export EnvironmentCheckFailure");
+    ProjectEnvironmentReadiness::export().expect("export ProjectEnvironmentReadiness");
+    MachineEnvironmentRecheckResult::export().expect("export MachineEnvironmentRecheckResult");
+    AgentRunnableOn::export().expect("export AgentRunnableOn");
     ProjectEnvironmentPause::export().expect("export ProjectEnvironmentPause");
     ProjectEnvironmentCheckResult::export().expect("export ProjectEnvironmentCheckResult");
     ProjectEnvironmentRecheckRequest::export().expect("export ProjectEnvironmentRecheckRequest");
@@ -403,6 +411,8 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ReorderSubtasksRequest::export().expect("export ReorderSubtasksRequest");
     OperatorSeverity::export().expect("export OperatorSeverity");
     OperatorStatusResponse::export().expect("export OperatorStatusResponse");
+    EventRelayStatus::export().expect("export EventRelayStatus");
+    WorkerDeadLetterSummary::export().expect("export WorkerDeadLetterSummary");
     ActiveExecutionSummary::export().expect("export ActiveExecutionSummary");
     BlockedTaskSummary::export().expect("export BlockedTaskSummary");
     DaemonIssueSummary::export().expect("export DaemonIssueSummary");

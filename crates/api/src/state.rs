@@ -32,6 +32,8 @@ pub struct AppState {
     pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
     /// Shared incremental usage index for Operations and Agent reads.
     pub usage_ledger_index: Arc<services::usage_projection::UsageLedgerIndex>,
+    /// Display-only Project slot counts. Never shared with admission services.
+    pub project_slots_memo: Arc<crate::project_slots::ProjectSlotsMemo>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
@@ -188,6 +190,7 @@ impl AppState {
             pricing_repository: Arc::clone(&runtime.pricing_repository),
             models_dev_client: Arc::clone(&runtime.models_dev_client),
             usage_ledger_index: runtime.operator_status_service.usage_ledger_index(),
+            project_slots_memo: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
             workspace_backend_router: Arc::clone(&runtime.workspace_backend_router),
             agent_service: Arc::clone(&runtime.agent_service),
@@ -243,6 +246,11 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.db.server_run_cap.set(
+            config.server.max_concurrent_runs,
+            config::resolved_run_cap(config.server.max_concurrent_runs),
+            &config::embedded_machine_id(),
+        );
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service

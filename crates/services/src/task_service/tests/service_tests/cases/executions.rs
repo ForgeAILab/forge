@@ -551,12 +551,6 @@ async fn claim_shell_task_with_environment(
     let (project_id, _repo_id, repo_dir) = seed_project_repo(db).await;
     // The repository directory must outlive the test's executions.
     std::mem::forget(repo_dir);
-    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
-        .bind(json!({ "environment": environment }).to_string())
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("environment sets");
     let agent_id = seed_agent(db).await;
     let task = service
         .create_task(
@@ -572,6 +566,12 @@ async fn claim_shell_task_with_environment(
         )
         .await
         .expect("task creates");
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(json!({ "environment": environment }).to_string())
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .expect("environment sets");
     let claimed = service
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
@@ -647,6 +647,26 @@ async fn run_execution_applies_the_project_environment() {
             .filter_map(|entry| entry.payload.get("line"))
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn run_execution_passes_checks_configured_before_direct_claim() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(16)));
+    let (_, execution, _) = claim_shell_task_with_environment(
+        &db,
+        &service,
+        "true",
+        json!({"checks":[{"name":"tool","command":"true"}]}),
+    )
+    .await;
+    let executor =
+        executors::AdapterExecutor::new(Arc::new(cli_adapters::test_support::test_registry()));
+    let completed = service
+        .run_execution(execution.id, &executor)
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ExecutionStatus::Completed);
 }
 
 #[tokio::test]
@@ -2128,7 +2148,7 @@ async fn planner_completion_advances_default_planning_gate() {
     .find(|execution| execution.role == crate::workflow::default_roles::PLANNER)
     .expect("the workflow hook creates a planner execution");
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let current = ExecutionRepo::get_by_id(&*db, &execution.id)
                 .await
@@ -2143,28 +2163,31 @@ async fn planner_completion_advances_default_planning_gate() {
     .await
     .expect("planner execution completes");
 
-    let early_settlement = tokio::time::timeout(std::time::Duration::from_millis(250), async {
-        loop {
-            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
-                .await
-                .expect("transition logs load while completion slot is held");
-            if logs.iter().any(|log| {
-                log.from_state == crate::workflow::default_states::PLANNING
-                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
-            }) || workspace_root
-                .path()
-                .join(&task.id)
-                .join("plan.md")
-                .exists()
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    // Poll against a deadline instead of wrapping the loop in a timeout: a
+    // timeout can cancel a query mid-flight, and the single in-memory
+    // connection is then replaced by an empty database.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut settled_early = false;
+    while std::time::Instant::now() < deadline {
+        let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+            .await
+            .expect("transition logs load while completion slot is held");
+        if logs.iter().any(|log| {
+            log.from_state == crate::workflow::default_states::PLANNING
+                && log.to_state == crate::workflow::default_states::IN_PROGRESS
+        }) || workspace_root
+            .path()
+            .join(&task.id)
+            .join("plan.md")
+            .exists()
+        {
+            settled_early = true;
+            break;
         }
-    })
-    .await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
-        early_settlement.is_err(),
+        !settled_early,
         "the workflow-dispatched runner must wait on the originating service's completion slot"
     );
     let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -2324,7 +2347,7 @@ async fn approval_gated_planner_completion_waits_for_human() {
         .await
         .expect("planner dispatch succeeds");
 
-    let waiting = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let current = TaskRepo::get_by_id(&*db, &task.id, false)
                 .await

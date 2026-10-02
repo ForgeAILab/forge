@@ -240,6 +240,89 @@ ETags get explicit skip reasons. Other errors are counted by status, including
 transport failures as status `0`; they do not abort a scenario. Error timings
 must not be mistaken for speedups.
 
+### Project slot read projection
+
+Project GET and list responses share an API-state memo capped at 256 Projects.
+Each entry contains counts and `(list_revision, version)`, read with the existing
+Project row. A hit runs no slot statement. Missing entries on a list page use
+one grouped statement, regardless of the number of Projects. Unlimited Projects
+(`max_active_tasks = 0`) need no slot statement and retain zero counts. The
+dispatcher continues to call the original, uncached `load_project_slots`.
+The revision column is selected only by the Project GET/list read projections;
+general Project repository reads retain their original columns and model.
+Mutation responses continue to read uncached counts.
+
+The grouped statement returns its observed Project revisions with its counts.
+If a write committed between the Project row read and that statement, the API
+does not memoize the result under the earlier key. Hits describe the snapshot
+observed by the Project row read; they do not promise to include writes committed
+after that read. The mutex protects only in-memory lookup/insertion and is never
+held across SQL. The fixed cap also bounds entries left by deleted Projects.
+
+| Slot input | What invalidates the memo |
+| --- | --- |
+| Task existence, Project membership, status (roots and subtasks) | V202610011636 Task insert/delete/update triggers bump `list_revision` for the old/new Project |
+| Parent/child links and child deletion, including settled or archived children in the child-existence probe | The same Task triggers cover same-Project links; V202610020410 also bumps an external parent's Project on child insert/delete/reparent/move/soft-delete |
+| Task visibility: `archived_at`, `deleted_at` | Task update trigger bumps `list_revision` |
+| Holds: non-null `blocked_json`, `failed_json`, blocking `error_annotation.type` (malformed/nonblocking annotations retain their existing behavior) | Task update trigger bumps `list_revision` |
+| Latest Review's status and ordering (`attempt_number`, `created_at`, `id`), Review-to-Task relation | Review insert/delete/update triggers bump `list_revision`; IDs are immutable in application writes and `(task_id, attempt_number)` is unique, so the ID tie-break cannot select a different Review |
+| Existence of a running Execution for a coordination root, Execution-to-Task relation | Execution insert/delete/update triggers bump `list_revision` on status or Task changes; running heartbeats do not change these inputs |
+| Project workflow state names/kinds, canonical phase, effective reviewer/auditor role, `run_merge` entry hooks, custom states inherited by subtasks | Workflow-definition trigger bumps `list_revision`; versioned workflow updates also move `version` |
+| Built-in default workflow, inherited subtask workflow, blocking annotation kind list and resolver rules | Constants in the binary; process restart creates an empty memo |
+| `settings.max_active_tasks`, including unlimited capacity | All production settings mutation paths increment Project `version` (`update_at_version`, review-config command, execution-setup command); no new settings trigger is needed |
+| Project pause/environment-pause flags; Task metadata, per-Task state config, assignments and priorities | Not read by the slot SQL (including `entry_barrier_json`); normal version/revision changes can conservatively invalidate, but these fields do not alter the counts |
+
+Project/Task identities are immutable application-generated UUIDs. Execution
+lease deadlines, deferred-dispatch times and Agent pause flags are not inputs:
+this projection reads execution status and Task state/holds, not wall-clock time.
+The production settings setters above increment `version` in the same guarded
+transaction as the settings update. Task/Review/Execution revision triggers and
+the parent-link triggers likewise commit atomically with their source changes.
+
+For authenticated Project GETs, the response path has one Project SELECT plus
+zero slot statements on a memo hit, or one slot statement on a bounded miss
+(previously one on every bounded GET). For a list page without `include_total`,
+there is one Project SELECT plus zero slot statements on all hits, or one grouped
+slot statement for any bounded misses (previously N slot statements for N bounded
+Projects). `include_total=true` adds the unchanged count statement.
+
+The runner includes `project list limit=100`. Fixture generation 2 has two
+Projects: the heavy Project and the small deferred-dispatch Project. Ten warmups
+mean the measured GET/list requests exercise memo hits. The multi-Project slot
+test covers different workflows, inherited/custom kinds, over 200 queued Tasks,
+empty/unlimited Projects and cross-Project child links. Existing slot scenarios
+also compare the batch to the original single-Project function. API memo tests
+mutate each changing input and use a database with no schema to prove that hits
+cannot issue SQL. The batch implementation has exactly one `fetch_all` outside
+the Project loop; the Project list route calls it once for all page misses and
+constructs responses without additional slot reads.
+
+Local validation on 2026-10-02 used macOS 27 / ARM64 release binaries and the
+unchanged generation-2 heavy fixture. Reports are under
+`/Volumes/Data/tmp/perf/heavy/`:
+
+| Build/report | Project GET p50 ms | Project list p50 ms |
+| --- | ---: | ---: |
+| v0.13.12, `final-v0.13.12.json` | 0.144 | Not measured |
+| 5db8ea0b, `final-next.json` | 0.246 | Not measured |
+| v0.13.12 with the list scenario, `slots-baseline-v0.13.12.json` | 0.147 | 0.149 |
+| 5db8ea0b with the list scenario, `slots-baseline-next-repeat.json` | 0.247 | 0.329 |
+| Final 5db8ea0b control, `slots-baseline-next-final.json` | 0.249 | 0.326 |
+| Final implementation, `slots.json` | 0.144 | 0.132 |
+| Final implementation repeat, `slots-scoped-repeat.json` | 0.139 | 0.153 |
+
+Both final implementation runs returned no request errors, preserved the fixture
+digests, and changed no tracked fixture tables during idle or through the GETs.
+The focused Rust checks covered eight slot tests and four memo tests; the added
+Python test checks the new Project list scenario. Full suites remain CI work.
+Other scenario timings varied across runs, so the Project timing improvement
+does not by itself establish a complete no-regression result. Process CPU/RSS
+measurements were unavailable because the sandbox denied `ps`.
+For example, Task relations measured 0.232 ms in the final implementation repeat
+versus 0.200 ms in the final baseline control. The full no-regression acceptance
+criterion remains unconfirmed; investigate that comparison in an isolated
+benchmark window without widening this change into the unrelated routes.
+
 Interpret the nearest-rank p50/p95 and minimum as local request latency, and
 response bytes as decoded HTTP body bytes. Status counts and `share_304` show
 whether the comparison returned full responses or cache validations. `b/a`
@@ -412,6 +495,37 @@ aggregation never does so during ordinary deltas. Other Operations diagnostics
 and `active_execution_count` remain live. Empty source breakdowns retain their
 single-acquisition fast path.
 
+Both Agent collection routes use one shared response builder. It combines the
+incremental usage/statistics reads and grouped assignments with the page-wide
+`runnable_on_for_agents` projection. Effective status also batches credential
+and connection health, CLI policies and live reservations; running counts come
+from the index. Reservation expiry and the distinction between ready placements
+and held slots match admission's scalar capacity calculation. The
+`environment_surface_lists` regression compares complete warm requests at one
+and twenty CLI/native Agents and checks the component statements, so adding a
+per-Agent read to either list fails the test.
+
+After merging `next/v0.14` at `7b913b25` into the usage branch, the complete
+warm-request statement counts were identical at exactly one and twenty Agents:
+
+| Backend | Agents list, 1 / 20 | Project Agents list, 1 / 20 |
+| --- | ---: | ---: |
+| CLI | 8 / 8 | 9 / 9 |
+| Native | 9 / 9 | 10 / 10 |
+
+Each includes two constant usage/statistics header probes, one grouped
+assignment statement, three effective-status statements and page-wide runnable
+facts. Project membership adds one statement. Native runnable health adds one
+statement. Counts and scalar-response comparisons are recorded in
+`/Volumes/Data/tmp/usage-merge/test-api-environment_surface_lists-final.log`.
+
+The merge benchmark also exposed unused CLI availability probes for paused
+Agents in the new runnable projection. The heavy fixture pauses all seven
+default Agents; probing installed CLIs still cost about 0.6–0.7 seconds per
+page although every runnable result was necessarily empty. Paused identities
+now skip those probes. A counted-adapter regression verifies zero probes for a
+paused page and one probe when an Agent of that executor family becomes active.
+
 Correctness validation includes the original three deterministic 360-step
 repository mutation sequences and six expanded seeds read after random batches
 of one to eight changes. Operations, individual/batched Agent aggregates, running
@@ -548,7 +662,7 @@ The same over-bound fixture on base `5db8ea0b`:
 
 Base outputs: `bench3-base-reported55-{1,4}.json`. The over-bound new build improves p50/p95 and cold latency on all three reads and both client counts. It retains zero index summaries: 232.4 MiB is the rejected minimum allocation, not allocated memory. The response memo keeps idle reads constant; source batches keep active RSS below 80 MiB in these runs.
 
-All 28 projection tests pass. Pure fold uses 3,000 deterministic seeds; repository differential tests cover all surfaces, legacy shapes, batched changes, deletion, timestamps/ownership, running counts and cold/warm equality. Cancellation tests cover every poll boundary through completion for event/reprice deltas. All 18 final-source mutations compiled and were caught by repository tests; results are `/Volumes/Data/tmp/usage-fixes/mutations-final/results.json` and `mutations-ultimate.log`. Clippy (warnings denied), formatting for db/services/api, the release build, and named DB/pricing/Operations/API-Agent tests pass.
+All 28 projection tests pass. Pure fold uses 3,000 deterministic seeds; repository differential tests cover all surfaces, legacy shapes, batched changes, deletion, timestamps/ownership, running counts and cold/warm equality. Cancellation tests cover every poll boundary through completion for event/reprice deltas. All 18 final-source mutations compiled and were caught by repository tests; results are `/Volumes/Data/tmp/usage-fixes/mutations-final-results.json` and `mutations-ultimate.log`. Clippy (warnings denied), formatting for db/services/api, the release build, and named DB/pricing/Operations/API-Agent tests pass.
 
 The standard runner also completed all 40 scenarios without errors on the final
 release binary: `/Volumes/Data/tmp/perf/heavy/usage5.json` and the repeat
@@ -567,3 +681,22 @@ Operations, 27.649 ms for Agents and 32.691 ms for Project Agents at 20×.
 Those tails remain visible in the table; this measurement does not establish
 flat concurrent p95. Over-bound active reads intentionally use the bounded
 fresh fallback, while idle reads retain the constant-cost response memo.
+
+### Merge confirmation, `7b913b25`, 2026-10-02
+
+The final release tree includes the Project slot memo, runtime worker/relay diagnostics, machine caps and page-wide runnable facts. Sequential measurements use 50 idle and 50 active reads per route, rotating appended events with an old-event reprice every 50 writes. Fixtures are copied, and source hashes are unchanged. Timings are milliseconds; no concurrent matrix was repeated.
+
+| History | Route | Previous idle p50 | Merged idle p50 / p95 | Previous active p50 | Merged active p50 / p95 | Merged cold |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1× | operations status | 0.680 | 1.603 / 2.261 | 1.147 | 1.615 / 2.275 | 46.211 |
+| 1× | agents | 0.450 | 0.588 / 0.660 | 0.724 | 0.815 / 1.197 | 38.719 |
+| 1× | project agents | 0.510 | 0.592 / 0.745 | 0.626 | 0.845 / 1.428 | 38.054 |
+| 20× | operations status | 0.670 | 1.423 / 1.844 | 1.150 | 1.643 / 2.473 | 824.631 |
+| 20× | agents | 0.457 | 0.570 / 0.661 | 0.588 | 0.741 / 1.050 | 839.236 |
+| 20× | project agents | 0.476 | 0.792 / 1.211 | 0.594 | 1.013 / 1.514 | 897.176 |
+
+The merge preserves constant statement counts and removes the paused-CLI probe regression. Absolute Operations latency is higher than the usage-only branch; the merged route also reports live worker, relay and machine-capacity sections. Both history sizes remain in low single digits, and both Agent routes remain below 2 ms. The measurements do not establish identical absolute timing to the earlier branch.
+
+Final outputs: `/Volumes/Data/tmp/usage-merge/bench-reported1.json` and `bench-reported20.json`; commands are in `benchmark-commands.json`. Complete verification logs and exit/pass/failure records are in `verification-all.json`. All requested Rust modules/targets, type export, TypeScript checking, workspace clippy and formatting passed. The additional environment regression module passed three tests. No Rust test reported FAILED.
+
+`pnpm typecheck` unexpectedly invoked automatic dependency installation, contrary to the requested no-install constraint; the first attempt was interrupted, but the later invocation completed installation and typecheck. This deviation is recorded in `typecheck-note.log` and `web-typecheck.log`. Type generation introduced no additional tracked web diff.

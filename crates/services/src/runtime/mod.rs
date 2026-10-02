@@ -139,7 +139,7 @@ impl RuntimeWorker {
             Self::Coordination => Some(crate::coordination_consumer_name()),
             Self::Attention => Some(crate::attention_service::attention_consumer_name()),
             Self::WakeDelivery => Some(crate::wake_turn_consumer_name()),
-            Self::DomainEventBroadcast => Some(crate::domain_event_broadcast_consumer_name()),
+            Self::DomainEventBroadcast => None, // Read-only tail, no durable checkpoint/lag.
             _ => None,
         }
     }
@@ -267,6 +267,11 @@ impl ForgeRuntime {
     /// after constructing a compatibility AppState.  New callers should pass
     /// the final config to the builder up front.
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.db.server_run_cap.set(
+            config.server.max_concurrent_runs,
+            config::resolved_run_cap(config.server.max_concurrent_runs),
+            &config::embedded_machine_id(),
+        );
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
         self.embedded_agent_service
@@ -556,6 +561,11 @@ impl ForgeRuntimeBuilder {
             ))
         });
         let effective_config = self.config;
+        self.db.server_run_cap.set(
+            effective_config.server.max_concurrent_runs,
+            config::resolved_run_cap(effective_config.server.max_concurrent_runs),
+            &config::embedded_machine_id(),
+        );
         let pricing_repository = Arc::new(crate::pricing_db::SqlitePricingRepository::new(
             Arc::clone(&self.db),
         ));
@@ -729,25 +739,19 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
         ));
-        let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(
-            Arc::clone(&self.db),
-            crate::memory_consumer_lease_owner(),
-        ));
-        let coordination_consumer = Arc::new(CoordinationOutcomeConsumer::new(
-            Arc::clone(&self.db),
-            crate::coordination_consumer_lease_owner(),
-        ));
+        let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(Arc::clone(&self.db)));
+        let coordination_consumer =
+            Arc::new(CoordinationOutcomeConsumer::new(Arc::clone(&self.db)));
         let attention_projection = Arc::new(
             AttentionService::new(Arc::clone(&self.db)).with_event_bus(Arc::clone(&self.event_bus)),
         );
-        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(
-            Arc::clone(&self.db),
-            crate::wake_turn_consumer_lease_owner(),
-        ));
+        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
         let domain_event_broadcast = Arc::new(DomainEventBroadcastConsumer::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
+            None,
         ));
+        operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
@@ -1158,7 +1162,7 @@ mod tests {
                     .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
             }
             let status = service.compute_status().await.unwrap();
-            assert_eq!(status.event_consumers.len(), 4);
+            assert_eq!(status.event_consumers.len(), 3);
             assert!(status
                 .event_consumers
                 .iter()
@@ -1195,7 +1199,7 @@ mod tests {
             .compute_status()
             .await
             .unwrap();
-        assert_eq!(monitored.event_consumers.len(), 5);
+        assert_eq!(monitored.event_consumers.len(), 4);
         assert_eq!(supervisor.start().await.expect("second start is no-op"), 0);
         supervisor.shutdown().await.expect("runtime shuts down");
         assert_eq!(supervisor.worker_handle_count(), 0);

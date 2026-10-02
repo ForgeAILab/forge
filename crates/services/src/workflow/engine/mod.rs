@@ -212,8 +212,9 @@ async fn annotate_dispatch_failure_details(
                 && serde_json::from_str::<serde_json::Value>(raw)
                     .ok()
                     .is_some_and(|value| {
-                        value["message"] == message
-                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED
+                        (value["message"] == message
+                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED)
+                            || (value["state"] == state && value["code"] == "placement_unavailable")
                     })
             {
                 return Ok(());
@@ -1936,16 +1937,6 @@ impl WorkflowEngine {
                 };
             drop(cleanup_guard);
 
-            // The authoritative event was committed with the task mutation.
-            // Fetching by the transition-log/event id also makes replayed board
-            // moves publish at most the already-committed event.
-            if let Some(event) = DomainEventRepo::get_event(&*self.db, &transition_log.id).await? {
-                crate::DomainEventService::new(
-                    Arc::clone(&self.db),
-                    Arc::clone(&self.event_bus),
-                )
-                .publish_committed(&event);
-            }
             let should_defer_dispatch = defer_dispatch_until.is_some()
                 && to_state.kind != StateKind::Active
                 && to_state
@@ -2717,6 +2708,7 @@ impl WorkflowEngine {
                 }
             }
 
+            crate::deferred_dispatch::finish_machine_wait(&self.db, &mut task, version).await?;
             let review = latest_review(&self.db, &task.id).await?;
 
             Ok(TransitionResult {

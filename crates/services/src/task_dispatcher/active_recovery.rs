@@ -68,6 +68,7 @@ impl TaskDispatcher {
             }
             let task_id = task.id.clone();
             let result: Result<()> = async {
+                task = self.task_service.refresh_placement_dispatch_refusal(task.clone()).await?;
                 if self.task_service.expire_owner_wait(&task).await? {
                     return Ok(());
                 }
@@ -113,7 +114,7 @@ impl TaskDispatcher {
                     return Ok(());
                 }
                 task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                    &self.db, &task,
+                    &self.db, &self.task_service.workspace_backend_router(), &task,
                 )
                 .await
                 {
@@ -219,11 +220,11 @@ impl TaskDispatcher {
                 };
                 if effective_role(state) == Some(crate::workflow::default_roles::REVIEWER) {
                     match self.recover_failed_review(&task).await {
-                        Ok(true) => {
-                            dispatched += 1;
+                        Ok(Some(dispatched_recovery)) => {
+                            dispatched += u64::from(dispatched_recovery);
                             return Ok(());
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(ServiceError::Db(DbError::VersionConflict)) => {
                             tracing::debug!(task_id = %task.id, "failed review recovery lost version race");
                             return Ok(());
@@ -382,6 +383,7 @@ impl TaskDispatcher {
                         }
                     }
                     Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                        if self.task_service.record_placement_dispatch_refusal(&task, &error).await? { return Ok(()); }
                         deferred_dispatch::record_dispatch_disposition(
                             &self.db,
                             &task,
@@ -425,7 +427,7 @@ impl TaskDispatcher {
         Ok(dispatched)
     }
 
-    pub(super) async fn recover_failed_review(&self, task: &Task) -> Result<bool> {
+    pub(super) async fn recover_failed_review(&self, task: &Task) -> Result<Option<bool>> {
         if helpers::has_blocking_annotation(task)
             || task.error_annotation.is_some()
             || helpers::awaiting_human(task)
@@ -434,42 +436,42 @@ impl TaskDispatcher {
                 .await?
                 .is_empty()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
         let Some(review) = reviews
             .into_iter()
             .max_by_key(|review| review.attempt_number)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if review.status != db::ReviewStatus::Failed {
-            return Ok(false);
+            return Ok(None);
         }
         let transitions = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
         let Some(entry) = transitions
             .last()
             .filter(|entry| entry.to_state == task.status)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         // User routing is a deliberate management action. Never reinterpret
         // a parked human review, or a verdict from a previous state entry.
         if entry.triggered_by.starts_with("user:") {
-            return Ok(false);
+            return Ok(None);
         }
         let (Ok(entered_at), Ok(started_at), Ok(failed_at)) = (
             chrono::DateTime::parse_from_rfc3339(&entry.created_at),
             chrono::DateTime::parse_from_rfc3339(&review.started_at),
             chrono::DateTime::parse_from_rfc3339(&review.updated_at),
         ) else {
-            return Ok(false);
+            return Ok(None);
         };
         if started_at < entered_at
             || chrono::Utc::now().signed_duration_since(failed_at)
                 < Self::FAILED_REVIEW_RECOVERY_GRACE
         {
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(raw_barrier) = task.entry_barrier_json.as_deref() {
             let barrier: serde_json::Value = serde_json::from_str(raw_barrier)
@@ -480,15 +482,40 @@ impl TaskDispatcher {
                 .and_then(serde_json::Value::as_str)
                 .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
             else {
-                return Ok(false);
+                return Ok(None);
             };
             if barrier_started_at > started_at {
                 // A newer entry retry has not produced its own verdict yet.
-                return Ok(false);
+                return Ok(None);
+            }
+        }
+        let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
+        let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
+            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+        if let Some(id) = settings
+            .automatic_recovery
+            .agent_id
+            .as_deref()
+            .filter(|_| settings.automatic_recovery.enabled)
+        {
+            if let Some(agent) = AgentRepo::get_by_id(&*self.db, id).await? {
+                if crate::placement::machine_precheck::wait_before_dispatch(
+                    &self.db,
+                    &self.task_service,
+                    task,
+                    &agent,
+                    Some("coder"),
+                )
+                .await?
+                {
+                    return Ok(Some(false));
+                }
             }
         }
         let Some(_cascade_slot) = self.task_service.claim_completion_cascade(&task.id) else {
-            return Ok(false);
+            return Ok(None);
         };
         // Claim this exact Task snapshot before routing or installing the
         // exhausted-budget annotation. Concurrent recovery loses this CAS.
@@ -512,7 +539,7 @@ impl TaskDispatcher {
             .await?
             .is_empty()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let task = if task.review_passed_at.is_some() {
             TaskRepo::set_review_passed_at_cas(
@@ -535,7 +562,7 @@ impl TaskDispatcher {
         self.task_service
             .reconcile_settled_reviewer_completion(&task, &execution, &review, false)
             .await?;
-        Ok(true)
+        Ok(Some(true))
     }
 
     async fn recover_merge_gate(
@@ -768,12 +795,15 @@ impl TaskDispatcher {
             .iter()
             .find(|state| state.name == task.status)
         else {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         };
         if !matches!(state.kind, StateKind::Active | StateKind::Gate) {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if self.is_stopped() {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if !state
@@ -782,15 +812,19 @@ impl TaskDispatcher {
             .iter()
             .any(|hook| hook.action == "dispatch_role_agent")
         {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if helpers::has_blocking_annotation(task) {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if deferred_dispatch::is_pending(task, chrono::Utc::now()) {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         let Some(role_name) = effective_role(state) else {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         };
         // The role already finished and the Task is waiting on a human
@@ -802,6 +836,7 @@ impl TaskDispatcher {
             )
             .await?
         {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if role_name == crate::workflow::default_roles::REVIEWER {
@@ -813,9 +848,11 @@ impl TaskDispatcher {
             && !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
                 .allows_execution(&state.name, role_name)
         {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if !crate::task_hierarchy::subtask_dispatch_ready(&self.db, task).await? {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         let reviewer_reconciliation = if role_name == crate::workflow::default_roles::REVIEWER {
@@ -830,6 +867,7 @@ impl TaskDispatcher {
             // blocker, or schedule a deferred retry. Let the next scan work
             // from those committed facts instead of dispatching from this
             // stale Task snapshot.
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
@@ -840,6 +878,7 @@ impl TaskDispatcher {
             if helpers::role_assignment_unassigned(assignment.as_ref()) {
                 let Some(target) = self.resolve_initial_schedule_target(workflow, task).await?
                 else {
+                    crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
                     return Ok(false);
                 };
                 return self.dispatch_initial_task(task, &target).await;
@@ -849,6 +888,7 @@ impl TaskDispatcher {
             && helpers::latest_stopped_execution_blocks_dispatch(&self.db, &task.id, role_name)
                 .await?
         {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         let Some(assignment) =
@@ -856,14 +896,31 @@ impl TaskDispatcher {
                 .await?
                 .map(|resolved| resolved.assignment)
         else {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         };
         if assignment.assignee_type != Some(db::AssigneeKind::Agent) {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         }
         let Some(agent_id) = assignment.assignee_id.as_deref() else {
+            crate::placement::machine_precheck::retire_wait(&self.db, task).await?;
             return Ok(false);
         };
+        let wait_agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id))?;
+        if crate::placement::machine_precheck::wait_before_dispatch(
+            &self.db,
+            &self.task_service,
+            task,
+            &wait_agent,
+            Some(role_name),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
         if helpers::has_running_execution_for_roles(
             &self.db,
             &task.id,
@@ -915,13 +972,7 @@ impl TaskDispatcher {
         ) {
             return Ok(false);
         }
-        if !has_execution_capacity(
-            &self.db,
-            &agent,
-            workspace.as_ref().map(|workspace| workspace.id.as_str()),
-        )
-        .await?
-        {
+        if !has_execution_capacity(&self.db, &agent).await? {
             return Ok(false);
         }
         if deferred_dispatch::pending_until(task).is_some() {
@@ -941,16 +992,18 @@ impl TaskDispatcher {
             self.ensure_review_attempt_for_recovery(project, task, &state.name)
                 .await?;
         }
-        let dispatch_ctx = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &state.name,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            workflow,
-        )
-        .await?;
+        let dispatch_ctx =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.task_service.workspace_backend_router(),
+                task_id: &task.id,
+                role: role_name,
+                state_name: &state.name,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
         let (prompt, selection) =
             build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
         let reviewer_snapshot = if role_name == crate::workflow::default_roles::REVIEWER {

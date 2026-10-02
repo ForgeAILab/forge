@@ -172,6 +172,16 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 
+Agent responses include `runnable_on: {count, machines?}`. Admins receive
+`machines`, an array of `{id, name, owner_kind, daemon_id, runtime_id}`; other
+users receive only `count`. The server host has `id: "server"`, name "Server
+host", and null daemon/runtime IDs. Daemon machines use their runtime ID as
+`id` and hostname as `name`. These are executor-fit facts: installed,
+authenticated and enabled on a reachable owner, restricted by an explicit pin.
+They do not guarantee repository/environment fit or free capacity.
+`daemon_id` remains admin-only (null for other users). Only admins may set or
+clear the pin; PATCH with `{"version": <version>, "daemon_id": null}` clears it.
+
 Agent daemon pins (`daemon_id`) are admin-only in both the account Agent list
 and `GET /api/v1/projects/{id}/agents`; non-admin responses return `null`.
 
@@ -185,12 +195,15 @@ ratio:
 
 `max_concurrent_tasks` is an execution cap, not an assignment or chat-turn
 cap: an assigned Task with no Running execution consumes no Task slot, and Main
-or Project Agent chat turns do not consume Task quota. Independently, a daemon
-may advertise a positive session cap in `labels_json` under
-`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
-`max_concurrent_tasks` key. That daemon cap counts its Running Task executions
-plus leased/running Agent Chat turns. Both caps are rechecked in the same
-`BEGIN IMMEDIATE` transaction that inserts a Running execution; read-side
+or Project Agent chat turns do not consume Task quota. Independently, each machine limits concurrent runs:
+`server.max_concurrent_runs` on the server host, or the daemon's typed
+`max_concurrent_runs` constrained by its administrator `run_limit`. Unset local
+configuration computes half the logical cores with a minimum of 2; zero means
+unlimited. Labels do not configure caps. Machine occupancy counts Running Task
+executions, reservations without a Running execution, and leased/running Agent
+Chat turns. The embedded daemon and direct server execution share one machine.
+Both Agent and machine caps are rechecked in the same `BEGIN IMMEDIATE`
+transaction that inserts a Running execution; read-side
 `effective_status` and capacity checks are advisory only. The same boundary
 also rejects an identity that became paused or selected a newer profile after
 dispatch preflight. Profile replacement covers daemon, provider, and executor
@@ -198,10 +211,13 @@ configuration reassignment even when the numeric task cap is unchanged.
 
 `status` is the identity's visible activity state: a persisted `idle` identity
 projects `busy` while `running_execution_count > 0`. `effective_status` remains
-the scheduling/availability projection (including capacity, pause, daemon, and
+the scheduling/availability projection (including the Agent's task quota, pause, daemon, and
 credential health), so it may be `active` below the concurrency cap while
-`status` is `busy`.
+`status` is `busy`. A full machine does not make `effective_status` busy: machine
+capacity is a placement wait, independent of Agent availability.
 
+| GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap applies live |
+| PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -789,13 +805,14 @@ Entries carry actor, canonical scope, operation, input digest, policy result,
 status, correlation id, optional committed outcome, and occurrence time. The
 projection never returns an action payload body.
 
-The `consumer_health` projection flushes successful progress at an event boundary
-after five seconds or 100 events, with immediate writes on errors. Batch release
-flushes remaining progress and clears any published lease. New batch owners and
-lease renewals are buffered; empty polls write at most once every five seconds.
-Its processed-event counter is diagnostic and can lose up to 99 buffered increments on a crash;
-durable delivery cursors and receipts remain authoritative. `stale` continues
-to mean more than 90 seconds since the last successfully processed event.
+The Attention `consumer_health` view reads `worker_health` and live checkpoint lag.
+`processed_events` is removed. `stale` means subscribed events are pending and
+both the oldest pending event and checkpoint/initialization progress are older
+than 90 seconds; caught-up idle and newly initialized consumers are not stale.
+`last_error_code` now reports the worker kind (`failure`, `transient`, `terminal`)
+and `last_error_message` supplies its bounded diagnostic. Recent quarantine
+records remain visible for the same one-hour window as operator issues.
+Read-only idle polls write no heartbeat.
 
 Without `project_id`, authorized account/Main activity and all visible Project
 activity are included. Account/Main Chat entries are visible only to the
@@ -1122,19 +1139,20 @@ private plan path. `$FORGE_PLAN_PATH` is the supported
 plan-write contract for CLI agents. Managed Codex cannot write the surrounding
 Task directory; a CLI adapter without an OS sandbox may still have ambient
 filesystem ability to edit sibling files, so universal confinement is not
-claimed and direct sibling writes are outside this contract. The file broker
-also has the existing managed-daemon filesystem constraint: the API server and
-execution host must see the Task directory at the same absolute path through a
-shared workspace mount. Forge does not yet sync plan files to a daemon on a
-separate filesystem.
+claimed and direct sibling writes are outside this contract. Server-owned workspaces use the local file broker, including verified shared
+mounts. Daemon-owned workspaces resolve the canonical plan through their owner,
+send the seed in `execution.start.plan_text`, and return the private candidate
+in `execution.terminal.plan_text`; the server never opens the daemon's path.
+There is no workspace filesystem sync.
 
 When the execution ends — before it settles and before the next role is
 dispatched — Forge validates each report entry exactly as the native operations
 do and stores it with provenance taken from the execution row (never from the
-files). For either the native `task.plan` path or the CLI outbox path, Forge
-validates the plan candidate and freezes the exact bytes in host-owned staging
-before terminal settlement. Later outbox changes cannot alter that frozen
-candidate. A durable compare-and-swap claim tied to the execution, Task state
+files). For server-owned native and CLI execution, Forge validates the plan
+candidate and freezes the exact bytes in host-owned staging before terminal
+settlement. For daemon-owned CLI execution, the daemon validates and freezes
+those bytes in its terminal journal, and the server retains them in the winning
+terminal execution snapshot. Later outbox changes cannot alter either candidate. A durable compare-and-swap claim tied to the execution, Task state
 entry, and Project version then controls whether it may replace the canonical
 Task `plan.md`. On Unix, publication uses an atomic same-directory rename and
 Forge rejects candidates with additional hard links; on other platforms it
@@ -1142,8 +1160,9 @@ uses the portable replacement fallback and does not promise those two Unix
 properties. Neither agent interface publishes the canonical file directly.
 Stale, failed, cancelled, reviewer, symlinked, non-regular, oversized, or
 invalid UTF-8 candidates cannot replace it. A rejected plan remains in that
-execution's outbox for diagnosis; after successful staging and report
-ingestion, Forge removes the agent-writable outbox before settlement. Captured
+execution's outbox for diagnosis. Server-owned ingestion removes the writable
+outbox after successful staging; daemon-owned publication retains its rollback
+snapshot and cleans the outbox through the owner after workflow settlement. Captured
 artifact captions become `validation` worklog entries. Malformed report entries
 are skipped and logged, never fatal; each report file is bounded to 1 MiB and
 200 entries.
@@ -1212,8 +1231,8 @@ budgets, optimistic versions, and idempotency keys make retries observable
 and prevent duplicate assistant messages. A missing assistant message with a
 non-success turn is never rendered as a completed exchange.
 
-The durable wake consumer records exactly one disposition for every claimed
-wake: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
+The durable wake consumer records exactly one current disposition for each
+subscribed wake event: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
 `setup_required`. Those dispositions are delivery provenance, not a separate
 REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
@@ -2033,6 +2052,50 @@ UsageBreakdown[]` when usage is exposed; the MCP chat timeline uses that same
 typed response. MCP adds no pricing-refresh, binding/override, or
 retrospective mutation tool in this change.
 
+## Forge Settings
+
+`GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
+The response lists `value`, `effective_value` and `restart_required` per key.
+Other keys retain their startup value until restart.
+
+| Key | Configured value | Application |
+| --- | --- | --- |
+| `forge.data_dir` | Data-directory path | Restart |
+| `server.bind` | HTTP bind address | Restart |
+| `server.mcp_enabled` | Boolean | Restart |
+| `server.max_concurrent_runs` | `null`: automatic; `0`: unlimited; positive integer: ceiling | Live |
+| `workspace.root` | Workspace-directory path | Restart |
+| `workspace.cleanup_delay_seconds` | Positive seconds | Restart |
+| `agent.max_concurrent_tasks` | Positive task quota | Restart |
+| `agent.heartbeat_interval_seconds` | Positive seconds | Restart |
+| `agent.max_missed_heartbeats` | Positive count | Restart |
+
+`server.max_concurrent_runs` accepts a non-negative integer or `null`:
+`null` selects automatic half-logical-core capacity (at least 2), `0` selects
+unlimited, and positive values set a ceiling. Omit the field to leave it alone.
+The response setting has `value` for the configured value and `effective_value`
+for the cap in effect (`null` when unlimited), with `restart_required: false`.
+Updates apply to the next placement admission after the YAML write succeeds.
+
+A live update supersedes a CLI or environment override for the running process;
+that override takes effect again at the next restart under the usual precedence.
+
+### Daemon run limits
+
+Daemon registration and periodic report accept optional typed
+`max_concurrent_runs` (non-negative integer); omission/null preserves the last
+recorded cap. Daemon responses expose `max_concurrent_runs` (reported),
+`run_limit` (admin ceiling) and `effective_max_concurrent_runs`. Zero or missing
+reported cap contributes no ceiling. Positive reported and admin ceilings use
+the lower value; `null` effective cap means unlimited. Existing unreported
+old daemons with neither ceiling remain unlimited.
+
+`PATCH /api/v1/daemons/{id}` is administrator-only. Body:
+`{"version": 3, "run_limit": 2}`; `run_limit: null` clears the ceiling.
+Zero, negative and fractional limits are refused. Updates check the current
+row version and increment it; stale versions return HTTP 409. Reports also
+increment that version and cannot overwrite the admin limit.
+
 ## Repository locations
 
 A Repo is always integrated by direct merge. `POST /api/v1/projects/{id}/repos`
@@ -2235,61 +2298,106 @@ ten-minute review at a time:
   no new execution launches while the Project is paused. A user or repository
   pause is never overwritten.
 - `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
-  While environment-paused, Forge automatically re-runs the recorded failing
-  checks in the primary checkout for embedded workspaces, or through the recorded
-  daemon owner in the ready workspace that failed, with the Project `env` and without
-  copying assets. Checks run in background jobs, at most one per Project, so dispatcher
-  ticks and operations refresh do not wait for them. Role-scoped checks that
-  triggered the pause are included. Every check
-  passing clears only the environment pause; Tasks then re-dispatch in their
-  current states. If the recorded workspace is missing or cannot be resolved,
-  or its daemon placement is not ready or its owner is unreachable, re-checks
-  fall back to the primary checkout. Another failure, including a re-check error,
-  updates the output and schedules the next check at the same interval.
-  Checks that depend on worktree assets may pass here and fail at launch,
-  which pauses the Project again. A daemon run-policy denial pauses with a clear
-  `purpose_denied` reason and no automatic re-check. Enable `environment_setup`
-  on that owner and use **Check now**. An asset-copy failure or a pause with no
-  re-runnable check stays paused; its output explains that the owner must fix
-  the environment and resume, or configure a real check.
+  Scheduled checks retry named failures on the machine that failed. Host checks
+  use the primary checkout; daemon checks use only the failure's recorded ready
+  workspace. Unreachable owners retain their readiness facts and reschedule.
+- A failure marks that machine `not_ready`. The Project pauses only when every
+  otherwise eligible connected machine fails the applicable environment checks.
+  A pinned or already placed Task can wait on its machine while other work runs.
+  Passing checks clear matching waits and environment pauses; user and repository
+  pauses are preserved. Assets are still verified at launch.
 
-`ProjectResponse.environment_pause` is `null` when there is no environment
-pause detail. `workspace_id` records the workspace used at failure and is nullable
-for checkout-only checks. Its persisted shape is:
+Project list pages load their readiness records in one bounded statement, then
+resolve daemon names and legacy pause owners in at most one additional statement.
+Response assembly runs in memory; a Project without readiness adds no per-Project
+query. Single-Project responses share the same assembly. Agent list pages load
+`runnable_on` facts once for the page (daemon/runtime names, native health and CLI
+policy), instead of querying per Agent. Profile/session lists return their own
+DTOs and do not compute Agent machine fit per row. Compact Task list items use
+the batched Task list projection and never call the full Task placement-diagnostics
+loader per item.
+
+`ProjectResponse.environment_readiness` is an array available to anyone who can
+read the Project. Projects without checks have no rows (`[]`). Each entry is:
 
 ```json
 {
-  "workspace_id": "<workspace-id>",
+  "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+  "status": "not_ready",
+  "failing_checks": [{"name": "disk", "output_tail": "root free: 7G"}],
+  "output_tail": "disk: root free: 7G",
+  "scope_covered": "full",
+  "checked_at": "2026-10-02T05:30:00Z",
+  "next_check_at": "2026-10-02T05:40:00Z"
+}
+```
+
+Status is `ready`, `not_ready` or `unknown`; times are nullable, `scope_covered`
+is `machine` or `full`, and output tails are bounded and redacted. The row's
+`output_tail` also represents an unnamed launch failure. The settings table
+shows per-machine **Check now**. These are recorded facts; launch preflight
+remains authoritative.
+
+`ProjectResponse.environment_pause` is null without pause detail. Its shape now
+includes the machine (a breaking addition); workspace ID is nullable for a
+checkout-only failure:
+
+```json
+{
+  "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+  "workspace_id": null,
   "checks": ["disk"],
   "role": "coder",
   "output": "disk: exit 1\nroot free: 7G",
-  "paused_at": "2026-09-30T05:30:00Z",
-  "last_checked_at": "2026-09-30T05:30:00Z",
-  "next_check_at": "2026-09-30T05:40:00Z"
+  "paused_at": "2026-10-02T05:30:00Z",
+  "last_checked_at": "2026-10-02T05:30:00Z",
+  "next_check_at": "2026-10-02T05:40:00Z"
 }
 ```
 
-The project list and header show **Environment paused**, the failing checks,
-collapsible output, the relative next check time, and **Check now**.
-`POST /api/v1/projects/{id}/environment/recheck` runs every configured check
-immediately (including role-scoped checks), with no request fields. It returns
-`{checks, project}`: each check has `name`, `passed`, nullable `exit_code`, and
-bounded `output_tail`; `project` is the updated `ProjectResponse`. If
-at least one check runs and all checks pass, an environment pause is cleared. A user or repository pause remains
-in place. If a scheduled or manual re-check is already running for this Project,
-the endpoint returns HTTP 409 immediately. For example:
+`POST /api/v1/projects/{id}/environment/recheck` accepts an empty body or `{}`
+for all targets, or `{"machine": "server"}` / `{"machine": "<runtime-id>"}` for
+one. It runs every configured check regardless of role. Targets are the union
+of readiness records and ready repository locations, including the primary
+host checkout. An unknown runtime selector returns HTTP 404 `machine not found`. Selecting
+`server` without recorded readiness or a ready repository location returns HTTP 404,
+but names the missing Project repository location rather than claiming that the
+server machine does not exist. Authority is unchanged:
+authentication is required; the endpoint has no additional owner/admin gate.
+A concurrent check of a selected machine returns HTTP 409. Projects without
+checks return `machines: []`, without creating rows or clearing a pause.
+
+The breaking response shape is `{machines, project}`:
 
 ```json
 {
-  "checks": [{"name": "disk", "passed": true, "exit_code": 0, "output_tail": "root free: 17G"}],
-  "project": {"id": "<project-id>", "paused": false, "system_pause_reason": null, "environment_pause": null, "...": "other ProjectResponse fields"}
+  "machines": [{
+    "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+    "checks": [{"name": "disk", "passed": true, "exit_code": 0, "output_tail": "root free: 17G"}],
+    "error": null
+  }],
+  "project": {"id": "<project-id>", "paused": false, "system_pause_reason": null, "environment_pause": null, "environment_readiness": [], "...": "other ProjectResponse fields"}
 }
 ```
 
-Manual Project resume also clears the environment pause. If the host is still
-not ready, the next launch pauses it again. Migration V202610010410 clears legacy Task
-`environment_not_ready` blocking annotations so those Tasks re-enter normal
-dispatch; no per-Task recovery is needed.
+A machine that cannot be checked has `checks: []` and a non-null `error`; its
+facts remain unchanged and a failed row's next check is rescheduled. Daemons
+without a recorded ready failure workspace cannot be checked by this build;
+they never receive substitute host results. A successful machine result may
+resume an environment pause; user/repository pauses remain. Empty checks do not
+resume asset-only failures. Manual Project resume clears an environment pause
+and resets failed readiness to unknown for immediate retry.
+
+Task detail responses include `placement_diagnostics`, an array of
+`{machine, filter_codes, failing_checks}`. It projects recorded environment
+waits, pending host probes, machine-capacity waits and the selected placement's
+rejected candidates. `machine` is null when a capacity wait did not record its
+identity. The placement panel displays pending probes as **Checking machine
+Server host…**, environment failures with check names, and machine capacity
+using the same status rows. Complete rejected-candidate identities are not
+persisted for every dispatch refusal; the response does not invent them.
+`placement_unavailable` error details retain `rejected_candidates`, including
+`filter_codes` and `failing_checks`.
 
 `PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
 invalid or reserved, whose asset source is not absolute or whose target
@@ -2721,7 +2829,7 @@ execution is running.
 
 `POST /api/v1/tasks/{id}/recover` returns `200` with the normal `TaskResponse`
 when the recovery can run immediately or its only refusal is agent capacity
-(including a configured daemon session cap). A capacity-bound recovery clears
+(including the machine's effective run cap). A capacity-bound recovery clears
 the blocking annotation and persists the selected action, reason, and context
 for the dispatcher to apply when a slot becomes available. Its
 `workflow_health.kind` is `waiting_for_agent` with label `Retry Queued`.
@@ -3087,19 +3195,33 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | --- | --- |
 | `database.incremental_vacuum` | Whether SQLite `auto_vacuum` is `INCREMENTAL` (mode 2). |
 | `database.free_pages` | SQLite `freelist_count`; pages available for reuse or incremental reclamation. |
-| `event_consumers[]` | Durable consumers belonging to workers started by this process. Missing expected cursors are included with sequence 0; cursors for other workers are omitted. |
+| `event_consumers[]` | The four durable runtime workers started by this process. Missing expected cursors are included with sequence 0; unrelated cursors and the read-only SSE tail are omitted. |
 | `event_consumers[].consumer_name` | Durable consumer identity. |
 | `event_consumers[].last_sequence` | Last checkpointed sequence. |
-| `event_consumers[].lag` | `max(domain_event.sequence) - last_sequence`, clamped to zero for an empty event table. This is sequence distance, so deleted gaps count; it is not a pending-row count. |
-| `event_consumers[].oldest_unprocessed_at` | Earliest creation timestamp among remaining events beyond the cursor, or `null` when caught up. |
+| `event_consumers[].lag` | Live count of pending events beyond the checkpoint matching the subscription in `worker_health`; deleted gaps and ignored types do not count. Attention subscribes to all types and classifies them in its handler. |
+| `event_consumers[].oldest_unprocessed_at` | Creation timestamp of the lowest pending subscribed sequence. Computed live, `null` when caught up. |
 | `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
-| `event_consumers[].stalled` | Remaining unprocessed events exist and the cursor has not advanced for more than `server.event_consumer_stall_seconds` (default 300). For a missing cursor, inactivity starts at the oldest pending event. Idle, caught-up consumers are never stalled. |
+| `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
+| `event_consumers[].dead_letter_count` | Total retained quarantines for that worker, without an age cutoff. |
+| `event_consumers[].recent_dead_letters` | Most recent five retained quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
+
+Dead-letter history remains visible after the one-hour degraded-health window.
+Replay and dismiss actions are not available in this slice. IDs are stable and
+opaque; the stored worker/item key identifies the source for later actions.
+Relay read errors or a stopped/restarting enabled relay raise attention.
 
 A stalled consumer raises `overall_severity` to at least `attention` and appears
 in the existing `recent_errors` operator issue list with `entity_type:
 "event_consumer"`, its consumer name as `entity_id`, and `severity: "attention"`.
-This current alert clears when the cursor recovers. Existing execution failures
+This current alert clears when the cursor recovers. All runtime workers also
+report bounded causes in the existing `recent_errors` list with the same
+consumer identity. Runtime causes clear on the next successful poll cycle,
+including empty cycles; event strikes remain until the event completes or is
+quarantined. Current deferrals include their reason and since-time as an
+informational worker entry, with `attention` when stalled. Quarantined items
+appear separately as `worker_dead_letter` issues for one hour, then expire. Existing execution failures
 still raise `error`; blocked tasks still raise `blocked`. The Operations page
 shows the lag, oldest pending age, stall state, vacuum mode, and free pages and
 uses its existing 30-second status polling to notice a dead consumer.
@@ -3107,6 +3229,12 @@ uses its existing 30-second status polling to notice a dead consumer.
 `POST /api/v1/operations/refresh` retains its existing dispatch-refresh behavior;
 storage maintenance runs only in the background worker or offline conversion
 command.
+
+Operations `daemon_pressure` lists one entry per execution machine, including
+`daemon_id: "server_host"` (the embedded daemon is included in that entry).
+Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
+`null` for unlimited), and `at_capacity`. `agent_pressure` uses
+`active_tasks` and `max_concurrent_tasks` fields for its per-Agent Task cap.
 
 ## Notifications
 
@@ -3713,6 +3841,37 @@ Every committed `domain_event` row is also relayed as a
 "...", "domain_entity_id": "...", "entity_type": "...", "scope_type": "...",
 "scope_id": "..." }`; the frame's own `entity_id` is the domain event id.
 
+The relay is a supervised in-memory tail, not a durable consumer, and is omitted
+from operator `event_consumers`; its own `event_relay` object reports health and position. Plain connections are live-only and do not read
+historical ledger rows. Frame IDs are transport identifiers:
+
+- Durable `domain_event.committed` frames use `id: domain-event:<sequence>`.
+- Bus-only and ordinary `events.resync_required` frames omit the SSE `id` field entirely.
+  They preserve the client's last durable cursor; an empty `id` would reset it.
+- Keep-alive frames are comments and also carry no `id` field.
+- JSON `entity_id` and the other committed-envelope fields retain their meaning.
+
+A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that
+fits SQLite's signed 64-bit sequence range, requests replay after that sequence.
+Missing, entity-shaped, old event-ID-shaped, or malformed IDs produce live-only
+connections. A durable cursor beyond the current ledger head emits one resync
+frame with `reason: "resume cursor beyond ledger head"` and `id: domain-event:<head>` before continuing live. This exception resets a stale cursor so automatic reconnect does not repeat resync forever. No numeric sequence query parameter is introduced.
+
+Resume subscribes to the live bus before capturing a ledger head. If at most
+1,000 rows were missed, it reads them in 100-row pages and emits them in sequence
+order through that snapshot, filtering overlapping durable live frames. Appends
+beyond the snapshot continue live. If more than 1,000 rows were missed, it emits
+exactly one `events.resync_required` frame with `reason: "replay limit exceeded"`,
+emits no replay frames, and continues live. The cap check visits at most 1,001
+sequence keys rather than counting or loading the whole backlog. Ledger-read
+failures also request resync. Bus-only events remain live-only; bus overflow still
+requests resync. The ordered relay is the sole publisher of durable frames, including events
+from standalone appends and composite transactions.
+
+The web client routes `event.data` and does not inspect `lastEventId`; forge-ctl
+also routes JSON payloads rather than frame IDs. MCP's stream is separate from
+`GET /api/v1/events`. Their payload handling is unaffected by the ID namespace.
+
 | Event | Context payload |
 |-------|-----------------|
 | `product_genesis.started` | `{ "operation": "genesis.start", "session_id": "...", "main_chat_id": "...", "source_message_id": "...", "source_turn_id": "...|null", "admitted_turn_id": "..." }` |
@@ -3802,8 +3961,12 @@ Workspace admission errors use HTTP `409`. `placement_unavailable` includes
 candidate names its repository location, owner, daemon/runtime and `filter_codes`.
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
-`agent_capacity`, `daemon_capacity`, `native_backend_unsupported`,
-`run_purpose_denied`, and `not_visible`.
+`agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
+`run_purpose_denied`, `not_visible`, `environment_not_ready`, and
+`environment_probe_pending`. Environment rejections carry applicable check names
+in `failing_checks`. Probe-pending defers dispatcher admission; direct/manual
+claims run the checks at launch. An environment Project pause defers dispatch
+without a `dispatch_failed` annotation.
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
@@ -3821,6 +3984,23 @@ failure cause and open a `workspace_fence_rejected` attention item for inspectio
 A new reservation after `prepare_failed` advances the unprepared placement's
 generation, giving the new prepare attempt a fresh operation ID. Retransmission
 within one attempt keeps its operation ID and replays the owner's retained result.
+
+### Machine capacity at execution start
+
+Each machine counts Running executions, live `reserved` / `preparing` placements
+without a Running execution, and leased/running chat turns. Ready placements and
+expired reservations hold nothing. Admission is rechecked at execution start.
+A start refused only for machine capacity leaves its workspace ready and waits
+visibly, without a failed Execution, blocking annotation, Attention item or
+retry-budget charge. It retries on a later tick when machine and Project room
+are available. A restart between prepare and start reclaims ready work normally.
+
+Capacity waits are parked in both Project slot projections. Plain edits preserve
+that projection until the next dispatch observation. A different refusal or skip
+clears the machine reason; a full Project during un-parking produces a
+`project_capacity` wait. Recovery ticks at a full machine and capacity races
+preserve queued intent without recovery events or a thirty-second retry delay.
+
 Every launch, follow-up, and resume uses reserve → prepare → start admission.
 The start transaction rechecks the prepared placement version and capacity before
 creating the Running Execution and its leases; a stale placement returns 409.
@@ -3861,11 +4041,42 @@ owner preparation result for that exact handle and generation.
 Task, Workspace, and Execution plan-artifact reads use the same owner router as
 dispatch. A daemon workspace handle is never interpreted as a server path.
 
+`execution.start.plan_text: string | null` carries the canonical plan for a
+plan-writing implementation role, falling back to `task.plan`; planners receive no seed. On daemon-owned placements the daemon prepares
+`FORGE_PLAN_PATH` in its own execution outbox. `execution.terminal.plan_text:
+string | null` carries the exact candidate alongside `outbox_entries`, under the
+same report identity, journal, digest, replay, and acknowledgement rules.
+An absent terminal plan field is omitted, preserving retained report payloads
+that contain no plan. Remote plans are limited to 128 KiB; capture failures become explicit failed terminal
+reports. The server stores a successful candidate in private execution artifact storage and publishes through its owner after acquiring the existing publication
+claim. `workspace.reset.operation` supports `publish_plan { execution_id,
+content }`, `restore_plan { execution_id }`, and `discard_plan { execution_id }`.
+These operations retain owner/generation/HEAD fencing and private rollback
+snapshots. They can settle while another CLI turn runs because they affect
+sibling artifacts and the completed execution's private files.
+Candidates are redacted against Project environment values and stored in the
+private `execution_plan_transport` table, never executor configuration snapshots,
+Execution API responses or receipt bodies. Receipts contain only the digest and
+byte length. Empty, checklist-free and unchanged-seed candidates use the ordinary
+workflow guard rejection; oversized candidates fail terminally and are acknowledged.
+Publication failures persist exponential backoff and a visible wait annotation;
+unreachable owners use the durable `runtime_offline` owner wait. Plan operations
+wait behind running owner checks, and discard of missing/cleaned state succeeds.
+
+Plan-writing roles require `execution.plan_transport`; a revision-3 owner that
+omits it is refused at placement with `capability_missing`, before an Execution
+exists. Dispatcher refusals name the machine and missing capability, remain
+quiescent until eligibility changes, and clear automatically when a machine
+becomes eligible. Revision-3 daemons without this capability continue reviewer,
+interactive, server-owned shared-mount, filesystem and PTY work.
+Server-owned and verified shared-mount plan files retain their layout and
+1 MiB size limit.
+
 ### Workspace daemon protocol
 
 Protocol revision 3 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
-Revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Revision-1 and revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
 automatically after the daemon upgrade. Existing placements disconnect
 and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
@@ -3881,7 +4092,7 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.diff` | Read diffs and exact reviewer evidence |
 | `workspace.read` | Read bounded artifacts, Git evidence, and owner-local paths |
 | `workspace.merge` | Direct merge into the verified primary checkout |
-| `workspace.reset` | Reset the workspace or perform typed asset and review-checkout operations |
+| `workspace.reset` | Reset the workspace or perform typed asset, review-checkout, and plan publication/restore/discard operations |
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
@@ -3899,8 +4110,8 @@ descendants retain an output pipe returns bytes read before the two-second drain
 limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
 of size truncation. These booleans default to false when absent.
 
-The single daemon journal retains terminal reports with bounded worklog/evidence
-outbox entries, operation results, and cleanup acknowledgements. Revision 3 uses
+The single daemon journal retains terminal reports with bounded plan/worklog/evidence
+outbox content, operation results, and cleanup acknowledgements. Revision 3 uses
 `journal.ack { entry_id }`. Retained terminal and cleanup results replay after
 reconnect until the server durably records their result and acknowledges it.
 Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt
@@ -4096,7 +4307,8 @@ into a known-tool `result` and do not use the orchestration envelope.
 ## Server-Sent Events
 
 `GET /api/v1/events` streams `ForgeEvent` payloads from the in-memory event
-bus. Useful for the web UI and for long-running scripts that want to react to
+bus. Plain connections are live-only; durable resume IDs and the 1,000-event
+replay cap are described in [SSE events](#sse-events). Useful for the web UI and for long-running scripts that want to react to
 state changes (`task.status_changed`, `task.moved`, `execution.completed`, …) without
 polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
 `daemon.offline` so clients can refresh daemon availability without waiting for
@@ -4529,7 +4741,7 @@ new review attempt. Attempt allocation and the Running reviewer execution/lease
 are one database admission boundary; the selected Task role assignment, Agent
 identity, workflow snapshot, and current candidate execution must still match
 when that boundary commits. Reviewer capacity counts live Running executions,
-with only an explicitly configured daemon session cap added to that check.
+plus the machine's effective run cap.
 The candidate must be a completed implementation execution at the insert
 boundary. Failed or cancelled remediation executions do not displace the last
 completed candidate, but a newer running implementation still fences review

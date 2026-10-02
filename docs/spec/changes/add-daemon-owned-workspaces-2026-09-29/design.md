@@ -219,7 +219,7 @@ cleanup(placement)       -> CleanupAck
   from the server filesystem after the turn (`runner.rs`, the
   `ingest_execution_outbox` call). On a daemon placement the server cannot
   see that directory. The daemon therefore reads the outbox after the CLI
-  exits and embeds the bounded entries in the terminal report. The report
+  exits and embeds the bounded plan candidate, worklog, and evidence entries in the terminal report. The report
   is retained, replayed, and acked as one unit, so evidence and terminal
   status can never arrive separately. The runner ingests entries from the
   report for every placement. The embedded backend fills the same field
@@ -228,11 +228,38 @@ cleanup(placement)       -> CleanupAck
   unchanged. Phase 2 ships only this, and it must be behavior-neutral: the
   existing merge, workspace, and review tests stay green without edits.
 - `DaemonWorkspaceBackend` maps each call to one `workspace.*` RPC.
+- Plans use the same owner routing boundary for reads, publication, rollback,
+  and cleanup. The server sends the start seed in `execution.start.plan_text`;
+  the daemon initializes its own outbox and returns `execution.terminal.plan_text`
+  with the terminal journal record. The terminal CAS freezes the returned text
+  in private execution artifact storage; the existing publication claim authorizes fenced
+  owner operations (`publish_plan`, `restore_plan`, `discard_plan`). The daemon
+  retains a private prior-plan snapshot until workflow settlement, preserving
+  publication and rollback replay. The capability `execution.plan_transport`
+  is required at placement for plan-writing roles; absent support yields
+  `capability_missing`, while older protocol revisions yield
+  `daemon_upgrade_required`. Remote candidates have a 128 KiB byte bound;
+  capture failure fails the execution explicitly. Server-owned and shared-mount
+  plan storage retains the canonical/outbox layout. Both owners use the same
+  implementation-only checklist seed policy; planners never receive a seed.
+  Missing/invalid/unchanged required candidates use the existing workflow guard
+  rejection. Oversized candidates fail terminally and are acknowledged; plan
+  errors never replace failed/cancelled outcomes. Private transported storage is
+  redacted, inaccessible through the Execution API and excluded from config
+  snapshots and receipt bodies (digest/length only).
+  `.forge-plan-staging/` is a Task sibling containing frozen local candidates,
+  previous-plan/absent markers on the server, or per-execution
+  candidate/previous-plan publication snapshots on the daemon. Settlement,
+  abandon cleanup or workspace cleanup removes those execution files.
+  Owner errors persist backoff and a visible wait; disconnection uses the same
+  durable runtime-offline wait. Plan operations wait behind long workspace
+  commands and discard of missing/cleaned state succeeds.
 
 ### D7. Daemon protocol revision 3
 
-- `DAEMON_PROTOCOL_REVISION` becomes 3, and the handshake gains the
-  capability `workspace.v1`. The minimum command revision is 3. Revision-2
+- `DAEMON_PROTOCOL_REVISION` remains 3, and the handshake retains the
+  capability `workspace.v1`. Plan transport adds only the capability
+  `execution.plan_transport`; it does not raise the protocol revision. The minimum command revision is 3. Revision-1 and revision-2
   sockets remain visible for upgrade diagnostics but every command RPC is
   refused, including execution, filesystem browsing, verification, and PTY
   terminals. `daemon_upgrade_required` is a human-action refusal on Task
@@ -241,6 +268,10 @@ cleanup(placement)       -> CleanupAck
   and no capacity-only or transient-only alternative; the accepted upgraded handshake
   clears that refusal and wakes dispatch automatically. Reservation writes no Task
   annotation. A socket awaiting its handshake is not ready, not outdated.
+  A revision-3 daemon without plan transport remains eligible for reviewer,
+  interactive, server-owned shared-mount, filesystem and PTY work. Deterministic
+  capability refusals visibly identify the machine, stay parked without repeated
+  placement attempts, and wake when eligibility facts change.
   Upgrade the server first, then every daemon from the same release.
 - Every mutating request carries `{workspace_handle | placement_id,
   operation_id, generation, expected}`. The daemon records

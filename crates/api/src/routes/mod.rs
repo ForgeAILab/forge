@@ -176,6 +176,26 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
 
 pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
     let slots = services::task_dispatcher::slots::load_project_slots(db, &project).await?;
+    project_response_with_slots(db, project, slots).await
+}
+
+async fn project_response_with_slots(
+    db: &db::SqliteDb,
+    project: Project,
+    slots: api_types::ProjectSlots,
+) -> ApiResult<ProjectResponse> {
+    let mut environment =
+        services::environment_surfaces::project_environments(db, std::slice::from_ref(&project))
+            .await?;
+    let environment = environment.remove(&project.id).expect("requested Project");
+    project_response_from_environment(project, slots, environment)
+}
+
+fn project_response_from_environment(
+    project: Project,
+    slots: api_types::ProjectSlots,
+    environment: services::environment_surfaces::ProjectEnvironmentRead,
+) -> ApiResult<ProjectResponse> {
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")
@@ -187,14 +207,26 @@ pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<
             project.id
         ))
     })?;
-    let environment_pause = project
-        .environment_pause_json
-        .as_deref()
-        .map(serde_json::from_str::<api_types::ProjectEnvironmentPause>)
-        .transpose()
-        .map_err(|error| {
-            ApiError::internal(format!("invalid persisted environment pause: {error}"))
-        })?;
+    let environment_readiness = environment.readiness;
+    let environment_pause = if let Some(raw) = project.environment_pause_json.as_deref() {
+        let detail =
+            serde_json::from_str::<api_types::ProjectEnvironmentPause>(raw).map_err(|error| {
+                ApiError::internal(format!("invalid persisted environment pause: {error}"))
+            })?;
+        let value: Value =
+            serde_json::from_str(raw).map_err(|error| ApiError::internal(error.to_string()))?;
+        if value.get("machine").is_some() {
+            serde_json::from_value::<db::EnvironmentMachine>(value["machine"].clone()).map_err(
+                |error| ApiError::internal(format!("invalid environment pause machine: {error}")),
+            )?;
+        }
+        Some(api_types::EnvironmentPauseResponse {
+            detail,
+            machine: environment.pause_machine.expect("loaded pause owner"),
+        })
+    } else {
+        None
+    };
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
@@ -209,6 +241,7 @@ pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<
         paused_at: project.paused_at.clone(),
         system_pause_reason: project.system_pause_reason,
         environment_pause,
+        environment_readiness,
         slots,
         paused: project.paused_at.is_some(),
         charter_status: project.charter_status,
@@ -420,7 +453,14 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
+    let placement_diagnostics = services::environment_surfaces::task_placement_diagnostics(
+        db,
+        &task,
+        workspace.as_ref().map(|workspace| &workspace.placement),
+    )
+    .await?;
     Ok(TaskResponse {
+        placement_diagnostics,
         id: task.id,
         project_id: task.project_id,
         parent_task_id: task.parent_task_id.clone(),
@@ -952,6 +992,7 @@ pub fn agent_response(
         config_json: redact_sensitive_config(parse_json_value_or_empty_object(agent.config_json)),
         credential_handle_id: agent.credential_ref,
         daemon_id: agent.daemon_id,
+        runnable_on: Default::default(),
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status,
         active_assigned_task_count,
@@ -981,8 +1022,17 @@ fn projected_agent_status(
     }
 }
 
-pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
+pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse {
+    if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
+        daemon.max_concurrent_runs = Some(db.server_run_cap.effective().unwrap_or(0));
+    }
     DaemonResponse {
+        max_concurrent_runs: daemon.max_concurrent_runs,
+        run_limit: daemon.run_limit,
+        effective_max_concurrent_runs: services::placement::capacity::effective_machine_cap(
+            daemon.max_concurrent_runs,
+            daemon.run_limit,
+        ),
         id: daemon.id,
         machine_id: daemon.machine_id,
         hostname: daemon.hostname,

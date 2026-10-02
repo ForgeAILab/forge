@@ -348,7 +348,17 @@ impl TaskService {
 
                 let plan_writing_role =
                     executors::task_role_can_write_plan(Some(execution.role.as_str()));
-                if plan_writing_role {
+                let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("execution missing workspace_id")
+                })?;
+                let placement =
+                    db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id)
+                        .await?;
+                if plan_writing_role
+                    && placement.as_ref().is_none_or(|placement| {
+                        placement.owner_kind == db::PlacementOwnerKind::Server
+                    })
+                {
                     let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
                         .await?
                         .ok_or_else(|| {
@@ -357,7 +367,7 @@ impl TaskService {
                     crate::plan_artifact::prepare_execution_plan_outbox(
                         std::path::Path::new(&params.workspace_path),
                         &execution.id,
-                        matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                        &execution.role,
                         task.plan.as_deref(),
                     )
                     .map_err(|error| {
@@ -764,7 +774,7 @@ impl TaskService {
                 )
                 .await?,
                 &execution_id,
-                matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                &execution.role,
                 task.plan.as_deref(),
             ) {
                 if let Some(outbox) = executors::execution_outbox_path(
@@ -2268,6 +2278,7 @@ impl TaskService {
         // The backend durably retains the owner's prepare/reset result before
         // acknowledging it. Resolve the path from that result, fenced to this
         // handle and generation, without opening or inferring any server path.
+        // Plan operations also use workspace.reset, but do not prepare a path.
         let receipt = sqlx::query_scalar::<_, String>(
             "SELECT outcome_json FROM command_receipt
              WHERE principal_type = 'system' AND principal_id = 'workspace-backend'
@@ -2275,6 +2286,7 @@ impl TaskService {
                AND operation IN ('daemon.workspace.prepare', 'daemon.workspace.reset')
                AND json_valid(outcome_json)
                AND json_extract(outcome_json, '$.metadata.status') = 'result'
+               AND json_type(outcome_json, '$.owner_result.workspace_path') = 'text'
                AND json_extract(outcome_json, '$.metadata.placement_id') = ?
                AND json_extract(outcome_json, '$.metadata.generation') = ?
                AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
@@ -2316,6 +2328,11 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        if let Some(config) = executor_config.as_object_mut() {
+            config.remove("terminal_plan_text");
+        }
+        executor_config["_forge_plan_transport"] =
+            json!(resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon);
         if read_only_execution_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
@@ -2352,7 +2369,38 @@ impl TaskService {
         .map_err(ServiceError::invalid_operation)?;
         let max_turns = self.resolve_max_turns(&task).await?;
 
+        let canonical = if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+            && matches!(execution.role.as_str(), "worker" | "coder" | "executor")
+        {
+            crate::plan_artifact::read_plan_text_with_router(
+                &self.db,
+                &self.workspace_backend_router,
+                workspace_id,
+            )
+            .await
+            .map_err(|error| error.into_service_error("canonical plan artifact is unreadable"))?
+        } else {
+            None
+        };
+        let plan_text = executors::execution_plan_seed(
+            Some(&execution.role),
+            canonical.as_deref(),
+            task.plan.as_deref(),
+        )
+        .map(str::to_owned);
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            crate::plan_artifact::transport::remember_seed(
+                &self.db,
+                &execution.id,
+                plan_text.as_deref(),
+                &environment.env,
+            )
+            .await?;
+        }
         Ok(api_types::ExecutionStartParams {
+            plan_text: (resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon)
+                .then_some(plan_text)
+                .flatten(),
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             workspace_path,
@@ -2492,11 +2540,7 @@ impl TaskService {
             },
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
+
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id,

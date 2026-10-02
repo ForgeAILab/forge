@@ -20,6 +20,7 @@ pub mod errors;
 pub mod json;
 pub mod middleware;
 mod path_input;
+pub mod project_slots;
 pub mod routes;
 pub mod state;
 
@@ -1052,7 +1053,7 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/daemons/register",
             post(routes::daemons::register_daemon),
         )
-        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon))
+        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon).patch(routes::daemons::update_daemon))
         .route(
             "/api/v1/daemons/{id}/connect",
             get(routes::daemons::connect_daemon),

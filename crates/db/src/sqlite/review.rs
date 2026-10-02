@@ -784,7 +784,8 @@ impl ReviewRepo for SqliteDb {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         validate_review_candidate_in_tx(&mut transaction, &review.task_id, &review.execution_id)
             .await?;
-        Self::create_execution_in_tx(&mut transaction, &execution, admission.as_ref()).await?;
+        self.create_execution_in_tx(&mut transaction, &execution, admission.as_ref())
+            .await?;
         let lease_result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
