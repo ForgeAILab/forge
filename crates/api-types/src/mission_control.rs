@@ -85,7 +85,7 @@ pub struct AttentionConsumerHealthResponse {
     pub last_success_at: Option<String>,
     pub last_error_code: Option<String>,
     pub stale: bool,
-    pub processed_events: i64,
+    pub last_error_message: Option<String>,
     pub updated_at: String,
 }
 

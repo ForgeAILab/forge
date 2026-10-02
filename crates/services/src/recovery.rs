@@ -1,7 +1,7 @@
 use crate::{
     daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
-    workflow::engine::WorkflowEngine, workspace_backend::EmbeddedWorkspaceBackend,
-    DomainEventService, Result, ServiceError, TaskService,
+    workflow::engine::WorkflowEngine, workspace_backend::EmbeddedWorkspaceBackend, Result,
+    ServiceError, TaskService,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 #[cfg(test)]
@@ -146,7 +146,6 @@ impl CrashRecovery {
             .await?;
 
             if outcome.annotated {
-                publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                 self.publish(ForgeEvent {
                     event_type: "task.recovered".to_owned(),
                     entity_id: outcome.task.id,
@@ -160,7 +159,7 @@ impl CrashRecovery {
             }
         }
 
-        recovered += sweep_stale_recovery_annotations(&self.db, &self.event_bus).await?;
+        recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
         for project in list_projects(&self.db).await? {
             let mut cursor = None;
@@ -676,7 +675,6 @@ impl HeartbeatMonitor {
                 .await?;
 
                 if outcome.annotated {
-                    publish_task_status_event(&self.db, &self.event_bus, &outcome.task).await;
                     self.publish(ForgeEvent {
                         event_type: "task.recovered".to_owned(),
                         entity_id: outcome.task.id.clone(),
@@ -934,11 +932,10 @@ impl HeartbeatMonitor {
                 },
             )
             .await?;
-            let ExecutionProgressWarningOutcome::Committed { event, .. } = outcome else {
+            let ExecutionProgressWarningOutcome::Committed { .. } = outcome else {
                 continue;
             };
-            DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                .publish_committed(&event);
+
             warned += 1;
         }
 
@@ -1325,10 +1322,7 @@ async fn recover_task(
     })
 }
 
-async fn sweep_stale_recovery_annotations(
-    db: &Arc<SqliteDb>,
-    event_bus: &Arc<EventBus>,
-) -> Result<u64> {
+async fn sweep_stale_recovery_annotations(db: &Arc<SqliteDb>) -> Result<u64> {
     let mut cleared = 0_u64;
 
     for project in list_projects(db).await? {
@@ -1389,7 +1383,7 @@ async fn sweep_stale_recovery_annotations(
                     continue;
                 }
 
-                let updated = TaskRepo::update_status(
+                TaskRepo::update_status(
                     db.as_ref(),
                     UpdateTaskStatus {
                         id: task.id.clone(),
@@ -1403,7 +1397,7 @@ async fn sweep_stale_recovery_annotations(
                     },
                 )
                 .await?;
-                publish_task_status_event(db, event_bus, &updated).await;
+
                 cleared += 1;
             }
 
@@ -1415,14 +1409,6 @@ async fn sweep_stale_recovery_annotations(
     }
 
     Ok(cleared)
-}
-
-async fn publish_task_status_event(db: &Arc<SqliteDb>, event_bus: &Arc<EventBus>, task: &Task) {
-    let service = DomainEventService::new(Arc::clone(db), Arc::clone(event_bus));
-    let dedupe_key = format!("task-status-update:{}:{}", task.id, task.version);
-    if let Err(error) = service.publish_by_dedupe(&dedupe_key).await {
-        tracing::warn!(task_id = %task.id, %error, "failed to mirror task status domain event");
-    }
 }
 
 fn execution_awaits_recovery(execution: &db::Execution) -> bool {
@@ -3892,6 +3878,11 @@ pub(crate) mod tests {
         .await;
         let _execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
 
+        let relay = crate::DomainEventBroadcastConsumer::new(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            Some(db.domain_event_head().await.unwrap()),
+        );
         let monitor = HeartbeatMonitor::with_check_interval(
             Arc::clone(&db),
             event_bus,
@@ -3899,6 +3890,7 @@ pub(crate) mod tests {
         );
         let timed_out = monitor.check_once().await.expect("monitor runs");
         assert_eq!(timed_out, 1);
+        relay.broadcast_once(100).await.unwrap();
 
         let updated_agent = AgentRepo::get_by_id(&*db, &agent.id)
             .await
@@ -3925,8 +3917,7 @@ pub(crate) mod tests {
 
         let mut event_types = Vec::new();
         let mut recovered_event_id = None;
-        for _ in 0..3 {
-            let event = rx.recv().await.expect("recovery event receives");
+        while let Ok(event) = rx.try_recv() {
             if event.event_type == "task.recovered" {
                 recovered_event_id = Some(event.entity_id);
             }

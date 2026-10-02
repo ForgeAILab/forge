@@ -119,6 +119,7 @@ def scenarios(client: LocalClient, manifest: dict) -> list[dict]:
     analytics_window = urlencode({'from': timestamp(), 'to': timestamp(2 * 86400)})
     routes = (
         ('project', f'/projects/{project}'),
+        ('project list limit=100', '/projects?limit=100'),
         ('project workflow', f'/projects/{project}/workflow'),
         ('project agents', f'/projects/{project}/agents'),
         ('agents', '/agents?limit=100'),

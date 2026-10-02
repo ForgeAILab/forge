@@ -8,6 +8,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
+  `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
+  and keep-alive comments carry no id, so a reconnecting client keeps its last
+  durable cursor. A connection without `Last-Event-ID`, or with one that is not
+  a durable cursor, is live only. Resuming from a durable cursor replays at most
+  1,000 missed events, in pages of 100; a larger gap, a failed read or a cursor
+  beyond the ledger head gets one `events.resync_required` frame instead (for a
+  cursor beyond the head that frame carries `id: domain-event:<head>`).
+  Frame ids were previously the entity id.
+- Operator status `event_consumers` lists four workers (memory, coordination,
+  attention, wake-turn) and no longer lists `sse-broadcast`. For all four,
+  `lag` and `oldest_unprocessed_at` describe pending events of the types the
+  worker subscribes to, not the distance between its cursor and the newest
+  event.
+- Mission Control `consumer_health`: `processed_events` is removed;
+  `last_error_code` is now `failure`, `transient` or `terminal` (was
+  `version_conflict`, `not_found`, `database_error`, `projection_error`) and
+  `last_error_message` is added; `stale` now means subscribed events have been
+  pending for longer than the threshold with no checkpoint progress, so an
+  idle or newly started consumer is healthy.
+- Migration V202610020700 drops `event_processing_lease`,
+  `event_projection_receipt` and `attention_consumer_health` and deletes the
+  `sse-broadcast` cursor. These are delivery metadata, not user data: consumer
+  cursors, wake dispositions, Attention incidents and coordination records are
+  kept, and no event is processed twice or skipped on upgrade.
 - Assigning `coder` on a coordination root now sets the default worker for
   subtasks instead of returning an error; converting a Task into a
   coordination root keeps its `coder` assignment instead of deleting it.
@@ -126,6 +151,44 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   every other hook.
 
 ### Changed
+
+- The coordination, Attention and wake-turn consumers run on the supervised
+  worker runtime, like the memory indexer. Each event's effects and the cursor
+  advance commit in one transaction. Idle polling backs off from 250 ms to
+  5 s and is woken by committed events (it was a fixed 1 s). An unexpected
+  failure, a panic or a handle timeout counts a strike against the event, and
+  the event is quarantined after eight. A worker's periodic `tick` has its own
+  30 s timeout and its own back-off (1 s to 5 min); while a tick is backing
+  off, events are still handled every cycle.
+- The SSE relay is the only publisher of durable event frames. Services no
+  longer publish a durable event directly after their own commit; the relay
+  reads the ledger in order and is woken by the commit hook (measured: 72 µs
+  median from commit to broadcast, was 9 µs). It runs under the supervisor,
+  keeps its position across restarts of the task, and never broadcasts
+  historical events when its first read of the ledger head fails.
+- Operator status `event_consumers[].lag` for the Agent Chat memory indexer is
+  now the live count of pending events of the types it subscribes to, not the
+  distance between its cursor and the newest event. `recent_errors` gains
+  entries for that worker: its last runtime, event, tick or post-commit error,
+  a current deferral with its reason, and a quarantined event (shown for one
+  hour).
+- The Agent Chat memory indexer runs on a supervised worker runtime. A worker
+  that exits or panics is restarted with back-off; an event that keeps failing
+  is retried eight times over about two minutes and then recorded in
+  `worker_dead_letter` so later events are not blocked; database and other
+  infrastructure failures never count against an event. An idle worker writes
+  nothing, and an event of a type it ignores costs no write. Migration
+  V202610012200 adds `worker_health` and `worker_dead_letter` and deletes the
+  indexer's old delivery lease and receipt rows; its cursor is kept, so no
+  event is skipped or indexed twice.
+- Committed domain events wake waiting workers through one database-connection
+  hook instead of a call at each write site.
+- Project GET and Project list responses reuse slot counts while the Project's
+  Tasks, reviews, executions, workflow and settings are unchanged, and the
+  Project list loads counts for the whole page in one query. Migration
+  V202610020410 adds triggers so a child Task in another Project also
+  invalidates its parent's Project. Dispatcher admission still reads fresh
+  counts.
 
 - Agents now get guidance that keeps a Project easy to merge. Charter
   discovery asks for small modules with clear ownership and no hub file that
@@ -246,6 +309,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Operator status exposes the SSE relay as `event_relay { running, position,
+  head, last_error, last_error_at }`, and each worker's dead letters as a
+  total plus the five most recent (`id`, item key, event sequence, reason,
+  time). The list does not expire; the degraded-health signal still covers
+  only the last hour. Migrations V202610020859 and V202610021051 add the error
+  kind, per-item retry state and a stable id to the worker tables. Replay and
+  dismiss actions for dead letters are not available yet.
 - Persisted Project environment pause detail, automatic re-check and resume,
   `POST /api/v1/projects/{id}/environment/recheck`, and
   `forge-ctl project env-recheck`. Project cards/list and headers show the
@@ -277,6 +347,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An event that a consumer can never apply no longer blocks every later event
+  for that consumer. Previously a Task outcome for a commitment that had been
+  cancelled was retried forever, and every later outcome for every Agent
+  waited behind it. Now a cancelled commitment needs
+  no outcome; a commitment or inbox delivery that is rejected is recorded as
+  a dead letter on its own while the other commitments and inbox items of the
+  same event are applied; and a rejection at commit time is retried once with
+  fresh data before the event is quarantined.
+- Wake retries: one retry row that keeps failing no longer stops the retries
+  behind it. Database-busy failures back off without counting against the
+  row, rows that are still waiting are skipped in the query, and a row that
+  exhausts its attempts ends with a `wake_retry_failed` disposition and a
+  dead letter. Resolving the "decision recorded" Attention item now commits
+  with the wake's admission instead of after it.
 - Token and cost figures for embedded Agents were too high. Each chat turn
   recorded its own provider calls and, again, every earlier call of the same
   chat session, so a chat of `n` single-call turns was counted as

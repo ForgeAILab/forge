@@ -3,56 +3,10 @@ use super::*;
 #[async_trait]
 impl AgentInboxRepo for SqliteDb {
     async fn create_inbox_item(&self, input: CreateAgentInboxItem) -> Result<AgentInboxItem> {
-        sqlx::query(
-            "INSERT INTO agent_inbox_item (
-                id, recipient_identity_id, scope_type, scope_id, kind, status, title, body,
-                payload_json, source_type, source_id, correlation_id, causation_id, dedupe_key,
-                version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(recipient_identity_id, dedupe_key) DO NOTHING",
-        )
-        .bind(&input.id)
-        .bind(&input.recipient_identity_id)
-        .bind(&input.scope_type)
-        .bind(&input.scope_id)
-        .bind(input.kind.to_string())
-        .bind(input.status.to_string())
-        .bind(&input.title)
-        .bind(&input.body)
-        .bind(&input.payload_json)
-        .bind(input.source_type.as_deref())
-        .bind(input.source_id.as_deref())
-        .bind(&input.correlation_id)
-        .bind(input.causation_id.as_deref())
-        .bind(&input.dedupe_key)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&self.pool)
-        .await
-        .map_err(check_error)?;
-        let stored = sqlx::query(
-            "SELECT * FROM agent_inbox_item
-             WHERE recipient_identity_id = ? AND dedupe_key = ?",
-        )
-        .bind(&input.recipient_identity_id)
-        .bind(&input.dedupe_key)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(map_agent_inbox_item)
-        .transpose()?
-        .ok_or(DbError::NotFound)?;
-        if stored.scope_type != input.scope_type
-            || stored.scope_id != input.scope_id
-            || stored.kind != input.kind
-            || stored.body != input.body
-            || stored.payload_json != input.payload_json
-            || stored.correlation_id != input.correlation_id
-        {
-            return Err(DbError::Check(
-                "inbox dedupe key was reused with different content".to_owned(),
-            ));
-        }
-        Ok(stored)
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let result = self.create_inbox_item_in_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn get_inbox_item(&self, id: &str) -> Result<Option<AgentInboxItem>> {
@@ -359,4 +313,63 @@ fn map_agent_question(row: SqliteRow) -> Result<AgentQuestion> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+impl SqliteDb {
+    pub async fn create_inbox_item_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentInboxItem,
+    ) -> Result<AgentInboxItem> {
+        sqlx::query(
+            "INSERT INTO agent_inbox_item (
+                id, recipient_identity_id, scope_type, scope_id, kind, status, title, body,
+                payload_json, source_type, source_id, correlation_id, causation_id, dedupe_key,
+                version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(recipient_identity_id, dedupe_key) DO NOTHING",
+        )
+        .bind(&input.id)
+        .bind(&input.recipient_identity_id)
+        .bind(&input.scope_type)
+        .bind(&input.scope_id)
+        .bind(input.kind.to_string())
+        .bind(input.status.to_string())
+        .bind(&input.title)
+        .bind(&input.body)
+        .bind(&input.payload_json)
+        .bind(input.source_type.as_deref())
+        .bind(input.source_id.as_deref())
+        .bind(&input.correlation_id)
+        .bind(input.causation_id.as_deref())
+        .bind(&input.dedupe_key)
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(check_error)?;
+        let stored = sqlx::query(
+            "SELECT * FROM agent_inbox_item
+             WHERE recipient_identity_id = ? AND dedupe_key = ?",
+        )
+        .bind(&input.recipient_identity_id)
+        .bind(&input.dedupe_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(map_agent_inbox_item)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+        if stored.scope_type != input.scope_type
+            || stored.scope_id != input.scope_id
+            || stored.kind != input.kind
+            || stored.body != input.body
+            || stored.payload_json != input.payload_json
+            || stored.correlation_id != input.correlation_id
+        {
+            return Err(DbError::Check(
+                "inbox dedupe key was reused with different content".to_owned(),
+            ));
+        }
+        Ok(stored)
+    }
 }

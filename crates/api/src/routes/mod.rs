@@ -172,6 +172,13 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
 
 pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
     let slots = services::task_dispatcher::slots::load_project_slots(db, &project).await?;
+    project_response_with_slots(project, slots)
+}
+
+fn project_response_with_slots(
+    project: Project,
+    slots: api_types::ProjectSlots,
+) -> ApiResult<ProjectResponse> {
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")

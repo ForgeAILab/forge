@@ -63,7 +63,7 @@ async fn seed_identity(db: &SqliteDb, identity_id: &str) {
 }
 
 #[tokio::test]
-async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicates() {
+async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_once() {
     let db = database().await;
     let identity_id = "identity-outcome";
     seed_identity(&db, identity_id).await;
@@ -140,6 +140,24 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         "shipped",
     )
     .unwrap();
+    let old = db
+        .append_event(CreateDomainEvent::task_transition(
+            "old-task-transition",
+            task.id.clone(),
+            project_id,
+            "in_progress",
+            "shipped",
+            None,
+            "system:workflow",
+            "old delivered event",
+            false,
+            now.clone(),
+            snapshot.clone(),
+        ))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, ?, ?)")
+        .bind(coordination_consumer_name()).bind(old.sequence).bind(&now).execute(db.pool()).await.unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent::task_transition(
@@ -174,12 +192,97 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         .await
         .unwrap();
 
-    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db), "consumer-1")
+    let wanted = db
+        .get_event("task-transition-outcome")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::raw_sql(include_str!("../../db/tests/fixtures/event_delivery.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)")
+        .bind(coordination_consumer_name()).bind(wanted.sequence).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let preparing = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    let services::worker_runtime::Outcome::Done(prepared) =
+        services::worker_runtime::Worker::handle(&preparing, &wanted)
+            .await
+            .unwrap()
+    else {
+        panic!("wanted outcome");
+    };
+    sqlx::query("UPDATE agent_commitment SET version = version + 1 WHERE id = ?")
+        .bind(&commitment.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut stale_tx = db::begin_immediate(db.pool()).await.unwrap();
+    let stale =
+        services::worker_runtime::Worker::commit(&preparing, &mut stale_tx, &wanted, &prepared)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        stale.kind,
+        services::worker_runtime::WorkerErrorKind::Transient,
+        "preparation must retain the commitment CAS version"
+    );
+    stale_tx.rollback().await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_outcome_after_commitment BEFORE INSERT ON agent_inbox_item WHEN NEW.kind = 'task_outcome' BEGIN SELECT RAISE(ABORT, 'test rollback after commitment write'); END;")
+        .execute(db.pool()).await.unwrap();
+    let failed = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
-    assert!(first.claimed_events >= 1);
-    assert_eq!(first.reconciled_events, 1);
+    assert_eq!(failed.processed_events, 0);
+    assert_eq!(
+        db.get_consumer_cursor(coordination_consumer_name())
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        old.sequence
+    );
+    assert_eq!(
+        db.get_commitment(&commitment.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        db::AgentCommitmentStatus::InProgress
+    );
+    assert!(db
+        .list_commitment_evidence(&commitment.id)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DROP TRIGGER fail_outcome_after_commitment")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db))
+        .run_once(100)
+        .await
+        .unwrap();
+    assert_eq!(first.claimed_events, 1);
+    assert_eq!(first.last_sequence, wanted.sequence);
+    assert_eq!(
+        CoordinationOutcomeConsumer::new(Arc::clone(&db))
+            .run_once(100)
+            .await
+            .unwrap()
+            .processed_events,
+        0
+    );
     assert_eq!(first.processed_events, first.claimed_events);
 
     let stored = AgentCommitmentRepo::get_commitment(&*db, &commitment.id)
@@ -209,27 +312,22 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
     assert_eq!(inbox.len(), 1);
 
     // Simulate a crash after the idempotent writes but before the durable
-    // receipt checkpoint.  A new process/lease owner must replay the event.
-    sqlx::query("DELETE FROM event_projection_receipt WHERE consumer_name = ?")
-        .bind(coordination_consumer_name())
-        .execute(db.pool())
-        .await
-        .unwrap();
+    // cursor checkpoint.  A new process/lease owner must replay the event.
     sqlx::query(
-        "UPDATE event_consumer_cursor SET last_sequence = 0, version = version + 1
+        "UPDATE event_consumer_cursor SET last_sequence = ?, version = version + 1
          WHERE consumer_name = ?",
     )
+    .bind(old.sequence)
     .bind(coordination_consumer_name())
     .execute(db.pool())
     .await
     .unwrap();
 
-    let replay = CoordinationOutcomeConsumer::new(Arc::clone(&db), "consumer-2")
+    let replay = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
     assert!(replay.claimed_events >= 1);
-    assert_eq!(replay.reconciled_events, 1);
     assert_eq!(
         AgentCommitmentRepo::list_commitment_evidence(&*db, &commitment.id)
             .await
@@ -563,11 +661,10 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     )
     .await
     .unwrap();
-    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db), "continuity-consumer-1")
+    CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
-    assert_eq!(first.reconciled_events, 1);
 
     let old_inbox = AgentInboxRepo::list_inbox_items(
         &*db,
@@ -599,7 +696,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     // A different consumer instance replaying the same durable event must
     // preserve one evidence row per commitment and one outcome item per
     // commitment/scope for the new owner.
-    CoordinationOutcomeConsumer::new(Arc::clone(&db), "continuity-consumer-2")
+    CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
@@ -626,4 +723,393 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
         .len(),
         2
     );
+}
+
+async fn audit_outcome_failure_fixture(
+    status: db::AgentCommitmentStatus,
+    replay_conflict: bool,
+    concurrent: bool,
+) {
+    let database_path = format!(
+        "/Volumes/Data/tmp/forge-coordination-race-{}.sqlite",
+        new_uuid_v4()
+    );
+    let db = if concurrent {
+        let pool = create_sqlite_pool(&format!("sqlite://{database_path}"))
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        Arc::new(SqliteDb::new(pool))
+    } else {
+        database().await
+    };
+    let identity_id = "identity-wedge";
+    seed_identity(&db, identity_id).await;
+    let now = now_rfc3339();
+    let project_id = "project-wedge";
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.to_owned(),
+            name: "Wedge Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("user-1".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut tasks = Vec::new();
+    for id in ["task-wedge", "task-behind"] {
+        tasks.push(
+            TaskRepo::create(
+                &*db,
+                CreateTask {
+                    id: id.to_owned(),
+                    project_id: project_id.to_owned(),
+                    parent_task_id: None,
+                    assignee_type: None,
+                    assignee_id: None,
+                    title: id.to_owned(),
+                    description: None,
+                    task_type: "task".to_owned(),
+                    status: "done".to_owned(),
+                    is_automation: false,
+                    priority: 0,
+                    subtask_order: None,
+                    task_state_config: None,
+                    merge_config: None,
+                    plan: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let commitments = CommitmentService::new(Arc::clone(&db));
+    let mut created = Vec::new();
+    for task in &tasks {
+        created.push(
+            commitments
+                .create(CreateCommitmentInput {
+                    id: Some(format!("commitment-{}", task.id)),
+                    owner_identity_id: identity_id.to_owned(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id.to_owned(),
+                    title: "Deliver".to_owned(),
+                    description: None,
+                    status: db::AgentCommitmentStatus::InProgress,
+                    due_at: None,
+                    correlation_id: format!("correlation-{}", task.id),
+                    originating_action_id: None,
+                    originating_task_id: Some(task.id.clone()),
+                    evidence_required: true,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    if status == db::AgentCommitmentStatus::Cancelled {
+        commitments
+            .cancel(
+                created[0].id.clone(),
+                created[0].version,
+                "no longer needed".into(),
+                "user".into(),
+                "user-1".into(),
+                "cancel-wedge".into(),
+            )
+            .await
+            .unwrap();
+    } else if status == db::AgentCommitmentStatus::Blocked {
+        sqlx::query(
+            "UPDATE agent_commitment SET status = 'blocked', version = version + 1 WHERE id = ?",
+        )
+        .bind(&created[0].id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    // ...and its Task still reaches done afterwards. Then another Task finishes.
+    let workflow = services::workflow::default_workflow::default_workflow();
+    for task in &tasks {
+        let snapshot = services::workflow::transition_event::transition_workflow_snapshot(
+            task,
+            &workflow,
+            "in_progress",
+            "done",
+        )
+        .unwrap();
+        DomainEventRepo::append_event(
+            &*db,
+            CreateDomainEvent::task_transition(
+                format!("transition-{}", task.id),
+                task.id.clone(),
+                project_id,
+                "in_progress",
+                "done",
+                None,
+                "system:workflow",
+                "delivered",
+                false,
+                now_rfc3339(),
+                snapshot,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let consumer = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    if replay_conflict {
+        consumer.run_once(1).await.unwrap();
+        sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+            .bind(&tasks[0].id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 0 WHERE consumer_name = ?")
+            .bind(coordination_consumer_name())
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    if concurrent {
+        let other = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+        let (a, b) = tokio::join!(consumer.run_once(100), other.run_once(100));
+        assert!(a.is_ok() || b.is_ok());
+    }
+    consumer.run_once(100).await.unwrap();
+    let cursor = db
+        .get_consumer_cursor(coordination_consumer_name())
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    let (attempts, runtime_error, item_error): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT retry_attempts, runtime_error, item_error FROM worker_health WHERE worker_name = ?",
+    )
+    .bind(coordination_consumer_name())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let behind = db
+        .get_commitment(&created[1].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let last = db
+        .get_event("transition-task-behind")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor, last.sequence);
+    assert_eq!(attempts, 0);
+    assert!(runtime_error.is_none() && item_error.is_none());
+    assert_eq!(
+        dead,
+        i64::from(status == db::AgentCommitmentStatus::Blocked || replay_conflict)
+    );
+    assert_eq!(behind, db::AgentCommitmentStatus::Completed);
+    if status == db::AgentCommitmentStatus::Cancelled {
+        assert_eq!(
+            db.get_commitment(&created[0].id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            db::AgentCommitmentStatus::Cancelled
+        );
+    }
+}
+#[tokio::test]
+async fn audit_cancelled_commitment_is_noop_and_later_outcome_reconciles() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::Cancelled, false, false).await;
+}
+#[tokio::test]
+async fn audit_blocked_completion_is_terminal_and_later_outcome_reconciles() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::Blocked, false, false).await;
+}
+#[tokio::test]
+async fn audit_inbox_replay_dedupe_check_is_terminal() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::InProgress, true, false).await;
+}
+
+#[tokio::test]
+async fn audit_two_runtimes_race_coordination_outcomes_on_file_database() {
+    audit_outcome_failure_fixture(db::AgentCommitmentStatus::InProgress, false, true).await;
+}
+
+/// Second-round audit: one commitment that rejects completion (blocked)
+/// quarantines the whole outcome event. What happens to the *other*
+/// commitment on the same Task and to the outcome inbox items?
+#[tokio::test]
+async fn audit2_blocked_commitment_failure_preserves_sibling_commitment_and_inbox() {
+    let db = database().await;
+    seed_identity(&db, "identity-a").await;
+    sqlx::query("UPDATE agent_identity SET name = 'owner-a' WHERE id = 'identity-a'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_identity(&db, "identity-b").await;
+    let now = now_rfc3339();
+    let project_id = "project-q";
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.to_owned(),
+            name: "Quarantine Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("user-1".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let task = TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: "task-q".to_owned(),
+            project_id: project_id.to_owned(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "task-q".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "done".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let commitments = CommitmentService::new(Arc::clone(&db));
+    let mut created = Vec::new();
+    for owner in ["identity-a", "identity-b"] {
+        created.push(
+            commitments
+                .create(CreateCommitmentInput {
+                    id: Some(format!("commitment-{owner}")),
+                    owner_identity_id: owner.to_owned(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id.to_owned(),
+                    title: "Deliver".to_owned(),
+                    description: None,
+                    status: db::AgentCommitmentStatus::InProgress,
+                    due_at: None,
+                    correlation_id: format!("correlation-{owner}"),
+                    originating_action_id: None,
+                    originating_task_id: Some(task.id.clone()),
+                    evidence_required: true,
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    // Owner A's commitment is blocked (as the consumer itself does on a
+    // cancelled/blocked Task outcome, or the Agent does by hand).
+    sqlx::query(
+        "UPDATE agent_commitment SET status = 'blocked', version = version + 1 WHERE id = ?",
+    )
+    .bind(&created[0].id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let workflow = services::workflow::default_workflow::default_workflow();
+    let snapshot = services::workflow::transition_event::transition_workflow_snapshot(
+        &task,
+        &workflow,
+        "in_progress",
+        "done",
+    )
+    .unwrap();
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent::task_transition(
+            "transition-task-q".to_owned(),
+            task.id.clone(),
+            project_id,
+            "in_progress",
+            "done",
+            None,
+            "system:workflow",
+            "delivered",
+            false,
+            now_rfc3339(),
+            snapshot,
+        ),
+    )
+    .await
+    .unwrap();
+    let consumer = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    consumer.run_once(100).await.unwrap();
+    consumer.run_once(100).await.unwrap();
+
+    let dead: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT source_key, error_kind, last_error FROM worker_dead_letter")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let a = db
+        .get_commitment(&created[0].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let b = db
+        .get_commitment(&created[1].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let outcome_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_inbox_item WHERE source_type = 'task_outcome' AND source_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let cursor = db
+        .get_consumer_cursor(coordination_consumer_name())
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    println!(
+        "AUDIT2 dead={dead:?} a={a:?} b={b:?} outcome_inbox_items={outcome_items} cursor={cursor}"
+    );
+    assert_eq!(dead.len(), 1, "only the rejected commitment is quarantined");
+    assert_eq!(a, db::AgentCommitmentStatus::Blocked);
+    assert!(dead[0].0.contains(&created[0].id));
+    assert!(dead[0].2.contains(&created[0].id));
+    assert_eq!(b, db::AgentCommitmentStatus::Completed);
+    assert_eq!(outcome_items, 2);
+    let event = db.get_event("transition-task-q").await.unwrap().unwrap();
+    assert_eq!(cursor, event.sequence);
+    let operator = services::OperatorStatusService::new_for_test(Arc::clone(&db));
+    operator.set_runtime_workers(&[services::RuntimeWorker::Coordination]);
+    let status = operator.compute_status().await.unwrap();
+    assert_eq!(status.event_consumers[0].dead_letter_count, 1);
+    assert!(status.event_consumers[0].recent_dead_letters[0]
+        .item_key
+        .contains(&created[0].id));
 }

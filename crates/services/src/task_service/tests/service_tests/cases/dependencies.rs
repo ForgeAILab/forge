@@ -157,20 +157,22 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
         .expect("task exists");
 
     let mut rx = event_bus.subscribe();
+    let relay = crate::DomainEventBroadcastConsumer::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+        Some(db.domain_event_head().await.unwrap()),
+    );
     let done = service
         .transition(review.task.id, "done".to_owned(), review.task.version)
         .await
         .expect("prerequisite completes");
     assert_eq!(done.task.status, "done".to_owned());
+    relay.broadcast_once(100).await.unwrap();
 
     let mut status_event_seen = false;
     let mut committed_event_seen = false;
     let mut dependency_event = None;
-    for _ in 0..3 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("transition event emits before timeout")
-            .expect("transition event receives");
+    while let Ok(event) = rx.try_recv() {
         match event.event_type.as_str() {
             "task.status_changed" => status_event_seen = true,
             "domain_event.committed" => committed_event_seen = true,

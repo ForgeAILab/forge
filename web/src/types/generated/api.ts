@@ -1535,6 +1535,22 @@ export interface McpConfigActionRequest {
 
 export type OperatorSeverity = 'healthy' | 'attention' | 'blocked' | 'error'
 
+export interface EventRelayStatus {
+  running: boolean
+  position: number | null
+  head: number | null
+  last_error: string | null
+  last_error_at: string | null
+}
+
+export interface WorkerDeadLetterSummary {
+  id: string
+  item_key: string
+  event_sequence: number | null
+  reason: string
+  occurred_at: string
+}
+
 export interface EventConsumerStatus {
   consumer_name: string
   last_sequence: number
@@ -1543,6 +1559,8 @@ export interface EventConsumerStatus {
   oldest_unprocessed_age_seconds: number | null
   last_advanced_at: string | null
   stalled: boolean
+  dead_letter_count: number
+  recent_dead_letters: WorkerDeadLetterSummary[]
 }
 
 export interface DatabaseStorageStatus {
@@ -1551,6 +1569,7 @@ export interface DatabaseStorageStatus {
 }
 
 export interface OperatorStatusResponse {
+  event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
   database: DatabaseStorageStatus
   overall_severity: OperatorSeverity

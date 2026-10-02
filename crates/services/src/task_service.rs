@@ -588,14 +588,6 @@ impl TaskService {
         self.workspace_backend_router = Arc::new(WorkspaceBackendRouter::new(Arc::new(embedded)));
     }
 
-    pub(crate) async fn publish_domain_event_by_dedupe(&self, dedupe_key: &str) {
-        let service =
-            crate::DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-            tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
-        }
-    }
-
     pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
         self.review_runner = Some(review_runner);
         self

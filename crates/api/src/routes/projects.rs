@@ -181,13 +181,22 @@ pub async fn list_projects(
     user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ProjectResponse>>> {
-    let page = ProjectRepo::list_visible(&*state.db, &user.user_id, page_request(&params)?).await?;
+    let page = state
+        .db
+        .list_visible_project_slot_reads(&user.user_id, page_request(&params)?)
+        .await
+        .map_err(ServiceError::from)?;
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, &page.items)
+        .await?;
     let mut items = Vec::with_capacity(page.items.len());
-    for project in page.items {
-        items.push(project_response(&state.db, project).await?);
+    for read in page.items {
+        let counts = slots.remove(&read.project.id).expect("requested Project");
+        items.push(super::project_response_with_slots(read.project, counts)?);
     }
     let response = PaginatedResponse {
         items,
@@ -203,8 +212,20 @@ pub async fn get_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = require_project_visible(&state, &id, &user.user_id).await?;
-    Ok(Json(project_response(&state.db, project).await?))
+    let read = state
+        .db
+        .get_visible_project_slot_read(&id, &user.user_id)
+        .await
+        .map_err(ServiceError::from)?
+        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let mut slots = state
+        .project_slots_memo
+        .load(&state.db, std::slice::from_ref(&read))
+        .await?;
+    Ok(Json(super::project_response_with_slots(
+        read.project,
+        slots.remove(&id).expect("requested Project"),
+    )?))
 }
 
 pub async fn list_project_hook_runs(

@@ -402,6 +402,8 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ReorderSubtasksRequest::export().expect("export ReorderSubtasksRequest");
     OperatorSeverity::export().expect("export OperatorSeverity");
     OperatorStatusResponse::export().expect("export OperatorStatusResponse");
+    EventRelayStatus::export().expect("export EventRelayStatus");
+    WorkerDeadLetterSummary::export().expect("export WorkerDeadLetterSummary");
     ActiveExecutionSummary::export().expect("export ActiveExecutionSummary");
     BlockedTaskSummary::export().expect("export BlockedTaskSummary");
     DaemonIssueSummary::export().expect("export DaemonIssueSummary");
