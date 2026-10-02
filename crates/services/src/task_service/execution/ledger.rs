@@ -414,6 +414,43 @@ fn selection_digest(
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))
 }
 
+/// The account an execution's pricing selections are admitted under: the
+/// Project owner, else the Agent owner. Admission is never skipped because
+/// both are missing: such an execution is admitted under the instance's first
+/// administrator, the account that claims ownerless resources at bootstrap
+/// (else the earliest account). With no adjustment of its own on the subject,
+/// that account resolves the plain models.dev list price.
+async fn admission_account_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: &str,
+    agent: &db::Agent,
+) -> Result<Option<String>> {
+    let project_owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    for owner in [project_owner, agent.owner_id.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|owner| !owner.trim().is_empty())
+    {
+        let account = sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
+            .bind(owner)
+            .fetch_optional(&mut **tx)
+            .await?;
+        if account.is_some() {
+            return Ok(account);
+        }
+    }
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT id FROM user ORDER BY is_admin DESC, created_at, id LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
 /// Same admission operation with the concrete DB handle required by the
 /// repository trait.
 pub(crate) async fn admit_task_execution_in_tx_with_db(
@@ -426,27 +463,10 @@ pub(crate) async fn admit_task_execution_in_tx_with_db(
 ) -> Result<()> {
     // Keep the implementation single-sourced while avoiding a DB handle in
     // every pure candidate helper.
-    let owner_candidate: Option<String> =
-        sqlx::query_scalar("SELECT COALESCE(owner_id, ?) FROM project WHERE id = ?")
-            .bind(agent.owner_id.as_deref())
-            .bind(&task.project_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let owner_candidate = owner_candidate.filter(|value| !value.trim().is_empty());
-    let owner_user_id = match owner_candidate {
-        Some(owner_user_id) => {
-            sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
-                .bind(owner_user_id)
-                .fetch_optional(&mut **tx)
-                .await?
-        }
-        None => None,
-    };
-    // A legacy Project can have no surviving account principal. Without an
-    // owner there is no valid pricing authority or account scope, so preserve
-    // execution behavior and leave the run visible through the domain-run
-    // denominator instead of minting an ownerless runtime ledger row.
-    let Some(owner_user_id) = owner_user_id else {
+    //
+    // Every runtime ledger row and pricing subject belongs to an account, so
+    // only an instance with no account at all has nothing to admit against.
+    let Some(owner_user_id) = admission_account_in_tx(tx, &task.project_id, agent).await? else {
         return Ok(());
     };
     if sqlx::query_scalar::<_, i64>(
@@ -2269,6 +2289,253 @@ mod tests {
         .await
         .expect("empty report converts")
         .is_none());
+    }
+
+    /// A Project and Agent without an owner are an anomaly, not a reason to
+    /// skip admission: the execution is still admitted, priced from the plain
+    /// models.dev catalogue row, and its usage report settles.
+    #[tokio::test]
+    async fn ownerless_execution_is_admitted_at_the_catalogue_price_and_settles() {
+        use crate::pricing::PricingCatalogRepository as _;
+
+        let db = Arc::new(test_db().await);
+        let now = db::now_rfc3339();
+        // The first registered account is the instance administrator.
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "instance-admin".to_owned(),
+                email: "admin@example.test".to_owned(),
+                password_hash: "test".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("account creates");
+        let when = std::time::SystemTime::now();
+        let snapshot = crate::pricing::parse_models_dev_catalog(
+            br#"{"openai": {"id":"openai","name":"OpenAI","models":{
+                "gpt-ownerless":{"id":"gpt-ownerless","last_updated":"2026-09-01",
+                  "cost":{"input":1,"output":2}}}}}"#,
+        )
+        .expect("catalogue parses")
+        .into_snapshot("ownerless-snapshot", None, when, when)
+        .expect("snapshot materializes");
+        crate::pricing_db::SqlitePricingRepository::new(Arc::clone(&db))
+            .activate_catalog_snapshot(snapshot, "ownerless-refresh")
+            .await
+            .expect("catalogue activates");
+
+        let project = db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: db::new_uuid_v4(),
+                name: "Ownerless".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("ownerless project creates");
+        let agent = db::AgentRepo::create(
+            &*db,
+            db::CreateAgent {
+                id: db::new_uuid_v4(),
+                name: "Ownerless worker".to_owned(),
+                description: None,
+                executor_type: "codex".to_owned(),
+                model: Some("gpt-ownerless".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("ownerless agent creates");
+        let task = db::TaskRepo::create(
+            &*db,
+            db::CreateTask {
+                id: db::new_uuid_v4(),
+                project_id: project.id.clone(),
+                parent_task_id: None,
+                subtask_order: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Ownerless work".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task creates");
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"model": "gpt-ownerless"},
+            "daemon_id": "ownerless-daemon",
+        });
+        let execution = db::ExecutionRepo::create(
+            &*db,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.id.clone()),
+                role: "coder".to_owned(),
+                status: db::ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(snapshot.to_string()),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        assert!(
+            ensure_task_execution_admission(&db, &task, &execution, &snapshot)
+                .await
+                .expect("ownerless admission succeeds")
+        );
+        let selections =
+            db::UsageLedgerRepo::list_pricing_selections_for_source(&*db, &execution.id)
+                .await
+                .expect("selections load");
+        assert_eq!(selections.len(), 1);
+        let selection = &selections[0];
+        assert_eq!(selection.owner_user_id.as_deref(), Some("instance-admin"));
+        assert_eq!(selection.selection_status, PricingSelectionStatus::Priced);
+        assert_eq!(
+            selection.source_kind,
+            Some(PricingRateSourceKind::ModelsDevCatalog)
+        );
+        assert_eq!(
+            selection.catalog_snapshot_id.as_deref(),
+            Some("ownerless-snapshot")
+        );
+        let rate: (Option<String>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT catalog_provider_id, owner_user_id, input_nano_usd_per_million,
+                    output_nano_usd_per_million
+             FROM pricing_rate_revision WHERE id = ?",
+        )
+        .bind(selection.rate_revision_id.as_deref().expect("frozen rate"))
+        .fetch_one(db.pool())
+        .await
+        .expect("rate loads");
+        // The global catalogue row, not an account's manual rate.
+        assert_eq!(
+            rate,
+            (
+                Some("openai".to_owned()),
+                None,
+                Some(1_000_000_000),
+                Some(2_000_000_000)
+            )
+        );
+
+        // The owner's terminal usage report finds its admitted candidate.
+        let mut report = UsageReport::metered(
+            "ownerless-report",
+            executors::UsageCounters {
+                input_tokens: Some(1_000_000),
+                output_tokens: Some(1_000_000),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        );
+        report.candidate_key = selection.candidate_key.clone();
+        let reports = [report];
+        let mut tx = db::begin_immediate(db.pool()).await.expect("transaction");
+        let prepared = ensure_remote_task_usage_invocations_in_tx(
+            &db,
+            &mut tx,
+            &execution,
+            &reports,
+            Some(&snapshot),
+            &now,
+        )
+        .await
+        .expect("the report matches the admitted selection");
+        assert_eq!(prepared.len(), 1);
+        for input in prepared {
+            let invocation =
+                db::UsageLedgerRepo::create_usage_invocation_in_tx(&*db, &mut tx, input)
+                    .await
+                    .expect("invocation creates");
+            db::UsageLedgerRepo::start_usage_invocation_in_tx(
+                &*db,
+                &mut tx,
+                db::StartUsageInvocation {
+                    id: invocation.id,
+                    expected_version: invocation.version,
+                    started_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("invocation starts");
+        }
+        tx.commit().await.expect("invocation commits");
+        settle_late_task_usage(&db, &execution.id, &reports, &now)
+            .await
+            .expect("usage settles");
+
+        let invocations =
+            db::UsageLedgerRepo::list_usage_invocations_for_source(&*db, &execution.id)
+                .await
+                .expect("invocations load");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].lifecycle, UsageInvocationLifecycle::Settled);
+        let events =
+            db::UsageLedgerRepo::list_usage_events_for_invocation(&*db, &invocations[0].id)
+                .await
+                .expect("events load");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].owner_user_id.as_deref(), Some("instance-admin"));
+        assert_eq!(events[0].cost_kind, db::UsageCostKind::Estimated);
+        // One million tokens each at 1 and 2 USD per million.
+        assert_eq!(events[0].estimated_nano_usd, Some(3_000_000_000));
     }
 
     #[test]

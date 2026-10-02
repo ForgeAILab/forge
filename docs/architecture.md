@@ -1583,11 +1583,17 @@ invocation. Historical attribution is frozen from admission-time identity and
 pricing-subject revisions rather than reconstructed through mutable Agent or
 provider bindings.
 
-Pre-V135 Projects whose stored owner no longer resolves to a current account
-principal do not receive fabricated accounting ownership. Their Task attempts
-remain visible in domain-run denominators as no-provider/no-usage coverage, but
-Forge creates no ownerless runtime invocation or usage row until a real account
-principal can be proved.
+Every runtime selection, invocation, and usage row belongs to an account; only
+migrated pre-V135 history may stay ownerless. Task admission resolves that
+account from the Project owner, else the Agent owner. Projects and Agents are
+expected to be owned, but a missing owner never skips admission: the execution
+is admitted under the instance's first administrator (the account that claims
+ownerless resources at bootstrap), else the earliest account, and resolves the
+models.dev list price unless that account configured an adjustment for the
+same provider entry or CLI runtime. Embedded and remote terminal usage reports
+therefore always find an admitted candidate. Only an instance with no account
+at all leaves a Task attempt unadmitted; it stays visible in domain-run
+denominators as no-provider/no-usage coverage.
 
 Admission freezes the eligible immutable rate revision for every Task route
 candidate, or for the selected chat/inquiry provider call. Immediately before

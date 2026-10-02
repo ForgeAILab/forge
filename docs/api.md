@@ -1986,10 +1986,14 @@ provider/model identity differs from the admitted candidate, Forge retains the
 actual identity but leaves the event unpriced until an exact retrospective
 operation is requested.
 
-For a legacy Project whose stored owner no longer resolves to a current account
-principal, Forge does not guess an owner or mint an ownerless runtime ledger
-row. Its Task attempt still contributes to the domain-run denominator and is
-reported as no-provider/no-usage coverage.
+Task admission is never skipped because an owner is missing. Selections are
+admitted under the Project owner, else the Agent owner. When neither resolves
+to a current account, the execution is admitted under the instance's first
+administrator (else the earliest account) and resolves the models.dev list
+price like any account without an adjustment on that provider entry or CLI
+runtime. Runtime ledger rows always belong to an account, so the usage appears
+in that account's analytics. Only an instance with no account at all leaves a
+Task attempt unadmitted, reported as no-provider/no-usage coverage.
 
 The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
