@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T18:37:37Z
+updated_at: 2026-10-02T19:22:11Z
 completed_at:
 ---
 
@@ -61,3 +61,9 @@ completed_at:
 - Task diagnostics expose recorded environment waits, host probes, capacity waits and selection rejections. Complete rejected identities are not persisted for every refusal, and a pure capacity wait does not record the machine; these limits are reported rather than adding placement behavior.
 - The single-machine smoke case is `single_machine_environment_recheck_resumes_task_dispatch`; it passed by exact name. Web states passed through Vitest; real Chrome launch was blocked by the sandbox, so screenshots/Lighthouse are unverified.
 - Final validation and exact results are recorded in `implementation-step-b.md`: all changed test modules/files passed; the named smoke passed; Rust check/clippy/fmt and web typecheck/focused ESLint passed.
+
+### Step B list-query correction
+- [x] Batch Project readiness for the page, including daemon names and legacy pause owner resolution; reuse the pure response assembly for single GET.
+- [x] Batch `runnable_on` facts for both Agent list routes; profile/session lists have no per-row Agent response.
+- [x] Permanent SQLx statement-count regression for 1/20 Projects (empty, server/daemon readiness, legacy pause) and batched CLI/native Agent facts; full requested modules/files, clippy and fmt.
+- Measured counts, per-Agent comparison with b34fe4c8 and final command/pass-count results: `list-query-correction.md`.

@@ -26,6 +26,14 @@ pub async fn list_project_agents(
         .await
         .map_err(ApiError::from)?;
 
+    let mut runnable = services::environment_surfaces::runnable_on_for_agents(
+        &state.db,
+        &agents,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        user.is_admin,
+    )
+    .await?;
     let mut responses = Vec::with_capacity(agents.len());
     for agent in agents {
         let active_assigned_task_count =
@@ -39,14 +47,7 @@ pub async fn list_project_agents(
                 .to_owned();
         let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
         let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
-        let runnable_on = services::environment_surfaces::runnable_on(
-            &state.db,
-            &agent,
-            &state.adapter_registry,
-            &state.daemon_connections,
-            user.is_admin,
-        )
-        .await?;
+        let runnable_on = runnable.remove(&agent.id).expect("requested Agent");
         let mut response = agent_response(
             agent,
             Some(active_assigned_task_count),

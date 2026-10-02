@@ -193,10 +193,20 @@ pub async fn list_projects(
         .project_slots_memo
         .load(&state.db, &page.items)
         .await?;
+    let projects: Vec<_> = page.items.iter().map(|read| read.project.clone()).collect();
+    let mut environment =
+        services::environment_surfaces::project_environments(&state.db, &projects).await?;
     let mut items = Vec::with_capacity(page.items.len());
     for read in page.items {
         let counts = slots.remove(&read.project.id).expect("requested Project");
-        items.push(super::project_response_with_slots(&state.db, read.project, counts).await?);
+        let environment = environment
+            .remove(&read.project.id)
+            .expect("requested Project");
+        items.push(super::project_response_from_environment(
+            read.project,
+            counts,
+            environment,
+        )?);
     }
     let response = PaginatedResponse {
         items,

@@ -2304,6 +2304,16 @@ ten-minute review at a time:
   Passing checks clear matching waits and environment pauses; user and repository
   pauses are preserved. Assets are still verified at launch.
 
+Project list pages load their readiness records in one bounded statement, then
+resolve daemon names and legacy pause owners in at most one additional statement.
+Response assembly runs in memory; a Project without readiness adds no per-Project
+query. Single-Project responses share the same assembly. Agent list pages load
+`runnable_on` facts once for the page (daemon/runtime names, native health and CLI
+policy), instead of querying per Agent. Profile/session lists return their own
+DTOs and do not compute Agent machine fit per row. Compact Task list items use
+the batched Task list projection and never call the full Task placement-diagnostics
+loader per item.
+
 `ProjectResponse.environment_readiness` is an array available to anyone who can
 read the Project. Projects without checks have no rows (`[]`). Each entry is:
 

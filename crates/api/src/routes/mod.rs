@@ -184,6 +184,18 @@ async fn project_response_with_slots(
     project: Project,
     slots: api_types::ProjectSlots,
 ) -> ApiResult<ProjectResponse> {
+    let mut environment =
+        services::environment_surfaces::project_environments(db, std::slice::from_ref(&project))
+            .await?;
+    let environment = environment.remove(&project.id).expect("requested Project");
+    project_response_from_environment(project, slots, environment)
+}
+
+fn project_response_from_environment(
+    project: Project,
+    slots: api_types::ProjectSlots,
+    environment: services::environment_surfaces::ProjectEnvironmentRead,
+) -> ApiResult<ProjectResponse> {
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")
@@ -195,7 +207,7 @@ async fn project_response_with_slots(
             project.id
         ))
     })?;
-    let environment_readiness = services::environment_surfaces::readiness(db, &project.id).await?;
+    let environment_readiness = environment.readiness;
     let environment_pause = if let Some(raw) = project.environment_pause_json.as_deref() {
         let detail =
             serde_json::from_str::<api_types::ProjectEnvironmentPause>(raw).map_err(|error| {
@@ -203,22 +215,14 @@ async fn project_response_with_slots(
             })?;
         let value: Value =
             serde_json::from_str(raw).map_err(|error| ApiError::internal(error.to_string()))?;
-        let machine = if value.get("machine").is_some() {
+        if value.get("machine").is_some() {
             serde_json::from_value::<db::EnvironmentMachine>(value["machine"].clone()).map_err(
                 |error| ApiError::internal(format!("invalid environment pause machine: {error}")),
-            )?
-        } else if let Some(workspace) = detail.workspace_id.as_deref() {
-            db::WorkspacePlacementRepo::get_by_workspace_id(db, workspace)
-                .await
-                .map_err(services::ServiceError::from)?
-                .map(|placement| db::EnvironmentMachine::from_placement(&placement))
-                .unwrap_or(db::EnvironmentMachine::Server)
-        } else {
-            db::EnvironmentMachine::Server
-        };
+            )?;
+        }
         Some(api_types::EnvironmentPauseResponse {
             detail,
-            machine: services::environment_surfaces::machine_identity(db, &machine).await?,
+            machine: environment.pause_machine.expect("loaded pause owner"),
         })
     } else {
         None
