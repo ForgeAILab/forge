@@ -107,24 +107,18 @@ fn durable_sequence(id: &str) -> Option<i64> {
 }
 
 fn frame(event: events::ForgeEvent) -> Option<Event> {
-    let id = match &event.context {
-        events::EventContext::DomainEventCommitted { sequence, .. } => {
-            format!("{DURABLE_ID_PREFIX}{sequence}")
-        }
-        _ => format!("entity:{}", event.entity_id),
-    };
-    Some(
-        Event::default()
-            .id(id)
-            .data(serde_json::to_string(&event).ok()?),
-    )
+    let mut frame = Event::default().data(serde_json::to_string(&event).ok()?);
+    // Omitting id preserves the client's last durable cursor. An empty id
+    // would reset it, and a bus-only id would replace it with a non-cursor.
+    if let events::EventContext::DomainEventCommitted { sequence, .. } = &event.context {
+        frame = frame.id(format!("{DURABLE_ID_PREFIX}{sequence}"));
+    }
+    Some(frame)
 }
 
 fn resync_frame(reason: &str) -> Event {
     let data = json!({ "event_type": "events.resync_required", "entity_id": "events.resync_required", "timestamp": events::event_timestamp(), "reason": reason });
-    Event::default()
-        .id("entity:events.resync_required")
-        .data(data.to_string())
+    Event::default().data(data.to_string())
 }
 
 fn replay_events(

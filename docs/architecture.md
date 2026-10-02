@@ -2100,8 +2100,9 @@ five-second idle fallback. It writes no cursor, lease, receipt or health row.
 
 SSE plain connects remain live-only. A connection reads the ledger only when
 `Last-Event-ID` has the durable form `domain-event:<sequence>`; entity IDs, missing
-headers and malformed IDs do not request replay. Bus-only frames use
-`entity:<entity_id>`, which cannot be mistaken for a durable resume cursor.
+headers and malformed IDs do not request replay. Bus-only and resync frames omit
+the SSE `id` field, preserving the client's last durable cursor across reconnects.
+Keep-alive comments also have no ID. Only durable frames set an SSE ID.
 The payload's `entity_id` remains unchanged. Neither the web client nor forge-ctl
 uses frame IDs for routing; MCP uses a separate stream. The web client recreates
 `EventSource` on reconnect and refreshes active queries after a stable open.

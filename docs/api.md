@@ -3720,7 +3720,9 @@ from operator `event_consumers`. Plain connections are live-only and do not read
 historical ledger rows. Frame IDs are transport identifiers:
 
 - Durable `domain_event.committed` frames use `id: domain-event:<sequence>`.
-- Bus-only frames use `id: entity:<entity_id>` and are not resumable.
+- Bus-only and `events.resync_required` frames omit the SSE `id` field entirely.
+  They preserve the client's last durable cursor; an empty `id` would reset it.
+- Keep-alive frames are comments and also carry no `id` field.
 - JSON `entity_id` and the other committed-envelope fields retain their meaning.
 
 A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that

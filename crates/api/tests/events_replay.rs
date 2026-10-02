@@ -65,7 +65,7 @@ async fn response_stream(h: &common::Harness, resume: Option<&str>) -> BodyDataS
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     response.into_body().into_data_stream()
 }
-async fn next_event(stream: &mut BodyDataStream) -> (String, Value) {
+async fn next_event(stream: &mut BodyDataStream) -> (Option<String>, Value) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let bytes = stream
@@ -80,9 +80,7 @@ async fn next_event(stream: &mut BodyDataStream) -> (String, Value) {
             let id = frame
                 .lines()
                 .find_map(|line| line.strip_prefix("id:"))
-                .unwrap()
-                .trim()
-                .to_owned();
+                .map(|id| id.trim().to_owned());
             return (id, serde_json::from_str(data.trim()).unwrap());
         }
     })
@@ -151,13 +149,23 @@ async fn plain_connect_is_live_only_and_frame_ids_distinguish_durable_and_bus_ev
     .await;
     assert!(!buffer.contains("historical"));
     assert!(buffer.contains("\"entity_id\":\"live\""));
+    buffer.clear();
     h.state.event_bus.publish(ForgeEvent {
         event_type: "test.bus".into(),
         entity_id: "domain-event:123".into(),
         timestamp: events::event_timestamp(),
         context: EventContext::Empty {},
     });
-    read_until(&mut socket, &mut buffer, "id: entity:domain-event:123").await;
+    read_until(
+        &mut socket,
+        &mut buffer,
+        "\"entity_id\":\"domain-event:123\"",
+    )
+    .await;
+    assert!(
+        !buffer.lines().any(|line| line.starts_with("id:")),
+        "bus-only frame must omit id even when its entity looks like a cursor"
+    );
     assert!(buffer.contains("\"entity_id\":\"domain-event:123\""));
     assert!(!buffer.contains("\nevent:"));
     server.abort();
@@ -174,7 +182,10 @@ async fn durable_resume_replays_missed_pages_once_in_order_with_append_during_re
     // Poll just one replay frame, keeping later pages unpolled. This forces the
     // append to occur during replay, rather than relying on socket timing.
     let first = next_event(&mut stream).await;
-    assert_eq!(first.0, format!("domain-event:{}", missed[0].sequence));
+    assert_eq!(
+        first.0,
+        Some(format!("domain-event:{}", missed[0].sequence))
+    );
     let concurrent = append(&h.state.db, "concurrent").await;
     publish(&h, &missed[0]); // delayed relay overlaps the captured snapshot
     publish(&h, &concurrent);
@@ -194,7 +205,7 @@ async fn durable_resume_replays_missed_pages_once_in_order_with_append_during_re
         .collect();
     assert_eq!(actual.len(), expected.len());
     for ((id, payload), (expected_id, entity)) in actual.iter().zip(expected) {
-        assert_eq!(id, &expected_id);
+        assert_eq!(id.as_ref(), Some(&expected_id));
         assert_eq!(payload["entity_id"], entity);
         assert_eq!(payload["event_type"], "domain_event.committed");
     }
@@ -214,7 +225,7 @@ async fn exactly_1000_missed_events_can_resume() {
     let mut stream = response_stream(&h, Some("domain-event:0")).await;
     for event in missed {
         let (id, payload) = next_event(&mut stream).await;
-        assert_eq!(id, format!("domain-event:{}", event.sequence));
+        assert_eq!(id, Some(format!("domain-event:{}", event.sequence)));
         assert_eq!(payload["entity_id"], event.id);
     }
     assert!(
@@ -231,14 +242,17 @@ async fn more_than_1000_missed_events_sends_one_resync_without_replay_then_goes_
     let missed = append_many(&h.state.db, 1001).await;
     let mut stream = response_stream(&h, Some("domain-event:0")).await;
     let (id, payload) = next_event(&mut stream).await;
-    assert_eq!(id, "entity:events.resync_required");
+    assert_eq!(
+        id, None,
+        "resync frame must omit the id line, not reset the durable cursor"
+    );
     assert_eq!(payload["event_type"], "events.resync_required");
     assert_eq!(payload["reason"], "replay limit exceeded");
     publish(&h, &missed[0]); // snapshot frames cannot become implicit replay
     let live = append(&h.state.db, "after-resync").await;
     publish(&h, &live);
     let (id, payload) = next_event(&mut stream).await;
-    assert_eq!(id, format!("domain-event:{}", live.sequence));
+    assert_eq!(id, Some(format!("domain-event:{}", live.sequence)));
     assert_eq!(payload["entity_id"], live.id);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), stream.next())
@@ -256,7 +270,6 @@ async fn entity_and_garbage_resume_ids_are_live_only() {
     for resume in [
         historical.id.as_str(),
         "p",
-        "entity:p",
         "garbage",
         "domain-event:",
         "domain-event:-1",
@@ -269,7 +282,7 @@ async fn entity_and_garbage_resume_ids_are_live_only() {
         let (id, payload) = next_event(&mut stream).await;
         assert_eq!(
             id,
-            format!("domain-event:{}", live.sequence),
+            Some(format!("domain-event:{}", live.sequence)),
             "invalid resume {resume}"
         );
         assert_eq!(payload["entity_id"], live.id);
@@ -279,4 +292,49 @@ async fn entity_and_garbage_resume_ids_are_live_only() {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn durable_cursor_survives_bus_only_frame_and_reconnect_replays_missed_events() {
+    let workspace = common::TestDir::new("events-cursor-preservation");
+    let h = common::test_app(workspace.path(), "events-cursor-preservation").await;
+    let mut stream = response_stream(&h, None).await;
+    let delivered = append(&h.state.db, "delivered").await;
+    publish(&h, &delivered);
+    let (id, _) = next_event(&mut stream).await;
+    let mut last_event_id = id.expect("durable frame supplies a cursor");
+    assert_eq!(
+        last_event_id,
+        format!("domain-event:{}", delivered.sequence)
+    );
+    h.state.event_bus.publish(ForgeEvent {
+        event_type: "test.bus".into(),
+        entity_id: "domain-event:123".into(),
+        timestamp: events::event_timestamp(),
+        context: EventContext::Empty {},
+    });
+    let (bus_id, payload) = next_event(&mut stream).await;
+    assert_eq!(bus_id, None, "bus-only frame has no id line");
+    assert_eq!(payload["entity_id"], "domain-event:123");
+    // Follow EventSource's rule: only a frame with an id changes its cursor.
+    if let Some(id) = bus_id {
+        last_event_id = id;
+    }
+    drop(stream);
+    let missed = [
+        append(&h.state.db, "missed-after-bus-a").await,
+        append(&h.state.db, "missed-after-bus-b").await,
+    ];
+    let mut resumed = response_stream(&h, Some(&last_event_id)).await;
+    for event in missed {
+        let (id, payload) = next_event(&mut resumed).await;
+        assert_eq!(id, Some(format!("domain-event:{}", event.sequence)));
+        assert_eq!(payload["entity_id"], event.id);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), resumed.next())
+            .await
+            .is_err(),
+        "missed durable events replay exactly once"
+    );
 }
