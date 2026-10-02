@@ -2024,12 +2024,21 @@ pub struct UsageLedgerSettlement {
     pub events: Vec<CreateUsageEvent>,
 }
 
+/// Private artifact content committed only by the winning terminal CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportedExecutionPlan {
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub size: Option<i64>,
+}
+
 /// Composite terminalization input for Task execution. The optional receipt
 /// identity is used by remote daemon delivery: it is persisted in the
 /// terminal domain event and lets a post-restart duplicate be acknowledged
 /// without mutating the execution or appending usage a second time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalizeExecutionWithLedger {
+    pub plan: Option<TransportedExecutionPlan>,
     pub terminal: TerminalizeExecution,
     pub settlements: Vec<UsageLedgerSettlement>,
     pub terminal_report_id: Option<String>,

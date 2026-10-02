@@ -212,8 +212,9 @@ async fn annotate_dispatch_failure_details(
                 && serde_json::from_str::<serde_json::Value>(raw)
                     .ok()
                     .is_some_and(|value| {
-                        value["message"] == message
-                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED
+                        (value["message"] == message
+                            && value["code"] == api_types::DAEMON_UPGRADE_REQUIRED)
+                            || (value["state"] == state && value["code"] == "placement_unavailable")
                     })
             {
                 return Ok(());

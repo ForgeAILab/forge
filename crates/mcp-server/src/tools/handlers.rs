@@ -431,6 +431,7 @@ pub(super) async fn forge_preview_prompt(
 
     let prompt = services::preview_effective_prompt(
         Arc::clone(&state.db),
+        &state.workspace_backend_router,
         &params.task_id,
         params.role.trim(),
         params.trigger,

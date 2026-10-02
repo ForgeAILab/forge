@@ -1371,6 +1371,7 @@ dependencies = [
  "executors",
  "futures-util",
  "git",
+ "libc",
  "portable-pty",
  "reqwest",
  "serde",

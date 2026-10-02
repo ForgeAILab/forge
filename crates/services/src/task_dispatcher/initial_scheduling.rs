@@ -147,12 +147,13 @@ impl TaskDispatcher {
 
         let mut project_slots = None;
         let mut dispatched = 0;
-        for task in tasks {
+        for mut task in tasks {
             if self.is_stopped() {
                 break;
             }
             let task_id = task.id.clone();
             let result: Result<()> = async {
+                task = self.task_service.refresh_placement_dispatch_refusal(task.clone()).await?;
                 if deferred_dispatch::queued_recovery(&task).is_some() {
                     return Ok(());
                 }
@@ -274,6 +275,7 @@ impl TaskDispatcher {
                         );
                     }
                     Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                        if self.task_service.record_placement_dispatch_refusal(&task, &error).await? { return Ok(()); }
                         deferred_dispatch::record_dispatch_disposition(
                             &self.db,
                             &task,

@@ -1572,16 +1572,18 @@ impl TaskService {
         let state_config = state.config.clone();
         let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
-        let dispatch_ctx = load_agent_dispatch_context(
-            Arc::clone(&self.db),
-            &task.id,
-            role_name,
-            &task.status,
-            state_config,
-            Some(selection.execution_policy.as_str()),
-            &workflow,
-        )
-        .await?;
+        let dispatch_ctx =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role: role_name,
+                state_name: &task.status,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow: &workflow,
+            })
+            .await?;
         let (prompt, _selection) =
             build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
         let summary = prompt.execution_input(context.as_deref());

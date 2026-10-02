@@ -48,7 +48,9 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. } => true,
         ServiceError::DaemonUpgradeRequired { .. } => true,
-        ServiceError::PlacementUnavailable(error) => error.needs_daemon_upgrade(),
+        ServiceError::PlacementUnavailable(error) => {
+            error.needs_daemon_upgrade() || error.is_deterministic()
+        }
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
         // A slot held by a concurrently running execution frees itself the
         // moment that execution terminalises, and nothing about that clears a

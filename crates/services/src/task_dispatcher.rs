@@ -264,6 +264,7 @@ impl TaskDispatcher {
                 {
                     match crate::task_service::execution::cleanup_execution_plan_private_files(
                         &self.db,
+                        &self.task_service.workspace_backend_router(),
                         &task,
                         &execution_id,
                     )
@@ -294,7 +295,7 @@ impl TaskDispatcher {
                     }
                 }
                 task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                    &self.db, &task,
+                    &self.db, &self.task_service.workspace_backend_router(), &task,
                 )
                 .await
                 {

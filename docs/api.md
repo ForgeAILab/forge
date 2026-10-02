@@ -1120,19 +1120,20 @@ private plan path. `$FORGE_PLAN_PATH` is the supported
 plan-write contract for CLI agents. Managed Codex cannot write the surrounding
 Task directory; a CLI adapter without an OS sandbox may still have ambient
 filesystem ability to edit sibling files, so universal confinement is not
-claimed and direct sibling writes are outside this contract. The file broker
-also has the existing managed-daemon filesystem constraint: the API server and
-execution host must see the Task directory at the same absolute path through a
-shared workspace mount. Forge does not yet sync plan files to a daemon on a
-separate filesystem.
+claimed and direct sibling writes are outside this contract. Server-owned workspaces use the local file broker, including verified shared
+mounts. Daemon-owned workspaces resolve the canonical plan through their owner,
+send the seed in `execution.start.plan_text`, and return the private candidate
+in `execution.terminal.plan_text`; the server never opens the daemon's path.
+There is no workspace filesystem sync.
 
 When the execution ends — before it settles and before the next role is
 dispatched — Forge validates each report entry exactly as the native operations
 do and stores it with provenance taken from the execution row (never from the
-files). For either the native `task.plan` path or the CLI outbox path, Forge
-validates the plan candidate and freezes the exact bytes in host-owned staging
-before terminal settlement. Later outbox changes cannot alter that frozen
-candidate. A durable compare-and-swap claim tied to the execution, Task state
+files). For server-owned native and CLI execution, Forge validates the plan
+candidate and freezes the exact bytes in host-owned staging before terminal
+settlement. For daemon-owned CLI execution, the daemon validates and freezes
+those bytes in its terminal journal, and the server retains them in the winning
+terminal execution snapshot. Later outbox changes cannot alter either candidate. A durable compare-and-swap claim tied to the execution, Task state
 entry, and Project version then controls whether it may replace the canonical
 Task `plan.md`. On Unix, publication uses an atomic same-directory rename and
 Forge rejects candidates with additional hard links; on other platforms it
@@ -1140,8 +1141,9 @@ uses the portable replacement fallback and does not promise those two Unix
 properties. Neither agent interface publishes the canonical file directly.
 Stale, failed, cancelled, reviewer, symlinked, non-regular, oversized, or
 invalid UTF-8 candidates cannot replace it. A rejected plan remains in that
-execution's outbox for diagnosis; after successful staging and report
-ingestion, Forge removes the agent-writable outbox before settlement. Captured
+execution's outbox for diagnosis. Server-owned ingestion removes the writable
+outbox after successful staging; daemon-owned publication retains its rollback
+snapshot and cleans the outbox through the owner after workflow settlement. Captured
 artifact captions become `validation` worklog entries. Malformed report entries
 are skipped and logged, never fatal; each report file is bounded to 1 MiB and
 200 entries.
@@ -3908,11 +3910,42 @@ owner preparation result for that exact handle and generation.
 Task, Workspace, and Execution plan-artifact reads use the same owner router as
 dispatch. A daemon workspace handle is never interpreted as a server path.
 
+`execution.start.plan_text: string | null` carries the canonical plan for a
+plan-writing implementation role, falling back to `task.plan`; planners receive no seed. On daemon-owned placements the daemon prepares
+`FORGE_PLAN_PATH` in its own execution outbox. `execution.terminal.plan_text:
+string | null` carries the exact candidate alongside `outbox_entries`, under the
+same report identity, journal, digest, replay, and acknowledgement rules.
+An absent terminal plan field is omitted, preserving retained report payloads
+that contain no plan. Remote plans are limited to 128 KiB; capture failures become explicit failed terminal
+reports. The server stores a successful candidate in private execution artifact storage and publishes through its owner after acquiring the existing publication
+claim. `workspace.reset.operation` supports `publish_plan { execution_id,
+content }`, `restore_plan { execution_id }`, and `discard_plan { execution_id }`.
+These operations retain owner/generation/HEAD fencing and private rollback
+snapshots. They can settle while another CLI turn runs because they affect
+sibling artifacts and the completed execution's private files.
+Candidates are redacted against Project environment values and stored in the
+private `execution_plan_transport` table, never executor configuration snapshots,
+Execution API responses or receipt bodies. Receipts contain only the digest and
+byte length. Empty, checklist-free and unchanged-seed candidates use the ordinary
+workflow guard rejection; oversized candidates fail terminally and are acknowledged.
+Publication failures persist exponential backoff and a visible wait annotation;
+unreachable owners use the durable `runtime_offline` owner wait. Plan operations
+wait behind running owner checks, and discard of missing/cleaned state succeeds.
+
+Plan-writing roles require `execution.plan_transport`; a revision-3 owner that
+omits it is refused at placement with `capability_missing`, before an Execution
+exists. Dispatcher refusals name the machine and missing capability, remain
+quiescent until eligibility changes, and clear automatically when a machine
+becomes eligible. Revision-3 daemons without this capability continue reviewer,
+interactive, server-owned shared-mount, filesystem and PTY work.
+Server-owned and verified shared-mount plan files retain their layout and
+1 MiB size limit.
+
 ### Workspace daemon protocol
 
 Protocol revision 3 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
-Revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Revision-1 and revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
 automatically after the daemon upgrade. Existing placements disconnect
 and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
@@ -3928,7 +3961,7 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.diff` | Read diffs and exact reviewer evidence |
 | `workspace.read` | Read bounded artifacts, Git evidence, and owner-local paths |
 | `workspace.merge` | Direct merge into the verified primary checkout |
-| `workspace.reset` | Reset the workspace or perform typed asset and review-checkout operations |
+| `workspace.reset` | Reset the workspace or perform typed asset, review-checkout, and plan publication/restore/discard operations |
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
@@ -3946,8 +3979,8 @@ descendants retain an output pipe returns bytes read before the two-second drain
 limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
 of size truncation. These booleans default to false when absent.
 
-The single daemon journal retains terminal reports with bounded worklog/evidence
-outbox entries, operation results, and cleanup acknowledgements. Revision 3 uses
+The single daemon journal retains terminal reports with bounded plan/worklog/evidence
+outbox content, operation results, and cleanup acknowledgements. Revision 3 uses
 `journal.ack { entry_id }`. Retained terminal and cleanup results replay after
 reconnect until the server durably records their result and acknowledges it.
 Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt

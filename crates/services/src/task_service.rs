@@ -62,6 +62,7 @@ mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
 mod move_task;
+mod placement_refusal;
 pub(crate) mod project_agent_workspace;
 mod proposal;
 mod reorder_subtasks;
@@ -1509,27 +1510,28 @@ impl TaskService {
         } else {
             "failed"
         });
-        let (status, stop_reason, stopped_by, stopped_at, terminal_error) = match outcome {
-            "completed" => (ExecutionStatus::Completed, None, None, None, None),
-            "cancelled" => (
-                ExecutionStatus::Cancelled,
-                Some(db::StopReason::ExecutorCancelled),
-                Some(Actor::system(api_types::SystemComponent::Executor).display()),
-                Some(notification.ts.clone()),
-                None,
-            ),
-            _ => (
-                ExecutionStatus::Failed,
-                Some(db::StopReason::ExecutorFailed),
-                Some(Actor::system(api_types::SystemComponent::Executor).display()),
-                Some(notification.ts.clone()),
-                Some(remote_terminal_error_message(
-                    notification.exit_code,
-                    signal,
-                    error,
-                )),
-            ),
-        };
+        let (mut status, mut stop_reason, mut stopped_by, mut stopped_at, mut terminal_error) =
+            match outcome {
+                "completed" => (ExecutionStatus::Completed, None, None, None, None),
+                "cancelled" => (
+                    ExecutionStatus::Cancelled,
+                    Some(db::StopReason::ExecutorCancelled),
+                    Some(Actor::system(api_types::SystemComponent::Executor).display()),
+                    Some(notification.ts.clone()),
+                    None,
+                ),
+                _ => (
+                    ExecutionStatus::Failed,
+                    Some(db::StopReason::ExecutorFailed),
+                    Some(Actor::system(api_types::SystemComponent::Executor).display()),
+                    Some(notification.ts.clone()),
+                    Some(remote_terminal_error_message(
+                        notification.exit_code,
+                        signal,
+                        error,
+                    )),
+                ),
+            };
 
         let executor_unavailable = notification.failure_class
             == Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable);
@@ -1557,6 +1559,41 @@ impl TaskService {
             )?,
             None => None,
         };
+
+        let environment =
+            match TaskRepo::get_by_id(&*self.db, &current_execution.task_id, true).await? {
+                Some(task) => self.project_environment(&task.project_id).await?.env,
+                None => Default::default(),
+            };
+        let plan = if executors::task_role_can_write_plan(Some(&current_execution.role)) {
+            Some(
+                crate::plan_artifact::transport::candidate(
+                    &self.db,
+                    &current_execution,
+                    notification.plan_text.as_deref(),
+                    &environment,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if status == ExecutionStatus::Completed
+            && notification
+                .plan_text
+                .as_ref()
+                .is_some_and(|text| text.len() as u64 > api_types::MAX_EXECUTION_PLAN_BYTES)
+        {
+            status = ExecutionStatus::Failed;
+            stop_reason = Some(db::StopReason::ExecutorFailed);
+            stopped_by = Some(Actor::system(api_types::SystemComponent::Executor).display());
+            stopped_at = Some(notification.ts.clone());
+            terminal_error = Some(format!(
+                "transported execution plan exceeds the {}-byte limit: {} bytes",
+                api_types::MAX_EXECUTION_PLAN_BYTES,
+                notification.plan_text.as_ref().unwrap().len()
+            ));
+        }
 
         let remote_reports = remote_usage_reports(&notification.usage_reports);
         let snapshot_value = current_execution
@@ -1678,41 +1715,45 @@ impl TaskService {
             }
             let attempt = ExecutionRepo::terminalize_with_ledger_and_invocations(
                 &*self.db,
-                execution::ledger::terminal_with_late_ledger(
-                    TerminalizeExecution {
-                        execution_id: notification.execution_id.clone(),
-                        expected_version: terminal_candidate.execution_version,
-                        lease_owner: Some(lease_owner.clone()),
-                        status: status.clone(),
-                        stop_reason: stop_reason.clone().map(Some),
-                        stopped_by: stopped_by.clone().map(Some),
-                        stopped_at: stopped_at.clone().map(Some),
-                        resume_policy: terminal_resume_policy.clone(),
-                        agent_session_id: notification.agent_session_id.clone().map(Some),
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        last_progress_at: None,
-                        summary: notification.summary.clone().map(Some),
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: notification.after_sha.clone().map(Some),
-                        error: terminal_error.clone().map(Some),
-                        executor_config_snapshot_json: snapshot_update.clone().map(Some),
-                        updated_at: terminal_updated_at.clone(),
-                        actor_type: "daemon".to_owned(),
-                        actor_id: Some(lease_owner.clone()),
-                        correlation_id: Some(format!(
-                            "remote-execution:{}",
-                            notification.execution_id
-                        )),
-                        causation_id: None,
-                        causation_depth: 0,
-                        lease_disposition: ExecutionLeaseDisposition::Revoke,
-                    },
-                    usage_settlements.clone(),
-                    Some(notification.terminal_report_id.clone()),
-                    Some(terminal_report_digest.clone()),
-                ),
+                {
+                    let mut input = execution::ledger::terminal_with_late_ledger(
+                        TerminalizeExecution {
+                            execution_id: notification.execution_id.clone(),
+                            expected_version: terminal_candidate.execution_version,
+                            lease_owner: Some(lease_owner.clone()),
+                            status: status.clone(),
+                            stop_reason: stop_reason.clone().map(Some),
+                            stopped_by: stopped_by.clone().map(Some),
+                            stopped_at: stopped_at.clone().map(Some),
+                            resume_policy: terminal_resume_policy.clone(),
+                            agent_session_id: notification.agent_session_id.clone().map(Some),
+                            agent_message_id: None,
+                            last_activity_at: None,
+                            last_progress_at: None,
+                            summary: notification.summary.clone().map(Some),
+                            logs_path: None,
+                            before_sha: None,
+                            after_sha: notification.after_sha.clone().map(Some),
+                            error: terminal_error.clone().map(Some),
+                            executor_config_snapshot_json: snapshot_update.clone().map(Some),
+                            updated_at: terminal_updated_at.clone(),
+                            actor_type: "daemon".to_owned(),
+                            actor_id: Some(lease_owner.clone()),
+                            correlation_id: Some(format!(
+                                "remote-execution:{}",
+                                notification.execution_id
+                            )),
+                            causation_id: None,
+                            causation_depth: 0,
+                            lease_disposition: ExecutionLeaseDisposition::Revoke,
+                        },
+                        usage_settlements.clone(),
+                        Some(notification.terminal_report_id.clone()),
+                        Some(terminal_report_digest.clone()),
+                    );
+                    input.plan = plan.clone();
+                    input
+                },
                 remote_invocations.clone(),
             )
             .await?;

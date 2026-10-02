@@ -11,6 +11,7 @@ pub mod daemon_fs;
 pub mod daemon_link;
 mod daemon_outbox;
 pub mod daemon_persistence;
+mod daemon_plan;
 pub mod daemon_runtime;
 pub mod daemon_workspace;
 pub mod embedded;

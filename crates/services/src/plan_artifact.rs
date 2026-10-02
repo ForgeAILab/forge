@@ -10,6 +10,8 @@ use crate::workspace_backend::{ResolvedWorkspace, WorkspaceBackendError, Workspa
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{SqliteDb, WorkspaceRepo};
 
+pub(crate) mod transport;
+
 pub const DEFAULT_PLAN_ARTIFACT_PATH: &str = executors::OUTBOX_PLAN_FILE;
 // Both delivery channels render the same planning doctrine.
 macro_rules! plan_instruction {
@@ -112,6 +114,49 @@ impl fmt::Display for PlanArtifactError {
     }
 }
 
+impl PlanArtifactError {
+    pub(crate) fn needs_placement_check(&self) -> bool {
+        match self {
+            Self::BackendError(
+                WorkspaceBackendError::OwnerUnsupported { .. }
+                | WorkspaceBackendError::WrongOwner { .. }
+                | WorkspaceBackendError::StaleGeneration { .. },
+            ) => true,
+            Self::BackendError(WorkspaceBackendError::Other(error)) => {
+                matches!(
+                    error.as_ref(),
+                    crate::ServiceError::DaemonUpgradeRequired { .. }
+                ) || matches!(error.as_ref(), crate::ServiceError::InvalidOperation { message }
+                    if message.starts_with(api_types::UNSUPPORTED_METHOD))
+            }
+            _ => false,
+        }
+    }
+    /// Owner transport refusals must retain their classification so dispatch
+    /// can queue an outage or surface an upgrade instead of parking silently.
+    pub(crate) fn into_service_error(self, context: &str) -> crate::ServiceError {
+        use crate::ServiceError;
+        match self {
+            Self::DbError(error) => error.into(),
+            Self::BackendError(WorkspaceBackendError::Other(error)) => match *error {
+                error @ (ServiceError::DaemonUnavailable { .. }
+                | ServiceError::DaemonTimeout { .. }
+                | ServiceError::DaemonUpgradeRequired { .. }
+                | ServiceError::Db(_)) => error,
+                ServiceError::InvalidOperation { message } => {
+                    ServiceError::invalid_operation(format!("{context}: {message}"))
+                }
+                error => ServiceError::invalid_operation(format!("{context}: {error}")),
+            },
+            Self::BackendError(
+                error @ (WorkspaceBackendError::OwnerUnreachable { .. }
+                | WorkspaceBackendError::RpcTimeoutBeforeStart { .. }),
+            ) => error.into(),
+            error => ServiceError::invalid_operation(format!("{context}: {error}")),
+        }
+    }
+}
+
 impl Error for PlanArtifactError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -132,6 +177,12 @@ impl From<io::Error> for PlanArtifactError {
 impl From<db::DbError> for PlanArtifactError {
     fn from(error: db::DbError) -> Self {
         Self::DbError(error)
+    }
+}
+
+impl From<crate::ServiceError> for PlanArtifactError {
+    fn from(error: crate::ServiceError) -> Self {
+        Self::from(WorkspaceBackendError::from(error))
     }
 }
 
@@ -195,27 +246,11 @@ pub async fn read_plan_with_router(
 pub(crate) async fn read_plan_for_resolved_workspace(
     resolved: &ResolvedWorkspace,
 ) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
-    let artifact = match resolved
-        .backend
-        .read(
-            &resolved.placement,
-            "../plan.md",
-            MAX_PLAN_ARTIFACT_SIZE_BYTES,
-        )
+    let artifact = read_plan_text_for_resolved_workspace(resolved)
         .await
-    {
-        Ok(bytes) => String::from_utf8(bytes)
-            .map(|content| parse_plan_markdown(&content))
-            .map_err(|_| {
-                PlanArtifactError::IoError(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stream did not contain valid UTF-8",
-                ))
-            }),
-        Err(error) => Err(error.into()),
-    };
+        .map(|content| content.map(|text| parse_plan_markdown(&text)));
     match artifact {
-        Ok(artifact) => {
+        Ok(Some(artifact)) => {
             let source_path = match resolved.placement.owner_kind {
                 db::PlacementOwnerKind::Server => {
                     default_plan_artifact_path(&resolved.embedded_path()?)
@@ -229,8 +264,161 @@ pub(crate) async fn read_plan_for_resolved_workspace(
                 to_plan_artifact_detail(&artifact, Some(source_path), None),
             )))
         }
-        Err(PlanArtifactError::NotFound) => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// Canonical plan text always comes through the recorded owner.
+pub async fn read_plan_text_with_router(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    workspace_id: &str,
+) -> Result<Option<String>, PlanArtifactError> {
+    let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+        .await?
+        .ok_or_else(|| PlanArtifactError::WorkspaceNotFound {
+            workspace_id: workspace_id.into(),
+        })?;
+    let resolved = router.resolve(db, &workspace).await?;
+    read_plan_text_for_resolved_workspace(&resolved).await
+}
+
+pub(crate) async fn read_plan_text_for_resolved_workspace(
+    resolved: &ResolvedWorkspace,
+) -> Result<Option<String>, PlanArtifactError> {
+    if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+        return read_canonical_plan_text(&resolved.embedded_path()?);
+    }
+    match resolved
+        .backend
+        .read(
+            &resolved.placement,
+            "../plan.md",
+            MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        )
+        .await
+    {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            PlanArtifactError::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ))
+        }),
+        Err(error) => match PlanArtifactError::from(error) {
+            PlanArtifactError::NotFound => Ok(None),
+            error => Err(error),
+        },
+    }
+}
+
+/// Owner-aware publication boundary. Local/shared-mount files retain their
+/// existing layout; daemon files are mutated only by fenced owner operations.
+pub(crate) struct ExecutionPlan<'a> {
+    db: &'a SqliteDb,
+    resolved: &'a ResolvedWorkspace,
+}
+impl<'a> ExecutionPlan<'a> {
+    pub(crate) fn new(db: &'a SqliteDb, resolved: &'a ResolvedWorkspace) -> Self {
+        Self { db, resolved }
+    }
+    async fn operation(
+        &self,
+        execution_id: &str,
+        name: &str,
+        operation: api_types::WorkspaceOwnerOperation,
+    ) -> Result<(), PlanArtifactError> {
+        transport::retry_due(self.db, execution_id, name).await?;
+        match self.resolved.apply_plan_operation(operation).await {
+            Ok(_) => transport::clear_retry(self.db, execution_id).await?,
+            Err(error) => {
+                transport::record_retry(
+                    self.db,
+                    execution_id,
+                    name,
+                    self.resolved
+                        .placement
+                        .daemon_id
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    &error,
+                )
+                .await?;
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn rejected_candidate(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return Ok(false);
+        }
+        let (content, issue) = transport::stored(self.db, execution_id).await?;
+        Ok(issue.is_some() || content.is_some_and(|text| !executors::plan_has_checklist(&text)))
+    }
+    pub(crate) async fn publish(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<bool, PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return publish_staged_execution_plan(&self.resolved.embedded_path()?, &execution.id);
+        }
+        let (content, issue) = transport::stored(self.db, &execution.id).await?;
+        let Some(content) =
+            content.filter(|content| issue.is_none() && executors::plan_has_checklist(content))
+        else {
+            return Ok(false);
+        };
+        self.operation(
+            &execution.id,
+            "publish",
+            api_types::WorkspaceOwnerOperation::PublishPlan {
+                execution_id: execution.id.clone(),
+                content,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+    pub(crate) async fn restore(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return restore_plan_before_abandon(&self.resolved.embedded_path()?, execution_id);
+        }
+        self.operation(
+            execution_id,
+            "restore",
+            api_types::WorkspaceOwnerOperation::RestorePlan {
+                execution_id: execution_id.into(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+    pub(crate) async fn discard(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let path = self.resolved.embedded_path()?;
+            discard_staged_execution_plan(&path, execution_id)?;
+            if let Some(outbox) = executors::execution_outbox_path(&path, execution_id) {
+                match fs::remove_dir_all(outbox) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(PlanArtifactError::IoError(error)),
+                }
+            }
+            return Ok(());
+        }
+        self.operation(
+            execution_id,
+            "discard",
+            api_types::WorkspaceOwnerOperation::DiscardPlan {
+                execution_id: execution_id.into(),
+            },
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -315,7 +503,7 @@ pub fn read_canonical_plan_text(worktree_root: &Path) -> Result<Option<String>, 
 pub fn prepare_execution_plan_outbox(
     worktree_root: &Path,
     execution_id: &str,
-    seed_existing_plan: bool,
+    role: &str,
     fallback_plan: Option<&str>,
 ) -> Result<bool, PlanArtifactError> {
     let outbox = executors::prepare_execution_outbox(worktree_root, execution_id)
@@ -328,30 +516,28 @@ pub fn prepare_execution_plan_outbox(
         Err(error) => return Err(error),
     }
 
-    if !seed_existing_plan {
+    if !matches!(role, "worker" | "coder" | "executor") {
         return Ok(false);
     }
 
     let canonical = default_plan_artifact_path(worktree_root);
     let task_root = worktree_root.parent().unwrap_or(worktree_root);
-    let content = match read_bounded_plan_text(&canonical, task_root, false) {
-        Ok(content) => content,
-        Err(PlanArtifactError::NotFound) => {
-            match fallback_plan.filter(|content| !parse_plan_markdown(content).items.is_empty()) {
-                Some(content) if content.len() as u64 <= MAX_PLAN_ARTIFACT_SIZE_BYTES => {
-                    content.to_owned()
-                }
-                Some(content) => {
-                    return Err(PlanArtifactError::FileTooLarge {
-                        size: content.len() as u64,
-                        max: MAX_PLAN_ARTIFACT_SIZE_BYTES,
-                    });
-                }
-                None => return Ok(false),
-            }
-        }
+    let canonical_text = match read_bounded_plan_text(&canonical, task_root, false) {
+        Ok(content) => Some(content),
+        Err(PlanArtifactError::NotFound) => None,
         Err(error) => return Err(error),
     };
+    let Some(content) =
+        executors::execution_plan_seed(Some(role), canonical_text.as_deref(), fallback_plan)
+    else {
+        return Ok(false);
+    };
+    if content.len() as u64 > MAX_PLAN_ARTIFACT_SIZE_BYTES {
+        return Err(PlanArtifactError::FileTooLarge {
+            size: content.len() as u64,
+            max: MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        });
+    }
     install_private_file_no_replace(&outbox_plan, content.as_bytes())?;
     Ok(true)
 }
@@ -1085,6 +1271,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_plan_read_preserves_transport_refusals() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::Other(Box::new(
+            crate::ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+        )));
+        assert!(error.needs_placement_check());
+        assert!(
+            matches!(error.into_service_error("canonical plan artifact is unreadable"), crate::ServiceError::DaemonUpgradeRequired { daemon_id } if daemon_id == "owner")
+        );
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(matches!(
+            error.into_service_error("canonical plan artifact is unreadable"),
+            crate::ServiceError::DaemonUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn unsupported_plan_owner_reaches_placement_checks() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnsupported {
+            owner_kind: db::PlacementOwnerKind::Daemon,
+        });
+        assert!(error.needs_placement_check());
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(!error.needs_placement_check());
+    }
+
+    #[test]
     fn valid_nested_checklist_with_mixed_levels() {
         let content = "\
 # Plan
@@ -1126,6 +1344,35 @@ mod tests {
             ]
         );
         assert!(artifact.warnings.is_empty());
+    }
+
+    #[test]
+    fn owner_seed_policy_preserves_server_files_and_never_seeds_planners() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        for (id, role, text) in [
+            ("planner-seed", "planner", "- [ ] old"),
+            ("prose-seed", "coder", "prose"),
+            ("empty-seed", "worker", ""),
+        ] {
+            assert!(!prepare_execution_plan_outbox(&worktree, id, role, Some(text)).unwrap());
+            let outbox = executors::execution_outbox_path(&worktree, id).unwrap();
+            assert!(!outbox.join("plan.md").exists());
+        }
+        assert!(prepare_execution_plan_outbox(
+            &worktree,
+            "coder-seed",
+            "coder",
+            Some("- [ ] original\n")
+        )
+        .unwrap());
+        let outbox = executors::execution_outbox_path(&worktree, "coder-seed").unwrap();
+        assert_eq!(
+            fs::read_to_string(outbox.join("plan.md")).unwrap(),
+            "- [ ] original\n"
+        );
+        assert!(!temp.path().join(".forge-plan-staging").exists());
     }
 
     #[test]
@@ -1252,7 +1499,7 @@ mod tests {
             tempdir.path().join(".forge-outbox").join("exec-1"),
         )
         .expect("execution symlink");
-        let execution_error = prepare_execution_plan_outbox(&worktree, "exec-1", false, None)
+        let execution_error = prepare_execution_plan_outbox(&worktree, "exec-1", "planner", None)
             .expect_err("symlinked execution fails");
         assert!(matches!(
             execution_error,
@@ -1290,7 +1537,7 @@ mod tests {
         let seeded = prepare_execution_plan_outbox(
             &worktree,
             "exec-1",
-            true,
+            "coder",
             Some("- [ ] fallback must not replace the candidate\n"),
         )
         .expect("recover seeded outbox");
@@ -1324,7 +1571,7 @@ mod tests {
         let seeded = prepare_execution_plan_outbox(
             &worktree,
             "exec-1",
-            true,
+            "coder",
             Some("- [ ] authoritative fallback\n"),
         )
         .expect("recover and seed outbox");

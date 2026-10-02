@@ -1819,6 +1819,7 @@ pub(crate) fn terminal_with_ledger(
     terminal_report_digest: Option<String>,
 ) -> TerminalizeExecutionWithLedger {
     TerminalizeExecutionWithLedger {
+        plan: None,
         terminal,
         settlements,
         terminal_report_id,
