@@ -17,3 +17,19 @@ CREATE TABLE event_processing_lease (
     PRIMARY KEY (consumer_name, event_sequence)
 );
 
+
+CREATE TABLE attention_consumer_health (
+    consumer_name      TEXT PRIMARY KEY,
+    last_sequence      INTEGER NOT NULL DEFAULT 0,
+    last_started_at    TEXT,
+    last_success_at    TEXT,
+    last_error_at      TEXT,
+    last_error_code    TEXT,
+    last_error_message TEXT,
+    lease_owner        TEXT,
+    lease_until        TEXT,
+    processed_events   INTEGER NOT NULL DEFAULT 0,
+    version            INTEGER NOT NULL DEFAULT 1,
+    updated_at         TEXT NOT NULL
+);
+

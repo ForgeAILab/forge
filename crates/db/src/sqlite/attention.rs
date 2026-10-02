@@ -170,59 +170,6 @@ impl AttentionRepo for SqliteDb {
         tx.commit().await?;
         Ok(result)
     }
-
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>> {
-        sqlx::query("SELECT * FROM attention_consumer_health WHERE consumer_name = ?")
-            .bind(consumer_name)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_attention_consumer_health)
-            .transpose()
-    }
-
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth> {
-        sqlx::query(
-            "INSERT INTO attention_consumer_health (
-                consumer_name, last_sequence, last_started_at, last_success_at,
-                last_error_at, last_error_code, last_error_message, lease_owner,
-                lease_until, processed_events, version, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(consumer_name) DO UPDATE SET
-                last_sequence = MAX(attention_consumer_health.last_sequence, excluded.last_sequence),
-                last_started_at = COALESCE(excluded.last_started_at, attention_consumer_health.last_started_at),
-                last_success_at = COALESCE(excluded.last_success_at, attention_consumer_health.last_success_at),
-                last_error_at = excluded.last_error_at,
-                last_error_code = excluded.last_error_code,
-                last_error_message = excluded.last_error_message,
-                lease_owner = excluded.lease_owner,
-                lease_until = excluded.lease_until,
-                processed_events = attention_consumer_health.processed_events + excluded.processed_events,
-                version = attention_consumer_health.version + 1,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.last_sequence)
-        .bind(input.last_started_at.as_deref())
-        .bind(input.last_success_at.as_deref())
-        .bind(input.last_error_at.as_deref())
-        .bind(input.last_error_code.as_deref())
-        .bind(input.last_error_message.as_deref())
-        .bind(input.lease_owner.as_deref())
-        .bind(input.lease_until.as_deref())
-        .bind(input.processed_events_delta)
-        .bind(&input.updated_at)
-        .execute(&self.pool)
-        .await?;
-        self.get_attention_consumer_health(&input.consumer_name)
-            .await?
-            .ok_or(DbError::NotFound)
-    }
 }
 
 fn map_attention_projection(row: SqliteRow) -> Result<AttentionProjection> {
@@ -247,23 +194,6 @@ fn map_attention_projection(row: SqliteRow) -> Result<AttentionProjection> {
         updated_by_user_id: row.try_get("updated_by_user_id")?,
         recommended_action: row.try_get("recommended_action")?,
         source_sequence: row.try_get("source_sequence")?,
-    })
-}
-
-fn map_attention_consumer_health(row: SqliteRow) -> Result<AttentionConsumerHealth> {
-    Ok(AttentionConsumerHealth {
-        consumer_name: row.try_get("consumer_name")?,
-        last_sequence: row.try_get("last_sequence")?,
-        last_started_at: row.try_get("last_started_at")?,
-        last_success_at: row.try_get("last_success_at")?,
-        last_error_at: row.try_get("last_error_at")?,
-        last_error_code: row.try_get("last_error_code")?,
-        last_error_message: row.try_get("last_error_message")?,
-        lease_owner: row.try_get("lease_owner")?,
-        lease_until: row.try_get("lease_until")?,
-        processed_events: row.try_get("processed_events")?,
-        version: row.try_get("version")?,
-        updated_at: row.try_get("updated_at")?,
     })
 }
 

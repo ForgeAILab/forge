@@ -11,33 +11,66 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::state::AppState;
 
+const MAX_REPLAY_EVENTS: i64 = 1_000;
+const REPLAY_PAGE_SIZE: i64 = 100;
+const DURABLE_ID_PREFIX: &str = "domain-event:";
+
+enum Replay {
+    None,
+    Events { after: i64, through: i64 },
+    Resync { reason: &'static str },
+}
+
 pub async fn stream_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    // Subscribe before taking the ledger snapshot: live appends cannot fall in
-    // the seam between replay and subscription. Only generic durable frames in
-    // that snapshot are filtered out of the live stream.
+    // Register before the snapshot so an append during replay is still live.
+    // Plain and unrecognized connects are live-only and never read the ledger.
     let receiver = state.event_bus.subscribe();
-    let after = if let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
-        state
-            .db
-            .get_event(id)
-            .await
-            .ok()
-            .flatten()
-            .map_or(0, |event| event.sequence)
-    } else {
-        0
+    let resume = headers
+        .get("last-event-id")
+        .and_then(|id| id.to_str().ok())
+        .and_then(durable_sequence);
+    let (replay, replay_through) = match resume {
+        None => (Replay::None, None),
+        Some(after) => match state.db.domain_event_head().await {
+            Ok(through) => {
+                let replay = match state
+                    .db
+                    .domain_event_replay_exceeds_limit(after, through, MAX_REPLAY_EVENTS)
+                    .await
+                {
+                    Ok(false) => Replay::Events { after, through },
+                    Ok(true) => Replay::Resync {
+                        reason: "replay limit exceeded",
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "SSE replay bound query failed");
+                        Replay::Resync {
+                            reason: "ledger replay failed",
+                        }
+                    }
+                };
+                (replay, Some(through))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "SSE replay snapshot failed");
+                (
+                    Replay::Resync {
+                        reason: "ledger replay failed",
+                    },
+                    None,
+                )
+            }
+        },
     };
-    let through = state.db.domain_event_head().await.unwrap_or(0);
-    let replay = replay_events(Arc::clone(&state.db), after, through);
+    let replay = replay_events(Arc::clone(&state.db), replay);
     let mut shutdown = state.shutdown_signal.subscribe();
     let shutdown_requested = async move {
         if *shutdown.borrow_and_update() {
             return;
         }
-
         while shutdown.changed().await.is_ok() {
             if *shutdown.borrow_and_update() {
                 return;
@@ -45,33 +78,19 @@ pub async fn stream_events(
         }
     };
 
-    // One canonical envelope per frame (D20): the frame carries no SSE `event:`
-    // name and the payload's `event_type` is the sole routing discriminator.
-    // A named frame is delivered only to a listener registered under that exact
-    // name, never to `onmessage`, so naming frames here meant the web client —
-    // which routes every frame through `onmessage` — saw none of them and the
-    // whole UI went stale until a reload.
-    let stream =
-        BroadcastStream::new(receiver).filter_map(move |event| match event {
-            Ok(event) => {
-                if matches!(&event.context, events::EventContext::DomainEventCommitted { sequence, .. } if *sequence <= through) { return None; }
-                let entity_id = event.entity_id.clone();
-                // EventContext is flattened and Serialize-derived, so review/cleanup/merge
-                // contexts pass through SSE without variant-specific routing here.
-                let data = serde_json::to_string(&event).ok()?;
-                Some(Ok(Event::default().id(entity_id).data(data)))
+    // Default message frames retain the canonical JSON envelope. Clients route
+    // payload.event_type; SSE IDs are transport cursors, not entity references.
+    let stream = BroadcastStream::new(receiver).filter_map(move |event| match event {
+        Ok(event) => {
+            if matches!(&event.context, events::EventContext::DomainEventCommitted { sequence, .. }
+                if replay_through.is_some_and(|through| *sequence <= through))
+            {
+                return None;
             }
-            Err(error) => {
-                let event_type = "events.resync_required";
-                let data = json!({
-                    "event_type": event_type,
-                    "entity_id": event_type,
-                    "timestamp": events::event_timestamp(),
-                    "reason": error.to_string(),
-                });
-                Some(Ok(Event::default().id(event_type).data(data.to_string())))
-            }
-        });
+            frame(event).map(Ok)
+        }
+        Err(error) => Some(Ok(resync_frame(&error.to_string()))),
+    });
     Sse::new(futures_util::StreamExt::take_until(
         tokio_stream::StreamExt::chain(replay, stream),
         shutdown_requested,
@@ -79,42 +98,79 @@ pub async fn stream_events(
     .keep_alive(KeepAlive::default())
 }
 
+fn durable_sequence(id: &str) -> Option<i64> {
+    let sequence = id.strip_prefix(DURABLE_ID_PREFIX)?;
+    if sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    sequence.parse().ok()
+}
+
+fn frame(event: events::ForgeEvent) -> Option<Event> {
+    let id = match &event.context {
+        events::EventContext::DomainEventCommitted { sequence, .. } => {
+            format!("{DURABLE_ID_PREFIX}{sequence}")
+        }
+        _ => format!("entity:{}", event.entity_id),
+    };
+    Some(
+        Event::default()
+            .id(id)
+            .data(serde_json::to_string(&event).ok()?),
+    )
+}
+
+fn resync_frame(reason: &str) -> Event {
+    let data = json!({ "event_type": "events.resync_required", "entity_id": "events.resync_required", "timestamp": events::event_timestamp(), "reason": reason });
+    Event::default()
+        .id("entity:events.resync_required")
+        .data(data.to_string())
+}
+
 fn replay_events(
     db: Arc<SqliteDb>,
-    after: i64,
-    through: i64,
+    replay: Replay,
 ) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+    // Preflight seeks at most 1,001 sequences; the stream keeps just one page.
     futures_util::stream::unfold(
-        (db, after, through, VecDeque::new(), false),
-        |(db, mut position, through, mut pending, failed)| async move {
-            if failed {
-                return None;
-            }
-            if pending.is_empty() && position < through {
-                match db.list_events_after(position, 100).await {
-                    Ok(rows) => {
-                        pending.extend(rows.into_iter().take_while(|row| row.sequence <= through))
+        (db, replay, VecDeque::new(), MAX_REPLAY_EVENTS),
+        |(db, replay, mut pending, mut remaining)| async move {
+            match replay {
+                Replay::None => None,
+                Replay::Resync { reason } => {
+                    Some((Ok(resync_frame(reason)), (db, Replay::None, pending, 0)))
+                }
+                Replay::Events { after, through } => {
+                    if remaining == 0 {
+                        return None;
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "SSE ledger replay failed");
-                        let data = json!({ "event_type": "events.resync_required", "entity_id": "events.resync_required", "timestamp": events::event_timestamp(), "reason": "ledger replay failed" });
-                        return Some((
-                            Ok(Event::default()
-                                .id("events.resync_required")
-                                .data(data.to_string())),
-                            (db, through, through, pending, true),
-                        ));
+                    if pending.is_empty() && after < through {
+                        match db
+                            .list_events_after(after, remaining.min(REPLAY_PAGE_SIZE))
+                            .await
+                        {
+                            Ok(rows) => pending
+                                .extend(rows.into_iter().take_while(|row| row.sequence <= through)),
+                            Err(error) => {
+                                tracing::warn!(%error, "SSE ledger replay failed");
+                                return Some((
+                                    Ok(resync_frame("ledger replay failed")),
+                                    (db, Replay::None, pending, 0),
+                                ));
+                            }
+                        }
                     }
+                    let event = pending.pop_front()?;
+                    let after = event.sequence;
+                    remaining -= 1;
+                    let frame = frame(services::DomainEventService::committed_frame(&event))
+                        .expect("committed event envelope serializes");
+                    Some((
+                        Ok(frame),
+                        (db, Replay::Events { after, through }, pending, remaining),
+                    ))
                 }
             }
-            let event = pending.pop_front()?;
-            position = event.sequence;
-            let frame = services::DomainEventService::committed_frame(&event);
-            let data = serde_json::to_string(&frame).expect("committed event envelope serializes");
-            Some((
-                Ok(Event::default().id(&event.id).data(data)),
-                (db, position, through, pending, false),
-            ))
         },
     )
 }

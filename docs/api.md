@@ -3716,17 +3716,32 @@ Every committed `domain_event` row is also relayed as a
 "scope_id": "..." }`; the frame's own `entity_id` is the domain event id.
 
 The relay is a read-only in-memory tail, not a durable consumer, and is omitted
-from operator `event_consumers`. Each connection subscribes to the live bus before
-capturing a ledger head, replays committed rows through that snapshot in sequence
-order, then streams live events with overlapping durable frames filtered out.
-A `Last-Event-ID` matching a domain-event ID resumes after that row. Missing or
-bus-only entity IDs replay the ledger from its beginning. This preserves downtime
-event delivery without a durable relay cursor. Bus-only typed notifications remain
-live-only. Frame IDs and committed-envelope fields are unchanged; no numeric
-sequence query parameter is introduced. Direct publisher plus relay invalidation
-may still repeat a newly committed event, as before. Bus overflow requests a
-client resync with `events.resync_required`.
+from operator `event_consumers`. Plain connections are live-only and do not read
+historical ledger rows. Frame IDs are transport identifiers:
 
+- Durable `domain_event.committed` frames use `id: domain-event:<sequence>`.
+- Bus-only frames use `id: entity:<entity_id>` and are not resumable.
+- JSON `entity_id` and the other committed-envelope fields retain their meaning.
+
+A `Last-Event-ID` in the durable form, with a nonnegative decimal sequence that
+fits SQLite's signed 64-bit sequence range, requests replay after that sequence.
+Missing, entity-shaped, old event-ID-shaped, or malformed IDs produce live-only
+connections. No numeric sequence query parameter is introduced.
+
+Resume subscribes to the live bus before capturing a ledger head. If at most
+1,000 rows were missed, it reads them in 100-row pages and emits them in sequence
+order through that snapshot, filtering overlapping durable live frames. Appends
+beyond the snapshot continue live. If more than 1,000 rows were missed, it emits
+exactly one `events.resync_required` frame with `reason: "replay limit exceeded"`,
+emits no replay frames, and continues live. The cap check visits at most 1,001
+sequence keys rather than counting or loading the whole backlog. Ledger-read
+failures also request resync. Bus-only events remain live-only; bus overflow still
+requests resync. Direct publisher plus relay invalidation may repeat a newly
+committed event, as before.
+
+The web client routes `event.data` and does not inspect `lastEventId`; forge-ctl
+also routes JSON payloads rather than frame IDs. MCP's stream is separate from
+`GET /api/v1/events`. Their payload handling is unaffected by the ID namespace.
 
 | Event | Context payload |
 |-------|-----------------|
@@ -4111,7 +4126,8 @@ into a known-tool `result` and do not use the orchestration envelope.
 ## Server-Sent Events
 
 `GET /api/v1/events` streams `ForgeEvent` payloads from the in-memory event
-bus. Useful for the web UI and for long-running scripts that want to react to
+bus. Plain connections are live-only; durable resume IDs and the 1,000-event
+replay cap are described in [SSE events](#sse-events). Useful for the web UI and for long-running scripts that want to react to
 state changes (`task.status_changed`, `task.moved`, `execution.completed`, …) without
 polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
 `daemon.offline` so clients can refresh daemon availability without waiting for

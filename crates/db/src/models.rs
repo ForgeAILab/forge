@@ -1007,37 +1007,6 @@ pub struct AttentionListQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events: i64,
-    pub version: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpsertAttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events_delta: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventConsumerCursor {
     pub consumer_name: String,
     pub last_sequence: i64,

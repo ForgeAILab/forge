@@ -120,6 +120,18 @@ async fn next_subscribed_sequence(
 }
 
 impl SqliteDb {
+    /// Check the replay cap using the sequence primary key. OFFSET visits at
+    /// most limit + 1 matching rows, without reading event payloads or counting
+    /// the rest of a potentially unbounded ledger.
+    pub async fn domain_event_replay_exceeds_limit(
+        &self,
+        after: i64,
+        through: i64,
+        limit: i64,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM domain_event WHERE sequence > ? AND sequence <= ? ORDER BY sequence LIMIT 1 OFFSET ?)")
+            .bind(after).bind(through).bind(limit.max(0)).fetch_one(&self.pool).await? != 0)
+    }
     pub async fn domain_event_head(&self) -> Result<i64> {
         Ok(
             sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM domain_event")

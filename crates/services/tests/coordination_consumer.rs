@@ -63,7 +63,7 @@ async fn seed_identity(db: &SqliteDb, identity_id: &str) {
 }
 
 #[tokio::test]
-async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicates() {
+async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_once() {
     let db = database().await;
     let identity_id = "identity-outcome";
     seed_identity(&db, identity_id).await;
@@ -269,7 +269,16 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         .run_once(100)
         .await
         .unwrap();
-    assert!(first.claimed_events >= 1);
+    assert_eq!(first.claimed_events, 1);
+    assert_eq!(first.last_sequence, wanted.sequence);
+    assert_eq!(
+        CoordinationOutcomeConsumer::new(Arc::clone(&db))
+            .run_once(100)
+            .await
+            .unwrap()
+            .processed_events,
+        0
+    );
     assert_eq!(first.reconciled_events, 1);
     assert_eq!(first.processed_events, first.claimed_events);
 

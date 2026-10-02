@@ -896,14 +896,6 @@ pub trait AttentionRepo: Send + Sync {
         source_event_id: &str,
         updated_at: &str,
     ) -> Result<Option<AttentionProjection>>;
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>>;
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

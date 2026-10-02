@@ -3796,7 +3796,7 @@ mod tests {
             .unwrap()
     }
     #[tokio::test]
-    async fn runtime_projection_preserves_upgrade_cursor_and_effect_checkpoint_atomicity() {
+    async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_projects_once() {
         let service = health_service().await;
         let old = append_projection_event(&service, "old-incident", "validation.failed").await;
         let next = append_projection_event(&service, "new-incident", "validation.failed").await;

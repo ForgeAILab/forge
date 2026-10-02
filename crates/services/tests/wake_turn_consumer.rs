@@ -2593,6 +2593,17 @@ async fn file_backed_upgrade_ignores_live_legacy_claim_and_preserves_post_cutove
     let cutover_consumer = WakeTurnConsumer::new(Arc::clone(&db));
     cutover_consumer.run_once(100).await.unwrap();
 
+    let cursor_at_n = db
+        .get_consumer_cursor("agent-wake-turns")
+        .await
+        .unwrap()
+        .unwrap()
+        .last_sequence;
+    let old_wake = db.get_event(&old_wake_id).await.unwrap().unwrap();
+    assert_eq!(
+        cursor_at_n, old_wake.sequence,
+        "wanted event at N is already checkpointed"
+    );
     let incident_key = format!("attention:restart_race:project:{project_id}");
     let source_event_id = new_uuid_v4();
     append_event(
@@ -2651,6 +2662,7 @@ async fn file_backed_upgrade_ignores_live_legacy_claim_and_preserves_post_cutove
         .unwrap()
         .unwrap();
 
+    assert!(wake_row.sequence > cursor_at_n);
     // Upgrade with a still-live claim. The retained cursor, not the old lease,
     // controls delivery; migration must never fast-forward it.
     sqlx::query("INSERT INTO agent_wake_lease (identity_id, scope_type, scope_id, incident_key, lease_owner, leased_until, reaction_depth, updated_at) VALUES (?, 'project', ?, ?, 'in-flight-domain-claim', '2999-01-01T00:00:00Z', 0, ?)")

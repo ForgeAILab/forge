@@ -2008,17 +2008,28 @@ persistence. Deferral reason and first deferral time are retained. A malformed
 stored wait is logged once per runtime and treated as due; the next state change
 rewrites it. All deadline arithmetic is checked.
 
-Only failures/panics in `handle` or `commit`, and handle timeout, add a strike.
-An explicit terminal worker error also quarantines at the commit boundary
-without a strike; this is how Attention preserves its `DbError::Check` rule.
+`WorkerErrorKind` has three deliberate meanings:
+
+| Kind | Use | Event handling |
+| --- | --- | --- |
+| `Failure` (strike) | Unexpected item failures returned by `WorkerError::new` or non-transient `WorkerError::database`; caught handle/commit panics and handle timeouts also take this path | Add a strike, retry under the worker's finite policy, and quarantine when the cap is reached |
+| `Transient` | Retryable availability/concurrency failures, or an ordinary consumer error whose existing behavior requires indefinite retry | Never add a strike or quarantine; retry independently with waits from one second to the five-second idle maximum |
+| `Terminal` | A deterministic semantic rejection that cannot succeed on retry, such as Attention's `DbError::Check` | Roll back any attempted effect and immediately commit quarantine plus cursor acknowledgement without adding a strike |
+
+`Terminal` was added because `commit` returns a commit result or an error, not
+`Outcome::DeadLetter`. Attention can discover a `Check` only after its first write;
+it must roll back that write and quarantine immediately. Expressing this with a
+one-strike policy would also quarantine unrelated panics and timeouts. An explicit
+terminal error preserves the existing Check-only rule without changing scheduling,
+supervision or health persistence.
+
 Default policy is eight attempts, waits exponential from one second capped at
 five minutes, and five-minute handle timeout. Policy waits have a one-second
 floor, respect their representable cap, and an unrepresentable cap falls back
 to five minutes. A capped or explicit `DeadLetter` moves the cursor and inserts
 the quarantine record together. Runtime infrastructure failures never strike.
 Memory classifies only SQLite busy/locked, pool failures and version conflicts
-as transient; other database failures strike. Transient worker retries back off
-independently from one second to the five-second idle maximum.
+as transient; other database failures strike.
 
 `tick` defaults to no-op and runs once per bounded poll cycle, not once per
 backlogged event. It runs again on wakes during retry/deferral waits; individual
@@ -2072,7 +2083,10 @@ cannot leak into the fallback disposition. Semantic wake retry attempts keep the
 immutable lineage and finite budget separately from runtime retries.
 
 Migration `V202610020700` drops `event_processing_lease` and
-`event_projection_receipt`, which contained delivery metadata, not user data.
+`event_projection_receipt` and the unused `attention_consumer_health` table.
+These contained only delivery metadata and operational counters, timestamps,
+bounded error diagnostics and lease details, not user data. Runtime health
+replaces the old attention-health storage and accessors.
 All durable consumer cursors and all domain/projection records survive unchanged;
 only the retired `sse-broadcast` cursor is removed. Live legacy claims do not block
 restart: each worker resumes strictly after its retained checkpoint.
@@ -2084,17 +2098,22 @@ publish their committed envelopes, and advance only memory. It uses the same
 committed-event `Notify`, registered before polling, and the same 250 ms to
 five-second idle fallback. It writes no cursor, lease, receipt or health row.
 
-Previously SSE subscribed only to `EventBus`, ignored `Last-Event-ID`, and offered
-no sequence replay. The web client recreates `EventSource` on reconnect, retains no
-resume sequence, and refreshes active queries after a stable connection opens. A client could receive downtime commits if it connected before
-the durable relay caught up. Connections now read the ledger directly: subscribe
-first, capture a head snapshot, replay through that snapshot in bounded read pages,
-and filter overlapping durable live frames. A recognized domain-event
-`Last-Event-ID` resumes after that row; absent or non-domain IDs replay from the
-beginning. Typed bus-only events remain live-only, and bus overflow still sends
-`events.resync_required`. The generic committed envelope and entity-ID frame IDs
-are unchanged. Direct publisher plus relay duplication of new events remains
-idempotent invalidation, as before.
+SSE plain connects remain live-only. A connection reads the ledger only when
+`Last-Event-ID` has the durable form `domain-event:<sequence>`; entity IDs, missing
+headers and malformed IDs do not request replay. Bus-only frames use
+`entity:<entity_id>`, which cannot be mistaken for a durable resume cursor.
+The payload's `entity_id` remains unchanged. Neither the web client nor forge-ctl
+uses frame IDs for routing; MCP uses a separate stream. The web client recreates
+`EventSource` on reconnect and refreshes active queries after a stable open.
+
+For durable resume, subscribe before capturing the ledger head, then check the
+bounded sequence range for at most 1,001 keys. At most 1,000 missed rows replay in
+ascending sequence order through that snapshot, using 100-row pages. A larger
+backlog produces one `events.resync_required` frame and no replay. Snapshot-covered
+durable live frames are filtered, so delayed relay frames cannot duplicate replay;
+appends beyond the captured head remain live. Bus-only events remain live-only,
+and bus overflow still requests resync. Direct publisher plus relay duplication of
+new events retains its existing idempotent invalidation behavior.
 
 The shared `RuntimeSupervisor` owns `StorageMaintenanceWorker`. Every five
 seconds it runs only a bounded `PRAGMA incremental_vacuum(100)`, consuming every
