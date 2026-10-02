@@ -44,6 +44,24 @@ pub struct Project {
     pub updated_at: String,
 }
 
+/// Project response inputs and the display revision from the same SELECT.
+#[derive(Debug, Clone)]
+pub struct ProjectSlotRead {
+    pub project: Project,
+    pub list_revision: i64,
+}
+
+/// Counts and revision fences read together by the batched slot statement.
+#[derive(Debug)]
+pub struct ProjectSlotCounts {
+    pub project_id: String,
+    pub project_version: i64,
+    pub list_revision: i64,
+    pub active: i64,
+    pub parked: i64,
+    pub queued: i64,
+}
+
 /// Durable, retryable work that reconciles a Project's repository and
 /// Workspace-capable role setup.  The status is deliberately independent of
 /// the Project Agent binding/chat state and optional plan traceability.

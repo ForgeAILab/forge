@@ -20,6 +20,7 @@ pub mod errors;
 pub mod json;
 pub mod middleware;
 mod path_input;
+pub mod project_slots;
 pub mod routes;
 pub mod state;
 

@@ -8,6 +8,56 @@ const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXIS
       AND project_member.user_id = ?
 ))";
 
+// These projections add a revision only for API Project responses. General
+// Project reads and dispatcher reads keep their existing column set.
+impl SqliteDb {
+    pub async fn get_visible_project_slot_read(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> Result<Option<crate::ProjectSlotRead>> {
+        sqlx::query(&format!("SELECT {PROJECT_COLUMNS}, list_revision FROM project WHERE id = ? AND {PROJECT_VISIBLE_TO_USER}"))
+            .bind(id).bind(user_id).bind(user_id).fetch_optional(self.pool()).await?
+            .map(map_project_slot_read).transpose()
+    }
+
+    pub async fn list_visible_project_slot_reads(
+        &self,
+        user_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<crate::ProjectSlotRead>> {
+        let offset = decode_offset(&page.cursor)?;
+        let rows = sqlx::query(&format!("SELECT {PROJECT_COLUMNS}, list_revision FROM project WHERE {PROJECT_VISIBLE_TO_USER} ORDER BY {} LIMIT ? OFFSET ?", order_clause_without_priority(&page)))
+            .bind(user_id).bind(user_id).bind(limit(&page) + 1).bind(offset).fetch_all(self.pool()).await?;
+        let items = rows
+            .into_iter()
+            .map(map_project_slot_read)
+            .collect::<Result<Vec<_>>>()?;
+        let total = if page.include_total {
+            Some(
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM project WHERE {PROJECT_VISIBLE_TO_USER}"
+                ))
+                .bind(user_id)
+                .bind(user_id)
+                .fetch_one(self.pool())
+                .await?,
+            )
+        } else {
+            None
+        };
+        page_from_items(items, &page, offset, total)
+    }
+}
+
+fn map_project_slot_read(row: SqliteRow) -> Result<crate::ProjectSlotRead> {
+    let list_revision = row.try_get("list_revision")?;
+    Ok(crate::ProjectSlotRead {
+        project: map_project(row)?,
+        list_revision,
+    })
+}
+
 async fn project_in_use_counts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     project_id: &str,

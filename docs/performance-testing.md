@@ -240,6 +240,89 @@ ETags get explicit skip reasons. Other errors are counted by status, including
 transport failures as status `0`; they do not abort a scenario. Error timings
 must not be mistaken for speedups.
 
+### Project slot read projection
+
+Project GET and list responses share an API-state memo capped at 256 Projects.
+Each entry contains counts and `(list_revision, version)`, read with the existing
+Project row. A hit runs no slot statement. Missing entries on a list page use
+one grouped statement, regardless of the number of Projects. Unlimited Projects
+(`max_active_tasks = 0`) need no slot statement and retain zero counts. The
+dispatcher continues to call the original, uncached `load_project_slots`.
+The revision column is selected only by the Project GET/list read projections;
+general Project repository reads retain their original columns and model.
+Mutation responses continue to read uncached counts.
+
+The grouped statement returns its observed Project revisions with its counts.
+If a write committed between the Project row read and that statement, the API
+does not memoize the result under the earlier key. Hits describe the snapshot
+observed by the Project row read; they do not promise to include writes committed
+after that read. The mutex protects only in-memory lookup/insertion and is never
+held across SQL. The fixed cap also bounds entries left by deleted Projects.
+
+| Slot input | What invalidates the memo |
+| --- | --- |
+| Task existence, Project membership, status (roots and subtasks) | V202610011636 Task insert/delete/update triggers bump `list_revision` for the old/new Project |
+| Parent/child links and child deletion, including settled or archived children in the child-existence probe | The same Task triggers cover same-Project links; V202610020410 also bumps an external parent's Project on child insert/delete/reparent/move/soft-delete |
+| Task visibility: `archived_at`, `deleted_at` | Task update trigger bumps `list_revision` |
+| Holds: non-null `blocked_json`, `failed_json`, blocking `error_annotation.type` (malformed/nonblocking annotations retain their existing behavior) | Task update trigger bumps `list_revision` |
+| Latest Review's status and ordering (`attempt_number`, `created_at`, `id`), Review-to-Task relation | Review insert/delete/update triggers bump `list_revision`; IDs are immutable in application writes and `(task_id, attempt_number)` is unique, so the ID tie-break cannot select a different Review |
+| Existence of a running Execution for a coordination root, Execution-to-Task relation | Execution insert/delete/update triggers bump `list_revision` on status or Task changes; running heartbeats do not change these inputs |
+| Project workflow state names/kinds, canonical phase, effective reviewer/auditor role, `run_merge` entry hooks, custom states inherited by subtasks | Workflow-definition trigger bumps `list_revision`; versioned workflow updates also move `version` |
+| Built-in default workflow, inherited subtask workflow, blocking annotation kind list and resolver rules | Constants in the binary; process restart creates an empty memo |
+| `settings.max_active_tasks`, including unlimited capacity | All production settings mutation paths increment Project `version` (`update_at_version`, review-config command, execution-setup command); no new settings trigger is needed |
+| Project pause/environment-pause flags; Task metadata, per-Task state config, assignments and priorities | Not read by the slot SQL (including `entry_barrier_json`); normal version/revision changes can conservatively invalidate, but these fields do not alter the counts |
+
+Project/Task identities are immutable application-generated UUIDs. Execution
+lease deadlines, deferred-dispatch times and Agent pause flags are not inputs:
+this projection reads execution status and Task state/holds, not wall-clock time.
+The production settings setters above increment `version` in the same guarded
+transaction as the settings update. Task/Review/Execution revision triggers and
+the parent-link triggers likewise commit atomically with their source changes.
+
+For authenticated Project GETs, the response path has one Project SELECT plus
+zero slot statements on a memo hit, or one slot statement on a bounded miss
+(previously one on every bounded GET). For a list page without `include_total`,
+there is one Project SELECT plus zero slot statements on all hits, or one grouped
+slot statement for any bounded misses (previously N slot statements for N bounded
+Projects). `include_total=true` adds the unchanged count statement.
+
+The runner includes `project list limit=100`. Fixture generation 2 has two
+Projects: the heavy Project and the small deferred-dispatch Project. Ten warmups
+mean the measured GET/list requests exercise memo hits. The multi-Project slot
+test covers different workflows, inherited/custom kinds, over 200 queued Tasks,
+empty/unlimited Projects and cross-Project child links. Existing slot scenarios
+also compare the batch to the original single-Project function. API memo tests
+mutate each changing input and use a database with no schema to prove that hits
+cannot issue SQL. The batch implementation has exactly one `fetch_all` outside
+the Project loop; the Project list route calls it once for all page misses and
+constructs responses without additional slot reads.
+
+Local validation on 2026-10-02 used macOS 27 / ARM64 release binaries and the
+unchanged generation-2 heavy fixture. Reports are under
+`/Volumes/Data/tmp/perf/heavy/`:
+
+| Build/report | Project GET p50 ms | Project list p50 ms |
+| --- | ---: | ---: |
+| v0.13.12, `final-v0.13.12.json` | 0.144 | Not measured |
+| 5db8ea0b, `final-next.json` | 0.246 | Not measured |
+| v0.13.12 with the list scenario, `slots-baseline-v0.13.12.json` | 0.147 | 0.149 |
+| 5db8ea0b with the list scenario, `slots-baseline-next-repeat.json` | 0.247 | 0.329 |
+| Final 5db8ea0b control, `slots-baseline-next-final.json` | 0.249 | 0.326 |
+| Final implementation, `slots.json` | 0.144 | 0.132 |
+| Final implementation repeat, `slots-scoped-repeat.json` | 0.139 | 0.153 |
+
+Both final implementation runs returned no request errors, preserved the fixture
+digests, and changed no tracked fixture tables during idle or through the GETs.
+The focused Rust checks covered eight slot tests and four memo tests; the added
+Python test checks the new Project list scenario. Full suites remain CI work.
+Other scenario timings varied across runs, so the Project timing improvement
+does not by itself establish a complete no-regression result. Process CPU/RSS
+measurements were unavailable because the sandbox denied `ps`.
+For example, Task relations measured 0.232 ms in the final implementation repeat
+versus 0.200 ms in the final baseline control. The full no-regression acceptance
+criterion remains unconfirmed; investigate that comparison in an isolated
+benchmark window without widening this change into the unrelated routes.
+
 Interpret the nearest-rank p50/p95 and minimum as local request latency, and
 response bytes as decoded HTTP body bytes. Status counts and `share_304` show
 whether the comparison returned full responses or cache validations. `b/a`
