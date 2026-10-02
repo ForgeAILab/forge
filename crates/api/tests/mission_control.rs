@@ -12,7 +12,7 @@ use axum::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, AttentionRepo, CreateAttentionProjection, CreateDomainEvent,
-    CreateProject, DomainEventRepo, ProjectRepo, UpsertAttentionConsumerHealth,
+    CreateProject, DomainEventRepo, ProjectRepo,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -148,24 +148,45 @@ async fn mission_control_reports_visible_attention_count_and_stale_health() {
     .await
     .expect("attention projection persists");
     let stale = "2020-01-01T00:00:00Z".to_owned();
-    AttentionRepo::upsert_attention_consumer_health(
-        &*harness.state.db,
-        UpsertAttentionConsumerHealth {
-            consumer_name: "attention_projection".to_owned(),
-            last_sequence: 12,
-            last_started_at: Some(stale.clone()),
-            last_success_at: Some(stale.clone()),
-            last_error_at: None,
-            last_error_code: None,
-            last_error_message: None,
-            lease_owner: None,
-            lease_until: None,
-            processed_events_delta: 12,
-            updated_at: stale,
-        },
-    )
-    .await
-    .expect("consumer health persists");
+    let health = db::WorkerHealth::new(
+        std::sync::Arc::clone(&harness.state.db),
+        "attention_projection",
+    );
+    let mut tx = db::begin_immediate(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .initialize_event_worker_in_tx(&mut tx, &health, &db::EventSubscription::All)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE worker_health SET last_success_at = ?, updated_at = ? WHERE worker_name = 'attention_projection'")
+        .bind(&stale).bind(&stale).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 12 WHERE consumer_name = 'attention_projection'").execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    // This view derives completed counts from the retained checkpoint's ledger.
+    while harness.state.db.domain_event_head().await.unwrap() < 12 {
+        harness
+            .state
+            .db
+            .append_event(CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "ignored".into(),
+                entity_type: "project".into(),
+                entity_id: project.id.clone(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: project.id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: now_rfc3339(),
+            })
+            .await
+            .unwrap();
+    }
 
     let home: MissionControlHomeResponse = common::empty_request(
         &harness.app,

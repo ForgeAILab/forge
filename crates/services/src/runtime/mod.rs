@@ -139,7 +139,7 @@ impl RuntimeWorker {
             Self::Coordination => Some(crate::coordination_consumer_name()),
             Self::Attention => Some(crate::attention_service::attention_consumer_name()),
             Self::WakeDelivery => Some(crate::wake_turn_consumer_name()),
-            Self::DomainEventBroadcast => Some(crate::domain_event_broadcast_consumer_name()),
+            Self::DomainEventBroadcast => None, // Read-only tail, no durable checkpoint/lag.
             _ => None,
         }
     }
@@ -730,20 +730,16 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&self.event_bus),
         ));
         let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(Arc::clone(&self.db)));
-        let coordination_consumer = Arc::new(CoordinationOutcomeConsumer::new(
-            Arc::clone(&self.db),
-            crate::coordination_consumer_lease_owner(),
-        ));
+        let coordination_consumer =
+            Arc::new(CoordinationOutcomeConsumer::new(Arc::clone(&self.db)));
         let attention_projection = Arc::new(
             AttentionService::new(Arc::clone(&self.db)).with_event_bus(Arc::clone(&self.event_bus)),
         );
-        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(
-            Arc::clone(&self.db),
-            crate::wake_turn_consumer_lease_owner(),
-        ));
+        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
         let domain_event_broadcast = Arc::new(DomainEventBroadcastConsumer::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
+            0,
         ));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let plugin_registry = lifecycle_plugin_registry();
@@ -896,6 +892,15 @@ impl RuntimeSupervisor {
         }
         if self.started {
             return Ok(0);
+        }
+
+        if let Err(error) = self
+            .runtime
+            .domain_event_broadcast
+            .initialize_at_head()
+            .await
+        {
+            tracing::warn!(%error, "SSE tail head initialization failed; retaining its in-memory position");
         }
 
         let recovered = match self.runtime.crash_recovery.run().await {

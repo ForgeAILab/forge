@@ -1421,7 +1421,7 @@ mod tests {
             .is_empty());
     }
     #[tokio::test]
-    async fn consumer_lag_uses_sequence_distance_and_stalls_use_existing_attention_alerts() {
+    async fn consumer_lag_counts_live_rows_and_stalls_use_existing_attention_alerts() {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let old = (now - Duration::minutes(10)).to_rfc3339();
@@ -1434,14 +1434,14 @@ mod tests {
             sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 10, ?) ON CONFLICT(consumer_name) DO UPDATE SET last_sequence = 10, updated_at = excluded.updated_at")
                 .bind(consumer).bind(&old).execute(db.pool()).await.unwrap();
         }
-        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'sse-broadcast'").execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
         let status = service.compute_status().await.unwrap();
         let stalled = status
             .event_consumers
             .iter()
-            .find(|c| c.consumer_name == "sse-broadcast")
+            .find(|c| c.consumer_name == "attention_projection")
             .unwrap();
-        assert_eq!(stalled.lag, 9); // Only one row is pending; gaps count in the metric.
+        assert_eq!(stalled.lag, 1); // Deleted sequence gaps do not count.
         assert!(stalled.stalled);
         assert!(stalled.oldest_unprocessed_age_seconds.unwrap() >= 600.0);
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
@@ -1452,16 +1452,16 @@ mod tests {
             OperatorSeverity::Attention
         );
         assert!(status.database.incremental_vacuum);
-        assert_eq!(status.event_consumers.len(), 5);
+        assert_eq!(status.event_consumers.len(), 4);
         assert!(status
             .event_consumers
             .iter()
-            .filter(|c| c.consumer_name != "sse-broadcast")
+            .filter(|c| c.consumer_name != "attention_projection")
             .all(|c| c.lag == 0
                 && !c.stalled
                 && c.oldest_unprocessed_at.is_none()
                 && c.last_advanced_at.as_deref() == Some(old.as_str())));
-        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'sse-broadcast'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'attention_projection'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
         let recovered = service.compute_status().await.unwrap();
         assert_eq!(recovered.overall_severity, OperatorSeverity::Healthy);
         assert!(recovered.recent_errors.is_empty());
@@ -1602,24 +1602,24 @@ mod tests {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let empty = service.event_consumers(now).await.unwrap();
-        assert_eq!(empty.len(), 5);
+        assert_eq!(empty.len(), 4);
         assert!(empty.iter().all(|c| c.lag == 0 && !c.stalled));
         let old = (now - Duration::seconds(301)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(&old).execute(db.pool()).await.unwrap();
         let missing = service.event_consumers(now).await.unwrap();
         let consumer = missing
             .iter()
-            .find(|c| c.consumer_name == "sse-broadcast")
+            .find(|c| c.consumer_name == "attention_projection")
             .unwrap();
         assert_eq!(consumer.lag, 1);
         assert_eq!(consumer.last_advanced_at, None);
         assert!(consumer.stalled);
-        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 0, ?)").bind((now - Duration::seconds(300)).to_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 0, ?)").bind((now - Duration::seconds(300)).to_rfc3339()).execute(db.pool()).await.unwrap();
         let at_threshold = service.event_consumers(now).await.unwrap();
         assert!(
             !at_threshold
                 .iter()
-                .find(|c| c.consumer_name == "sse-broadcast")
+                .find(|c| c.consumer_name == "attention_projection")
                 .unwrap()
                 .stalled
         );
@@ -1631,7 +1631,7 @@ mod tests {
         assert!(
             shorter
                 .iter()
-                .find(|c| c.consumer_name == "sse-broadcast")
+                .find(|c| c.consumer_name == "attention_projection")
                 .unwrap()
                 .stalled
         );
@@ -1640,9 +1640,9 @@ mod tests {
     #[tokio::test]
     async fn idle_consumer_with_old_cursor_is_never_stalled() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Attention]);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('sse-broadcast', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers.len(), 1);
         let consumer = &status.event_consumers[0];
@@ -1667,5 +1667,16 @@ mod tests {
         assert_eq!(status.event_consumers[0].lag, 1);
         assert!(!status.event_consumers[0].stalled);
         assert!(status.recent_errors.is_empty());
+    }
+    #[tokio::test]
+    async fn consumer_tail_has_no_durable_lag_entry_or_stall() {
+        let (_, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        assert!(service
+            .compute_status()
+            .await
+            .unwrap()
+            .event_consumers
+            .is_empty());
     }
 }

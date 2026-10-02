@@ -1,9 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use crate::pagination::PageRequest;
-use crate::repository::{
-    AdmitAgentChatTurn, CompleteDomainEvent, CreateAgentActionExecution, CreateCommandReceipt,
-};
+use crate::repository::{AdmitAgentChatTurn, CreateAgentActionExecution, CreateCommandReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row};
@@ -840,12 +838,10 @@ pub struct CreateAgentWakeDisposition {
     pub updated_at: String,
 }
 
-/// Atomically persists the first disposition for a claimed event, its
-/// current-pointer row, and the event projection receipt/cursor checkpoint.
+/// Transaction-owned first wake disposition, current pointer and optional admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteClaimedWake {
+pub struct PersistAgentWake {
     pub disposition: CreateAgentWakeDisposition,
-    pub completion: CompleteDomainEvent,
     /// Required for `turn_admitted`.  The DB inserts/replays this message and
     /// turn inside the same transaction as the disposition and source-event
     /// checkpoint, closing the crash seam between admission and delivery.

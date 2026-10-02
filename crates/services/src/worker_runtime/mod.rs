@@ -409,6 +409,9 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
         event: &DomainEvent,
         error: WorkerError,
     ) -> Result<PollResult> {
+        if error.kind == WorkerErrorKind::Terminal {
+            return self.failure(cursor, event, error.message(), true).await;
+        }
         if error.kind == WorkerErrorKind::Transient {
             self.health.report_error(error.message()).await?;
             let delay = self

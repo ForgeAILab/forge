@@ -5,14 +5,6 @@ use events::{EventBus, EventContext, ForgeEvent};
 
 use crate::Result;
 
-/// The repository's completion identity is the stored dedupe key when one is
-/// present and the event id itself otherwise. Keep every durable consumer on
-/// this exact fallback; inventing a prefixed value wedges its cursor forever
-/// on legacy or internal events whose dedupe key is null.
-pub(crate) fn event_completion_dedupe_key(event: &DomainEvent) -> String {
-    event.dedupe_key.clone().unwrap_or_else(|| event.id.clone())
-}
-
 /// Commits authoritative domain events to SQLite and only then mirrors a
 /// bounded invalidation notification to the in-process event bus.
 #[derive(Clone)]
@@ -51,7 +43,11 @@ impl DomainEventService {
     /// Call this only after the transaction containing `event` has committed.
     /// The bus payload intentionally excludes the authoritative event body.
     pub fn publish_committed(&self, event: &DomainEvent) {
-        self.event_bus.publish(ForgeEvent {
+        self.event_bus.publish(Self::committed_frame(event));
+    }
+
+    pub fn committed_frame(event: &DomainEvent) -> ForgeEvent {
+        ForgeEvent {
             event_type: "domain_event.committed".to_owned(),
             entity_id: event.id.clone(),
             timestamp: event.created_at.clone(),
@@ -63,6 +59,6 @@ impl DomainEventService {
                 scope_type: event.scope_type.clone(),
                 scope_id: event.scope_id.clone(),
             },
-        });
+        }
     }
 }

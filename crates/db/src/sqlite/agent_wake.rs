@@ -1,5 +1,4 @@
 use super::agent_chat::admit_agent_chat_turn_in_tx;
-use super::domain_event::map_domain_event;
 use super::*;
 
 #[async_trait]
@@ -163,135 +162,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
         .collect()
     }
 
-    async fn complete_claimed_agent_wake(
-        &self,
-        input: CompleteClaimedWake,
-    ) -> Result<AgentWakeDisposition> {
-        validate_disposition_input(&input.disposition)?;
-        if input.disposition.consumer_name != input.completion.consumer_name
-            || input.disposition.source_event_id != input.completion.event_id
-            || input.disposition.source_event_sequence != input.completion.event_sequence
-        {
-            return Err(DbError::Check(
-                "wake disposition and claimed event identity must match".to_owned(),
-            ));
-        }
-
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let event = load_claimed_event(&mut transaction, &input.completion).await?;
-        if event.sequence != input.disposition.source_event_sequence {
-            return Err(DbError::Check(
-                "wake disposition source sequence does not match event".to_owned(),
-            ));
-        }
-
-        if let Some(expected_attention) = input.expected_attention.as_ref() {
-            validate_expected_attention_in_tx(&mut transaction, expected_attention).await?;
-        }
-
-        let mut admitted_turn = false;
-        match input.disposition.disposition {
-            AgentWakeDispositionKind::TurnAdmitted => {
-                let admission = input.admission.clone().ok_or_else(|| {
-                    DbError::Check(
-                        "turn_admitted wake disposition requires an atomic turn admission"
-                            .to_owned(),
-                    )
-                })?;
-                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                    || admission.message.id != admission.turn.triggering_message_id
-                {
-                    return Err(DbError::Check(
-                        "wake disposition turn link does not match admission".to_owned(),
-                    ));
-                }
-                let admitted =
-                    admit_agent_chat_turn_in_tx(self, &mut transaction, admission).await?;
-                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                {
-                    return Err(DbError::IdempotencyConflict);
-                }
-                admitted_turn = true;
-            }
-            _ if input.admission.is_some() => {
-                return Err(DbError::Check(
-                    "only turn_admitted wake dispositions may carry admission".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-
-        let existing = sqlx::query(
-            "SELECT * FROM agent_wake_disposition
-             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
-        )
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(input.disposition.attempt_number)
-        .fetch_optional(&mut *transaction)
-        .await?;
-
-        let disposition = if let Some(row) = existing {
-            let existing = map_agent_wake_disposition(row)?;
-            if !wake_disposition_semantics_match(&input.disposition, &existing) {
-                return Err(DbError::IdempotencyConflict);
-            }
-            ensure_current_pointer(&mut transaction, &existing, &input.disposition.updated_at)
-                .await?;
-            existing
-        } else {
-            if input.disposition.attempt_number > 1 {
-                let current = current_disposition_in_tx(
-                    &mut transaction,
-                    &input.disposition.consumer_name,
-                    &input.disposition.source_event_id,
-                )
-                .await?
-                .ok_or(DbError::VersionConflict)?;
-                if input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
-                    || !matches!(
-                        current.disposition,
-                        AgentWakeDispositionKind::Deferred
-                            | AgentWakeDispositionKind::SetupRequired
-                    )
-                {
-                    return Err(DbError::VersionConflict);
-                }
-            } else if input.disposition.parent_disposition_id.is_some()
-                || current_disposition_in_tx(
-                    &mut transaction,
-                    &input.disposition.consumer_name,
-                    &input.disposition.source_event_id,
-                )
-                .await?
-                .is_some()
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-
-            if input.disposition.disposition == AgentWakeDispositionKind::TurnAdmitted
-                && !admitted_turn
-            {
-                return Err(DbError::Check(
-                    "turn admission must be committed with turn_admitted disposition".to_owned(),
-                ));
-            }
-
-            insert_disposition(&mut transaction, &input.disposition).await?;
-            ensure_current_pointer(
-                &mut transaction,
-                &input.disposition,
-                &input.disposition.updated_at,
-            )
-            .await?;
-            disposition_from_create(&input.disposition)
-        };
-
-        complete_event_in_tx(&mut transaction, &input.completion).await?;
-        transaction.commit().await?;
-        Ok(disposition)
-    }
-
     async fn retry_agent_wake(
         &self,
         input: RetryAgentWakeDisposition,
@@ -413,30 +283,6 @@ impl AgentWakeDispositionRepo for SqliteDb {
     }
 }
 
-async fn load_claimed_event(
-    transaction: &mut Transaction<'_, Sqlite>,
-    input: &CompleteDomainEvent,
-) -> Result<DomainEvent> {
-    let event = sqlx::query("SELECT * FROM domain_event WHERE sequence = ?")
-        .bind(input.event_sequence)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(DbError::NotFound)
-        .and_then(|row| map_domain_event(row).map_err(DbError::from))?;
-    if event.id != input.event_id {
-        return Err(DbError::Check(
-            "event id does not match the claimed sequence".to_owned(),
-        ));
-    }
-    let expected_dedupe = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
-    if expected_dedupe != input.dedupe_key {
-        return Err(DbError::Check(
-            "event dedupe key does not match the claimed event".to_owned(),
-        ));
-    }
-    Ok(event)
-}
-
 /// Re-read the Attention materialization inside the same write transaction as
 /// turn admission.  This closes the resolver-to-admission race even when a
 /// caller supplied a stale version whose legacy projection upsert failed to
@@ -527,98 +373,6 @@ fn canonical_attention_digest_from_row(row: &SqliteRow) -> Result<String> {
         source_sequence: row.try_get("source_sequence")?,
     };
     Ok(canonical_attention_incident_digest(&attention))
-}
-
-async fn complete_event_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    input: &CompleteDomainEvent,
-) -> Result<()> {
-    let cursor = sqlx::query_scalar::<_, i64>(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
-    )
-    .bind(&input.consumer_name)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    if input.event_sequence
-        > super::domain_event::next_existing_sequence(transaction, cursor)
-            .await?
-            .unwrap_or(i64::MAX)
-    {
-        return Err(DbError::Check(
-            "domain events must be checkpointed in sequence order".to_owned(),
-        ));
-    }
-
-    let receipt = sqlx::query(
-        "SELECT dedupe_key FROM event_projection_receipt
-         WHERE consumer_name = ? AND event_id = ?",
-    )
-    .bind(&input.consumer_name)
-    .bind(&input.event_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if let Some(row) = receipt {
-        let dedupe_key: String = row.try_get("dedupe_key")?;
-        if dedupe_key != input.dedupe_key {
-            return Err(DbError::IdempotencyConflict);
-        }
-    } else {
-        let lease_owner = sqlx::query_scalar::<_, String>(
-            "SELECT lease_owner FROM event_processing_lease
-             WHERE consumer_name = ? AND event_sequence = ?",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.event_sequence)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if lease_owner != input.lease_owner {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "INSERT INTO event_projection_receipt (
-                consumer_name, event_id, dedupe_key, processed_at
-             ) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&input.consumer_name)
-        .bind(&input.event_id)
-        .bind(&input.dedupe_key)
-        .bind(&input.completed_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(map_wake_write_error)?;
-    }
-
-    if Some(input.event_sequence)
-        == super::domain_event::next_existing_sequence(transaction, cursor).await?
-    {
-        let updated = sqlx::query(
-            "UPDATE event_consumer_cursor
-             SET last_sequence = ?, version = version + 1, updated_at = ?
-             WHERE consumer_name = ? AND last_sequence = ?",
-        )
-        .bind(input.event_sequence)
-        .bind(&input.completed_at)
-        .bind(&input.consumer_name)
-        .bind(cursor)
-        .execute(&mut **transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    sqlx::query(
-        "DELETE FROM event_processing_lease
-         WHERE consumer_name = ? AND event_sequence = ? AND lease_owner = ?",
-    )
-    .bind(&input.consumer_name)
-    .bind(input.event_sequence)
-    .bind(&input.lease_owner)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
 }
 
 async fn insert_disposition(
@@ -945,5 +699,132 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
         DbError::Check("wake disposition constraint failed".to_owned())
     } else {
         error.into()
+    }
+}
+
+impl SqliteDb {
+    pub async fn persist_agent_wake_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        input: PersistAgentWake,
+    ) -> Result<AgentWakeDisposition> {
+        validate_disposition_input(&input.disposition)?;
+        if event.id != input.disposition.source_event_id
+            || event.sequence != input.disposition.source_event_sequence
+        {
+            return Err(DbError::Check(
+                "wake disposition source does not match event".to_owned(),
+            ));
+        }
+        let source: Option<String> =
+            sqlx::query_scalar("SELECT id FROM domain_event WHERE sequence = ?")
+                .bind(event.sequence)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        if source.as_deref() != Some(event.id.as_str()) {
+            return Err(DbError::NotFound);
+        }
+        if let Some(expected_attention) = input.expected_attention.as_ref() {
+            validate_expected_attention_in_tx(transaction, expected_attention).await?;
+        }
+
+        let mut admitted_turn = false;
+        match input.disposition.disposition {
+            AgentWakeDispositionKind::TurnAdmitted => {
+                let admission = input.admission.clone().ok_or_else(|| {
+                    DbError::Check(
+                        "turn_admitted wake disposition requires an atomic turn admission"
+                            .to_owned(),
+                    )
+                })?;
+                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                    || admission.message.id != admission.turn.triggering_message_id
+                {
+                    return Err(DbError::Check(
+                        "wake disposition turn link does not match admission".to_owned(),
+                    ));
+                }
+                let admitted = admit_agent_chat_turn_in_tx(self, transaction, admission).await?;
+                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+                admitted_turn = true;
+            }
+            _ if input.admission.is_some() => {
+                return Err(DbError::Check(
+                    "only turn_admitted wake dispositions may carry admission".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        let existing = sqlx::query(
+            "SELECT * FROM agent_wake_disposition
+             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
+        )
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(input.disposition.attempt_number)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        let disposition = if let Some(row) = existing {
+            let existing = map_agent_wake_disposition(row)?;
+            if !wake_disposition_semantics_match(&input.disposition, &existing) {
+                return Err(DbError::IdempotencyConflict);
+            }
+            ensure_current_pointer(transaction, &existing, &input.disposition.updated_at).await?;
+            existing
+        } else {
+            if input.disposition.attempt_number > 1 {
+                let current = current_disposition_in_tx(
+                    transaction,
+                    &input.disposition.consumer_name,
+                    &input.disposition.source_event_id,
+                )
+                .await?
+                .ok_or(DbError::VersionConflict)?;
+                if input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
+                    || !matches!(
+                        current.disposition,
+                        AgentWakeDispositionKind::Deferred
+                            | AgentWakeDispositionKind::SetupRequired
+                    )
+                {
+                    return Err(DbError::VersionConflict);
+                }
+            } else if input.disposition.parent_disposition_id.is_some()
+                || current_disposition_in_tx(
+                    transaction,
+                    &input.disposition.consumer_name,
+                    &input.disposition.source_event_id,
+                )
+                .await?
+                .is_some()
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+
+            if input.disposition.disposition == AgentWakeDispositionKind::TurnAdmitted
+                && !admitted_turn
+            {
+                return Err(DbError::Check(
+                    "turn admission must be committed with turn_admitted disposition".to_owned(),
+                ));
+            }
+
+            insert_disposition(transaction, &input.disposition).await?;
+            ensure_current_pointer(
+                transaction,
+                &input.disposition,
+                &input.disposition.updated_at,
+            )
+            .await?;
+            disposition_from_create(&input.disposition)
+        };
+
+        Ok(disposition)
     }
 }

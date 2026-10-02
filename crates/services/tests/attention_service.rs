@@ -1232,7 +1232,7 @@ async fn recovered_task_suppresses_a_stale_interruption_wake_before_budget() {
 }
 
 #[tokio::test]
-async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
+async fn projection_health_uses_buffered_checkpoints_and_idle_polls_do_not_write() {
     let db = database().await;
     for sequence in 0..100 {
         DomainEventRepo::append_event(
@@ -1257,29 +1257,26 @@ async fn projection_health_batches_writes_and_keeps_exact_completed_counts() {
         .await
         .unwrap();
     }
-    let service = AttentionService::new(Arc::clone(&db));
-    let run = service.project_once(100).await.unwrap();
-    assert_eq!(run.processed_events, 100);
-    let health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-        .await
-        .unwrap()
-        .unwrap();
+    let service = Arc::new(AttentionService::new(Arc::clone(&db)));
+    let runtime =
+        services::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service));
+    assert_eq!(
+        runtime.run_once(100).await.unwrap(),
+        0,
+        "ignored events have no per-event write"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5100)).await;
+    runtime.run_once(100).await.unwrap(); // buffered scan checkpoint
+    let health = service.consumer_health().await.unwrap().unwrap();
     assert_eq!(health.processed_events, 100);
-    assert_eq!(health.last_sequence, run.last_sequence);
-    assert_eq!(health.version, 3); // lease acquisition, 100-event flush, lease release
-    assert!(health.lease_owner.is_none());
-    assert!(health.lease_until.is_none());
-    // Idle polls still claim/release ledger leases, but must not churn health.
-    sqlx::query("CREATE TRIGGER reject_health_write BEFORE UPDATE ON attention_consumer_health BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
+    assert_eq!(health.last_sequence, 100);
+    sqlx::query("CREATE TRIGGER reject_health_write BEFORE UPDATE ON worker_health BEGIN SELECT RAISE(ABORT, 'unexpected health write'); END")
         .execute(db.pool()).await.unwrap();
     for _ in 0..10 {
-        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        assert_eq!(runtime.run_once(100).await.unwrap(), 0);
     }
-    let idle_health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(idle_health.version, health.version);
+    let idle_health = service.consumer_health().await.unwrap().unwrap();
+    assert_eq!(idle_health.updated_at, health.updated_at);
     assert_eq!(idle_health.processed_events, 100);
 }
 
@@ -1325,9 +1322,7 @@ async fn projection_worker_drains_events_reports_health_and_stops() {
     let handle = std::sync::Arc::clone(&service).start(shutdown_rx);
     let mut health = None;
     for _ in 0..100 {
-        health = AttentionRepo::get_attention_consumer_health(&*db, "attention_projection")
-            .await
-            .unwrap();
+        health = service.consumer_health().await.unwrap();
         if health
             .as_ref()
             .is_some_and(|value| value.processed_events >= 1)

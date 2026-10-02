@@ -1,149 +1,82 @@
-//! Generic post-commit relay from the durable domain-event outbox to the
-//! live SSE bus (D20: "every committed durable event must publish after its
-//! transaction commits").
-//!
-//! Several commands append a domain event with
-//! `DomainEventRepo::append_event_in_tx` from inside a larger composite
-//! transaction — Project creation from a Charter approval, Main Genesis
-//! control transfer, every Agent Chat message/turn, milestone
-//! readiness/release — so the event row commits atomically with the records
-//! it describes. That guarantees durability, but nothing then mirrors the
-//! row to `EventBus`: the write is correct, it is just invisible to a
-//! connected browser until its next poll or reconnect (the 8.4.2 audit
-//! finding behind F16 — the client's named-listener bug was real, but even a
-//! perfectly-routed client never saw these frames because the server never
-//! sent one). This consumer is the missing "then": it claims every new
-//! domain event exactly once, in commit order, and republishes it as a
-//! `domain_event.committed` frame — the same generic wrapper
-//! `DomainEventService::append` already uses for the events it publishes
-//! itself.
-//!
-//! It is deliberately generic across event types and independent of any
-//! bespoke `event_bus.publish` a command also makes directly (`project.
-//! created`, `project.deleted`, `task.status_changed`, ...): those never
-//! touch the `domain_event` table and are unaffected. An event that both
-//! writes to the outbox *and* is published immediately by
-//! `DomainEventService::append` is broadcast a second time here; the
-//! client's invalidation is idempotent, so the redundancy costs one extra
-//! broad-scoped refetch, never a correctness gap. `web/src/api/sse.ts`
-//! routes `domain_event.committed` by the frame's `scope_type`/`entity_type`
-//! to the exact query keys those scopes affect, falling back to a full
-//! resync only for a scope it does not recognize.
-
-use std::sync::Arc;
-
-use chrono::{Duration, Utc};
-use db::{now_rfc3339, ClaimDomainEvents, CompleteDomainEvent, DomainEventRepo, SqliteDb};
-use events::EventBus;
-use tokio::{sync::watch, task::JoinHandle, time::Duration as TokioDuration};
-use uuid::Uuid;
-
+//! Read-only, in-memory tail of committed domain events for the live SSE bus.
 use crate::{DomainEventService, Result};
-
+use db::{DomainEventRepo, SqliteDb};
+use events::EventBus;
+use std::{sync::Arc, time::Duration};
+use tokio::{
+    sync::{watch, Mutex},
+    task::JoinHandle,
+};
 const CONSUMER_NAME: &str = "sse-broadcast";
-const LEASE_SECONDS: i64 = 30;
-const POLL_INTERVAL: TokioDuration = TokioDuration::from_millis(500);
 const BATCH_LIMIT: i64 = 100;
-
-/// Drains the durable domain-event outbox and republishes every row to the
-/// live `EventBus` exactly once, independent of which command wrote it.
+const MIN_IDLE: Duration = Duration::from_millis(250);
+const MAX_IDLE: Duration = Duration::from_secs(5);
 pub struct DomainEventBroadcastConsumer {
     db: Arc<SqliteDb>,
     events: DomainEventService,
-    lease_owner: String,
+    position: Mutex<i64>,
 }
-
 impl DomainEventBroadcastConsumer {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
-        Self::with_lease_owner(db, event_bus, domain_event_broadcast_lease_owner())
-    }
-
-    pub fn with_lease_owner(
-        db: Arc<SqliteDb>,
-        event_bus: Arc<EventBus>,
-        lease_owner: impl Into<String>,
-    ) -> Self {
+    pub fn new(db: Arc<SqliteDb>, bus: Arc<EventBus>, after: i64) -> Self {
         Self {
-            events: DomainEventService::new(Arc::clone(&db), event_bus),
+            events: DomainEventService::new(Arc::clone(&db), bus),
             db,
-            lease_owner: lease_owner.into(),
+            position: Mutex::new(after),
         }
     }
-
+    pub(crate) async fn initialize_at_head(&self) -> Result<()> {
+        *self.position.lock().await = self.db.domain_event_head().await?;
+        Ok(())
+    }
     pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut poll = tokio::time::interval(POLL_INTERVAL);
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let notify = self.db.domain_event_notify();
+            let mut idle = MIN_IDLE;
             loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() {
-                            break;
-                        }
-                    }
-                    _ = poll.tick() => {
-                        if let Err(error) = self.broadcast_once(BATCH_LIMIT).await {
-                            tracing::warn!(error = %error, "SSE domain-event broadcast poll failed");
-                        }
-                    }
+                if *shutdown.borrow_and_update() {
+                    return;
                 }
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                match self.broadcast_once(BATCH_LIMIT).await {
+                    Ok(n) if n > 0 => {
+                        idle = MIN_IDLE;
+                        continue;
+                    }
+                    Err(error) => tracing::warn!(%error, "SSE domain-event tail read failed"),
+                    _ => {}
+                }
+                tokio::select! {
+                    changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow_and_update() { return; } }
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(idle) => {}
+                }
+                idle = idle.saturating_mul(2).min(MAX_IDLE);
             }
         })
     }
-
-    /// Claim and republish a bounded batch, in commit order. Each event is
-    /// checkpointed only after its publish returns, so a crash mid-batch
-    /// leaves the remainder eligible for an idempotent replay rather than
-    /// losing it.
     pub async fn broadcast_once(&self, limit: i64) -> Result<usize> {
-        let now = now_rfc3339();
-        let leased_until = (Utc::now() + Duration::seconds(LEASE_SECONDS)).to_rfc3339();
-        let claimed = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                lease_owner: self.lease_owner.clone(),
-                now,
-                leased_until,
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
-
-        let mut published = 0;
-        for event in claimed {
-            self.events.publish_committed(&event);
-            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
-            DomainEventRepo::complete_claimed_event(
-                &*self.db,
-                CompleteDomainEvent {
-                    consumer_name: CONSUMER_NAME.to_owned(),
-                    lease_owner: self.lease_owner.clone(),
-                    event_sequence: event.sequence,
-                    event_id: event.id,
-                    dedupe_key,
-                    completed_at: now_rfc3339(),
-                },
-            )
+        let mut position = self.position.lock().await;
+        let rows = self
+            .db
+            .list_events_after(*position, limit.clamp(1, BATCH_LIMIT))
             .await?;
-            published += 1;
+        for row in &rows {
+            self.events.publish_committed(row);
+            *position = row.sequence;
         }
-        Ok(published)
+        Ok(rows.len())
     }
 }
-
 pub fn domain_event_broadcast_consumer_name() -> &'static str {
     CONSUMER_NAME
-}
-
-pub fn domain_event_broadcast_lease_owner() -> String {
-    format!("sse-broadcast-{}", Uuid::new_v4())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db::{run_migrations, CreateDomainEvent};
+    use db::{now_rfc3339, run_migrations, CreateDomainEvent};
 
     async fn database() -> Arc<SqliteDb> {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
@@ -156,7 +89,7 @@ mod tests {
         let db = database().await;
         let bus = Arc::new(EventBus::new(16));
         let mut rx = bus.subscribe();
-        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus));
+        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), 0);
 
         // Simulate the outbox pattern used by, e.g., project creation from a
         // Charter approval: the event row is inserted directly (standing in
@@ -206,5 +139,54 @@ mod tests {
             .await
             .expect("broadcast succeeds");
         assert_eq!(replayed, 0);
+    }
+    #[tokio::test]
+    async fn burst_is_ordered_without_gaps_duplicates_or_metadata_writes() {
+        let db = database().await;
+        let bus = Arc::new(EventBus::new(512));
+        let mut rx = bus.subscribe();
+        let consumer = DomainEventBroadcastConsumer::new(Arc::clone(&db), Arc::clone(&bus), 0);
+        let mut expected = Vec::new();
+        for n in 0..250 {
+            let event = db
+                .append_event(CreateDomainEvent {
+                    id: format!("burst-{n}"),
+                    event_type: "test".into(),
+                    entity_type: "project".into(),
+                    entity_id: "p".into(),
+                    actor_type: "system".into(),
+                    actor_id: None,
+                    scope_type: "project".into(),
+                    scope_id: "p".into(),
+                    correlation_id: format!("burst-{n}"),
+                    causation_id: None,
+                    causation_depth: 0,
+                    dedupe_key: None,
+                    payload_json: "{}".into(),
+                    created_at: now_rfc3339(),
+                })
+                .await
+                .unwrap();
+            expected.push(event.sequence);
+        }
+        let before: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 100);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 100);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 50);
+        assert_eq!(consumer.broadcast_once(100).await.unwrap(), 0);
+        let mut actual = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let events::EventContext::DomainEventCommitted { sequence, .. } = frame.context {
+                actual.push(sequence);
+            }
+        }
+        assert_eq!(actual, expected);
+        let after: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor ORDER BY consumer_name").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+        let health: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_health")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(health, 0);
     }
 }

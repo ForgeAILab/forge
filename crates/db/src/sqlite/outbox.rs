@@ -103,7 +103,10 @@ impl SqliteDb {
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
             "WITH consumers(consumer_name) AS (SELECT CAST(NULL AS TEXT) WHERE 0",
         );
-        for name in expected_consumers {
+        for name in expected_consumers
+            .iter()
+            .filter(|name| **name != "sse-broadcast")
+        {
             query.push(" UNION SELECT ").push_bind(*name);
         }
         query.push(") SELECT consumers.consumer_name, COALESCE(cursor.last_sequence, 0) AS last_sequence,
@@ -112,20 +115,18 @@ impl SqliteDb {
             LEFT JOIN worker_health AS health ON health.worker_name = consumers.consumer_name ORDER BY consumer_name");
         let rows = query.build().fetch_all(&self.pool).await?;
         let mut result = Vec::with_capacity(rows.len());
-        // Legacy consumers retain their global sequence-distance metric.
-        let head = self.domain_event_head().await?;
         for row in rows {
             let cursor: i64 = row.try_get("last_sequence")?;
             let subscription: Option<String> = row.try_get("subscription_json")?;
-            let (lag, oldest_unprocessed_at) = if let Some(subscription) = subscription {
-                let subscription = serde_json::from_str(&subscription)
-                    .map_err(|_| DbError::Check("invalid worker subscription".into()))?;
-                self.subscribed_backlog(cursor, &subscription).await?
-            } else {
-                let oldest = sqlx::query_scalar("SELECT created_at FROM domain_event WHERE sequence > ? ORDER BY julianday(created_at), sequence LIMIT 1")
-                    .bind(cursor).fetch_optional(&self.pool).await?;
-                ((head - cursor).max(0), oldest)
-            };
+            let subscription = subscription
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|_| DbError::Check("invalid worker subscription".into()))
+                })
+                .transpose()?
+                .unwrap_or(EventSubscription::All);
+            let (lag, oldest_unprocessed_at) =
+                self.subscribed_backlog(cursor, &subscription).await?;
             result.push(DomainEventConsumerLag {
                 consumer_name: row.try_get("consumer_name")?,
                 last_sequence: cursor,

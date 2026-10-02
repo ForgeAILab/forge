@@ -1,8 +1,5 @@
 use super::*;
-use db::{
-    create_sqlite_pool, new_uuid_v4, run_migrations, ClaimDomainEvents, CreateDomainEvent,
-    DomainEventRepo,
-};
+use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -278,7 +275,7 @@ async fn strict_order_sql_filter_and_no_per_ignored_event_writes() {
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = 'filtered'"
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_processing_lease'"
         )
         .await,
         0
@@ -286,7 +283,7 @@ async fn strict_order_sql_filter_and_no_per_ignored_event_writes() {
     assert_eq!(
         scalar(
             &db,
-            "SELECT COUNT(*) FROM event_projection_receipt WHERE consumer_name = 'filtered'"
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_projection_receipt'"
         )
         .await,
         0
@@ -773,17 +770,7 @@ async fn upgrade_reuses_cursor_ignores_legacy_leases_and_handles_once() {
     let next = append(&db, "wanted", "new").await;
     sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('upgrade', ?, ?)")
         .bind(old.sequence).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
-    let claimed = db
-        .claim_event_batch(ClaimDomainEvents {
-            consumer_name: "upgrade".into(),
-            lease_owner: "legacy".into(),
-            now: db::now_rfc3339(),
-            leased_until: "2999-01-01T00:00:00Z".into(),
-            limit: 10,
-        })
-        .await
-        .unwrap();
-    assert_eq!(claimed.len(), 1);
+    legacy_delivery(&db, "upgrade").await;
     let runtime = WorkerRuntime::new(Arc::clone(&db), Arc::new(TinyWorker::new("upgrade")));
     assert_eq!(runtime.run_once(10).await.unwrap(), 1);
     assert_eq!(runtime.run_once(10).await.unwrap(), 0);
@@ -1055,15 +1042,7 @@ async fn worker_runtime_migration_removes_only_memory_delivery_metadata() {
     let db = database().await;
     let event = append(&db, "wanted", "legacy").await;
     for name in [crate::memory_consumer_name(), "unmigrated"] {
-        db.claim_event_batch(ClaimDomainEvents {
-            consumer_name: name.into(),
-            lease_owner: "legacy".into(),
-            now: db::now_rfc3339(),
-            leased_until: "2999-01-01T00:00:00Z".into(),
-            limit: 10,
-        })
-        .await
-        .unwrap();
+        legacy_delivery(&db, name).await;
         sqlx::query("INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at) VALUES (?, ?, ?, ?)")
             .bind(name).bind(&event.id).bind(&event.id).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
     }
@@ -1192,3 +1171,23 @@ async fn invalid_retry_timestamp_is_due_and_recovers_without_resetting_strikes()
 
 #[path = "regressions.rs"]
 mod regressions;
+
+async fn legacy_delivery(db: &SqliteDb, name: &str) {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_processing_lease'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    if exists == 0 {
+        sqlx::raw_sql(include_str!(
+            "../../../db/tests/fixtures/event_delivery.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?) ON CONFLICT DO NOTHING").bind(name).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) SELECT ?, sequence, 'legacy', '2999-01-01T00:00:00Z', 1, ? FROM domain_event WHERE sequence > (SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?)")
+        .bind(name).bind(db::now_rfc3339()).bind(name).execute(db.pool()).await.unwrap();
+}

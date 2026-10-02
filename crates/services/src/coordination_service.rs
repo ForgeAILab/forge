@@ -876,7 +876,7 @@ fn validate_scope(scope_type: &str, scope_id: &str) -> Result<()> {
     required_text("scope id", scope_id).map(|_| ())
 }
 
-fn validate_commitment_transition(
+pub(crate) fn validate_commitment_transition(
     from: &AgentCommitmentStatus,
     to: &AgentCommitmentStatus,
     reason: Option<&str>,

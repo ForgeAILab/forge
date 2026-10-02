@@ -140,6 +140,24 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         "shipped",
     )
     .unwrap();
+    let old = db
+        .append_event(CreateDomainEvent::task_transition(
+            "old-task-transition",
+            task.id.clone(),
+            project_id,
+            "in_progress",
+            "shipped",
+            None,
+            "system:workflow",
+            "old delivered event",
+            false,
+            now.clone(),
+            snapshot.clone(),
+        ))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, ?, ?)")
+        .bind(coordination_consumer_name()).bind(old.sequence).bind(&now).execute(db.pool()).await.unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent::task_transition(
@@ -174,7 +192,80 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         .await
         .unwrap();
 
-    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db), "consumer-1")
+    let wanted = db
+        .get_event("task-transition-outcome")
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::raw_sql(include_str!("../../db/tests/fixtures/event_delivery.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)")
+        .bind(coordination_consumer_name()).bind(wanted.sequence).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let preparing = CoordinationOutcomeConsumer::new(Arc::clone(&db));
+    let services::worker_runtime::Outcome::Done(prepared) =
+        services::worker_runtime::Worker::handle(&preparing, &wanted)
+            .await
+            .unwrap()
+    else {
+        panic!("wanted outcome");
+    };
+    sqlx::query("UPDATE agent_commitment SET version = version + 1 WHERE id = ?")
+        .bind(&commitment.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut stale_tx = db::begin_immediate(db.pool()).await.unwrap();
+    let stale =
+        services::worker_runtime::Worker::commit(&preparing, &mut stale_tx, &wanted, &prepared)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        stale.kind,
+        services::worker_runtime::WorkerErrorKind::Transient,
+        "preparation must retain the commitment CAS version"
+    );
+    stale_tx.rollback().await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER fail_outcome_after_commitment BEFORE INSERT ON agent_inbox_item WHEN NEW.kind = 'task_outcome' BEGIN SELECT RAISE(ABORT, 'test rollback after commitment write'); END;")
+        .execute(db.pool()).await.unwrap();
+    let failed = CoordinationOutcomeConsumer::new(Arc::clone(&db))
+        .run_once(100)
+        .await
+        .unwrap();
+    assert_eq!(failed.processed_events, 0);
+    assert_eq!(
+        db.get_consumer_cursor(coordination_consumer_name())
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        old.sequence
+    );
+    assert_eq!(
+        db.get_commitment(&commitment.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        db::AgentCommitmentStatus::InProgress
+    );
+    assert!(db
+        .list_commitment_evidence(&commitment.id)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DROP TRIGGER fail_outcome_after_commitment")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
@@ -209,22 +300,18 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
     assert_eq!(inbox.len(), 1);
 
     // Simulate a crash after the idempotent writes but before the durable
-    // receipt checkpoint.  A new process/lease owner must replay the event.
-    sqlx::query("DELETE FROM event_projection_receipt WHERE consumer_name = ?")
-        .bind(coordination_consumer_name())
-        .execute(db.pool())
-        .await
-        .unwrap();
+    // cursor checkpoint.  A new process/lease owner must replay the event.
     sqlx::query(
-        "UPDATE event_consumer_cursor SET last_sequence = 0, version = version + 1
+        "UPDATE event_consumer_cursor SET last_sequence = ?, version = version + 1
          WHERE consumer_name = ?",
     )
+    .bind(old.sequence)
     .bind(coordination_consumer_name())
     .execute(db.pool())
     .await
     .unwrap();
 
-    let replay = CoordinationOutcomeConsumer::new(Arc::clone(&db), "consumer-2")
+    let replay = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
@@ -563,7 +650,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     )
     .await
     .unwrap();
-    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db), "continuity-consumer-1")
+    let first = CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();
@@ -599,7 +686,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     // A different consumer instance replaying the same durable event must
     // preserve one evidence row per commitment and one outcome item per
     // commitment/scope for the new owner.
-    CoordinationOutcomeConsumer::new(Arc::clone(&db), "continuity-consumer-2")
+    CoordinationOutcomeConsumer::new(Arc::clone(&db))
         .run_once(100)
         .await
         .unwrap();

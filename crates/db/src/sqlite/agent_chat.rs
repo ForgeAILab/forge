@@ -2995,3 +2995,18 @@ fn map_chat_write_error(error: sqlx::Error) -> DbError {
         error.into()
     }
 }
+
+impl SqliteDb {
+    pub async fn get_agent_chat_turn_job_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<AgentChatTurnJob>> {
+        sqlx::query(AGENT_CHAT_TURN_WITH_RETRY_STATE)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_agent_chat_turn_job)
+            .transpose()
+    }
+}

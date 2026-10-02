@@ -19,6 +19,8 @@ pub enum Outcome<T> {
 pub enum WorkerErrorKind {
     Failure,
     Transient,
+    /// Deterministic rejection discovered at the transaction boundary.
+    Terminal,
 }
 
 /// Messages must exclude payloads, credentials and other secret material.
@@ -37,6 +39,12 @@ impl WorkerError {
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: WorkerErrorKind::Transient,
+            message: bounded_error(&message.into()),
+        }
+    }
+    pub fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            kind: WorkerErrorKind::Terminal,
             message: bounded_error(&message.into()),
         }
     }

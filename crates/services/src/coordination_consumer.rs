@@ -1,36 +1,41 @@
 //! Durable reconciliation of Task outcomes into Agent coordination state.
 //!
-//! Task transitions are authoritative in the Task/domain-event ledger.  This
-//! consumer is deliberately a projection: it claims the same leased event
-//! sequence used by the other durable consumers, applies only idempotent
-//! commitment/inbox writes, and records the receipt after those writes commit.
-//! A process crash therefore replays the event without creating a second
-//! evidence row, lifecycle transition, or outcome message.
+//! Task transitions are authoritative in the Task/domain-event ledger. The
+//! worker prepares scope-validated outcomes, then commits idempotent commitment
+//! and inbox effects with its retained checkpoint in one runtime transaction.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
-use chrono::{DateTime, Duration, Utc};
+use async_trait::async_trait;
 use db::{
-    now_rfc3339, AgentCommitmentRepo, AgentCommitmentStatus, AgentInboxKind, ClaimDomainEvents,
-    CompleteDomainEvent, CreateAgentCommitmentEvidence, DomainEvent, DomainEventRepo, SqliteDb,
-    Task, TaskRepo,
+    now_rfc3339, AgentCommitmentStatus, AgentInboxKind, CreateAgentCommitmentEvidence, DomainEvent,
+    DomainEventRepo, SqliteDb, Task, TaskRepo,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
-use tokio::{sync::watch, task::JoinHandle, time::Duration as TokioDuration};
-use uuid::Uuid;
+use sqlx::{Row, Sqlite, Transaction};
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    AgentInboxService, CommitmentService, CompleteCommitmentInput, DeliverInboxInput, Result,
-    ServiceError, UpdateCommitmentInput,
+    worker_runtime::{Outcome, RetryPolicy, Subscription, Worker, WorkerError, WorkerRuntime},
+    CommitmentService, Result, ServiceError,
 };
 
 const CONSUMER_NAME: &str = "agent-coordination-outcomes";
-const LEASE_SECONDS: i64 = 60;
-const POLL_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
+const EVENT_TYPES: &[&str] = &[
+    "task.transitioned",
+    "task.done",
+    "task.completed",
+    "task.blocked",
+    "task.failed",
+    "task.cancelled",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinationOutcomeRun {
@@ -44,19 +49,17 @@ pub struct CoordinationOutcomeRun {
 pub struct CoordinationOutcomeConsumer {
     db: Arc<SqliteDb>,
     commitments: CommitmentService,
-    inbox: AgentInboxService,
     consumer_name: String,
-    lease_owner: String,
+    reconciled: Arc<AtomicUsize>,
 }
 
 impl CoordinationOutcomeConsumer {
-    pub fn new(db: Arc<SqliteDb>, lease_owner: impl Into<String>) -> Self {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         Self {
             commitments: CommitmentService::new(Arc::clone(&db)),
-            inbox: AgentInboxService::new(Arc::clone(&db)),
             db,
             consumer_name: CONSUMER_NAME.to_owned(),
-            lease_owner: lease_owner.into(),
+            reconciled: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -65,103 +68,40 @@ impl CoordinationOutcomeConsumer {
         self
     }
 
-    /// Start the restart-safe outcome projector.  The in-memory lease owner
-    /// is only a holder identity; the cursor and receipts live in SQLite.
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(POLL_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if let Err(error) = self.run_once(100).await {
-                            tracing::warn!(
-                                consumer = %self.consumer_name,
-                                %error,
-                                "Task outcome reconciliation poll failed"
-                            );
-                        }
-                    }
-                }
-            }
-        })
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        Arc::new(WorkerRuntime::new(Arc::clone(&self.db), self)).start(shutdown)
     }
-
-    /// Claim and reconcile a bounded batch.  A failed projection is not
-    /// acknowledged, so the lease expires and a subsequent process retries
-    /// the same event.  Every mutation below carries an event-derived dedupe
-    /// key, making that replay safe even after a crash between projection and
-    /// receipt checkpoint.
     pub async fn run_once(&self, limit: i64) -> Result<CoordinationOutcomeRun> {
-        let now = now_rfc3339();
-        let leased_until = lease_until(&now);
-        let events = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: self.consumer_name.clone(),
-                lease_owner: self.lease_owner.clone(),
-                now,
-                leased_until,
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
-        let claimed_events = events.len();
-        let mut reconciled_events = 0;
-        let mut processed_events = 0;
-        let mut last_sequence =
-            DomainEventRepo::get_consumer_cursor(&*self.db, &self.consumer_name)
-                .await?
-                .map(|cursor| cursor.last_sequence)
-                .unwrap_or(0);
-
-        for event in events {
-            if self.reconcile_event(&event).await? {
-                reconciled_events += 1;
-            }
-            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
-            DomainEventRepo::complete_claimed_event(
-                &*self.db,
-                CompleteDomainEvent {
-                    consumer_name: self.consumer_name.clone(),
-                    lease_owner: self.lease_owner.clone(),
-                    event_sequence: event.sequence,
-                    event_id: event.id,
-                    dedupe_key,
-                    completed_at: now_rfc3339(),
-                },
-            )
+        let before = self.reconciled.load(Ordering::Relaxed);
+        let processed_events = WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
+            .run_once(limit.clamp(1, 100) as usize)
             .await?;
-            processed_events += 1;
-            last_sequence = event.sequence;
-        }
-
+        let last_sequence = self
+            .db
+            .get_consumer_cursor(&self.consumer_name)
+            .await?
+            .map_or(0, |c| c.last_sequence);
         Ok(CoordinationOutcomeRun {
-            claimed_events,
-            reconciled_events,
+            claimed_events: processed_events,
             processed_events,
+            reconciled_events: self.reconciled.load(Ordering::Relaxed) - before,
             last_sequence,
         })
     }
 
-    async fn reconcile_event(&self, event: &DomainEvent) -> Result<bool> {
+    async fn prepare_event(&self, event: &DomainEvent) -> Result<Option<PreparedCoordination>> {
         if event.entity_type != "task" || !is_task_outcome_event(event) {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(task) = TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await? else {
             // A task can be removed by a forward migration after its event
             // was committed.  The event remains checkpointable; there is no
             // safe scope to which a synthetic outcome could be delivered.
-            return Ok(false);
+            return Ok(None);
         };
         let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
         let Some(outcome) = task_outcome(event, &task, &payload) else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let commitment_ids = sqlx::query_scalar::<_, String>(
@@ -173,13 +113,8 @@ impl CoordinationOutcomeConsumer {
         .await?;
         let action_origins = self.task_action_origins(&task.id).await?;
 
-        // A proposal inbox is acknowledged before the new outcome item is
-        // inserted.  This prevents a replay from acknowledging the outcome
-        // message that this same projector just created.
-        self.acknowledge_originating_inbox(&task.id, &action_origins)
-            .await?;
-
         let mut recipients = BTreeMap::<RecipientKey, RecipientSource>::new();
+        let mut commitments = Vec::new();
         for commitment_id in commitment_ids {
             let commitment = self.commitments.get(&commitment_id).await?;
             if !self
@@ -193,8 +128,6 @@ impl CoordinationOutcomeConsumer {
                 );
                 continue;
             }
-            self.reconcile_commitment(&commitment, &task, event, &outcome)
-                .await?;
             let key = RecipientKey {
                 identity_id: commitment.owner_identity_id.clone(),
                 scope_type: commitment.scope_type.clone(),
@@ -203,8 +136,9 @@ impl CoordinationOutcomeConsumer {
             recipients
                 .entry(key)
                 .or_insert_with(|| RecipientSource::Commitment(commitment.id.clone()));
+            commitments.push(commitment);
         }
-        for action in action_origins {
+        for action in &action_origins {
             if !self
                 .action_scope_matches_task(&action.scope_type, &action.scope_id, &task)
                 .await?
@@ -217,20 +151,22 @@ impl CoordinationOutcomeConsumer {
                 continue;
             }
             let key = RecipientKey {
-                identity_id: action.actor_identity_id,
-                scope_type: action.scope_type,
-                scope_id: action.scope_id,
+                identity_id: action.actor_identity_id.clone(),
+                scope_type: action.scope_type.clone(),
+                scope_id: action.scope_id.clone(),
             };
             recipients
                 .entry(key)
-                .or_insert_with(|| RecipientSource::Action(action.action_id));
+                .or_insert_with(|| RecipientSource::Action(action.action_id.clone()));
         }
 
-        for (recipient, source) in recipients {
-            self.deliver_outcome(&recipient, &source, &task, event, &outcome)
-                .await?;
-        }
-        Ok(true)
+        Ok(Some(PreparedCoordination {
+            task,
+            outcome,
+            actions: action_origins,
+            commitments,
+            recipients,
+        }))
     }
 
     async fn task_action_origins(&self, task_id: &str) -> Result<Vec<ActionOrigin>> {
@@ -268,8 +204,9 @@ impl CoordinationOutcomeConsumer {
         Ok(origins)
     }
 
-    async fn acknowledge_originating_inbox(
+    async fn acknowledge_originating_inbox_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         task_id: &str,
         actions: &[ActionOrigin],
     ) -> Result<()> {
@@ -283,7 +220,7 @@ impl CoordinationOutcomeConsumer {
                  WHERE source_id = ? AND COALESCE(source_type, '') <> 'task_outcome'",
             )
             .bind(&source_id)
-            .fetch_all(self.db.pool())
+            .fetch_all(&mut **tx)
             .await?;
             for id in ids {
                 sqlx::query(
@@ -299,7 +236,7 @@ impl CoordinationOutcomeConsumer {
                 .bind(&now)
                 .bind(&now)
                 .bind(id)
-                .execute(self.db.pool())
+                .execute(&mut **tx)
                 .await?;
             }
         }
@@ -340,13 +277,19 @@ impl CoordinationOutcomeConsumer {
         }
     }
 
-    async fn reconcile_commitment(
+    async fn reconcile_commitment_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         commitment: &db::AgentCommitment,
         task: &Task,
         event: &DomainEvent,
         outcome: &TaskOutcome,
     ) -> Result<()> {
+        let current = self
+            .db
+            .get_commitment_in_tx(tx, &commitment.id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
         let dedupe_key = format!("task-outcome:{}:{}:commitment", task.id, event.id);
         match outcome {
             TaskOutcome::Delivered => {
@@ -377,53 +320,51 @@ impl CoordinationOutcomeConsumer {
                     created_at: now_rfc3339(),
                 };
                 if commitment.status == AgentCommitmentStatus::Completed {
-                    let evidence_rows = self.commitments.evidence(&commitment.id).await?;
-                    if evidence_rows.iter().any(|row| {
-                        row.evidence_type == "task_delivery" && row.evidence_id == task.id
-                    }) {
-                        return Ok(());
-                    }
-                    // Never rewrite a completed obligation with a second
-                    // source of evidence; a human completion remains final.
                     return Ok(());
                 }
+                crate::coordination_service::validate_commitment_transition(
+                    &current.status,
+                    &AgentCommitmentStatus::Completed,
+                    Some("Task delivery reconciled from the durable outcome event"),
+                )?;
                 let result = self
-                    .commitments
-                    .complete(CompleteCommitmentInput {
-                        id: commitment.id.clone(),
-                        expected_version: commitment.version,
-                        evidence: commitment_evidence_input(&evidence),
-                        actor_type: "forge".to_owned(),
-                        actor_id: CONSUMER_NAME.to_owned(),
-                        reason: Some(
-                            "Task delivery reconciled from the durable outcome event".to_owned(),
-                        ),
-                        dedupe_key,
-                    })
+                    .db
+                    .complete_commitment_in_tx(
+                        tx,
+                        db::CompleteAgentCommitment {
+                            id: commitment.id.clone(),
+                            expected_version: commitment.version,
+                            evidence,
+                            actor_type: "forge".to_owned(),
+                            actor_id: CONSUMER_NAME.to_owned(),
+                            reason: Some(
+                                "Task delivery reconciled from the durable outcome event"
+                                    .to_owned(),
+                            ),
+                            dedupe_key,
+                            completed_at: now_rfc3339(),
+                            updated_at: now_rfc3339(),
+                        },
+                    )
                     .await;
                 match result {
                     Ok(_) => Ok(()),
-                    Err(ServiceError::Db(db::DbError::VersionConflict)) => {
-                        let current = self.commitments.get(&commitment.id).await?;
-                        let evidence_rows = self.commitments.evidence(&commitment.id).await?;
-                        if current.status == AgentCommitmentStatus::Completed
-                            && evidence_rows.iter().any(|row| {
-                                row.evidence_type == "task_delivery" && row.evidence_id == task.id
-                            })
-                        {
+                    Err(db::DbError::VersionConflict) => {
+                        let evidence: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_evidence WHERE commitment_id = ? AND evidence_type = 'task_delivery' AND evidence_id = ?")
+                            .bind(&commitment.id).bind(&task.id).fetch_one(&mut **tx).await?;
+                        if current.status == AgentCommitmentStatus::Completed && evidence > 0 {
                             Ok(())
                         } else {
-                            Err(ServiceError::Db(db::DbError::VersionConflict))
+                            Err(db::DbError::VersionConflict.into())
                         }
                     }
-                    Err(error) => Err(error),
+                    Err(error) => Err(error.into()),
                 }
             }
             TaskOutcome::Blocked { reason } | TaskOutcome::Cancelled { reason } => {
-                let lifecycle =
-                    AgentCommitmentRepo::list_commitment_lifecycle(&*self.db, &commitment.id)
-                        .await?;
-                if lifecycle.iter().any(|row| row.dedupe_key == dedupe_key) {
+                let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?")
+                    .bind(&commitment.id).bind(&dedupe_key).fetch_one(&mut **tx).await?;
+                if exists > 0 {
                     return Ok(());
                 }
                 let (status, blocked_reason) = match &commitment.status {
@@ -438,26 +379,35 @@ impl CoordinationOutcomeConsumer {
                         return Ok(());
                     }
                 };
-                self.commitments
-                    .update(UpdateCommitmentInput {
-                        id: commitment.id.clone(),
-                        expected_version: commitment.version,
-                        status: Some(status),
-                        due_at: None,
-                        description: None,
-                        blocked_reason,
-                        cancellation_reason: None,
-                        actor_type: "forge".to_owned(),
-                        actor_id: CONSUMER_NAME.to_owned(),
-                        reason: Some(reason.clone()),
-                        evidence_id: None,
-                        dedupe_key,
-                    })
+                crate::coordination_service::validate_commitment_transition(
+                    &current.status,
+                    &status,
+                    Some(reason),
+                )?;
+                self.db
+                    .update_commitment_in_tx(
+                        tx,
+                        db::UpdateAgentCommitment {
+                            id: commitment.id.clone(),
+                            expected_version: commitment.version,
+                            status: Some(status),
+                            due_at: None,
+                            description: None,
+                            blocked_reason,
+                            cancellation_reason: None,
+                            actor_type: "forge".to_owned(),
+                            actor_id: CONSUMER_NAME.to_owned(),
+                            reason: Some(reason.clone()),
+                            evidence_id: None,
+                            dedupe_key,
+                            updated_at: now_rfc3339(),
+                        },
+                    )
                     .await
                     .map(|_| ())
                     .or_else(|error| match error {
-                        ServiceError::Db(db::DbError::VersionConflict) => Ok(()),
-                        other => Err(other),
+                        db::DbError::VersionConflict => Ok(()),
+                        other => Err(other.into()),
                     })
             }
         }
@@ -485,8 +435,9 @@ impl CoordinationOutcomeConsumer {
         })
     }
 
-    async fn deliver_outcome(
+    async fn deliver_outcome_in_tx(
         &self,
+        tx: &mut Transaction<'_, Sqlite>,
         recipient: &RecipientKey,
         source: &RecipientSource,
         task: &Task,
@@ -513,30 +464,36 @@ impl CoordinationOutcomeConsumer {
             "cancelled" => "Task delivery cancelled",
             _ => "Task outcome",
         };
-        self.inbox
-            .deliver(DeliverInboxInput {
-                id: None,
-                recipient_identity_id: recipient.identity_id.clone(),
-                scope_type: recipient.scope_type.clone(),
-                scope_id: recipient.scope_id.clone(),
-                kind: AgentInboxKind::TaskOutcome,
-                title: title.to_owned(),
-                body: payload_json.clone(),
-                payload_json,
-                source_type: Some("task_outcome".to_owned()),
-                source_id: Some(task.id.clone()),
-                correlation_id: event.correlation_id.clone(),
-                causation_id: Some(event.id.clone()),
-                dedupe_key: format!(
-                    "task-outcome:{}:{}:inbox:{}:{}:{}:{}",
-                    task.id,
-                    event.id,
-                    recipient.identity_id,
-                    recipient.scope_type,
-                    recipient.scope_id,
-                    source_id
-                ),
-            })
+        self.db
+            .create_inbox_item_in_tx(
+                tx,
+                db::CreateAgentInboxItem {
+                    id: db::new_uuid_v4(),
+                    recipient_identity_id: recipient.identity_id.clone(),
+                    scope_type: recipient.scope_type.clone(),
+                    scope_id: recipient.scope_id.clone(),
+                    kind: AgentInboxKind::TaskOutcome,
+                    status: db::AgentInboxStatus::Unread,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                    title: title.to_owned(),
+                    body: payload_json.clone(),
+                    payload_json,
+                    source_type: Some("task_outcome".to_owned()),
+                    source_id: Some(task.id.clone()),
+                    correlation_id: event.correlation_id.clone(),
+                    causation_id: Some(event.id.clone()),
+                    dedupe_key: format!(
+                        "task-outcome:{}:{}:inbox:{}:{}:{}:{}",
+                        task.id,
+                        event.id,
+                        recipient.identity_id,
+                        recipient.scope_type,
+                        recipient.scope_id,
+                        source_id
+                    ),
+                },
+            )
             .await
             .map(|_| ())
             .map_err(|error| {
@@ -547,8 +504,72 @@ impl CoordinationOutcomeConsumer {
                     %error,
                     "Task outcome inbox delivery failed and will retry"
                 );
-                error
+                error.into()
             })
+    }
+}
+
+pub struct PreparedCoordination {
+    task: Task,
+    outcome: TaskOutcome,
+    actions: Vec<ActionOrigin>,
+    commitments: Vec<db::AgentCommitment>,
+    recipients: BTreeMap<RecipientKey, RecipientSource>,
+}
+#[async_trait]
+impl Worker for CoordinationOutcomeConsumer {
+    type Prepared = PreparedCoordination;
+    fn name(&self) -> &str {
+        &self.consumer_name
+    }
+    fn subscription(&self) -> Subscription {
+        Subscription::Exact(EVENT_TYPES.iter().map(|s| s.to_string()).collect())
+    }
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
+    fn handle_timeout(&self) -> Duration {
+        Duration::from_secs(300)
+    }
+    async fn handle(
+        &self,
+        event: &DomainEvent,
+    ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
+        self.prepare_event(event)
+            .await
+            .map(|p| p.map_or(Outcome::Skip, Outcome::Done))
+            .map_err(|e| WorkerError::transient(format!("coordination preparation failed: {e}")))
+    }
+    async fn commit(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        p: &Self::Prepared,
+    ) -> std::result::Result<(), WorkerError> {
+        async {
+            self.acknowledge_originating_inbox_in_tx(tx, &p.task.id, &p.actions)
+                .await?;
+            for commitment in &p.commitments {
+                self.reconcile_commitment_in_tx(tx, commitment, &p.task, event, &p.outcome)
+                    .await?;
+            }
+            for (recipient, source) in &p.recipients {
+                self.deliver_outcome_in_tx(tx, recipient, source, &p.task, event, &p.outcome)
+                    .await?;
+            }
+            Ok::<_, ServiceError>(())
+        }
+        .await
+        .map_err(|e| WorkerError::transient(format!("coordination persistence failed: {e}")))
+    }
+    async fn after_commit(
+        &self,
+        _: &DomainEvent,
+        _: &Self::Prepared,
+        _: &(),
+    ) -> std::result::Result<(), WorkerError> {
+        self.reconciled.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -664,34 +685,6 @@ fn task_reason(task: &Task) -> Option<String> {
         })
 }
 
-fn commitment_evidence_input(
-    evidence: &CreateAgentCommitmentEvidence,
-) -> crate::CommitmentEvidenceInput {
-    crate::CommitmentEvidenceInput {
-        id: Some(evidence.id.clone()),
-        commitment_id: evidence.commitment_id.clone(),
-        evidence_type: evidence.evidence_type.clone(),
-        evidence_id: evidence.evidence_id.clone(),
-        scope_type: evidence.scope_type.clone(),
-        scope_id: evidence.scope_id.clone(),
-        description: evidence.description.clone(),
-        metadata_json: evidence.metadata_json.clone(),
-        authorized_by_type: evidence.authorized_by_type.clone(),
-        authorized_by_id: evidence.authorized_by_id.clone(),
-        dedupe_key: evidence.dedupe_key.clone(),
-    }
-}
-
-fn lease_until(now: &str) -> String {
-    DateTime::parse_from_rfc3339(now)
-        .map(|value| (value.with_timezone(&Utc) + Duration::seconds(LEASE_SECONDS)).to_rfc3339())
-        .unwrap_or_else(|_| now.to_owned())
-}
-
 pub fn coordination_consumer_name() -> &'static str {
     CONSUMER_NAME
-}
-
-pub fn coordination_consumer_lease_owner() -> String {
-    format!("coordination-consumer-{}", Uuid::new_v4())
 }

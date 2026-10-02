@@ -145,6 +145,10 @@ async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_leas
     )
     .await
     .expect("event appends");
+    sqlx::raw_sql(include_str!("../../db/tests/fixtures/event_delivery.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner,
         leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)",
@@ -170,6 +174,12 @@ async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_leas
     .await
     .expect("message inserts after source recovery");
 
+    sqlx::raw_sql(include_str!(
+        "../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     let second = AgentChatMemoryConsumer::new(Arc::clone(&db))
         .run_once(10)
         .await
@@ -202,16 +212,9 @@ async fn agent_chat_memory_consumer_preserves_upgrade_cursor_ignores_legacy_leas
         .await
         .unwrap();
     assert_eq!(dead, 0, "wanted event below the cursor is not revisited");
-    let leases: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM event_processing_lease WHERE consumer_name = ?")
-            .bind(services::memory_consumer_name())
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        leases, 1,
-        "generic source does not touch seeded legacy leases"
-    );
+    let retired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('event_processing_lease', 'event_projection_receipt')")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(retired, 0);
 }
 
 #[tokio::test]
