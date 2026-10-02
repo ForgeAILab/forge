@@ -30,6 +30,40 @@ pub struct DaemonWorkspaceClient {
 }
 
 impl DaemonWorkspaceClient {
+    pub async fn machine_probe(
+        &self,
+        daemon_id: &str,
+        params: MachineProbeParams,
+    ) -> Result<MachineProbeResult> {
+        let seconds = params
+            .commands
+            .iter()
+            .map(|command| command.timeout_seconds.clamp(1, 300) + 3)
+            .sum::<u64>();
+        self.request(
+            daemon_id,
+            METHOD_MACHINE_PROBE,
+            &params,
+            Duration::from_secs(seconds).saturating_add(self.timeout),
+            false,
+        )
+        .await
+    }
+
+    pub async fn provision_location(
+        &self,
+        daemon_id: &str,
+        params: RepoLocationProvisionParams,
+    ) -> Result<RepoLocationProvisionResult> {
+        self.request(
+            daemon_id,
+            METHOD_REPO_LOCATION_PROVISION,
+            &params,
+            Duration::from_secs(330),
+            false,
+        )
+        .await
+    }
     pub fn new(registry: Arc<DaemonConnectionRegistry>) -> Self {
         Self {
             registry,

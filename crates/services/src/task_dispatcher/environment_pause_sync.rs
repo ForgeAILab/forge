@@ -199,7 +199,7 @@ impl TaskDispatcher {
                             .map(|path| Some(ProbeTarget::Server(path)))
                     } else {
                         environment::target_for_machine(&db, &project, &row.machine,
-                            &service.workspace_backend_router(), row.workspace_id.as_deref()).await
+                            &service.workspace_backend_router(), service.environment_daemon_connections(), row.workspace_id.as_deref()).await
                     };
                     let results = match target {
                         Ok(Some(target)) => environment::run_checks(&target, &environment, &checks).await,
@@ -296,7 +296,7 @@ impl TaskDispatcher {
                     };
                     if let Some(project) = ProjectRepo::get_by_id(&*db, &event.entity_id).await? {
                         if let Err(error) = environment::schedule_project_probes(
-                            &db, &project, service.dispatch_notify(), event_bus.clone()).await {
+                            &db, &project, service.dispatch_notify(), event_bus.clone(), service.environment_daemon_connections()).await {
                             tracing::warn!(project_id = %project.id, %error, "settings environment probe could not start");
                         }
                         service.dispatch_notify().notify_one();

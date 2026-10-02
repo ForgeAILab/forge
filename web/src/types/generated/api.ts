@@ -283,6 +283,7 @@ export interface LifecycleHookTestResponse {
 }
 
 export interface ProjectSettings {
+  placement?: ProjectPlacementSettings
   max_active_tasks: number
   retry_budgets: RetryBudgets
   default_role_assignments: DefaultRoleAssignment[]
@@ -303,7 +304,14 @@ export interface EnvironmentAsset {
   target: string
 }
 
+export type EnvironmentCheckScope = 'workspace' | 'machine'
+export type PlacementProvision = 'when_verified' | 'never'
+export interface ProjectPlacementSettings {
+  provision: PlacementProvision
+}
+
 export interface EnvironmentCheck {
+  scope?: EnvironmentCheckScope
   name: string
   command: string
   roles: string[]

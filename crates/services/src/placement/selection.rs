@@ -61,6 +61,10 @@ pub struct PlacementCandidate {
     pub negotiated_revision: Option<u32>,
     pub workspace_v1: bool,
     pub plan_transport: bool,
+    pub machine_probe: bool,
+    pub repo_provision: bool,
+    /// This location is proposed, or belongs to an unfinished provisioning job.
+    pub provisioning: bool,
     pub runtime_ready: bool,
     pub visible: bool,
     /// Availability is resolved per Agent, including its owner-scoped enable
@@ -134,6 +138,7 @@ pub enum PlacementFilterCode {
     NotVisible,
     EnvironmentNotReady,
     EnvironmentProbePending,
+    EnvironmentUnverified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +216,7 @@ impl PlacementUnavailable {
                                 | PlacementFilterCode::MachineCapacity
                                 | PlacementFilterCode::EnvironmentProbePending
                                 | PlacementFilterCode::EnvironmentNotReady
+                                | PlacementFilterCode::EnvironmentUnverified
                         )
                     })
             })
@@ -235,6 +241,7 @@ impl PlacementUnavailable {
                             | MachineCapacity
                             | EnvironmentProbePending
                             | EnvironmentNotReady
+                            | EnvironmentUnverified
                     ) || (handshake_missing
                         && matches!(
                             code,
@@ -262,6 +269,13 @@ impl PlacementUnavailable {
                 api_types::DAEMON_UPGRADE_REQUIRED,
                 api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
             )
+        } else if self.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .filter_codes
+                .contains(&PlacementFilterCode::EnvironmentUnverified)
+        }) {
+            ": environment_unverified: declare a machine check or register a repository location"
+                .to_owned()
         } else {
             String::new()
         }
@@ -294,6 +308,9 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
     let mut eligible = Vec::new();
     let mut rejected_candidates = Vec::new();
     for candidate in candidates {
+        if candidate.provisioning && ready_location_can_run(context) {
+            continue;
+        }
         let filter_codes = filter_candidate(context, candidate);
         if filter_codes.is_empty() {
             eligible.push(candidate);
@@ -405,7 +422,8 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
     // Unknown readiness does not demote a preferred owner. Wait for its
     // server probe rather than changing the established placement order.
     if context.candidates.iter().any(|pending| {
-        filter_candidate(context, pending) == [PlacementFilterCode::EnvironmentProbePending]
+        !pending.provisioning
+            && filter_candidate(context, pending) == [PlacementFilterCode::EnvironmentProbePending]
             && preference_key(context, pending) < preference_key(context, candidate)
     }) {
         return unavailable();
@@ -421,20 +439,36 @@ pub fn select_placement(context: &SelectionContext) -> SelectionOutcome {
     }))
 }
 
-/// Step A probes only the server. Daemon facts come from launch checks:
-/// unknown, missing and stale facts pass at both reserve and claim. Step 3's
-/// machine.probe replaces this one policy function; never probe a Task workspace.
+/// Probe-capable owners need current full readiness for automatic dispatch.
+/// Legacy/denied owners, asset-backed Projects and direct claims use launch
+/// preflight on existing locations. Provisioning always needs machine checks.
 pub(crate) fn environment_filter(
     context: &SelectionContext,
     candidate: &PlacementCandidate,
 ) -> Option<PlacementFilterCode> {
+    if candidate.provisioning {
+        if !context.environment_checks.iter().any(|check| {
+            check.scope == api_types::EnvironmentCheckScope::Machine
+                && check.applies_to(&context.claiming_agent.role)
+        }) {
+            return Some(PlacementFilterCode::EnvironmentUnverified);
+        }
+        if !applicable_failing_checks(context, candidate).is_empty() {
+            return Some(PlacementFilterCode::EnvironmentNotReady);
+        }
+        return Some(PlacementFilterCode::EnvironmentProbePending);
+    }
     let digest = context.environment_digest.as_ref()?;
     let current = candidate
         .environment_readiness
         .as_ref()
         .filter(|row| &row.checks_digest == digest);
     match current {
-        Some(row) if row.status == EnvironmentReadinessStatus::Ready => None,
+        Some(row)
+            if row.status == EnvironmentReadinessStatus::Ready && row.scope_covered == "full" =>
+        {
+            None
+        }
         Some(row)
             if row.status == EnvironmentReadinessStatus::NotReady
                 && (!context.environment_has_assets
@@ -446,10 +480,27 @@ pub(crate) fn environment_filter(
                     .role
                     .as_ref()
                     .is_none_or(|role| &context.claiming_agent.role == role);
-            (unnamed_applies || !applicable_failing_checks(context, candidate).is_empty())
-                .then_some(PlacementFilterCode::EnvironmentNotReady)
+            if unnamed_applies || !applicable_failing_checks(context, candidate).is_empty() {
+                Some(PlacementFilterCode::EnvironmentNotReady)
+            } else if row.scope_covered != "full"
+                && context.environment_admission == EnvironmentAdmission::Dispatcher
+                && !context.environment_has_assets
+                && (candidate.location.owner_kind == RepoLocationOwnerKind::Server
+                    || (candidate.machine_probe
+                        && candidate
+                            .allowed_run_purposes
+                            .contains(&WorkspaceRunPurpose::EnvironmentProbe)))
+            {
+                Some(PlacementFilterCode::EnvironmentProbePending)
+            } else {
+                None
+            }
         }
-        _ if candidate.location.owner_kind == RepoLocationOwnerKind::Daemon
+        _ if (candidate.location.owner_kind == RepoLocationOwnerKind::Daemon
+            && (!candidate.machine_probe
+                || !candidate
+                    .allowed_run_purposes
+                    .contains(&WorkspaceRunPurpose::EnvironmentProbe)))
             || context.environment_has_assets
             || context.environment_admission == EnvironmentAdmission::LaunchPreflight =>
         {
@@ -526,9 +577,23 @@ pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&P
         // that other owner therefore cannot establish a whole-Project pause.
         return Vec::new();
     }
+    if context.candidates.iter().any(|candidate| {
+        candidate.provisioning
+            && filter_candidate(context, candidate).iter().all(|code| {
+                matches!(
+                    code,
+                    PlacementFilterCode::EnvironmentProbePending
+                        | PlacementFilterCode::LocationNotReady
+                )
+            })
+    }) {
+        return Vec::new();
+    }
     let mut unfit = Vec::new();
     for candidate in &context.candidates {
-        if candidate.location.status != RepoLocationStatus::Ready || !candidate.connected {
+        if (!candidate.provisioning && candidate.location.status != RepoLocationStatus::Ready)
+            || !candidate.connected
+        {
             continue;
         }
         let codes = filter_candidate(&unrestricted, candidate);
@@ -548,7 +613,17 @@ pub(crate) fn environment_pause_candidates(context: &SelectionContext) -> Vec<&P
         {
             return Vec::new();
         }
-        if codes == [PlacementFilterCode::EnvironmentNotReady] {
+        if codes == [PlacementFilterCode::EnvironmentNotReady]
+            || (candidate.provisioning
+                && codes.contains(&PlacementFilterCode::EnvironmentNotReady)
+                && codes.iter().all(|code| {
+                    matches!(
+                        code,
+                        PlacementFilterCode::EnvironmentNotReady
+                            | PlacementFilterCode::LocationNotReady
+                    )
+                }))
+        {
             unfit.push(candidate);
         }
     }
@@ -608,7 +683,28 @@ fn matches_placement(candidate: &PlacementCandidate, placement: &WorkspacePlacem
                 .or(placement.daemon_id.as_deref())
 }
 
-fn filter_candidate(
+/// Capacity waits and pending readiness on an existing checkout never justify
+/// copying code elsewhere. Provisioning jobs themselves consume no run slots.
+pub(crate) fn ready_location_can_run(context: &SelectionContext) -> bool {
+    context
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.provisioning && candidate.location.status == RepoLocationStatus::Ready
+        })
+        .any(|candidate| {
+            filter_candidate(context, candidate).iter().all(|code| {
+                matches!(
+                    code,
+                    PlacementFilterCode::AgentCapacity
+                        | PlacementFilterCode::MachineCapacity
+                        | PlacementFilterCode::EnvironmentProbePending
+                )
+            })
+        })
+}
+
+pub(crate) fn filter_candidate(
     context: &SelectionContext,
     candidate: &PlacementCandidate,
 ) -> Vec<PlacementFilterCode> {
@@ -656,7 +752,7 @@ fn filter_candidate(
     {
         filters.insert(CapabilityMissing);
     }
-    if candidate.location.status != RepoLocationStatus::Ready
+    if (!candidate.provisioning && candidate.location.status != RepoLocationStatus::Ready)
         || candidate.location.repo_id != context.repo.id
         || (candidate.location.owner_kind == RepoLocationOwnerKind::Server
             && candidate.location.kind != RepoLocationKind::SharedMount
@@ -709,15 +805,17 @@ fn filter_candidate(
             }
         }
     }
-    if !context
-        .agent_capacity
-        .has_capacity(context.claiming_agent.agent.max_concurrent_tasks)
+    if !candidate.provisioning
+        && !context
+            .agent_capacity
+            .has_capacity(context.claiming_agent.agent.max_concurrent_tasks)
     {
         filters.insert(AgentCapacity);
     }
-    if candidate
-        .machine_capacity
-        .is_none_or(|capacity| !capacity.has_capacity())
+    if !candidate.provisioning
+        && candidate
+            .machine_capacity
+            .is_none_or(|capacity| !capacity.has_capacity())
     {
         filters.insert(MachineCapacity);
     }
@@ -728,6 +826,23 @@ fn filter_candidate(
             .any(|purpose| !candidate.allowed_run_purposes.contains(purpose))
     {
         filters.insert(RunPurposeDenied);
+    }
+    if candidate.provisioning {
+        if candidate.location.status == RepoLocationStatus::Unavailable {
+            filters.insert(LocationNotReady);
+        }
+        if !candidate.machine_probe || !candidate.repo_provision {
+            filters.insert(CapabilityMissing);
+        }
+        if ![
+            WorkspaceRunPurpose::EnvironmentProbe,
+            WorkspaceRunPurpose::RepoProvision,
+        ]
+        .iter()
+        .all(|purpose| candidate.allowed_run_purposes.contains(purpose))
+        {
+            filters.insert(RunPurposeDenied);
+        }
     }
     if !candidate.visible {
         filters.insert(NotVisible);
@@ -850,6 +965,96 @@ pub async fn load_selection_context(
         .collect::<Result<Vec<_>>>()?;
     if locations.is_empty() {
         locations.extend(input.fallback_server_location);
+    }
+    let mut provisioning_ids = BTreeSet::new();
+    if input.project_settings.placement.provision == api_types::PlacementProvision::WhenVerified
+        && input
+            .repo
+            .remote_url
+            .as_deref()
+            .is_some_and(|remote| !remote.trim().is_empty())
+        && existing_placement.as_ref().is_none_or(|placement| {
+            placement.state == PlacementState::Cleaned
+                || (placement.state == PlacementState::Failed
+                    && placement.workspace_handle.is_none())
+        })
+        && inherited_root_placement.is_none()
+    {
+        let runtimes = sqlx::query("SELECT r.*, d.created_at AS daemon_created FROM runtime r JOIN daemon d ON d.id = r.daemon_id WHERE d.machine_id <> ? ORDER BY d.created_at, d.id, r.id")
+            .bind(db.server_run_cap.embedded_machine_id()).fetch_all(&mut **transaction).await?;
+        for runtime in runtimes {
+            let id: String = runtime.try_get("id")?;
+            let daemon: String = runtime.try_get("daemon_id")?;
+            let retry_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE repo_id = ? AND runtime_id = ?)")
+                .bind(&input.repo.id).bind(&id).fetch_one(&mut **transaction).await?;
+            let capable = input.handshakes.get(&daemon).is_some_and(|facts| {
+                [
+                    api_types::DAEMON_CAPABILITY_MACHINE_PROBE,
+                    api_types::DAEMON_CAPABILITY_REPO_PROVISION,
+                ]
+                .iter()
+                .all(|capability| {
+                    facts
+                        .handshake
+                        .capabilities
+                        .iter()
+                        .any(|fact| fact == capability)
+                }) && [
+                    WorkspaceRunPurpose::EnvironmentProbe,
+                    WorkspaceRunPurpose::RepoProvision,
+                ]
+                .iter()
+                .all(|purpose| {
+                    facts
+                        .handshake
+                        .workspace_run_policy
+                        .allowed_purposes
+                        .contains(purpose)
+                })
+            });
+            if !capable && !retry_exists {
+                continue;
+            }
+            let retry_location: Option<String> = sqlx::query_scalar(
+                "SELECT location_id FROM repo_provision_retry WHERE repo_id = ? AND runtime_id = ?",
+            )
+            .bind(&input.repo.id)
+            .bind(&id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .flatten();
+            if let Some(location) = locations
+                .iter()
+                .find(|location| location.runtime_id.as_deref() == Some(&id))
+            {
+                if retry_location.as_deref() == Some(&location.id) {
+                    provisioning_ids.insert(location.id.clone());
+                }
+                continue;
+            }
+            let location_id = format!("provision-{id}");
+            provisioning_ids.insert(location_id.clone());
+            locations.push(RepoLocation {
+                id: location_id,
+                repo_id: input.repo.id.clone(),
+                owner_kind: RepoLocationOwnerKind::Daemon,
+                daemon_id: Some(daemon),
+                runtime_id: Some(id),
+                path: std::path::Path::new(&runtime.try_get::<String, _>("workspace_root")?)
+                    .join("repos")
+                    .join(&input.repo.id)
+                    .to_string_lossy()
+                    .into_owned(),
+                kind: RepoLocationKind::ManagedClone,
+                is_default: false,
+                status: RepoLocationStatus::Unverified,
+                last_verified_at: None,
+                last_error: None,
+                version: 1,
+                created_at: runtime.try_get("created_at")?,
+                updated_at: runtime.try_get("updated_at")?,
+            });
+        }
     }
     let mut candidates = Vec::with_capacity(locations.len());
     for location in locations {
@@ -1030,6 +1235,21 @@ pub async fn load_selection_context(
         let environment_readiness = readiness.iter().find(|row| row.machine == machine).cloned();
         candidates.push(PlacementCandidate {
             environment_readiness,
+            provisioning: provisioning_ids.contains(&location.id),
+            machine_probe: handshake.is_some_and(|facts| {
+                facts
+                    .handshake
+                    .capabilities
+                    .iter()
+                    .any(|fact| fact == api_types::DAEMON_CAPABILITY_MACHINE_PROBE)
+            }),
+            repo_provision: handshake.is_some_and(|facts| {
+                facts
+                    .handshake
+                    .capabilities
+                    .iter()
+                    .any(|fact| fact == api_types::DAEMON_CAPABILITY_REPO_PROVISION)
+            }),
             location,
             execution_daemon_id,
             embedded_execution,
@@ -1128,6 +1348,82 @@ fn map_location(row: SqliteRow) -> Result<RepoLocation> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_machine_facts_do_not_skip_full_checks_for_another_role() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.environment_checks = vec![serde_json::from_value(serde_json::json!({"name":"cargo","command":"false","scope":"machine","roles":["reviewer"]})).unwrap()];
+        context.candidates[0].machine_probe = true;
+        context.candidates[0]
+            .allowed_run_purposes
+            .push(WorkspaceRunPurpose::EnvironmentProbe);
+        let mut row = readiness(&context, 0, EnvironmentReadinessStatus::NotReady);
+        row.scope_covered = "machine".into();
+        context.candidates[0].environment_readiness = Some(row);
+        rejected(&context, PlacementFilterCode::EnvironmentProbePending);
+        context.candidates[0]
+            .environment_readiness
+            .as_mut()
+            .unwrap()
+            .scope_covered = "full".into();
+        selected(&context);
+    }
+
+    #[test]
+    fn probe_capable_daemon_defers_but_legacy_daemon_uses_preflight() {
+        let mut context = context();
+        context.environment_digest = Some("current".into());
+        context.candidates[0].machine_probe = true;
+        context.candidates[0]
+            .allowed_run_purposes
+            .push(api_types::WorkspaceRunPurpose::EnvironmentProbe);
+        rejected(&context, PlacementFilterCode::EnvironmentProbePending);
+        context.candidates[0].machine_probe = false;
+        selected(&context);
+        context.candidates[0].machine_probe = true;
+        context.environment_admission = EnvironmentAdmission::LaunchPreflight;
+        selected(&context);
+        context.environment_admission = EnvironmentAdmission::Dispatcher;
+        context.environment_has_assets = true;
+        selected(&context);
+    }
+    #[test]
+    fn provisioning_requires_machine_checks_and_never_follows_capacity_only_refusal() {
+        let mut context = context();
+        let mut proposed = context.candidates[0].clone();
+        proposed.location.id = "proposed".into();
+        proposed.provisioning = true;
+        proposed.machine_probe = true;
+        proposed.repo_provision = true;
+        proposed.allowed_run_purposes.extend([
+            api_types::WorkspaceRunPurpose::EnvironmentProbe,
+            api_types::WorkspaceRunPurpose::RepoProvision,
+        ]);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .max_concurrent_runs = Some(1);
+        context.candidates[0]
+            .machine_capacity
+            .as_mut()
+            .unwrap()
+            .running_executions = 1;
+        context.candidates.push(proposed);
+        assert!(ready_location_can_run(&context));
+        let refusal = rejected(&context, PlacementFilterCode::MachineCapacity);
+        assert_eq!(refusal.rejected_candidates.len(), 1);
+        context.candidates[0].executors.clear();
+        assert!(!ready_location_can_run(&context));
+        rejected(&context, PlacementFilterCode::EnvironmentUnverified);
+        context.environment_checks = vec![serde_json::from_value(
+            serde_json::json!({"name":"cargo","command":"true","scope":"machine"}),
+        )
+        .unwrap()];
+        context.environment_digest = Some("current".into());
+        rejected(&context, PlacementFilterCode::EnvironmentProbePending);
+    }
+
     use super::*;
     use db::AgentStatus;
 
@@ -1250,6 +1546,9 @@ mod tests {
 
     fn candidate(context: &SelectionContext, id: &str, daemon: Option<&str>) -> PlacementCandidate {
         PlacementCandidate {
+            machine_probe: false,
+            repo_provision: false,
+            provisioning: false,
             environment_readiness: None,
             location: RepoLocation {
                 id: id.to_owned(),

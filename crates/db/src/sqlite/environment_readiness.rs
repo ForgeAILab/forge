@@ -151,8 +151,9 @@ impl ProjectMachineReadinessRepo for SqliteDb {
         {
             // Readiness wakes do not spend another Task version on a queued
             // probe deferral. Authority edits retain the existing version fence.
-            sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.deferred_dispatch') WHERE project_id = ? AND json_valid(metadata_json) AND ((? AND json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_probe_pending') OR (json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' AND json_extract(metadata_json, '$.environment_wait.machine') = json(?)))")
-                .bind(&saved.project_id).bind(saved.machine == EnvironmentMachine::Server)
+            sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.deferred_dispatch') WHERE project_id = ? AND json_valid(metadata_json) AND ((json_extract(metadata_json, '$.deferred_dispatch.kind') IN ('environment_probe_pending', 'environment_unverified') AND ? AND ((? AND json_type(metadata_json, '$.environment_wait.machine') IS NULL) OR json_extract(metadata_json, '$.environment_wait.machine') = json(?))) OR (json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' AND json_extract(metadata_json, '$.environment_wait.machine') = json(?)))")
+                .bind(&saved.project_id).bind(saved.scope_covered == "full" || saved.status == EnvironmentReadinessStatus::NotReady).bind(saved.machine == EnvironmentMachine::Server)
+                .bind(serde_json::to_value(&saved.machine).map_err(|error|DbError::Check(error.to_string()))?.to_string())
                 .bind(serde_json::to_value(&saved.machine).map_err(|error|DbError::Check(error.to_string()))?.to_string()).execute(&mut *tx).await?;
         }
         if saved.status == EnvironmentReadinessStatus::Ready
@@ -164,8 +165,11 @@ impl ProjectMachineReadinessRepo for SqliteDb {
                 .to_string();
             sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id = ? AND json_valid(metadata_json) AND json_extract(metadata_json, '$.environment_wait.machine') = json(?))")
                 .bind(crate::now_rfc3339()).bind(crate::now_rfc3339()).bind(&saved.project_id).bind(&machine).execute(&mut *tx).await?;
-            sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json) AND json_extract(metadata_json, '$.environment_wait.machine') = json(?)")
-                .bind(&saved.project_id).bind(&machine).execute(&mut *tx).await?;
+            if saved.scope_covered == "full" || saved.status == EnvironmentReadinessStatus::Unknown
+            {
+                sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json) AND json_extract(metadata_json, '$.environment_wait.machine') = json(?) AND (? OR COALESCE(json_extract(metadata_json, '$.environment_wait.kind'), '') NOT IN ('environment_probe_pending', 'environment_unverified'))")
+                .bind(&saved.project_id).bind(&machine).bind(saved.status == EnvironmentReadinessStatus::Ready && saved.scope_covered == "full").execute(&mut *tx).await?;
+            }
         }
         tx.commit().await?;
         Ok(saved)

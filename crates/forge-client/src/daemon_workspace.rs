@@ -26,6 +26,13 @@ const WORKTREE_DIRECTORY: &str = ".forge/workspaces";
 const WORKSPACE_ERROR: &str = "workspace_error";
 const VERSION_CONFLICT: &str = "version_conflict";
 const MAX_READ_BYTES: u64 = 1024 * 1024;
+
+struct RemoveDirectory(PathBuf);
+impl Drop for RemoveDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
@@ -77,6 +84,7 @@ pub struct DaemonWorkspaceBackend {
     manager: WorkspaceManager,
     state: Mutex<WorkspaceRegistry>,
     operation_lock: tokio::sync::Mutex<()>,
+    provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DaemonWorkspaceBackend {
@@ -96,6 +104,7 @@ impl DaemonWorkspaceBackend {
             journal,
             state: Mutex::new(state),
             operation_lock: tokio::sync::Mutex::new(()),
+            provision_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -107,6 +116,8 @@ impl DaemonWorkspaceBackend {
         matches!(
             method,
             METHOD_REPO_LOCATION_VERIFY
+                | METHOD_MACHINE_PROBE
+                | METHOD_REPO_LOCATION_PROVISION
                 | METHOD_WORKSPACE_PREPARE
                 | METHOD_WORKSPACE_DESCRIBE
                 | METHOD_WORKSPACE_RUN
@@ -124,6 +135,23 @@ impl DaemonWorkspaceBackend {
         params: Value,
         active_ids: impl FnOnce() -> Vec<String>,
     ) -> CommandResult<Value> {
+        // Probes neither serialize behind a workspace lock nor use its journal.
+        if method == METHOD_MACHINE_PROBE {
+            return encode(self.machine_probe(decode(params)?).await?);
+        }
+        if method == METHOD_REPO_LOCATION_PROVISION {
+            let params: RepoLocationProvisionParams = decode(params)?;
+            validate_id(&params.repo_id)?;
+            let lock = self
+                .provision_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(params.repo_id.clone())
+                .or_default()
+                .clone();
+            let _guard = lock.lock().await;
+            return encode(self.provision_location(params).await?);
+        }
         let _guard = self.operation_lock.lock().await;
         // Capture activity after acquiring the mutation lock. An execution
         // may have started while this request was waiting for another RPC.
@@ -588,6 +616,171 @@ impl DaemonWorkspaceBackend {
         })
     }
 
+    async fn machine_probe(&self, params: MachineProbeParams) -> CommandResult<MachineProbeResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        if !self
+            .policy
+            .allowed_purposes
+            .contains(&WorkspaceRunPurpose::EnvironmentProbe)
+        {
+            return Err(error(
+                "run_purpose_denied",
+                "environment_probe is denied by local daemon configuration",
+            ));
+        }
+        if params.commands.is_empty()
+            || params.commands.len() > 64
+            || params.commands.iter().any(|command| {
+                command.name.trim().is_empty()
+                    || command.command.trim().is_empty()
+                    || !(1..=300).contains(&command.timeout_seconds)
+            })
+        {
+            return Err(error(
+                INVALID_INPUT,
+                "machine.probe requires 1–64 named commands with 1–300 second timeouts",
+            ));
+        }
+        let checkout = match params.repo_location_id.as_deref() {
+            Some(id) => Some(self.location_path(id).await?.1),
+            None => None,
+        };
+        let mut results = Vec::new();
+        for check in params.commands {
+            let scratch = if checkout.is_none() {
+                let path = self.confined_path(
+                    &self
+                        .workspace_root
+                        .join(".forge/probes")
+                        .join(uuid::Uuid::new_v4().to_string()),
+                )?;
+                std::fs::create_dir_all(&path).map_err(io_error)?;
+                Some(RemoveDirectory(path))
+            } else {
+                None
+            };
+            let path = checkout
+                .as_deref()
+                .unwrap_or_else(|| &scratch.as_ref().expect("scratch").0);
+            let mut command = Command::new("bash");
+            command
+                .args(["-lc", &check.command])
+                .envs(&params.env)
+                .env("PWD", path)
+                .current_dir(path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let output = bounded_command(command, check.timeout_seconds, 4096, true).await?;
+            let raw = [output.stdout, output.stderr].concat();
+            let (output_tail, _) = redacted_tail(&raw, &params.env, 4096);
+            results.push(MachineProbeCommandResult {
+                name: check.name,
+                exit_code: output.exit_code,
+                timed_out: output.timed_out,
+                output_tail,
+            });
+        }
+        Ok(MachineProbeResult { results })
+    }
+
+    async fn provision_location(
+        &self,
+        params: RepoLocationProvisionParams,
+    ) -> CommandResult<RepoLocationProvisionResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        validate_id(&params.repo_id)?;
+        if !self
+            .policy
+            .allowed_purposes
+            .contains(&WorkspaceRunPurpose::RepoProvision)
+        {
+            return Err(error(
+                "run_purpose_denied",
+                "repo_provision is denied by local daemon configuration",
+            ));
+        }
+        if params.remote_url.trim().is_empty() || params.remote_url.starts_with('-') {
+            return Err(error(INVALID_INPUT, "repository remote is required"));
+        }
+        let requested_path = self.workspace_root.join("repos").join(&params.repo_id);
+        let path = self.confined_path(&requested_path)?;
+        if path != requested_path {
+            return Err(error(
+                "path_conflict",
+                "managed clone path contains a symlink",
+            ));
+        }
+        if path.exists() {
+            let origin = local_git(&path, &["remote", "get-url", "origin"]).await;
+            let top = local_git(&path, &["rev-parse", "--show-toplevel"]).await;
+            if origin.is_err()
+                || top.is_err()
+                || Path::new(top.as_ref().expect("checked")) != path
+                || git::normalize_remote_url(&params.remote_url)
+                    != git::normalize_remote_url(origin.as_ref().expect("checked"))
+            {
+                return Err(error(
+                    "path_conflict",
+                    "managed clone path holds another repository or non-repository content",
+                ));
+            }
+        } else {
+            let requested_staging = self
+                .workspace_root
+                .join(".forge/provision")
+                .join(&params.repo_id);
+            let staging = self.confined_path(&requested_staging)?;
+            if staging != requested_staging {
+                return Err(error(
+                    "path_conflict",
+                    "private staging path contains a symlink",
+                ));
+            }
+            // A crash can leave only our private staging directory. Retry removes
+            // it before cloning; the final path is published atomically.
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging).map_err(io_error)?;
+            }
+            std::fs::create_dir_all(staging.parent().expect("staging parent")).map_err(io_error)?;
+            let cleanup = RemoveDirectory(staging.clone());
+            let mut command = Command::new("git");
+            command
+                .arg("clone")
+                .arg("--")
+                .arg(&params.remote_url)
+                .arg(&staging)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .current_dir(&self.workspace_root)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let output = bounded_command(command, 300, 4096, true).await?;
+            if output.timed_out || output.exit_code != Some(0) {
+                let (message, _) = redacted_tail(&output.stderr, &BTreeMap::new(), 4096);
+                return Err(error(
+                    "clone_failed",
+                    if output.timed_out {
+                        "repository clone timed out".to_owned()
+                    } else if message.is_empty() {
+                        "repository clone failed".to_owned()
+                    } else {
+                        message
+                    },
+                ));
+            }
+            std::fs::create_dir_all(path.parent().expect("clone parent")).map_err(io_error)?;
+            std::fs::rename(&staging, &path).map_err(io_error)?;
+            drop(cleanup);
+        }
+        verify_git_dir(&path, &self.workspace_root).await?;
+        let default_branch = local_git(&path, &["symbolic-ref", "--short", "HEAD"]).await?;
+        Ok(RepoLocationProvisionResult {
+            path: path.to_string_lossy().into_owned(),
+            default_branch,
+        })
+    }
+
     async fn exclude_runtime_metadata(&self, repo_path: &Path) -> CommandResult<()> {
         // When the advertised root is itself a checkout, Forge's own journal
         // and worktrees must not make the user's integration target dirty.
@@ -903,6 +1096,15 @@ impl DaemonWorkspaceBackend {
     }
 
     async fn run(&self, params: WorkspaceRunParams) -> CommandResult<WorkspaceRunResult> {
+        if matches!(
+            params.purpose,
+            WorkspaceRunPurpose::EnvironmentProbe | WorkspaceRunPurpose::RepoProvision
+        ) {
+            return Err(error(
+                INVALID_INPUT,
+                "machine operations require their dedicated RPC",
+            ));
+        }
         if !self.policy.allowed_purposes.contains(&params.purpose) {
             return Err(error(
                 PURPOSE_DENIED,

@@ -256,6 +256,21 @@ forge-ctl task cancel <TASK_ID>
 to preview the prompt for a transition target instead of the task's current
 state.
 
+### Project environment checks
+
+```bash
+forge-ctl project env-check <PROJECT_ID> --name cargo --command 'cargo --version' --scope machine
+forge-ctl project env-check <PROJECT_ID> --name tests --command 'cargo check' --scope workspace --role coder --timeout-seconds 120
+```
+
+Adds or replaces one named check while preserving other Project settings.
+`--scope` is `workspace` (default) or `machine`; machine checks need no checkout
+and can gate cloning. Commands must be read-only. `--role` may be repeated;
+omitting it applies to all roles. The server validates timeout bounds 1–300.
+The update uses the current Project version; a concurrent edit returns 409.
+Project settings also accept `placement.provision = when_verified` (default)
+or `never`, editable in the web Environment settings.
+
 ### Project environment re-check
 
 ```bash

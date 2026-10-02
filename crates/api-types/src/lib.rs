@@ -134,6 +134,9 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ProjectEnvironmentRecheckResponse::export().expect("export ProjectEnvironmentRecheckResponse");
     EnvironmentAsset::export().expect("export EnvironmentAsset");
     EnvironmentCheck::export().expect("export EnvironmentCheck");
+    EnvironmentCheckScope::export().expect("export EnvironmentCheckScope");
+    PlacementProvision::export().expect("export PlacementProvision");
+    ProjectPlacementSettings::export().expect("export ProjectPlacementSettings");
     FailureKind::export().expect("export FailureKind");
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");

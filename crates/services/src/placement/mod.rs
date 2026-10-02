@@ -5,6 +5,7 @@ pub mod capacity;
 pub(crate) mod context;
 pub(crate) mod environment;
 pub(crate) mod machine_precheck;
+pub(crate) mod provisioning;
 pub mod selection;
 
 pub use selection::{
@@ -24,12 +25,18 @@ pub(crate) fn retryable_filter_codes(codes: &[PlacementFilterCode]) -> bool {
                     | PlacementFilterCode::OwnerUnreachable
                     | PlacementFilterCode::EnvironmentProbePending
                     | PlacementFilterCode::EnvironmentNotReady
-            ) || (codes.contains(&PlacementFilterCode::OwnerUnreachable)
-                && matches!(
-                    code,
-                    PlacementFilterCode::WorkspaceProtocolMissing
-                        | PlacementFilterCode::ExecutorUnavailable
-                ))
+                    | PlacementFilterCode::EnvironmentUnverified
+            ) || (*code == PlacementFilterCode::LocationNotReady
+                && (codes.contains(&PlacementFilterCode::EnvironmentProbePending)
+                    || codes.contains(&PlacementFilterCode::EnvironmentNotReady)))
+                || (codes.contains(&PlacementFilterCode::OwnerUnreachable)
+                    && matches!(
+                        code,
+                        PlacementFilterCode::WorkspaceProtocolMissing
+                            | PlacementFilterCode::ExecutorUnavailable
+                            | PlacementFilterCode::CapabilityMissing
+                            | PlacementFilterCode::RunPurposeDenied
+                    ))
         })
 }
 /// Classify selection filters; transport errors also require placement state.

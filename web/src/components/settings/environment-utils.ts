@@ -6,7 +6,7 @@ export const ENVIRONMENT_EXAMPLE = `{
     { "source": "/srv/assets/limezu", "target": "assets/vendor/limezu" }
   ],
   "checks": [
-    { "name": "godot", "command": "\\"$GODOT_BIN\\" --headless --version" },
+    { "name": "godot", "scope": "machine", "command": "\\"$GODOT_BIN\\" --headless --version" },
     { "name": "browser", "command": "chromium --headless=new --dump-dom about:blank >/dev/null", "roles": ["reviewer"] }
   ]
 }`
@@ -50,11 +50,34 @@ export function parseEnvironmentText(
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       return { ok: false, error: 'Environment must be a JSON object' }
     }
-    return { ok: true, value: value as Record<string, unknown> }
+    const record = value as Record<string, unknown>
+    if (
+      Array.isArray(record.checks) &&
+      record.checks.some(
+        (check) =>
+          typeof check === 'object' &&
+          check !== null &&
+          'scope' in check &&
+          check.scope !== 'workspace' &&
+          check.scope !== 'machine',
+      )
+    ) {
+      return { ok: false, error: 'Check scope must be workspace or machine' }
+    }
+    return { ok: true, value: record }
   } catch (error) {
     return {
       ok: false,
       error: `Environment is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
+}
+
+export function usePlacementProvision(settings: unknown) {
+  const [provision, setProvision] = useState<'when_verified' | 'never'>('when_verified')
+  useEffect(() => {
+    const record = settings as { placement?: { provision?: string } } | undefined
+    setProvision(record?.placement?.provision === 'never' ? 'never' : 'when_verified')
+  }, [settings])
+  return [provision, setProvision] as const
 }

@@ -2248,7 +2248,7 @@ ten-minute review at a time:
         }
       ],
       "checks": [
-        { "name": "godot", "command": "\"$GODOT_BIN\" --headless --version" },
+        { "name": "godot", "scope": "machine", "command": "\"$GODOT_BIN\" --headless --version" },
         {
           "name": "browser",
           "command": "chromium --headless --dump-dom about:blank >/dev/null",
@@ -2260,6 +2260,21 @@ ten-minute review at a time:
   }
 }
 ```
+
+- Every check accepts `scope: "workspace" | "machine"`; omission defaults to
+  `workspace` without rewriting saved settings. Unknown values are rejected by
+  Project create/PATCH validation. Machine checks must work without a checkout
+  or assets; checks must be read-only. Timeouts remain 1–300 seconds.
+- `settings.placement` accepts `{ "provision": "when_verified" | "never" }`.
+  Omission defaults to `when_verified`. Unknown values are rejected. Provisioning
+  needs a remote, both daemon capabilities and local policy permissions, and at
+  least one applicable passing machine check. No eligible ready location is
+  displaced by provisioning; capacity-only waits do not trigger it.
+- `placement_unavailable` candidate filter codes now include
+  `environment_unverified`, with instructions to declare a machine check or
+  register a location. Like `environment_probe_pending`, it is retryable and
+  parks the Task with its machine in `environment_wait`. Clone errors retain
+  `location_not_ready` and the unavailable location's bounded `last_error`.
 
 - `env` is set on every executor process (all CLI harnesses and the shell
   executor), on review `setup_steps`/`ci_steps`/required checks, and on
@@ -4027,6 +4042,8 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 
 | Method | Owner operation |
 | --- | --- |
+| `machine.probe` | Run read-only Project checks with env in a verified checkout or empty scratch directories |
+| `repo_location.provision` | Idempotently clone a verified machine's repository remote under its root |
 | `repo_location.verify` | Verify the checkout and any shared-mount probe |
 | `workspace.prepare` | Prepare a placement and return its opaque handle and base SHA |
 | `workspace.describe` | Report workspace state, active executions, and retained execution results |
@@ -4037,12 +4054,35 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.reset` | Reset the workspace or perform typed asset, review-checkout, and plan publication/restore/discard operations |
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
+`machine_probe.v1` and `repo_provision.v1` are independent optional handshake
+capabilities; protocol revision remains 3. Daemons missing them stay connected
+and unverified and existing locations use launch preflight. Their run-policy
+allow list gains `environment_probe` and `repo_provision`; defaults stay
+`[ci_step]`. Neither purpose can be sent through `workspace.run`.
+
+`machine.probe` request: `{ daemon_id, runtime_id, repo_location_id: string | null,
+commands: [{ name, command, timeout_seconds }], env: { KEY: value } }`. It accepts
+1–64 commands with 1–300 second timeouts and returns `{ results: [{ name,
+exit_code: number | null, timed_out: boolean, output_tail: string }] }`.
+Tails are bounded to 4096 bytes while collected and redacted using Project env.
+A null location uses a new empty directory per command, removed afterwards.
+It uses no workspace lock, handle, mutation fence, journal or run slot.
+
+`repo_location.provision` request: `{ daemon_id, runtime_id, repo_id, remote_url }`;
+response: `{ path, default_branch }`. No credentials are sent. It clones under
+`workspace_root/repos/<repo_id>`, using daemon-local Git credentials. Retries
+reuse a matching normalized remote. Other content returns `path_conflict`
+without changes. `clone_failed` returns bounded output and removes partial
+staging; lost replies or restart are safe to retry. The server records a
+managed location as unverified, verifies it, and runs full checks before
+admission. Failures use durable exponential backoff. Both RPCs refuse local
+policy denial with `run_purpose_denied`, without running commands.
+
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
 `generation`, and `expected` (a base SHA or version). Existing workspaces also
 carry `workspace_handle`. Duplicate operation IDs replay their journaled result
 until acknowledgement;
-`stale_generation` and `wrong_owner` refuse changes. No method accepts an arbitrary
-shell command outside the three configured run purposes. `purpose_denied` is
+`stale_generation` and `wrong_owner` refuse changes. Workspace methods accept shell commands only for the three configured workspace run purposes; machine probes accept only the named Project checks under their separate purpose. `purpose_denied` is
 never retried. CI permits unbounded execution time, with output capped at 1 MiB
 per stream. UTF-8-safe tails start with `[Forge: CI log truncated]` and set
 `stdout_truncated`/`stderr_truncated` when size-bounded. Unbounded CI requests

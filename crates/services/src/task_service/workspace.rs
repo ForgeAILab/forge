@@ -53,6 +53,12 @@ pub(super) struct WorkspaceAdmission {
 }
 
 impl TaskService {
+    pub(crate) fn environment_daemon_connections(
+        &self,
+    ) -> Option<&Arc<crate::daemon_transport::DaemonConnectionRegistry>> {
+        self.daemon_connections.as_ref()
+    }
+
     pub(crate) async fn defer_initial_environment_probe(
         &self,
         task: &Task,
@@ -64,12 +70,17 @@ impl TaskService {
             .fetch_optional(self.db.pool())
             .await?
             .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
-        let environment = serde_json::from_str::<ProjectSettings>(&raw)
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid project settings: {error}"))
-            })?
-            .environment;
-        if environment.checks.is_empty() || !environment.assets.is_empty() {
+        let settings = serde_json::from_str::<ProjectSettings>(&raw).map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid project settings: {error}"))
+        })?;
+        if (settings.environment.checks.is_empty() || !settings.environment.assets.is_empty())
+            && (settings.placement.provision == api_types::PlacementProvision::Never
+                || !crate::placement::environment::has_provisioning_runtime(
+                    &self.db,
+                    self.daemon_connections.as_ref(),
+                )
+                .await?)
+        {
             return Ok(false);
         }
         let prepared = crate::placement::context::prepare_selection(
@@ -80,13 +91,13 @@ impl TaskService {
             self.placement_adapter_registry.as_deref(),
         )
         .await?;
-        if prepared.settings.environment.checks.is_empty() {
-            return Ok(false);
-        }
         let context = self.environment_selection_context(task, &prepared).await?;
         crate::placement::environment::start_context_probes(
             &self.db,
             &context,
+            &self.daemon_connections.clone().unwrap_or_else(|| {
+                Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
+            }),
             &self.event_bus,
             self.dispatch_notify(),
         )
@@ -658,6 +669,12 @@ impl TaskService {
                     crate::placement::environment::start_context_probes(
                         &self.db,
                         context,
+                        &self.daemon_connections.clone().unwrap_or_else(|| {
+                            Arc::new(
+                                crate::daemon_transport::DaemonConnectionRegistry::without_handlers(
+                                ),
+                            )
+                        }),
                         &self.event_bus,
                         self.dispatch_notify(),
                     )
@@ -2774,8 +2791,11 @@ mod tests {
                 let version: i64 = name.strip_prefix('V')?.split_once("__")?.0.parse().ok()?;
                 // Placement arrives after the legacy rows are seeded; migrations
                 // that read `workspace_placement` are applied with it below.
-                (!matches!(version, 202610010400 | 202610010530 | 202610020600))
-                    .then_some((version, path))
+                (!matches!(
+                    version,
+                    202610010400 | 202610010530 | 202610020600 | 202610021500
+                ))
+                .then_some((version, path))
             })
             .collect::<Vec<_>>();
         historical.sort_by_key(|(version, _)| *version);
@@ -2875,6 +2895,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610020600__project_machine_readiness.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610021500__repo_provision_retry.sql"
         ))
         .execute(db.pool())
         .await

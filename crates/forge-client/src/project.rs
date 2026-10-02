@@ -19,6 +19,20 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
+    /// Add or replace a named, read-only Project environment check.
+    EnvCheck {
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        command: String,
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "machine"])]
+        scope: String,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
     Create {
         #[arg(long)]
         name: String,
@@ -45,6 +59,38 @@ enum ProjectCmd {
 impl ProjectArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.cmd {
+            ProjectCmd::EnvCheck {
+                project,
+                name,
+                command,
+                scope,
+                timeout_seconds,
+                roles,
+            } => {
+                let current: ProjectResponse =
+                    client.get(&format!("/api/v1/projects/{project}")).await?;
+                let settings = check_settings(
+                    current.settings.clone(),
+                    api_types::EnvironmentCheck {
+                        name: name.clone(),
+                        command: command.clone(),
+                        scope: if scope == "machine" {
+                            api_types::EnvironmentCheckScope::Machine
+                        } else {
+                            api_types::EnvironmentCheckScope::Workspace
+                        },
+                        roles: roles.clone(),
+                        timeout_seconds: *timeout_seconds,
+                    },
+                )?;
+                let saved: ProjectResponse = client
+                    .patch(
+                        &format!("/api/v1/projects/{project}"),
+                        &serde_json::json!({"version":current.version,"settings":settings}),
+                    )
+                    .await?;
+                print_project(output, &saved)
+            }
             ProjectCmd::Create { name } => {
                 let request = CreateProjectRequest {
                     name: name.clone(),
@@ -111,6 +157,29 @@ impl ProjectArgs {
             }
         }
     }
+}
+
+fn check_settings(
+    mut settings: serde_json::Value,
+    check: api_types::EnvironmentCheck,
+) -> Result<serde_json::Value> {
+    let mut environment: api_types::ProjectEnvironment = settings
+        .get("environment")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(existing) = environment
+        .checks
+        .iter_mut()
+        .find(|existing| existing.name == check.name)
+    {
+        *existing = check;
+    } else {
+        environment.checks.push(check);
+    }
+    settings["environment"] = serde_json::to_value(environment)?;
+    Ok(settings)
 }
 
 fn print_project(output: &OutputFormat, project: &ProjectResponse) -> Result<()> {
@@ -299,6 +368,55 @@ fn surface_name(surface: api_types::UsageSurface) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn environment_check_scope_flag_and_upsert_preserve_settings() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "forge-ctl",
+            "env-check",
+            "p",
+            "--name",
+            "cargo",
+            "--command",
+            "cargo --version",
+            "--scope",
+            "machine",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvCheck { scope, .. } if scope == "machine")
+        );
+        assert!(Cli::try_parse_from([
+            "forge-ctl",
+            "env-check",
+            "p",
+            "--name",
+            "x",
+            "--command",
+            "true",
+            "--scope",
+            "host"
+        ])
+        .is_err());
+        let check: api_types::EnvironmentCheck = serde_json::from_value(
+            serde_json::json!({"name":"cargo","command":"true","scope":"machine"}),
+        )
+        .unwrap();
+        let settings = super::check_settings(serde_json::json!({"placement":{"provision":"never"},"environment":{"env":{"X":"value"},"checks":[{"name":"cargo","command":"false"}]}}), check).unwrap();
+        assert_eq!(
+            settings["environment"]["checks"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(settings["environment"]["checks"][0]["scope"], "machine");
+        assert_eq!(settings["environment"]["env"]["X"], "value");
+        assert_eq!(settings["placement"]["provision"], "never");
+    }
+
     use super::analytics_path;
 
     #[test]

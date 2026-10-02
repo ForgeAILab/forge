@@ -1166,3 +1166,215 @@ async fn refused_workspace_fences_leave_no_journal_intents() {
         assert_eq!(fixture.journal.pending().unwrap().len(), before);
     }
 }
+
+#[tokio::test]
+async fn machine_probe_scratch_policy_timeout_output_and_no_journal() {
+    let mut fixture = Fixture::new().await;
+    let params = MachineProbeParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_location_id: None,
+        commands: vec![MachineProbeCommand {
+            name: "empty".into(),
+            command: "test -z \"$(ls -A)\"; printf '%s' \"$TOKEN\"".into(),
+            timeout_seconds: 5,
+        }],
+        env: BTreeMap::from([("TOKEN".into(), "secret-value".into())]),
+    };
+    let denied = fixture
+        .backend
+        .handle(
+            METHOD_MACHINE_PROBE,
+            serde_json::to_value(&params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "run_purpose_denied");
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::EnvironmentProbe);
+    let before = fixture.journal.pending().unwrap().len();
+    let held_lock = fixture.backend.operation_lock.lock().await;
+    let result: MachineProbeResult = serde_json::from_value(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.backend.handle(
+                METHOD_MACHINE_PROBE,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    drop(held_lock);
+    assert_eq!(result.results[0].exit_code, Some(0));
+    assert_eq!(result.results[0].output_tail, "[REDACTED]");
+    assert_eq!(fixture.journal.pending().unwrap().len(), before);
+    assert_eq!(
+        std::fs::read_dir(fixture.dir.path().join(".forge/probes"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let mut params = params;
+    params.commands[0].command = "printf '%10000s' noisy; sleep 5".into();
+    params.commands[0].timeout_seconds = 1;
+    let result: MachineProbeResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_MACHINE_PROBE,
+                serde_json::to_value(params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result.results[0].timed_out);
+    assert!(result.results[0].output_tail.len() <= 4096);
+    assert_eq!(
+        std::fs::read_dir(fixture.dir.path().join(".forge/probes"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn provision_idempotency_conflict_partial_clone_and_restart() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::RepoProvision);
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    let params = RepoLocationProvisionParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_id: repo_id.clone(),
+        remote_url: fixture.repo.to_string_lossy().into_owned(),
+    };
+    let held_workspace_lock = fixture.backend.operation_lock.lock().await;
+    let reply: RepoLocationProvisionResult = serde_json::from_value(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.backend.handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    drop(held_workspace_lock);
+    assert_eq!(reply.default_branch, "main");
+    let repeated: RepoLocationProvisionResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply.path, repeated.path);
+    assert_eq!(
+        Path::new(&reply.path),
+        fixture
+            .dir
+            .path()
+            .join("repos")
+            .join(repo_id)
+            .canonicalize()
+            .unwrap()
+    );
+    let conflict_id = uuid::Uuid::new_v4().to_string();
+    let conflict = fixture.dir.path().join("repos").join(&conflict_id);
+    std::fs::create_dir(&conflict).unwrap();
+    std::fs::write(conflict.join("keep"), "mine").unwrap();
+    let mut params = params;
+    params.repo_id = conflict_id;
+    assert_eq!(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "path_conflict"
+    );
+    assert_eq!(
+        std::fs::read_to_string(conflict.join("keep")).unwrap(),
+        "mine"
+    );
+    params.repo_id = uuid::Uuid::new_v4().to_string();
+    params.remote_url = fixture
+        .dir
+        .path()
+        .join("missing-remote")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "clone_failed"
+    );
+    assert!(!fixture
+        .dir
+        .path()
+        .join("repos")
+        .join(&params.repo_id)
+        .exists());
+    let staging = fixture
+        .dir
+        .path()
+        .join(".forge/provision")
+        .join(&params.repo_id);
+    assert!(!staging.exists());
+    // A killed daemon leaves private staging, never a published partial clone.
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("partial"), "interrupted").unwrap();
+    let restarted = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        fixture.backend.policy.clone(),
+        fixture.journal.clone(),
+    )
+    .unwrap();
+    params.remote_url = fixture.repo.to_string_lossy().into_owned();
+    restarted
+        .handle(
+            METHOD_REPO_LOCATION_PROVISION,
+            serde_json::to_value(params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    assert!(!staging.exists());
+}

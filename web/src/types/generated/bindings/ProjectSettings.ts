@@ -4,10 +4,11 @@ import type { DefaultRoleAssignment } from "./DefaultRoleAssignment";
 import type { LifecycleEvent } from "./LifecycleEvent";
 import type { LifecycleHookDef } from "./LifecycleHookDef";
 import type { ProjectEnvironment } from "./ProjectEnvironment";
+import type { ProjectPlacementSettings } from "./ProjectPlacementSettings";
 import type { RetryBudgets } from "./RetryBudgets";
 
 export type ProjectSettings = { 
 /**
  * Maximum unparked Tasks in active/gate states; 0 disables the limit.
  */
-max_active_tasks: number, retry_budgets: RetryBudgets, default_role_assignments: Array<DefaultRoleAssignment>, lifecycle_hooks: { [key in LifecycleEvent]?: Array<LifecycleHookDef> }, automatic_recovery: AutomaticRecoverySettings, environment: ProjectEnvironment, };
+max_active_tasks: number, retry_budgets: RetryBudgets, default_role_assignments: Array<DefaultRoleAssignment>, lifecycle_hooks: { [key in LifecycleEvent]?: Array<LifecycleHookDef> }, automatic_recovery: AutomaticRecoverySettings, environment: ProjectEnvironment, placement: ProjectPlacementSettings, };

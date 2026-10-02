@@ -175,6 +175,74 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn scope_upgrade_recomputes_digest_without_losing_failure_or_due_time() {
+        let (db, id, environment) = fixture().await;
+        let mut failure = row(&id, &environment);
+        failure.status = EnvironmentReadinessStatus::NotReady;
+        failure.failing_checks = vec![ReadinessCheckFailure {
+            name: "cargo".into(),
+            output_tail: "missing".into(),
+        }];
+        failure.next_check_at = Some("2000-01-01T00:00:00Z".into());
+        db.put_readiness(failure, None).await.unwrap();
+        sqlx::raw_sql("DROP TABLE repo_provision_retry; UPDATE project_machine_readiness SET checks_digest = 'before-scope';").execute(db.pool()).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/V202610021500__repo_provision_retry.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        crate::sqlite::environment_readiness::fill_migrated_digests(db.pool())
+            .await
+            .unwrap();
+        let migrated = db
+            .get_readiness(&id, &EnvironmentMachine::Server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            migrated.checks_digest,
+            environment_checks_digest(&environment)
+        );
+        assert_eq!(migrated.status, EnvironmentReadinessStatus::NotReady);
+        assert_eq!(migrated.failing_checks[0].name, "cargo");
+        assert_eq!(
+            migrated.next_check_at.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_only_readiness_keeps_provisioning_wait_until_full_checks() {
+        let (db, id, environment) = fixture().await;
+        let now = crate::now_rfc3339();
+        let machine = EnvironmentMachine::Daemon {
+            daemon_id: "probe-owner".into(),
+            runtime_id: "probe-runtime".into(),
+        };
+        sqlx::query("INSERT INTO task (id,project_id,title,task_type,status,metadata_json,created_at,updated_at) VALUES ('provision-wait',?,'Task','task','in_progress',?,?,?)")
+            .bind(&id).bind(serde_json::json!({"deferred_dispatch":{"kind":"environment_probe_pending"},"environment_wait":{"machine":machine,"kind":"environment_probe_pending"}}).to_string()).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let mut ready = row(&id, &environment);
+        ready.machine = machine;
+        ready.scope_covered = "machine".into();
+        ready.status = EnvironmentReadinessStatus::Unknown;
+        let unknown = db.put_readiness(ready, None).await.unwrap();
+        let mut ready = unknown.clone();
+        ready.status = EnvironmentReadinessStatus::Ready;
+        let saved = db
+            .put_readiness(ready, Some(unknown.version))
+            .await
+            .unwrap();
+        let wait: Option<String> = sqlx::query_scalar("SELECT json_extract(metadata_json,'$.environment_wait.kind') FROM task WHERE id='provision-wait'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(wait.as_deref(), Some("environment_probe_pending"));
+        let mut full = saved.clone();
+        full.scope_covered = "full".into();
+        db.put_readiness(full, Some(saved.version)).await.unwrap();
+        let wait: Option<String> = sqlx::query_scalar("SELECT json_extract(metadata_json,'$.environment_wait.kind') FROM task WHERE id='provision-wait'").fetch_one(db.pool()).await.unwrap();
+        assert!(wait.is_none());
+    }
+
     #[test]
     fn digest_covers_only_env_and_checks() {
         let mut environment = api_types::ProjectEnvironment::default();
@@ -442,6 +510,7 @@ mod tests {
         for (task, kind) in [
             ("probe", "environment_probe_pending"),
             ("wait", "environment_not_ready"),
+            ("unverified", "environment_unverified"),
             ("lookalike", "environmentXprobe_pending"),
             ("other", "environment_unrelated"),
         ] {
@@ -460,6 +529,7 @@ mod tests {
         for (task, cleared) in [
             ("probe", true),
             ("wait", true),
+            ("unverified", true),
             ("lookalike", false),
             ("other", false),
         ] {
