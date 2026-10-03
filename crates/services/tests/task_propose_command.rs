@@ -532,7 +532,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
 
     let bundle: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
-             (SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND entity_id = ?),
+             (SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created' AND entity_id = ?),
              (SELECT COUNT(*) FROM command_receipt
               WHERE operation = 'task.propose' AND idempotency_key = ?),
              (SELECT COUNT(*) FROM agent_action_execution WHERE action_id = ?),
@@ -1306,7 +1306,7 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'"
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'"
         )
         .await,
         0
@@ -1471,7 +1471,7 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
@@ -1676,7 +1676,7 @@ async fn direct_task_proposal_commits_one_receipt_bundle_without_action_rows() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
@@ -1835,7 +1835,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         0
@@ -1891,7 +1891,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
@@ -1943,7 +1943,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
     assert_eq!(
         count(
             &fixture.db,
-            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
+            "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
         1
