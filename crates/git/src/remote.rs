@@ -56,6 +56,92 @@ fn repository_path(path: &str) -> &str {
     path.strip_suffix(".git").unwrap_or(path)
 }
 
+/// Remove URL credentials from diagnostic text without changing the URL used
+/// for Git. Git may echo an encoded URL or only a decoded query value.
+pub fn redact_remote_credentials(text: &str, remote: &str) -> String {
+    if remote.is_empty() {
+        return text.to_owned();
+    }
+    let Ok(mut url) = Url::parse(remote) else {
+        return text.replace(remote, "[REDACTED remote]");
+    };
+    let original = url.to_string();
+    let mut secrets = Vec::new();
+    if !url.username().is_empty() && url.username().len() >= 4 {
+        secrets.push(url.username().to_owned());
+    }
+    if let Some(password) = url.password() {
+        secrets.push(password.to_owned());
+    }
+    let pairs: Vec<_> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    if url.query().is_some() {
+        let mut query = url.query_pairs_mut();
+        query.clear();
+        for (key, value) in pairs {
+            let name = key.to_ascii_lowercase();
+            let sensitive = [
+                "token",
+                "secret",
+                "password",
+                "credential",
+                "signature",
+                "auth",
+            ]
+            .iter()
+            .any(|word| name.contains(word))
+                || matches!(
+                    name.as_str(),
+                    "key" | "apikey" | "api-key" | "sig" | "jwt" | "pat"
+                )
+                || name.ends_with("_key");
+            if sensitive {
+                secrets.push(value.clone());
+                query.append_pair(&key, "[REDACTED]");
+            } else {
+                query.append_pair(&key, &value);
+            }
+        }
+    }
+    let mut redacted = text
+        .replace(remote, url.as_str())
+        .replace(&original, url.as_str());
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    for secret in secrets.into_iter().filter(|value| !value.is_empty()) {
+        redacted = redact_secret(&redacted, &secret);
+        // Decode percent-encoded userinfo using the same URL decoding rules.
+        let decoded = url::form_urlencoded::parse(format!("v={secret}").as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+        if !decoded.is_empty() {
+            redacted = redact_secret(&redacted, &decoded);
+        }
+    }
+    redacted
+}
+
+fn redact_secret(text: &str, secret: &str) -> String {
+    let mut result = text.replace(secret, "[REDACTED]");
+    // A bounded tail can start partway through a credential, so the complete
+    // value no longer appears. Mask an overlapping secret suffix at its start.
+    if !result.starts_with("[REDACTED]") {
+        let overlap = (1..=secret.len().min(result.len())).rev().find(|length| {
+            result.is_char_boundary(*length)
+                && secret.is_char_boundary(secret.len() - length)
+                && result[..*length] == secret[secret.len() - length..]
+        });
+        if let Some(length) = overlap {
+            result.replace_range(..length, "[REDACTED]");
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,18 +166,52 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remote_normalization_equates_file_urls_and_absolute_paths() {
-        let expected = normalize_remote_url("/Volumes/Data/tmp/origin.git");
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin.git");
+        let expected = normalize_remote_url(origin.to_str().unwrap());
+        let file = url::Url::from_file_path(&origin).unwrap();
+        let mut local = file.clone();
+        local.set_host(Some("localhost")).unwrap();
         for remote in [
-            "file:///Volumes/Data/tmp/origin.git",
-            "file://localhost/Volumes/Data/tmp/origin/",
-            "/Volumes/Data/tmp/origin.git/",
+            file.to_string(),
+            local.to_string(),
+            format!("{}/", origin.display()),
         ] {
-            assert_eq!(normalize_remote_url(remote), expected, "{remote}");
+            assert_eq!(normalize_remote_url(&remote), expected, "{remote}");
         }
+        let spaced = root.path().join("a b/origin.git");
         assert_eq!(
-            normalize_remote_url("file:///tmp/a%20b/origin.git"),
-            normalize_remote_url("/tmp/a b/origin")
+            normalize_remote_url(url::Url::from_file_path(&spaced).unwrap().as_str()),
+            normalize_remote_url(root.path().join("a b/origin").to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn remote_diagnostics_redact_userinfo_and_token_queries() {
+        let url = "https://username:pa%24s@example.invalid/repo?token=supersecret&access_token=encoded%24token&branch=main";
+        let message = format!("clone {url} failed: supersecret, encoded$token and pa$s");
+        let output = super::redact_remote_credentials(&message, url);
+        for secret in [
+            "username",
+            "pa%24s",
+            "pa$s",
+            "supersecret",
+            "encoded$token",
+            "encoded%24token",
+        ] {
+            assert!(!output.contains(secret), "{output}");
+        }
+        assert!(output.contains("branch=main"));
+    }
+
+    #[test]
+    fn remote_diagnostics_redact_credentials_cut_by_bounded_tail() {
+        let secret = "abcdefSECRETTAIL";
+        let remote = format!("https://example.invalid/repo?token={secret}");
+        let tail = "SECRETTAIL failed to authenticate";
+        let output = super::redact_remote_credentials(tail, &remote);
+        assert!(!output.contains("SECRETTAIL"));
+        assert!(output.contains("failed to authenticate"));
     }
 
     #[test]

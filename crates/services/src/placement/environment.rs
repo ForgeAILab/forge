@@ -1,4 +1,4 @@
-//! Environment-only admission handling and host probes. No daemon probes.
+//! Environment admission and owner-local probes outside workspace reservation.
 use crate::{
     project_environment::{bounded_output_tail, next_check_at},
     workspace_backend::{RunSpec, WorkspaceBackend, WorkspaceBackendError, WorkspaceRunPurpose},
@@ -19,6 +19,11 @@ use std::{
 #[derive(Clone)]
 pub(crate) enum ProbeTarget {
     Server(PathBuf),
+    Machine {
+        machine: EnvironmentMachine,
+        client: crate::daemon_transport::workspace_client::DaemonWorkspaceClient,
+        location_id: Option<String>,
+    },
     /// Only scheduled re-checks use this, and only for the failure's workspace.
     Daemon {
         placement: Box<db::WorkspacePlacement>,
@@ -26,6 +31,12 @@ pub(crate) enum ProbeTarget {
     },
 }
 type FlightKey = (String, EnvironmentMachine);
+pub(crate) fn retry_deadline(attempt: i64) -> String {
+    next_check_at(
+        chrono::Utc::now(),
+        (30_u64.saturating_mul(1_u64 << attempt.clamp(0, 5))).min(600),
+    )
+}
 static FLIGHTS: OnceLock<Mutex<HashSet<FlightKey>>> = OnceLock::new();
 pub(crate) struct ProbeGuard(FlightKey);
 impl Drop for ProbeGuard {
@@ -79,28 +90,49 @@ pub(crate) fn start_probe(
     events: Arc<EventBus>,
     kick: Arc<tokio::sync::Notify>,
 ) {
-    // Step A is deliberately host-only. A daemon check through a live Task
-    // workspace is never a readiness probe; machine.probe lands in step 3.
-    if environment.checks.is_empty()
-        || !environment.assets.is_empty()
-        || !matches!(target, ProbeTarget::Server(_))
+    if environment.checks.is_empty() || !environment.assets.is_empty() {
+        return;
+    }
+    let machine = match &target {
+        ProbeTarget::Server(_) => EnvironmentMachine::Server,
+        ProbeTarget::Machine { machine, .. } => machine.clone(),
+        ProbeTarget::Daemon { .. } => return,
+    };
+    if observed
+        .as_ref()
+        .filter(|row| row.checks_digest == db::environment_checks_digest(&environment))
+        .and_then(|row| row.next_check_at.as_ref())
+        .is_some_and(|next| {
+            chrono::DateTime::parse_from_rfc3339(next).is_ok_and(|next| next > chrono::Utc::now())
+        })
     {
         return;
     }
-    let Some(guard) = claim_probe(&project, &EnvironmentMachine::Server) else {
+    let Some(guard) = claim_probe(&project, &machine) else {
         return;
     };
     tokio::spawn(async move {
+        let mut attempt = None;
         let result = async {
             let snapshot = db::ProjectRepo::get_by_id(&db, &project)
                 .await?
                 .ok_or(db::DbError::NotFound)?;
             let row = db
                 .put_readiness(
-                    unknown_record(&project, EnvironmentMachine::Server, &environment),
+                    unknown_record(&project, machine.clone(), &environment),
                     observed.map(|row| row.version),
                 )
                 .await?;
+            // Persist a deadline before I/O. A panicking/aborted flight can be
+            // retried by admission after this deadline, including after restart.
+            let retry = next_check_at(chrono::Utc::now(), 30);
+            if !db.reschedule_readiness(&row, &retry).await? {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let mut row = row;
+            row.version += 1;
+            row.next_check_at = Some(retry);
+            attempt = Some(row.clone());
             let results = run_checks(&target, &environment, &environment.checks).await?;
             let saved = save_results(&db, row, &environment, results).await?;
             if saved.status == EnvironmentReadinessStatus::Ready {
@@ -112,6 +144,17 @@ pub(crate) fn start_probe(
         if let Err(error) = result {
             if !matches!(error, ServiceError::Db(db::DbError::VersionConflict)) {
                 tracing::warn!(%project, %error, "environment probe failed");
+                if let Some(row) = attempt.as_ref() {
+                    if db
+                        .reschedule_readiness(row, &next_check_at(chrono::Utc::now(), 30))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        let mut fenced = row.clone();
+                        fenced.version += 1;
+                        let _ = record_probe_error(&db, &fenced, &error.to_string()).await;
+                    }
+                }
             }
         }
         // Release single flight before the wake can start a new digest.
@@ -127,10 +170,7 @@ pub(crate) fn start_probe(
                     && db::environment_checks_digest(&settings.environment)
                         != db::environment_checks_digest(&environment)
                 {
-                    match db
-                        .get_readiness(&project, &EnvironmentMachine::Server)
-                        .await
-                    {
+                    match db.get_readiness(&project, &machine).await {
                         Ok(observed)
                             if observed.as_ref().is_none_or(|row| {
                                 row.status == EnvironmentReadinessStatus::Unknown
@@ -157,11 +197,108 @@ pub(crate) fn start_probe(
         kick.notify_one();
     });
 }
+async fn record_probe_error(
+    db: &SqliteDb,
+    row: &ProjectMachineReadiness,
+    error: &str,
+) -> Result<()> {
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let rows = db.list_readiness_in_tx(&mut tx, &row.project_id).await?;
+    if !rows.iter().any(|current| {
+        current.machine == row.machine
+            && current.version == row.version
+            && current.checks_digest == row.checks_digest
+    }) {
+        return Ok(());
+    }
+    let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+        .bind(&row.project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let settings: api_types::ProjectSettings = serde_json::from_str(&raw)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    if db::environment_checks_digest(&settings.environment) != row.checks_digest {
+        return Ok(());
+    }
+    let error = bounded_output_tail(&executors::environment::redact_environment_values(
+        error,
+        &settings.environment.env,
+    ));
+    let machine = serde_json::to_value(&row.machine)
+        .expect("machine")
+        .to_string();
+    // Only matching Task waits receive diagnostics; readiness facts are unchanged.
+    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'")
+        .bind(&error).bind(&error).bind(&row.project_id).bind(machine).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
 pub(crate) async fn run_checks(
     target: &ProbeTarget,
     environment: &ProjectEnvironment,
     checks: &[EnvironmentCheck],
 ) -> Result<Vec<api_types::ProjectEnvironmentCheckResult>> {
+    if let ProbeTarget::Machine {
+        machine:
+            EnvironmentMachine::Daemon {
+                daemon_id,
+                runtime_id,
+            },
+        client,
+        location_id,
+    } = target
+    {
+        let reply = client
+            .machine_probe(
+                daemon_id,
+                api_types::MachineProbeParams {
+                    daemon_id: daemon_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    repo_location_id: location_id.clone(),
+                    commands: checks
+                        .iter()
+                        .map(|check| api_types::MachineProbeCommand {
+                            name: check.name.clone(),
+                            command: check.command.clone(),
+                            timeout_seconds: check.timeout_seconds.clamp(1, 300),
+                        })
+                        .collect(),
+                    env: environment.env.clone(),
+                },
+            )
+            .await
+            .map_err(super::provisioning::client_error)?;
+        if reply.results.len() != checks.len()
+            || reply
+                .results
+                .iter()
+                .zip(checks)
+                .any(|(result, check)| result.name != check.name)
+        {
+            return Err(ServiceError::invalid_operation(
+                "machine.probe returned different checks",
+            ));
+        }
+        return Ok(reply
+            .results
+            .into_iter()
+            .map(|result| api_types::ProjectEnvironmentCheckResult {
+                name: result.name,
+                passed: result.exit_code == Some(0) && !result.timed_out,
+                exit_code: result.exit_code,
+                output_tail: bounded_output_tail(
+                    &executors::environment::redact_environment_values(
+                        &if result.timed_out {
+                            format!("{}\ncheck timed out", result.output_tail)
+                        } else {
+                            result.output_tail
+                        },
+                        &environment.env,
+                    ),
+                ),
+            })
+            .collect());
+    }
     let mut results = Vec::new();
     for check in checks {
         let spec = RunSpec {
@@ -176,6 +313,9 @@ pub(crate) async fn run_checks(
                 crate::workspace_backend::run_environment_checkout(path, &spec).await
             }
             ProbeTarget::Daemon { placement, backend } => backend.run(placement, &spec).await,
+            ProbeTarget::Machine { .. } => {
+                return Err(ServiceError::invalid_operation("invalid probe owner"))
+            }
         };
         let (passed, exit_code, output) = match result {
             Ok(result) => (
@@ -206,6 +346,11 @@ pub(crate) async fn save_results(
     environment: &ProjectEnvironment,
     results: Vec<api_types::ProjectEnvironmentCheckResult>,
 ) -> Result<ProjectMachineReadiness> {
+    // Never attach results from one check snapshot to another digest, even if
+    // the caller accidentally supplies a freshly re-read readiness row.
+    if row.checks_digest != db::environment_checks_digest(environment) {
+        return Err(db::DbError::VersionConflict.into());
+    }
     let version = row.version;
     // Retain results for checks not re-run by a due failing-check re-check.
     for result in results {
@@ -339,34 +484,79 @@ pub(crate) async fn clear_matching_pause(
 pub(crate) async fn start_context_probes(
     db: &SqliteDb,
     context: &super::SelectionContext,
+    registry: &Arc<crate::daemon_transport::DaemonConnectionRegistry>,
     events: &Arc<EventBus>,
     kick: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    if context.environment_digest.is_none() {
-        return Ok(());
-    }
-    let Some(candidate) = context.candidates.iter().find(|candidate| {
-        candidate.location.owner_kind == db::RepoLocationOwnerKind::Server
-            && candidate.location.status == db::RepoLocationStatus::Ready
-            && super::selection::environment_filter(context, candidate)
-                == Some(super::PlacementFilterCode::EnvironmentProbePending)
-    }) else {
-        return Ok(());
-    };
     let project = db::ProjectRepo::get_by_id(db, &context.task.project_id)
         .await?
         .ok_or(db::DbError::NotFound)?;
     let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-    start_probe(
-        db.clone(),
-        project.id,
-        settings.environment,
-        candidate.environment_readiness.clone(),
-        ProbeTarget::Server(PathBuf::from(&candidate.location.path)),
-        events.clone(),
-        kick,
-    );
+    let mut provision_scheduled = false;
+    let mut candidates = context.candidates.iter().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| (&candidate.location.created_at, &candidate.location.id));
+    for candidate in candidates {
+        if candidate.provisioning {
+            if !provision_scheduled
+                && !super::selection::ready_location_can_run(context)
+                && super::selection::filter_candidate(context, candidate)
+                    .iter()
+                    .all(|code| {
+                        matches!(
+                            code,
+                            super::PlacementFilterCode::EnvironmentProbePending
+                                | super::PlacementFilterCode::LocationNotReady
+                        )
+                    })
+            {
+                provision_scheduled = true;
+                if let Err(error) = super::provisioning::start(super::provisioning::Job {
+                    db: db.clone(),
+                    repo: context.repo.clone(),
+                    project: project.clone(),
+                    candidate: candidate.clone(),
+                    registry: registry.clone(),
+                    events: events.clone(),
+                    kick: kick.clone(),
+                    role: context.claiming_agent.role.clone(),
+                })
+                .await
+                {
+                    tracing::warn!(project_id=%project.id,%error,"provisioning setup failed; continuing other probes");
+                }
+            }
+            continue;
+        }
+        if candidate.location.status != db::RepoLocationStatus::Ready
+            || !candidate.connected
+            || !candidate.visible
+            || super::selection::environment_filter(context, candidate)
+                != Some(super::PlacementFilterCode::EnvironmentProbePending)
+        {
+            continue;
+        }
+        let target = if candidate.location.owner_kind == db::RepoLocationOwnerKind::Server {
+            ProbeTarget::Server(candidate.location.path.clone().into())
+        } else {
+            ProbeTarget::Machine {
+                machine: EnvironmentMachine::from_location(&candidate.location),
+                client: crate::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
+                    registry.clone(),
+                ),
+                location_id: Some(candidate.location.id.clone()),
+            }
+        };
+        start_probe(
+            db.clone(),
+            project.id.clone(),
+            settings.environment.clone(),
+            candidate.environment_readiness.clone(),
+            target,
+            events.clone(),
+            kick.clone(),
+        );
+    }
     Ok(())
 }
 pub(crate) async fn schedule_project_probes(
@@ -374,6 +564,7 @@ pub(crate) async fn schedule_project_probes(
     project: &db::Project,
     kick: Arc<tokio::sync::Notify>,
     events: Arc<EventBus>,
+    registry: Option<&Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
 ) -> Result<()> {
     let settings: api_types::ProjectSettings = match serde_json::from_str(&project.settings) {
         Ok(settings) => settings,
@@ -381,6 +572,51 @@ pub(crate) async fn schedule_project_probes(
     };
     if settings.environment.checks.is_empty() || !settings.environment.assets.is_empty() {
         return Ok(());
+    }
+    if let Some(registry) = registry {
+        let locations: Vec<(String, String, String)> = sqlx::query_as("SELECT l.id, l.daemon_id, l.runtime_id FROM repo_location l JOIN repo r ON r.id = l.repo_id JOIN daemon d ON d.id = l.daemon_id WHERE r.project_id = ? AND l.owner_kind = 'daemon' AND l.status = 'ready' AND (d.visibility = 'global' OR d.owner_id IS NULL OR d.owner_id = ?)").bind(&project.id).bind(&project.owner_id).fetch_all(db.pool()).await?;
+        for (location_id, daemon_id, runtime_id) in locations {
+            let machine = EnvironmentMachine::Daemon {
+                daemon_id,
+                runtime_id,
+            };
+            let EnvironmentMachine::Daemon { daemon_id, .. } = &machine else {
+                unreachable!()
+            };
+            if !registry
+                .connection_snapshots()
+                .get(daemon_id)
+                .is_some_and(|facts| {
+                    facts
+                        .handshake
+                        .capabilities
+                        .iter()
+                        .any(|fact| fact == api_types::DAEMON_CAPABILITY_MACHINE_PROBE)
+                        && facts
+                            .handshake
+                            .workspace_run_policy
+                            .allowed_purposes
+                            .contains(&WorkspaceRunPurpose::EnvironmentProbe)
+                })
+            {
+                continue;
+            }
+            match db.get_readiness(&project.id, &machine).await {
+                Ok(observed)
+                    if observed.as_ref().is_none_or(|row| {
+                        row.status == EnvironmentReadinessStatus::Unknown
+                            || row.checks_digest
+                                != db::environment_checks_digest(&settings.environment)
+                    }) =>
+                {
+                    start_probe(db.clone(), project.id.clone(), settings.environment.clone(), observed, ProbeTarget::Machine { machine, client: crate::daemon_transport::workspace_client::DaemonWorkspaceClient::new(registry.clone()), location_id: Some(location_id) }, events.clone(), kick.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(project_id=%project.id,%error,"isolating unreadable daemon readiness row")
+                }
+            }
+        }
     }
     let observed = db
         .get_readiness(&project.id, &EnvironmentMachine::Server)
@@ -419,11 +655,66 @@ pub(crate) async fn target_for_machine(
     project: &db::Project,
     machine: &EnvironmentMachine,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
+    registry: Option<&Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     workspace_id: Option<&str>,
 ) -> Result<Option<ProbeTarget>> {
     let EnvironmentMachine::Daemon { .. } = machine else {
         return Ok(None);
     };
+    if let Some(registry) = registry {
+        if let EnvironmentMachine::Daemon {
+            daemon_id,
+            runtime_id,
+        } = machine
+        {
+            if registry
+                .connection_snapshots()
+                .get(daemon_id)
+                .is_some_and(|facts| {
+                    facts
+                        .handshake
+                        .capabilities
+                        .iter()
+                        .any(|fact| fact == api_types::DAEMON_CAPABILITY_MACHINE_PROBE)
+                        && facts
+                            .handshake
+                            .workspace_run_policy
+                            .allowed_purposes
+                            .contains(&WorkspaceRunPurpose::EnvironmentProbe)
+                })
+            {
+                let location: Option<String> = sqlx::query_scalar("SELECT l.id FROM repo_location l JOIN repo r ON r.id = l.repo_id WHERE r.project_id = ? AND l.daemon_id = ? AND l.runtime_id = ? AND l.status = 'ready' ORDER BY l.is_default DESC, l.created_at, l.id LIMIT 1")
+                    .bind(&project.id).bind(daemon_id).bind(runtime_id).fetch_optional(db.pool()).await?;
+                if location.is_none() {
+                    let settings: api_types::ProjectSettings =
+                        serde_json::from_str(&project.settings)
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    if db
+                        .get_readiness(&project.id, machine)
+                        .await?
+                        .is_some_and(|row| {
+                            row.failing_checks.iter().any(|failure| {
+                                settings.environment.checks.iter().any(|check| {
+                                    check.name == failure.name
+                                        && check.scope
+                                            == api_types::EnvironmentCheckScope::Workspace
+                                })
+                            })
+                        })
+                    {
+                        return Ok(None); // Missing checkout is not a failed command.
+                    }
+                }
+                return Ok(Some(ProbeTarget::Machine {
+                    machine: machine.clone(),
+                    client: crate::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
+                        registry.clone(),
+                    ),
+                    location_id: location,
+                }));
+            }
+        }
+    }
     let Some(workspace_id) = workspace_id else {
         return Ok(None);
     };
@@ -472,6 +763,7 @@ pub(crate) async fn handle_refusal(
     project: &db::Project,
     context: &super::SelectionContext,
     refusal: &super::PlacementUnavailable,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> Result<bool> {
     use super::PlacementFilterCode::*;
     if super::machine_precheck::capacity_only_wait(refusal) {
@@ -545,6 +837,7 @@ pub(crate) async fn handle_refusal(
         db,
         task,
         &ServiceError::PlacementUnavailable(refusal.clone()),
+        registry,
     )
     .await?
     .unwrap_or(false))
@@ -553,6 +846,7 @@ pub(crate) async fn defer_refusal(
     db: &SqliteDb,
     task: &db::Task,
     error: &ServiceError,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> Result<Option<bool>> {
     if matches!(
         error,
@@ -602,13 +896,7 @@ pub(crate) async fn defer_refusal(
         candidate
             .filter_codes
             .contains(&super::PlacementFilterCode::EnvironmentProbePending)
-            && candidate.filter_codes.iter().all(|code| {
-                matches!(
-                    code,
-                    super::PlacementFilterCode::EnvironmentProbePending
-                        | super::PlacementFilterCode::MachineCapacity
-                )
-            })
+            && super::retryable_filter_codes(&candidate.filter_codes)
     };
     let pending = refusal.rejected_candidates.iter().any(probe_pending);
     if let Some(candidate) = refusal.rejected_candidates.iter().find(|candidate| {
@@ -629,33 +917,145 @@ pub(crate) async fn defer_refusal(
         persist_machine_wait(db, task, &machine, &candidate.failing_checks).await?;
         return Ok(Some(true));
     }
-    if !refusal.rejected_candidates.iter().any(probe_pending) {
+    if !refusal.rejected_candidates.iter().any(&probe_pending) {
         return Ok(None);
     }
-    let marker = serde_json::json!({"kind":"environment_probe_pending","reason":"environment_probe_pending: server","target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});
+    let candidate = refusal
+        .rejected_candidates
+        .iter()
+        .find(|candidate| probe_pending(candidate))
+        .expect("environment wait");
+    let machine = if candidate.owner_kind == "server" {
+        EnvironmentMachine::Server
+    } else {
+        EnvironmentMachine::Daemon {
+            daemon_id: candidate.daemon_id.clone().unwrap_or_default(),
+            runtime_id: candidate.runtime_id.clone().unwrap_or_default(),
+        }
+    };
+    let kind = "environment_probe_pending";
+    let label = machine_name(db, &machine).await?;
+    let progress = provisioning_wait_detail(db, &refusal.repo_id, &machine, registry).await?;
+    let current: Option<String> = sqlx::query_scalar("SELECT metadata_json FROM task WHERE id=?")
+        .bind(&task.id)
+        .fetch_optional(db.pool())
+        .await?
+        .flatten();
+    let previous: serde_json::Value = current
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let last_error = (previous["environment_wait"]["machine"]
+        == serde_json::to_value(&machine).expect("machine"))
+    .then(|| previous["environment_wait"]["last_error"].as_str())
+    .flatten();
+    let diagnostic = last_error
+        .map(|error| format!("; last failure: {error}"))
+        .unwrap_or_default();
+    let marker = serde_json::json!({"kind":kind,"reason":format!("{kind}: {label}{progress}{diagnostic}"),"target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});
+    let mut wait = serde_json::json!({"machine":machine,"checks":[],"kind":kind});
+    if let Some(error) = last_error {
+        wait["last_error"] = serde_json::json!(error);
+    }
     let mut tx = db::begin_immediate(db.pool()).await?;
     // If completion won this race, leave no delayed marker behind.
     let rows = db.list_readiness_in_tx(&mut tx, &task.project_id).await?;
     if rows.iter().any(|row| {
-        row.machine == EnvironmentMachine::Server
+        row.machine == machine
+            && row.scope_covered == "full"
             && row.status != EnvironmentReadinessStatus::Unknown
     }) {
         return Ok(Some(true));
     }
-    let changed = sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ?")
-        .bind(marker.to_string()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+    let changed = sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ?")
+        .bind(marker.to_string()).bind(wait.to_string()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
     if changed.rows_affected() != 1 {
         return Err(db::DbError::VersionConflict.into());
     }
     tx.commit().await?;
     Ok(Some(true))
 }
+pub(crate) async fn machine_name(db: &SqliteDb, machine: &EnvironmentMachine) -> Result<String> {
+    match machine {
+        EnvironmentMachine::Server => Ok("server".into()),
+        EnvironmentMachine::Daemon { daemon_id, .. } => Ok(sqlx::query_scalar::<_, String>(
+            "SELECT hostname FROM daemon WHERE id = ?",
+        )
+        .bind(daemon_id)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or_else(|| "daemon machine".into())),
+    }
+}
+
+async fn provisioning_wait_detail(
+    db: &SqliteDb,
+    repo: &str,
+    machine: &EnvironmentMachine,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
+) -> Result<String> {
+    let EnvironmentMachine::Daemon {
+        runtime_id,
+        daemon_id,
+    } = machine
+    else {
+        return Ok(String::new());
+    };
+    let detail: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELECT started_at, COALESCE(l.last_error, j.last_error) FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?").bind(repo).bind(runtime_id).fetch_optional(db.pool()).await?;
+    let Some((started, error)) = detail else {
+        return Ok(String::new());
+    };
+    let retry:super::provisioning::ProvisionRetryState=sqlx::query_as::<_,(i64,String,i64)>("SELECT attempts,checks_digest AS inputs_digest,connection_id FROM repo_provision_retry WHERE repo_id=? AND runtime_id=?").bind(repo).bind(runtime_id).fetch_one(db.pool()).await?.into();
+    let raw: String = sqlx::query_scalar(
+        "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
+    )
+    .bind(repo)
+    .fetch_one(db.pool())
+    .await?;
+    let settings: api_types::ProjectSettings = serde_json::from_str(&raw)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let exhausted = retry.exhausted(
+        &settings,
+        registry
+            .and_then(|registry| registry.get(daemon_id))
+            .map(|connection| connection.id()),
+    );
+    let elapsed = started
+        .as_deref()
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| {
+            (chrono::Utc::now() - time.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0)
+        })
+        .unwrap_or(0);
+    let remote: Option<String> = sqlx::query_scalar("SELECT remote_url FROM repo WHERE id=?")
+        .bind(repo)
+        .fetch_optional(db.pool())
+        .await?
+        .flatten();
+    let error =
+        error.map(|error| git::redact_remote_credentials(&error, remote.as_deref().unwrap_or("")));
+    Ok(format!(
+        "; {}{}",
+        if exhausted {
+            "provision_failed: retry limit reached; reconnect the machine or update its Project settings".to_owned()
+        } else {
+            format!("provisioning elapsed {elapsed}s")
+        },
+        error
+            .map(|error| format!("; last failure: {error}"))
+            .unwrap_or_default()
+    ))
+}
+
 pub(crate) async fn persist_machine_wait(
     db: &SqliteDb,
     task: &db::Task,
     machine: &EnvironmentMachine,
     checks: &[String],
 ) -> Result<()> {
+    let label = machine_name(db, machine).await?;
     let mut tx = db::begin_immediate(db.pool()).await?;
     let project: (Option<String>, String) =
         sqlx::query_as("SELECT paused_at, settings FROM project WHERE id = ?")
@@ -688,7 +1088,7 @@ pub(crate) async fn persist_machine_wait(
         .extra
         .get("environment_wait")
         == Some(&marker);
-    let deferral = serde_json::json!({"kind":"environment_not_ready","reason":format!("environment_not_ready: {} ({})",machine_label(machine),checks.join(", ")),"target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});
+    let deferral = serde_json::json!({"kind":"environment_not_ready","reason":format!("environment_not_ready: {} ({})",label,checks.join(", ")),"target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});
     sqlx::query("UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ?")
         .bind(marker.to_string()).bind(deferral.to_string()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
     if !unchanged {
@@ -716,7 +1116,7 @@ pub(crate) async fn persist_machine_wait(
         )
         .await?;
         sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'environment_not_ready', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'wait') ON CONFLICT(dedupe_key) DO UPDATE SET status = 'open', summary = excluded.summary, details_json = excluded.details_json, source_event_id = excluded.source_event_id, resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL, updated_at = excluded.updated_at, version = attention_projection.version + 1")
-            .bind(db::new_uuid_v4()).bind(&task.project_id).bind(event_id).bind(format!("Waiting for environment on {}: {}",machine_label(machine),checks.join(", ")))
+            .bind(db::new_uuid_v4()).bind(&task.project_id).bind(event_id).bind(format!("Waiting for environment on {}: {}",label,checks.join(", ")))
             .bind(serde_json::json!({"task":{"id":task.id,"title":task.title},"machine":machine,"checks":checks,"cause":"environment_not_ready"}).to_string()).bind(format!("task-environment-wait:{}",task.id)).bind(&now).bind(&now).execute(&mut *tx).await?;
     }
     tx.commit().await?;
@@ -856,6 +1256,61 @@ mod tests {
         (db, id)
     }
     #[tokio::test]
+    async fn probe_error_is_visible_redacted_and_fenced_without_changing_facts() {
+        let environment:ProjectEnvironment=serde_json::from_value(serde_json::json!({"env":{"PASSWORD":"hidden-value"},"checks":[{"name":"cargo","command":"true"}]})).unwrap();
+        let (db, project) = fixture(&environment).await;
+        let mut row = unknown_record(&project, EnvironmentMachine::Server, &environment);
+        row.status = EnvironmentReadinessStatus::Ready;
+        let row = db.put_readiness(row, None).await.unwrap();
+        let now = db::now_rfc3339();
+        let wait=serde_json::json!({"environment_wait":{"kind":"environment_probe_pending","machine":{"owner_kind":"server"}},"deferred_dispatch":{"reason":"environment_probe_pending: server"}}).to_string();
+        sqlx::query("INSERT INTO task(id,project_id,title,task_type,status,created_at,updated_at,metadata_json) VALUES('probe-wait',?,'wait','task','todo',?,?,?)").bind(&project).bind(&now).bind(&now).bind(&wait).execute(db.pool()).await.unwrap();
+        record_probe_error(&db, &row, "daemon offline: hidden-value")
+            .await
+            .unwrap();
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata_json FROM task WHERE id='probe-wait'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(metadata.contains("last failure: daemon offline"));
+        assert!(!metadata.contains("hidden-value"));
+        let saved = db
+            .get_readiness(&project, &EnvironmentMachine::Server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, row.status);
+        assert_eq!(saved.version, row.version);
+        let newer = db
+            .put_readiness(saved.clone(), Some(saved.version))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json=? WHERE id='probe-wait'")
+            .bind(&wait)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        record_probe_error(&db, &row, "stale failure")
+            .await
+            .unwrap();
+        let metadata: String =
+            sqlx::query_scalar("SELECT metadata_json FROM task WHERE id='probe-wait'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(metadata, wait);
+        assert_eq!(
+            db.get_readiness(&project, &EnvironmentMachine::Server)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            newer.version
+        );
+    }
+
+    #[tokio::test]
     async fn environment_stale_probe_result_is_discarded_after_settings_edit() {
         let checkout = tempfile::TempDir::new().unwrap();
         let signals = tempfile::TempDir::new().unwrap();
@@ -952,6 +1407,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new"]
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_probe_completion_records_full_readiness_and_kicks_dispatch() {
+        let environment: ProjectEnvironment = serde_json::from_value(
+            serde_json::json!({"checks":[{"name":"cargo","command":"true"}]}),
+        )
+        .unwrap();
+        let (db, project) = fixture(&environment).await;
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, mut requests) =
+            crate::daemon_transport::DaemonConnection::new("probe-daemon".into());
+        registry.register("probe-daemon".into(), connection.clone());
+        let handshake = api_types::DaemonHandshakeNotification {
+            protocol_revision: 3,
+            capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
+                .iter()
+                .map(|fact| (*fact).to_owned())
+                .chain([
+                    api_types::DAEMON_CAPABILITY_WORKSPACE.into(),
+                    api_types::DAEMON_CAPABILITY_MACHINE_PROBE.into(),
+                ])
+                .collect(),
+            executor_capabilities: Default::default(),
+            workspace_run_policy: api_types::WorkspaceRunPolicy {
+                allowed_purposes: vec![WorkspaceRunPurpose::EnvironmentProbe],
+            },
+        };
+        registry.dispatch_incoming_for_connection(
+            "probe-daemon",
+            connection.id(),
+            api_types::DaemonFrame::Notification {
+                method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+                params: serde_json::to_value(handshake).unwrap(),
+            },
+        );
+        let incoming = registry.clone();
+        let daemon = tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, params } =
+                requests.recv().await.unwrap()
+            else {
+                panic!("probe request");
+            };
+            assert_eq!(method, api_types::METHOD_MACHINE_PROBE);
+            assert_eq!(params["repo_location_id"], "location");
+            incoming.dispatch_incoming_for_connection("probe-daemon", connection.id(), api_types::DaemonFrame::Response { id, result: serde_json::json!({"results":[{"name":"cargo","exit_code":0,"timed_out":false,"output_tail":"ready"}]}) });
+        });
+        let kick = Arc::new(tokio::sync::Notify::new());
+        let machine = EnvironmentMachine::Daemon {
+            daemon_id: "probe-daemon".into(),
+            runtime_id: "probe-runtime".into(),
+        };
+        start_probe(
+            db.clone(),
+            project.clone(),
+            environment,
+            None,
+            ProbeTarget::Machine {
+                machine: machine.clone(),
+                client: crate::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
+                    registry,
+                ),
+                location_id: Some("location".into()),
+            },
+            Arc::new(EventBus::default()),
+            kick.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), kick.notified())
+            .await
+            .unwrap();
+        daemon.await.unwrap();
+        let row = db.get_readiness(&project, &machine).await.unwrap().unwrap();
+        assert_eq!(row.status, EnvironmentReadinessStatus::Ready);
+        assert_eq!(row.scope_covered, "full");
     }
 
     #[tokio::test]

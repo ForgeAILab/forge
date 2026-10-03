@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicU32, AtomicU8, Ordering},
     Arc, Mutex, MutexGuard, Weak,
 };
 use std::time::Duration;
@@ -36,7 +36,12 @@ pub use remote::{RemoteExecutionProvider, RemoteFilesystemProvider};
 pub use router::{select_execution_provider, select_filesystem_provider};
 
 pub const DAEMON_OUTBOUND_BUFFER: usize = 256;
-static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+fn new_connection_id() -> u64 {
+    let uuid = Uuid::new_v4().as_u128();
+    // Mix both halves so UUID version/variant bits do not reduce the numeric
+    // token's entropy. Keep it positive for SQLite INTEGER retry epochs.
+    (((uuid >> 64) as u64 ^ uuid as u64) & i64::MAX as u64).max(1)
+}
 
 const PROTOCOL_UNKNOWN: u8 = 0;
 const PROTOCOL_COMPATIBLE: u8 = 1;
@@ -188,7 +193,7 @@ impl DaemonConnection {
         let (stale_tx, stale_rx) = watch::channel(false);
         (
             Self {
-                id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                id: new_connection_id(),
                 connected_at: db::now_rfc3339(),
                 daemon_id,
                 outbound,

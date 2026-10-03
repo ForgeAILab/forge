@@ -609,6 +609,13 @@ pub(crate) async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
     }
     let started = Instant::now();
     let output = match spec.purpose {
+        super::WorkspaceRunPurpose::EnvironmentProbe
+        | super::WorkspaceRunPurpose::RepoProvision => {
+            return Err(ServiceError::invalid_operation(
+                "machine operations cannot run through workspace.run",
+            )
+            .into());
+        }
         super::WorkspaceRunPurpose::Hook | super::WorkspaceRunPurpose::EnvironmentSetup => {
             // Hooks and environment checks inherit Git variables, close
             // stdin, and collect output before their callers redact it.

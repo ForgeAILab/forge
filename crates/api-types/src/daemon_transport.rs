@@ -14,6 +14,8 @@ pub const METHOD_EXECUTION_TERMINAL: &str = "execution.terminal";
 pub const METHOD_JOURNAL_ACK: &str = "journal.ack";
 pub const METHOD_DAEMON_HANDSHAKE: &str = "daemon.handshake";
 pub const METHOD_REPO_LOCATION_VERIFY: &str = "repo_location.verify";
+pub const METHOD_MACHINE_PROBE: &str = "machine.probe";
+pub const METHOD_REPO_LOCATION_PROVISION: &str = "repo_location.provision";
 pub const METHOD_WORKSPACE_PREPARE: &str = "workspace.prepare";
 pub const METHOD_WORKSPACE_DESCRIBE: &str = "workspace.describe";
 pub const METHOD_WORKSPACE_RUN: &str = "workspace.run";
@@ -56,6 +58,8 @@ pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
 /// Remote plans reserve room for JSON escaping and the rest of the terminal report.
 pub const MAX_EXECUTION_PLAN_BYTES: u64 = 128 * 1024;
 pub const DAEMON_CAPABILITY_WORKSPACE: &str = "workspace.v1";
+pub const DAEMON_CAPABILITY_MACHINE_PROBE: &str = "machine_probe.v1";
+pub const DAEMON_CAPABILITY_REPO_PROVISION: &str = "repo_provision.v1";
 pub const DAEMON_REQUIRED_CAPABILITIES: &[&str] = &[
     DAEMON_CAPABILITY_USAGE_REPORTS,
     DAEMON_CAPABILITY_JOURNAL_ACK,
@@ -245,8 +249,56 @@ pub struct WorkspaceDescribeResult {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceRunPurpose {
     EnvironmentSetup,
+    EnvironmentProbe,
+    RepoProvision,
     Hook,
     CiStep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MachineProbeCommand {
+    pub name: String,
+    pub command: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MachineProbeParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub repo_location_id: Option<String>,
+    pub commands: Vec<MachineProbeCommand>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MachineProbeCommandResult {
+    pub name: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct MachineProbeResult {
+    pub results: Vec<MachineProbeCommandResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RepoLocationProvisionParams {
+    pub default_branch: String,
+    pub timeout_seconds: u64,
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub repo_id: String,
+    pub remote_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct RepoLocationProvisionResult {
+    pub workspace_root: String,
+    pub path: String,
+    pub default_branch: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -988,6 +1040,29 @@ pub struct DaemonErrorPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn machine_capabilities_are_optional_at_revision_three() {
+        let old: Vec<String> = super::DAEMON_REQUIRED_CAPABILITIES
+            .iter()
+            .map(|fact| (*fact).into())
+            .collect();
+        assert!(super::daemon_protocol_is_compatible(3, &old));
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 3);
+        let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
+        assert_eq!(probe.commands[0].name, "cargo");
+        let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
+        assert!(serde_json::to_value(provision)
+            .unwrap()
+            .get("credentials")
+            .is_none());
+        for purpose in ["environment_probe", "repo_provision"] {
+            assert!(
+                serde_json::from_value::<super::WorkspaceRunPurpose>(serde_json::json!(purpose))
+                    .is_ok()
+            );
+        }
+    }
+
     use super::*;
     use crate::UsageTelemetryState;
     use serde::de::DeserializeOwned;

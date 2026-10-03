@@ -126,14 +126,40 @@ Rows with no named failure are retryable only through resume or Check now.
 ### D5. Provisioning a machine that lacks the code
 A daemon runtime is a *provisioning candidate* for a repository when: it has no location for it; the repository has a remote URL; the daemon advertises `machine_probe.v1` and `repo_provision.v1`; its run policy allows the new purposes; it has the Agent's executor; and the Project allows provisioning (`settings.placement.provision`: `when_verified` (default) or `never`).
 
-Provisioning candidates are considered **only when no candidate with a ready location passes the filters**. Then:
+Provisioning candidates are considered **only when no candidate with a ready location passes the environment and capability filters**. Capacity-only waits and preferred pending probes prevent provisioning elsewhere. Then:
 
-1. Run the Project's `machine` checks through `machine.probe`. If the Project declares no `machine` check, reject with `environment_unverified`: the error tells the owner to declare one or register a location by hand. All must pass.
+1. Run the Project's `machine` checks through `machine.probe`. If the Project declares no `machine` check, reject with `environment_unverified`: the error tells the owner to declare one or register a location by hand. All applicable checks must pass.
 2. `repo_location.provision`: the daemon clones the remote into `<workspace_root>/repos/<repo id>` using the machine's own Git credentials, and the server records a `managed_clone` location, `unverified`.
 3. The existing `repo_location.verify` runs; then the full checks run in the clone and the readiness row becomes `ready` with `scope_covered = full`, or `not_ready`.
 4. Dispatch is woken; normal selection now sees a ready location on a ready machine.
 
-Steps run as a background job, single-flight per (repository, runtime), outside admission; the Task waits with `environment_probe_pending`. A clone failure leaves the location `unavailable` with the daemon's error and exponential retry backoff, as server managed clones do today.
+Steps run as a background job, single-flight per (repository, runtime), outside
+admission; the Task waits with `environment_probe_pending`. Every write fences
+its check digest and observed row version. A stale job discards its result and
+wakes the current digest. The daemon returns the authoritative canonical root
+and clone path; the server validates root/repos/repository identity and records
+it. The provision request selects the repository default branch and fetches a
+missing local ref on reuse. `placement.provision_timeout_seconds` defaults to
+1800 (1–86400 allowed). Clone and verification failures leave the bounded,
+credential-redacted error in the location and Task wait reason with elapsed time.
+Exponential backoff is 60–600 seconds; five failed attempts for unchanged inputs
+and connection stop admission on that machine with deterministic provision_failed.
+The Task's Attention names the machine and redacted last error, is recorded once,
+and wakes when the retry epoch or placement eligibility changes. The exhaustion
+rule compares the current digest and socket token; socket tokens remain unique
+across server restart. Unrelated settings edits do not abort an in-flight job.
+Reconnection or settings changes restart the budget.
+
+A provisioning candidate never contributes to the last-resort Project pause.
+Failed machine checks instead mark that Project/machine not ready, create Task
+Attention naming the machine and checks, and recover through scheduled rechecks.
+`environment_unverified` is deterministic, recorded once with an actionable
+machine-named reason and Task Attention. It wakes on checks/provision setting
+changes, connection changes, or location changes. Codeless candidates with other
+hard failures retain the determinism of the other candidates. No-check initial
+dispatch returns before context assembly; provisioning facts are loaded once per
+admission. Deleting a Project cascades retry rows; managed daemon repository
+clones remain owner-local caches pending a repository-clone cleanup operation.
 
 - Alternative considered: provision whenever the executor is present. Rejected: this is exactly the reported failure (code lands on a machine that cannot build it).
 - Alternative considered: provision eagerly on every capable daemon. Rejected: copies code to machines that may never be needed.

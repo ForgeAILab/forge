@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T19:57:03Z
+updated_at: 2026-10-03T02:20:08Z
 completed_at:
 ---
 
@@ -22,20 +22,20 @@ completed_at:
 - [x] 2.7 `happy_path` named case for a single machine: check fails → Project paused → re-check passes → Task re-dispatches (behaviour unchanged)
 
 ## 3. Check scope, daemon probe, provisioning
-- [ ] 3.1 `EnvironmentCheck.scope` (`workspace` default, `machine`), validation, settings UI and `forge-ctl`
-- [ ] 3.2 Daemon transport: `machine.probe` + capability fact `machine_probe.v1`; run-policy purposes `environment_probe` and `repo_provision`; handshake facts; `forge-daemon` implementation with scratch directory lifecycle and timeouts
-- [ ] 3.3 Probe job uses `machine.probe` for daemon machines (with a location: all checks; without: `machine` checks)
-- [ ] 3.4 Daemon transport: `repo_location.provision` + `repo_provision.v1`; idempotent clone under `workspace_root/repos/<repo id>`; no partial directory on failure
-- [ ] 3.5 Provisioning candidates in admission (only when no ready-location candidate passes); provisioning job single-flight per (repository, runtime): machine checks → provision → verify → full checks → wake dispatch; `settings.placement.provision` (`when_verified` | `never`)
-- [ ] 3.6 Two-machine integration test with the daemon test harness: executor only on the daemon, machine checks pass → clone, verify, place; machine check fails → no clone, `placement_unavailable` with the check name; no machine checks → `environment_unverified`
+- [x] 3.1 `EnvironmentCheck.scope` (`workspace` default, `machine`), validation, settings UI and `forge-ctl`
+- [x] 3.2 Daemon transport: `machine.probe` + capability fact `machine_probe.v1`; run-policy purposes `environment_probe` and `repo_provision`; handshake facts; `forge-daemon` implementation with scratch directory lifecycle and timeouts
+- [x] 3.3 Probe job uses `machine.probe` for daemon machines (with a location: all checks; without: `machine` checks)
+- [x] 3.4 Daemon transport: `repo_location.provision` + `repo_provision.v1`; idempotent clone under `workspace_root/repos/<repo id>`; no partial directory on failure
+- [x] 3.5 Provisioning candidates in admission (only when no ready-location candidate passes); provisioning job single-flight per (repository, runtime): machine checks → provision → verify → full checks → wake dispatch; `settings.placement.provision` (`when_verified` | `never`)
+- [x] 3.6 Two-machine integration test with the daemon test harness: executor only on the daemon, machine checks pass → clone, verify, place; machine check fails → no clone, `placement_unavailable` with the check name; no machine checks → `environment_unverified`
 
 ## 4. Docs and release notes
-- [ ] 4.1 `docs/architecture.md`: Workspace placement (readiness filter, provisioning), Project environment (per-machine failure, re-check), daemon command transport (two new operations)
+- [x] 4.1 `docs/architecture.md`: Workspace placement (readiness filter, provisioning), Project environment (per-machine failure, re-check), daemon command transport (two new operations)
 - [x] 4.1B Public readiness, manual re-check, Agent machines and Task diagnostics documentation in this build step; provisioning/transport remains step C
 - [x] 4.2B Release-note text drafted in `implementation-step-b.md` and final reply; CHANGELOG.md remains untouched by request
 - [ ] 4.2 `CHANGELOG.md` `### Breaking`: recheck response shape, `environment_pause` gains the machine, Project pauses only when no machine is eligible; `### Added` for the rest
 
-### Backend build-step verification
+### Backend A build-step verification
 - Backend tasks 1.1–1.5 and 2.1–2.3 include audit corrections D-A–D-F: host-only probes, role-specific admission pause, transactional resume reset, environmental waits, parked slot projection, and preference-preserving deferral.
 - Machine key is Project/server owner or Project/daemon/runtime owner. The temporary daemon missing/unknown/stale pass is `placement::selection::environment_filter`, shared by reserve and claim; step 3 removes it.
 - Audit reproductions are permanent repo tests in `task_dispatcher/tests/environment_placement.rs`; they have no dependency on audit scratch files. The shared launch fixture no longer seeds a ready row: it configures the environment before ordinary claim; direct claims use launch preflight and dispatcher tests exercise real probes.
@@ -73,3 +73,11 @@ completed_at:
 - [x] Admin pins use the runnable machine name or an exact daemon lookup; embedded pins use Server host, absent pins display offline/unavailable/disabled status beside the name, and IDs are titles.
 - [x] A server recheck without a Project location retains 404 and identifies the missing repository location; no-repository settings empty state explains why checks cannot run.
 - Verification: full web typecheck/lint, four related Vitest files (40 tests), API environment_surfaces (5 tests), services environment_surfaces (2 tests), clippy/fmt for touched Rust crates. Browser QA uses installed Chromium in single-process mode because normal launch is sandbox-blocked; readiness screenshots at 1440/1280/768 have no horizontal overflow and fully visible actions.
+
+### Build step C verification
+- [x] 3.1–3.6 and 4.1 implemented on `feat/environment-placement-daemon-probe`, base b34fe4c8.
+- Protocol stays at revision 3; machine probe/provision are optional capability facts. Legacy ready-location owners retain launch preflight.
+- V202610021500 adds restartable retry deadlines and refreshes scope-default digests while retaining verdicts and due times.
+- Whole touched modules/targets passed: 443 test executions across 16 commands, plus 603 binding-export tests and 7 web tests. Clippy, Rust formatting, web typecheck, daemon build check and strict spec validation passed.
+- Browser QA could not start: installed Chrome exited with SIGABRT. No screenshots or Lighthouse result are claimed.
+- Step B surfaces and CHANGELOG.md remain under their respective owners; those task boxes are unchanged.

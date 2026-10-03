@@ -516,6 +516,7 @@ pub async fn recheck(
                 &project,
                 &machine,
                 &router,
+                service.environment_daemon_connections(),
                 observed
                     .as_ref()
                     .and_then(|row| row.workspace_id.as_deref()),
@@ -644,17 +645,22 @@ pub async fn task_placement_diagnostics(
         if let Ok(machine) = serde_json::from_value::<EnvironmentMachine>(wait["machine"].clone()) {
             diagnostics.push(api_types::TaskPlacementDiagnostic {
                 machine: Some(machine_identity(db, &machine).await?),
-                filter_codes: vec!["environment_not_ready".into()],
+                filter_codes: vec![wait["kind"]
+                    .as_str()
+                    .unwrap_or("environment_not_ready")
+                    .to_owned()],
                 failing_checks: serde_json::from_value(wait["checks"].clone()).unwrap_or_default(),
             });
         }
     }
-    if metadata.extra.get("deferred_dispatch").is_some_and(|d| {
-        d["kind"] == "environment_probe_pending"
-            || d["reason"]
-                .as_str()
-                .is_some_and(|r| r.starts_with("environment_probe_pending:"))
-    }) {
+    if !metadata.extra.contains_key("environment_wait")
+        && metadata.extra.get("deferred_dispatch").is_some_and(|d| {
+            d["kind"] == "environment_probe_pending"
+                || d["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("environment_probe_pending:"))
+        })
+    {
         diagnostics.push(api_types::TaskPlacementDiagnostic {
             machine: Some(machine_identity(db, &EnvironmentMachine::Server).await?),
             filter_codes: vec!["environment_probe_pending".into()],
@@ -699,6 +705,39 @@ pub async fn task_placement_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn placement_diagnostics_preserve_wait_kind_and_daemon_owner() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        sqlx::query("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES('wait-project','wait','{}','{}','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES('wait-daemon','remote','Remote machine','linux','x86_64','online','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,task_type,status,created_at,updated_at) VALUES('wait-task','wait-project','wait','task','todo','now','now')").execute(db.pool()).await.unwrap();
+        for kind in [
+            "environment_unverified",
+            "environment_probe_pending",
+            "provision_failed",
+        ] {
+            let metadata = serde_json::json!({"environment_wait":{"kind":kind,"machine":{"owner_kind":"daemon","daemon_id":"wait-daemon","runtime_id":"wait-runtime"},"checks":[]},"deferred_dispatch":{"kind":"environment_probe_pending","reason":"environment_probe_pending: remote"}});
+            sqlx::query("UPDATE task SET metadata_json=? WHERE id='wait-task'")
+                .bind(metadata.to_string())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let task = db::TaskRepo::get_by_id(&db, "wait-task", false)
+                .await
+                .unwrap()
+                .unwrap();
+            let diagnostics = task_placement_diagnostics(&db, &task, None).await.unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].filter_codes, [kind]);
+            let machine = diagnostics[0].machine.as_ref().unwrap();
+            assert_eq!(machine.owner_kind, api_types::RepoLocationOwnerKind::Daemon);
+            assert_eq!(machine.name, "Remote machine");
+            assert_eq!(machine.runtime_id.as_deref(), Some("wait-runtime"));
+        }
+    }
+
     struct CountedAvailability(std::sync::Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait::async_trait]
     impl executors::CodingExecutorAdapter for CountedAvailability {

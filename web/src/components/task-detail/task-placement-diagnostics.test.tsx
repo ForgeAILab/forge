@@ -31,6 +31,19 @@ describe('Placement diagnostics', () => {
     expect(screen.getByText('Checking machine Mac mini…')).toBeTruthy()
     expect(screen.getByText('Mac mini: Machine run capacity reached')).toBeTruthy()
   })
+  it('labels exhausted provisioning without calling the connected machine offline', () => {
+    render(
+      <TaskPlacementDiagnostics
+        diagnostics={[{ machine, filter_codes: ['provision_failed'], failing_checks: [] }]}
+      />,
+    )
+    expect(
+      screen.getByText(
+        'Mac mini: Repository provisioning failed; reconnect or update placement settings to retry',
+      ),
+    ).toBeTruthy()
+    expect(screen.queryByText(/offline/i)).toBeNull()
+  })
   it('has no empty status panel', () => {
     render(<TaskPlacementDiagnostics diagnostics={[]} />)
     expect(screen.queryByRole('status')).toBeNull()

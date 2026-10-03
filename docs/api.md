@@ -2261,7 +2261,7 @@ ten-minute review at a time:
         }
       ],
       "checks": [
-        { "name": "godot", "command": "\"$GODOT_BIN\" --headless --version" },
+        { "name": "godot", "scope": "machine", "command": "\"$GODOT_BIN\" --headless --version" },
         {
           "name": "browser",
           "command": "chromium --headless --dump-dom about:blank >/dev/null",
@@ -2273,6 +2273,30 @@ ten-minute review at a time:
   }
 }
 ```
+
+- Every check accepts `scope: "workspace" | "machine"`; omission defaults to
+  `workspace` without rewriting saved settings. Unknown values are rejected by
+  Project create/PATCH validation. Machine checks must work without a checkout
+  or assets; checks must be read-only. Timeouts remain 1–300 seconds.
+- `settings.placement` accepts `{ "provision": "when_verified" | "never", "provision_timeout_seconds": 1800 }`.
+  Omission defaults to `when_verified` and a 30-minute clone/fetch timeout.
+  `provision_timeout_seconds` must be 1–86400. Unknown provision values are rejected. Provisioning
+  needs a remote, both daemon capabilities and local policy permissions, and at
+  least one applicable passing machine check. No eligible ready location is
+  displaced by provisioning; capacity-only waits do not trigger it.
+- `placement_unavailable` candidate filter codes now include
+  `environment_unverified`, with instructions to declare a machine check or
+  add the repository on that machine. This is a deterministic refusal recorded
+  once with Task `human_input_required` Attention (details `cause: environment_unverified`,
+  `task: { id, title }`, and `machines: [{ daemon_id, machine, filter_codes }]`,
+  recommended action `configure_environment`); checks/provision settings changes, machine connections,
+  and new locations wake it. `environment_probe_pending` remains retryable and
+  parks the Task in `environment_wait`. Failed provisioning-only machine checks
+  create Task environment Attention and never pause the Project. Clone and verify
+  errors retain the location's bounded `last_error` and appear in the wait reason
+  with elapsed seconds; credentials are redacted. Five failed attempts for the
+  same settings and connection show a provision_failed Task blocker until reconnection
+  or settings changes.
 
 - `env` is set on every executor process (all CLI harnesses and the shell
   executor), on review `setup_steps`/`ci_steps`/required checks, and on
@@ -3962,11 +3986,22 @@ candidate names its repository location, owner, daemon/runtime and `filter_codes
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
 `agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
-`run_purpose_denied`, `not_visible`, `environment_not_ready`, and
-`environment_probe_pending`. Environment rejections carry applicable check names
+`run_purpose_denied`, `not_visible`, `environment_not_ready`,
+`environment_probe_pending`, `environment_unverified`, and `provision_failed`. Unverified is a
+deterministic, action-required refusal with machine-named Task Attention; it
+also stays deterministic when transport facts are absent. Environment rejections carry applicable check names
 in `failing_checks`. Probe-pending defers dispatcher admission; direct/manual
 claims run the checks at launch. An environment Project pause defers dispatch
 without a `dispatch_failed` annotation.
+`provision_failed` is a deterministic refusal when five attempts belong to the
+current job-input digest and socket incarnation. It records machine-named Task
+Attention once, including the bounded redacted last provisioning error. Repeated
+claims/scans do not rewrite Task metadata. Changed job inputs or a new connection
+clear the blocker. A connected machine is not labeled offline because cloning
+or verification failed. Retry attempts, input digest and connection ID are part
+of the refusal's eligibility key. Task placement diagnostics preserve the
+`environment_wait.kind` filter and its daemon/runtime machine identity.
+
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
@@ -4085,6 +4120,8 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 
 | Method | Owner operation |
 | --- | --- |
+| `machine.probe` | Run read-only Project checks with env in a verified checkout or empty scratch directories |
+| `repo_location.provision` | Idempotently clone a verified machine's repository remote under its root |
 | `repo_location.verify` | Verify the checkout and any shared-mount probe |
 | `workspace.prepare` | Prepare a placement and return its opaque handle and base SHA |
 | `workspace.describe` | Report workspace state, active executions, and retained execution results |
@@ -4095,12 +4132,42 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.reset` | Reset the workspace or perform typed asset, review-checkout, and plan publication/restore/discard operations |
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
+`machine_probe.v1` and `repo_provision.v1` are independent optional handshake
+capabilities; protocol revision remains 3. Upgrade the server before enabling
+these new purposes on daemons: older servers reject their handshake enum values.
+Daemons missing the capabilities stay connected
+and unverified and existing locations use launch preflight. Their run-policy
+allow list gains `environment_probe` and `repo_provision`; defaults stay
+`[ci_step]`. Neither purpose can be sent through `workspace.run`.
+
+`machine.probe` request: `{ daemon_id, runtime_id, repo_location_id: string | null,
+commands: [{ name, command, timeout_seconds }], env: { KEY: value } }`. It accepts
+1–64 commands with 1–300 second timeouts and returns `{ results: [{ name,
+exit_code: number | null, timed_out: boolean, output_tail: string }] }`.
+Tails are bounded to 4096 bytes while collected and redacted using Project env.
+A null location uses a new empty directory per command, removed afterwards.
+It uses no workspace lock, handle, mutation fence, journal or run slot.
+
+`repo_location.provision` request: `{ daemon_id, runtime_id, repo_id, remote_url,
+default_branch, timeout_seconds }`; response: `{ workspace_root, path,
+default_branch }`. The branch and timeout are required; timeout is 1–86400 seconds.
+The server passes the owner-configured URL and uses daemon-local Git credentials;
+URL userinfo and token-like parameters are redacted from diagnostics. It clones
+under the returned canonical `workspace_root/repos/<repo_id>`. The returned path
+is authoritative even for a symlinked advertised root. The requested branch is
+selected for a new clone; a missing local branch is fetched on reuse. Retries
+reuse a matching normalized remote. Other content returns `path_conflict`
+without changes. `clone_failed` returns bounded output and removes partial
+staging; lost replies or restart are safe to retry. The server records a
+managed location as unverified, verifies it, and runs full checks before
+admission. Failures use durable exponential backoff. Both RPCs refuse local
+policy denial with `run_purpose_denied`, without running commands.
+
 Mutations carry `daemon_id`, `runtime_id`, `placement_id`, `operation_id`,
 `generation`, and `expected` (a base SHA or version). Existing workspaces also
 carry `workspace_handle`. Duplicate operation IDs replay their journaled result
 until acknowledgement;
-`stale_generation` and `wrong_owner` refuse changes. No method accepts an arbitrary
-shell command outside the three configured run purposes. `purpose_denied` is
+`stale_generation` and `wrong_owner` refuse changes. Workspace methods accept shell commands only for the three configured workspace run purposes; machine probes accept only the named Project checks under their separate purpose. `purpose_denied` is
 never retried. CI permits unbounded execution time, with output capped at 1 MiB
 per stream. UTF-8-safe tails start with `[Forge: CI log truncated]` and set
 `stdout_truncated`/`stderr_truncated` when size-bounded. Unbounded CI requests

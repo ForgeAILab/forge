@@ -794,6 +794,11 @@ workflow.
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,
 `recheck_interval_seconds`) is applied before local or daemon execution starts.
+Each check declares `scope`: `workspace` (the default for existing checks), or
+`machine` for toolchains, disk and services that need no checkout. Owners must
+write read-only commands. Without a checkout, daemon machine checks run with
+Project env and no assets in fresh empty directories under the owner's root.
+With a ready location, probes run all checks in its verified checkout.
 Local preflight runs in `TaskService::run_execution`, after the workspace lock
 and the final WorkspaceLease verification and before ledger admission; remote
 preflight runs before the provider RPC. Both use the placement's workspace
@@ -860,9 +865,11 @@ checks. Rows with no named failing check
 are never rechecked on a schedule: they require manual resume or Check now,
 because passing checks do not verify asset staging or run-policy repair. Project env is applied without
 asset staging. Host checks use the repository's primary or managed server
-checkout. Daemon re-checks use only the ready workspace recorded with that
-failure through `workspace.run`, never another Task's workspace or the server
-as a substitute. These commands must be read-only: like the base's scheduled
+checkout. Probe-capable daemon re-checks use `machine.probe` in a ready repository
+location, or scratch space for recorded machine checks before provisioning.
+Daemons without `machine_probe.v1` (or without probe policy permission) retain
+the recorded ready-workspace `workspace.run` path, never another Task's
+workspace or the server as a substitute. These commands must be read-only: like the base's scheduled
 re-check, host checks run in the primary checkout and are not filesystem
 sandboxed against writes. Output is bounded while collecting both streams,
 then redacted before storage.
@@ -886,12 +893,10 @@ a new launch to decide. Check timeouts remain 1–300 seconds (default 120), and
 60–86400 seconds (default 600).
 
 Readiness success removes the machine wait and wakes dispatch; independent
-execution blockers still apply. Current daemon coder prompt loading uses a
-server-only canonical-plan accessor in `workflow/dispatch/loader.rs`, and
-coder/planner start prepares plan outboxes on the server using daemon-local
-paths in `task_service/execution/runner.rs`. These existing plan I/O paths are
-owned by the workflow/runtime refactor; this backend step verifies daemon
-re-dispatch through the execution path without plan I/O.
+execution blockers still apply. Coder, worker and planner placements require
+`execution.plan_transport`: start plan text is read through the owner with
+`task.plan` fallback, and the daemon prepares its own private plan outbox.
+Provisioned locations use this same owner routing and plan transport.
 
 `POST /projects/{id}/environment/recheck` accepts an optional machine selector
 (`server` or daemon runtime ID), runs every configured check on the selected
@@ -2669,38 +2674,105 @@ selection reads the candidate's readiness and per-check results for the Task's
 launching role. Current `ready` passes; a current `not_ready` row rejects only
 when a failing check applies to that launching role (an unnamed launch failure applies
 to its recorded role). Host missing, unknown or stale records return transient
-`environment_probe_pending`. Daemon missing, unknown or stale records pass:
-only current applicable launch-time failures reject daemon admission. This
-single temporary policy lives in `placement/selection.rs::environment_filter`
-and is removed by step 3's `machine.probe`. It applies identically at reserve
-and claim, regardless of whether a workspace has just been prepared.
+`environment_probe_pending`. A daemon advertising `machine_probe.v1` and
+allowing `environment_probe` uses the same readiness gate. A daemon without
+that capability or permission retains launch-time preflight: unknown facts
+mean unverified, never offline. Protocol revision stays 3. This policy applies
+identically at reserve and claim. Direct/manual claims and asset-backed
+Projects retain launch preflight on an existing location.
 Projects with no checks ignore readiness, never probe and write no new rows;
 removing checks deletes existing rows and resolves machine waits.
 
-Only check-only Projects on the server are proactively probed in this build step.
+Check-only Projects are proactively probed on the host and probe-capable daemon owners.
 When assets are configured, a primary-checkout probe cannot see staged assets:
 admission uses launch-time preflight and ignores primary-checkout probe facts.
 Actual launch-time not-ready facts still filter the machine. Direct/manual
 claims also bypass probe-pending and check at launch; dispatcher admissions
 retain probe deferral. Probes run every
-configured check with Project env in the server repository checkout, outside
+configured check with Project env in the owner's verified repository checkout, outside
 admission's transaction, without assets or workspace preparation. Each result
 retains its check name and pass/fail status; role applicability is evaluated by
 pure selection rather than by collapsing the result into a Project-wide fact.
-Probes are single-flight per Project/server and write with a digest/version
+Probes are single-flight per Project/machine and write with a digest/version
 fence, then wake dispatch through the in-process dispatcher `Notify`. Settings
 edits invalidate rows transactionally; the Project event observer starts host
-probes for existing host rows or ready host locations without waiting for a
-Task. A digest edit colliding with an older flight is re-probed on completion,
+probes for existing host rows or ready host locations and probes visible,
+probe-capable daemon locations without waiting for a Task. A digest edit colliding with an older flight is re-probed on completion,
 even without a queued Task; retained host rows can use the server checkout
 without a location row. A passing host probe compare-and-clears a matching
 environment pause against the current Project snapshot after its result, so a settings edit
-cannot leave a ready host behind an old pause. Daemon facts come only from launch-time results; there is no proactive
-`workspace.run` through a live Task. Initial dispatch returns early before assembly when there are no checks, and
+cannot leave a ready host behind an old pause. Daemon probes use `machine.probe`; there is no proactive `workspace.run` through a live Task. Initial dispatch returns early before assembly when there are no checks, and
 otherwise uses the same shared, read-only admission context builder as reservation. An environment refusal
 keeps the Task queued with at most one version change. A preferred candidate
 that is only probe-pending defers selection rather than diverting work to a
 lower-preference passing owner; existing placement order is preserved.
+When no ready-location candidate passes the environment, capability, visibility
+and pin filters, admission may consider a daemon runtime with no location and
+both `machine_probe.v1` and `repo_provision.v1`. Its local policy must allow
+`environment_probe` and `repo_provision`; the repository needs a remote and
+Project `settings.placement.provision` must be `when_verified` (default).
+`never` disables provisioning. A ready location blocked only by capacity or a
+pending probe prevents provisioning elsewhere. Probe and clone jobs take no run
+slots. A daemon with no applicable machine check is `environment_unverified`.
+This deterministic refusal is recorded once on the Task with Attention naming
+the machine and the action: mark a Project check `machine`, or add the repository
+on that machine. Repeated scans do not rewrite the Task. Changes to checks or
+`placement.provision`, machine connections, and location changes wake it.
+Role/assignee changes also invalidate the refusal. State-entry bookkeeping does
+not: its key tracks placement facts and role assignments, rather than Task
+version changes from internal hooks. A rolled-back entry refusal is recorded
+against the restored Task before the scan finishes.
+A provisioning candidate with an incompatible executor or capability does not
+turn another candidate's deterministic refusal into a pending environment wait.
+
+A background job, single-flight per repository/runtime, runs machine checks
+before `repo_location.provision`. Only passing applicable checks permit cloning
+under `<workspace_root>/repos/<repo id>` with the daemon's own Git credentials.
+The resulting managed location is unverified until `repo_location.verify` and
+full checks finish. Check failures retain per-role facts; successful completion
+wakes normal dispatch. Clone failures leave an unavailable location and bounded
+error. Durable exponential retry deadlines (`repo_provision_retry`) survive
+server restarts without a persistent running flag; daemon retries reuse an
+existing matching clone and remove interrupted private staging. Transport and
+version errors retain check facts, reschedule and do not fail another Task.
+Pending, provisioning and unverified Tasks reuse `environment_wait`, remain queued, and
+are parked for Project slots. An unfinished daemon location with provisioning
+disabled waits for location verification with `location_not_ready`, rather than
+for a full probe without a checkout. A failed machine check on a provisioning candidate
+creates Task-scoped environment Attention naming the machine and checks; it
+never pauses the Project. The last-resort Project pause considers ready-location
+candidates only. Scheduled rechecks recover the failing machine.
+All job writes fence the check digest and observed readiness version; stale
+results are discarded and the current digest is probed. Clone and verification
+failures appear in the Task's wait reason, with elapsed time and the bounded
+`repo_location.last_error`. Provisioning stops after five attempts for unchanged
+inputs and connection, records deterministic `provision_failed` Task Attention
+with the machine name and redacted last error, and resumes after reconnection or
+a relevant settings edit. Both claim and dispatch paths record this once; their
+eligibility key includes attempts, job-input digest and connection ID. A failed
+clone does not make a connected machine offline. Selection and wait diagnostics
+share one exhaustion rule. Unrelated Project settings edits leave an in-flight
+job and its attempt intact; result writes still fence the job inputs and
+readiness version. Socket incarnation IDs are random numeric tokens that remain
+unique across server restarts without a public shape change. Backoff is 60–600 seconds. No execution,
+lease or worktree exists during these jobs.
+
+Provisioning sends the repository's default branch, creates or fetches its local
+ref before verification, and uses `settings.placement.provision_timeout_seconds`
+(default 1800; allowed 1–86400). The daemon's returned canonical root and clone
+path are authoritative; the server checks `<returned root>/repos/<repo id>` and
+records that path, including when the advertised root uses a symlink. Daemon
+locations do not suppress creation of the server's own lazy location.
+Credentials in URL userinfo and token-like query parameters are redacted from
+errors, receipts, logs, and wait reasons on both sides; the clone URL itself is
+sent to the daemon, which also uses its local Git credentials.
+
+Deleting a Project removes its readiness and provisioning retry rows through
+foreign keys. Task workspace cleanup uses the existing owner-routed cleanup
+path. The repository's managed daemon clone is retained as an owner-local cache:
+there is currently no repository-clone cleanup operation. The owner may remove
+`<workspace_root>/repos/<repo id>` after its Task workspaces are cleaned.
+
 The embedded provider supplies the server host's adapter facts, including session
 resume for its session-capable executors. Recovery uses those facts for embedded
 execution and the current owner's handshake for daemon execution; no command
@@ -2833,6 +2905,29 @@ The daemon validates paths against its advertised workspace root, runs the local
 CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
+
+Protocol revision 3 independently negotiates `machine_probe.v1` for
+`machine.probe` and `repo_provision.v1` for `repo_location.provision`.
+A probe accepts named commands, 1–300 second timeouts, Project env, and an
+optional verified location ID. It returns exit status, timeout and a redacted
+4096-byte output tail per command. Without a location, each command gets a fresh
+empty directory removed on completion or cancellation, with abandoned probe
+directories swept at daemon startup. Checks must be read-only: scratch directories
+are a working-directory choice, not a filesystem sandbox. Checks inherit the
+daemon's environment with Project env overrides, as `workspace.run` does.
+Timeout and cancellation kill the entire probe process group; a completed probe
+also stops background descendants. Probes take no workspace
+lock and write no journal. Provisioning is idempotent by repository identity and
+normalized remote: a matching clone is reused; conflicting content returns
+`path_conflict` unchanged. Failed clones publish no partial final directory. Provisioning serializes only
+requests for the same repository, leaving workspace operations and other
+repositories' jobs independent. Clone URLs may carry owner-configured credentials;
+these are never included in diagnostics. These operations require their separate
+local policy purposes, `environment_probe` and `repo_provision`, and refusal is
+`run_purpose_denied`. Missing capabilities do not change connection health.
+Upgrade the server first: a daemon that opts into these new purposes needs a
+server from this release; an older server rejects the handshake because its
+run-purpose enum does not recognize them. Protocol revision remains 3.
 
 Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
