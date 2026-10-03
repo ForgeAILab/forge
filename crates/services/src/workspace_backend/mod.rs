@@ -296,6 +296,13 @@ pub struct WorkspaceBackendRouter {
 }
 
 impl WorkspaceBackendRouter {
+    pub fn daemon_connections(&self) -> Option<&crate::daemon_transport::DaemonConnectionRegistry> {
+        self.daemon
+            .as_deref()
+            .and_then(|backend| backend.daemon_client())
+            .map(|client| client.registry())
+    }
+
     pub fn new(embedded: Arc<dyn WorkspaceBackend>) -> Self {
         Self {
             embedded,

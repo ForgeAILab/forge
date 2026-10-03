@@ -72,6 +72,7 @@ mod review_config;
 mod roles;
 mod subtask;
 mod transition;
+pub(crate) use transition::next_workflow_state;
 mod update;
 mod validation;
 pub(crate) mod workspace;
@@ -437,6 +438,7 @@ pub struct TaskService {
     /// release, so a successor completion is never silently dropped.
     completion_cascade_released: Arc<tokio::sync::Notify>,
     credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
+    pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug)]
@@ -529,6 +531,7 @@ impl TaskService {
             dispatch_notify: Arc::default(),
             completion_cascade_released: Arc::default(),
             credential_env: None,
+            dispatch_wake: Arc::default(),
         }
     }
 
@@ -683,6 +686,12 @@ impl TaskService {
     }
 
     fn publish(&self, event: ForgeEvent) {
+        if matches!(
+            event.event_type.as_str(),
+            "execution.completed" | "execution.failed" | "execution.cancelled"
+        ) {
+            self.dispatch_wake.notify_one();
+        }
         self.event_bus.publish(event);
     }
 

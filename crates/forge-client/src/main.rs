@@ -54,7 +54,12 @@ async fn main() -> Result<()> {
         }
         Commands::Task(args) => {
             let client = client_for(cli.server.as_deref())?;
-            args.run(&client, &cli.output).await
+            match args.run(&client, &cli.output).await {
+                Err(error) if error.is::<forge_client::client::ActionUnavailable>() => {
+                    std::process::exit(3)
+                }
+                result => result,
+            }
         }
         Commands::Agent(args) => {
             let client = client_for(cli.server.as_deref())?;

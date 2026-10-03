@@ -1065,7 +1065,7 @@ Project's current primary Repo only when admitting a new execution.
 When repository setup, dependencies, assignment, workflow, source availability,
 and the current Task version all pass, the
 scheduler assigns the selected Worker and issues one Task-scoped Workspace
-lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
+lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/actions` with `start` or the offered `release`/`retry` and normal workflow scheduling
 use the same admission checks. An Agent serving as Main or Project Agent may
 also receive that lease when explicitly assigned, but the Task session is
 isolated from its chat session. Inspect the linked Task, transitions, executions, and Workspace

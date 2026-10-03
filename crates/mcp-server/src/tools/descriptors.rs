@@ -95,12 +95,10 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             &["task_id", "agent_id"],
         ),
         tool_descriptor(
-            "forge_cancel_task",
-            "Cancel a task.",
-            json!({
-                "task_id": { "type": "string" }
-            }),
-            &["task_id"],
+            "forge_task_action",
+            "Apply one of the Task's current available_actions at an exact version.",
+            json!({ "task_id": { "type": "string" }, "action": api_types::task_action_schema(), "version": { "type": "integer" } }),
+            &["task_id", "action", "version"],
         ),
         tool_descriptor(
             "forge_get_task_diff",

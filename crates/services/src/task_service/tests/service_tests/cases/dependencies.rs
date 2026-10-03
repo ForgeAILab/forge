@@ -608,10 +608,10 @@ async fn cancelled_prerequisite_durably_blocks_dependents_until_link_is_removed(
     )
     .expect("annotation parses");
     assert_eq!(annotation.blocking_reason, "dependency_cancelled");
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![api_types::RecoveryAction::CancelTask]
-    );
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 
     service
         .remove_task_dependency(&dependent.id, &prerequisite.id)

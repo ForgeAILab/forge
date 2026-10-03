@@ -12,7 +12,6 @@ pub(super) struct TaskDiagnosticRows<'a> {
 pub(super) struct TaskDiagnosticProjection {
     pub(super) canonical_phase: api_types::CanonicalPhase,
     pub(super) remaining_retries: HashMap<String, i64>,
-    pub(super) execution_actions: Vec<api_types::ExecutionAction>,
     pub(super) error_annotation: Option<TaskAnnotation>,
     pub(super) workflow_health: Option<api_types::WorkflowHealthSummary>,
     pub(super) workflow_exception: Option<api_types::WorkflowExceptionSummary>,
@@ -22,7 +21,6 @@ pub(super) fn task_diagnostic_projection(
     task: &Task,
     workflow: &api_types::WorkflowDefinition,
     rows: TaskDiagnosticRows<'_>,
-    include_actions: bool,
     awaiting_human: bool,
 ) -> TaskDiagnosticProjection {
     let TaskDiagnosticRows {
@@ -82,27 +80,6 @@ pub(super) fn task_diagnostic_projection(
         .iter()
         .find(|state| state.name == task.status)
         .and_then(services::workflow::effective_role);
-    let blocked_execution_id =
-        blocking_annotation.and_then(|annotation| annotation.blocked_execution_id.as_deref());
-    let open_interactive_target =
-        select_open_interactive_target(execution_authority, current_role, blocked_execution_id);
-    let open_interactive_launch_authority = has_open_interactive_launch_authority(
-        execution_authority,
-        task_role_assignments,
-        current_role,
-        blocked_execution_id,
-    );
-    let execution_actions = if include_actions {
-        resolve_execution_actions(
-            task,
-            workflow,
-            execution_authority,
-            blocking_annotation,
-            latest_review,
-        )
-    } else {
-        Vec::new()
-    };
     let running_interactive_execution = running_executions
         .iter()
         .filter(|execution| execution.role == "interactive")
@@ -132,22 +109,13 @@ pub(super) fn task_diagnostic_projection(
         .or(running_current_role_execution)
         .or(active_execution)
         .or_else(|| latest_execution.cloned());
-    let running_role_execution = running_executions
-        .iter()
-        .filter(|execution| execution.role != "interactive")
-        .max_by(|left, right| compare_running_execution_authority(left, right));
-    let workflow_exception = derive_workflow_exception_with_running_interactive(
+    let workflow_exception = services::task_diagnostics::task_exception_projection(
         task,
         workflow,
-        task_role_assignments,
+        execution_authority,
         latest_review,
-        latest_execution,
-        running_interactive_execution.as_ref(),
-        open_interactive_target,
-        open_interactive_launch_authority,
-        &remaining_retries,
-    )
-    .map(|exception| disable_recovery_while_running(exception, running_role_execution));
+        Vec::new(),
+    );
     let workflow_health = Some(derive_workflow_health(
         task,
         workflow,
@@ -160,7 +128,6 @@ pub(super) fn task_diagnostic_projection(
     TaskDiagnosticProjection {
         canonical_phase,
         remaining_retries,
-        execution_actions,
         error_annotation,
         workflow_health,
         workflow_exception,
@@ -180,7 +147,7 @@ pub(super) fn task_list_response(
         .map(task_role_assignment_response)
         .collect();
     let latest_execution_id = rows.latest_execution.map(|execution| execution.id.clone());
-    let projection = task_diagnostic_projection(&task, workflow, rows, false, false);
+    let projection = task_diagnostic_projection(&task, workflow, rows, false);
     api_types::TaskListItemResponse {
         id: task.id,
         project_id: task.project_id,

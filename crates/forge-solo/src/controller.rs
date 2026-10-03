@@ -953,6 +953,7 @@ mod tests {
             setup_agents: Vec::new(),
             live_activity: Vec::new(),
             tasks: vec![TaskSnapshot {
+                review_actions: Vec::new(),
                 id: "task".into(),
                 title: "task".into(),
                 state: TaskState::Done,

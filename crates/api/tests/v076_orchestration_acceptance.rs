@@ -218,10 +218,10 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
         workspace_access: WorkspaceAccess::ProjectVerify,
     };
     for (operation, cause) in [
-        ("task.recover", "permission_missing(propose_task)"),
+        ("task.action", "permission_missing(propose_task)"),
         ("task.review", "operation_not_in_scope"),
         ("task.propose", "charter_not_adopted"),
-        ("task.cancel", "project_paused(old detail)"),
+        ("task.action", "project_paused(old detail)"),
         ("task.adaptive", "identity_paused"),
     ] {
         provider
@@ -256,7 +256,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
         .await
         .unwrap();
     let paused = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
-    assert!(paused.input_parts[1].contains("task.cancel (project_paused(environment_not_ready))"));
+    assert!(paused.input_parts[1].contains("task.action (project_paused(environment_not_ready))"));
     assert!(paused.input_parts[1].contains("task.adaptive (identity_paused)"));
     assert!(!paused.input_parts[1].contains("old detail"));
     assert_eq!(first.system_prompt, paused.system_prompt);
@@ -278,7 +278,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
     .await;
     let second = chat_preview(&harness, &fixture.project_chat_id, &second_turn).await;
     for entry in [
-        "task.recover (permission_missing(propose_task))",
+        "task.action (permission_missing(propose_task))",
         "task.propose (charter_not_adopted)",
     ] {
         assert!(
@@ -288,7 +288,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
     }
     assert!(second.input_parts[1].contains("### Unavailable in this session"));
     assert!(second.input_parts[1].contains("task.review (operation_not_in_scope)"));
-    assert!(!second.input_parts[1].contains("task.cancel (project_paused"));
+    assert!(!second.input_parts[1].contains("task.action (project_paused"));
     assert!(!second.input_parts[1].contains("task.adaptive (identity_paused)"));
     assert!(!second.input_parts[1].contains("message.send (operation_not_in_scope)"));
     assert_eq!(
@@ -955,6 +955,16 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
         previous_preview.system_prompt,
         retained_preview.system_prompt
     );
+    // Replaying the historical @18 migration must not make it the current @19 contract.
+    let action_migration =
+        include_str!("../../db/migrations/V202610030100__task_action_doctrine.sql").replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&action_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let current_turn = admit_preview_turn(
         &harness,
         &genesis.project_chat_id,
@@ -968,7 +978,7 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
             .unwrap();
     assert_eq!(
         current_job.operating_skill_revision_id.as_deref(),
-        Some("forge.project.orchestration/v1@18")
+        Some("forge.project.orchestration/v1@19")
     );
     let current_preview = runner.preview_prompt(&current_job).await.unwrap();
     assert!(current_preview

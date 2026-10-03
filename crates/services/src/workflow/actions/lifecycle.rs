@@ -285,7 +285,6 @@ async fn annotate_before_work_hook_block(
             "id": format!("before_work:{}", failure.index),
             "log_path": failure.log_path,
         },
-        "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
     });
 
     persist_before_work_annotation(ctx, task, annotation.to_string()).await
@@ -303,7 +302,6 @@ async fn annotate_before_work_workspace_reset(
         "blocked_at": now_rfc3339(),
         "blocked_execution_id": ctx.execution_id,
         "message": error.to_string(),
-        "recovery_actions": ["reset_to_initial", "cancel_task"],
     });
     persist_before_work_annotation(ctx, task, annotation.to_string()).await
 }

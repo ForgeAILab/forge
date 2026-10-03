@@ -1,6 +1,6 @@
 use super::*;
 use ::review::ReviewWorkspace;
-use api_types::{Actor, UserActionSource};
+use api_types::Actor;
 
 impl TaskService {
     pub(crate) async fn annotate_review_ci_interruption(
@@ -39,14 +39,8 @@ impl TaskService {
         barrier["interrupted_at"] = json!(now);
         barrier["infrastructure_attempts"] = json!(attempts);
         barrier["blocking_reason"] = json!(reason);
-        let actions = if reset {
-            json!(["reset_to_initial", "cancel_task"])
-        } else {
-            json!(["retry_hook", "cancel_task"])
-        };
         let annotation = json!({"type": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed },
-            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason,
-            "recovery_actions": actions});
+            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason});
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         if let Some(version) = ctx.project_version {
             let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
@@ -126,11 +120,6 @@ impl TaskService {
         Ok((task, review))
     }
 
-    pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
-        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
-            .await
-    }
-
     pub async fn approve_review_as(
         &self,
         task_id: impl Into<String>,
@@ -204,15 +193,6 @@ impl TaskService {
             )
             .await?;
         Ok((transitioned.task, review))
-    }
-
-    pub async fn reject_review(
-        &self,
-        task_id: impl Into<String>,
-        reason: Option<String>,
-    ) -> Result<(Task, Review)> {
-        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
-            .await
     }
 
     pub async fn reject_review_as(
@@ -304,7 +284,10 @@ impl TaskService {
             crate::workflow::default_roles::CODER,
         )
         .await?;
-        if remaining_retries > 0 && !follow_up_already_dispatched {
+        if remaining_retries > 0
+            && !follow_up_already_dispatched
+            && !Self::task_action_command_active()
+        {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },

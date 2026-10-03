@@ -249,7 +249,7 @@ async fn recovery_queue_and_project_slot_queue_count_once_and_have_distinct_comp
         let mut metadata = json!({"dispatch_disposition":disposition});
         if task.id == recovery.id {
             metadata["queued_recovery"] = json!({
-                "id":db::new_uuid_v4(), "request":{"action":"reexecute", "reason":"retry", "context":null},
+                "id":db::new_uuid_v4(), "request":{"action":{"verb":"retry","fresh_session":true}, "reason":"retry", "context":null},
                 "target_state":"in_progress", "error_annotation":null, "blocked_json":null
             });
             metadata["deferred_dispatch"] = json!({

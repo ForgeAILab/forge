@@ -1,3 +1,4 @@
+use crate::Offer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
@@ -64,30 +65,9 @@ pub enum ResumePolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum RecoveryAction {
-    ResumeSession,
-    Reexecute,
-    ResetToInitial,
-    CancelTask,
-    MarkReviewed,
-    DeferToFollowUp,
-    RetryHook,
-    ResumeProcess,
-    UpdateWorkspaceAndRetryHook,
-    SkipHookOnce,
-    ResetRetryWindow,
-    ProceedOnce,
-    OpenInteractive,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
 pub enum ExecutionBehaviorKind {
     ManualLaunch,
     SessionFollowUp,
-    WorkflowResume,
-    ReExecute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -99,30 +79,6 @@ pub struct ExecutionBehavior {
     pub cascade_role: Option<String>,
     pub cascade_state: Option<String>,
     pub description: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionActionKind {
-    ManualLaunch,
-    SessionFollowUp,
-    WorkflowResume,
-    ReExecute,
-    StopExecution,
-    CancelTask,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct ExecutionAction {
-    pub action: ExecutionActionKind,
-    pub label: String,
-    pub enabled: bool,
-    pub propagates: bool,
-    pub requires_session: bool,
-    pub disabled_reason: Option<String>,
-    pub target_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -145,6 +101,8 @@ pub struct BlockingArtifact {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum FailureKind {
+    DispatchFailed,
+    DependencyCancelled,
     MergeConflict,
     TargetRepoDirty,
     DirtyWorktree,
@@ -243,8 +201,6 @@ pub struct TaskBlockingAnnotation {
     #[ts(type = "Record<string, unknown> | null")]
     #[ts(optional)]
     pub hook: Option<serde_json::Value>,
-    #[serde(default)]
-    pub recovery_actions: Vec<RecoveryAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -302,7 +258,7 @@ pub struct WorkflowExceptionSummary {
     #[serde(default)]
     pub related_evidence: Vec<RelatedEvidence>,
     #[serde(default)]
-    pub actions: Vec<WorkflowExceptionAction>,
+    pub actions: Vec<Offer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -323,22 +279,6 @@ pub struct RelatedEvidence {
     pub kind: String,
     pub id: Option<String>,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub struct WorkflowExceptionAction {
-    pub kind: RecoveryAction,
-    pub label: String,
-    pub enabled: bool,
-    pub disabled_reason: Option<String>,
-    pub requires_reason: bool,
-    pub requires_guidance: bool,
-    pub propagates: bool,
-    pub target_state: Option<String>,
-    pub target_role: Option<String>,
-    pub target_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]

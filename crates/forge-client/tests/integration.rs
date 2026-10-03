@@ -151,8 +151,8 @@ async fn forge_client_runs_task_flow_and_deletes_task() {
     let cancelled: TaskResponse = server
         .client
         .post(
-            &format!("/api/v1/tasks/{}/cancel", task.id),
-            &serde_json::json!({}),
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            &serde_json::json!({"action":{"verb":"cancel"},"version":claimed.version}),
         )
         .await
         .expect("cancel task");
@@ -199,6 +199,7 @@ impl TestData {
 }
 
 struct TestServer {
+    base_url: String,
     client: ForgeClient,
     handle: tokio::task::JoinHandle<()>,
     _repo_dir: TempDir,
@@ -226,6 +227,7 @@ impl TestServer {
         });
 
         Some(Self {
+            base_url: localhost_url(addr),
             client: ForgeClient::new_without_credentials(localhost_url(addr)),
             handle,
             _repo_dir: repo_dir,
@@ -257,7 +259,10 @@ fn test_router(state: TestState) -> Router {
         .route("/api/v1/agents", post(create_agent_route))
         .route("/api/v1/daemons", get(list_daemons_route))
         .route("/api/v1/tasks/{task_id}/claim", post(claim_task_route))
-        .route("/api/v1/tasks/{task_id}/cancel", post(cancel_task_route))
+        .route(
+            "/api/v1/tasks/{task_id}/actions",
+            get(task_actions_route).post(task_action_route),
+        )
         .route("/api/v1/tasks/{task_id}", delete(delete_task_route))
         .with_state(state)
 }
@@ -394,12 +399,23 @@ async fn claim_task_route(
     update_task_status(&state, &task_id, "in_progress")
 }
 
-async fn cancel_task_route(
+async fn task_action_route(
     State(state): State<TestState>,
     AxumPath(task_id): AxumPath<String>,
-    Json(_request): Json<serde_json::Value>,
-) -> Result<Json<TaskResponse>, StatusCode> {
-    update_task_status(&state, &task_id, "cancelled")
+    Json(request): Json<api_types::TaskActionRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let current = state.inner.lock().unwrap().tasks.get(&task_id).cloned();
+    let Some(current) = current else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if request.version != current.version {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if request.action.verb() != "cancel" {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({"code":"action_unavailable","message":"changed","request_id":"test","details":{"available_actions":[{"action":{"verb":"cancel"},"label":"Cancel Task"}]}}))).into_response();
+    }
+    update_task_status(&state, &task_id, "cancelled").into_response()
 }
 
 async fn delete_task_route(
@@ -571,7 +587,7 @@ fn task_response(
         effective_coder: None,
         effective_coder_source: None,
         remaining_retries: HashMap::new(),
-        execution_actions: Vec::new(),
+        available_actions: Vec::new(),
         error_annotation: None,
         blocked: None,
         failed: None,
@@ -784,4 +800,94 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+async fn task_actions_route(
+    State(state): State<TestState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<api_types::TaskActionsResponse>, StatusCode> {
+    let task = state
+        .inner
+        .lock()
+        .unwrap()
+        .tasks
+        .get(&task_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(api_types::TaskActionsResponse {
+        version: task.version,
+        available_actions: vec![api_types::Offer {
+            action: api_types::TaskAction::Cancel { reason: None },
+            parameters: Vec::new(),
+            authority: vec![api_types::ActionAuthority::Owner],
+            reason: "task_cancel".into(),
+            label: "Cancel Task".into(),
+            target_execution_id: None,
+            propagates: false,
+        }],
+    }))
+}
+
+#[tokio::test]
+async fn task_action_commands_json_and_unavailable_exit() {
+    let server = TestServer::spawn().await.expect("local listener");
+    let project = create_project(&server.client, "Actions").await;
+    let task: TaskResponse = server
+        .client
+        .post(
+            &format!("/api/v1/projects/{}/tasks", project.id),
+            &CreateTaskRequest {
+                title: "Action target".into(),
+                description: None,
+                parent_task_id: None,
+                task_type: None,
+                priority: None,
+                review_config: None,
+                merge_config: None,
+                role_assignments: None,
+                governance: None,
+            },
+        )
+        .await
+        .unwrap();
+    let run = |arguments: Vec<String>| {
+        let server_url = server.base_url.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_forge-ctl"))
+                .args(["--server", &server_url, "--output", "json", "task"])
+                .args(arguments)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+    let offers = run(vec!["actions".into(), task.id.clone()]).await;
+    assert!(offers.status.success());
+    let offers: serde_json::Value = serde_json::from_slice(&offers.stdout).unwrap();
+    assert_eq!(offers["version"], task.version);
+    assert_eq!(offers["available_actions"][0]["action"]["verb"], "cancel");
+    let unavailable = run(vec!["action".into(), task.id.clone(), "start".into()]).await;
+    assert_eq!(unavailable.status.code(), Some(3));
+    let error: serde_json::Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(
+        error["details"]["available_actions"][0]["action"]["verb"],
+        "cancel"
+    );
+    let sent = run(vec![
+        "action".into(),
+        task.id.clone(),
+        "cancel".into(),
+        "--reason".into(),
+        "obsolete".into(),
+    ])
+    .await;
+    assert!(
+        sent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent.stdout).unwrap()["status"],
+        "cancelled"
+    );
 }

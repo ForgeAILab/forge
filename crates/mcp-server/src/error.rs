@@ -188,7 +188,39 @@ impl McpToolError {
             .data
             .as_ref()
             .and_then(safe_execution_already_running_details);
-        let (outcome_code, safe_message, retry_action, retryable) = self.outcome_classification();
+        let action_unavailable_offers = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| {
+                serde_json::from_value::<Vec<api_types::Offer>>(data["available_actions"].clone())
+                    .ok()
+            });
+        let wait_cause = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| data["denied_by"].as_str())
+            .and_then(|value| value.parse::<api_types::DeniedBy>().ok())
+            .filter(|cause| {
+                matches!(
+                    cause,
+                    api_types::DeniedBy::TargetAgentPaused | api_types::DeniedBy::ProjectPaused(_)
+                )
+            });
+        let (outcome_code, safe_message, retry_action, retryable) =
+            if action_unavailable_offers.is_some() {
+                (
+                    OutcomeCode::ActionUnavailable,
+                    "the requested Task action is unavailable; use the current offers",
+                    Some(RetryAction::CorrectInput),
+                    false,
+                )
+            } else {
+                self.outcome_classification()
+            };
         let mut outcome = OrchestrationOutcome::new(
             outcome_code,
             OrchestrationOutcome::status_for_code(outcome_code),
@@ -218,7 +250,16 @@ impl McpToolError {
             }
             outcome.retry = Some(retry);
         }
-        outcome.details = execution_already_running_details;
+        if let Some(cause) = wait_cause {
+            outcome.safe_message = format!("Task action is unavailable while {cause}");
+            outcome.denied_by = Some(cause);
+            let mut retry = RetryInstruction::new(RetryAction::None, false);
+            retry.scope = Some(api_types::RetryScope::Turn);
+            outcome.retry = Some(retry);
+        }
+        outcome.details = action_unavailable_offers
+            .map(|offers| json!({"available_actions": offers}))
+            .or(execution_already_running_details);
         serde_json::to_value(outcome).unwrap_or_else(|_| {
             json!({
                 "code": "internal_failure",
@@ -386,9 +427,13 @@ impl From<ServiceError> for McpToolError {
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
-            } => Self::new(-32029, reason.clone()).with_data(json!({
+                wait_cause,
+            } => Self::new(-32010, reason.clone()).with_data(json!({
+                "code": "action_unavailable",
                 "available_actions": available_actions,
                 "reason": reason,
+                    "denied_by": wait_cause.as_ref().map(ToString::to_string),
+                    "retry": wait_cause.map(|_| json!({"action":"none", "scope":"turn", "retryable":false})),
             })),
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.

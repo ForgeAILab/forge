@@ -1597,7 +1597,13 @@ fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<Stri
                 .map(|actions| {
                     actions
                         .iter()
-                        .filter_map(Value::as_str)
+                        .filter_map(|value| {
+                            value
+                                .get("action")
+                                .and_then(|action| action.get("verb"))
+                                .and_then(Value::as_str)
+                                .or_else(|| value.as_str())
+                        })
                         .filter(|action| !action.trim().is_empty())
                         .map(str::to_owned)
                         .collect()
@@ -1612,7 +1618,13 @@ fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<Stri
         Value::Array(actions) => (
             actions
                 .iter()
-                .filter_map(Value::as_str)
+                .filter_map(|value| {
+                    value
+                        .get("action")
+                        .and_then(|action| action.get("verb"))
+                        .and_then(Value::as_str)
+                        .or_else(|| value.as_str())
+                })
                 .filter(|action| !action.trim().is_empty())
                 .map(str::to_owned)
                 .collect(),
@@ -1623,7 +1635,7 @@ fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<Stri
 }
 
 /// Give execution-failure wakes a constrained work order. The action list is
-/// only the Attention's snapshot; `task.recover` remains server-authorized
+/// only the Attention's snapshot; `task.action` remains server-authorized
 /// against the current Task state.
 fn execution_failed_directive(attention: &db::AttentionProjection) -> String {
     let (actions, automatic_retry) = execution_recovery_snapshot(attention);
@@ -1638,11 +1650,11 @@ fn execution_failed_directive(attention: &db::AttentionProjection) -> String {
 
     if automatic_retry {
         format!(
-            "EXECUTION FAILURE RECOVERY\nAutomatic retry is scheduled or in progress. This wake is observation-only: refresh the current Task state and inspect/diagnose the execution, but do not manually retry, reexecute, resume, or invoke `task.recover` while that retry is pending. {action_snapshot} After it settles, use only a recovery action currently advertised by the current Task; the server remains authoritative and may reject stale or unsupported actions."
+            "EXECUTION FAILURE RECOVERY\nAutomatic retry is scheduled or in progress. This wake is observation-only: refresh the current Task state and inspect/diagnose the execution, but do not manually retry, release, or invoke `task.action` while that retry is pending. {action_snapshot} After it settles, use only a recovery action currently advertised by the current Task; the server remains authoritative and may reject stale or unsupported actions."
         )
     } else if actions.is_empty() {
         format!(
-            "EXECUTION FAILURE RECOVERY\nRefresh the current Task state and inspect/diagnose the failed execution. {action_snapshot} Do not invoke `task.recover` unless the current Task advertises a recovery action; this wake grants no recovery action."
+            "EXECUTION FAILURE RECOVERY\nRefresh the current Task state and inspect/diagnose the failed execution. {action_snapshot} Do not invoke `task.action` unless the current Task advertises a recovery action; this wake grants no recovery action."
         )
     } else {
         format!(
@@ -1949,8 +1961,8 @@ mod tests {
 
         assert!(content.contains("Automatic retry is scheduled or in progress"));
         assert!(content.contains("observation-only"));
-        assert!(content.contains("do not manually retry, reexecute, resume"));
-        assert!(content.contains("or invoke `task.recover`"));
+        assert!(content.contains("do not manually retry, release"));
+        assert!(content.contains("or invoke `task.action`"));
         assert!(content.contains("reexecute"));
         assert!(content.contains("use only a recovery action currently advertised"));
         assert!(!content.contains("otherwise proceed."));
@@ -1969,7 +1981,7 @@ mod tests {
         assert!(content.contains("inspect/diagnose the failed execution"));
         assert!(content.contains("No recovery action is advertised"));
         assert!(content.contains(
-            "Do not invoke `task.recover` unless the current Task advertises a recovery action"
+            "Do not invoke `task.action` unless the current Task advertises a recovery action"
         ));
         assert!(!content.contains("otherwise proceed."));
     }

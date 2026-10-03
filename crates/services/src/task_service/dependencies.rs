@@ -172,7 +172,6 @@ impl TaskService {
                 "name": "dependency_gate",
                 "cancelled_dependency_ids": cancelled_dependency_ids,
             })),
-            recovery_actions: vec![api_types::RecoveryAction::CancelTask],
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(

@@ -133,17 +133,11 @@ impl HookAction for CheckRetryBudget {
             (max_rejections, count)
         };
 
-        if count >= i64::from(max_rejections) {
-            if ctx.to_state == default_states::REVIEW {
-                tracing::debug!(
-                    task_id = %ctx.task_id,
-                    state = %ctx.to_state,
-                    rejections = count,
-                    budget = i64::from(max_rejections),
-                    "review retry budget exhausted on gate entry; deferring enforcement until review failure"
-                );
-                return HookResult::Ok;
-            }
+        if crate::task_diagnostics::gate_entry_retry_exhausted(
+            &ctx.to_state,
+            i64::from(max_rejections),
+            count,
+        ) {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },

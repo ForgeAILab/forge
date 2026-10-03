@@ -13,8 +13,7 @@ import type {
   UpdateProfileRequest,
   UserResponse,
   UserSearchResult,
-  RecoverTaskRequest,
-  RecoveryAction,
+  TaskActionRequest,
   ReorderSubtasksRequest,
   SaveWorkflowTemplateRequest,
   SettingsResponse,
@@ -215,20 +214,8 @@ export function removeDependency(taskId: string, dependsOnId: string): Promise<v
   })
 }
 
-export async function recoverTask(
-  taskId: string,
-  action: RecoveryAction,
-  reason?: string,
-  context?: string,
-): Promise<Task> {
-  return apiFetch<Task>(`/tasks/${taskId}/recover`, {
-    method: 'POST',
-    body: JSON.stringify({
-      action,
-      reason: reason ?? null,
-      context: context ?? null,
-    } satisfies RecoverTaskRequest),
-  })
+export function applyTaskAction(taskId: string, request: TaskActionRequest): Promise<Task> {
+  return apiFetch<Task>(`/tasks/${taskId}/actions`, { method: 'POST', body: JSON.stringify(request) })
 }
 
 export function listWorkflowTemplates(): Promise<WorkflowTemplateSummary[]> {

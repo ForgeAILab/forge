@@ -370,17 +370,6 @@ pub struct ReviewResponse {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewDecisionResponse {
-    pub task: TaskResponse,
-    pub review: ReviewResponse,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectReviewRequest {
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CreateCommentRequest {
