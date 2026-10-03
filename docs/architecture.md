@@ -2274,7 +2274,10 @@ transaction records a failed attempt/error. A repeat quarantine upsert reopens
 the stable row, clears resolution, stores the new error/attempt, and increments
 its version. Replay checks the row after the consumer commit; a version beyond
 the fence means commit re-quarantined it, so effects roll back and the action
-records `replay_failed` with the new error. Errors and deferrals never schedule
+records `replay_failed` with the new error. A consumer that isolates one item of
+the replayed event inside its own commit (coordination quarantining a single
+commitment or inbox item) is not a failed replay: the other items' effects stay,
+as in normal delivery, and the item becomes a new open, dismiss-only row. Errors and deferrals never schedule
 a retry. A terminal commit gets the same one fresh preparation as ordinary delivery.
 Dismiss uses the same version fence and audit transaction without invoking the
 worker. Competing actions using the same open version have exactly one winner;

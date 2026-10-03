@@ -3283,6 +3283,10 @@ with existing consumer idempotency. Effects, health bookkeeping and successful
 resolution commit in one transaction. Failed effects roll back before recording
 the failed attempt. If commit re-quarantines that same row, replay detects its
 version change, rolls back effects and records `replay_failed` with the new error.
+A consumer that isolates one item of the event inside its own commit (coordination
+quarantines a single commitment or inbox item and applies the rest, exactly as in
+normal delivery) still reports `replayed`: the other items' effects are kept and
+the isolated item appears as a new open, dismiss-only dead letter.
 A repeat quarantine reopens its stable identity, clears resolution and increments
 its version, so later failures cannot stay hidden behind an earlier dismissal. Replay neither moves the original cursor nor fans out the
 source event to other consumers. Normal events emitted by a consumer's commit
