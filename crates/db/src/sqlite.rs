@@ -90,6 +90,8 @@ mod command_finalization;
 mod command_receipt;
 mod commitment;
 mod daemon;
+mod dead_letter;
+pub use dead_letter::{DeadLetter, DeadLetterAction, DeadLetterPage};
 mod domain_event;
 pub use domain_event::EventSubscription;
 mod embedded_agent;

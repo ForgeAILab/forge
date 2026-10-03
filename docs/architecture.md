@@ -2249,10 +2249,56 @@ subscription, without scanning ignored event rows through `json_each`. Existing
 `recent_errors` entries carry bounded worker causes and deferral reason/since;
 readiness alone is informational, while errors and stalls raise attention.
 Dead letters degrade health for the same one-hour window as ordinary errors.
-Each worker also exposes its retained total and five most recent quarantines with
-stable IDs, item keys/sequence, reason and time, without expiry. The table retains
-worker/source identity for later replay/dismiss actions; those actions are outside
-this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+Each worker also exposes its open total and five most recent open quarantines
+with stable IDs, item keys/sequence, event type, consumer, attempts, reason and time,
+without expiry. Resolved rows and their action audit are retained; there is no
+retention/pruning job for either. A future retention job must delete
+`worker_dead_letter_action` rows before their parent `worker_dead_letter` rows
+to satisfy the foreign key.
+
+`DeadLetterService` checks admin authority and maps the stable consumer name to
+that runtime's existing worker instance. Only canonical positive bare sequence
+keys are replayable. Coordination's `event:N:commitment:C` and `event:N:inbox:…`
+quarantines, and Wake's `wake-retry:…` rows, are dismiss-only; replay rejects them
+with `DeadLetterNotReplayable`/409 before any write or handler call. Manual replay
+shares `WorkerRuntime`'s
+bounded preparation, panic handling, transactional commit and after-commit path.
+Preparation runs before the writer transaction; a compare-and-swap on the open
+row's version fences the commit. Effects, health success, resolution principal/time
+and an action audit entry commit together under `BEGIN IMMEDIATE`. Replay reads
+the consumer cursor for display context, leaves it unchanged, and delivers the
+original event only to its owning consumer.
+Consumer-emitted domain events retain normal downstream semantics. Skip resolves
+without effects. Commit errors roll back all effects, then a separate fenced
+transaction records a failed attempt/error. A repeat quarantine upsert reopens
+the stable row, clears resolution, stores the new error/attempt, and increments
+its version. Replay checks the row after the consumer commit; a version beyond
+the fence means commit re-quarantined it, so effects roll back and the action
+records `replay_failed` with the new error. A consumer that isolates one item of
+the replayed event inside its own commit (coordination quarantining a single
+commitment or inbox item) is not a failed replay: the other items' effects stay,
+as in normal delivery, and the item becomes a new open, dismiss-only row. Errors and deferrals never schedule
+a retry. A terminal commit gets the same one fresh preparation as ordinary delivery.
+Dismiss uses the same version fence and audit transaction without invoking the
+worker. Competing actions using the same open version have exactly one winner;
+the loser receives `DbError::VersionConflict` through the service/API boundaries.
+No durable in-progress lease can strand a row after a crash. Post-commit hooks
+retain normal worker semantics: their errors report health without reopening the
+resolved event. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+
+Replay deliberately breaks original event ordering: it applies event N after
+newer acknowledged events, using current consumer state. An old `task.blocked`
+coordination outcome can block a commitment that returned to `in_progress` and
+send an old “Task delivery blocked” inbox item. Consumer idempotency does not
+restore the original state timeline. The API/status summary exposes replayability,
+source `event_created_at`, and `events_since` (later retained subscribed events
+through the current checkpoint, including handler skips), so operators can assess
+that context. Subscription changes mean this is not a historical receipt count.
+
+The REST route spawns and awaits the service operation. Dropping the requesting
+client's future detaches that task, preserving `after_commit` work such as Project
+hook external Agent launch after a committed replay. A process crash retains
+normal worker recovery behavior.
 
 Each standard SQLite pool connection has an insert hook, commit marker and
 rollback handling. Pool-scoped `Notify` is delivered on connection release

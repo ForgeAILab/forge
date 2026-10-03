@@ -17,6 +17,7 @@ pub mod daemon_workspace;
 pub mod embedded;
 pub mod mcp;
 pub mod memory;
+pub mod operations;
 pub mod output;
 mod password_prompt;
 pub mod project;

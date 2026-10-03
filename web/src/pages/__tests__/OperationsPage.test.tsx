@@ -1,10 +1,20 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/hooks'
+import {
+  useDeadLetterActionMutation,
+  useOperationsStatusQuery,
+  useRefreshOperationsMutation,
+} from '@/api/hooks'
+import { ApiError } from '@/api/client'
 import { OperationsPage } from '@/pages/OperationsPage'
 import { emptyUsage } from '@/test-utils/usage'
-import type { CostSummary, OperatorStatusResponse, UsageAggregate } from '@/types/generated'
+import type {
+  CostSummary,
+  DeadLetterActionResponse,
+  OperatorStatusResponse,
+  UsageAggregate,
+} from '@/types/generated'
 
 type LinkProps = {
   to: string
@@ -27,6 +37,7 @@ vi.mock('@tanstack/react-router', () => ({
 }))
 
 vi.mock('@/api/hooks', () => ({
+  useDeadLetterActionMutation: vi.fn(),
   useOperationsStatusQuery: vi.fn(),
   useRefreshOperationsMutation: vi.fn(),
 }))
@@ -98,7 +109,13 @@ const degradedStatus: OperatorStatusResponse = {
       recent_dead_letters: [
         {
           id: 'dead-1',
-          item_key: 'event:9:commitment:c-1',
+          consumer_name: 'attention_projection',
+          event_type: 'task.done',
+          attempts: 8,
+          item_key: '9',
+          replayable: true,
+          event_created_at: '2025-04-29T12:00:00Z',
+          events_since: 4,
           event_sequence: 9,
           reason: 'blocked commitment',
           occurred_at: '2025-04-29T12:00:00Z',
@@ -226,6 +243,9 @@ const degradedStatus: OperatorStatusResponse = {
 
 describe('OperationsPage', () => {
   beforeEach(() => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn(),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
     vi.mocked(useOperationsStatusQuery).mockReturnValue({
       data: degradedStatus,
       isLoading: false,
@@ -239,6 +259,191 @@ describe('OperationsPage', () => {
     } as unknown as ReturnType<typeof useRefreshOperationsMutation>)
   })
 
+  function actionResult(outcome: DeadLetterActionResponse['outcome']) {
+    return {
+      outcome,
+      dead_letter: {
+        summary: {
+          ...degradedStatus.event_consumers[0].recent_dead_letters[0],
+          attempts: 9,
+          reason: outcome === 'replay_failed' ? 'new error' : 'blocked commitment',
+        },
+        state: outcome === 'replay_failed' ? ('open' as const) : ('resolved' as const),
+        error_kind: 'failure',
+        first_failed_at: '',
+        last_failed_at: '',
+        resolved_at: outcome === 'replay_failed' ? null : '2026-10-03T00:00:00Z',
+        resolved_by: 'admin',
+        resolution: outcome,
+        resolution_reason: null,
+      },
+    }
+  }
+  it('replays and shows success inline with resolved actions removed', async () => {
+    const mutate = vi.fn().mockResolvedValue(actionResult('replayed'))
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: mutate,
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    await screen.findByText('Replayed successfully.')
+    expect(mutate).toHaveBeenCalledWith({ id: 'dead-1', action: 'replay', reason: undefined })
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
+  })
+  it('dismisses with the optional reason and shows its result inline', async () => {
+    const mutate = vi.fn().mockResolvedValue(actionResult('dismissed'))
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: mutate,
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    render(<OperationsPage />)
+    fireEvent.change(screen.getByLabelText('Dismiss reason (optional)'), {
+      target: { value: ' obsolete ' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await screen.findByText('Dismissed without delivery.')
+    expect(mutate).toHaveBeenCalledWith({ id: 'dead-1', action: 'dismiss', reason: 'obsolete' })
+  })
+  it('shows new replay error and attempts while keeping the row actionable', async () => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockResolvedValue(actionResult('replay_failed')),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    await screen.findByText('Replay failed; remains open. Retry after fixing the cause.')
+    expect(screen.getByText('new error')).toBeTruthy()
+    expect(screen.getByText(/9 attempts/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Replay' }).hasAttribute('disabled')).toBe(false)
+  })
+  it('shows newer polled attempts and errors after a failed action', async () => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockResolvedValue(actionResult('replay_failed')),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    const view = render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    await screen.findByText('new error')
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          {
+            ...degradedStatus.event_consumers[0],
+            recent_dead_letters: [
+              {
+                ...degradedStatus.event_consumers[0].recent_dead_letters[0],
+                attempts: 10,
+                reason: 'latest polled error',
+              },
+            ],
+          },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    view.rerender(<OperationsPage />)
+    expect(screen.getByText(/10 attempts/)).toBeTruthy()
+    expect(screen.getByText('latest polled error')).toBeTruthy()
+    expect(screen.queryByText('new error')).toBeNull()
+  })
+  it('hides Replay on item quarantines while keeping Dismiss', () => {
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          {
+            ...degradedStatus.event_consumers[0],
+            recent_dead_letters: [
+              {
+                ...degradedStatus.event_consumers[0].recent_dead_letters[0],
+                item_key: 'event:9:commitment:c-1',
+                replayable: false,
+              },
+            ],
+          },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    render(<OperationsPage />)
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+  })
+  it('shows event age and later-event context next to Replay', () => {
+    render(<OperationsPage />)
+    expect(screen.getByText(/Event .* old · 4 later events processed/)).toBeTruthy()
+  })
+  it('retains the action result when status refresh removes the resolved row', async () => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockResolvedValue(actionResult('replayed')),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    const view = render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    await screen.findByText('Replayed successfully.')
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          { ...degradedStatus.event_consumers[0], dead_letter_count: 0, recent_dead_letters: [] },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    view.rerender(<OperationsPage />)
+    expect(screen.getByText('Dead letters 0')).toBeTruthy()
+    expect(screen.getByText('Replayed successfully.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+  })
+  it('shows the resolved receipt when a poll removed the row during after-commit work', async () => {
+    let complete: (value: ReturnType<typeof actionResult>) => void = () => {}
+    const promise = new Promise<ReturnType<typeof actionResult>>((resolve) => {
+      complete = resolve
+    })
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockReturnValue(promise),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    const view = render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          { ...degradedStatus.event_consumers[0], dead_letter_count: 0, recent_dead_letters: [] },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    view.rerender(<OperationsPage />)
+    complete(actionResult('replayed'))
+    await screen.findByText('Replayed successfully.')
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+    expect(screen.getByText('Dead letters 0')).toBeTruthy()
+  })
+  it('disables both actions during replay and handles conflict inline', async () => {
+    let reject: (reason: unknown) => void = () => {}
+    const promise = new Promise((_, fail) => {
+      reject = fail
+    })
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockReturnValue(promise),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    expect(screen.getByRole('button', { name: 'Replaying…' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('button', { name: 'Dismiss' }).hasAttribute('disabled')).toBe(true)
+    reject(new ApiError(JSON.stringify({ code: 'version_conflict' }), 409))
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('already resolved or changed'),
+    )
+  })
+  it('shows request failures inline and allows another action', async () => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockRejectedValue(new Error('network failed')),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toBe('network failed'))
+    expect(screen.getByRole('button', { name: 'Replay' }).hasAttribute('disabled')).toBe(false)
+  })
   it('lists server-host occupancy and links it to live settings', () => {
     render(<OperationsPage />)
     expect(screen.getByRole('link', { name: 'Server host' }).getAttribute('href')).toBe('/settings')
@@ -317,7 +522,7 @@ describe('OperationsPage', () => {
 
   it('renders consumer lag, stalled status and database reclamation diagnostics', () => {
     render(<OperationsPage />)
-    expect(screen.getByText('attention_projection')).toBeTruthy()
+    expect(screen.getAllByText(/attention_projection/).length).toBeGreaterThan(0)
     expect(screen.getByText('Pending events 5')).toBeTruthy()
     expect(screen.getByText('Stalled')).toBeTruthy()
     expect(screen.getByText('Conversion required')).toBeTruthy()
@@ -344,7 +549,8 @@ describe('OperationsPage', () => {
       'Position 12 · Head 15 · tail retry',
     )
     expect(screen.getByText('Dead letters 7')).toBeTruthy()
-    expect(screen.getByText(/event:9:commitment:c-1: blocked commitment/)).toBeTruthy()
+    expect(screen.getByText(/9 · 8 attempts/)).toBeTruthy()
+    expect(screen.getByText('blocked commitment')).toBeTruthy()
   })
 })
 

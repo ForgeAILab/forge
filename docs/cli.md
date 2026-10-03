@@ -703,3 +703,28 @@ the current version. The help text names each flag's verb. Exit code 3 means
 `action_unavailable`: read `task actions` again and select a current offer.
 Fixed boolean values and omitted presets are supplied by the server; contradictory
 values are refused.
+
+## Operations dead letters
+
+These commands require an administrator login and share the normal `--server`,
+`--output json|table`, authentication and HTTP error handling.
+
+```bash
+forge-ctl operations dead-letters list [--consumer <name>] [--state open|resolved] [--limit 1..100] [--cursor <opaque>]
+forge-ctl operations dead-letters replay <id>
+forge-ctl operations dead-letters dismiss <id> [--reason <text>]
+```
+
+List defaults to open rows, 50 at a time. JSON returns `items` and `next_cursor`;
+table output prints the next cursor when another page exists. It uses lowercase
+states and shows `replayable`, `event_created_at`, and `events_since`. Pass the cursor
+unchanged with the same filters. Resolved lists order by resolution time. IDs come from this list or Operations status.
+Replay accepts only whole-event bare sequence keys; item-level and wake-retry
+quarantines return 409 `dead_letter_not_replayable` without counting an attempt.
+They remain dismissible. Replay delivers one event to its original consumer through the usual transaction
+and idempotency rules, without moving the cursor. Its outcome is `replayed`,
+`skipped` or `replay_failed`. Failed replay prints its updated row and exits
+nonzero; it remains open for another manual action. Dismiss returns `dismissed`
+and retains the optional reason. Unknown IDs return 404; resolved rows or a lost
+race return 409. Resolved rows are retained for audit and omitted from open counts.
+There is no automatic replay, bulk command or dead-letter retention job.

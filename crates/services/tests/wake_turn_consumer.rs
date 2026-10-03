@@ -3010,6 +3010,45 @@ async fn audit_retry_rows_are_isolated_and_bounded_with_visible_dead_letter() {
         .await
         .unwrap()
         .is_empty());
+    let row_id: String = sqlx::query_scalar("SELECT id FROM worker_dead_letter WHERE worker_name = 'agent-wake-turns' AND source_key = ?").bind(format!("wake-retry:{}", deferred.id)).fetch_one(db.pool()).await.unwrap();
+    let before = db.get_dead_letter(&row_id).await.unwrap();
+    let mut service = services::dead_letter_service::DeadLetterService::new(db.clone());
+    service.register(Arc::new(consumer));
+    assert!(matches!(
+        service
+            .replay(
+                services::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true
+                },
+                &row_id
+            )
+            .await,
+        Err(services::ServiceError::Db(
+            db::DbError::DeadLetterNotReplayable
+        ))
+    ));
+    let after = db.get_dead_letter(&row_id).await.unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.attempts, before.attempts);
+    assert!(!after.replayable());
+    assert!(after.resolved_at.is_none());
+    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter_action")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(audit, 0);
+    service
+        .dismiss(
+            services::dead_letter_service::DeadLetterActor {
+                user_id: "admin",
+                is_admin: true,
+            },
+            &row_id,
+            None,
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
