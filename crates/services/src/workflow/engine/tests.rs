@@ -652,7 +652,7 @@ async fn review_carry_two_refresh_rounds_complete_without_parking() {
         }
         previous_chain = Some(input.chain_id.clone());
         db.enqueue_step(&input).await.unwrap();
-        db.ready_step(&input.id, task.version).await.unwrap();
+        db.ready_step(&input.id).await.unwrap();
         let settled = drain(driver.clone(), id).await;
         assert_eq!(settled.status, *target);
         assert!(settled.blocked_json.is_none());
@@ -4737,3 +4737,103 @@ async fn periodic_warning_budgets_finish_inline_ci_and_clear_entry_barriers() {
         assert!(!persisted.entry_barrier_is_running());
     }
 }
+
+/// Audit 2.3a: with no ci_steps and no reviewer (the default workflow's
+/// "unconfigured review"), one target-moved refresh round repeats
+/// review -> merging inside one chain without creating a Review row, so the
+/// loop detector parks a legitimate integration retry. The old depth guard
+/// allowed two such rounds.
+#[tokio::test]
+async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(256));
+    let id = "audit-unconfigured-refresh";
+    seed_project_repo_and_task(&db, id, default_states::IN_PROGRESS).await;
+    let workflow = default_workflow::default_workflow();
+    let driver = engine(Arc::clone(&db), Arc::clone(&bus));
+
+    // Real producer: unconfigured review cascades review -> merging (step 1).
+    let result = driver
+        .transition(
+            id,
+            default_states::REVIEW,
+            1,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::General),
+            "agent completed",
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.pending_steps, 1);
+    let merging = drain(driver.clone(), id).await;
+    assert_eq!(merging.status, default_states::MERGING);
+    let step1 = db.task_steps(id).await.unwrap().last().cloned().unwrap();
+    assert_eq!(step1.status, "done");
+
+    // RunMerge's TargetMoved outcome (target_moved_result) returns exactly
+    // this cascade from the step-1 execution; enqueue it the way the engine
+    // does, with step 1 as parent.
+    let reason = format!(
+        "{} {} main advanced; rebased onto main, re-review required",
+        crate::workflow::REVIEW_REFRESH_MARKER,
+        crate::workflow::TARGET_MOVED_MARKER
+    );
+    let input = driver
+        .cascade_step_input(
+            &merging,
+            &workflow,
+            default_states::MERGE_FAILED.into(),
+            reason,
+            false,
+            false,
+            None,
+            Some(&step1),
+            "audit:target-moved".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(input.chain_id, step1.chain_id);
+    db.enqueue_step(&input).await.unwrap();
+    db.ready_step(&input.id).await.unwrap();
+
+    // Real producers from here: merge_failed bridge -> review, then the
+    // unconfigured review cascades review -> merging again.
+    let settled = drain(driver.clone(), id).await;
+    let steps = db.task_steps(id).await.unwrap();
+    println!(
+        "audit steps: {:?}",
+        steps
+            .iter()
+            .map(|s| (
+                s.expected_status.as_str(),
+                s.status.as_str(),
+                s.chain_position
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(settled.status, default_states::MERGING);
+    assert_eq!(steps.last().unwrap().status, "done");
+    assert!(settled.blocked_json.is_none());
+    let snapshot = driver
+        .task_service
+        .task_action_snapshot(
+            id,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+        )
+        .await
+        .unwrap();
+    let offers = crate::available_actions(&snapshot);
+    println!(
+        "audit offers: {:?} annotation: {:?}",
+        offers
+            .iter()
+            .map(|o| (o.reason.clone(), o.label.clone()))
+            .collect::<Vec<_>>(),
+        settled.error_annotation
+    );
+}
+
+#[path = "tests/audit_23a_worker.rs"]
+mod audit_worker;

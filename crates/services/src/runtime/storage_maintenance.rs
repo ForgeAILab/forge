@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use db::SqliteDb;
+use db::{SqliteDb, TaskStepRepo};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::Result;
@@ -45,6 +45,8 @@ impl StorageMaintenanceWorker {
 
     async fn maintain_once(&self, shutdown: &watch::Receiver<bool>) -> Result<()> {
         if !*shutdown.borrow() {
+            let before = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+            self.db.prune_steps(&before, 100).await?;
             db::incremental_vacuum(self.db.pool()).await?;
         }
         Ok(())

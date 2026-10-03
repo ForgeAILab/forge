@@ -1105,7 +1105,7 @@ impl WorkflowEngine {
         };
         let pending_steps = self.db.pending_steps(task_id).await?;
         if let Some(id) = &queued_step_id {
-            self.db.ready_step(id, task.version).await?;
+            self.db.ready_step(id).await?;
         }
 
         let review = latest_review(&self.db, &task.id).await?;
@@ -1310,7 +1310,7 @@ impl WorkflowEngine {
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
 
-            if task.version != version {
+            if step.is_none() && task.version != version {
                 tracing::warn!(
                     task_id = %task.id,
                     expected_version = version,
@@ -1331,6 +1331,7 @@ impl WorkflowEngine {
                 });
             }
 
+            let version = if step.is_some() { task.version } else { version };
             let current_status = task.status.to_string();
             tracing::debug!(
                 task_id = %task.id,
@@ -1621,9 +1622,6 @@ impl WorkflowEngine {
                         duration_ms,
                     ));
 
-                    if let HookResult::Cascade { to, reason: cascade_reason } = &result {
-                        cascade = Some((to.clone(), cascade_reason.clone()));
-                    }
                     if let HookResult::Failed {
                         reason: guard_reason,
                     } = result
@@ -1875,30 +1873,23 @@ impl WorkflowEngine {
                         .as_ref()
                         .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
                     let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL AND (? IS NULL OR status = ?)",
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND (SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) IS ?))",
                     )
                     .bind(&target_state)
                     .bind(&updated_at)
                     .bind(entry_barrier_json.as_deref())
                     .bind(clear_review_passed_at)
                     .bind(&task_id)
+                    .bind(step.is_some())
                     .bind(version)
+                    .bind(step.is_some())
                     .bind(step.as_ref().map(|s| s.expected_status.as_str()))
-                    .bind(step.as_ref().map(|s| s.expected_status.as_str()))
+                    .bind(step.as_ref().and_then(|s|s.producing_transition_id.as_deref()))
                     .execute(&mut *transaction)
                     .await?;
 
                     if update.rows_affected() != 1 {
                         return Err(db::DbError::VersionConflict.into());
-                    }
-                    // A replayed transition (including a same-state hook
-                    // retry) is consumed by this CAS. A later version bump
-                    // would supersede this transition's own queued cascade.
-                    if crate::TaskService::is_replaying_recovery(&task_id) {
-                        if let Some(intent) = deferred_dispatch::queued_recovery(&task) {
-                            sqlx::query("UPDATE task SET metadata_json=json_remove(COALESCE(metadata_json,'{}'),'$.queued_recovery','$.deferred_dispatch') WHERE id=? AND json_extract(metadata_json,'$.queued_recovery.id')=?")
-                                .bind(&task_id).bind(&intent.id).execute(&mut *transaction).await?;
-                        }
                     }
                     if reopens_visible_work {
                         ProjectRepo::increment_project_work_epoch(
@@ -2711,7 +2702,7 @@ impl WorkflowEngine {
             }
             let pending_steps = self.db.pending_steps(&task_id).await?;
             if !crate::worker_runtime::queue::producer_deferred(&task_id) {
-                if let Some(id) = &queued_step_id { self.db.ready_step(id, task.version).await?; }
+                if let Some(id) = &queued_step_id { self.db.ready_step(id).await?; }
             }
             let review = latest_review(&self.db, &task.id).await?;
 
@@ -2731,12 +2722,14 @@ impl WorkflowEngine {
         &self,
         step: &db::TaskStep,
         payload: &crate::worker_runtime::queue::CascadePayload,
+        workflow: &WorkflowDefinition,
+        authority: Option<WorkflowAuthority>,
     ) -> crate::Result<TransitionResult> {
         self.transition_inner(
             step.task_id.clone(),
             payload.to.clone(),
             step.expected_version,
-            &payload.workflow,
+            workflow,
             crate::worker_runtime::queue::cascade_actor(),
             payload.reason.clone(),
             payload.rejection,
@@ -2744,12 +2737,12 @@ impl WorkflowEngine {
             None,
             None,
             Some(step.clone()),
-            payload.authority.clone(),
+            authority,
         )
         .await
     }
 
-    fn cascade_allowed(state: &StateDefinition, reason: &str, rejection: bool) -> bool {
+    pub(crate) fn cascade_allowed(state: &StateDefinition, reason: &str, rejection: bool) -> bool {
         state.kind != StateKind::Gate
             || rejection
             || !state
@@ -2774,7 +2767,7 @@ impl WorkflowEngine {
         parent: Option<&db::TaskStep>,
         causation_key: String,
     ) -> crate::Result<db::EnqueueTaskStep> {
-        let evidence = latest_review(&self.db, &task.id)
+        let review_evidence = latest_review(&self.db, &task.id)
             .await?
             .filter(|r| {
                 matches!(
@@ -2783,17 +2776,68 @@ impl WorkflowEngine {
                 )
             })
             .map(|r| format!("{}:{}", r.id, r.updated_at));
+        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let rebases = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .trigger_reason
+                    .contains(crate::workflow::TARGET_MOVED_MARKER)
+                    && entry.triggered_by == crate::worker_runtime::queue::cascade_actor().display()
+            })
+            .count();
+        let head: Option<String> = sqlx::query_scalar("SELECT h.head_sha FROM workspace_expected_head h JOIN workspace_placement p ON p.id=h.placement_id AND p.generation=h.generation WHERE p.task_id=? ORDER BY h.recorded_at DESC LIMIT 1")
+            .bind(&task.id).fetch_optional(self.db.pool()).await?;
+        let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
+        let producing_transition_id = if uuid::Uuid::parse_str(&causation_key).is_ok() {
+            Some(causation_key.clone())
+        } else {
+            sqlx::query_scalar("SELECT id FROM transition_log WHERE task_id=? AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1").bind(&task.id).fetch_optional(self.db.pool()).await?
+        };
+        let workflow_ref = if authority.is_some() {
+            crate::worker_runtime::queue::WorkflowReference::Project
+        } else {
+            crate::worker_runtime::queue::WorkflowReference::Snapshot(
+                self.db
+                    .store_step_workflow(
+                        &serde_json::to_string(workflow)
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+                    )
+                    .await?,
+            )
+        };
         let continuing = parent.filter(|p| {
             serde_json::from_str::<crate::worker_runtime::queue::CascadePayload>(&p.payload_json)
                 .is_ok_and(|p| p.evidence == evidence)
         });
+        let admission_agent_id = if reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
+            || reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+        {
+            None
+        } else if let Some(role) = workflow
+            .states
+            .iter()
+            .find(|state| state.name == to)
+            .and_then(crate::workflow::effective_role)
+        {
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, role)
+                .await?
+                .map(|resolved| resolved.assignment)
+                .filter(|assignment| assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                .and_then(|assignment| assignment.assignee_id)
+        } else {
+            None
+        };
         let payload = crate::worker_runtime::queue::CascadePayload {
             to,
             reason,
             rejection,
             skip_before_exit,
-            workflow: workflow.clone(),
-            authority,
+            workflow_ref,
+            admission_agent_id,
+            clear_review_passed_at_on_commit: authority
+                .as_ref()
+                .is_some_and(|a| a.clear_review_passed_at_on_commit),
             evidence,
         };
         Ok(db::EnqueueTaskStep {
@@ -2809,6 +2853,8 @@ impl WorkflowEngine {
             chain_position: continuing.map(|p| p.chain_position + 1).unwrap_or(1),
             expected_status: task.status.clone(),
             expected_version: task.version,
+            producing_transition_id,
+            lane: crate::worker_runtime::queue::cascade_lane(workflow, &payload.to).into(),
             available_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
         })
     }

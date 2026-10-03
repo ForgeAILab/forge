@@ -240,8 +240,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     .await;
     assert!(logs.contains("forge-e2e-ok"));
 
-    common::drain(&state, &app, &task.id).await;
-    let agent_detail = poll_agent_active(&app, &agent_id).await;
+    let agent_detail = poll_agent_active(&state, &app, &task.id, &agent_id).await;
     assert_eq!(agent_detail.effective_status.as_deref(), Some("active"));
     assert_eq!(agent_detail.active_assigned_task_count, Some(0));
 }
@@ -345,9 +344,17 @@ async fn poll_execution_status(
     }
 }
 
-async fn poll_agent_active(app: &Router, agent_id: &str) -> AgentResponse {
+async fn poll_agent_active(
+    state: &AppState,
+    app: &Router,
+    task_id: &str,
+    agent_id: &str,
+) -> AgentResponse {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
+        // Terminal execution storage precedes its completion producer. An
+        // empty queue can become nonempty while we wait for that producer.
+        common::drain(state, app, task_id).await;
         let agent: AgentResponse = empty_request(
             app,
             Method::GET,

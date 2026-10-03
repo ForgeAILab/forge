@@ -17,7 +17,9 @@ use tokio::{
 };
 
 pub const CHAIN_LIMIT: i64 = 64;
-const CONCURRENCY: usize = 8;
+const FAST_CONCURRENCY: usize = 4;
+const LONG_CONCURRENCY: usize = 4;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const LEASE_SECONDS: i64 = 60;
 
 tokio::task_local! { pub(crate) static PRODUCER_TASK: String; }
@@ -57,21 +59,63 @@ pub(crate) struct CascadePayload {
     pub reason: String,
     pub rejection: bool,
     pub skip_before_exit: bool,
-    pub workflow: api_types::WorkflowDefinition,
-    pub authority: Option<WorkflowAuthority>,
+    pub workflow_ref: WorkflowReference,
+    pub clear_review_passed_at_on_commit: bool,
+    #[serde(default)]
+    pub admission_agent_id: Option<String>,
     /// A new completed CI/review result is an execution-result chain boundary.
     pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub(crate) enum WorkflowReference {
+    Project,
+    Snapshot(String),
+}
+
+pub(crate) fn cascade_lane(workflow: &api_types::WorkflowDefinition, to: &str) -> &'static str {
+    let long = workflow
+        .states
+        .iter()
+        .find(|state| state.name == to)
+        .is_some_and(|state| {
+            state
+                .hooks
+                .before_enter
+                .iter()
+                .chain(&state.hooks.on_enter)
+                .chain(&state.hooks.after_enter)
+                .any(|hook| {
+                    matches!(
+                        hook.action.as_str(),
+                        "run_merge"
+                            | "run_ci_steps"
+                            | "run_before_work_hooks"
+                            | "dispatch_role_agent"
+                            | "dispatch_fix_agent"
+                            | "dispatch_executor"
+                    )
+                })
+        });
+    if long {
+        "long"
+    } else {
+        "fast"
+    }
 }
 
 pub struct TaskStepWorker {
     engine: WorkflowEngine,
     db: Arc<db::SqliteDb>,
+    pub(crate) renew_interval: Duration,
 }
 impl TaskStepWorker {
     pub fn new(engine: WorkflowEngine) -> Self {
         Self {
             db: Arc::clone(&engine.db),
             engine,
+            renew_interval: Duration::from_secs(15),
         }
     }
     pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
@@ -79,37 +123,74 @@ impl TaskStepWorker {
             WorkerHealth::new(Arc::clone(&self.db), "task_steps"),
             SupervisorPolicy::default(),
         )
+        .with_shutdown_grace(Duration::from_secs(10))
         .start(move |shutdown| Arc::clone(&self).run(shutdown), shutdown)
     }
     async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let notify = self.db.domain_event_notify();
-        let mut jobs = JoinSet::new();
+        let mut fast = JoinSet::new();
+        let mut long = JoinSet::new();
         loop {
             if *shutdown.borrow_and_update() {
-                return Ok(());
+                break;
             }
-            while jobs.len() < CONCURRENCY {
-                let owner = db::new_uuid_v4();
-                let Some(step) = self.db.claim_step(&owner, None, &lease_deadline()).await? else {
-                    break;
-                };
-                let worker = Arc::clone(&self);
-                jobs.spawn(async move { worker.execute(step).await });
+            // Wall time can jump while the laptop's monotonic timer pauses.
+            // Restore live owners before any claim on wake; local witnesses
+            // also exclude their Tasks while a hook future remains alive.
+            if let Err(error) = self.db.renew_active_steps(&lease_deadline()).await {
+                tracing::warn!(%error,"active task step renewal failed; retaining executions");
             }
-            tokio::select! {
-                _ = super::supervisor::shutdown_signal(&mut shutdown) => return Ok(()),
-                result = jobs.join_next(), if !jobs.is_empty() => {
-                    match result {
-                        Some(Ok(Ok(()))) => {},
-                        Some(Ok(Err(error))) => tracing::warn!(%error, "task step settlement failed; lease will recover"),
-                        Some(Err(error)) => tracing::warn!(%error, "task step panicked; lease will recover"),
-                        None => {},
+            for (lane, capacity, jobs) in [
+                ("fast", FAST_CONCURRENCY, &mut fast),
+                ("long", LONG_CONCURRENCY, &mut long),
+            ] {
+                while jobs.len() < capacity {
+                    let owner = db::new_uuid_v4();
+                    match self
+                        .db
+                        .claim_step_lane(&owner, None, Some(lane), &lease_deadline())
+                        .await
+                    {
+                        Ok(Some(step)) => {
+                            let activity = self.db.hold_task_step(&step);
+                            let worker = Arc::clone(&self);
+                            jobs.spawn(async move {
+                                let _activity = activity;
+                                worker.execute(step).await
+                            });
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!(%error, lane, "task step claim failed; preserving in-flight transitions");
+                            break;
+                        }
                     }
                 }
+            }
+            tokio::select! {
+                _ = super::supervisor::shutdown_signal(&mut shutdown) => break,
+                result = fast.join_next(), if !fast.is_empty() => log_job(result),
+                result = long.join_next(), if !long.is_empty() => log_job(result),
                 _ = notify.notified() => {},
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {},
             }
         }
+        let drain = async {
+            while let Some(result) = fast.join_next().await {
+                log_job(Some(result));
+            }
+            while let Some(result) = long.join_next().await {
+                log_job(Some(result));
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
+            tracing::warn!("task step shutdown grace elapsed; leases will recover unfinished work");
+            fast.abort_all();
+            long.abort_all();
+            while fast.join_next().await.is_some() {}
+            while long.join_next().await.is_some() {}
+        }
+        Ok(())
     }
     /// Deterministic test/service utility. Does not spawn background work and
     /// waits for existing owners/backoff exactly as the production worker does.
@@ -117,6 +198,7 @@ impl TaskStepWorker {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         loop {
             if self.db.pending_steps(task_id).await? == 0
+                && !self.db.task_step_is_running(task_id)
                 && !self.db.task_steps(task_id).await?.iter().any(|step| {
                     step.lease_until
                         .as_deref()
@@ -136,6 +218,7 @@ impl TaskStepWorker {
                 .claim_step(&owner, Some(task_id), &lease_deadline())
                 .await?
             {
+                let _activity = self.db.hold_task_step(&step);
                 self.execute(step).await?;
             } else {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -147,18 +230,32 @@ impl TaskStepWorker {
         // The status CAS marks done before inline hooks settle. Keep the lease
         // through that phase so another process cannot start this Task's next
         // step during its predecessor's hooks. All commits fence this token.
-        let execution = self.execute_inner(&step);
-        tokio::pin!(execution);
-        let result = loop {
-            tokio::select! {
-                result = &mut execution => break result,
-                _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                    if !self.db.renew_step(&step.id, owner, &lease_deadline()).await? {
-                        return Err(db::DbError::VersionConflict.into());
+        // Renewal runs independently: awaiting the pool from a select branch
+        // must not stop polling a transition that currently owns a transaction.
+        let (stop, mut stopped) = watch::channel(false);
+        let db = self.db.clone();
+        let id = step.id.clone();
+        let token = owner.to_owned();
+        let interval = self.renew_interval;
+        let renewer = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _=super::supervisor::shutdown_signal(&mut stopped)=>return,
+                    _=tokio::time::sleep(interval)=> {
+                        match db.renew_step(&id,&token,&lease_deadline()).await {
+                            Ok(true)=>{},
+                            Ok(false)=>tracing::warn!(step_id=%id,"task step lost ownership; awaiting started transition"),
+                            Err(error)=>tracing::warn!(step_id=%id,%error,"task step renewal failed; awaiting started transition"),
+                        }
                     }
                 }
             }
-        };
+        });
+        let result = self.execute_inner(&step).await;
+        let _ = stop.send(true);
+        if let Err(error) = renewer.await {
+            tracing::warn!(%error,"task step renewal task stopped");
+        }
         if let Err(error) = result {
             let current = self
                 .db
@@ -170,10 +267,7 @@ impl TaskStepWorker {
                 .as_ref()
                 .is_some_and(|s| s.status == "claimed" && s.claimed_by == step.claimed_by)
             {
-                let task = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
-                if task.as_ref().is_none_or(|t| {
-                    t.status != step.expected_status || t.version != step.expected_version
-                }) {
+                if !self.db.step_entry_matches(&step).await? {
                     self.settle(&step, "superseded", Some(&error.to_string()), false)
                         .await?;
                 } else if retryable(&error) && step.attempts < 8 {
@@ -199,45 +293,101 @@ impl TaskStepWorker {
     }
     async fn execute_inner(&self, step: &TaskStep) -> Result<()> {
         let task = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
-        if task
-            .as_ref()
-            .is_none_or(|t| t.status != step.expected_status || t.version != step.expected_version)
-        {
+        if !self.db.step_entry_matches(step).await? {
             return self
                 .settle(
                     step,
                     "superseded",
-                    Some("Task left the producing status/version"),
+                    Some("Task left the producing status entry"),
                     false,
                 )
                 .await;
         }
-        let mut payload: CascadePayload =
+        let payload: CascadePayload =
             serde_json::from_str(&step.payload_json).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid cascade payload: {error}"))
             })?;
-        if payload.authority.is_some() {
-            let task = task.as_ref().expect("matching Task");
-            let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-            // This is a new normal system transition entry, including the
-            // inherited-subtask selection. Pin this entry's authority rather
-            // than treating unrelated Project settings edits as Task moves.
-            payload.workflow = WorkflowEngine::resolve_workflow_for_task(
-                task,
-                &project.workflow_definition,
-                &cascade_actor(),
-            );
-            payload.authority = Some(WorkflowAuthority {
-                project_version: project.version,
-                workflow_definition: project.workflow_definition,
-                clear_review_passed_at_on_commit: false,
-            });
+        let task = task.as_ref().expect("matching Task");
+        let (workflow, authority) = match &payload.workflow_ref {
+            WorkflowReference::Project => {
+                let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+                (
+                    WorkflowEngine::resolve_workflow_for_task(
+                        task,
+                        &project.workflow_definition,
+                        &cascade_actor(),
+                    ),
+                    Some(WorkflowAuthority {
+                        project_version: project.version,
+                        workflow_definition: project.workflow_definition,
+                        clear_review_passed_at_on_commit: payload.clear_review_passed_at_on_commit,
+                    }),
+                )
+            }
+            WorkflowReference::Snapshot(id) => (
+                serde_json::from_str(&self.db.step_workflow(id).await?)
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                None,
+            ),
+        };
+        let current_lane = cascade_lane(&workflow, &payload.to);
+        if current_lane != step.lane {
+            self.db.reroute_step(step, current_lane).await?;
+            return Ok(());
+        }
+        if matches!(payload.workflow_ref, WorkflowReference::Project) {
+            let source = workflow
+                .states
+                .iter()
+                .find(|state| state.name == step.expected_status);
+            let target = workflow
+                .states
+                .iter()
+                .find(|state| state.name == payload.to);
+            let edge = workflow
+                .outgoing_trigger_targets(&step.expected_status)
+                .any(|(_, to)| to == payload.to);
+            let routing_exception = payload.skip_before_exit
+                && (target.is_some_and(|state| state.kind == api_types::StateKind::Initial)
+                    || payload.to == step.expected_status)
+                || workflow.cancellation_state.as_deref() == Some(payload.to.as_str());
+            if source.is_none() || target.is_none() || (!edge && !routing_exception) {
+                return self
+                    .settle(
+                        step,
+                        "superseded",
+                        Some("Cascade edge is no longer allowed by the current workflow"),
+                        false,
+                    )
+                    .await;
+            }
+        }
+        if let Some(source) = workflow
+            .states
+            .iter()
+            .find(|state| state.name == step.expected_status)
+        {
+            let rejection_to_target = payload.rejection
+                && source
+                    .gate_config
+                    .as_ref()
+                    .is_some_and(|gate| gate.reject_target.as_deref() == Some(payload.to.as_str()));
+            if !WorkflowEngine::cascade_allowed(source, &payload.reason, rejection_to_target) {
+                return self
+                    .settle(
+                        step,
+                        "superseded",
+                        Some("Cascade requires approval in the current workflow"),
+                        false,
+                    )
+                    .await;
+            }
         }
         let repeated = self
             .db
-            .task_steps(&step.task_id)
+            .chain_steps(&step.chain_id)
             .await?
             .iter()
             .any(|prior| {
@@ -253,21 +403,37 @@ impl TaskStepWorker {
             self.settle(step, "parked", Some(&reason), true).await?;
             return Ok(());
         }
-        let result = self.engine.transition_step(step, &payload).await?;
+        let result = self
+            .engine
+            .transition_step(step, &payload, &workflow, authority)
+            .await?;
         // These used to observe the final recursive result in TaskService's
         // wrapper. The queued terminal hop now owns that same settlement.
-        if payload.workflow.state_kind(&result.task.status) == Some(api_types::StateKind::Terminal)
-        {
-            if payload.workflow.cancellation_state.as_deref() != Some(result.task.status.as_str()) {
-                self.engine
+        if workflow.state_kind(&result.task.status) == Some(api_types::StateKind::Terminal) {
+            if workflow.cancellation_state.as_deref() != Some(result.task.status.as_str()) {
+                if let Err(error) = self
+                    .engine
                     .task_service
                     .wake_dependents_of_completed_task(&result.task)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(task_id=%result.task.id, %error, "failed to wake dependents after committed cascade");
+                }
             }
             self.engine
                 .task_service
                 .reconcile_terminal_subtask(&result.task)
                 .await;
+        }
+        if workflow.state_kind(&result.task.status) == Some(api_types::StateKind::Initial) {
+            if let Err(error) = self
+                .engine
+                .task_service
+                .finish_initial_unverified_refusal(&result.task)
+                .await
+            {
+                tracing::warn!(task_id=%result.task.id,%error,"initial cascade refusal bookkeeping remains pending");
+            }
         }
         Ok(())
     }
@@ -278,10 +444,10 @@ impl TaskStepWorker {
         error: Option<&str>,
         annotate: bool,
     ) -> Result<()> {
-        let mut snapshot = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
+        let mut snapshot = TaskRepo::get_by_id(&*self.db, &step.task_id, true).await?;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND version=? AND deleted_at IS NULL)")
-            .bind(&step.task_id).bind(&step.expected_status).bind(step.expected_version).fetch_one(&mut *tx).await?;
+        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND deleted_at IS NULL AND (SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) IS ?)")
+            .bind(&step.task_id).bind(&step.expected_status).bind(&step.producing_transition_id).fetch_one(&mut *tx).await?;
         let status = if annotate && !matches {
             "superseded"
         } else {
@@ -290,6 +456,23 @@ impl TaskStepWorker {
         self.db
             .finish_step_in_tx(&mut tx, step, status, error)
             .await?;
+        if status == "superseded" {
+            let observed: Option<(String, Option<String>)> = sqlx::query_as("SELECT status,(SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) FROM task WHERE id=?")
+                .bind(&step.task_id).fetch_optional(&mut *tx).await?;
+            let mut event = db::CreateDomainEvent::task_interruption_changed(
+                snapshot
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::not_found("task", step.task_id.clone()))?,
+            );
+            event.id = db::new_uuid_v4();
+            event.event_type = "transition.step_superseded".into();
+            event.entity_id = step.task_id.clone();
+            event.scope_id = step.task_id.clone();
+            event.dedupe_key = Some(format!("task-step-superseded:{}", step.id));
+            event.payload_json = serde_json::json!({"task_id":step.task_id,"step_id":step.id,"expected_status":step.expected_status,"expected_entry":step.producing_transition_id,"observed_status":observed.as_ref().map(|o|&o.0),"observed_entry":observed.as_ref().and_then(|o|o.1.as_ref()),"reason":error}).to_string();
+            tracing::debug!(step_id=%step.id, expected_status=%step.expected_status, expected_entry=?step.producing_transition_id, observed=?observed, "cascade superseded");
+            db::DomainEventRepo::append_event_in_tx(&*self.db, &mut tx, &event).await?;
+        }
         if annotate && matches {
             self.annotate_in_tx(
                 &mut tx,
@@ -328,7 +511,7 @@ impl TaskStepWorker {
         error: Option<&str>,
     ) -> Result<()> {
         let now = db::now_rfc3339();
-        let mut annotation = serde_json::json!({"type":"dispatch_failed", "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
+        let mut annotation = serde_json::json!({"type":if status=="parked" {"workflow_loop"} else {"cascade_failed"}, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
         if status != "parked" {
             if let Some(mut existing) = snapshot
                 .error_annotation
@@ -350,7 +533,7 @@ impl TaskStepWorker {
                 .to_string()
         });
         sqlx::query("UPDATE task SET error_annotation=?,blocked_json=COALESCE(?,blocked_json),version=version+1,updated_at=? WHERE id=? AND version=?")
-                .bind(annotation.to_string()).bind(blocked).bind(&now).bind(&step.task_id).bind(step.expected_version).execute(&mut **tx).await?;
+                .bind(annotation.to_string()).bind(blocked).bind(&now).bind(&step.task_id).bind(snapshot.version).execute(&mut **tx).await?;
         snapshot.error_annotation = Some(annotation.to_string());
         if status == "parked" {
             snapshot.blocked_json = Some(
@@ -377,7 +560,7 @@ impl TaskStepWorker {
         let message = format!("Transition committed; inline hook failed: {error}");
         let mut snapshot = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let latest: Option<String> = sqlx::query_scalar("SELECT id FROM transition_log WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 1")
+        let latest: Option<String> = sqlx::query_scalar("SELECT id FROM transition_log WHERE task_id=? AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1")
             .bind(&step.task_id).fetch_optional(&mut *tx).await?;
         let target = serde_json::from_str::<CascadePayload>(&step.payload_json)
             .ok()
@@ -410,18 +593,21 @@ impl TaskStepWorker {
         Ok(())
     }
 }
+fn log_job(result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>) {
+    match result {
+        Some(Ok(Err(error))) => {
+            tracing::warn!(%error,"task step settlement failed; lease will recover")
+        }
+        Some(Err(error)) => tracing::warn!(%error,"task step job panicked; lease will recover"),
+        _ => {}
+    }
+}
 fn lease_deadline() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(LEASE_SECONDS)).to_rfc3339()
 }
 fn retryable(error: &ServiceError) -> bool {
-    matches!(
-        error,
-        ServiceError::Db(
-            db::DbError::VersionConflict
-                | db::DbError::AgentAtCapacity
-                | db::DbError::MachineAtCapacity
-        )
-    ) || consumer_error_kind(error) == WorkerErrorKind::Transient
+    matches!(error, ServiceError::Db(db::DbError::VersionConflict))
+        || consumer_error_kind(error) == WorkerErrorKind::Transient
 }
 
 // The step uses the same actor as the former recursive hop.

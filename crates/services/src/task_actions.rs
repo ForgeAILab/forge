@@ -540,13 +540,15 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if barrier_running || queued {
         return offers;
     }
-    if condition == Some(FailureKind::DispatchFailed)
-        && metadata["placement_refusal"]["annotation"]
-            == task
-                .error_annotation
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .unwrap_or_default()
+    if matches!(
+        condition,
+        Some(FailureKind::DispatchFailed | FailureKind::WorkflowLoop | FailureKind::CascadeFailed)
+    ) && metadata["placement_refusal"]["annotation"]
+        == task
+            .error_annotation
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or_default()
         && metadata.get("placement_refusal").is_some()
     {
         offer(
@@ -1248,6 +1250,8 @@ fn restart_condition(condition: Option<FailureKind>) -> bool {
         condition,
         Some(
             FailureKind::DispatchFailed
+                | FailureKind::WorkflowLoop
+                | FailureKind::CascadeFailed
                 | FailureKind::RecoveryRequired
                 | FailureKind::ExecutorFailed
                 | FailureKind::ExecutorUnavailable

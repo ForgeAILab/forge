@@ -298,7 +298,7 @@ impl TaskService {
         .await?;
         self.reconcile_terminal_subtask(&result.task).await;
         if let Some(id) = &engine_result.queued_step_id {
-            db::TaskStepRepo::ready_step(&*self.db, id, result.task.version).await?;
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
         }
         Ok(result)
     }

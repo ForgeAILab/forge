@@ -1600,6 +1600,7 @@ export interface OperatorStatusResponse {
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
   periodic_workers: PeriodicWorkerStatus[]
+  task_steps: import("./bindings/TaskStepQueueStatus").TaskStepQueueStatus
   database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]

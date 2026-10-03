@@ -509,7 +509,7 @@ async fn insert_transition_log(
     input: &CreateTransitionLog,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at,is_status_entry) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -521,6 +521,7 @@ async fn insert_transition_log(
     .bind(input.hook_results_json.as_deref())
     .bind(if input.rejection { 1_i64 } else { 0_i64 })
     .bind(&input.created_at)
+    .bind(input.from_state!=input.to_state)
     .execute(&mut **tx)
     .await?;
     Ok(())

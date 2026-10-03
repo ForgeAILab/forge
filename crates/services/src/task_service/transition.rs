@@ -283,7 +283,7 @@ impl TaskService {
         }
         let pending_steps = db::TaskStepRepo::pending_steps(&*self.db, &task_id).await?;
         if let Some(id) = &result.queued_step_id {
-            db::TaskStepRepo::ready_step(&*self.db, id, task.version).await?;
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
         }
         Ok(TransitionResult {
             task,
@@ -1191,26 +1191,19 @@ async fn clear_manual_advance_error_annotation(
         return Ok(advanced_task);
     }
 
-    TaskRepo::update(
-        db,
-        UpdateTask {
-            id: advanced_task.id.clone(),
-            expected_version: advanced_task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(None),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .map_err(Into::into)
+    let cleared: Option<(String,i64)> = sqlx::query_as("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL RETURNING status,version")
+        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation).fetch_optional(db.pool()).await?;
+    // Preserve the initiating transition's response snapshot even if its step
+    // has already advanced the persisted Task. Clearing a replaced annotation
+    // is a no-op, never a post-commit 409.
+    let mut snapshot = advanced_task;
+    if let Some((status, version)) = cleared {
+        if status == snapshot.status {
+            snapshot.version = version;
+        }
+    }
+    snapshot.error_annotation = None;
+    Ok(snapshot)
 }
 
 pub(super) async fn clear_manual_review_awaiting_metadata(
@@ -1492,6 +1485,51 @@ mod tests {
             version: 1,
             created_at: now.clone(),
             updated_at: now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn advance_annotation_clear_accepts_both_step_orderings() {
+        for step_wins in [false, true] {
+            let db = SqliteDb::new(db::create_sqlite_pool("sqlite::memory:").await.unwrap());
+            db::run_migrations(db.pool()).await.unwrap();
+            let now = now_rfc3339();
+            sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+                .bind(&now)
+                .bind(&now)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task(id,project_id,title,status,error_annotation,created_at,updated_at) VALUES('t','p','t','todo','old annotation',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            let source = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            sqlx::query("UPDATE task SET status='planning',version=version+1 WHERE id='t'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let advanced = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            if step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let result = clear_manual_advance_error_annotation(&db, &source, advanced)
+                .await
+                .unwrap();
+            assert!(result.error_annotation.is_none());
+            if !step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let final_task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            assert_eq!(final_task.status, "in_progress");
+            assert!(final_task.error_annotation.is_none());
         }
     }
 }

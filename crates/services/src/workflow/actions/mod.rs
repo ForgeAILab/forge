@@ -28,3 +28,6 @@ pub use subtasks::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use merge::target_moved_result;

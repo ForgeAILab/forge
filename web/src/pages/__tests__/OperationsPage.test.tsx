@@ -82,6 +82,18 @@ const usageSummary: UsageAggregate = {
 
 const degradedStatus: OperatorStatusResponse = {
   periodic_workers: [],
+  task_steps: {
+    worker_name: 'task_steps',
+    pending: 0,
+    claimed: 0,
+    failed: 0,
+    parked: 0,
+    in_flight: 0,
+    oldest_pending_age_seconds: null,
+    last_error: null,
+    last_error_at: null,
+    restart_count: 0,
+  },
   usage_index: {
     current_size_bytes: 10 * 1024 * 1024,
     budget_bytes: 128 * 1024 * 1024,

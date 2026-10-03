@@ -5000,7 +5000,7 @@ async fn dispatcher_respects_priority_ordering() {
     crate::test_support::force_task_version_conflict_after_transition(
         &db,
         &high.id,
-        crate::workflow::default_states::IN_PROGRESS,
+        crate::workflow::default_states::PLANNING,
         &low.id,
     )
     .await;
@@ -9150,3 +9150,6 @@ async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_sto
     assert!(!in_flight.load(Ordering::SeqCst));
     assert_eq!(calls.load(Ordering::SeqCst), 4);
 }
+
+#[path = "tests/audit_23a.rs"]
+mod audit_23a;

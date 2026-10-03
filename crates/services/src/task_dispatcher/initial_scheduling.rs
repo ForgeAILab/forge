@@ -356,6 +356,30 @@ impl TaskDispatcher {
         let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
+        // A queued role entry has not acquired its execution slot yet. Count
+        // that short admission window without executing the cascade inline.
+        let (queued_agent,queued_all):(i64,i64)=sqlx::query_as("SELECT COALESCE(SUM(json_extract(payload_json,'$.admission_agent_id')=?),0),COUNT(*) FROM task_step WHERE task_id<>? AND json_extract(payload_json,'$.admission_agent_id') IS NOT NULL AND (status IN ('pending','claimed') OR lease_until>?) AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.task_id=task_step.task_id AND e.status='running')")
+            .bind(&agent.id).bind(&task.id).bind(db::now_rfc3339()).fetch_one(self.db.pool()).await?;
+        let running_agent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE agent_id=? AND status='running'",
+        )
+        .bind(&agent.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if queued_agent > 0 && queued_agent + running_agent >= agent.max_concurrent_tasks {
+            return Ok(false);
+        }
+        if let Some(cap) = self.db.server_run_cap.effective() {
+            let rows = crate::placement::machine_precheck::snapshot(&self.db).await?;
+            let active = rows
+                .iter()
+                .find(|row| row.daemon_id.is_none())
+                .map(|row| row.capacity.active_runs())
+                .unwrap_or(0);
+            if queued_all > 0 && queued_all + active >= cap {
+                return Ok(false);
+            }
+        }
         if crate::placement::machine_precheck::wait_before_dispatch(
             &self.db,
             &self.task_service,
@@ -413,17 +437,12 @@ impl TaskDispatcher {
                 },
             )
             .await;
-        // A gate may enqueue the actual role entry. Settle that admission on
-        // the background dispatcher before inspecting the next candidate's
-        // machine capacity or finalizing an initial placement refusal. REST
-        // and MCP still return their own committed transition immediately.
-        let transition = match transition {
-            Ok(mut result) if result.pending_steps > 0 => {
-                result.task = self.task_service.drain(&task.id).await?;
-                Ok(result)
-            }
-            other => other,
-        };
+        if transition
+            .as_ref()
+            .is_ok_and(|result| result.pending_steps > 0)
+        {
+            self.db.domain_event_notify().notify_waiters();
+        }
         // Log-policy entry failures can return Ok with the restored Task.
         // Rebase only that handled refusal; ordinary dispatch adds no read.
         if transition

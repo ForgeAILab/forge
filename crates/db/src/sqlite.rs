@@ -144,6 +144,8 @@ mod workspace_placement;
 pub struct SqliteDb {
     pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
     pool: SqlitePool,
+    pub(crate) task_step_activity:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
     readiness_decode_warnings: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
     domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
@@ -158,6 +160,7 @@ impl SqliteDb {
         let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
+            task_step_activity: Default::default(),
             readiness_decode_warnings: Default::default(),
             domain_event_hooks,
             server_run_cap: Arc::new(crate::machine_capacity::MachineRunCap::default()),

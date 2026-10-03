@@ -171,7 +171,7 @@ It does not wait for those follow-up transitions. For example, entering
 `planning` without a planner returns `task.status = "planning"` and
 `pending_steps = 1`; the queued hop later enters `in_progress`. Observe subsequent
 `task.status_changed` SSE events or issue a later `GET /api/v1/tasks/{id}` for the
-settled state. `pending_steps = 0` is a snapshot, not a promise that future agent
+settled state. `pending_steps = 0` does not mean settled: a done step can still be running inline hooks and enqueue more steps. It is a snapshot, not a promise that future agent
 or execution actions will never enqueue more work. Failed, parked, superseded
 and done rows do not count as pending.
 
@@ -4975,3 +4975,7 @@ The web renders Task controls from live offers, including placement waits (`hold
 Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
 
 Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
+
+Operator status includes `task_steps`: `worker_name`, pending/claimed/failed/parked counts, in_flight jobs, oldest_pending_age_seconds (null for an empty queue), last_error, last_error_at and restart_count. This queue has no consumer cursor or worker dead-letter actions.
+
+`transition.step_superseded` is durable and records task_id, step_id, expected_status, expected_entry, observed_status, observed_entry and reason when a real status-entry change or a current-workflow approval rule invalidates a follow-up. Version-only edits do not invalidate it.
