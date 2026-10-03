@@ -186,7 +186,8 @@ async fn test_app() -> Harness {
         true,
         adapter_registry,
     ));
-    let hook_service_handle = Arc::clone(&state.project_hook_service).start();
+    let hook_service_handle = Arc::clone(&state.project_hook_service)
+        .start_with_shutdown(state.shutdown_signal.subscribe());
     tokio::task::yield_now().await;
 
     let web_dist_dir = common::TestDir::new("forge-project-hooks-web");

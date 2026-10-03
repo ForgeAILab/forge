@@ -13,13 +13,13 @@ use axum::{
     Router,
 };
 use db::{new_uuid_v4, now_rfc3339, CreateTask, NotificationListQuery, NotificationRepo, TaskRepo};
-use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
+use events::{EventBus, EventContext, ForgeEvent};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn event_bus_creates_notification_and_api_manages_inbox() {
+async fn durable_event_creates_notification_and_api_manages_inbox() {
     let harness = test_app().await;
     let (project, _repo) = create_project_and_repo(&harness.app).await;
 
@@ -51,18 +51,10 @@ async fn event_bus_creates_notification_and_api_manages_inbox() {
     .expect("task creates");
 
     let mut rx = harness.event_bus.subscribe();
-    harness.event_bus.publish(ForgeEvent {
-        event_type: "task.blocked".to_owned(),
-        entity_id: task_id.clone(),
-        timestamp: event_timestamp(),
-        context: EventContext::TaskBlocked {
-            project_id: project.id.clone(),
-            reason: "waiting for product input".to_owned(),
-            kind: None,
-            source: None,
-            execution_id: None,
-        },
-    });
+    db::DomainEventRepo::append_event(&*harness.state.db, db::CreateDomainEvent {
+        id: new_uuid_v4(), event_type: "notification.requested".to_owned(), entity_type: "task".to_owned(), entity_id: task_id.clone(), actor_type: "system".to_owned(), actor_id: None, scope_type: "task".to_owned(), scope_id: task_id.clone(), correlation_id: task_id.clone(), causation_id: None, causation_depth: 0, dedupe_key: None,
+        payload_json: json!({"project_id": project.id, "task_id": task_id, "event_type": "task.blocked", "title": "Blocked task", "body": "waiting for product input"}).to_string(), created_at: now_rfc3339(),
+    }).await.expect("durable request appends");
 
     let created = wait_for_notification_created(&mut rx).await;
     assert_eq!(created.event_type, "task.blocked");

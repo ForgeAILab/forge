@@ -2585,6 +2585,23 @@ async fn audit_zero_budget_chat_stall_uses_project_scope() {
             reason: WakeSuppressionReason::BudgetExhausted
         }
     ));
+    let requests: Vec<(String, String)> = sqlx::query_as("SELECT scope_id, payload_json FROM domain_event WHERE event_type = 'notification.requested'").fetch_all(db.pool()).await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, project);
+    let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
+    assert_eq!(request["event_type"], "project.autonomy_stalled");
+    assert_eq!(request["project_id"], project);
+    // Delivery reads only the committed request, independently of the live hint.
+    let notifications = Arc::new(services::NotificationService::new(
+        Arc::clone(&db),
+        Arc::new(events::EventBus::new(1)),
+    ));
+    services::worker_runtime::WorkerRuntime::new(Arc::clone(&db), notifications)
+        .run_once(100)
+        .await
+        .unwrap();
+    let inbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE project_id = ? AND event_type = 'project.autonomy_stalled'").bind(&project).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(inbox_count, 1);
     let event = rx.try_recv().unwrap();
     assert!(
         matches!(event.context, events::EventContext::ProjectAutonomyStalled { project_id, .. } if project_id == project)

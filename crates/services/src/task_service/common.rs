@@ -135,7 +135,13 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
+        self.after_project_hook_comment(&comment).await;
+        Ok(())
+    }
+
+    pub(crate) async fn after_project_hook_comment(&self, comment: &TaskComment) {
+        let task_id = &comment.task_id;
+        if let Err(error) = self.index_task_comment_memory(task_id, comment).await {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
         self.publish(ForgeEvent {
@@ -144,12 +150,11 @@ impl TaskService {
             timestamp: event_timestamp(),
             context: EventContext::CommentCreated {
                 task_id: task_id.to_owned(),
-                comment_id: comment.id,
+                comment_id: comment.id.clone(),
                 author_type: "system".to_owned(),
                 author_name: "Forge".to_owned(),
             },
         });
-        Ok(())
     }
 
     pub(super) async fn create_agent_comment(

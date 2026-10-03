@@ -654,6 +654,28 @@ impl AttentionService {
 
         if budget == Some(0) {
             *stall_scope = Some((budget_scope_type.clone(), budget_scope_id.clone()));
+            if budget_scope_type == "project" {
+                let open_incidents: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'"
+                ).bind(&budget_scope_id).fetch_one(&mut **transaction).await?;
+                if open_incidents > 0 {
+                    DomainEventRepo::append_event_in_tx(&*self.db, transaction, &CreateDomainEvent {
+                        id: new_uuid_v4(), event_type: "notification.requested".to_owned(),
+                        entity_type: "project".to_owned(), entity_id: budget_scope_id.clone(),
+                        actor_type: "system".to_owned(), actor_id: None,
+                        scope_type: "project".to_owned(), scope_id: budget_scope_id.clone(),
+                        correlation_id: request.correlation_id.clone(), causation_id: request.causation_id.clone(),
+                        causation_depth: request.reaction_depth,
+                        dedupe_key: None,
+                        payload_json: json!({
+                            "project_id": budget_scope_id, "task_id": null,
+                            "event_type": "project.autonomy_stalled",
+                            "title": format!("Project Agent stopped: {open_incidents} open incident(s) unanswered"),
+                            "body": "the Project Agent's hourly wake budget is exhausted"
+                        }).to_string(), created_at: now.clone(),
+                    }).await?;
+                }
+            }
             self.append_wake_decision_in_tx(
                 transaction,
                 request,

@@ -155,6 +155,7 @@ impl TaskService {
             &finished_at,
             task.version,
             Some(finished_at.clone()),
+            db::ReviewEventOrigin::User,
         )
         .await?;
 
@@ -235,6 +236,7 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
+            db::ReviewEventOrigin::User,
         )
         .await?;
 

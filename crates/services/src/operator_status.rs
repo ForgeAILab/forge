@@ -1198,6 +1198,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn notify_and_project_hook_workers_expose_health_and_live_lag() {
+        let (db, operator) = test_service().await;
+        let bus = Arc::new(events::EventBus::new(1));
+        let notifications = Arc::new(crate::NotificationService::new(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+        ));
+        let hooks = Arc::new(crate::ProjectHookService::new(
+            Arc::clone(&db),
+            Arc::clone(&bus),
+            Arc::new(crate::TaskService::new(Arc::clone(&db), bus)),
+            Arc::clone(&notifications),
+        ));
+        crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), notifications)
+            .run_once(1)
+            .await
+            .unwrap();
+        crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), hooks)
+            .run_once(1)
+            .await
+            .unwrap();
+        operator.set_runtime_workers(&[
+            crate::RuntimeWorker::NotificationProjection,
+            crate::RuntimeWorker::ProjectHooks,
+        ]);
+        let event_id = new_uuid_v4();
+        db::DomainEventRepo::append_event(
+            &*db,
+            db::CreateDomainEvent::task_transition(
+                event_id,
+                "lag-task",
+                "lag-project",
+                "review",
+                "done",
+                Some("complete"),
+                "system",
+                "done",
+                false,
+                db::now_rfc3339(),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .unwrap();
+        let status = operator.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers.len(), 2);
+        for name in ["notifications", "project-hooks"] {
+            let consumer = status
+                .event_consumers
+                .iter()
+                .find(|consumer| consumer.consumer_name == name)
+                .unwrap();
+            assert_eq!(consumer.lag, 1);
+            let subscription: Option<String> = sqlx::query_scalar(
+                "SELECT subscription_json FROM worker_health WHERE worker_name = ?",
+            )
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert!(subscription.unwrap().contains("task.transitioned"));
+        }
+    }
+
+    #[tokio::test]
     async fn empty_db_is_healthy() {
         let (_db, service) = test_service().await;
 
@@ -1585,7 +1650,7 @@ mod tests {
             OperatorSeverity::Attention
         );
         assert!(status.database.incremental_vacuum);
-        assert_eq!(status.event_consumers.len(), 4);
+        assert_eq!(status.event_consumers.len(), 6);
         assert!(status
             .event_consumers
             .iter()
@@ -1743,7 +1808,7 @@ mod tests {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let empty = service.event_consumers(now).await.unwrap();
-        assert_eq!(empty.len(), 4);
+        assert_eq!(empty.len(), 6);
         assert!(empty.iter().all(|c| c.lag == 0 && !c.stalled));
         let old = (now - Duration::seconds(301)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(&old).execute(db.pool()).await.unwrap();

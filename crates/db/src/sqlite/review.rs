@@ -66,6 +66,7 @@ async fn update_status_inner(
     expected_review_status: Option<ReviewStatus>,
     expected_review_updated_at: Option<&str>,
     expected_candidate_execution_id: Option<&str>,
+    origin: crate::ReviewEventOrigin,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
@@ -223,7 +224,7 @@ async fn update_status_inner(
         event_type: "review.status_changed".to_owned(),
         entity_type: "review".to_owned(),
         entity_id: review.id.clone(),
-        actor_type: "review_runner".to_owned(),
+        actor_type: origin.actor_type().to_owned(),
         actor_id: None,
         scope_type: "task".to_owned(),
         scope_id: review.task_id.clone(),
@@ -438,7 +439,12 @@ async fn update_status_with_review_authority_inner(
         event_type: "review.status_changed".to_owned(),
         entity_type: "review".to_owned(),
         entity_id: review.id.clone(),
-        actor_type: "review_runner".to_owned(),
+        actor_type: if carry.is_some() {
+            "workflow"
+        } else {
+            "review_runner"
+        }
+        .to_owned(),
         actor_id: None,
         scope_type: "task".to_owned(),
         scope_id: review.task_id.clone(),
@@ -865,6 +871,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             None,
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok(review)
@@ -892,6 +899,7 @@ impl ReviewRepo for SqliteDb {
             Some(expected_status),
             Some(expected_updated_at),
             None,
+            crate::ReviewEventOrigin::Runner,
         )
         .await
         {
@@ -910,6 +918,7 @@ impl ReviewRepo for SqliteDb {
         updated_at: &str,
         expected_task_version: i64,
         review_passed_at: Option<String>,
+        origin: crate::ReviewEventOrigin,
     ) -> Result<(Review, Task)> {
         let (review, task) = update_status_inner(
             self,
@@ -927,6 +936,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             None,
+            origin,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))
@@ -959,6 +969,7 @@ impl ReviewRepo for SqliteDb {
             None,
             None,
             Some(expected_candidate_execution_id),
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))
@@ -995,6 +1006,7 @@ impl ReviewRepo for SqliteDb {
             Some(expected_review_status),
             Some(expected_review_updated_at),
             Some(expected_candidate_execution_id),
+            crate::ReviewEventOrigin::Runner,
         )
         .await?;
         Ok((review, task.ok_or(DbError::NotFound)?))

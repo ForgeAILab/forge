@@ -1,92 +1,68 @@
-use db::{AgentRepo, ProjectAgentBindingRepo, ProjectHookRunStatus};
+use db::{AgentRepo, ProjectAgentBindingRepo};
 use serde_json::Value;
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
-    project_hooks::actions::{
-        task_type_to_string, ActionContext, ActionOutcome, HookActionHandler,
-    },
+    project_hooks::actions::ActionContext,
     Result, ServiceError,
 };
 
-pub struct DispatchAgentAction<'a> {
-    pub agent_id: &'a str,
-    pub prompt: Option<&'a str>,
-    pub follow_up: Option<&'a Value>,
+pub(crate) enum DispatchPreparation {
+    Ready {
+        task: Box<crate::task_service::PreparedProjectHookTask>,
+        agent_id: String,
+        prompt: String,
+    },
+    Skipped(String),
 }
 
-#[async_trait::async_trait]
-impl HookActionHandler for DispatchAgentAction<'_> {
-    async fn execute(&self, context: &ActionContext<'_>) -> Result<ActionOutcome> {
-        if context.project.paused_at.is_some() {
-            return Ok(ActionOutcome::skipped(format!(
-                "project {} is paused",
-                context.project.id
-            )));
-        }
-
-        let agent = AgentRepo::get_by_id(&*context.service.db, self.agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", self.agent_id.to_owned()))?;
-        if !agent_usable_in_project(context, &agent).await? {
-            return Ok(ActionOutcome::skipped(format!(
-                "agent {} is not usable in project {}",
-                agent.id, context.project.id
-            )));
-        }
-
-        match compute_effective_status(&context.service.db, &agent, None).await? {
-            EffectiveStatus::Active => {}
-            status => {
-                return Ok(ActionOutcome::skipped(format!(
-                    "agent {} is not available: {}",
-                    agent.id, status
-                )));
-            }
-        }
-
-        let task = context
-            .service
-            .task_service
-            .create_automation_task(
-                context.project.id.clone(),
-                format!("Automation: {}", context.rule_id),
-                Some(automation_task_description(context)),
-                Some(task_type_to_string(api_types::TaskType::Task)),
-                None,
-                None,
-            )
-            .await?;
-
-        let prompt = build_prompt(context, self.prompt, self.follow_up);
-        let launch = context
-            .service
-            .task_service
-            .launch_execution(task.id.clone(), agent.id.clone(), Some(prompt), None)
-            .await;
-        let execution = match launch {
-            Ok(result) => result.execution,
-            Err(error) => {
-                return Ok(ActionOutcome {
-                    status: ProjectHookRunStatus::Failed,
-                    automation_task_id: Some(task.id),
-                    execution_id: None,
-                    agent_id: Some(agent.id),
-                    reason: Some(format!(
-                        "automation task created but execution launch failed: {error}"
-                    )),
-                });
-            }
-        };
-
-        Ok(ActionOutcome {
-            status: ProjectHookRunStatus::Dispatched,
-            automation_task_id: Some(task.id),
-            execution_id: Some(execution.id),
-            agent_id: Some(agent.id),
-            reason: Some("agent dispatched".to_owned()),
-        })
+pub(crate) async fn prepare(
+    context: &ActionContext<'_>,
+    agent_id: &str,
+    prompt: Option<&str>,
+    follow_up: Option<&Value>,
+) -> Result<DispatchPreparation> {
+    if context.project.paused_at.is_some() {
+        return Ok(DispatchPreparation::Skipped(format!(
+            "project {} is paused",
+            context.project.id
+        )));
     }
+    let agent = AgentRepo::get_by_id(&*context.service.db, agent_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+    if !agent_usable_in_project(context, &agent).await? {
+        return Ok(DispatchPreparation::Skipped(format!(
+            "agent {} is not usable in project {}",
+            agent.id, context.project.id
+        )));
+    }
+    match compute_effective_status(&context.service.db, &agent, None).await? {
+        EffectiveStatus::Active => {}
+        status => {
+            return Ok(DispatchPreparation::Skipped(format!(
+                "agent {} is not available: {}",
+                agent.id, status
+            )))
+        }
+    }
+    let task = context
+        .service
+        .task_service
+        .prepare_project_hook_task(
+            context.project,
+            format!("Automation: {}", context.rule_id),
+            automation_task_description(context),
+            "task".to_owned(),
+            0,
+            true,
+        )
+        .await?;
+    Ok(DispatchPreparation::Ready {
+        task: Box::new(task),
+        agent_id: agent.id,
+        prompt: build_prompt(context, prompt, follow_up),
+    })
 }
 
 async fn agent_usable_in_project(context: &ActionContext<'_>, agent: &db::Agent) -> Result<bool> {

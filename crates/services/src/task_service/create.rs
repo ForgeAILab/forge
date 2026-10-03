@@ -555,11 +555,21 @@ impl TaskService {
     pub(super) async fn project_default_role_assignments(
         &self,
         task: &Task,
+        covered_roles: HashSet<String>,
+    ) -> Result<Vec<CreateTaskRoleAssignment>> {
+        self.project_default_role_assignments_for_ids(&task.id, &task.project_id, covered_roles)
+            .await
+    }
+
+    async fn project_default_role_assignments_for_ids(
+        &self,
+        task_id: &str,
+        project_id: &str,
         mut covered_roles: HashSet<String>,
     ) -> Result<Vec<CreateTaskRoleAssignment>> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         let settings =
             serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid project settings: {error}"))
@@ -618,7 +628,7 @@ impl TaskService {
             let now = now_rfc3339();
             assignments.push(CreateTaskRoleAssignment {
                 id: new_uuid_v4(),
-                task_id: task.id.clone(),
+                task_id: task_id.to_owned(),
                 role_name: role_name.clone(),
                 assignee_type: Some(assignee_type),
                 assignee_id: Some(assignee_id),
@@ -674,5 +684,108 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         }
         Ok(current)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedProjectHookTask {
+    input: CreateTask,
+    governance: Option<super::governance::PreparedTaskGovernance>,
+    assignments: Vec<CreateTaskRoleAssignment>,
+}
+
+impl TaskService {
+    pub(crate) async fn prepare_project_hook_task(
+        &self,
+        project: &db::Project,
+        title: String,
+        description: String,
+        task_type: String,
+        priority: i64,
+        is_automation: bool,
+    ) -> Result<PreparedProjectHookTask> {
+        validate_required("title", &title)?;
+        if !is_automation {
+            self.validate_task_review_requirement_ids(project, &[])
+                .await?;
+        }
+        let governance = self
+            .prepare_task_governance(project, &task_type, None)
+            .await?;
+        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let status = workflow
+            .states
+            .iter()
+            .find(|state| state.kind == api_types::StateKind::Initial)
+            .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
+            .name
+            .clone();
+        let now = now_rfc3339();
+        let input = CreateTask {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title,
+            description: Some(description),
+            task_type,
+            status,
+            is_automation,
+            priority,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let assignments = if is_automation {
+            Vec::new()
+        } else {
+            self.project_default_role_assignments_for_ids(
+                &input.id,
+                &input.project_id,
+                HashSet::new(),
+            )
+            .await?
+        };
+        Ok(PreparedProjectHookTask {
+            input,
+            governance,
+            assignments,
+        })
+    }
+
+    pub(crate) async fn commit_project_hook_task(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        prepared: &PreparedProjectHookTask,
+    ) -> Result<Task> {
+        let task = self
+            .insert_created_task_in_tx(
+                transaction,
+                prepared.input.clone(),
+                prepared.governance.clone(),
+            )
+            .await?;
+        for (expected_version, assignment) in (task.version..).zip(&prepared.assignments) {
+            sqlx::query("INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                .bind(&assignment.id).bind(&task.id).bind(&assignment.role_name)
+                .bind(assignment.assignee_type.as_ref().map(|kind| kind.to_string())).bind(&assignment.assignee_id)
+                .bind(&assignment.created_at).bind(&assignment.updated_at).execute(&mut **transaction).await?;
+            let updated =
+                sqlx::query("UPDATE task SET version = version + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND version = ?")
+                    .bind(now_rfc3339()).bind(&task.id)
+                    .bind(expected_version)
+                    .execute(&mut **transaction)
+                    .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        TaskRepo::get_by_id_in_tx(&*self.db, transaction, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
 }
