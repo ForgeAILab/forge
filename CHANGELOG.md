@@ -42,6 +42,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   for the Task being placed. With a single machine the outcome is the same as
   before: the Project pauses and the Task keeps its state without a failure
   annotation. API response shapes are unchanged.
+- Project environment checks have a `scope`: `workspace` (the default, which
+  existing checks keep) runs in a checkout; `machine` runs without one. Project
+  settings gain `placement.provision` (`when_verified`, the default, or
+  `never`) and `placement.provision_timeout_seconds` (default 1800, 1–86400).
+  Omitted fields take the defaults; regenerate API clients.
+- New deterministic placement refusals, each with a Task Attention item that
+  names the machine: `environment_unverified` (no machine-scope check can
+  verify a machine before code is copied to it) and `provision_failed` (five
+  failed provisioning attempts with the same inputs on the same connection).
+- Daemon run policies accept the purposes `environment_probe` and
+  `repo_provision`. A daemon that opts in needs a server from this release, so
+  upgrade the server first. The protocol revision stays 3; support is
+  advertised as `machine_probe.v1` and `repo_provision.v1`.
 - `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
   `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
   and keep-alive comments carry no id, so a reconnecting client keeps its last
@@ -420,6 +433,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - Agent responses carry `runnable_on`: the machines that have the Agent's
     executor (administrators see the machines; other users see a count). The
     Agents page shows it, and "Cannot run" when there is none.
+- Placement can use a daemon that does not have the Project's code yet. With
+  `placement.provision = when_verified`, Forge runs the Project's
+  machine-scope checks on that daemon, clones the repository into
+  `workspace_root/repos/<repo id>` on the configured branch, runs the full
+  checks, and then dispatches there. Failed clones retry with backoff across
+  server restarts and stop after five attempts (`provision_failed`); a
+  relevant settings change or a reconnect starts over. URL credentials are
+  redacted from errors. A Task that only waits for capacity never triggers a
+  clone. Migration V202610021500 adds the retry records.
+  - A machine-scope check that fails on a daemon without the code marks only
+    that machine not ready; the Project is not paused.
+  - On daemons that support machine probes, "Check now"
+    (`POST /api/v1/projects/{id}/environment/recheck`) runs without a recorded
+    workspace.
+  - Project settings, Environment tab: per-check scope and the provisioning
+    policy. `forge-ctl project env-check --scope workspace|machine`.
 - Machine run caps.
   - Server host: `server.max_concurrent_runs` in the config file,
     `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
