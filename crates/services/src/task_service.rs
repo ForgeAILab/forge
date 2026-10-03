@@ -446,6 +446,7 @@ pub struct TaskService {
 pub struct TransitionResult {
     pub task: Task,
     pub review: Option<Review>,
+    pub pending_steps: i64,
 }
 
 pub struct TransitionOptions {
@@ -2047,3 +2048,14 @@ fn remote_terminal_error_message(
 
 #[cfg(test)]
 mod tests;
+
+impl TaskService {
+    pub fn task_step_worker(&self) -> Arc<crate::worker_runtime::queue::TaskStepWorker> {
+        Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(
+            self.workflow_engine(),
+        ))
+    }
+    pub async fn drain(&self, task_id: &str) -> Result<Task> {
+        self.task_step_worker().drain(task_id).await
+    }
+}

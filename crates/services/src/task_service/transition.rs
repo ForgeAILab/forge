@@ -10,7 +10,12 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        self.transition_inner(task_id.into(), new_status, options.into(), None)
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), None),
+            )
             .await
     }
 
@@ -21,13 +26,13 @@ impl TaskService {
         options: impl Into<TransitionOptions>,
         execution_id: &str,
     ) -> Result<TransitionResult> {
-        self.transition_inner(
-            task_id.into(),
-            new_status,
-            options.into(),
-            Some(execution_id),
-        )
-        .await
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), Some(execution_id)),
+            )
+            .await
     }
 
     async fn transition_inner(
@@ -159,13 +164,13 @@ impl TaskService {
                 }),
             )
             .await?;
-        // Entry/after-enter hooks can update metadata without changing the
-        // Task version (for example, a manual review marker). Reload the
-        // committed row so the returned Task snapshot and its version carry
-        // the same state used by API readiness calculations.
-        let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
+            Arc::clone(&self.db),
+            result.queued_step_id.as_deref(),
+        );
+        // The engine returns the requested transition's settled inline
+        // snapshot. A concurrent writer cannot replace it in this response.
+        let mut task = result.task;
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -271,8 +276,18 @@ impl TaskService {
         }
         self.reconcile_terminal_subtask(&task).await;
 
+        if let Some(persisted) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? {
+            if persisted.status == task.status && persisted.version == task.version {
+                task = persisted;
+            }
+        }
+        let pending_steps = db::TaskStepRepo::pending_steps(&*self.db, &task_id).await?;
+        if let Some(id) = &result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id, task.version).await?;
+        }
         Ok(TransitionResult {
             task,
+            pending_steps,
             review: result.review,
         })
     }

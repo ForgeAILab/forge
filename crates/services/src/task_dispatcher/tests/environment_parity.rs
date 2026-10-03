@@ -37,7 +37,7 @@ async fn environment_asset_check_launches_after_staging_without_probe() {
     assign_role(&db, &task.id, "coder", &agent).await;
     configure(&db,&project,serde_json::json!({"assets":[{"source":assets.path(),"target":"vendor/model"}],"checks":[{"name":"model","command":"test -f vendor/model/weights.bin"}]})).await;
     let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), launches.recv())
             .await

@@ -44,6 +44,16 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        self.task_action_snapshot_for_task(task, actor).await
+    }
+
+    /// Derive offers for a known committed Task without replacing it with a
+    /// newer row while an asynchronous cascade is advancing in the background.
+    pub async fn task_action_snapshot_for_task(
+        &self,
+        task: Task,
+        actor: &Actor,
+    ) -> Result<TaskSnapshot> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;

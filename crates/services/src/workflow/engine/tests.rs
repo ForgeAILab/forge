@@ -442,86 +442,321 @@ fn cascade_chain_workflow(steps: usize) -> WorkflowDefinition {
     }
 }
 
-#[tokio::test]
-async fn terminal_cascade_completes_at_depth_limit() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(64));
-    let mut events = event_bus.subscribe();
-    let task_id = "terminal-cascade-depth";
-    seed_project_repo_and_task(&db, task_id, "start").await;
-    // Entry into step_0 is depth 0; step_8 must still cascade into done.
-    // This also traverses the old depth-3 cutoff on the way there.
-    let workflow = cascade_chain_workflow(9);
-    let task = TaskRepo::get_by_id(&*db, task_id, false)
+async fn drain(engine: WorkflowEngine, task_id: &str) -> db::Task {
+    crate::worker_runtime::queue::TaskStepWorker::new(engine)
+        .drain(task_id)
+        .await
+        .expect("cascade queue drains")
+}
+
+async fn drain_result(
+    driver: WorkflowEngine,
+    mut result: super::TransitionResult,
+) -> super::TransitionResult {
+    result.task = drain(driver.clone(), &result.task.id).await;
+    result.review = db::ReviewRepo::list_by_task(&*driver.db, &result.task.id)
         .await
         .unwrap()
-        .unwrap();
-    let result = engine(Arc::clone(&db), event_bus)
-        .transition(
-            task_id,
-            "step_0",
-            task.version,
-            &workflow,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            "start cascade chain",
-            false,
-        )
-        .await
-        .expect("terminal cascade completes");
-    assert_eq!(result.task.status, "done");
-    assert!(result.cascaded);
-    let transitions = TransitionLogRepo::list_by_task(&*db, task_id)
-        .await
-        .unwrap();
-    assert_eq!(transitions.len(), 10);
-    assert_eq!(transitions.last().unwrap().from_state, "step_8");
-    assert!(!drain_events(&mut events)
-        .iter()
-        .any(|event| { event.event_type == "transition.cascade_depth_exceeded" }));
+        .into_iter()
+        .max_by_key(|r| r.attempt_number);
+    result.pending_steps = 0;
+    result
 }
 
 #[tokio::test]
-async fn nonterminal_cascade_stops_at_depth_limit_and_publishes_event() {
+async fn long_legitimate_cascade_returns_own_commit_then_drains_without_parking() {
     let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(64));
-    let mut events = event_bus.subscribe();
-    let task_id = "nonterminal-cascade-depth";
-    seed_project_repo_and_task(&db, task_id, "start").await;
-    let workflow = cascade_chain_workflow(10);
-    let task = TaskRepo::get_by_id(&*db, task_id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    let result = engine(Arc::clone(&db), event_bus)
+    let bus = Arc::new(EventBus::new(256));
+    let mut events = bus.subscribe();
+    let id = "long-chain";
+    seed_project_repo_and_task(&db, id, "start").await;
+    // 40 distinct edges, over four times the hotfix's nine-hop carry chain.
+    let workflow = cascade_chain_workflow(40);
+    let result = engine(db.clone(), bus.clone())
         .transition(
-            task_id,
+            id,
             "step_0",
-            task.version,
+            1,
             &workflow,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            "start cascade chain",
+            "start",
             false,
         )
         .await
-        .expect("nonterminal cascade is bounded");
-    assert_eq!(result.task.status, "step_8");
+        .unwrap();
+    assert_eq!(result.task.status, "step_0");
+    assert_eq!(result.pending_steps, 1);
     assert_eq!(
-        TransitionLogRepo::list_by_task(&*db, task_id)
+        TaskRepo::get_by_id(&*db, id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "step_0"
+    );
+    let settled = drain(engine(db.clone(), bus), id).await;
+    assert_eq!(settled.status, "done");
+    assert!(settled.blocked_json.is_none());
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*db, id)
             .await
             .unwrap()
             .len(),
-        9
+        41
     );
-    let exceeded = drain_events(&mut events)
-        .into_iter()
-        .filter(|event| event.event_type == "transition.cascade_depth_exceeded")
-        .collect::<Vec<_>>();
-    assert_eq!(exceeded.len(), 1);
-    assert!(matches!(
-        &exceeded[0].context,
-        events::EventContext::TransitionCascadeDepthExceeded { state, depth: 8, .. }
-            if state == "step_8"
-    ));
+    assert!(db::TaskStepRepo::task_steps(&*db, id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|s| s.status == "done"));
+    assert!(!drain_events(&mut events)
+        .iter()
+        .any(|e| e.event_type == "transition.loop_detected"));
+}
+
+#[tokio::test]
+async fn automatic_chain_bound_parks_and_publishes_loop_event() {
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(512));
+    let mut events = bus.subscribe();
+    let id = "bounded-chain";
+    seed_project_repo_and_task(&db, id, "start").await;
+    let workflow = cascade_chain_workflow(66);
+    engine(db.clone(), bus.clone())
+        .transition(
+            id,
+            "step_0",
+            1,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start",
+            false,
+        )
+        .await
+        .unwrap();
+    let settled = drain(engine(db.clone(), bus), id).await;
+    assert_eq!(settled.status, "step_64");
+    assert!(settled
+        .blocked_json
+        .as_deref()
+        .unwrap()
+        .contains("limit 64"));
+    let steps = db::TaskStepRepo::task_steps(&*db, id).await.unwrap();
+    assert_eq!(steps.last().unwrap().status, "parked");
+    assert_eq!(steps.last().unwrap().chain_position, 65);
+    assert_eq!(
+        drain_events(&mut events)
+            .iter()
+            .filter(|e| e.event_type == "transition.loop_detected")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn review_carry_two_refresh_rounds_complete_without_parking() {
+    use db::{ReviewRepo, TaskStepRepo};
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(128));
+    let id = "review-carry-chain";
+    seed_project_repo_and_task(&db, id, "review").await;
+    let mut merging = with_trigger(
+        state("merging", StateKind::Gate, None, StateHooks::default()),
+        WorkflowTrigger::Accept,
+        "done",
+    );
+    merging.triggers.insert(
+        WorkflowTrigger::Reject,
+        WorkflowTriggerDefinition {
+            to: "merge_failed".into(),
+            dispatch: None,
+        },
+    );
+    let workflow = WorkflowDefinition {
+        roles: vec![],
+        configuration: vec![],
+        cancellation_state: None,
+        states: vec![
+            with_trigger(
+                state("review", StateKind::Gate, None, StateHooks::default()),
+                WorkflowTrigger::Accept,
+                "merging",
+            ),
+            merging,
+            with_trigger(
+                state("merge_failed", StateKind::Gate, None, StateHooks::default()),
+                WorkflowTrigger::Accept,
+                "review",
+            ),
+            state("done", StateKind::Terminal, None, StateHooks::default()),
+        ],
+    };
+    let driver = engine(db.clone(), bus);
+    let mut parent: Option<db::TaskStep> = None;
+    let mut previous_chain = None;
+    // Each rebase/CI result creates a new Review, exactly the carry producer's
+    // new evidence boundary. A repeated edge without that result parks.
+    for (index, target) in [
+        "merging",
+        "merge_failed",
+        "review",
+        "merging",
+        "merge_failed",
+        "review",
+        "merging",
+        "done",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if index == 3 || index == 6 {
+            let now = now_rfc3339();
+            let execution_id = new_uuid_v4();
+            sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES (?,?,'coder','completed',?,?)")
+                .bind(&execution_id).bind(id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            ReviewRepo::create(
+                &*db,
+                db::CreateReview {
+                    id: new_uuid_v4(),
+                    task_id: id.into(),
+                    execution_id,
+                    attempt_number: index as i64,
+                    status: db::ReviewStatus::Passed,
+                    step_results_json: "{}".into(),
+                    started_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let task = TaskRepo::get_by_id(&*db, id, false).await.unwrap().unwrap();
+        let input = driver
+            .cascade_step_input(
+                &task,
+                &workflow,
+                (*target).into(),
+                "review carry fixture".into(),
+                false,
+                false,
+                None,
+                parent.as_ref(),
+                format!("carry:{index}"),
+            )
+            .await
+            .unwrap();
+        if index == 3 || index == 6 {
+            assert_ne!(previous_chain.as_ref(), Some(&input.chain_id));
+            assert_eq!(input.chain_position, 1);
+        }
+        previous_chain = Some(input.chain_id.clone());
+        db.enqueue_step(&input).await.unwrap();
+        db.ready_step(&input.id, task.version).await.unwrap();
+        let settled = drain(driver.clone(), id).await;
+        assert_eq!(settled.status, *target);
+        assert!(settled.blocked_json.is_none());
+        parent = db.task_steps(id).await.unwrap().last().cloned();
+    }
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*db, id)
+            .await
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(db
+        .task_steps(id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|s| s.status == "done"));
+}
+
+#[tokio::test]
+async fn repeated_edge_parks_instead_of_transitioning_again() {
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(64));
+    let id = "loop-chain";
+    seed_project_repo_and_task(&db, id, "start").await;
+    let mut workflow = cascade_chain_workflow(2);
+    workflow.states[2]
+        .triggers
+        .get_mut(&WorkflowTrigger::Accept)
+        .unwrap()
+        .to = "step_0".into();
+    workflow.states[2].hooks.on_enter =
+        vec![hook("auto_cascade_on_unassigned_role", FailurePolicy::Log)];
+    engine(db.clone(), bus.clone())
+        .transition(
+            id,
+            "step_0",
+            1,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start",
+            false,
+        )
+        .await
+        .unwrap();
+    let settled = drain(engine(db.clone(), bus), id).await;
+    assert_eq!(settled.status, "step_0");
+    assert!(settled.blocked_json.is_some());
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*db, id)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        db::TaskStepRepo::task_steps(&*db, id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        "parked"
+    );
+}
+
+#[tokio::test]
+async fn moved_task_supersedes_pending_cascade() {
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(64));
+    let id = "superseded-chain";
+    seed_project_repo_and_task(&db, id, "start").await;
+    let workflow = cascade_chain_workflow(2);
+    engine(db.clone(), bus.clone())
+        .transition(
+            id,
+            "step_0",
+            1,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start",
+            false,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id=?")
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let settled = drain(engine(db.clone(), bus), id).await;
+    assert_eq!(settled.status, "done");
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*db, id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db::TaskStepRepo::task_steps(&*db, id).await.unwrap()[0].status,
+        "superseded"
+    );
 }
 
 #[tokio::test]
@@ -536,7 +771,7 @@ async fn lifecycle_ordering() {
         .expect("task loads")
         .expect("task exists");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             task_id,
             default_states::PLANNING,
@@ -548,6 +783,8 @@ async fn lifecycle_ordering() {
         )
         .await
         .expect("transition succeeds");
+
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
 
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
     let results = hook_results(&db, task_id).await;
@@ -842,7 +1079,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
         .expect("task loads")
         .expect("task exists");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             task_id,
             default_states::PLANNING,
@@ -854,6 +1091,8 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
         )
         .await
         .expect("planning gate is skipped");
+
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
 
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
     let transition_logs = TransitionLogRepo::list_by_task(&*db, task_id)
@@ -908,7 +1147,7 @@ async fn default_workflow_skips_system_review_when_no_checks_or_reviewer_are_ass
         .expect("task loads")
         .expect("task exists");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             task_id,
             default_states::REVIEW,
@@ -920,6 +1159,8 @@ async fn default_workflow_skips_system_review_when_no_checks_or_reviewer_are_ass
         )
         .await
         .expect("system-entered unconfigured review skips to merge gate");
+
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
 
     assert_eq!(result.task.status.to_string(), default_states::MERGING);
     let transition_logs = TransitionLogRepo::list_by_task(&*db, task_id)
@@ -1187,7 +1428,7 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
         .expect("task loads")
         .expect("task exists");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             task_id,
             default_states::PLANNING,
@@ -1201,6 +1442,7 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
         .expect("transition succeeds");
 
     assert!(result.cascaded);
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
     assert_eq!(
         result.task.status.to_string(),
         default_states::TODO,
@@ -1750,7 +1992,7 @@ async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
         .await
         .expect("project settings become invalid");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             &task_id,
             default_states::MERGE_FAILED,
@@ -1765,6 +2007,8 @@ async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
         )
         .await
         .expect("review refresh crosses the repair bridge");
+
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
 
     assert_eq!(result.task.status, default_states::REVIEW);
     let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
@@ -2175,7 +2419,7 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
         .await
         .expect("task review config updates");
 
-    let result = engine(Arc::clone(&db), event_bus)
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
         .transition(
             &task_id,
             "review",
@@ -2187,6 +2431,8 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
         )
         .await
         .expect("failed validation cascades back to working");
+
+    let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
 
     assert_eq!(result.task.status, "working");
     assert!(result.task.entry_barrier_json.is_none());
@@ -2384,6 +2630,8 @@ async fn before_work_workspace_reset_required_keeps_typed_recovery_annotation() 
         .await
         .expect("typed workspace blocker settles the transition");
 
+    let result = drain_result(fixture.engine.clone(), result).await;
+
     assert_eq!(result.task.status, "in_progress");
     let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
@@ -2447,6 +2695,7 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             )
             .await
             .unwrap();
+        let result = drain_result(fixture.engine.clone(), result).await;
         assert_eq!(result.task.status, "in_progress");
         assert!(result.task.entry_barrier_json.is_none());
         assert!(result.task.blocked_json.is_none());
@@ -4069,6 +4318,7 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
         )
         .await;
     let result = result.unwrap();
+    let result = drain_result(fixture.engine.clone(), result).await;
     assert_eq!(result.task.status, "in_progress");
     assert!(result.task.entry_barrier_json.is_none());
     let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
@@ -4349,4 +4599,37 @@ async fn dispatch_failure_upgrade_wake_preserves_a_concurrent_manual_deferral() 
             .unwrap()
     )
     .is_some());
+}
+
+#[tokio::test]
+async fn declared_pure_cascade_enqueue_failure_rolls_back_producing_transition() {
+    let db = Arc::new(sqlite_db().await);
+    let bus = Arc::new(EventBus::new(16));
+    let id = "atomic-declared";
+    seed_project_repo_and_task(&db, id, "start").await;
+    sqlx::query("CREATE TRIGGER reject_enqueue BEFORE INSERT ON task_step BEGIN SELECT RAISE(ABORT,'injected enqueue failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let result = engine(db.clone(), bus)
+        .transition(
+            id,
+            "step_0",
+            1,
+            &cascade_chain_workflow(1),
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "start",
+            false,
+        )
+        .await;
+    assert!(result.is_err());
+    let task = TaskRepo::get_by_id(&*db, id, false).await.unwrap().unwrap();
+    assert_eq!(task.status, "start");
+    assert_eq!(task.version, 1);
+    assert!(TransitionLogRepo::list_by_task(&*db, id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(db::TaskStepRepo::task_steps(&*db, id)
+        .await
+        .unwrap()
+        .is_empty());
 }

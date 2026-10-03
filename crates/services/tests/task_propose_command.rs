@@ -451,6 +451,21 @@ async fn count(db: &SqliteDb, query: &str) -> i64 {
         .expect("count")
 }
 
+// V202610030200 captures the Project-hook delivery in the Task writer's
+// transaction, alongside the command's Task-created audit event.
+async fn assert_task_creation_events(db: &SqliteDb, task_id: &str) {
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_type='task' AND entity_id=? ORDER BY event_type",
+    ).bind(task_id).fetch_all(db.pool()).await.expect("Task creation event bundle");
+    assert_eq!(
+        kinds,
+        vec![
+            "project_hook.task_created".to_owned(),
+            "task.created".to_owned()
+        ]
+    );
+}
+
 async fn role_ids(db: &SqliteDb, task_id: &str) -> Vec<String> {
     sqlx::query_scalar("SELECT id FROM task_role_assignment WHERE task_id = ? ORDER BY id")
         .bind(task_id)
@@ -545,7 +560,8 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("atomic bundle counts");
-    assert_eq!(bundle, (1, 1, 1, 1));
+    assert_eq!(bundle, (2, 1, 1, 1));
+    assert_task_creation_events(&fixture.db, &task_id).await;
 
     let outcome_json: String = sqlx::query_scalar(
         "SELECT outcome_json FROM command_receipt
@@ -1474,8 +1490,9 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
         )
         .await,
-        1
+        2
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,
@@ -1679,8 +1696,9 @@ async fn direct_task_proposal_commits_one_receipt_bundle_without_action_rows() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
         )
         .await,
-        1
+        2
     );
+    assert_task_creation_events(&fixture.db, &first.task.id).await;
 
     sqlx::query("UPDATE task SET title = 'live direct title' WHERE id = ?")
         .bind(&first.task.id)
@@ -1894,8 +1912,9 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
         )
         .await,
-        1
+        2
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,
@@ -1946,8 +1965,9 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task'",
         )
         .await,
-        1
+        2
     );
+    assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
         count(
             &fixture.db,

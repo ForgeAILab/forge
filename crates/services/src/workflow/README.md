@@ -22,7 +22,7 @@ Return one of:
 - `HookResult::Ok`: action succeeded.
 - `HookResult::Skipped { reason }`: action does not apply to this transition/context.
 - `HookResult::Failed { reason }`: action tried to run and failed.
-- `HookResult::Cascade { to, reason }`: request an engine-managed follow-up transition.
+- `HookResult::Cascade { to, reason }`: request a durable queued follow-up transition; use `TaskService::drain(task_id)` in tests before asserting its settled state.
 
 Always check preconditions first. Return `Skipped` when required context is missing, such as no workspace, no executor/execution row, no role assignment, or no applicable state config. This keeps human-driven board flows working: a user can move cards without having an agent workspace, and hooks record that they did not apply instead of breaking the transition.
 

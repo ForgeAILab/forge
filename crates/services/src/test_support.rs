@@ -198,3 +198,21 @@ pub(crate) async fn force_task_version_conflict_after_transition(
         .await
         .expect("test agent capacity cutover trigger creates");
 }
+
+/// Preserve final-state assertions while testing the asynchronous cascade path.
+pub(crate) async fn drain_transition(
+    service: &crate::TaskService,
+    mut result: crate::task_service::TransitionResult,
+) -> crate::task_service::TransitionResult {
+    result.task = service
+        .drain(&result.task.id)
+        .await
+        .expect("Task steps drain");
+    result.review = db::ReviewRepo::list_by_task(&*service.workflow_engine().db, &result.task.id)
+        .await
+        .expect("Review history loads")
+        .into_iter()
+        .max_by_key(|r| r.attempt_number);
+    result.pending_steps = 0;
+    result
+}

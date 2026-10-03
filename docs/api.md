@@ -125,7 +125,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
 | POST   | `/api/v1/tasks/{id}/actions` | Apply one offered closed verb and parameters at an exact Task version |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
-| POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
+| POST   | `/api/v1/tasks/{id}/transition` | Commit the requested transition; return `{task, review, pending_steps}` before queued cascades |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
 | POST   | `/api/v1/tasks/{id}/subtasks/reorder` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move |
 | GET    | `/api/v1/tasks/{id}/dependencies` | List prerequisite dependency edges |
@@ -163,6 +163,24 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}/pricing` | Remove the agent's adjustment (`?version=`) so it inherits again |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
+
+`POST /api/v1/tasks/{id}/transition` returns the Task snapshot produced by the
+requested transition, its inline Review (or `null`), and `pending_steps` (the
+number of pending or claimed cascade rows for that Task at response preparation).
+It does not wait for those follow-up transitions. For example, entering
+`planning` without a planner returns `task.status = "planning"` and
+`pending_steps = 1`; the queued hop later enters `in_progress`. Observe subsequent
+`task.status_changed` SSE events or issue a later `GET /api/v1/tasks/{id}` for the
+settled state. `pending_steps = 0` is a snapshot, not a promise that future agent
+or execution actions will never enqueue more work. Failed, parked, superseded
+and done rows do not count as pending.
+
+`forge_transition_task` retains its Task-with-offers result and adds the same
+`pending_steps` integer. The returned Task belongs to the requested transition;
+follow-up cascades are asynchronous on both REST and MCP. In this first outbox
+slice, the requested transition still runs its existing inline post-commit
+hooks (including CI and merge); moving that phase off requests is slice B.
+
 
 Agent responses include `runnable_on: {count, machines?}`. Admins receive
 `machines`, an array of `{id, name, owner_kind, daemon_id, runtime_id}`; other
@@ -2815,7 +2833,7 @@ agent default.
 `reason`, and optional `source`. When a user move would fail strict routing
 (missing edge or system-only trigger) but the target is a defined workflow
 state, the server auto-escalates to the user-routing-override path. MCP
-`forge_transition_task` is unchanged — it still emits `triggered_by="system"`
+`forge_transition_task` retains its MCP system attribution (`triggered_by="system"`)
 and does not support user override (REST-only for now).
 
 `approve` and `send_back` at `POST /api/v1/tasks/{id}/actions` accept the
@@ -2994,8 +3012,9 @@ project/column membership and adjacency, then writes status and position in one
 transaction. Same-column moves skip status hooks; cross-column moves retain
 workflow guards, cancellation, audit, hooks, dispatch, and cascades.
 
-The response contains the final task after synchronous cascades, the final
-board revision, and the submitted operation ID:
+The response contains the Task committed by the move, its board revision, and
+the submitted operation ID. Automatic cascade steps run asynchronously; their
+final state arrives through SSE or a later GET:
 
 ```json
 {
@@ -4377,7 +4396,7 @@ context contains `project_id`, `operation_id`, `old_status`, `new_status`,
 `old_board_position`, `new_board_position`, `task_version`, `board_revision`,
 `before_id`, and `after_id`. Status-changing moves drive the same internal
 lifecycle consumers as normal transitions but do not also publish a direct
-`task.status_changed` event. Synchronous cascades remain separate transitions
+`task.status_changed` event. Queued cascades remain separate transitions
 and can publish their own status events.
 
 Agent Chat events already committed to the durable outbox (message admission,

@@ -146,6 +146,7 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
         )
         .await
         .expect("prerequisite enters review");
+    let review = crate::test_support::drain_transition(&service, review).await;
     assert_eq!(review.task.status, "merging");
     TaskDependencyRepo::add_dependency(&*db, &dependent.id, &prerequisite.id, &now_rfc3339())
         .await
@@ -280,6 +281,7 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
         )
         .await
         .expect("prerequisite enters review");
+    let review = crate::test_support::drain_transition(&service, review).await;
     assert_eq!(review.task.status, "merging");
     let done = service
         .transition(review.task.id, "done".to_owned(), review.task.version)

@@ -29,6 +29,22 @@ pub struct Harness {
     _web_dist_dir: TestDir,
 }
 
+/// Settle queued workflow cascades deterministically before final-state assertions.
+pub async fn drain(state: &AppState, app: &Router, task_id: &str) -> TaskResponse {
+    state
+        .task_service
+        .drain(task_id)
+        .await
+        .expect("Task steps drain");
+    empty_request(
+        app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await
+}
+
 pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await

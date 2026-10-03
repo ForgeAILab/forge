@@ -413,6 +413,17 @@ impl TaskDispatcher {
                 },
             )
             .await;
+        // A gate may enqueue the actual role entry. Settle that admission on
+        // the background dispatcher before inspecting the next candidate's
+        // machine capacity or finalizing an initial placement refusal. REST
+        // and MCP still return their own committed transition immediately.
+        let transition = match transition {
+            Ok(mut result) if result.pending_steps > 0 => {
+                result.task = self.task_service.drain(&task.id).await?;
+                Ok(result)
+            }
+            other => other,
+        };
         // Log-policy entry failures can return Ok with the restored Task.
         // Rebase only that handled refusal; ordinary dispatch adds no read.
         if transition

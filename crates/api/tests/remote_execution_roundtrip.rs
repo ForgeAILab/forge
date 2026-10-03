@@ -27,11 +27,17 @@ use common::{
 };
 
 async fn poll_task_status_after_execution(
-    db: &Arc<db::SqliteDb>,
+    state: &api::AppState,
     task_id: &str,
     expected: &str,
 ) -> db::Task {
+    let db = &state.db;
     for _ in 0..200 {
+        state
+            .task_service
+            .drain(task_id)
+            .await
+            .expect("cascade steps drain");
         if let Some(task) = TaskRepo::get_by_id(&**db, task_id, false)
             .await
             .expect("task lookup")
@@ -410,8 +416,7 @@ async fn remote_execution_completes_and_transitions_task() {
     // part of this round-trip instead of leaving the task at the review gate.
     complete_remote_reviewer(&mut fixture.daemon_socket, &fixture.harness.state.db).await;
 
-    let reviewed =
-        poll_task_status_after_execution(&fixture.harness.state.db, &task_id, "done").await;
+    let reviewed = poll_task_status_after_execution(&fixture.harness.state, &task_id, "done").await;
     assert_eq!(reviewed.status, "done");
 
     let logs = poll_execution_logs(&fixture.harness.app, &execution_id, 3).await;

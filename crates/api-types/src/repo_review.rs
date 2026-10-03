@@ -424,9 +424,16 @@ pub struct UnreadCountResponse {
     pub count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct TransitionTaskResponse {
+    /// Pending and claimed cascades at response preparation; later state is
+    /// delivered by SSE or GET, not by waiting in this request.
+    #[ts(type = "number")]
+    pub pending_steps: i64,
+    #[ts(type = "import('../api').Task")]
     pub task: TaskResponse,
+    #[ts(type = "import('../api').Review | null")]
     pub review: Option<ReviewResponse>,
 }
 

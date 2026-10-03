@@ -3255,10 +3255,12 @@ remote owners/providers. Evidence uses the execution's immutable terminal time,
 so later edits to an old execution cannot supersede a rebase head. A recording
 failure is logged without failing the successful Git operation; reconciliation
 may then require an explicit reset.
-Terminal reports are acknowledged only after their Task cascade commits. A
-report received during suspension stays unacknowledged until reconciliation and
-cascade settlement finish; retained reports can replay after a cascade failure
-or server restart.
+Terminal reports are acknowledged after reconciliation and the initiating Task
+transition plus any discovered cascade enqueue commit. Queued follow-up hops
+may still be pending at acknowledgement; SSE or a later GET reports their final
+Task state. A report received during suspension stays unacknowledged until that
+settlement finishes; retained reports can replay after a settlement failure or
+server restart.
 A periodic sweep
 retries reconciliation for disconnected placements whose owner is online, so
 an interrupted reconnect can finish after a server restart. The workspace cleanup
@@ -3373,6 +3375,10 @@ backlog ──► todo ──► planning ──► in_progress ──► review
 
                          any non-terminal state ──► cancelled
 ```
+
+REST/MCP transition responses describe the requested commit; automatic cascade
+hops are durable queued steps. A response's `pending_steps` tells clients that
+follow-up work remains; SSE or a later GET supplies its final state.
 
 All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `cancelled`. The default workflow lives in
@@ -3623,7 +3629,7 @@ is a root or subtask, whether its **current** state belongs to the inherited
 subtask workflow, and the acting party (`triggered_by`). The result is passed
 into wrapper pre-checks, `WorkflowEngine::transition` / `transition_inner`,
 and `HookContext` so hook actions, cascades, and advance steps consume the same
-definition — no downstream layer re-resolves for that transition. Each nested
+definition — no downstream layer re-resolves for that transition. Each queued
 transition entry (for example a system cascade step) calls the same function at
 its own entry, which is correct because resolution keys on current-state
 membership, not on who started the original user move.
@@ -3753,12 +3759,70 @@ in the compact Task list's existing `workflow_health` projection.
    `B.after_enter` hooks. Gate states with `max_rejections` get
    `check_retry_budget` prepended unless already present.
 5. Backfill `transition_log.hook_results_json`.
-6. If an entry/exit hook returns `HookResult::Cascade`, recursively transition
-   with `triggered_by = "system"`. Non-terminal cascades stop at depth eight
-   and publish `transition.cascade_depth_exceeded`; terminal targets always
-   complete because terminal states are absorbing. Eight allows the normal
-   `review → merging → merge_failed → review → merging → done` review-authority
-   carry chain plus another target-moved rebase round.
+6. If an entry/exit hook returns `HookResult::Cascade`, enqueue a durable
+   `task_step` instead of recursively transitioning. The requested transition
+   returns its own Task snapshot, inline Review, and `pending_steps` count;
+   cascades settle asynchronously. The final state arrives through SSE
+   `task.status_changed` or a later GET. Tests use `TaskService::drain(task_id)`.
+
+The `task_step` cascade outbox orders rows by a monotonically increasing `seq`
+per Task. Its leased worker lives in `worker_runtime/queue.rs` and is registered
+with the common runtime supervisor. Up to eight different Tasks run in parallel;
+only the earliest unfinished row of each Task is eligible. Claims carry a unique
+owner token and a renewable 60-second lease. A missed in-process commit kick
+falls back to a 250 ms poll; expired claims are reclaimed after a restart. The
+step's `done` write shares the transition's status/version CAS transaction.
+Each hop resolves the current applicable workflow at its own system entry and
+fences that observed Project authority in the CAS. A removed cascade target
+fails visibly rather than silently applying an old workflow. Its
+lease remains held through the existing inline hook phase, so the next queued
+hop cannot overlap those hooks even in another process.
+
+Each step fences the exact producing status and final inline Task version. If
+another writer moved or edited the Task, the step becomes `superseded`, with a
+reason and no transition or retry. Producers reserve eligibility until their
+inline hook and service-wrapper writes finish; readiness binds only that
+reserved row to the final version of the same status entry. A lost reservation
+becomes eligible after 60 seconds and is still checked against its recorded
+status/version. Transient availability/database failures retry with exponential
+backoff (1–64 seconds, at most eight attempts). Deterministic failures become
+`failed` and persist a `dispatch_failed` Task annotation consumed by existing
+recovery views. An exception from the retained inline hook phase after the CAS
+records `failed` with an explicit "transition committed" annotation; it never
+replays that applied transition. If a later Task entry interrupted the hooks,
+the predecessor remains `done` with its diagnostic and the later entry is not
+annotated. Queue history retains every outcome.
+
+Loop detection replaces recursion depth. Within an uninterrupted automatic
+chain, a repeated `(from_status, to_status)` edge or position greater than 64
+parks the Task with `blocked_json`, a recovery annotation, and
+`transition.loop_detected`. Sixty-four exceeds four times the longest legitimate
+nine-hop carry sequence found during inventory. Human/agent/execution entries
+start new chains. A fresh completed CI/Review result is also an execution-result
+boundary: review-authority carry after a rebase may legitimately repeat the
+review-to-merging edge, and the new Review evidence starts a new chain. This is
+recorded using the Review id and update timestamp in the step payload.
+
+Slice A preserves post-commit hooks. A cascade known before the status CAS
+(including board-move before-enter hooks) is inserted in the same transaction.
+A context-independent completion cascade also declares its intent when it is
+the first reachable hook and no earlier exit/entry hook can intercept it. Its
+hook still runs in its existing post-commit phase; the intent is already durable.
+A cascade learned by post-commit CI, merge, dispatch or entry-retry hooks is
+idempotently enqueued immediately after hook settlement, keyed by the producing
+transition-log id (or the versioned entry-retry identity). Those effects cannot
+be moved into the CAS transaction without moving the hook phase itself; a
+crash before their enqueue remains the explicit slice-B gap. Completion
+serialization, merge-hook single-flight tracking, running entry barriers and
+the stale-merging re-drive remain in place. Direct non-cascade writers remain
+until slice C; queued-step leases alone are not yet a universal Task writer.
+
+Initial admission on the background dispatcher settles its queued gate steps
+through the same leased worker before checking another candidate's machine
+capacity or finalizing a placement refusal. This preserves admission ordering
+and stable refusal annotations without delaying REST/MCP cascade responses.
+Recovery replay consumes its command marker in its transition CAS, so its
+own subsequent cleanup cannot invalidate the newly queued step.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
 barrier until those hooks and the target state's inline `on_enter` dispatch
@@ -3872,7 +3936,7 @@ existing post-commit crash gap detectable, while board/task refetch remains the
 recovery source of truth. Each newly committed direct move publishes exactly
 one `task.moved` event after commit. Status-changing move events feed lifecycle,
 project-hook, notification, and operation-status consumers in place of a second
-direct `task.status_changed`; any synchronous cascade emits its own normal
+direct `task.status_changed`; any queued cascade emits its own normal
 transition event.
 
 **User routing override:** When a user actor's move would be rejected solely

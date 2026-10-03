@@ -872,10 +872,8 @@ export interface Review {
   updated_at: string
 }
 
-export interface TransitionTaskResponse {
-  task: Task
-  review: Review | null
-}
+export type TransitionTaskResponse =
+  import('./bindings/TransitionTaskResponse').TransitionTaskResponse
 
 export interface NotificationResponse {
   id: string

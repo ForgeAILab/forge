@@ -717,7 +717,21 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    task_with_offers(state, task.task).await
+    transition_task_value(state, task.task, task.pending_steps).await
+}
+
+async fn transition_task_value(
+    state: &AppState,
+    task: db::Task,
+    pending_steps: i64,
+) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot_for_task(task, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    let mut value = task_snapshot_value(snapshot)?;
+    value["pending_steps"] = json!(pending_steps);
+    Ok(value)
 }
 
 pub(super) async fn forge_register_agent(
@@ -1991,4 +2005,47 @@ fn chat_status(value: &str) -> AgentChatStatus {
 
 fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transition_response_keeps_committed_task_after_background_advance() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let state = AppState::new(db.clone(), Arc::new(events::EventBus::new(16)));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('t','p','task','todo',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let committed = TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let value = transition_task_value(&state, committed, 1).await.unwrap();
+        assert_eq!(value["status"], "todo");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["pending_steps"], 1);
+        assert!(value["available_actions"].is_array());
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, "t", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "done"
+        );
+    }
 }

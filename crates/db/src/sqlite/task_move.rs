@@ -272,6 +272,9 @@ impl TaskBoardRepo for SqliteDb {
         .bind(&input.operation_id)
         .execute(&mut *tx)
         .await?;
+        if let Some(step) = &input.cascade_step {
+            crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
+        }
         tx.commit().await?;
 
         Ok(MoveTaskPersistence::Committed {

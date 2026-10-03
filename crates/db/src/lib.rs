@@ -15,6 +15,8 @@ mod repository;
 mod review_conformance;
 mod sqlite;
 mod task_metadata;
+mod task_step;
+pub use task_step::*;
 #[cfg(test)]
 mod tests;
 mod time;

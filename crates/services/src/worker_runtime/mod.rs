@@ -2,6 +2,7 @@
 //! source-neutral DB health, poison policy and loop supervision.
 mod event_source;
 mod policy;
+pub mod queue;
 mod supervisor;
 
 pub use db::EventSubscription as Subscription;
