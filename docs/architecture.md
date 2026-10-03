@@ -1949,8 +1949,8 @@ an account-owned Forge provider entry and lease.
 Protected session/checkpoint payloads use a versioned zstd envelope inside
 authenticated encryption; earlier encrypted JSON rows remain readable and are
 converted on their next state change. Snapshot digests use domain-separated
-HMAC-SHA256 with the protected store key and exclude the save timestamp, so
-unchanged saves do no encryption or database write. Checkpoints
+HMAC-SHA256 with the protected store key and exclude the save timestamp and
+diagnostic manifests, so unchanged saves do no encryption or database write. Checkpoints
 are idempotent by session, turn, revision, and operation fingerprint, and retain
 the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
 also serves as the session snapshot (NULL standalone snapshot columns reference
@@ -1964,6 +1964,27 @@ separately so a standalone save cannot relabel an older checkpoint. A checkpoint
 decode failure returns an error naming the runtime session; it cannot safely
 fall back to fresh state because that would discard provider/tool recovery
 barriers.
+
+Runtime manifests are an ordered recent window (default 32 planned steps),
+not a lifetime session archive. New protected checkpoints omit this diagnostic
+window, while ordinary snapshots preserve any supplied manifests and the
+runtime-owned `runtime.manifest_boundary` extension. The boundary remains part
+of the snapshot digest. Loading the checkpoint-backed snapshot or saving the
+live diagnostic window therefore preserves the same canonical state identity.
+Forge links context provenance from the latest manifest in the live session
+after the turn; it does not reconstruct historical replay from a checkpoint.
+
+Native turn failures project runtime failure classes into Forge's existing
+typed categories: policy denial, context overflow, authentication, quota,
+provider-stage request rejection, and typed turn limits retain their evidence.
+Retry delays and quota reset timestamps remain optional, including explicit
+zero. Transient/rate-limit classification alone never authorizes a retry, and
+local Config failures carrying only transience or request-rejection evidence
+retain their unclassified projection. State conflicts,
+host-component failures, non-provider request rejection, cancellation, internal
+failures, and unknown classes retain the coarse kind/retryability projection;
+nonretryable conflicts are not promoted into provider cooldowns. Credential
+recovery remains runtime-owned and is not a Forge retry or authority grant.
 
 Forge does not configure Agent Runtime's tool-step or turn-time limits; their
 defaults are `None`. Task workflow `max_turns` is also optional and has no
@@ -2028,6 +2049,12 @@ drops superseded LCM component state on load — from the session snapshot and
 from the checkpoint's copy, which the resume overlay would otherwise reinstate
 — leaving the coordinator to rebuild it from `agent_lcm_entry` /
 `agent_lcm_node`. Bump that constant with any change to those three policies.
+
+The runtime's process-local history/LCM accounting cache still reads authorized
+inclusive ranges in pages of at most 1,024 entries and checks the DAG revision
+before and after pressure accounting. Forge's store and sizer satisfy those
+contracts without changing `FORGE_LCM_POLICY_REVISION` or dropping session LCM
+state.
 
 Leaf compaction only cuts at user boundaries, and an agentic turn is not
 bounded by one reply: a Project Agent tool loop can put tens of thousands of
