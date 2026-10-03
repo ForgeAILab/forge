@@ -3077,7 +3077,10 @@ configured agent, `create_task` creates a task, `add_comment` adds a task
 comment, and `notify` creates a notification. `task.stuck` is
 deferred to a future stuck-signal change. Run history is available at
 `GET /api/v1/projects/{id}/project_hook_runs` with `items` and `next_cursor`
-pagination.
+pagination. The `project-hooks` runtime consumer evaluates committed Task events;
+its DB actions commit with its cursor. External dispatch uses a durable started
+run and is at most once: a crash before launch may leave a `running` hook run
+without an execution, and restart does not launch it again.
 
 ## Prompt preview
 
@@ -3262,11 +3265,15 @@ Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
 
 ## Notifications
 
-Notifications are created server-side from workflow events and delivered both
-through the REST endpoints above and as `notification.created` SSE events.
+The `notifications` runtime consumer creates notifications from durable workflow
+outcomes and immutable `notification.requested` records. Each notification row
+commits with the consumer cursor; `notification.created` is a best-effort live
+SSE hint after commit, while REST exposes the retained inbox. Migration
+`V202610030200` starts both this consumer and `project-hooks` at the log head,
+so upgrading never fires historical hooks or notifications.
 `event_type` values: `task.done`, `task.blocked`, `task.failed`,
 `task.recovery_required`, `review.passed`, `review.failed`, `merge.failed`,
-and `project_hook.notify`. `task.recovery_required` fires when crash recovery
+`project.autonomy_stalled`, and `project_hook.notify`. `task.recovery_required` fires when crash recovery
 or an agent heartbeat timeout leaves a task needing manual recovery;
 graceful-shutdown recoveries auto-resume at the next startup and are not
 notified. `execution.failed` and `execution.cancelled` are deliberately not

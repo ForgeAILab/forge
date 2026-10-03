@@ -2094,7 +2094,7 @@ SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
 Durable consumers checkpoint only after their projection is safe to commit, so
 lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
-memory indexing, or commitment reconciliation. Four durable consumers use the
+memory indexing, notification rows, Project hook DB actions, or commitment reconciliation. Six durable consumers use the
 single-process worker runtime described below. SSE uses a read-only in-memory
 tail and connection-time ledger replay.
 
@@ -2210,6 +2210,41 @@ rows are recreated. The consumer placements are:
 | `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
 | `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
 | `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
+| `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | None | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
+| `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
+
+
+Project hooks and notifications cut over in migration `V202610030200`.
+Each new cursor is seeded at `MAX(domain_event.sequence)` in the migration
+transaction; existing cursors and all user history survive. Only events committed
+after this upgrade boundary can trigger either consumer. Health and live lag use
+the existing operator consumer shape and process-owned worker registry.
+
+Task creation/archive and human interruption signals previously had only bus
+hints. The migration adds writer-transaction triggers for `project_hook.task_created`,
+`project_hook.task_archived`, and `notification.requested`. A request freezes the original
+Project/Task, title, event kind and full body for `task.blocked`, `task.failed`,
+manual `task.recovery_required` (crash/heartbeat, excluding shutdown), and
+`merge.failed` (detected merge conflict/dirty target). Review completion uses
+`review.status_changed`; automatic and manual board transitions share
+`task.transitioned`. Direct status mutations use `task.status_changed`.
+Attention records a zero-budget Project autonomy stall's `notification.requested`
+in the same wake-decision transaction, including the open-incident count.
+Raw execution attempt events remain silent. Live UI bus publications remain,
+but neither consumer subscribes to them.
+
+Notification creation and Project hook notification/comment/Task actions are
+atomic with their checkpoints. Existing Project/rule/epoch uniqueness, cooldown,
+concurrency, action content and dispatch prompt apply. Hook dispatch commits the
+automation Task and a `project_hook_run.status = running` started marker with the
+cursor before invoking the existing launch path in `after_commit`. The external
+launch is **at most once** per admitted run: a restart or duplicate evaluation
+never launches that run again, even if it crashed after the launch or just before
+it. Exactly-once external execution is impossible without cooperation from the
+external runner. A crash between commit and launch may therefore leave a running
+run with an automation Task but no execution; it is deliberately not retried.
+Live SSE hints and derived comment-memory indexing are best effort after commit;
+the authoritative rows remain queryable after a crash before publication.
 
 The three migrated consumers use the standard eight-strike policy for unexpected
 hook faults and a five-minute handle timeout. Preparation performs local database

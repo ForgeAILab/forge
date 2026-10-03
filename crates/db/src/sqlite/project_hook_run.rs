@@ -48,109 +48,20 @@ impl ProjectHookRunRepo for SqliteDb {
         skip_reason: &str,
     ) -> Result<Option<ProjectHookRun>> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let sql = format!(
-            "INSERT INTO project_hook_run ({PROJECT_HOOK_RUN_COLUMNS}) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(project_id, rule_id, dedupe_key) DO NOTHING \
-             RETURNING {PROJECT_HOOK_RUN_COLUMNS}"
-        );
-        let Some(run) = sqlx::query(&sql)
-            .bind(&input.id)
-            .bind(&input.project_id)
-            .bind(&input.rule_id)
-            .bind(&input.trigger_type)
-            .bind(&input.dedupe_key)
-            .bind(input.status.to_string())
-            .bind(input.source_task_id.as_deref())
-            .bind(input.source_execution_id.as_deref())
-            .bind(input.automation_task_id.as_deref())
-            .bind(input.execution_id.as_deref())
-            .bind(input.agent_id.as_deref())
-            .bind(input.reason.as_deref())
-            .bind(&input.created_at)
-            .bind(&input.updated_at)
-            .bind(input.completed_at.as_deref())
-            .fetch_optional(&mut *transaction)
-            .await?
-            .map(map_project_hook_run)
-            .transpose()?
-        else {
-            transaction.commit().await?;
-            return Ok(None);
-        };
-
-        let active_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_hook_run \
-             WHERE project_id = ? \
-               AND rule_id = ? \
-               AND status IN ('queued', 'running', 'dispatched') \
-               AND completed_at IS NULL",
-        )
-        .bind(&input.project_id)
-        .bind(&input.rule_id)
-        .fetch_one(&mut *transaction)
-        .await?;
-
-        let run = if active_count > max_active_runs {
-            let sql = format!(
-                "UPDATE project_hook_run \
-                 SET status = ?, reason = ?, updated_at = ?, completed_at = ? \
-                 WHERE id = ? RETURNING {PROJECT_HOOK_RUN_COLUMNS}"
-            );
-            sqlx::query(&sql)
-                .bind(ProjectHookRunStatus::Skipped.to_string())
-                .bind(skip_reason)
-                .bind(&input.updated_at)
-                .bind(&input.updated_at)
-                .bind(&run.id)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .map(map_project_hook_run)
-                .transpose()?
-                .ok_or(DbError::NotFound)?
-        } else {
-            run
-        };
-
+        let run = self
+            .claim_project_hook_run_in_tx(&mut transaction, input, max_active_runs, skip_reason)
+            .await?;
         transaction.commit().await?;
-        Ok(Some(run))
+        Ok(run)
     }
 
     async fn update_status(&self, input: UpdateProjectHookRun) -> Result<ProjectHookRun> {
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE project_hook_run SET status = ");
-        query.push_bind(input.status.to_string());
-        if let Some(automation_task_id) = input.automation_task_id {
-            query
-                .push(", automation_task_id = ")
-                .push_bind(automation_task_id);
-        }
-        if let Some(execution_id) = input.execution_id {
-            query.push(", execution_id = ").push_bind(execution_id);
-        }
-        if let Some(agent_id) = input.agent_id {
-            query.push(", agent_id = ").push_bind(agent_id);
-        }
-        if let Some(reason) = input.reason {
-            query.push(", reason = ").push_bind(reason);
-        }
-        if let Some(completed_at) = input.completed_at {
-            query.push(", completed_at = ").push_bind(completed_at);
-        }
-        query
-            .push(", updated_at = ")
-            .push_bind(&input.updated_at)
-            .push(" WHERE id = ")
-            .push_bind(&input.id)
-            .push(" RETURNING ")
-            .push(PROJECT_HOOK_RUN_COLUMNS);
-
-        query
-            .build()
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_project_hook_run)
-            .transpose()?
-            .ok_or(DbError::NotFound)
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let run = self
+            .update_project_hook_run_in_tx(&mut transaction, input)
+            .await?;
+        transaction.commit().await?;
+        Ok(run)
     }
 
     async fn list_recent_for_project(
@@ -279,4 +190,119 @@ fn encode_project_hook_run_cursor(created_at: &str, id: &str) -> Result<String> 
     })
     .map_err(|_| DbError::InvalidCursor)?;
     Ok(base64::Engine::encode(&URL_SAFE_NO_PAD, bytes))
+}
+
+impl SqliteDb {
+    pub async fn update_project_hook_run_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateProjectHookRun,
+    ) -> Result<ProjectHookRun> {
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE project_hook_run SET status = ");
+        query.push_bind(input.status.to_string());
+        if let Some(automation_task_id) = input.automation_task_id {
+            query
+                .push(", automation_task_id = ")
+                .push_bind(automation_task_id);
+        }
+        if let Some(execution_id) = input.execution_id {
+            query.push(", execution_id = ").push_bind(execution_id);
+        }
+        if let Some(agent_id) = input.agent_id {
+            query.push(", agent_id = ").push_bind(agent_id);
+        }
+        if let Some(reason) = input.reason {
+            query.push(", reason = ").push_bind(reason);
+        }
+        if let Some(completed_at) = input.completed_at {
+            query.push(", completed_at = ").push_bind(completed_at);
+        }
+        query
+            .push(", updated_at = ")
+            .push_bind(&input.updated_at)
+            .push(" WHERE id = ")
+            .push_bind(&input.id)
+            .push(" RETURNING ")
+            .push(PROJECT_HOOK_RUN_COLUMNS);
+
+        query
+            .build()
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(map_project_hook_run)
+            .transpose()?
+            .ok_or(DbError::NotFound)
+    }
+    pub async fn claim_project_hook_run_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateProjectHookRun,
+        max_active_runs: i64,
+        skip_reason: &str,
+    ) -> Result<Option<ProjectHookRun>> {
+        let sql = format!(
+            "INSERT INTO project_hook_run ({PROJECT_HOOK_RUN_COLUMNS}) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id, rule_id, dedupe_key) DO NOTHING \
+             RETURNING {PROJECT_HOOK_RUN_COLUMNS}"
+        );
+        let Some(run) = sqlx::query(&sql)
+            .bind(&input.id)
+            .bind(&input.project_id)
+            .bind(&input.rule_id)
+            .bind(&input.trigger_type)
+            .bind(&input.dedupe_key)
+            .bind(input.status.to_string())
+            .bind(input.source_task_id.as_deref())
+            .bind(input.source_execution_id.as_deref())
+            .bind(input.automation_task_id.as_deref())
+            .bind(input.execution_id.as_deref())
+            .bind(input.agent_id.as_deref())
+            .bind(input.reason.as_deref())
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .bind(input.completed_at.as_deref())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .map(map_project_hook_run)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+
+        let active_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_hook_run \
+             WHERE project_id = ? \
+               AND rule_id = ? \
+               AND status IN ('queued', 'running', 'dispatched') \
+               AND completed_at IS NULL",
+        )
+        .bind(&input.project_id)
+        .bind(&input.rule_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+
+        let run = if active_count > max_active_runs {
+            let sql = format!(
+                "UPDATE project_hook_run \
+                 SET status = ?, reason = ?, updated_at = ?, completed_at = ? \
+                 WHERE id = ? RETURNING {PROJECT_HOOK_RUN_COLUMNS}"
+            );
+            sqlx::query(&sql)
+                .bind(ProjectHookRunStatus::Skipped.to_string())
+                .bind(skip_reason)
+                .bind(&input.updated_at)
+                .bind(&input.updated_at)
+                .bind(&run.id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .map(map_project_hook_run)
+                .transpose()?
+                .ok_or(DbError::NotFound)?
+        } else {
+            run
+        };
+
+        Ok(Some(run))
+    }
 }

@@ -55,6 +55,7 @@ mod claim;
 mod common;
 pub(crate) mod config;
 mod create;
+pub(crate) use create::PreparedProjectHookTask;
 mod create_subtasks;
 mod dependencies;
 pub(crate) mod execution;

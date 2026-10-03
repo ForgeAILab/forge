@@ -81,3 +81,32 @@ async fn evaluate_rule(
     }
     Ok(())
 }
+
+/// Prepare every enabled rule outside the runtime's writer transaction.
+pub(crate) async fn prepare_for_project(
+    service: &ProjectHookService,
+    project: &Project,
+    cause: &EvaluationCause,
+) -> Result<Vec<super::engine::PreparedHook>> {
+    let rules = parse_project_hooks_json(&project.project_hooks_json).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid project hooks: {error}"))
+    })?;
+    let engine = ProjectHookEngine::new(service);
+    let mut prepared = Vec::new();
+    for rule in rules.into_iter().filter(|rule| rule.enabled) {
+        let context = TriggerContext {
+            db: &service.db,
+            project,
+            cause,
+        };
+        let matched = match rule.trigger {
+            ProjectHookTrigger::AllWorkCompleted => {
+                AllWorkCompletedTrigger.evaluate(&context).await?
+            }
+        };
+        if let Some(matched) = matched {
+            prepared.push(engine.prepare(project, rule, matched).await?);
+        }
+    }
+    Ok(prepared)
+}

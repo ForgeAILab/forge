@@ -68,7 +68,7 @@ pub(crate) struct AdaptiveTaskGovernance {
     pub provenance_json: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct PreparedTaskGovernance {
     pub charter_revision_id: Option<String>,
     pub plan_item_id: Option<String>,
