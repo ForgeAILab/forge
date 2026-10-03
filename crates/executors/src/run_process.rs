@@ -68,7 +68,7 @@ pub fn build_environment(
         });
         if let Some(value) = declared {
             env.insert(key.into(), value.into());
-        } else if let Some(value) = operator(key) {
+        } else if let Some(value) = operator(key).filter(|value| !value.is_empty()) {
             env.insert(key.into(), value);
         } else if jobs > 0 {
             let value = match key {
@@ -86,9 +86,19 @@ pub fn apply(command: &mut Command, project: &BTreeMap<String, String>) {
     apply_budget(command, machine_policy().get(), project);
 }
 pub fn apply_budget(command: &mut Command, budget: RunBudget, project: &BTreeMap<String, String>) {
-    command.envs(build_environment(budget, project, |key| {
-        std::env::var_os(key)
-    }));
+    // A non-empty value already set on the command (an Agent profile's env,
+    // a shell plan, or the inherited environment) wins over the budget.
+    let preset = command
+        .as_std()
+        .get_envs()
+        .filter(|(_, value)| value.is_some_and(|value| !value.is_empty()))
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
+    command.envs(
+        build_environment(budget, project, |key| std::env::var_os(key))
+            .into_iter()
+            .filter(|(key, _)| !preset.contains(key)),
+    );
     lower_priority(command, budget.run_nice);
 }
 
@@ -189,6 +199,32 @@ mod tests {
             |_| None
         )
         .is_empty());
+    }
+    #[test]
+    fn empty_values_do_not_disable_the_budget_and_command_env_wins() {
+        let budget = RunBudget {
+            build_jobs_per_run: Some(2),
+            run_nice: 0,
+            ..Default::default()
+        };
+        // `make` exports an empty MAKEFLAGS to its children.
+        let env = build_environment(budget, &BTreeMap::new(), |key| {
+            (key == "MAKEFLAGS").then(|| "".into())
+        });
+        assert_eq!(env.get(std::ffi::OsStr::new("MAKEFLAGS")).unwrap(), "-j2");
+
+        let mut command = Command::new("cargo");
+        command.env("CARGO_BUILD_JOBS", "8").env("MAKEFLAGS", "");
+        apply_budget(&mut command, budget, &BTreeMap::new());
+        let vars: BTreeMap<_, _> = command.as_std().get_envs().collect();
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("CARGO_BUILD_JOBS")),
+            Some(&Some(std::ffi::OsStr::new("8")))
+        );
+        assert_eq!(
+            vars.get(std::ffi::OsStr::new("MAKEFLAGS")),
+            Some(&Some(std::ffi::OsStr::new("-j2")))
+        );
     }
     #[test]
     fn budget_does_not_restore_removed_git_environment() {

@@ -3049,16 +3049,7 @@ impl FederatedAgentChatTurnRunner {
         let environment =
             if let Some(project_id) = chat.as_ref().and_then(|chat| chat.project_id.as_deref()) {
                 match db::ProjectRepo::get_by_id(&*self.db, project_id).await? {
-                    Some(project) => {
-                        serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
-                            .map_err(|error| {
-                                ServiceError::invalid_operation(format!(
-                                    "invalid project settings: {error}"
-                                ))
-                            })?
-                            .environment
-                            .env
-                    }
+                    Some(project) => crate::lifecycle::project_env(&project.settings),
                     None => Default::default(),
                 }
             } else {

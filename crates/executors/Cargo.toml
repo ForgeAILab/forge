@@ -27,5 +27,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc = "0.2"
 
 # Only run_process's audited pre_exec callback permits unsafe OS syscalls.
+# The workspace lint table forbids unsafe code, which cannot be overridden
+# locally, so this crate does not inherit it: copy any new workspace lint here.
 [lints.rust]
 unsafe_code = "deny"
