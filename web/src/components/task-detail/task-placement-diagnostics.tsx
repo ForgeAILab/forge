@@ -3,6 +3,7 @@ import type { TaskPlacementDiagnostic } from '@/types/generated/bindings/TaskPla
 const labels: Record<string, string> = {
   environment_not_ready: 'Environment not ready',
   environment_probe_pending: 'Checking machine',
+  environment_unverified: 'No machine checks to verify before cloning',
   machine_capacity: 'Machine run capacity reached',
   executor_unavailable: 'Executor unavailable',
 }

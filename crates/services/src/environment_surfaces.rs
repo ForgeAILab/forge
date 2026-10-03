@@ -516,6 +516,7 @@ pub async fn recheck(
                 &project,
                 &machine,
                 &router,
+                service.environment_daemon_connections(),
                 observed
                     .as_ref()
                     .and_then(|row| row.workspace_id.as_deref()),

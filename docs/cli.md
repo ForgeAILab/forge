@@ -293,9 +293,9 @@ selected machine. `server` names the host; daemon machines use runtime IDs from
 `env-status`. Table output groups checks and unavailable-machine errors by
 machine, followed by the updated Project. JSON output is `{machines, project}`.
 Passing a machine resumes a matching environment pause; user/repository pauses
-remain. A manual re-check on a daemon runs in a ready workspace recorded on that
-machine (placement probes are separate); a machine without one returns an
-unavailable result and keeps its facts.
+remain. On a daemon that supports machine probes the re-check runs there
+directly; other daemons need a ready workspace recorded on that machine, and a
+machine without one returns an unavailable result and keeps its facts.
 
 Both commands exit 0 after a successful API response, including checks that
 report failure or unavailability. Inspect `passed` and `error` for those

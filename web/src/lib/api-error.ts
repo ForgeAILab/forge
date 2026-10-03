@@ -72,6 +72,8 @@ const placementFilterMessages: Record<string, string> = {
   not_visible: 'Owner is not accessible to the Task owner',
   environment_not_ready: 'Project environment checks failed on this machine',
   environment_probe_pending: 'Project environment checks are pending on this machine',
+  environment_unverified:
+    'This machine has no copy of the repository and no machine-scope checks can verify it before cloning',
 }
 
 function getPlacementRejectionMessage(error: ApiError): string | undefined {
