@@ -30,6 +30,7 @@ mod log_snapshot;
 use log_snapshot::ExecutionLogSnapshots;
 
 pub struct OperatorStatusService {
+    run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
     db: Arc<SqliteDb>,
     log_snapshots: ExecutionLogSnapshots,
     usage_cache: Arc<UsageLedgerIndex>,
@@ -48,6 +49,7 @@ impl OperatorStatusService {
     ) -> Self {
         Self {
             db: Arc::clone(&db),
+            run_process_policy: Arc::new(executors::run_process::MachineRunPolicy::default()),
             log_snapshots: ExecutionLogSnapshots::default(),
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
@@ -71,6 +73,7 @@ impl OperatorStatusService {
         Self {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db: Arc::clone(&db),
+            run_process_policy: Arc::new(executors::run_process::MachineRunPolicy::default()),
             log_snapshots: ExecutionLogSnapshots::default(),
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
@@ -79,6 +82,14 @@ impl OperatorStatusService {
             relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
         }
+    }
+
+    pub fn with_run_process_policy(
+        mut self,
+        policy: Arc<executors::run_process::MachineRunPolicy>,
+    ) -> Self {
+        self.run_process_policy = policy;
+        self
     }
 
     pub fn usage_ledger_index(&self) -> Arc<UsageLedgerIndex> {
@@ -554,14 +565,24 @@ impl OperatorStatusService {
     }
 
     async fn daemon_pressure(&self) -> Result<Vec<DaemonPressureSummary>, ServiceError> {
+        let budget = self.run_process_policy.get();
         Ok(crate::placement::machine_precheck::snapshot(&self.db)
             .await?
             .into_iter()
             .map(|row| DaemonPressureSummary {
-                daemon_id: row.daemon_id.unwrap_or_else(|| "server_host".to_owned()),
+                daemon_id: row
+                    .daemon_id
+                    .clone()
+                    .unwrap_or_else(|| "server_host".to_owned()),
                 hostname: Some(row.hostname),
                 active_runs: row.capacity.active_runs().max(0) as u32,
                 max_concurrent_runs: row.capacity.max_concurrent_runs,
+                logical_cores: row
+                    .daemon_id
+                    .is_none()
+                    .then(|| u32::try_from(config::logical_cores()).unwrap_or(u32::MAX)),
+                build_jobs_per_run: row.daemon_id.is_none().then(|| budget.build_jobs()),
+                run_nice: row.daemon_id.is_none().then_some(budget.run_nice),
                 at_capacity: !row.capacity.has_capacity(),
             })
             .collect())
@@ -952,6 +973,15 @@ mod tests {
         assert_eq!(pressure[0].daemon_id, "server_host");
         assert_eq!(pressure[0].active_runs, 0);
         assert_eq!(pressure[0].max_concurrent_runs, Some(4));
+        assert_eq!(
+            pressure[0].logical_cores,
+            Some(config::logical_cores() as u32)
+        );
+        assert_eq!(
+            pressure[0].build_jobs_per_run,
+            Some(executors::run_process::machine_policy().get().build_jobs())
+        );
+        assert_eq!(pressure[0].run_nice, Some(10));
         assert!(!pressure[0].at_capacity);
     }
 

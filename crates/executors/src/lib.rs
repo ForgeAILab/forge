@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod adapter;
 pub mod command;
@@ -8,6 +8,8 @@ pub mod environment;
 pub mod log_reader;
 pub mod log_schema;
 pub mod log_writer;
+#[allow(unsafe_code)]
+pub mod run_process;
 pub mod shell;
 
 pub use adapter::{

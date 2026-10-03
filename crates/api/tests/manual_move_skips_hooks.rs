@@ -148,7 +148,7 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
                 .any(|hook| {
                     hook["action"] == "dispatch_role_agent"
                         && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
+                        && hook["error"] == "dispatch deferred to Task dispatcher"
                 })
     }));
 }
@@ -366,7 +366,7 @@ async fn board_drag_to_passive_state_defers_role_dispatch_hook() {
                 .any(|hook| {
                     hook["action"] == "dispatch_role_agent"
                         && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
+                        && hook["error"] == "dispatch deferred to Task dispatcher"
                 })
     }));
 }

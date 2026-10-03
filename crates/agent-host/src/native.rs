@@ -551,6 +551,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             self.forge_tool_provider.clone(),
             ScopeToolRuntime {
                 command_allowlist: request.command_allowlist.clone(),
+                environment: request.environment.clone(),
                 fetch_transport: Some(Arc::clone(&self.fetch_transport)),
             },
         )?;

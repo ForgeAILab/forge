@@ -54,6 +54,14 @@ pub struct UpdateServerSettingsRequest {
         skip_serializing_if = "Option::is_none"
     )]
     #[ts(optional, type = "number | null")]
+    pub build_jobs_per_run: Option<Option<u32>>,
+    pub run_nice: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_u32_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "number | null")]
     pub usage_index_budget_mb: Option<Option<u32>>,
     pub bind: Option<String>,
     pub mcp_enabled: Option<bool>,

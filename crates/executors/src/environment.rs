@@ -412,13 +412,7 @@ pub async fn run_environment_check(
     env: &BTreeMap<String, String>,
     check: &EnvironmentCheck,
 ) -> EnvironmentCheckResult {
-    let mut command = tokio::process::Command::new("bash");
-    command
-        .args(["-lc", &check.command])
-        .current_dir(worktree)
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
+    let mut command = environment_check_command(worktree, env, check);
     let outcome = tokio::time::timeout(
         Duration::from_secs(check_timeout_seconds(check)),
         command.output(),
@@ -481,6 +475,22 @@ fn output_tail(text: &str) -> String {
         start += 1;
     }
     text[start..].to_owned()
+}
+
+fn environment_check_command(
+    worktree: &Path,
+    env: &BTreeMap<String, String>,
+    check: &EnvironmentCheck,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("bash");
+    command
+        .args(["-lc", &check.command])
+        .current_dir(worktree)
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    crate::run_process::apply(&mut command, env);
+    command
 }
 
 #[cfg(test)]
@@ -796,5 +806,45 @@ mod tests {
             .expect("check fails");
         assert!(!failure.output_tail.contains("very-secret"));
         assert!(failure.output_tail.contains("[REDACTED]"));
+    }
+}
+
+#[cfg(test)]
+mod run_budget_tests {
+    use super::*;
+    #[test]
+    fn launch_environment_preserves_project_and_fills_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let env =
+            std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project-value".into())]);
+        let check = EnvironmentCheck {
+            name: "budget".into(),
+            command: "cargo test".into(),
+            scope: api_types::EnvironmentCheckScope::Workspace,
+            roles: Vec::new(),
+            timeout_seconds: 30,
+        };
+        let command = environment_check_command(temp.path(), &env, &check);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_BUILD_JOBS")).unwrap(),
+            "project-value"
+        );
+        let jobs = crate::run_process::machine_policy().get().build_jobs();
+        for (key, default) in [
+            ("RUST_TEST_THREADS", jobs.to_string()),
+            ("MAKEFLAGS", format!("-j{jobs}")),
+            ("CMAKE_BUILD_PARALLEL_LEVEL", jobs.to_string()),
+            ("GOFLAGS", format!("-p={jobs}")),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&std::env::var_os(key).unwrap_or(default.into()))
+            );
+        }
     }
 }

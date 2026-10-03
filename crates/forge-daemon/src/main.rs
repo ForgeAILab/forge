@@ -32,6 +32,12 @@ struct Cli {
     /// Maximum concurrent runs (default: automatic; 0: unlimited).
     #[arg(long)]
     max_concurrent_runs: Option<u32>,
+    /// Build jobs per run (unset: automatic; 0: disabled).
+    #[arg(long)]
+    build_jobs_per_run: Option<u32>,
+    /// Unix niceness increment for run children (0: off).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+    run_nice: Option<u32>,
     /// Forge server URL, for example https://forge.example.com.
     #[arg(long)]
     server: String,
@@ -83,6 +89,14 @@ async fn main() -> Result<()> {
     let daemon_config = forge_client::daemon_config::DaemonConfig::load(&credentials_path)?;
     let run_policy = daemon_config.run_policy();
     let max_concurrent_runs = daemon_config.run_cap(cli.max_concurrent_runs);
+    let budget = daemon_config.run_budget(
+        cli.max_concurrent_runs,
+        cli.build_jobs_per_run,
+        cli.run_nice,
+    )?;
+    executors::run_process::install_machine_policy(Arc::new(
+        executors::run_process::MachineRunPolicy::new(budget),
+    ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {

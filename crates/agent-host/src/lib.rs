@@ -290,6 +290,8 @@ pub struct AgentTurnRequest {
     /// caller from owner configuration and the owning Project. `None` uses
     /// the built-in set; the composition never takes this from model input.
     pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    /// Host-resolved Project environment for build variable overrides.
+    pub environment: std::collections::BTreeMap<String, String>,
     pub cancellation: CancellationToken,
 }
 
