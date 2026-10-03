@@ -394,6 +394,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer stops the other rules for the same event. Owner Hold, review-CI
   infrastructure blocks, restoring a queued action and human review decisions
   stay silent, as before.
+- The server's long-lived background loops (task dispatcher, heartbeat
+  monitor, Agent Chat turn poller, workspace cleanup, storage maintenance,
+  operator status emitter, lifecycle hooks, daemon monitor, embedded daemon,
+  shared media cleanup, external sync, environment settings observer) run
+  under the worker-runtime supervisor. A loop that panics or returns is
+  restarted with back-off (250 ms to 5 s) instead of staying dead until the
+  server restarts. Each pass has a budget: loops whose pass is safe to
+  interrupt are cancelled past it; the task dispatcher, heartbeat monitor,
+  Agent Chat admission and external sync run workflow transitions or CI
+  inline, so past their budget they keep running and report "running longer
+  than" instead. A poller panic cancels and drains in-flight Agent Chat turns
+  (up to 15 s) before restarting. Intervals, wake-ups and log messages are
+  unchanged; warnings gain a `worker` field.
 - The SSE relay is the only publisher of durable event frames. Services no
   longer publish a durable event directly after their own commit; the relay
   reads the ledger in order and is woken by the commit hook (measured: 72 µs
@@ -558,6 +571,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- Operator status `periodic_workers` lists each supervised background loop
+  with running state, last tick, last error, restart count and an over-budget
+  warning. A failing or over-budget loop adds a `recent_errors` entry with
+  `entity_type: "periodic_worker"` and raises `overall_severity` to Attention
+  until it recovers.
 
 - Per-machine environment readiness is visible.
   - Project responses carry `environment_readiness`: one entry per machine
