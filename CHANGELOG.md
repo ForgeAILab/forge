@@ -362,6 +362,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the event is quarantined after eight. A worker's periodic `tick` has its own
   30 s timeout and its own back-off (1 s to 5 min); while a tick is backing
   off, events are still handled every cycle.
+- Project hooks and notifications run on the supervised worker runtime as
+  durable consumers of committed events (`task.transitioned`,
+  `task.status_changed`, `review.status_changed`, `notification.requested` and
+  the hook Task created/archived events) instead of an in-memory bus
+  subscription, so a lagging bus or a server restart no longer loses a hook
+  run or an inbox notification. A hook's database actions and each
+  notification commit with the consumer's cursor; the `notification.created`
+  SSE frame is a live hint after the commit. Migration V202610030200 starts
+  both consumers at the end of the event log, so upgrading does not replay old
+  hooks or notifications. Operator status lists them as `project-hooks` and
+  `notifications`.
+- A hook that dispatches an Agent is launched at most once: the run is
+  recorded as `running` first and launched after the commit, so a crash in
+  between leaves a `running` run with no execution that is never launched
+  again. After ten minutes the worker settles such a run as `dispatched` (an
+  execution exists) or `failed` (none), which frees its concurrency slot. A
+  launch is bounded to five minutes, and a rule that fails to prepare no
+  longer stops the other rules for the same event. Owner Hold, review-CI
+  infrastructure blocks, restoring a queued action and human review decisions
+  stay silent, as before.
 - The SSE relay is the only publisher of durable event frames. Services no
   longer publish a durable event directly after their own commit; the relay
   reads the ledger in order and is woken by the commit hook (measured: 72 µs
