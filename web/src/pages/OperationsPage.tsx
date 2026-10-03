@@ -630,6 +630,12 @@ export function OperationsPage() {
         {status.event_relay.position ?? '-'} · Head {status.event_relay.head ?? '-'}
         {status.event_relay.last_error ? ` · ${status.event_relay.last_error}` : ''}
       </p>
+      <p className="text-xs text-muted-foreground">
+        Usage index {(status.usage_index.current_size_bytes / (1024 * 1024)).toFixed(1)} MiB
+        {' / '}
+        {status.usage_index.budget_bytes / (1024 * 1024)} MiB budget ·{' '}
+        {status.usage_index.fallback ? 'Memoized full reads' : 'Incremental reads'}
+      </p>
       <EventConsumersSection items={status.event_consumers} />
 
       {status.usage_summary ? (

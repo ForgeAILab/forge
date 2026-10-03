@@ -26,6 +26,9 @@ struct Cli {
     /// Maximum concurrent runs on the server host (default: automatic; 0: unlimited).
     #[arg(long)]
     max_concurrent_runs: Option<u32>,
+    /// Usage observation index budget in MiB (default: 128; 0: memoized full reads).
+    #[arg(long)]
+    usage_index_budget_mb: Option<u32>,
     #[arg(long)]
     demo: bool,
     #[arg(long = "no-mcp")]
@@ -60,6 +63,7 @@ async fn run() {
         None,
         ConfigOverrides {
             server_max_concurrent_runs: cli.max_concurrent_runs,
+            server_usage_index_budget_mb: cli.usage_index_budget_mb,
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
             event_consumer_stall_seconds: cli.event_consumer_stall_seconds,
@@ -533,6 +537,27 @@ mod tests {
         net::SocketAddr,
         path::{Path, PathBuf},
     };
+
+    #[test]
+    fn usage_index_budget_cli_accepts_zero_and_mib() {
+        assert_eq!(
+            Cli::try_parse_from(["forge"])
+                .unwrap()
+                .usage_index_budget_mb,
+            None
+        );
+        for budget in ["0", "64", "4294967295"] {
+            assert_eq!(
+                Cli::try_parse_from(["forge", "--usage-index-budget-mb", budget])
+                    .unwrap()
+                    .usage_index_budget_mb,
+                Some(budget.parse().unwrap())
+            );
+        }
+        for budget in ["-1", "1.5", "4294967296"] {
+            assert!(Cli::try_parse_from(["forge", "--usage-index-budget-mb", budget]).is_err());
+        }
+    }
 
     #[test]
     fn storage_cli_parses_stall_setting_and_offline_conversion() {

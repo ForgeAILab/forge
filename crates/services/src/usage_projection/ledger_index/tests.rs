@@ -663,6 +663,13 @@ async fn randomized_differential_ledger_mutations() {
         assert_reference(&db, &index, seed, 1007).await;
         let mut serial = 0;
         for step in 0..360 {
+            if step % 60 == 0 {
+                index.set_budget_mb(match (step / 60) % 3 {
+                    0 => Some(0),
+                    1 => Some(1),
+                    _ => None,
+                });
+            }
             let choice = (next(&mut rng) % 13) as usize;
             serial += 1;
             if projects.is_empty() || choice == 0 {
@@ -1804,7 +1811,7 @@ async fn compact_citations_recover_removed_winners_without_retaining_events() {
         };
         assert!(
             matches!(
-                citation_repairs(&state, &staged, &mut connection, through)
+                citation_repairs(&state, &staged, &mut connection, through, MAX_INDEX_BYTES)
                     .await
                     .unwrap(),
                 CitationRepairs::Overflow(_)
@@ -1828,7 +1835,7 @@ async fn compact_citations_recover_removed_winners_without_retaining_events() {
             .await
             .unwrap();
         let CitationRepairs::Ready(repairs, _) =
-            citation_repairs(&state, &staged, &mut empty, through)
+            citation_repairs(&state, &staged, &mut empty, through, MAX_INDEX_BYTES)
                 .await
                 .unwrap()
         else {
@@ -2058,4 +2065,65 @@ async fn overflow_source_batches_equal_reference_for_all_scopes() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn zero_budget_uses_memoized_full_reads_even_for_an_empty_ledger() {
+    let db = fixture().await;
+    let index = UsageLedgerIndex::new(db.clone());
+    index.set_budget_mb(Some(0));
+    assert_reference(&db, &index, 0, 0).await;
+    let status = index.status().await;
+    assert!(status.fallback);
+    assert_eq!(status.budget_bytes, 0);
+    assert_eq!(status.current_size_bytes, 0);
+    assert!(index.state.lock().await.watermarks.is_none());
+    assert!(index.fallback.lock().await.operations.is_some());
+    assert_eq!(index.state.lock().await.audit.payload_rows, 0);
+    index.set_budget_mb(None);
+    assert_reference(&db, &index, 0, 1).await;
+    assert!(!index.status().await.fallback);
+}
+
+#[tokio::test]
+async fn live_budget_changes_discard_and_rebuild_without_changing_results() {
+    let db = fixture().await;
+    project(&db, "p").await;
+    let exec = execution(&db, "run", "p", "a", db::ExecutionStatus::Running).await;
+    let invocation = admit(&db, "inv", "p", "run", "b").await;
+    let invocation = start(&db, &invocation).await;
+    let invocation = settle(&db, &invocation).await;
+    let event = event(&db, &invocation, "e", "a", false, 5).await;
+    let index = UsageLedgerIndex::new(db.clone());
+    index.set_budget_mb(Some(16));
+    assert_reference(&db, &index, 0, 0).await;
+    let size = index.status().await.current_size_bytes;
+    assert!(size > 1024 * 1024 && size < 16 * 1024 * 1024);
+    // A fitting decrease preserves the warm index and performs no payload reads.
+    index.set_budget_mb(Some(12));
+    assert_reference(&db, &index, 0, 1).await;
+    assert_eq!(index.status().await.current_size_bytes, size);
+    assert_eq!(index.state.lock().await.audit.payload_rows, 0);
+    // Even with no ledger mutation, the next read frees the oversized index.
+    index.set_budget_mb(Some(1));
+    assert_reference(&db, &index, 0, 2).await;
+    assert!(index.status().await.fallback);
+    assert_eq!(index.status().await.current_size_bytes, 0);
+    assert!(index.state.lock().await.invocations.is_empty());
+    assert!(index.fallback.lock().await.operations.is_some());
+    reprice(&db, &event, 51).await;
+    finish(&db, &exec, true).await;
+    assert_reference(&db, &index, 0, 3).await;
+    index.set_budget_mb(Some(0));
+    assert_reference(&db, &index, 0, 4).await;
+    assert_eq!(index.status().await.budget_bytes, 0);
+    // Increasing the bound retries a cold build without requiring ledger changes.
+    index.set_budget_mb(Some(16));
+    index.operations().await.unwrap();
+    assert!(index.state.lock().await.audit.payload_rows > 0);
+    assert!(!index.status().await.fallback);
+    assert_reference(&db, &index, 0, 5).await;
+    index.set_budget_mb(None);
+    assert_reference(&db, &index, 0, 6).await;
+    assert_eq!(index.status().await.budget_bytes, 128 * 1024 * 1024);
 }

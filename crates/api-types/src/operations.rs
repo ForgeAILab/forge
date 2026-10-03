@@ -77,11 +77,23 @@ pub struct OperatorStatusResponse {
     pub workspace_cleanup: Vec<WorkspaceCleanupSummary>,
     pub retry_pressure: Vec<RetryPressureSummary>,
     pub usage_summary: Option<UsageSummary>,
+    pub usage_index: UsageIndexStatus,
     pub recent_errors: Vec<RecentErrorSummary>,
     pub event_consumers: Vec<EventConsumerStatus>,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UsageIndexStatus {
+    /// Conservative index charge, including allocator and read reserves; not RSS.
+    #[ts(type = "number")]
+    pub current_size_bytes: u64,
+    #[ts(type = "number")]
+    pub budget_bytes: u64,
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

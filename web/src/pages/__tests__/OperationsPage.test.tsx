@@ -70,6 +70,11 @@ const usageSummary: UsageAggregate = {
 }
 
 const degradedStatus: OperatorStatusResponse = {
+  usage_index: {
+    current_size_bytes: 10 * 1024 * 1024,
+    budget_bytes: 128 * 1024 * 1024,
+    fallback: false,
+  },
   overall_severity: 'error',
   event_relay: {
     running: true,
@@ -221,7 +226,6 @@ describe('OperationsPage', () => {
     } as unknown as ReturnType<typeof useRefreshOperationsMutation>)
   })
 
-
 it('lists server-host occupancy and links it to live settings', () => {
   render(<OperationsPage />)
   expect(screen.getByRole('link', { name: 'Server host' }).getAttribute('href')).toBe('/settings')
@@ -322,4 +326,22 @@ it('lists server-host occupancy and links it to live settings', () => {
     expect(screen.getByText('Dead letters 7')).toBeTruthy()
     expect(screen.getByText(/event:9:commitment:c-1: blocked commitment/)).toBeTruthy()
   })
+})
+
+it('shows usage index charge and budget and the fallback read path', () => {
+  vi.mocked(useOperationsStatusQuery).mockReturnValue({
+    data: degradedStatus,
+    isLoading: false,
+  } as ReturnType<typeof useOperationsStatusQuery>)
+  const view = render(<OperationsPage />)
+  expect(screen.getByText('Usage index 10.0 MiB / 128 MiB budget · Incremental reads')).toBeTruthy()
+  vi.mocked(useOperationsStatusQuery).mockReturnValue({
+    data: {
+      ...degradedStatus,
+      usage_index: { current_size_bytes: 0, budget_bytes: 0, fallback: true },
+    },
+    isLoading: false,
+  } as ReturnType<typeof useOperationsStatusQuery>)
+  view.rerender(<OperationsPage />)
+  expect(screen.getByText('Usage index 0.0 MiB / 0 MiB budget · Memoized full reads')).toBeTruthy()
 })
