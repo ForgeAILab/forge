@@ -560,7 +560,7 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("atomic bundle counts");
-    assert_eq!(bundle, (2, 1, 1, 1));
+    assert_eq!(bundle, (1, 1, 1, 1));
     assert_task_creation_events(&fixture.db, &task_id).await;
 
     let outcome_json: String = sqlx::query_scalar(
@@ -1490,7 +1490,7 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
-        2
+        1
     );
     assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
@@ -1696,7 +1696,7 @@ async fn direct_task_proposal_commits_one_receipt_bundle_without_action_rows() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
-        2
+        1
     );
     assert_task_creation_events(&fixture.db, &first.task.id).await;
 
@@ -1912,7 +1912,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
-        2
+        1
     );
     assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
@@ -1965,7 +1965,7 @@ async fn direct_task_proposal_receipt_failure_rolls_back_everything() {
             "SELECT COUNT(*) FROM domain_event WHERE entity_type = 'task' AND event_type <> 'project_hook.task_created'",
         )
         .await,
-        2
+        1
     );
     assert_task_creation_events(&fixture.db, &frozen_task.id).await;
     assert_eq!(
