@@ -1485,8 +1485,30 @@ async fn verification_failure_is_visible_and_exhausted_retry_waits_for_reconnect
         .lock()
         .unwrap()
         .len();
-    for _ in 0..2 {
-        fixture.claim().await.unwrap_err();
+    let mut first = None;
+    for _ in 0..3 {
+        let services::ServiceError::PlacementUnavailable(refusal) =
+            fixture.claim().await.unwrap_err()
+        else {
+            panic!("placement refusal");
+        };
+        assert!(refusal.is_deterministic());
+        assert!(refusal.rejected_candidates.iter().any(|candidate| candidate
+            .filter_codes
+            .contains(&services::placement::PlacementFilterCode::ProvisionFailed)));
+        let snapshot:(i64,i64,Option<String>,Option<String>)=sqlx::query_as("SELECT t.version,p.list_revision,t.error_annotation,t.metadata_json FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&fixture.task).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
+        assert!(snapshot.2.as_deref().unwrap().contains("remote-test-host"));
+        assert!(snapshot
+            .2
+            .as_deref()
+            .unwrap()
+            .contains("verification deliberately failed"));
+        assert!(snapshot.3.as_deref().unwrap().contains("provision_failed"));
+        if let Some(first) = &first {
+            assert_eq!(&snapshot, first);
+        } else {
+            first = Some(snapshot);
+        }
     }
     assert_eq!(
         fixture
@@ -1499,14 +1521,58 @@ async fn verification_failure_is_visible_and_exhausted_retry_waits_for_reconnect
             .len(),
         before
     );
-    let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &fixture.task, false)
+    let attention: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE dedupe_key=? AND status='open'",
+    )
+    .bind(format!("task-provision-failed:{}", fixture.task))
+    .fetch_one(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention, 1);
+    let now = db::now_rfc3339();
+    db::TaskRoleAssignmentRepo::assign(
+        &*fixture.harness.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: fixture.task.clone(),
+            role_name: "coder".into(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(fixture.agent.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET status='in_progress',error_annotation=NULL,metadata_json=NULL,version=version+1 WHERE id=?").bind(&fixture.task).execute(fixture.harness.state.db.pool()).await.unwrap();
+    let dispatcher = services::TaskDispatcher::new(
+        fixture.harness.state.db.clone(),
+        fixture.harness.state.event_bus.clone(),
+        fixture.service.clone(),
+    );
+    let mut active = None;
+    for _ in 0..3 {
+        dispatcher.check_once().await.unwrap();
+        let snapshot:(i64,i64,Option<String>,Option<String>)=sqlx::query_as("SELECT t.version,p.list_revision,t.error_annotation,t.metadata_json FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&fixture.task).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
+        assert!(
+            snapshot
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .contains("verification deliberately failed"),
+            "{snapshot:?}"
+        );
+        if let Some(active) = &active {
+            assert_eq!(&snapshot, active);
+        } else {
+            active = Some(snapshot);
+        }
+    }
+    sqlx::query("UPDATE task SET status='todo',version=version+1 WHERE id=?")
+        .bind(&fixture.task)
+        .execute(fixture.harness.state.db.pool())
         .await
-        .unwrap()
         .unwrap();
-    assert!(task
-        .metadata_json
-        .unwrap()
-        .contains("machine unreachable: retry limit reached"));
     fixture.owner.take();
     fixture.owner = Some(
         Owner::connect(
@@ -1516,5 +1582,88 @@ async fn verification_failure_is_visible_and_exhausted_retry_waits_for_reconnect
         )
         .await,
     );
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            dispatcher.check_once().await.unwrap();
+            if WorkspacePlacementRepo::get_for_task(&*fixture.harness.state.db, &fixture.task)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_project_edit_during_full_checks_keeps_the_same_provision_attempt() {
+    let fixture = Fixture::new(
+        json!([
+            {"name":"toolchain","command":"true","scope":"machine"},
+            {"name":"slow","command":"sleep 2; true","timeout_seconds":10}
+        ]),
+        "coder",
+    )
+    .await;
+    fixture.claim().await.unwrap_err();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if fixture
+                .owner
+                .as_ref()
+                .unwrap()
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| method.as_str() == METHOD_MACHINE_PROBE)
+                .count()
+                >= 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let project = ProjectRepo::get_by_id(&*fixture.harness.state.db, &fixture.project)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings: Value = serde_json::from_str(&project.settings).unwrap();
+    settings["max_active_tasks"] = json!(17);
+    ProjectRepo::update_at_version(
+        &*fixture.harness.state.db,
+        db::UpdateProject {
+            id: project.id,
+            name: None,
+            settings: Some(settings.to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: db::now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
     fixture.claim_until_ready().await;
+    assert_eq!(
+        fixture
+            .owner
+            .as_ref()
+            .unwrap()
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| method.as_str() == METHOD_REPO_LOCATION_PROVISION)
+            .count(),
+        1
+    );
 }

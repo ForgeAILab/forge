@@ -362,7 +362,8 @@ mod tests {
                 &current,
                 &crate::ServiceError::DaemonUnavailable {
                     daemon_id: placement.daemon_id.clone().unwrap()
-                }
+                },
+                None,
             )
             .await
             .unwrap(),

@@ -69,7 +69,7 @@ impl TaskDispatcher {
             let task_id = task.id.clone();
             let result: Result<()> = async {
                 task = self.task_service.refresh_placement_dispatch_refusal(task.clone()).await?;
-                if task.metadata().map_err(|error|ServiceError::invalid_operation(error.to_string()))?.extra.get("environment_wait").is_some_and(|wait|wait["kind"]=="environment_unverified") {
+                if task.metadata().map_err(|error|ServiceError::invalid_operation(error.to_string()))?.extra.get("environment_wait").is_some_and(|wait|matches!(wait["kind"].as_str(),Some("environment_unverified"|"provision_failed"))) {
                     return Ok(());
                 }
                 if self.task_service.expire_owner_wait(&task).await? {

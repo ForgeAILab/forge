@@ -113,6 +113,7 @@ impl TaskService {
             &prepared.project,
             &context,
             &refusal,
+            self.daemon_connections.as_deref(),
         )
         .await
     }
@@ -185,6 +186,11 @@ impl TaskService {
         task: &Task,
         error: &ServiceError,
     ) -> Result<bool> {
+        if matches!(error,ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate|candidate.filter_codes.contains(&crate::placement::PlacementFilterCode::ProvisionFailed)))
+            && self.record_placement_dispatch_refusal(task, error).await?
+        {
+            return Ok(true);
+        }
         if !crate::placement::is_machine_capacity_refusal(error) {
             crate::deferred_dispatch::clear_capacity_wait(&self.db, task).await?;
         }
@@ -198,8 +204,13 @@ impl TaskService {
                 return Ok(true);
             }
         }
-        if let Some(deferred) =
-            crate::placement::environment::defer_refusal(&self.db, task, error).await?
+        if let Some(deferred) = crate::placement::environment::defer_refusal(
+            &self.db,
+            task,
+            error,
+            self.daemon_connections.as_deref(),
+        )
+        .await?
         {
             return Ok(deferred);
         }
@@ -687,12 +698,13 @@ impl TaskService {
                         &authority.project,
                         context,
                         &refusal,
+                        self.daemon_connections.as_deref(),
                     )
                     .await?;
                     let error = ServiceError::PlacementUnavailable(refusal);
                     if environment_admission
                         == crate::placement::selection::EnvironmentAdmission::LaunchPreflight
-                        && matches!(&error, ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate| candidate.filter_codes.contains(&crate::placement::PlacementFilterCode::EnvironmentUnverified)))
+                        && matches!(&error, ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate| candidate.filter_codes.iter().any(|code|matches!(code,crate::placement::PlacementFilterCode::EnvironmentUnverified|crate::placement::PlacementFilterCode::ProvisionFailed))))
                     {
                         self.record_placement_dispatch_refusal(task, &error).await?;
                     }

@@ -143,7 +143,11 @@ missing local ref on reuse. `placement.provision_timeout_seconds` defaults to
 1800 (1–86400 allowed). Clone and verification failures leave the bounded,
 credential-redacted error in the location and Task wait reason with elapsed time.
 Exponential backoff is 60–600 seconds; five failed attempts for unchanged inputs
-and connection stop admission on that machine with an unreachable reason.
+and connection stop admission on that machine with deterministic provision_failed.
+The Task's Attention names the machine and redacted last error, is recorded once,
+and wakes when the retry epoch or placement eligibility changes. The exhaustion
+rule compares the current digest and socket token; socket tokens remain unique
+across server restart. Unrelated settings edits do not abort an in-flight job.
 Reconnection or settings changes restart the budget.
 
 A provisioning candidate never contributes to the last-resort Project pause.

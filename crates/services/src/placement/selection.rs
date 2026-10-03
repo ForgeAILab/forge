@@ -122,25 +122,7 @@ impl SelectionContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlacementFilterCode {
-    OwnerUnreachable,
-    DaemonUpgradeRequired,
-    WorkspaceProtocolMissing,
-    LocationNotReady,
-    ExecutorUnavailable,
-    CapabilityMissing,
-    PinMismatch,
-    AgentCapacity,
-    MachineCapacity,
-    NativeBackendUnsupported,
-    RunPurposeDenied,
-    NotVisible,
-    EnvironmentNotReady,
-    EnvironmentProbePending,
-    EnvironmentUnverified,
-}
+pub use api_types::PlacementFilterCode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateRejection {
@@ -206,24 +188,27 @@ impl PlacementUnavailable {
         !self.rejected_candidates.is_empty()
             && self.rejected_candidates.iter().all(|candidate| {
                 !candidate.filter_codes.is_empty()
-                    && (candidate
-                        .filter_codes
-                        .contains(&PlacementFilterCode::EnvironmentUnverified)
-                        || candidate.filter_codes.iter().all(|code| {
-                            // Unverified always needs an owner action, even while
-                            // transport facts are temporarily absent. Other
-                            // capacity, reachability and environment readiness
-                            // change without the Task changing, so a refusal for
-                            // them is retried on the next scan.
-                            !matches!(
-                                code,
-                                PlacementFilterCode::OwnerUnreachable
-                                    | PlacementFilterCode::AgentCapacity
-                                    | PlacementFilterCode::MachineCapacity
-                                    | PlacementFilterCode::EnvironmentProbePending
-                                    | PlacementFilterCode::EnvironmentNotReady
-                            )
-                        }))
+                    && (candidate.filter_codes.iter().any(|code| {
+                        matches!(
+                            code,
+                            PlacementFilterCode::EnvironmentUnverified
+                                | PlacementFilterCode::ProvisionFailed
+                        )
+                    }) || candidate.filter_codes.iter().all(|code| {
+                        // Unverified always needs an owner action, even while
+                        // transport facts are temporarily absent. Other
+                        // capacity, reachability and environment readiness
+                        // change without the Task changing, so a refusal for
+                        // them is retried on the next scan.
+                        !matches!(
+                            code,
+                            PlacementFilterCode::OwnerUnreachable
+                                | PlacementFilterCode::AgentCapacity
+                                | PlacementFilterCode::MachineCapacity
+                                | PlacementFilterCode::EnvironmentProbePending
+                                | PlacementFilterCode::EnvironmentNotReady
+                        )
+                    }))
             })
     }
 
@@ -452,7 +437,7 @@ pub(crate) fn environment_filter(
 ) -> Option<PlacementFilterCode> {
     if candidate.provisioning {
         if candidate.provision_exhausted {
-            return Some(PlacementFilterCode::OwnerUnreachable);
+            return Some(PlacementFilterCode::ProvisionFailed);
         }
         if !context.environment_checks.iter().any(|check| {
             check.scope == api_types::EnvironmentCheckScope::Machine
@@ -1000,22 +985,24 @@ pub async fn load_selection_context(
                 .try_get::<Option<String>, _>("retry_runtime")?
                 .is_some();
             let retry_location: Option<String> = runtime.try_get("retry_location")?;
-            let exhausted = runtime
-                .try_get::<Option<i64>, _>("retry_attempts")?
-                .is_some_and(|attempts| attempts >= super::provisioning::MAX_PROVISION_ATTEMPTS)
-                && runtime
+            let exhausted = super::provisioning::ProvisionRetryState {
+                attempts: runtime
+                    .try_get::<Option<i64>, _>("retry_attempts")?
+                    .unwrap_or_default(),
+                inputs_digest: runtime
                     .try_get::<Option<String>, _>("retry_digest")?
-                    .as_deref()
-                    == Some(&super::provisioning::job_inputs_digest(
-                        input.project_settings,
-                    ))
-                && input.handshakes.get(&daemon).is_none_or(|facts| {
-                    runtime
-                        .try_get::<Option<i64>, _>("retry_connection")
-                        .ok()
-                        .flatten()
-                        == Some(facts.connection_id as i64)
-                });
+                    .unwrap_or_default(),
+                connection_id: runtime
+                    .try_get::<Option<i64>, _>("retry_connection")?
+                    .unwrap_or_default(),
+            }
+            .exhausted(
+                input.project_settings,
+                input
+                    .handshakes
+                    .get(&daemon)
+                    .map(|facts| facts.connection_id),
+            );
             let capable = input.handshakes.get(&daemon).is_some_and(|facts| {
                 [
                     api_types::DAEMON_CAPABILITY_MACHINE_PROBE,
@@ -1468,7 +1455,11 @@ mod tests {
             WorkspaceRunPurpose::EnvironmentProbe,
             WorkspaceRunPurpose::RepoProvision,
         ]);
-        rejected(&context, PlacementFilterCode::OwnerUnreachable);
+        let refusal = rejected(&context, PlacementFilterCode::ProvisionFailed);
+        assert!(refusal.is_deterministic());
+        assert!(!crate::placement::is_retryable_admission_refusal(
+            &crate::ServiceError::PlacementUnavailable(refusal)
+        ));
         assert!(environment_pause_candidates(&context).is_empty());
         context.candidates.push(candidate(&context, "server", None));
         context.candidates[1].environment_readiness =

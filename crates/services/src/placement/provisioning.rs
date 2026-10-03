@@ -17,6 +17,29 @@ use std::{
 
 pub(crate) const MAX_PROVISION_ATTEMPTS: i64 = 5;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProvisionRetryState {
+    pub attempts: i64,
+    pub inputs_digest: String,
+    pub connection_id: i64,
+}
+impl From<(i64, String, i64)> for ProvisionRetryState {
+    fn from((attempts, inputs_digest, connection_id): (i64, String, i64)) -> Self {
+        Self {
+            attempts,
+            inputs_digest,
+            connection_id,
+        }
+    }
+}
+impl ProvisionRetryState {
+    pub fn exhausted(&self, settings: &ProjectSettings, connection: Option<u64>) -> bool {
+        self.attempts >= MAX_PROVISION_ATTEMPTS
+            && self.inputs_digest == job_inputs_digest(settings)
+            && connection.is_none_or(|id| self.connection_id == id as i64)
+    }
+}
+
 type Key = (String, String);
 static FLIGHTS: OnceLock<Mutex<HashSet<Key>>> = OnceLock::new();
 struct Flight(Key);
@@ -176,9 +199,17 @@ pub(crate) async fn start(job: Job) -> Result<()> {
                         .await;
                 }
             }
-            let _ = sqlx::query("UPDATE repo_provision_retry SET last_error = ?, next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ? AND attempts = ? AND checks_digest = ? AND connection_id = ? AND EXISTS(SELECT 1 FROM project WHERE id=? AND settings=?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+            if let Ok(mut tx) = db::begin_immediate(job.db.pool()).await {
+                if fence_job_inputs(&mut tx, &job.project.id, &digest)
+                    .await
+                    .is_ok()
+                {
+                    let _ = sqlx::query("UPDATE repo_provision_retry SET last_error = ?, next_attempt_at = ? WHERE repo_id = ? AND runtime_id = ? AND attempts = ? AND checks_digest = ? AND connection_id = ? AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
                 .bind(crate::project_environment::bounded_output_tail(&error.to_string())).bind(environment_retry_at(attempts))
-                .bind(&job.repo.id).bind(&job.candidate.location.runtime_id).bind(attempts).bind(&digest).bind(connection as i64).bind(&job.project.id).bind(&job.project.settings).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(job.db.pool()).await;
+                .bind(&job.repo.id).bind(&job.candidate.location.runtime_id).bind(attempts).bind(&digest).bind(connection as i64).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(&mut *tx).await;
+                    let _ = tx.commit().await;
+                }
+            }
         }
         // Existing waiters receive the terminal failure/progress reason without
         // spending a Task version or relying on a later scan to display it.
@@ -190,9 +221,14 @@ pub(crate) async fn start(job: Job) -> Result<()> {
                 let tasks: Vec<(String,i64)> = sqlx::query_as("SELECT id,version FROM task WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?)")
                     .bind(&job.project.id).bind(&machine_json).fetch_all(job.db.pool()).await.unwrap_or_default();
                 let elapsed = started.as_deref().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()).map(|time| (chrono::Utc::now()-time.with_timezone(&chrono::Utc)).num_seconds().max(0)).unwrap_or(0);
-                let reason = format!("environment_probe_pending: {name}; provisioning elapsed {elapsed}s; last failure: {error}{}", if attempts >= MAX_PROVISION_ATTEMPTS { "; machine unreachable: retry limit reached" } else { "" });
-                for (id,version) in tasks { let _ = sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND EXISTS(SELECT 1 FROM project WHERE id=? AND settings=?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
-                    .bind(&reason).bind(id).bind(version).bind(&machine_json).bind(&job.project.id).bind(&job.project.settings).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(job.db.pool()).await; }
+                let reason = format!("environment_probe_pending: {name}; provisioning elapsed {elapsed}s; last failure: {error}{}", if attempts >= MAX_PROVISION_ATTEMPTS { "; provisioning retry limit reached" } else { "" });
+                if let Ok(mut tx)=db::begin_immediate(job.db.pool()).await {
+                    if fence_job_inputs(&mut tx,&job.project.id,&digest).await.is_ok() {
+                for (id,version) in tasks { let _ = sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+                    .bind(&reason).bind(id).bind(version).bind(&machine_json).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(&mut *tx).await; }
+                        let _=tx.commit().await;
+                    }
+                }
             }
         }
         drop(guard);
@@ -208,6 +244,24 @@ pub(crate) fn job_inputs_digest(settings: &ProjectSettings) -> String {
         settings.placement.provision,
         settings.placement.provision_timeout_seconds
     )
+}
+
+async fn fence_job_inputs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+    digest: &str,
+) -> Result<()> {
+    let raw: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+        .bind(project_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    let settings: ProjectSettings = serde_json::from_str(&raw)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    if job_inputs_digest(&settings) != digest {
+        return Err(db::DbError::VersionConflict.into());
+    }
+    Ok(())
 }
 
 fn environment_retry_at(attempt: i64) -> String {
@@ -283,9 +337,12 @@ impl Job {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         row: &db::ProjectMachineReadiness,
     ) -> Result<()> {
+        let snapshot: ProjectSettings = serde_json::from_str(&self.project.settings)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        fence_job_inputs(tx, &self.project.id, &job_inputs_digest(&snapshot)).await?;
         let (owner, daemon, runtime) = row.machine.columns();
-        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_machine_readiness r JOIN project p ON p.id=r.project_id WHERE r.project_id=? AND r.owner_kind=? AND r.daemon_id=? AND r.runtime_id=? AND r.version=? AND r.checks_digest=? AND p.settings=?)")
-            .bind(&self.project.id).bind(owner).bind(daemon).bind(runtime).bind(row.version).bind(&row.checks_digest).bind(&self.project.settings).fetch_one(&mut **tx).await?;
+        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project_machine_readiness r JOIN project p ON p.id=r.project_id WHERE r.project_id=? AND r.owner_kind=? AND r.daemon_id=? AND r.runtime_id=? AND r.version=? AND r.checks_digest=?)")
+            .bind(&self.project.id).bind(owner).bind(daemon).bind(runtime).bind(row.version).bind(&row.checks_digest).fetch_one(&mut **tx).await?;
         if !current {
             return Err(db::DbError::VersionConflict.into());
         }
@@ -562,6 +619,75 @@ fn managed_clone_path_matches(root: &str, path: &str, repo: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provisioning_exhaustion_uses_current_inputs_and_socket_epoch() {
+        let mut settings = ProjectSettings::default();
+        let mut row = ProvisionRetryState {
+            attempts: 5,
+            inputs_digest: job_inputs_digest(&settings),
+            connection_id: 42,
+        };
+        assert!(row.exhausted(&settings, Some(42)));
+        assert!(row.exhausted(&settings, None));
+        assert!(!row.exhausted(&settings, Some(43)));
+        settings.max_active_tasks += 1;
+        assert!(
+            row.exhausted(&settings, Some(42)),
+            "unrelated settings are not job inputs"
+        );
+        settings.placement.provision_timeout_seconds += 1;
+        assert!(!row.exhausted(&settings, Some(42)));
+        row.inputs_digest = job_inputs_digest(&settings);
+        row.attempts = 4;
+        assert!(!row.exhausted(&settings, Some(42)));
+    }
+
+    #[tokio::test]
+    async fn transactional_job_input_fence_ignores_unrelated_settings_edits() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        let id = db::new_uuid_v4();
+        let now = db::now_rfc3339();
+        db::ProjectRepo::create(
+            &db,
+            db::CreateProject {
+                id: id.clone(),
+                name: "fence".into(),
+                settings: "{}".into(),
+                workflow_definition: "{}".into(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let settings = ProjectSettings::default();
+        let digest = job_inputs_digest(&settings);
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(serde_json::json!({"max_active_tasks":23}).to_string())
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        fence_job_inputs(&mut tx, &id, &digest).await.unwrap();
+        tx.rollback().await.unwrap();
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(serde_json::json!({"placement":{"provision":"never"}}).to_string())
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        assert!(matches!(
+            fence_job_inputs(&mut tx, &id, &digest).await,
+            Err(ServiceError::Db(db::DbError::VersionConflict))
+        ));
+    }
+
     #[test]
     fn provision_path_validation_uses_the_daemons_path_syntax() {
         let root = tempfile::tempdir().unwrap();

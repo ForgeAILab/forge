@@ -763,6 +763,7 @@ pub(crate) async fn handle_refusal(
     project: &db::Project,
     context: &super::SelectionContext,
     refusal: &super::PlacementUnavailable,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> Result<bool> {
     use super::PlacementFilterCode::*;
     if super::machine_precheck::capacity_only_wait(refusal) {
@@ -812,26 +813,6 @@ pub(crate) async fn handle_refusal(
         }
         return Ok(true); // A CAS loser retries fresh; never enter a failed transition.
     }
-    if context
-        .candidates
-        .iter()
-        .any(|candidate| candidate.provision_exhausted)
-    {
-        let mut pending = refusal.clone();
-        for rejected in &mut pending.rejected_candidates {
-            if context.candidates.iter().any(|candidate| {
-                candidate.provision_exhausted && candidate.location.id == rejected.repo_location_id
-            }) {
-                rejected.filter_codes.push(EnvironmentProbePending);
-            }
-        }
-        return Ok(
-            defer_refusal(db, task, &ServiceError::PlacementUnavailable(pending))
-                .await?
-                .unwrap_or(false),
-        );
-    }
-
     if let Some(rejection) = refusal
         .rejected_candidates
         .iter()
@@ -856,6 +837,7 @@ pub(crate) async fn handle_refusal(
         db,
         task,
         &ServiceError::PlacementUnavailable(refusal.clone()),
+        registry,
     )
     .await?
     .unwrap_or(false))
@@ -864,6 +846,7 @@ pub(crate) async fn defer_refusal(
     db: &SqliteDb,
     task: &db::Task,
     error: &ServiceError,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> Result<Option<bool>> {
     if matches!(
         error,
@@ -952,7 +935,7 @@ pub(crate) async fn defer_refusal(
     };
     let kind = "environment_probe_pending";
     let label = machine_name(db, &machine).await?;
-    let progress = provisioning_wait_detail(db, &refusal.repo_id, &machine).await?;
+    let progress = provisioning_wait_detail(db, &refusal.repo_id, &machine, registry).await?;
     let current: Option<String> = sqlx::query_scalar("SELECT metadata_json FROM task WHERE id=?")
         .bind(&task.id)
         .fetch_optional(db.pool())
@@ -1009,15 +992,34 @@ async fn provisioning_wait_detail(
     db: &SqliteDb,
     repo: &str,
     machine: &EnvironmentMachine,
+    registry: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
 ) -> Result<String> {
-    let EnvironmentMachine::Daemon { runtime_id, .. } = machine else {
+    let EnvironmentMachine::Daemon {
+        runtime_id,
+        daemon_id,
+    } = machine
+    else {
         return Ok(String::new());
     };
     let detail: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELECT started_at, COALESCE(l.last_error, j.last_error) FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?").bind(repo).bind(runtime_id).fetch_optional(db.pool()).await?;
     let Some((started, error)) = detail else {
         return Ok(String::new());
     };
-    let exhausted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo_provision_retry WHERE repo_id=? AND runtime_id=? AND attempts>=?)").bind(repo).bind(runtime_id).bind(super::provisioning::MAX_PROVISION_ATTEMPTS).fetch_one(db.pool()).await?;
+    let retry:super::provisioning::ProvisionRetryState=sqlx::query_as::<_,(i64,String,i64)>("SELECT attempts,checks_digest AS inputs_digest,connection_id FROM repo_provision_retry WHERE repo_id=? AND runtime_id=?").bind(repo).bind(runtime_id).fetch_one(db.pool()).await?.into();
+    let raw: String = sqlx::query_scalar(
+        "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
+    )
+    .bind(repo)
+    .fetch_one(db.pool())
+    .await?;
+    let settings: api_types::ProjectSettings = serde_json::from_str(&raw)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let exhausted = retry.exhausted(
+        &settings,
+        registry
+            .and_then(|registry| registry.get(daemon_id))
+            .map(|connection| connection.id()),
+    );
     let elapsed = started
         .as_deref()
         .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
@@ -1037,7 +1039,7 @@ async fn provisioning_wait_detail(
     Ok(format!(
         "; {}{}",
         if exhausted {
-            "machine unreachable: retry limit reached; reconnect the machine or update its Project settings".to_owned()
+            "provision_failed: retry limit reached; reconnect the machine or update its Project settings".to_owned()
         } else {
             format!("provisioning elapsed {elapsed}s")
         },

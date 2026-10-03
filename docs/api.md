@@ -2295,7 +2295,7 @@ ten-minute review at a time:
   create Task environment Attention and never pause the Project. Clone and verify
   errors retain the location's bounded `last_error` and appear in the wait reason
   with elapsed seconds; credentials are redacted. Five failed attempts for the
-  same settings and connection show an unreachable machine until reconnection
+  same settings and connection show a provision_failed Task blocker until reconnection
   or settings changes.
 
 - `env` is set on every executor process (all CLI harnesses and the shell
@@ -3986,13 +3986,22 @@ candidate names its repository location, owner, daemon/runtime and `filter_codes
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
 `agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
-`run_purpose_denied`, `not_visible`, `environment_not_ready`, and
-`environment_probe_pending`, and `environment_unverified`. Unverified is a
+`run_purpose_denied`, `not_visible`, `environment_not_ready`,
+`environment_probe_pending`, `environment_unverified`, and `provision_failed`. Unverified is a
 deterministic, action-required refusal with machine-named Task Attention; it
 also stays deterministic when transport facts are absent. Environment rejections carry applicable check names
 in `failing_checks`. Probe-pending defers dispatcher admission; direct/manual
 claims run the checks at launch. An environment Project pause defers dispatch
 without a `dispatch_failed` annotation.
+`provision_failed` is a deterministic refusal when five attempts belong to the
+current job-input digest and socket incarnation. It records machine-named Task
+Attention once, including the bounded redacted last provisioning error. Repeated
+claims/scans do not rewrite Task metadata. Changed job inputs or a new connection
+clear the blocker. A connected machine is not labeled offline because cloning
+or verification failed. Retry attempts, input digest and connection ID are part
+of the refusal's eligibility key. Task placement diagnostics preserve the
+`environment_wait.kind` filter and its daemon/runtime machine identity.
+
 `daemon_upgrade_required` applies only if an otherwise eligible candidate is
 blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.

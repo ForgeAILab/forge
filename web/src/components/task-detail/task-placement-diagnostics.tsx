@@ -4,6 +4,8 @@ const labels: Record<string, string> = {
   environment_not_ready: 'Environment not ready',
   environment_probe_pending: 'Checking machine',
   environment_unverified: 'No machine checks to verify before cloning',
+  provision_failed:
+    'Repository provisioning failed; reconnect or update placement settings to retry',
   machine_capacity: 'Machine run capacity reached',
   executor_unavailable: 'Executor unavailable',
 }

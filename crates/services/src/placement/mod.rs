@@ -17,6 +17,7 @@ pub use selection::{
 
 pub(crate) fn retryable_filter_codes(codes: &[PlacementFilterCode]) -> bool {
     !codes.is_empty()
+        && !codes.contains(&PlacementFilterCode::ProvisionFailed)
         && codes.iter().all(|code| {
             matches!(
                 code,

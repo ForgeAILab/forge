@@ -161,7 +161,7 @@ async fn task_response_exposes_recorded_environment_and_capacity_waits() {
         StatusCode::OK,
     )
     .await;
-    sqlx::query("UPDATE task SET metadata_json=? WHERE id=?").bind(json!({"environment_wait":{"machine":{"owner_kind":"server"},"checks":["cargo"]},"deferred_dispatch":{"kind":"environment_probe_pending"},"dispatch_disposition":{"task_version":task.version-1,"capability":"machine_capacity","blocker_digest":"test","recorded_at":db::now_rfc3339(),"safe_message":"Machine run capacity reached"}}).to_string()).bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET metadata_json=? WHERE id=?").bind(json!({"environment_wait":{"kind":"environment_not_ready","machine":{"owner_kind":"server"},"checks":["cargo"]},"deferred_dispatch":{"kind":"environment_probe_pending"},"dispatch_disposition":{"task_version":task.version-1,"capability":"machine_capacity","blocker_digest":"test","recorded_at":db::now_rfc3339(),"safe_message":"Machine run capacity reached"}}).to_string()).bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
     let read: api_types::TaskResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -171,19 +171,46 @@ async fn task_response_exposes_recorded_environment_and_capacity_waits() {
     .await;
     assert_eq!(
         read.placement_diagnostics.len(),
-        3,
+        2,
         "{:?}",
         read.placement_diagnostics
     );
     assert_eq!(read.placement_diagnostics[0].failing_checks, vec!["cargo"]);
     assert_eq!(
-        read.placement_diagnostics[1].machine.as_ref().unwrap().name,
+        read.placement_diagnostics[0].machine.as_ref().unwrap().name,
         "Server host"
     );
     assert_eq!(
-        read.placement_diagnostics[2].filter_codes,
+        read.placement_diagnostics[1].filter_codes,
         vec!["machine_capacity"]
     );
+    sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES('diagnostic-daemon','remote','Remote worker','linux','x86_64','online','now','now')").execute(harness.state.db.pool()).await.unwrap();
+    for kind in [
+        "environment_unverified",
+        "environment_probe_pending",
+        "provision_failed",
+    ] {
+        let metadata = json!({"environment_wait":{"kind":kind,"machine":{"owner_kind":"daemon","daemon_id":"diagnostic-daemon","runtime_id":"diagnostic-runtime"},"checks":[]},"deferred_dispatch":{"kind":"environment_probe_pending"}});
+        sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
+            .bind(metadata.to_string())
+            .bind(&task.id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let response: api_types::TaskResponse = common::empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}", task.id),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(response.placement_diagnostics.len(), 1);
+        assert_eq!(response.placement_diagnostics[0].filter_codes, [kind]);
+        let machine = response.placement_diagnostics[0].machine.as_ref().unwrap();
+        assert_eq!(machine.name, "Remote worker");
+        assert_eq!(machine.daemon_id.as_deref(), Some("diagnostic-daemon"));
+        assert_eq!(machine.runtime_id.as_deref(), Some("diagnostic-runtime"));
+    }
 }
 
 #[tokio::test]

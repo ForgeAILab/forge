@@ -2746,8 +2746,15 @@ All job writes fence the check digest and observed readiness version; stale
 results are discarded and the current digest is probed. Clone and verification
 failures appear in the Task's wait reason, with elapsed time and the bounded
 `repo_location.last_error`. Provisioning stops after five attempts for unchanged
-inputs and connection, shows the machine as unreachable, and resumes after
-reconnection or a relevant settings edit. Backoff is 60–600 seconds. No execution,
+inputs and connection, records deterministic `provision_failed` Task Attention
+with the machine name and redacted last error, and resumes after reconnection or
+a relevant settings edit. Both claim and dispatch paths record this once; their
+eligibility key includes attempts, job-input digest and connection ID. A failed
+clone does not make a connected machine offline. Selection and wait diagnostics
+share one exhaustion rule. Unrelated Project settings edits leave an in-flight
+job and its attempt intact; result writes still fence the job inputs and
+readiness version. Socket incarnation IDs are random numeric tokens that remain
+unique across server restarts without a public shape change. Backoff is 60–600 seconds. No execution,
 lease or worktree exists during these jobs.
 
 Provisioning sends the repository's default branch, creates or fetches its local

@@ -181,3 +181,29 @@ turn other deterministic refusals into pending environment waits.
 #### Scenario: Settings change while full checks run
 - **WHEN** a checks edit changes the digest or a newer readiness row wins during full checks
 - **THEN** the old job discards its results and the current digest is probed
+
+### Requirement: Provisioning exhaustion is a deterministic Task blocker
+The system SHALL, after five provisioning attempts for unchanged job inputs and
+connection, refuse placement with provision_failed and record machine-named
+Task Attention with the redacted last error once. Both initial and active scans
+SHALL avoid metadata rewrites until eligibility changes. Retry attempts, input
+digest and connection ID SHALL participate in the eligibility key; connection
+IDs SHALL be unique across server restarts. Unrelated Project settings SHALL NOT
+abort a job or spend a retry attempt. Public Task placement diagnostics SHALL
+preserve the wait kind and its machine identity.
+
+#### Scenario: Connected machine exhausts provisioning
+- **WHEN** a connected machine exhausts the current provisioning retry epoch
+- **THEN** the Task has provision_failed Attention and a visible last error without an owner_unreachable classification or repeated metadata writes
+
+#### Scenario: Reconnect after exhaustion
+- **WHEN** the daemon reconnects, including after a server restart
+- **THEN** a distinct socket token invalidates the old exhausted epoch and wakes dispatch
+
+#### Scenario: Unrelated Project edit during provisioning
+- **WHEN** an owner edits a setting outside the provisioning job inputs
+- **THEN** the running job completes without restarting or spending another attempt
+
+#### Scenario: Daemon wait diagnostics
+- **WHEN** a Task waits on a daemon for unverified, probe-pending or provision-failed placement
+- **THEN** placement_diagnostics carries that wait kind and the daemon machine identity

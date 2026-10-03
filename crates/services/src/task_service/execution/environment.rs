@@ -152,6 +152,8 @@ impl TaskService {
                     &prepared.project,
                     &context,
                     &refusal,
+                    self.environment_daemon_connections()
+                        .map(|registry| &**registry),
                 )
                 .await?;
             }

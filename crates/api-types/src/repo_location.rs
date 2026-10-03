@@ -1,6 +1,28 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlacementFilterCode {
+    OwnerUnreachable,
+    DaemonUpgradeRequired,
+    WorkspaceProtocolMissing,
+    LocationNotReady,
+    ExecutorUnavailable,
+    CapabilityMissing,
+    PinMismatch,
+    AgentCapacity,
+    MachineCapacity,
+    NativeBackendUnsupported,
+    RunPurposeDenied,
+    NotVisible,
+    EnvironmentNotReady,
+    EnvironmentProbePending,
+    EnvironmentUnverified,
+    ProvisionFailed,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
