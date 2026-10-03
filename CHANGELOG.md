@@ -42,7 +42,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `task.actions_changed` is removed, and Task actions no longer return
     `task.terminal` (launch and follow-up still can). Stored actor sources
     change from `user:recovery:*` to `user:action:*`, and transition triggers
-    gain `restart` and `retry`. Stored historical payloads are kept as
+    gain `restart` and `retry`. A dispatch hook skipped because the Task
+    dispatcher will launch the role later is logged as `dispatch deferred to
+    Task dispatcher` (was `dispatch deferred after board drag`). Stored historical payloads are kept as
     evidence; no user data is rewritten.
 
   | Old operation | New action |
