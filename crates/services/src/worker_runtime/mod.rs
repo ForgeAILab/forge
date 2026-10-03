@@ -1,5 +1,6 @@
 //! Ordered event execution assembled from a durable source and reusable,
 //! source-neutral DB health, poison policy and loop supervision.
+pub(crate) mod conflict_hotspot;
 mod event_source;
 mod periodic;
 mod policy;

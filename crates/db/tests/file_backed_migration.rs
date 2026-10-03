@@ -5179,3 +5179,53 @@ async fn daemon_migrations_arriving_after_integration_preserve_existing_workspac
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn conflict_hotspot_migration_seeds_current_head_on_migrated_clone() {
+    let migration_dir = unique_temp_path("conflict-hotspot-migrations");
+    fs::create_dir_all(&migration_dir).unwrap();
+    copy_migrations_up_to(202610032059, &migration_dir);
+    let db_path = unique_temp_path("conflict-hotspot-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, payload_json, created_at) VALUES ('hotspot-before-upgrade', 'task.transitioned', 'task', 'task-before', 'system', 'task', 'task-before', 'upgrade-test', '{\"project_id\":\"project-before\"}', '2026-10-03T20:00:00Z')")
+        .execute(&pool).await.unwrap();
+    let head: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Close and reopen the already-migrated file, as a clone upgrade does.
+    pool.close().await;
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let cursor: (i64, i64) = sqlx::query_as("SELECT last_sequence, version FROM event_consumer_cursor WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cursor, (head, 1));
+    let cutover: i64 = sqlx::query_scalar("SELECT cutover_sequence FROM event_consumer_cutover WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cutover, head);
+    let historical: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE id = 'hotspot-before-upgrade'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(historical, 1);
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = last_sequence + 1, version = version + 1 WHERE consumer_name = 'conflict-hotspots'")
+        .execute(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let cursor_after: (i64, i64) = sqlx::query_as("SELECT last_sequence, version FROM event_consumer_cursor WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cursor_after, (head + 1, 2));
+    let index: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_domain_event_type_sequence'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(index, 1);
+    let boundaries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conflict_hotspot_boundary")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(boundaries, 0);
+    pool.close().await;
+    fs::remove_file(db_path).unwrap();
+    fs::remove_dir_all(migration_dir).unwrap();
+}

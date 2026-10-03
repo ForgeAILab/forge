@@ -173,6 +173,34 @@ const data: MissionControlResponse = {
 }
 
 describe('MissionControlPage', () => {
+  it('renders conflict hot spots with the existing attention warning treatment', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'conflict_hotspot',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: 'src/shared.rs conflicted in 3 Tasks this week',
+        recommended_action: 'split_hotspot',
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.getByText('Conflict Hotspot')).toBeTruthy()
+      expect(screen.getByText('src/shared.rs conflicted in 3 Tasks this week')).toBeTruthy()
+      expect(screen.getByText('Split Hotspot')).toBeTruthy()
+      expect(
+        screen
+          .getByText('Conflict Hotspot')
+          .closest('article')
+          ?.classList.contains('border-warning/30'),
+      ).toBe(true)
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
   it('prioritizes attention and review-ready work', () => {
     render(<MissionControlPage />)
     expect(screen.getByText('What needs your attention?')).toBeTruthy()

@@ -123,6 +123,7 @@ function attentionTone(item: AttentionItem): string {
       'review_risk',
       'budget_threshold',
       'commitment_overdue',
+      'conflict_hotspot',
       'progress_warning',
     ].includes(item.category)
   ) {

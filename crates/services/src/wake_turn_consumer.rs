@@ -1663,6 +1663,23 @@ fn execution_failed_directive(attention: &db::AttentionProjection) -> String {
     }
 }
 
+fn conflict_hotspot_directive(attention: &db::AttentionProjection) -> String {
+    let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
+    let hotspot = &details["conflict_hotspot"];
+    let path = hotspot["path"].as_str().unwrap_or("unknown path");
+    let tasks = hotspot["task_ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let layout = forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE;
+    format!("Path: {path}; Tasks: {tasks}. Propose one Task via `task.propose` to split this file into smaller modules, unless an open Task already covers it. {layout} Use clear owners so parallel Tasks edit disjoint files. Resolve this incident afterwards.")
+}
+
 fn wake_content(
     attention: &db::AttentionProjection,
     delivery: Option<&DeliveryFollowupState>,
@@ -1683,6 +1700,8 @@ fn wake_content(
     let decision_requirement = decision_directive(attention);
     let final_instruction = if attention.attention_type == "execution_failed" {
         execution_failed_directive(attention)
+    } else if attention.attention_type == "conflict_hotspot" {
+        conflict_hotspot_directive(attention)
     } else {
         "Assess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.".to_owned()
     };
@@ -1895,6 +1914,38 @@ mod tests {
             updated_by_user_id: None,
             recommended_action: "continue_from_decision".to_owned(),
             source_sequence: Some(1),
+        }
+    }
+
+    #[test]
+    fn conflict_hotspot_directive_names_path_tasks_and_stays_category_local() {
+        let details = json!({"conflict_hotspot": {"path": "src/shared.rs",
+            "task_ids": (1..=10).map(|id| format!("task-{id}")).collect::<Vec<_>>()}})
+        .to_string();
+        let item = attention("conflict_hotspot", &details);
+        let directive = conflict_hotspot_directive(&item);
+        assert_eq!(directive, format!("Path: src/shared.rs; Tasks: task-1,task-2,task-3,task-4,task-5,task-6,task-7,task-8,task-9,task-10. Propose one Task via `task.propose` to split this file into smaller modules, unless an open Task already covers it. {} Use clear owners so parallel Tasks edit disjoint files. Resolve this incident afterwards.", forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE));
+        assert!(directive.split_whitespace().count() <= 60);
+        assert!(wake_content(&item, None).ends_with(&directive));
+        for category in [
+            "execution_failed",
+            "delivery_followup",
+            "decision_recorded",
+            "run_stalled",
+            "human_input_required",
+            "review_risk",
+            "budget_threshold",
+            "commitment_overdue",
+        ] {
+            let content = wake_content(&attention(category, &details), None);
+            assert!(
+                !content.contains("Propose one Task via `task.propose`"),
+                "{category}"
+            );
+            assert!(
+                !content.contains(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE),
+                "{category}"
+            );
         }
     }
 

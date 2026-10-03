@@ -2654,3 +2654,72 @@ async fn audit_lost_wake_lease_cas_suppresses_without_charging_budget() {
         .unwrap();
     assert_eq!(budgets, 0);
 }
+
+#[tokio::test]
+async fn conflict_hotspots_project_per_path_refresh_and_keep_wake_rules() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "conflict-hotspots").await;
+    let service = AttentionService::new(Arc::clone(&db));
+    let mut first_id = None;
+    for (path, count) in [("src/共有.rs", 3), ("src/共有.rs", 4), ("src/other.rs", 3)] {
+        db.append_event(CreateDomainEvent {
+            id: new_uuid_v4(), event_type: "project.conflict_hotspot.detected".into(),
+            entity_type: "project".into(), entity_id: project_id.clone(),
+            actor_type: "system".into(), actor_id: Some("conflict-hotspots".into()),
+            scope_type: "project".into(), scope_id: project_id.clone(),
+            correlation_id: new_uuid_v4(), causation_id: None, causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: serde_json::json!({"project_id": project_id, "path": path,
+                "task_ids": ["task-3", "task-2", "task-1"], "handoff_count": count, "window_days": 7}).to_string(),
+            created_at: now_rfc3339(),
+        }).await.unwrap();
+        service.project_once(100).await.unwrap();
+        let rows = sqlx::query_as::<_, (String, String, String, String, String, i64, String, i64)>(
+            "SELECT id, scope_type, scope_id, summary, recommended_action, priority, details_json, version
+             FROM attention_projection WHERE attention_type = 'conflict_hotspot' ORDER BY source_sequence",
+        ).fetch_all(db.pool()).await.unwrap();
+        let item = rows.last().unwrap();
+        assert_eq!(item.1, "project");
+        assert_eq!(item.2, project_id);
+        assert_eq!(
+            item.3,
+            format!("{path} conflicted in {count} Tasks this week")
+        );
+        assert_eq!(item.4, "split_hotspot");
+        assert_eq!(item.5, 60);
+        let details: serde_json::Value = serde_json::from_str(&item.6).unwrap();
+        assert_eq!(details["conflict_hotspot"]["path"], path);
+        if path == "src/共有.rs" {
+            assert_eq!(rows.len(), 1);
+            match &first_id {
+                None => first_id = Some(item.0.clone()),
+                Some(first) => {
+                    assert_eq!(&item.0, first);
+                    assert!(item.7 > 1);
+                }
+            }
+        } else {
+            assert_eq!(rows.len(), 2);
+            assert_ne!(Some(&item.0), first_id.as_ref());
+        }
+        let projection = db.get_attention(&item.0).await.unwrap().unwrap();
+        assert_eq!(
+            services::attention_service::attention_item(projection)
+                .unwrap()
+                .category,
+            api_types::AttentionCategory::ConflictHotspot
+        );
+    }
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admitted, 2); // Same path's refresh remains a duplicate incident.
+    let ineligible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.suppressed' AND json_extract(payload_json, '$.reason') = 'ineligible_scope'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(ineligible, 0);
+}

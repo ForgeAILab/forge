@@ -2176,7 +2176,7 @@ SQLite transaction as their authoritative state. Events carry canonical scope,
 actor, correlation/causation, bounded reaction depth, and dedupe identity.
 Durable consumers checkpoint only after their projection is safe to commit, so
 lag and restart replay cannot duplicate chat turn jobs, Attention rows, actions,
-memory indexing, notification rows, Project hook DB actions, or commitment reconciliation. Six durable consumers use the
+memory indexing, notification rows, Project hook DB actions, or commitment reconciliation. Seven durable consumers use the
 single-process worker runtime described below. SSE uses a read-only in-memory
 tail and connection-time ledger replay.
 
@@ -3603,6 +3603,18 @@ retry window and conflicts on coordination roots, whose aggregate branch stays
 on the manual path. There, the recovery action creates a
 marked review-refresh transition, clears the old approval, and runs the
 repaired result through fresh checks and review before merge.
+
+The durable `conflict-hotspots` consumer observes these workflow-authored
+`merging → merge_failed` handoffs after its installation cutover. The existing
+type/sequence index bounds the event-ledger query, which filters the Project and
+seven-day window and counts distinct Tasks per path, excluding unsplittable
+dependency lockfiles. Three Tasks produce a
+`project.conflict_hotspot.detected` event atomically with the consumer cursor;
+Attention projects a Project/path incident and the existing wake pipeline asks
+the Project Agent to propose one module-splitting Task. Further handoffs refresh
+the same incident. A durable boundary preserves the latest resolution timestamp across reopening, so only
+newer handoffs count. Worker retries, dead letters, and replay use
+the shared runtime; neither conflict handling nor wake budgets change.
 
 ### Task condition actions
 

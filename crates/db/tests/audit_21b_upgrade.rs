@@ -81,17 +81,18 @@ async fn audit_real_runner_upgrade_from_base_schema() {
     let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('event_processing_lease', 'event_projection_receipt', 'attention_consumer_health', 'idx_attention_consumer_health_stale')")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(legacy, 0);
-    let cursors_after: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor WHERE consumer_name NOT IN ('notifications', 'project-hooks') ORDER BY consumer_name")
+    let cursors_after: Vec<(String, i64, i64, String)> = sqlx::query_as("SELECT consumer_name, last_sequence, version, updated_at FROM event_consumer_cursor WHERE consumer_name NOT IN ('conflict-hotspots', 'notifications', 'project-hooks') ORDER BY consumer_name")
         .fetch_all(&pool).await.unwrap();
     assert_eq!(cursors_before, cursors_after, "cursors kept; sse removed");
     let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM domain_event")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let new_cursors: Vec<(String, i64)> = sqlx::query_as("SELECT consumer_name, last_sequence FROM event_consumer_cursor WHERE consumer_name IN ('notifications', 'project-hooks') ORDER BY consumer_name").fetch_all(&pool).await.unwrap();
+    let new_cursors: Vec<(String, i64)> = sqlx::query_as("SELECT consumer_name, last_sequence FROM event_consumer_cursor WHERE consumer_name IN ('conflict-hotspots', 'notifications', 'project-hooks') ORDER BY consumer_name").fetch_all(&pool).await.unwrap();
     assert_eq!(
         new_cursors,
         vec![
+            ("conflict-hotspots".to_owned(), head),
             ("notifications".to_owned(), head),
             ("project-hooks".to_owned(), head)
         ]
@@ -106,7 +107,11 @@ async fn audit_real_runner_upgrade_from_base_schema() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(cutover_before, cutover_after);
+    assert_eq!(cutover_before + 1, cutover_after);
+    let hotspot_cutover: i64 = sqlx::query_scalar(
+        "SELECT cutover_sequence FROM event_consumer_cutover WHERE consumer_name = 'conflict-hotspots'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(hotspot_cutover, head);
     let fk: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
         .fetch_all(&pool)
         .await

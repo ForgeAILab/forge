@@ -3367,3 +3367,62 @@ async fn audit2_responder_read_failure_keeps_existing_deferral() {
         .unwrap();
     assert_eq!(dead, 0);
 }
+
+#[tokio::test]
+async fn conflict_hotspot_wake_routes_to_project_agent_with_bounded_directive() {
+    let fixture = chat_turn_fixture().await;
+    fixture
+        .db
+        .append_event(CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "project.conflict_hotspot.detected".into(),
+            entity_type: "project".into(),
+            entity_id: fixture.project_id.clone(),
+            actor_type: "system".into(),
+            actor_id: Some("conflict-hotspots".into()),
+            scope_type: "project".into(),
+            scope_id: fixture.project_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json:
+                serde_json::json!({"project_id": fixture.project_id, "path": "src/共有.rs",
+            "task_ids": ["task-3", "task-2", "task-1"], "handoff_count": 3, "window_days": 7})
+                .to_string(),
+            created_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    AttentionService::new(Arc::clone(&fixture.db))
+        .project_once(100)
+        .await
+        .unwrap();
+    let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted' AND scope_type = 'project' AND scope_id = ?")
+        .bind(&fixture.project_id).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(admitted, 1);
+    WakeTurnConsumer::new(Arc::clone(&fixture.db))
+        .run_once(100)
+        .await
+        .unwrap();
+    let (chat_id, responder, content): (String, String, String) = sqlx::query_as(
+        "SELECT j.chat_id, j.responder_identity_id, m.content FROM agent_chat_turn_job j
+         JOIN agent_chat_message m ON m.id = j.triggering_message_id
+         WHERE j.chat_id = ? AND m.content LIKE '%Category: conflict_hotspot%'",
+    )
+    .bind(&fixture.chat_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(chat_id, fixture.chat_id);
+    assert_eq!(responder, fixture.identity_id);
+    let directive = content.lines().last().unwrap();
+    assert!(directive.contains("src/共有.rs"));
+    for task in ["task-1", "task-2", "task-3"] {
+        assert!(directive.contains(task));
+    }
+    assert!(directive.contains("Propose one Task via `task.propose`"));
+    assert!(directive.contains("unless an open Task already covers it"));
+    assert!(directive.contains("Resolve this incident afterwards."));
+    assert!(directive.split_whitespace().count() <= 60);
+}

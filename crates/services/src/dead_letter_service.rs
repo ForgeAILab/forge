@@ -45,6 +45,7 @@ impl DeadLetterService {
         service.register(Arc::clone(&runtime.wake_turn_consumer));
         service.register(Arc::clone(&runtime.project_hook_service));
         service.register(Arc::clone(&runtime.notification_service));
+        service.register(Arc::clone(&runtime.conflict_hotspot_consumer));
         service
     }
     pub fn register<W: Worker<C>, C: Send + Sync + 'static>(&mut self, worker: Arc<W>) {

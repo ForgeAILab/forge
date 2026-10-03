@@ -815,6 +815,24 @@ Project Chat/task scopes) and intentionally excludes account/Main activity.
 Direct receipts linked to an `AgentActionExecution` are omitted from the
 direct stream so one approved execution cannot appear twice.
 
+`AttentionCategory` includes `human_input_required`, `validation_failed`,
+`run_stalled`, `progress_warning`, `retry_exhausted`, `review_ready`, `review_risk`,
+`execution_failed`, `delivery_followup`, `decision_recorded`, `runtime_offline`,
+`budget_threshold`, `commitment_overdue`, and `conflict_hotspot`.
+
+`project.conflict_hotspot.detected` is a durable Project-scoped event with
+`project_id`, `path`, `task_ids` (distinct, most recent first, at most 10),
+`handoff_count` (the full distinct-Task count), and `window_days` (7).
+Three distinct Tasks handing off conflicts on one non-lockfile path within seven
+days raise one `conflict_hotspot` Attention incident per Project/path (priority 60,
+recommended action `split_hotspot`). Repeated detections refresh that incident.
+The detector starts at the installation event head and excludes earlier handoffs.
+After resolution, three distinct Tasks must hand off that path again using only
+handoffs newer than resolution. Its Project Agent wake asks for one file-splitting
+Task proposal through the existing approval flow, skips an already-open equivalent
+Task, and asks the Agent to resolve the incident; Forge does not create the Task.
+Existing wake duplicate, cooldown, and budget rules apply.
+
 `AttentionCategory` includes `delivery_followup`. Forge projects it when a
 Task reaches a successful terminal state (`done` in the default workflow) so
 the bound Project Agent can reconcile authoritative

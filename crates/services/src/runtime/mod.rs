@@ -127,6 +127,7 @@ pub enum RuntimeWorker {
     Attention,
     WakeDelivery,
     ProjectHooks,
+    ConflictHotspots,
     WorkspaceCleanup,
     DomainEventBroadcast,
     StorageMaintenance,
@@ -137,6 +138,7 @@ impl RuntimeWorker {
         match self {
             Self::NotificationProjection => Some(crate::notification_service::CONSUMER_NAME),
             Self::ProjectHooks => Some(crate::project_hooks::CONSUMER_NAME),
+            Self::ConflictHotspots => Some(crate::worker_runtime::conflict_hotspot::CONSUMER_NAME),
             Self::Memory => Some(crate::memory_consumer_name()),
             Self::Coordination => Some(crate::coordination_consumer_name()),
             Self::Attention => Some(crate::attention_service::attention_consumer_name()),
@@ -147,7 +149,7 @@ impl RuntimeWorker {
     }
 }
 
-pub(crate) const COMMON_WORKERS: [RuntimeWorker; 15] = [
+pub(crate) const COMMON_WORKERS: [RuntimeWorker; 16] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -163,6 +165,7 @@ pub(crate) const COMMON_WORKERS: [RuntimeWorker; 15] = [
     RuntimeWorker::WorkspaceCleanup,
     RuntimeWorker::DomainEventBroadcast,
     RuntimeWorker::StorageMaintenance,
+    RuntimeWorker::ConflictHotspots,
 ];
 
 /// Abortable ownership for a compatibility worker that starts before a
@@ -249,6 +252,8 @@ pub struct ForgeRuntime {
     pub coordination_consumer: Arc<CoordinationOutcomeConsumer>,
     pub attention_projection: Arc<AttentionService>,
     pub wake_turn_consumer: Arc<WakeTurnConsumer>,
+    pub(crate) conflict_hotspot_consumer:
+        Arc<crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer>,
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
@@ -763,6 +768,11 @@ impl ForgeRuntimeBuilder {
                 .with_action_connections(Arc::clone(&daemon_connections)),
         );
         let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
+        let conflict_hotspot_consumer = Arc::new(
+            crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer::new(Arc::clone(
+                &self.db,
+            )),
+        );
         let domain_event_broadcast = Arc::new(DomainEventBroadcastConsumer::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
@@ -815,6 +825,7 @@ impl ForgeRuntimeBuilder {
             coordination_consumer,
             attention_projection,
             wake_turn_consumer,
+            conflict_hotspot_consumer,
             domain_event_broadcast,
             storage_maintenance,
             lifecycle_emitter,
@@ -1008,6 +1019,14 @@ impl RuntimeSupervisor {
             Arc::clone(&self.runtime.domain_event_broadcast).start(shutdown.clone()),
         ));
         self.handles.push((
+            RuntimeWorker::ConflictHotspots,
+            Arc::new(crate::worker_runtime::WorkerRuntime::new(
+                Arc::clone(&self.runtime.db),
+                Arc::clone(&self.runtime.conflict_hotspot_consumer),
+            ))
+            .start(shutdown.clone()),
+        ));
+        self.handles.push((
             RuntimeWorker::StorageMaintenance,
             Arc::clone(&self.runtime.storage_maintenance).start(&periodic_workers, shutdown),
         ));
@@ -1149,13 +1168,14 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 15);
+        assert_eq!(COMMON_WORKERS.len(), 16);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
         assert_eq!(COMMON_WORKERS[4], RuntimeWorker::TaskDispatcher);
         assert_eq!(COMMON_WORKERS[13], RuntimeWorker::DomainEventBroadcast);
         assert_eq!(COMMON_WORKERS[14], RuntimeWorker::StorageMaintenance);
+        assert_eq!(COMMON_WORKERS[15], RuntimeWorker::ConflictHotspots);
     }
 
     #[tokio::test]
@@ -1180,7 +1200,7 @@ mod tests {
                     .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
             }
             let status = service.compute_status().await.unwrap();
-            assert_eq!(status.event_consumers.len(), 5);
+            assert_eq!(status.event_consumers.len(), 6);
             assert!(status
                 .event_consumers
                 .iter()
@@ -1204,8 +1224,8 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 15);
-        assert_eq!(supervisor.worker_handle_count(), 14);
+        assert_eq!(supervisor.workers().len(), 16);
+        assert_eq!(supervisor.worker_handle_count(), 15);
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1217,7 +1237,7 @@ mod tests {
             .compute_status()
             .await
             .unwrap();
-        assert_eq!(monitored.event_consumers.len(), 6);
+        assert_eq!(monitored.event_consumers.len(), 7);
         assert_eq!(supervisor.start().await.expect("second start is no-op"), 0);
         supervisor.shutdown().await.expect("runtime shuts down");
         assert_eq!(supervisor.worker_handle_count(), 0);
@@ -1305,7 +1325,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 14);
+        assert_eq!(supervisor.worker_handle_count(), 15);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }
