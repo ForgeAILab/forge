@@ -376,3 +376,73 @@ async fn running_task_with_paused_agent_offers_the_execution_hold() {
         .iter()
         .any(|offer| offer.action.verb() == "hold"));
 }
+
+#[tokio::test]
+async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
+    let fixture = fixture().await;
+    sqlx::query("UPDATE agent_identity SET paused = 1")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let owner = Actor::user(UserActionSource::Test);
+    let verbs = |offers: &api_types::TaskActionsResponse| {
+        offers
+            .available_actions
+            .iter()
+            .map(|offer| format!("{}[{}]", offer.action.verb(), offer.reason))
+            .collect::<Vec<_>>()
+    };
+
+    let waiting = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(verbs(&waiting).contains(&"hold[dispatch_wait]".to_owned()));
+    let current = reload(&fixture).await;
+    fixture
+        .service
+        .perform_task_action_as(
+            &fixture.task.id,
+            TaskAction::Hold { reason: None },
+            current.version,
+            owner.clone(),
+        )
+        .await
+        .unwrap();
+
+    let held = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(
+        verbs(&held).contains(&"release[held_waiting]".to_owned()),
+        "{:?}",
+        verbs(&held)
+    );
+    let current = reload(&fixture).await;
+    fixture
+        .service
+        .perform_task_action_as(
+            &fixture.task.id,
+            TaskAction::Release { reason: None },
+            current.version,
+            owner.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(reload(&fixture).await.error_annotation.is_none());
+    assert!(
+        ExecutionRepo::list_running_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(verbs(&after).contains(&"hold[dispatch_wait]".to_owned()));
+}

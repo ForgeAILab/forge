@@ -598,6 +598,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "role_retry",
                 "Retry Held Task",
             );
+        } else {
+            // No Agent can take the role right now: releasing returns the Task
+            // to the dispatch queue instead of launching it.
+            offer(
+                TaskAction::Release { reason: None },
+                &[],
+                &[Owner],
+                "held_waiting",
+                "Release Task",
+            );
         }
         offer(
             TaskAction::Restart { reason: None },

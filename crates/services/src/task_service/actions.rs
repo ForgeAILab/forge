@@ -206,6 +206,10 @@ impl TaskService {
                         TaskAction::Hold { reason } if offer.reason == "dispatch_wait" => {
                             self.hold_waiting_task(&snapshot, reason.as_deref()).await?
                         }
+                        TaskAction::Release { reason } if offer.reason == "held_waiting" => {
+                            self.release_to_dispatch_queue(&snapshot, reason.as_deref())
+                                .await?
+                        }
                         TaskAction::Hold { reason } => {
                             TaskRepo::mutate_metadata_and_bump_version(
                                 &*self.db,
@@ -566,6 +570,37 @@ impl TaskService {
         self.create_system_comment(&task.id, format!("Task paused by user: {reason}"))
             .await?;
         Ok(held)
+    }
+
+    /// Clear an owner's hold on a Task that no Agent can take yet. The Task
+    /// goes back to waiting for dispatch; nothing is launched here.
+    async fn release_to_dispatch_queue(
+        &self,
+        snapshot: &TaskSnapshot,
+        reason: Option<&str>,
+    ) -> Result<Task> {
+        let task = &snapshot.task;
+        let released = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            None,
+            None,
+            None,
+            &now_rfc3339(),
+            None,
+            Self::workflow_execution_roles(snapshot),
+            Vec::new(),
+        )
+        .await?;
+        self.create_system_comment(
+            &task.id,
+            reason
+                .map(|reason| format!("Task released by user: {reason}"))
+                .unwrap_or_else(|| "Task released by user".to_owned()),
+        )
+        .await?;
+        Ok(released)
     }
 
     async fn retry_recorded_placement(
