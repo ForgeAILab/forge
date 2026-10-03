@@ -21,6 +21,7 @@ pub mod coordination_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
 pub mod daemon_transport;
+pub mod dead_letter_service;
 pub mod default_agents;
 pub(crate) mod deferred_dispatch;
 pub mod demo;

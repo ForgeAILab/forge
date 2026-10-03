@@ -563,8 +563,14 @@ Attention badge; caught-up rows say “Caught up”. Database mode and free page
 existing stat cards. Current stall alerts share the Errors and Alerts section,
 using semantic warning/destructive icons. Existing page loading, error, refresh,
 and empty states remain the state harness; the healthy empty message is withheld
-while any consumer has sequence lag. No new typography, spacing, or color tokens
-are introduced.
+while any consumer has sequence lag. Recent open dead letters use compact wrapping panels with event type, consumer,
+attempts and the existing bounded error. Replay and Dismiss use small outline
+Buttons; an optional labelled Input captures the dismissal reason. Pending
+requests disable both actions, successful resolution removes the controls,
+replay failure retains them with the new attempt/error, and result/conflict/error
+text is announced inline with status/alert roles. Status polling refreshes the
+open history; the action result stays visible until that refresh.
+No new typography, spacing, or color tokens are introduced.
 
 ### Machine run capacity
 

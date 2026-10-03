@@ -1552,6 +1552,9 @@ export interface EventRelayStatus {
 }
 
 export interface WorkerDeadLetterSummary {
+  consumer_name: string
+  event_type: string
+  attempts: number
   id: string
   item_key: string
   event_sequence: number | null

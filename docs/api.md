@@ -3199,13 +3199,13 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `event_consumers[].oldest_unprocessed_age_seconds` | Age of that event in seconds, clamped to zero, or `null`. |
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
 | `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
-| `event_consumers[].dead_letter_count` | Total retained quarantines for that worker, without an age cutoff. |
-| `event_consumers[].recent_dead_letters` | Most recent five retained quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `event_consumers[].dead_letter_count` | Open quarantines for that worker, without an age cutoff; resolved audit rows are excluded. |
+| `event_consumers[].recent_dead_letters` | Most recent five open quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, `consumer_name`, `event_type`, `attempts`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
 | `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
 
 Dead-letter history remains visible after the one-hour degraded-health window.
-Replay and dismiss actions are not available in this slice. IDs are stable and
-opaque; the stored worker/item key identifies the source for later actions.
+IDs are stable and opaque; the stored worker/item key identifies the source for
+admin replay and dismiss actions. Resolved rows remain available in the audit list.
 Relay read errors or a stopped/restarting enabled relay raise attention.
 
 A stalled consumer raises `overall_severity` to at least `attention` and appears
@@ -3221,6 +3221,44 @@ appear separately as `worker_dead_letter` issues for one hour, then expire. Exis
 still raise `error`; blocked tasks still raise `blocked`. The Operations page
 shows the lag, oldest pending age, stall state, vacuum mode, and free pages and
 uses its existing 30-second status polling to notice a dead consumer.
+
+Admin dead-letter actions use these routes:
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| GET | `/api/v1/operations/dead-letters` | List `items` and nullable `next_cursor`. Filter by exact `consumer` and `state=open\|resolved` (default `open`); `limit` defaults to 50, clamped to 1–100. |
+| POST | `/api/v1/operations/dead-letters/{id}/replay` | Replay the source event only to its original registered durable consumer. No body is required. |
+| POST | `/api/v1/operations/dead-letters/{id}/dismiss` | Resolve without delivery. JSON body `{ "reason"?: string }`; optional reason is bounded to 1024 characters. |
+
+List ordering is `(dead_lettered_at DESC, id DESC)` with a keyset cursor and
+`limit + 1` fetch. Cursors are opaque and bound to the consumer/state filters;
+invalid cursors or changed filters return 400. Each item has `summary` (the same
+bounded metadata as status), `state`, `error_kind`, `first_failed_at`,
+`last_failed_at`, and nullable `resolved_at`, `resolved_by`, `resolution`,
+`resolution_reason`. Neither this list nor action responses include payload bodies.
+
+Actions return `{ "dead_letter": <list item>, "outcome": ... }`. A replay that
+commits returns `replayed`; consumer classification `Skip` resolves as `skipped`.
+A handler/commit error, timeout, missing source or deferral returns HTTP 200 with
+`replay_failed`, incremented `attempts`, and a bounded new error in `summary.reason`;
+the row stays open and is never automatically retried. The runtime's one fresh
+preparation on a terminal commit error also applies to manual replay. Dismiss
+returns `dismissed`. Every winning action records its principal, time and outcome
+in the durable action audit, including failed replays. Unknown IDs return 404;
+already resolved rows and losing concurrent actions return 409 `version_conflict`.
+All three routes require admin access (non-admin 403). Replay of a quarantine
+with no registered event consumer records `replay_failed`; dismissal remains available.
+
+Replay uses the normal preparation, transactional commit and after-commit hooks,
+with existing consumer idempotency. Effects, health bookkeeping and successful
+resolution commit in one transaction. Failed effects roll back before recording
+the failed attempt. Replay neither moves the original cursor nor fans out the
+source event to other consumers. Normal events emitted by a consumer's commit
+remain subject to their usual downstream delivery. After-commit faults remain
+worker health faults and do not undo the successful replay. Resolved audit rows
+are excluded from counts, recent status history and quarantine alerts. There is
+currently no dead-letter retention/pruning job; open and resolved rows are retained.
+There is no automatic or bulk replay endpoint.
 
 `POST /api/v1/operations/refresh` retains its existing dispatch-refresh behavior;
 storage maintenance runs only in the background worker or offline conversion

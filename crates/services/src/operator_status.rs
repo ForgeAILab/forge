@@ -11,7 +11,7 @@ use api_types::{
     DaemonPressureSummary, DatabaseStorageStatus, EffectiveExecutionPolicy, EventConsumerStatus,
     EventRelayStatus, OperatorSeverity, OperatorStatusResponse, PlanProgressSummary,
     RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
-    WorkerDeadLetterSummary, WorkspaceCleanupSummary,
+    WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{SqliteDb, WorkspaceRepo};
@@ -333,23 +333,7 @@ impl OperatorStatusService {
                 .await?;
             let recent_dead_letters = recent_dead_letters
                 .into_iter()
-                .map(|dead| {
-                    let event_sequence = dead.source_key.parse().ok().or_else(|| {
-                        dead.source_key
-                            .strip_prefix("event:")?
-                            .split(':')
-                            .next()?
-                            .parse()
-                            .ok()
-                    });
-                    WorkerDeadLetterSummary {
-                        id: dead.id,
-                        item_key: dead.source_key,
-                        event_sequence,
-                        reason: dead.reason,
-                        occurred_at: dead.occurred_at,
-                    }
-                })
+                .map(|dead| crate::dead_letter_service::summary(&dead))
                 .collect();
             let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
             statuses.push(EventConsumerStatus {
@@ -1940,5 +1924,56 @@ mod tests {
         );
         assert!(status.recent_errors.is_empty());
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    }
+    #[tokio::test]
+    async fn resolved_dead_letters_are_excluded_from_counts_recent_history_and_alerts() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        let name = crate::coordination_consumer_name();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.ensure_in_tx(&mut tx).await.unwrap();
+        health
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "12",
+                    item_type: "task.done",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: &db::now_rfc3339(),
+                },
+                "old failure",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers[0].dead_letter_count, 1);
+        assert_eq!(status.event_consumers[0].recent_dead_letters[0].attempts, 8);
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|error| error.entity_type == "worker_dead_letter"));
+        let id = status.event_consumers[0].recent_dead_letters[0].id.clone();
+        crate::dead_letter_service::DeadLetterService::new(db.clone())
+            .dismiss(
+                crate::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true,
+                },
+                &id,
+                None,
+            )
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers[0].dead_letter_count, 0);
+        assert!(status.event_consumers[0].recent_dead_letters.is_empty());
+        assert!(!status
+            .recent_errors
+            .iter()
+            .any(|error| error.entity_type == "worker_dead_letter"));
     }
 }

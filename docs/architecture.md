@@ -2222,10 +2222,28 @@ subscription, without scanning ignored event rows through `json_each`. Existing
 `recent_errors` entries carry bounded worker causes and deferral reason/since;
 readiness alone is informational, while errors and stalls raise attention.
 Dead letters degrade health for the same one-hour window as ordinary errors.
-Each worker also exposes its retained total and five most recent quarantines with
-stable IDs, item keys/sequence, reason and time, without expiry. The table retains
-worker/source identity for later replay/dismiss actions; those actions are outside
-this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+Each worker also exposes its open total and five most recent open quarantines
+with stable IDs, item keys/sequence, event type, consumer, attempts, reason and time,
+without expiry. Resolved rows and their action audit are retained; there is no
+retention/pruning job for either.
+
+`DeadLetterService` checks admin authority and maps the stable consumer name to
+that runtime's existing worker instance. Manual replay shares `WorkerRuntime`'s
+bounded preparation, panic handling, transactional commit and after-commit path.
+Preparation runs before the writer transaction; a compare-and-swap on the open
+row's version fences the commit. Effects, health success, resolution principal/time
+and an action audit entry commit together under `BEGIN IMMEDIATE`. Replay never
+reads or writes the consumer cursor and never fans out the original event.
+Consumer-emitted domain events retain normal downstream semantics. Skip resolves
+without effects. Commit errors roll back all effects, then a separate fenced
+transaction records a failed attempt/error; errors and deferrals never schedule
+a retry. A terminal commit gets the same one fresh preparation as ordinary delivery.
+Dismiss uses the same version fence and audit transaction without invoking the
+worker. Competing actions using the same open version have exactly one winner;
+the loser receives `DbError::VersionConflict` through the service/API boundaries.
+No durable in-progress lease can strand a row after a crash. Post-commit hooks
+retain normal worker semantics: their errors report health without reopening the
+resolved event. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
 
 Each standard SQLite pool connection has an insert hook, commit marker and
 rollback handling. Pool-scoped `Notify` is delivered on connection release

@@ -58,6 +58,7 @@ pub struct AppState {
     pub notification_service: Arc<NotificationService>,
     pub project_hook_service: Arc<ProjectHookService>,
     pub terminal_service: Arc<TerminalService>,
+    pub dead_letter_service: Arc<services::dead_letter_service::DeadLetterService>,
     pub operator_status_service: Arc<OperatorStatusService>,
     pub operator_status_emitter: Arc<OperatorStatusEmitter>,
     pub cleanup_scheduler: Arc<WorkspaceCleanupScheduler>,
@@ -223,6 +224,9 @@ impl AppState {
             notification_service: Arc::clone(&runtime.notification_service),
             project_hook_service: Arc::clone(&runtime.project_hook_service),
             terminal_service: Arc::clone(&runtime.terminal_service),
+            dead_letter_service: Arc::new(
+                services::dead_letter_service::DeadLetterService::for_runtime(&runtime),
+            ),
             operator_status_service: Arc::clone(&runtime.operator_status_service),
             operator_status_emitter: Arc::clone(&runtime.operator_status_emitter),
             cleanup_scheduler: Arc::clone(&runtime.cleanup_scheduler),

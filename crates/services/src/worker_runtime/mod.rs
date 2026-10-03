@@ -2,6 +2,9 @@
 //! source-neutral DB health, poison policy and loop supervision.
 mod event_source;
 mod policy;
+mod replay;
+pub(crate) use replay::record_failed;
+pub use replay::EventReplay;
 mod supervisor;
 
 pub use db::EventSubscription as Subscription;
@@ -345,15 +348,7 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
             });
         }
         for refresh in 0..2 {
-            let outcome = catch_worker(
-                async {
-                    tokio::time::timeout(self.worker.handle_timeout(), self.worker.handle(&event))
-                        .await
-                        .unwrap_or_else(|_| Err(WorkerError::new("worker handle timed out")))
-                },
-                "worker handle panicked",
-            )
-            .await;
+            let outcome = self.prepare_delivery(&event).await;
             return match outcome {
                 Ok(Outcome::Done(prepared)) => {
                     let mut tx = self.begin_write().await?;
@@ -361,12 +356,7 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                         .validate_in_tx(&mut tx, cursor, event.sequence)
                         .await?;
                     self.health.ensure_in_tx(&mut tx).await?;
-                    let committed = match catch_worker(
-                        async { self.worker.commit(&mut tx, &event, &prepared).await },
-                        "worker commit panicked",
-                    )
-                    .await
-                    {
+                    let committed = match self.commit_delivery(&mut tx, &event, &prepared).await {
                         Ok(committed) => committed,
                         Err(error) => {
                             tx.rollback().await?;
@@ -385,26 +375,7 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                     tx.commit().await?;
                     self.clear_wait();
                     self.source.flushed();
-                    if let Err(error) = catch_worker(
-                        async {
-                            self.worker
-                                .after_commit(&event, &prepared, &committed)
-                                .await
-                        },
-                        "worker after_commit panicked",
-                    )
-                    .await
-                    {
-                        tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
-                        let _ = self
-                            .health
-                            .report_classified_error(
-                                HealthErrorKind::AfterCommit,
-                                error.kind.as_str(),
-                                error.message(),
-                            )
-                            .await;
-                    }
+                    self.finish_delivery(&event, &prepared, &committed).await;
                     Ok(PollResult::Progress)
                 }
                 Ok(Outcome::Skip) => {
@@ -436,6 +407,50 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
             };
         }
         unreachable!("fresh preparation returns a result")
+    }
+    async fn prepare_delivery(
+        &self,
+        event: &DomainEvent,
+    ) -> std::result::Result<Outcome<W::Prepared>, WorkerError> {
+        catch_worker(
+            async {
+                tokio::time::timeout(self.worker.handle_timeout(), self.worker.handle(event))
+                    .await
+                    .unwrap_or_else(|_| Err(WorkerError::new("worker handle timed out")))
+            },
+            "worker handle panicked",
+        )
+        .await
+    }
+    async fn commit_delivery(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        prepared: &W::Prepared,
+    ) -> std::result::Result<C, WorkerError> {
+        catch_worker(
+            self.worker.commit(tx, event, prepared),
+            "worker commit panicked",
+        )
+        .await
+    }
+    async fn finish_delivery(&self, event: &DomainEvent, prepared: &W::Prepared, committed: &C) {
+        if let Err(error) = catch_worker(
+            self.worker.after_commit(event, prepared, committed),
+            "worker after_commit panicked",
+        )
+        .await
+        {
+            tracing::warn!(worker = self.worker.name(), %error, "worker after_commit failed");
+            let _ = self
+                .health
+                .report_classified_error(
+                    HealthErrorKind::AfterCommit,
+                    error.kind.as_str(),
+                    error.message(),
+                )
+                .await;
+        }
     }
     async fn worker_failure(
         &self,

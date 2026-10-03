@@ -721,6 +721,9 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/operations/status",
             get(routes::operations::get_operations_status),
         )
+        .route("/api/v1/operations/dead-letters", get(routes::operations::list_dead_letters))
+        .route("/api/v1/operations/dead-letters/{id}/replay", post(routes::operations::replay_dead_letter))
+        .route("/api/v1/operations/dead-letters/{id}/dismiss", post(routes::operations::dismiss_dead_letter))
         .route(
             "/api/v1/operations/refresh",
             post(routes::operations::refresh_operations),

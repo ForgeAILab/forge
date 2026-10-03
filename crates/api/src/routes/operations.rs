@@ -1,9 +1,87 @@
-use api_types::{OperationsRefreshResponse, OperatorStatusResponse};
-use axum::{extract::State, Json};
+use api_types::{
+    DeadLetterActionResponse, DeadLetterListResponse, DeadLetterState, DismissDeadLetterRequest,
+    OperationsRefreshResponse, OperatorStatusResponse,
+};
+use axum::{
+    extract::{Path, Query, State},
+    Json,
+};
 use db::now_rfc3339;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{errors::ApiResult, routes::auth::RequireAdmin, state::AppState};
+use services::dead_letter_service::DeadLetterActor;
+
+#[derive(serde::Deserialize)]
+pub struct DeadLetterListQuery {
+    pub consumer: Option<String>,
+    #[serde(default)]
+    pub state: DeadLetterState,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+pub async fn list_dead_letters(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Query(query): Query<DeadLetterListQuery>,
+) -> ApiResult<Json<DeadLetterListResponse>> {
+    Ok(Json(
+        state
+            .dead_letter_service
+            .list(
+                DeadLetterActor {
+                    user_id: &admin.user_id,
+                    is_admin: admin.is_admin,
+                },
+                query.consumer.as_deref(),
+                query.state,
+                query.cursor.as_deref(),
+                query.limit.unwrap_or(50),
+            )
+            .await?,
+    ))
+}
+
+pub async fn replay_dead_letter(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<DeadLetterActionResponse>> {
+    Ok(Json(
+        state
+            .dead_letter_service
+            .replay(
+                DeadLetterActor {
+                    user_id: &admin.user_id,
+                    is_admin: admin.is_admin,
+                },
+                &id,
+            )
+            .await?,
+    ))
+}
+
+pub async fn dismiss_dead_letter(
+    RequireAdmin(admin): RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DismissDeadLetterRequest>,
+) -> ApiResult<Json<DeadLetterActionResponse>> {
+    Ok(Json(
+        state
+            .dead_letter_service
+            .dismiss(
+                DeadLetterActor {
+                    user_id: &admin.user_id,
+                    is_admin: admin.is_admin,
+                },
+                &id,
+                body.reason.as_deref(),
+            )
+            .await?,
+    ))
+}
 
 /// Admin snapshot including live worker backlog, supervised relay status,
 /// lasting dead-letter history, SQLite storage diagnostics and usage index charge.

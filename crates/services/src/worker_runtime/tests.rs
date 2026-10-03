@@ -216,6 +216,99 @@ async fn scalar(db: &SqliteDb, query: &str) -> i64 {
         .await
         .unwrap()
 }
+
+async fn replay_row(db: &Arc<SqliteDb>, name: &str, event: &DomainEvent) -> db::DeadLetter {
+    let health = WorkerHealth::new(db.clone(), name);
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    health
+        .dead_letter_in_tx(
+            &mut tx,
+            WorkItem {
+                source_key: &event.sequence.to_string(),
+                item_type: &event.event_type,
+            },
+            FailureState {
+                attempts: 8,
+                first_failed_at: "2000-01-01T00:00:00Z",
+            },
+            "original failure",
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.list_dead_letters(Some(name), false, None, 1)
+        .await
+        .unwrap()
+        .items
+        .remove(0)
+}
+
+#[tokio::test]
+async fn manual_replay_uses_terminal_refresh_and_keeps_after_commit_errors_resolved() {
+    let db = database().await;
+    let event = append(&db, "wanted", "okay").await;
+    let mut worker = TinyWorker::new("manual");
+    worker.commit_terminal_once.store(true, Ordering::SeqCst);
+    worker.after_failure = true;
+    let worker = Arc::new(worker);
+    let runtime = WorkerRuntime::new(db.clone(), worker.clone());
+    let row = replay_row(&db, "manual", &event).await;
+    let (updated, outcome) = runtime.replay(&row, "admin").await.unwrap();
+    assert_eq!(outcome, "replayed");
+    assert!(updated.resolved_at.is_some());
+    assert_eq!(updated.attempts, 9);
+    assert_eq!(effects(&db).await, vec![event.sequence]);
+    assert_eq!(
+        *worker.seen.lock().unwrap(),
+        vec![event.sequence, event.sequence]
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM worker_health WHERE after_commit_error = 'post-commit failed'"
+        )
+        .await,
+        1
+    );
+    assert!(db.get_consumer_cursor("manual").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn manual_replay_skip_resolves_and_deferral_panic_missing_source_stay_open() {
+    let db = database().await;
+    for (name, entity) in [
+        ("skip", "okay"),
+        ("defer", "defer"),
+        ("panic", "panic"),
+        ("missing", "okay"),
+    ] {
+        let event = append(&db, "wanted", entity).await;
+        let mut worker = TinyWorker::new(name);
+        worker.skip_on_refresh = name == "skip";
+        let row = replay_row(&db, name, &event).await;
+        if name == "missing" {
+            sqlx::query("DELETE FROM domain_event WHERE sequence = ?")
+                .bind(event.sequence)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let runtime = WorkerRuntime::new(db.clone(), Arc::new(worker));
+        let (updated, outcome) = runtime.replay(&row, "admin").await.unwrap();
+        assert_eq!(
+            outcome,
+            if name == "skip" {
+                "skipped"
+            } else {
+                "replay_failed"
+            }
+        );
+        assert_eq!(updated.resolved_at.is_some(), name == "skip");
+        assert_eq!(updated.attempts, 9);
+        assert_eq!(effects(&db).await, Vec::<i64>::new());
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM worker_health WHERE retry_source_key IS NOT NULL OR deferred_source_key IS NOT NULL").await, 0);
+    }
+}
 async fn effects(db: &SqliteDb) -> Vec<i64> {
     sqlx::query_scalar("SELECT sequence FROM worker_test_effect ORDER BY sequence")
         .fetch_all(db.pool())

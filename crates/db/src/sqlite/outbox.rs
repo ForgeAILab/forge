@@ -72,7 +72,7 @@ impl SqliteDb {
         cutoff: &str,
     ) -> Result<Vec<WorkerDeadLetterIssue>> {
         let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "SELECT * FROM worker_dead_letter WHERE dead_lettered_at >= ",
+            "SELECT * FROM worker_dead_letter WHERE resolved_at IS NULL AND dead_lettered_at >= ",
         );
         query.push_bind(cutoff).push(" AND worker_name IN (");
         let mut separated = query.separated(", ");
@@ -99,24 +99,18 @@ impl SqliteDb {
     pub async fn worker_dead_letter_history(
         &self,
         name: &str,
-    ) -> Result<(i64, Vec<crate::WorkerDeadLetterRecord>)> {
-        let count =
-            sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter WHERE worker_name = ?")
-                .bind(name)
-                .fetch_one(&self.pool)
-                .await?;
-        let rows = sqlx::query("SELECT id, source_key, last_error, dead_lettered_at FROM worker_dead_letter WHERE worker_name = ? ORDER BY dead_lettered_at DESC, id DESC LIMIT 5")
+    ) -> Result<(i64, Vec<super::dead_letter::DeadLetter>)> {
+        let count = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL",
+        )
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query("SELECT * FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL ORDER BY dead_lettered_at DESC, id DESC LIMIT 5")
             .bind(name).fetch_all(&self.pool).await?;
         let records = rows
             .into_iter()
-            .map(|row| {
-                Ok(crate::WorkerDeadLetterRecord {
-                    id: row.try_get("id")?,
-                    source_key: row.try_get("source_key")?,
-                    reason: row.try_get("last_error")?,
-                    occurred_at: row.try_get("dead_lettered_at")?,
-                })
-            })
+            .map(super::dead_letter::map_dead_letter)
             .collect::<Result<Vec<_>>>()?;
         Ok((count, records))
     }

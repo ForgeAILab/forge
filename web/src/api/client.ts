@@ -5,6 +5,7 @@ import type {
   FsListResponse,
   NotificationResponse,
   OperationsRefreshResponse,
+  DeadLetterActionResponse,
   OperatorStatusResponse,
   PaginatedResponse,
   Project,
@@ -263,6 +264,20 @@ export function getOperationsStatus(): Promise<OperatorStatusResponse> {
 
 export function refreshOperations(): Promise<OperationsRefreshResponse> {
   return apiFetch<OperationsRefreshResponse>('/operations/refresh', { method: 'POST' })
+}
+
+export function replayDeadLetter(id: string): Promise<DeadLetterActionResponse> {
+  return apiFetch<DeadLetterActionResponse>(
+    `/operations/dead-letters/${encodeURIComponent(id)}/replay`,
+    { method: 'POST' },
+  )
+}
+
+export function dismissDeadLetter(id: string, reason?: string): Promise<DeadLetterActionResponse> {
+  return apiFetch<DeadLetterActionResponse>(
+    `/operations/dead-letters/${encodeURIComponent(id)}/dismiss`,
+    { method: 'POST', body: JSON.stringify({ reason }) },
+  )
 }
 
 export async function getProjectAnalytics(

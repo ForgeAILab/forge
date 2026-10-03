@@ -416,6 +416,11 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     OperatorSeverity::export().expect("export OperatorSeverity");
     OperatorStatusResponse::export().expect("export OperatorStatusResponse");
     EventRelayStatus::export().expect("export EventRelayStatus");
+    DeadLetterState::export().expect("export DeadLetterState");
+    DeadLetterResponse::export().expect("export DeadLetterResponse");
+    DeadLetterListResponse::export().expect("export DeadLetterListResponse");
+    DeadLetterActionResponse::export().expect("export DeadLetterActionResponse");
+    DismissDeadLetterRequest::export().expect("export DismissDeadLetterRequest");
     WorkerDeadLetterSummary::export().expect("export WorkerDeadLetterSummary");
     ActiveExecutionSummary::export().expect("export ActiveExecutionSummary");
     BlockedTaskSummary::export().expect("export BlockedTaskSummary");

@@ -288,6 +288,10 @@ pub struct EventConsumerStatus {
 pub struct WorkerDeadLetterSummary {
     pub id: String,
     pub item_key: String,
+    pub consumer_name: String,
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub attempts: i64,
     #[ts(type = "number | null")]
     pub event_sequence: Option<i64>,
     pub reason: String,
@@ -312,4 +316,49 @@ pub struct DatabaseStorageStatus {
     pub incremental_vacuum: bool,
     #[ts(type = "number")]
     pub free_pages: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterResponse {
+    pub summary: WorkerDeadLetterSummary,
+    pub state: DeadLetterState,
+    pub error_kind: String,
+    pub first_failed_at: String,
+    pub last_failed_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterListResponse {
+    pub items: Vec<DeadLetterResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterActionResponse {
+    pub dead_letter: DeadLetterResponse,
+    /// replayed, skipped, replay_failed, or dismissed. Failure is an audited
+    /// action result, with the dead letter still open; it is never auto-retried.
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DismissDeadLetterRequest {
+    pub reason: Option<String>,
 }
