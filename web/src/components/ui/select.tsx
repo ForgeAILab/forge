@@ -21,6 +21,11 @@ type SelectProps = {
   title?: string
 }
 
+const MENU_GAP = 4
+const MENU_MAX_HEIGHT = 256
+const MENU_PADDING = 10
+const OPTION_HEIGHT = 32
+
 export function Select({
   id,
   value,
@@ -85,14 +90,26 @@ export function Select({
   const updatePosition = useCallback(() => {
     if (!triggerRef.current) return
     const rect = triggerRef.current.getBoundingClientRect()
+    // Open upwards when the menu would not fit below the trigger and there is
+    // more room above; either way cap the height to the space available.
+    const spaceBelow = window.innerHeight - rect.bottom - MENU_GAP * 2
+    const spaceAbove = rect.top - MENU_GAP * 2
+    const wanted = Math.min(MENU_MAX_HEIGHT, options.length * OPTION_HEIGHT + MENU_PADDING)
+    const above = wanted > spaceBelow && spaceAbove > spaceBelow
     setStyle({
       position: 'fixed',
       zIndex: 9999,
-      top: rect.bottom + 4,
       left: rect.left,
       minWidth: rect.width,
+      maxHeight: Math.max(
+        OPTION_HEIGHT,
+        Math.min(MENU_MAX_HEIGHT, above ? spaceAbove : spaceBelow),
+      ),
+      ...(above
+        ? { bottom: window.innerHeight - rect.top + MENU_GAP }
+        : { top: rect.bottom + MENU_GAP }),
     })
-  }, [])
+  }, [options.length])
 
   useEffect(() => {
     if (!open) return
@@ -219,7 +236,7 @@ export function Select({
             role="listbox"
             aria-labelledby={triggerId}
             style={style}
-            className="max-h-64 overflow-y-auto rounded-lg border border-border-subtle bg-popover p-1 text-popover-foreground shadow-float animate-slide-in"
+            className="overflow-y-auto rounded-lg border border-border-subtle bg-popover p-1 text-popover-foreground shadow-float animate-slide-in"
           >
             {options.map((option, index) => (
               <button

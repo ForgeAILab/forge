@@ -158,3 +158,52 @@ Task responses and the Task workspace placement panel SHALL show, for each rejec
 #### Scenario: Owner reads why a Task is not running
 - **WHEN** a Task cannot be placed because daemon D failed `cargo` and the server has no Codex
 - **THEN** the Task page lists "server: executor unavailable" and "D: environment not ready (cargo)"
+
+### Requirement: Provisioning refusal lifecycle
+Provisioning candidates SHALL NOT contribute to last-resort Project pauses.
+Failed machine checks SHALL create Task environment Attention naming the machine
+and applicable failing checks and SHALL be rechecked on schedule.
+`environment_unverified` SHALL be deterministic and recorded once with an
+actionable machine-named reason and Task Attention. Checks or provisioning
+settings changes, machine connection changes, and location changes SHALL wake it.
+Every probe/provision job write SHALL fence the check digest and observed row
+version. Codeless candidates with incompatible executors/capabilities SHALL NOT
+turn other deterministic refusals into pending environment waits.
+
+#### Scenario: Codeless machine fails a check
+- **WHEN** a provisioning candidate fails a machine check and no ready location can run the Task
+- **THEN** the machine is not ready, the Task waits with Attention and placement_unavailable naming the failing checks, and the Project remains unpaused
+
+#### Scenario: Unverified machine is unchanged across scans
+- **WHEN** the Project has no applicable machine check and dispatch scans repeatedly
+- **THEN** environment_unverified is recorded once without rewriting Task metadata until eligibility changes
+
+#### Scenario: Settings change while full checks run
+- **WHEN** a checks edit changes the digest or a newer readiness row wins during full checks
+- **THEN** the old job discards its results and the current digest is probed
+
+### Requirement: Provisioning exhaustion is a deterministic Task blocker
+The system SHALL, after five provisioning attempts for unchanged job inputs and
+connection, refuse placement with provision_failed and record machine-named
+Task Attention with the redacted last error once. Both initial and active scans
+SHALL avoid metadata rewrites until eligibility changes. Retry attempts, input
+digest and connection ID SHALL participate in the eligibility key; connection
+IDs SHALL be unique across server restarts. Unrelated Project settings SHALL NOT
+abort a job or spend a retry attempt. Public Task placement diagnostics SHALL
+preserve the wait kind and its machine identity.
+
+#### Scenario: Connected machine exhausts provisioning
+- **WHEN** a connected machine exhausts the current provisioning retry epoch
+- **THEN** the Task has provision_failed Attention and a visible last error without an owner_unreachable classification or repeated metadata writes
+
+#### Scenario: Reconnect after exhaustion
+- **WHEN** the daemon reconnects, including after a server restart
+- **THEN** a distinct socket token invalidates the old exhausted epoch and wakes dispatch
+
+#### Scenario: Unrelated Project edit during provisioning
+- **WHEN** an owner edits a setting outside the provisioning job inputs
+- **THEN** the running job completes without restarting or spending another attempt
+
+#### Scenario: Daemon wait diagnostics
+- **WHEN** a Task waits on a daemon for unverified, probe-pending or provision-failed placement
+- **THEN** placement_diagnostics carries that wait kind and the daemon machine identity

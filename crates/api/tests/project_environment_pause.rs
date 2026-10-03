@@ -240,3 +240,42 @@ async fn project_patch_refuses_unbounded_environment_check_timeout() {
         assert!(error.message.contains("timeout_seconds"));
     }
 }
+
+#[tokio::test]
+async fn project_patch_validates_environment_scope_and_provision_policy() {
+    let root = common::TestDir::new("environment-scope-api");
+    let harness = common::test_app(root.path(), "environment-scope-api").await;
+    let project: api_types::ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Scope"}),
+        StatusCode::OK,
+    )
+    .await;
+    for settings in [
+        json!({"environment":{"checks":[{"name":"cargo","command":"true","scope":"host"}]}}),
+        json!({"placement":{"provision":"always"}}),
+        json!({"placement":{"provision_timeout_seconds":0}}),
+        json!({"placement":{"provision_timeout_seconds":86401}}),
+    ] {
+        let _: ErrorResponse = common::json_request(
+            &harness.app,
+            Method::PATCH,
+            &format!("/api/v1/projects/{}", project.id),
+            json!({"version":project.version,"settings":settings}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let saved: api_types::ProjectResponse = common::json_request(&harness.app, Method::PATCH, &format!("/api/v1/projects/{}", project.id), json!({"version":project.version,"settings":{"environment":{"checks":[{"name":"cargo","command":"true","scope":"machine"}]},"placement":{"provision":"never","provision_timeout_seconds":3600}}}), StatusCode::OK).await;
+    assert_eq!(
+        saved.settings["environment"]["checks"][0]["scope"],
+        "machine"
+    );
+    assert_eq!(saved.settings["placement"]["provision"], "never");
+    assert_eq!(
+        saved.settings["placement"]["provision_timeout_seconds"],
+        3600
+    );
+}

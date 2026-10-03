@@ -94,7 +94,9 @@ impl DaemonLocationVerifier for RemoteDaemonLocationVerifier {
         {
             return Ok(LocationVerification::invalid(api_types::WRONG_OWNER));
         }
-        if !within_runtime_root(&location.path, &runtime.workspace_root) {
+        if location.kind != RepoLocationKind::ManagedClone
+            && !within_runtime_root(&location.path, &runtime.workspace_root)
+        {
             return Ok(LocationVerification::invalid(
                 api_types::OUTSIDE_WORKSPACE_ROOT,
             ));
@@ -542,7 +544,8 @@ impl RepoLocationService {
                     location.runtime_id.as_deref().unwrap_or_default(),
                 )
             })?;
-            if !runtime.workspace_root.trim().is_empty()
+            if location.kind != RepoLocationKind::ManagedClone
+                && !runtime.workspace_root.trim().is_empty()
                 && !within_runtime_root(&location.path, &runtime.workspace_root)
             {
                 LocationVerification::invalid("outside_workspace_root")

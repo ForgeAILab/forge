@@ -22,6 +22,23 @@ pub enum WorkspaceClientError {
 
 pub type Result<T> = std::result::Result<T, WorkspaceClientError>;
 
+fn redact_remote_error(error: WorkspaceClientError, remote: &str) -> WorkspaceClientError {
+    match error {
+        WorkspaceClientError::Daemon(mut error) => {
+            error.message = git::redact_remote_credentials(&error.message, remote);
+            error.details = error.details.and_then(|value| {
+                serde_json::from_str(&git::redact_remote_credentials(&value.to_string(), remote))
+                    .ok()
+            });
+            WorkspaceClientError::Daemon(error)
+        }
+        WorkspaceClientError::Transport(ServiceError::InvalidOperation { message }) => {
+            ServiceError::invalid_operation(git::redact_remote_credentials(&message, remote)).into()
+        }
+        error => error,
+    }
+}
+
 #[derive(Clone)]
 pub struct DaemonWorkspaceClient {
     registry: Arc<DaemonConnectionRegistry>,
@@ -34,6 +51,41 @@ impl DaemonWorkspaceClient {
         &self.registry
     }
 
+    pub async fn machine_probe(
+        &self,
+        daemon_id: &str,
+        params: MachineProbeParams,
+    ) -> Result<MachineProbeResult> {
+        let seconds = params
+            .commands
+            .iter()
+            .map(|command| command.timeout_seconds.clamp(1, 300) + 3)
+            .sum::<u64>();
+        self.request(
+            daemon_id,
+            METHOD_MACHINE_PROBE,
+            &params,
+            Duration::from_secs(seconds).saturating_add(self.timeout),
+            false,
+        )
+        .await
+    }
+
+    pub async fn provision_location(
+        &self,
+        daemon_id: &str,
+        params: RepoLocationProvisionParams,
+    ) -> Result<RepoLocationProvisionResult> {
+        self.request(
+            daemon_id,
+            METHOD_REPO_LOCATION_PROVISION,
+            &params,
+            Duration::from_secs(params.timeout_seconds).saturating_add(self.timeout),
+            false,
+        )
+        .await
+        .map_err(|error| redact_remote_error(error, &params.remote_url))
+    }
     pub fn new(registry: Arc<DaemonConnectionRegistry>) -> Self {
         Self {
             registry,
@@ -57,14 +109,24 @@ impl DaemonWorkspaceClient {
         daemon_id: &str,
         params: RepoLocationVerifyParams,
     ) -> Result<RepoLocationVerifyResult> {
-        self.request(
-            daemon_id,
-            METHOD_REPO_LOCATION_VERIFY,
-            &params,
-            self.timeout,
-            false,
-        )
-        .await
+        let remote = params.remote_url.as_deref().unwrap_or_default();
+        let mut result: RepoLocationVerifyResult = self
+            .request(
+                daemon_id,
+                METHOD_REPO_LOCATION_VERIFY,
+                &params,
+                self.timeout,
+                false,
+            )
+            .await
+            .map_err(|error| redact_remote_error(error, remote))?;
+        result.origin_url = result.origin_url.map(|origin| {
+            git::redact_remote_credentials(
+                &git::redact_remote_credentials(&origin, &origin),
+                remote,
+            )
+        });
+        Ok(result)
     }
 
     pub async fn prepare(
@@ -1121,6 +1183,19 @@ pub(crate) mod tests {
     use crate::daemon_transport::DaemonExecutionEventHandler;
 
     pub(crate) const DAEMON_ID: &str = "daemon-test";
+    #[test]
+    fn daemon_errors_redact_clone_url_credentials_at_server_boundary() {
+        let remote = "https://username:PASSWORD@127.0.0.1/repo?token=QUERYSECRET";
+        let error = WorkspaceClientError::Daemon(DaemonErrorPayload {
+            code: "clone_failed".into(),
+            message: remote.into(),
+            details: Some(json!({"failure":"PASSWORD QUERYSECRET"})),
+        });
+        let sanitized = redact_remote_error(error, remote).to_string();
+        for secret in ["username", "PASSWORD", "QUERYSECRET"] {
+            assert!(!sanitized.contains(secret), "{sanitized}");
+        }
+    }
 
     struct NoopHandler;
 

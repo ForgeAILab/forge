@@ -1166,3 +1166,468 @@ async fn refused_workspace_fences_leave_no_journal_intents() {
         assert_eq!(fixture.journal.pending().unwrap().len(), before);
     }
 }
+
+#[tokio::test]
+async fn machine_probe_scratch_policy_timeout_output_and_no_journal() {
+    let mut fixture = Fixture::new().await;
+    let params = MachineProbeParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_location_id: None,
+        commands: vec![MachineProbeCommand {
+            name: "empty".into(),
+            command: "test -z \"$(ls -A)\"; printf '%s' \"$TOKEN\"".into(),
+            timeout_seconds: 5,
+        }],
+        env: BTreeMap::from([("TOKEN".into(), "secret-value".into())]),
+    };
+    let denied = fixture
+        .backend
+        .handle(
+            METHOD_MACHINE_PROBE,
+            serde_json::to_value(&params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code, "run_purpose_denied");
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::EnvironmentProbe);
+    let before = fixture.journal.pending().unwrap().len();
+    let held_lock = fixture.backend.operation_lock.lock().await;
+    let result: MachineProbeResult = serde_json::from_value(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.backend.handle(
+                METHOD_MACHINE_PROBE,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    drop(held_lock);
+    assert_eq!(result.results[0].exit_code, Some(0));
+    assert_eq!(result.results[0].output_tail, "[REDACTED]");
+    assert_eq!(fixture.journal.pending().unwrap().len(), before);
+    assert_eq!(
+        std::fs::read_dir(fixture.dir.path().join(".forge/probes"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let mut params = params;
+    params.commands[0].command = "printf '%10000s' noisy; sleep 5".into();
+    params.commands[0].timeout_seconds = 1;
+    let result: MachineProbeResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_MACHINE_PROBE,
+                serde_json::to_value(params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result.results[0].timed_out);
+    assert!(result.results[0].output_tail.len() <= 4096);
+    assert_eq!(
+        std::fs::read_dir(fixture.dir.path().join(".forge/probes"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn provision_idempotency_conflict_partial_clone_and_restart() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::RepoProvision);
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    let params = RepoLocationProvisionParams {
+        default_branch: "main".into(),
+        timeout_seconds: 1800,
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_id: repo_id.clone(),
+        remote_url: fixture.repo.to_string_lossy().into_owned(),
+    };
+    let held_workspace_lock = fixture.backend.operation_lock.lock().await;
+    let reply: RepoLocationProvisionResult = serde_json::from_value(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture.backend.handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    drop(held_workspace_lock);
+    assert_eq!(reply.default_branch, "main");
+    let repeated: RepoLocationProvisionResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply.path, repeated.path);
+    assert_eq!(
+        Path::new(&reply.path),
+        fixture
+            .dir
+            .path()
+            .join("repos")
+            .join(repo_id)
+            .canonicalize()
+            .unwrap()
+    );
+    let conflict_id = uuid::Uuid::new_v4().to_string();
+    let conflict = fixture.dir.path().join("repos").join(&conflict_id);
+    std::fs::create_dir(&conflict).unwrap();
+    std::fs::write(conflict.join("keep"), "mine").unwrap();
+    let mut params = params;
+    params.repo_id = conflict_id;
+    assert_eq!(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "path_conflict"
+    );
+    assert_eq!(
+        std::fs::read_to_string(conflict.join("keep")).unwrap(),
+        "mine"
+    );
+    params.repo_id = uuid::Uuid::new_v4().to_string();
+    params.remote_url = fixture
+        .dir
+        .path()
+        .join("missing-remote")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "clone_failed"
+    );
+    assert!(!fixture
+        .dir
+        .path()
+        .join("repos")
+        .join(&params.repo_id)
+        .exists());
+    let staging = fixture
+        .dir
+        .path()
+        .join(".forge/provision")
+        .join(&params.repo_id);
+    assert!(!staging.exists());
+    // A killed daemon leaves private staging, never a published partial clone.
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("partial"), "interrupted").unwrap();
+    let restarted = DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        fixture.backend.policy.clone(),
+        fixture.journal.clone(),
+    )
+    .unwrap();
+    params.remote_url = fixture.repo.to_string_lossy().into_owned();
+    restarted
+        .handle(
+            METHOD_REPO_LOCATION_PROVISION,
+            serde_json::to_value(params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    assert!(!staging.exists());
+}
+
+#[tokio::test]
+async fn provision_requested_non_head_branch_and_fetch_on_reuse() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::RepoProvision);
+    local_git(&fixture.repo, &["branch", "develop"])
+        .await
+        .unwrap();
+    let mut params = RepoLocationProvisionParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_id: uuid::Uuid::new_v4().to_string(),
+        remote_url: fixture.repo.to_string_lossy().into_owned(),
+        default_branch: "develop".into(),
+        timeout_seconds: 1800,
+    };
+    let result: RepoLocationProvisionResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        local_git(Path::new(&result.path), &["branch", "--show-current"])
+            .await
+            .unwrap(),
+        "develop"
+    );
+    fixture
+        .backend
+        .handle(
+            METHOD_REPO_LOCATION_VERIFY,
+            serde_json::to_value(RepoLocationVerifyParams {
+                repo_location_id: "provisioned-location".into(),
+                daemon_id: params.daemon_id.clone(),
+                runtime_id: params.runtime_id.clone(),
+                path: result.path.clone(),
+                kind: DaemonRepoLocationKind::ManagedClone,
+                default_branch: "develop".into(),
+                remote_url: Some(params.remote_url.clone()),
+                expected_version: 0,
+                probe: None,
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    // The existing clone has no local main branch. Reuse fetches it without
+    // resetting the active checkout or disturbing repository contents.
+    params.default_branch = "main".into();
+    params.remote_url = reqwest::Url::from_file_path(&fixture.repo)
+        .unwrap()
+        .to_string();
+    let reused: RepoLocationProvisionResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_REPO_LOCATION_PROVISION,
+                serde_json::to_value(&params).unwrap(),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reused.path, result.path);
+    assert_eq!(
+        local_git(Path::new(&result.path), &["remote", "get-url", "origin"])
+            .await
+            .unwrap(),
+        params.remote_url
+    );
+    local_git(
+        Path::new(&result.path),
+        &["rev-parse", "--verify", "refs/heads/main"],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        local_git(Path::new(&result.path), &["branch", "--show-current"])
+            .await
+            .unwrap(),
+        "develop"
+    );
+}
+
+#[tokio::test]
+async fn clone_errors_redact_url_credentials_and_leave_no_partial_clone() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::RepoProvision);
+    let params = RepoLocationProvisionParams {
+        daemon_id: "daemon-1".into(),
+        runtime_id: "runtime-1".into(),
+        repo_id: uuid::Uuid::new_v4().to_string(),
+        remote_url: "https://probe-user:USERSECRET@127.0.0.1:9/repo.git?token=QUERYSECRET".into(),
+        default_branch: "main".into(),
+        timeout_seconds: 2,
+    };
+    let error = fixture
+        .backend
+        .handle(
+            METHOD_REPO_LOCATION_PROVISION,
+            serde_json::to_value(&params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap_err();
+    let text = serde_json::to_string(&error).unwrap();
+    assert_eq!(error.code, "clone_failed");
+    assert!(
+        !text.contains("USERSECRET")
+            && !text.contains("QUERYSECRET")
+            && !text.contains("probe-user"),
+        "{text}"
+    );
+    assert!(!fixture
+        .dir
+        .path()
+        .join("repos")
+        .join(&params.repo_id)
+        .exists());
+    assert!(!fixture
+        .dir
+        .path()
+        .join(".forge/provision")
+        .join(&params.repo_id)
+        .exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_timeout_and_cancellation_kill_descendants_and_startup_sweeps_scratch() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .backend
+        .policy
+        .allowed_purposes
+        .push(WorkspaceRunPurpose::EnvironmentProbe);
+    for cancel in [false, true] {
+        let pidfile = fixture
+            .dir
+            .path()
+            .join(if cancel { "cancel.pid" } else { "timeout.pid" });
+        let params = MachineProbeParams {
+            daemon_id: "daemon-1".into(),
+            runtime_id: "runtime-1".into(),
+            repo_location_id: None,
+            commands: vec![MachineProbeCommand {
+                name: "child".into(),
+                command: "(while :; do echo tick >> \"$PIDFILE\"; sleep 0.05; done) & wait".into(),
+                timeout_seconds: if cancel { 30 } else { 1 },
+            }],
+            env: BTreeMap::from([("PIDFILE".into(), pidfile.to_string_lossy().into_owned())]),
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(if cancel { 500 } else { 5000 }),
+            fixture.backend.handle(
+                METHOD_MACHINE_PROBE,
+                serde_json::to_value(params).unwrap(),
+                Vec::new,
+            ),
+        )
+        .await;
+        if cancel {
+            assert!(outcome.is_err());
+        } else {
+            let reply: MachineProbeResult =
+                serde_json::from_value(outcome.unwrap().unwrap()).unwrap();
+            assert!(reply.results[0].timed_out);
+        }
+        // Observe a child-owned heartbeat instead of inspecting the system
+        // process table (which is unavailable in some local sandboxes).
+        let ticks = std::fs::metadata(&pidfile).unwrap().len();
+        assert!(ticks > 0, "probe child started");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            std::fs::metadata(&pidfile).unwrap().len(),
+            ticks,
+            "probe descendant survived cancellation/timeout"
+        );
+        assert_eq!(
+            std::fs::read_dir(fixture.dir.path().join(".forge/probes"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    let stale = fixture
+        .dir
+        .path()
+        .join(".forge/probes")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("partial"), "abandoned").unwrap();
+    DaemonWorkspaceBackend::new(
+        fixture.dir.path().to_owned(),
+        "daemon-1".into(),
+        fixture.backend.policy.clone(),
+        fixture.journal.clone(),
+    )
+    .unwrap();
+    assert!(!stale.exists());
+}
+
+#[tokio::test]
+async fn verification_receipt_redacts_origin_credentials() {
+    let fixture = Fixture::new().await;
+    let remote = "https://username:PASSWORD@127.0.0.1/repo?token=QUERYSECRET";
+    local_git(&fixture.repo, &["remote", "add", "origin", remote])
+        .await
+        .unwrap();
+    let reply = fixture
+        .backend
+        .handle(
+            METHOD_REPO_LOCATION_VERIFY,
+            serde_json::to_value(RepoLocationVerifyParams {
+                repo_location_id: "redacted-location".into(),
+                daemon_id: "daemon-1".into(),
+                runtime_id: "runtime-1".into(),
+                path: fixture.repo.to_string_lossy().into_owned(),
+                kind: DaemonRepoLocationKind::PrimaryCheckout,
+                default_branch: "main".into(),
+                remote_url: Some(remote.into()),
+                expected_version: 0,
+                probe: None,
+            })
+            .unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    let encoded = reply.to_string();
+    for secret in ["username", "PASSWORD", "QUERYSECRET"] {
+        assert!(!encoded.contains(secret), "{encoded}");
+    }
+}

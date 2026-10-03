@@ -256,6 +256,21 @@ forge-ctl task action <TASK_ID> cancel
 to preview the prompt for a transition target instead of the task's current
 state.
 
+### Project environment checks
+
+```bash
+forge-ctl project env-check <PROJECT_ID> --name cargo --command 'cargo --version' --scope machine
+forge-ctl project env-check <PROJECT_ID> --name tests --command 'cargo check' --scope workspace --role coder --timeout-seconds 120
+```
+
+Adds or replaces one named check while preserving other Project settings.
+`--scope` is `workspace` (default) or `machine`; machine checks need no checkout
+and can gate cloning. Commands must be read-only. `--role` may be repeated;
+omitting it applies to all roles. The server validates timeout bounds 1–300.
+The update uses the current Project version; a concurrent edit returns 409.
+Project settings also accept `placement.provision = when_verified` (default)
+or `never`, editable in the web Environment settings.
+
 ### Project environment readiness and re-check
 
 ```bash
@@ -278,8 +293,9 @@ selected machine. `server` names the host; daemon machines use runtime IDs from
 `env-status`. Table output groups checks and unavailable-machine errors by
 machine, followed by the updated Project. JSON output is `{machines, project}`.
 Passing a machine resumes a matching environment pause; user/repository pauses
-remain. A daemon needs its failure's recorded ready workspace until independent
-daemon probes are available; unavailable machines retain their facts.
+remain. On a daemon that supports machine probes the re-check runs there
+directly; other daemons need a ready workspace recorded on that machine, and a
+machine without one returns an unavailable result and keeps its facts.
 
 Both commands exit 0 after a successful API response, including checks that
 report failure or unavailability. Inspect `passed` and `error` for those

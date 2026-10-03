@@ -350,6 +350,8 @@ impl DaemonRuntime {
         ];
         if self.workspace.is_some() {
             capabilities.push(api_types::DAEMON_CAPABILITY_WORKSPACE.to_owned());
+            capabilities.push(api_types::DAEMON_CAPABILITY_MACHINE_PROBE.to_owned());
+            capabilities.push(api_types::DAEMON_CAPABILITY_REPO_PROVISION.to_owned());
         }
         let handshake = api_types::DaemonHandshakeNotification {
             protocol_revision: DAEMON_PROTOCOL_REVISION,

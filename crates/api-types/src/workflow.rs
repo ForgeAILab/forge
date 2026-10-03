@@ -106,6 +106,50 @@ pub struct ProjectSettings {
     pub automatic_recovery: AutomaticRecoverySettings,
     #[serde(default)]
     pub environment: ProjectEnvironment,
+    #[serde(default)]
+    pub placement: ProjectPlacementSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlacementProvision {
+    #[default]
+    WhenVerified,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectPlacementSettings {
+    #[serde(default)]
+    pub provision: PlacementProvision,
+    #[serde(default = "default_provision_timeout_seconds")]
+    #[ts(type = "number")]
+    pub provision_timeout_seconds: u64,
+}
+
+/// Total clone/fetch budget; 1–86400 seconds, default 30 minutes.
+pub fn default_provision_timeout_seconds() -> u64 {
+    1800
+}
+impl Default for ProjectPlacementSettings {
+    fn default() -> Self {
+        Self {
+            provision: PlacementProvision::default(),
+            provision_timeout_seconds: default_provision_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EnvironmentCheckScope {
+    #[default]
+    Workspace,
+    Machine,
 }
 
 fn default_max_active_tasks() -> u32 {
@@ -180,6 +224,8 @@ pub struct EnvironmentAsset {
 pub struct EnvironmentCheck {
     pub name: String,
     pub command: String,
+    #[serde(default)]
+    pub scope: EnvironmentCheckScope,
     /// Execution roles the check gates (`coder`, `reviewer`, ...). Empty
     /// gates every role.
     #[serde(default)]
@@ -222,6 +268,7 @@ impl Default for ProjectSettings {
             lifecycle_hooks: std::collections::HashMap::new(),
             automatic_recovery: AutomaticRecoverySettings::default(),
             environment: ProjectEnvironment::default(),
+            placement: ProjectPlacementSettings::default(),
         }
     }
 }
@@ -740,6 +787,27 @@ fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn environment_scope_and_provision_defaults_and_validation() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"cargo --version"}]}})).unwrap();
+        assert!(<super::ProjectPlacementSettings as ts_rs::TS>::decl()
+            .contains("provision_timeout_seconds: number"));
+        assert_eq!(
+            settings.environment.checks[0].scope,
+            super::EnvironmentCheckScope::Workspace
+        );
+        assert_eq!(
+            settings.placement.provision,
+            super::PlacementProvision::WhenVerified
+        );
+        for invalid in [
+            serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"true","scope":"host"}]}}),
+            serde_json::json!({"placement":{"provision":"always"}}),
+        ] {
+            assert!(serde_json::from_value::<super::ProjectSettings>(invalid).is_err());
+        }
+    }
+
     use super::{
         CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition,
         WorkflowTrigger, WorkflowTriggerDefinition,

@@ -18,6 +18,18 @@ use super::{
 };
 use crate::ServiceError;
 
+#[test]
+fn socket_incarnations_are_random_numeric_tokens_across_new_allocators() {
+    let ids: std::collections::HashSet<_> = (0..128)
+        .map(|_| DaemonConnection::new("same-daemon".into()).0.id())
+        .collect();
+    assert_eq!(ids.len(), 128);
+    assert!(ids.iter().all(|id| *id > 0 && *id <= i64::MAX as u64));
+    // No process-local sequence/boot state can restart at the previous token.
+    let token = super::new_connection_id();
+    assert!(!ids.contains(&token));
+}
+
 struct NoopHandler;
 
 #[async_trait]

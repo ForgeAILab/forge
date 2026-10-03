@@ -489,6 +489,7 @@ mod tests {
 
     fn check(name: &str, command: &str, roles: &[&str]) -> EnvironmentCheck {
         EnvironmentCheck {
+            scope: Default::default(),
             name: name.to_owned(),
             command: command.to_owned(),
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
@@ -500,6 +501,7 @@ mod tests {
     fn environment_timeout_is_bounded_on_write_and_legacy_read() {
         let mut environment = ProjectEnvironment::default();
         let mut check = EnvironmentCheck {
+            scope: Default::default(),
             name: "slow".to_owned(),
             command: "true".to_owned(),
             roles: Vec::new(),

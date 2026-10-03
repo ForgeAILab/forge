@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { ENVIRONMENT_EXAMPLE, parseEnvironmentText } from './environment-utils'
 
@@ -11,6 +12,8 @@ interface EnvironmentTabProps {
   canSave: boolean
   isSaving: boolean
   environmentText: string
+  provision: 'when_verified' | 'never'
+  onProvisionChange: (value: 'when_verified' | 'never') => void
   recheckMinutes: string
   recheckIntervalError: string | null
   saveError: string | null
@@ -25,6 +28,8 @@ export function EnvironmentTab({
   canSave,
   isSaving,
   environmentText,
+  provision,
+  onProvisionChange,
   recheckMinutes,
   recheckIntervalError,
   saveError,
@@ -34,6 +39,24 @@ export function EnvironmentTab({
 }: EnvironmentTabProps) {
   const parsed = parseEnvironmentText(environmentText)
   const validationError = parsed.ok ? null : parsed.error
+  const checks = parsed.ok && Array.isArray(parsed.value?.checks) ? parsed.value.checks : []
+  const setScope = (index: number, scope: string) => {
+    if (!parsed.ok || !parsed.value) return
+    onEnvironmentTextChange(
+      JSON.stringify(
+        {
+          ...parsed.value,
+          checks: checks.map((check, i) =>
+            i === index && typeof check === 'object' && check !== null
+              ? { ...check, scope }
+              : check,
+          ),
+        },
+        null,
+        2,
+      ),
+    )
+  }
 
   return (
     <div>
@@ -64,12 +87,60 @@ export function EnvironmentTab({
                 {validationError}
               </p>
             ) : null}
+            {checks.map((check, index) => {
+              if (typeof check !== 'object' || check === null) return null
+              const record = check as Record<string, unknown>
+              const name = typeof record.name === 'string' ? record.name : `Check ${index + 1}`
+              return (
+                <div key={index} className="space-y-2">
+                  <Label htmlFor={`environment-scope-${index}`}>{name}: check scope</Label>
+                  <Select
+                    id={`environment-scope-${index}`}
+                    aria-label={`${name} check scope`}
+                    value={record.scope === 'machine' ? 'machine' : 'workspace'}
+                    options={[
+                      { value: 'workspace', label: 'Workspace — requires a checkout' },
+                      { value: 'machine', label: 'Machine — toolchains, disk or services' },
+                    ]}
+                    onChange={(scope) => setScope(index, scope)}
+                  />
+                </div>
+              )
+            })}
             <p id="project-environment-help" className="text-xs text-muted-foreground">
-              Checks run with <code>bash -lc</code> in the worktree; <code>roles</code> limits a
-              check to those execution roles (empty means all). Asset sources are absolute host
-              paths; targets are relative to the worktree. Project settings are stored as plain text
-              and readable through the API, so use a credential provider—not <code>env</code>
+              Checks must be read-only and run with <code>bash -lc</code>. Machine checks can run in
+              an empty directory before code is copied; workspace checks require a checkout;{' '}
+              <code>roles</code> limits a check to those execution roles (empty means all). Asset
+              sources are absolute host paths; targets are relative to the worktree. Project
+              settings are stored as plain text and readable through the API, so use a credential
+              provider—not <code>env</code>
               —for secrets.
+            </p>
+          </div>
+        )}
+      </SettingsSection>
+      <SettingsSection
+        title="Repository provisioning"
+        description="Allow a managed clone on another machine only after its machine checks pass."
+      >
+        {projectIsLoading ? (
+          <Skeleton className="h-10 w-full" />
+        ) : (
+          <div className="space-y-2">
+            <Label htmlFor="project-placement-provision">Provision a repository location</Label>
+            <Select
+              id="project-placement-provision"
+              aria-label="Provision a repository location"
+              value={provision}
+              options={[
+                { value: 'when_verified', label: 'When verified' },
+                { value: 'never', label: 'Never' },
+              ]}
+              onChange={(value) => onProvisionChange(value as 'when_verified' | 'never')}
+            />
+            <p className="text-xs text-muted-foreground">
+              Requires a repository remote and at least one passing machine check. Manually
+              registered locations remain available.
             </p>
           </div>
         )}

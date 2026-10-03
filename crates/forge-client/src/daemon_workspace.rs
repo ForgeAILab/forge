@@ -26,6 +26,13 @@ const WORKTREE_DIRECTORY: &str = ".forge/workspaces";
 const WORKSPACE_ERROR: &str = "workspace_error";
 const VERSION_CONFLICT: &str = "version_conflict";
 const MAX_READ_BYTES: u64 = 1024 * 1024;
+
+struct RemoveDirectory(PathBuf);
+impl Drop for RemoveDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 
 type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
@@ -77,6 +84,7 @@ pub struct DaemonWorkspaceBackend {
     manager: WorkspaceManager,
     state: Mutex<WorkspaceRegistry>,
     operation_lock: tokio::sync::Mutex<()>,
+    provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DaemonWorkspaceBackend {
@@ -87,6 +95,22 @@ impl DaemonWorkspaceBackend {
         journal: Arc<DaemonJournal>,
     ) -> anyhow::Result<Self> {
         let workspace_root = workspace_root.canonicalize()?;
+        let probes = workspace_root.join(".forge/probes");
+        if probes.exists() {
+            if probes.canonicalize()? != probes {
+                anyhow::bail!("probe directory contains a symlink");
+            }
+            for entry in std::fs::read_dir(&probes)? {
+                let entry = entry?;
+                if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+                    if entry.file_type()?.is_dir() {
+                        std::fs::remove_dir_all(entry.path())?;
+                    } else {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+        }
         let state = journal.load_workspace_state()?;
         Ok(Self {
             manager: WorkspaceManager::new(workspace_root.join(WORKTREE_DIRECTORY)),
@@ -96,6 +120,7 @@ impl DaemonWorkspaceBackend {
             journal,
             state: Mutex::new(state),
             operation_lock: tokio::sync::Mutex::new(()),
+            provision_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -107,6 +132,8 @@ impl DaemonWorkspaceBackend {
         matches!(
             method,
             METHOD_REPO_LOCATION_VERIFY
+                | METHOD_MACHINE_PROBE
+                | METHOD_REPO_LOCATION_PROVISION
                 | METHOD_WORKSPACE_PREPARE
                 | METHOD_WORKSPACE_DESCRIBE
                 | METHOD_WORKSPACE_RUN
@@ -124,6 +151,34 @@ impl DaemonWorkspaceBackend {
         params: Value,
         active_ids: impl FnOnce() -> Vec<String>,
     ) -> CommandResult<Value> {
+        // Probes neither serialize behind a workspace lock nor use its journal.
+        if method == METHOD_MACHINE_PROBE {
+            return encode(self.machine_probe(decode(params)?).await?);
+        }
+        if method == METHOD_REPO_LOCATION_PROVISION {
+            let params: RepoLocationProvisionParams = decode(params)?;
+            validate_id(&params.repo_id)?;
+            let lock = self
+                .provision_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(params.repo_id.clone())
+                .or_default()
+                .clone();
+            let _guard = lock.lock().await;
+            let remote = params.remote_url.clone();
+            return encode(self.provision_location(params).await.map_err(|mut error| {
+                error.message = git::redact_remote_credentials(&error.message, &remote);
+                if let Some(details) = error.details {
+                    error.details = serde_json::from_str(&git::redact_remote_credentials(
+                        &details.to_string(),
+                        &remote,
+                    ))
+                    .ok();
+                }
+                error
+            })?);
+        }
         let _guard = self.operation_lock.lock().await;
         // Capture activity after acquiring the mutation lock. An execution
         // may have started while this request was waiting for another RPC.
@@ -132,7 +187,21 @@ impl DaemonWorkspaceBackend {
             return Err(error(UNSUPPORTED_METHOD, "unsupported workspace method"));
         }
         match method {
-            METHOD_REPO_LOCATION_VERIFY => return encode(self.verify(decode(params)?).await?),
+            METHOD_REPO_LOCATION_VERIFY => {
+                let request: RepoLocationVerifyParams = decode(params)?;
+                let remote = request.remote_url.clone().unwrap_or_default();
+                return encode(self.verify(request).await.map_err(|mut error| {
+                    error.message = git::redact_remote_credentials(&error.message, &remote);
+                    error.details = error.details.and_then(|details| {
+                        serde_json::from_str(&git::redact_remote_credentials(
+                            &details.to_string(),
+                            &remote,
+                        ))
+                        .ok()
+                    });
+                    error
+                })?);
+            }
             METHOD_WORKSPACE_DESCRIBE => {
                 if params.get("operation").is_some() {
                     return encode(self.reconcile(decode(params)?).await?);
@@ -583,8 +652,245 @@ impl DaemonWorkspaceBackend {
             repo_location_id: params.repo_location_id,
             path: path.to_string_lossy().into_owned(),
             default_branch_sha,
-            origin_url: branches.origin_url,
+            origin_url: branches
+                .origin_url
+                .map(|origin| git::redact_remote_credentials(&origin, &origin)),
             probe_content,
+        })
+    }
+
+    async fn machine_probe(&self, params: MachineProbeParams) -> CommandResult<MachineProbeResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        if !self
+            .policy
+            .allowed_purposes
+            .contains(&WorkspaceRunPurpose::EnvironmentProbe)
+        {
+            return Err(error(
+                "run_purpose_denied",
+                "environment_probe is denied by local daemon configuration",
+            ));
+        }
+        if params.commands.is_empty()
+            || params.commands.len() > 64
+            || params.commands.iter().any(|command| {
+                command.name.trim().is_empty()
+                    || command.command.trim().is_empty()
+                    || !(1..=300).contains(&command.timeout_seconds)
+            })
+        {
+            return Err(error(
+                INVALID_INPUT,
+                "machine.probe requires 1–64 named commands with 1–300 second timeouts",
+            ));
+        }
+        let checkout = match params.repo_location_id.as_deref() {
+            Some(id) => Some(self.location_path(id).await?.1),
+            None => None,
+        };
+        let mut results = Vec::new();
+        for check in params.commands {
+            let scratch = if checkout.is_none() {
+                let path = self.confined_path(
+                    &self
+                        .workspace_root
+                        .join(".forge/probes")
+                        .join(uuid::Uuid::new_v4().to_string()),
+                )?;
+                std::fs::create_dir_all(&path).map_err(io_error)?;
+                Some(RemoveDirectory(path))
+            } else {
+                None
+            };
+            let path = checkout
+                .as_deref()
+                .unwrap_or_else(|| &scratch.as_ref().expect("scratch").0);
+            let mut command = Command::new("bash");
+            command
+                .args(["-lc", &check.command])
+                .envs(&params.env)
+                .env("PWD", path)
+                .current_dir(path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let output =
+                bounded_command_inner(command, check.timeout_seconds, 4096, true, true).await?;
+            let raw = [output.stdout, output.stderr].concat();
+            let (output_tail, _) = redacted_tail(&raw, &params.env, 4096);
+            results.push(MachineProbeCommandResult {
+                name: check.name,
+                exit_code: output.exit_code,
+                timed_out: output.timed_out,
+                output_tail,
+            });
+        }
+        Ok(MachineProbeResult { results })
+    }
+
+    async fn provision_location(
+        &self,
+        params: RepoLocationProvisionParams,
+    ) -> CommandResult<RepoLocationProvisionResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        validate_id(&params.repo_id)?;
+        if !self
+            .policy
+            .allowed_purposes
+            .contains(&WorkspaceRunPurpose::RepoProvision)
+        {
+            return Err(error(
+                "run_purpose_denied",
+                "repo_provision is denied by local daemon configuration",
+            ));
+        }
+        if !(1..=86400).contains(&params.timeout_seconds) {
+            return Err(error(
+                INVALID_INPUT,
+                "provision timeout must be between 1 and 86400 seconds",
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(params.timeout_seconds);
+        if params.default_branch.is_empty()
+            || params.default_branch.starts_with('-')
+            || local_git(
+                &self.workspace_root,
+                &[
+                    "check-ref-format",
+                    &format!("refs/heads/{}", params.default_branch),
+                ],
+            )
+            .await
+            .is_err()
+        {
+            return Err(error(INVALID_INPUT, "invalid repository branch"));
+        }
+        if params.remote_url.trim().is_empty() || params.remote_url.starts_with('-') {
+            return Err(error(INVALID_INPUT, "repository remote is required"));
+        }
+        let requested_path = self.workspace_root.join("repos").join(&params.repo_id);
+        let path = self.confined_path(&requested_path)?;
+        if path != requested_path {
+            return Err(error(
+                "path_conflict",
+                "managed clone path contains a symlink",
+            ));
+        }
+        if path.exists() {
+            let origin = local_git(&path, &["remote", "get-url", "origin"]).await;
+            let top = local_git(&path, &["rev-parse", "--show-toplevel"]).await;
+            if origin.is_err()
+                || top.is_err()
+                || Path::new(top.as_ref().expect("checked")) != path
+                || git::normalize_remote_url(&params.remote_url)
+                    != git::normalize_remote_url(origin.as_ref().expect("checked"))
+            {
+                return Err(error(
+                    "path_conflict",
+                    "managed clone path holds another repository or non-repository content",
+                ));
+            }
+            // The identity is unchanged, but owner-configured credentials may
+            // have rotated. Fetch uses this request's URL, never a stale origin.
+            local_git(&path, &["remote", "set-url", "origin", &params.remote_url]).await?;
+        } else {
+            let requested_staging = self
+                .workspace_root
+                .join(".forge/provision")
+                .join(&params.repo_id);
+            let staging = self.confined_path(&requested_staging)?;
+            if staging != requested_staging {
+                return Err(error(
+                    "path_conflict",
+                    "private staging path contains a symlink",
+                ));
+            }
+            // A crash can leave only our private staging directory. Retry removes
+            // it before cloning; the final path is published atomically.
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging).map_err(io_error)?;
+            }
+            std::fs::create_dir_all(staging.parent().expect("staging parent")).map_err(io_error)?;
+            let cleanup = RemoveDirectory(staging.clone());
+            let mut command = Command::new("git");
+            command
+                .arg("clone")
+                .arg("--branch")
+                .arg(&params.default_branch)
+                .arg("--")
+                .arg(&params.remote_url)
+                .arg(&staging)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .current_dir(&self.workspace_root)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let output = bounded_command(command, params.timeout_seconds, 4096, true).await?;
+            if output.timed_out || output.exit_code != Some(0) {
+                let (message, _) = redacted_tail(&output.stderr, &BTreeMap::new(), 4096);
+                return Err(error(
+                    "clone_failed",
+                    if output.timed_out {
+                        "repository clone timed out".to_owned()
+                    } else if message.is_empty() {
+                        "repository clone failed".to_owned()
+                    } else {
+                        message
+                    },
+                ));
+            }
+            std::fs::create_dir_all(path.parent().expect("clone parent")).map_err(io_error)?;
+            std::fs::rename(&staging, &path).map_err(io_error)?;
+            drop(cleanup);
+        }
+        verify_git_dir(&path, &self.workspace_root).await?;
+        if resolve_commit(&path, &format!("refs/heads/{}", params.default_branch))
+            .await
+            .is_err()
+        {
+            let mut fetch = Command::new("git");
+            fetch
+                .args([
+                    "fetch",
+                    "--",
+                    "origin",
+                    &format!(
+                        "refs/heads/{0}:refs/remotes/origin/{0}",
+                        params.default_branch
+                    ),
+                ])
+                .current_dir(&path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+            if remaining == 0 {
+                return Err(error("clone_failed", "repository fetch timed out"));
+            }
+            let fetched = bounded_command(fetch, remaining, 4096, true).await?;
+            if fetched.timed_out || fetched.exit_code != Some(0) {
+                return Err(error(
+                    "clone_failed",
+                    String::from_utf8_lossy(&fetched.stderr),
+                ));
+            }
+            local_git(
+                &path,
+                &[
+                    "branch",
+                    "--no-track",
+                    &params.default_branch,
+                    &format!("refs/remotes/origin/{}", params.default_branch),
+                ],
+            )
+            .await?;
+        }
+        let default_branch = params.default_branch;
+        Ok(RepoLocationProvisionResult {
+            workspace_root: self.workspace_root.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            default_branch,
         })
     }
 
@@ -903,6 +1209,15 @@ impl DaemonWorkspaceBackend {
     }
 
     async fn run(&self, params: WorkspaceRunParams) -> CommandResult<WorkspaceRunResult> {
+        if matches!(
+            params.purpose,
+            WorkspaceRunPurpose::EnvironmentProbe | WorkspaceRunPurpose::RepoProvision
+        ) {
+            return Err(error(
+                INVALID_INPUT,
+                "machine operations require their dedicated RPC",
+            ));
+        }
         if !self.policy.allowed_purposes.contains(&params.purpose) {
             return Err(error(
                 PURPOSE_DENIED,
@@ -1471,11 +1786,50 @@ struct BoundedOutput {
     stderr_drain_incomplete: bool,
 }
 
+struct ProcessGroupGuard(Option<u32>);
+impl ProcessGroupGuard {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &id.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 async fn bounded_command(
+    command: Command,
+    seconds: u64,
+    cap: usize,
+    keep_tail: bool,
+) -> CommandResult<BoundedOutput> {
+    bounded_command_inner(command, seconds, cap, keep_tail, false).await
+}
+
+async fn bounded_command_inner(
     mut command: Command,
     seconds: u64,
     cap: usize,
     keep_tail: bool,
+    kill_on_success: bool,
 ) -> CommandResult<BoundedOutput> {
     command
         .stdin(Stdio::null())
@@ -1485,6 +1839,7 @@ async fn bounded_command(
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(io_error)?;
+    let mut group = ProcessGroupGuard(child.id());
     let stdout = child
         .stdout
         .take()
@@ -1515,19 +1870,17 @@ async fn bounded_command(
     let (exit_code, timed_out) = match wait {
         Ok(status) => (status.map_err(io_error)?.code(), false),
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(id) = child.id() {
-                // The shell's descendants share its process group.
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{id}")])
-                    .status()
-                    .await;
-            }
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             (None, true)
         }
     };
+    if kill_on_success {
+        group.kill();
+    } else {
+        group.0 = None;
+    }
     let collect = async {
         (&mut stdout_task)
             .await

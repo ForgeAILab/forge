@@ -40,6 +40,7 @@ import { EnvironmentTab } from '@/components/settings/EnvironmentTab'
 import {
   parseEnvironmentText,
   useProjectEnvironmentText,
+  usePlacementProvision,
 } from '@/components/settings/environment-utils'
 import { GeneralTab } from '@/components/settings/GeneralTab'
 import { HooksTab } from '@/components/settings/HooksTab'
@@ -154,6 +155,7 @@ export function ProjectSettingsPage({
   const roles = workflowQuery.data?.roles ?? []
   const agents = agentsQuery.data?.items ?? []
   const [environmentText, setEnvironmentText] = useProjectEnvironmentText(project?.settings)
+  const [provision, setProvision] = usePlacementProvision(project?.settings)
   const [projectSaveError, setProjectSaveError] = useState<string | null>(null)
   const [environmentSaveError, setEnvironmentSaveError] = useState<string | null>(null)
   const activeLimit = Number(maxActiveTasks)
@@ -317,6 +319,7 @@ export function ProjectSettingsPage({
           version: project.version,
           settings: {
             ...(isRecord(project.settings) ? project.settings : {}),
+            placement: { ...(isRecord(project.settings?.placement) ? project.settings.placement : {}), provision },
             environment: {
               ...(environment.value ?? { env: {}, assets: [], checks: [] }),
               recheck_interval_seconds: Math.round(recheckMinutes * 60),
@@ -478,6 +481,8 @@ export function ProjectSettingsPage({
                 canSave={Boolean(project)}
                 isSaving={updateProject.isPending}
                 environmentText={environmentText}
+                provision={provision}
+                onProvisionChange={setProvision}
                 recheckMinutes={environmentRecheckMinutes}
                 recheckIntervalError={recheckIntervalError}
                 saveError={environmentSaveError}

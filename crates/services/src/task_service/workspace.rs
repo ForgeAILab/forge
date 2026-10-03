@@ -53,6 +53,12 @@ pub(super) struct WorkspaceAdmission {
 }
 
 impl TaskService {
+    pub(crate) fn environment_daemon_connections(
+        &self,
+    ) -> Option<&Arc<crate::daemon_transport::DaemonConnectionRegistry>> {
+        self.daemon_connections.as_ref()
+    }
+
     pub(crate) async fn defer_initial_environment_probe(
         &self,
         task: &Task,
@@ -64,12 +70,10 @@ impl TaskService {
             .fetch_optional(self.db.pool())
             .await?
             .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
-        let environment = serde_json::from_str::<ProjectSettings>(&raw)
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid project settings: {error}"))
-            })?
-            .environment;
-        if environment.checks.is_empty() || !environment.assets.is_empty() {
+        let settings = serde_json::from_str::<ProjectSettings>(&raw).map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid project settings: {error}"))
+        })?;
+        if settings.environment.checks.is_empty() || !settings.environment.assets.is_empty() {
             return Ok(false);
         }
         let prepared = crate::placement::context::prepare_selection(
@@ -80,13 +84,13 @@ impl TaskService {
             self.placement_adapter_registry.as_deref(),
         )
         .await?;
-        if prepared.settings.environment.checks.is_empty() {
-            return Ok(false);
-        }
         let context = self.environment_selection_context(task, &prepared).await?;
         crate::placement::environment::start_context_probes(
             &self.db,
             &context,
+            &self.daemon_connections.clone().unwrap_or_else(|| {
+                Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
+            }),
             &self.event_bus,
             self.dispatch_notify(),
         )
@@ -94,6 +98,14 @@ impl TaskService {
         let Err(refusal) = crate::placement::select_placement(&context).into_result() else {
             return Ok(false);
         };
+        if refusal.is_deterministic() {
+            return self
+                .record_placement_dispatch_refusal(
+                    task,
+                    &ServiceError::PlacementUnavailable(refusal),
+                )
+                .await;
+        }
         crate::placement::environment::handle_refusal(
             &self.db,
             &self.event_bus,
@@ -101,6 +113,7 @@ impl TaskService {
             &prepared.project,
             &context,
             &refusal,
+            self.daemon_connections.as_deref(),
         )
         .await
     }
@@ -173,6 +186,11 @@ impl TaskService {
         task: &Task,
         error: &ServiceError,
     ) -> Result<bool> {
+        if matches!(error,ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate|candidate.filter_codes.contains(&crate::placement::PlacementFilterCode::ProvisionFailed)))
+            && self.record_placement_dispatch_refusal(task, error).await?
+        {
+            return Ok(true);
+        }
         if !crate::placement::is_machine_capacity_refusal(error) {
             crate::deferred_dispatch::clear_capacity_wait(&self.db, task).await?;
         }
@@ -186,8 +204,13 @@ impl TaskService {
                 return Ok(true);
             }
         }
-        if let Some(deferred) =
-            crate::placement::environment::defer_refusal(&self.db, task, error).await?
+        if let Some(deferred) = crate::placement::environment::defer_refusal(
+            &self.db,
+            task,
+            error,
+            self.daemon_connections.as_deref(),
+        )
+        .await?
         {
             return Ok(deferred);
         }
@@ -609,7 +632,7 @@ impl TaskService {
             });
         }
         let location_count =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repo_location WHERE repo_id = ?")
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repo_location WHERE repo_id = ? AND owner_kind = 'server' AND daemon_id IS NULL")
                 .bind(&repo.id)
                 .fetch_one(&mut *transaction)
                 .await?;
@@ -658,6 +681,12 @@ impl TaskService {
                     crate::placement::environment::start_context_probes(
                         &self.db,
                         context,
+                        &self.daemon_connections.clone().unwrap_or_else(|| {
+                            Arc::new(
+                                crate::daemon_transport::DaemonConnectionRegistry::without_handlers(
+                                ),
+                            )
+                        }),
                         &self.event_bus,
                         self.dispatch_notify(),
                     )
@@ -669,9 +698,17 @@ impl TaskService {
                         &authority.project,
                         context,
                         &refusal,
+                        self.daemon_connections.as_deref(),
                     )
                     .await?;
-                    return Err(ServiceError::PlacementUnavailable(refusal));
+                    let error = ServiceError::PlacementUnavailable(refusal);
+                    if environment_admission
+                        == crate::placement::selection::EnvironmentAdmission::LaunchPreflight
+                        && matches!(&error, ServiceError::PlacementUnavailable(refusal) if refusal.rejected_candidates.iter().any(|candidate| candidate.filter_codes.iter().any(|code|matches!(code,crate::placement::PlacementFilterCode::EnvironmentUnverified|crate::placement::PlacementFilterCode::ProvisionFailed))))
+                    {
+                        self.record_placement_dispatch_refusal(task, &error).await?;
+                    }
+                    return Err(error);
                 }
             };
             let location = selection.candidate.location;
@@ -2774,8 +2811,11 @@ mod tests {
                 let version: i64 = name.strip_prefix('V')?.split_once("__")?.0.parse().ok()?;
                 // Placement arrives after the legacy rows are seeded; migrations
                 // that read `workspace_placement` are applied with it below.
-                (!matches!(version, 202610010400 | 202610010530 | 202610020600))
-                    .then_some((version, path))
+                (!matches!(
+                    version,
+                    202610010400 | 202610010530 | 202610020600 | 202610021500
+                ))
+                .then_some((version, path))
             })
             .collect::<Vec<_>>();
         historical.sort_by_key(|(version, _)| *version);
@@ -2875,6 +2915,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610020600__project_machine_readiness.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610021500__repo_provision_retry.sql"
         ))
         .execute(db.pool())
         .await
@@ -3335,6 +3381,56 @@ mod tests {
             panic!("placement refusal")
         };
         assert!(refusal.needs_daemon_upgrade());
+    }
+
+    #[tokio::test]
+    async fn no_checks_precheck_returns_before_invalid_selection_context() {
+        let db = Arc::new(sqlite_db().await);
+        let (mut task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let agent = AgentRepo::get_by_id(&*db, placement.agent_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let (connection, _outbound) =
+            crate::daemon_transport::DaemonConnection::new(daemon_id.into());
+        let id = connection.id();
+        registry.register(daemon_id.into(), connection);
+        registry.dispatch_incoming_for_connection(daemon_id,id,api_types::DaemonFrame::Notification {
+            method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
+            params:json!({"protocol_revision":3,"capabilities":["execution.terminal.usage_reports","journal.ack","workspace.v1","machine_probe.v1","repo_provision.v1"],"executor_capabilities":{},"workspace_run_policy":{"allowed_purposes":["environment_probe","repo_provision"]}}),
+        });
+        // A capable codeless runtime used to bypass the no-check early return.
+        let root = TempDir::new().unwrap();
+        db::RuntimeRepo::create(
+            &*db,
+            db::CreateRuntime {
+                id: new_uuid_v4(),
+                daemon_id: daemon_id.into(),
+                kind: "probe-fast-path".into(),
+                workspace_root: root.path().to_string_lossy().into_owned(),
+                status: db::RuntimeStatus::Ready,
+                labels_json: "{}".into(),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        task.task_state_config = Some("invalid workflow json".into());
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_daemon_connections(registry);
+        assert!(!service
+            .defer_initial_environment_probe(&task, &agent, "nonexistent-role")
+            .await
+            .unwrap());
+        let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project_machine_readiness")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(facts, 0);
     }
 
     #[tokio::test]

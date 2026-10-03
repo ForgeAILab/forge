@@ -215,6 +215,25 @@ pub async fn connect_terminal(
     connect_async(url).await.map(|(socket, _)| socket)
 }
 
+/// Route the environmental operations through the real daemon implementation.
+/// The caller supplies its configured root/runtime, never a server-guessed path.
+pub async fn handle_environment_request(
+    runtime: &Arc<forge_client::daemon_runtime::DaemonRuntime>,
+    frame: DaemonFrame,
+) -> Option<DaemonFrame> {
+    match &frame {
+        DaemonFrame::Request { method, .. }
+            if matches!(
+                method.as_str(),
+                api_types::METHOD_MACHINE_PROBE | api_types::METHOD_REPO_LOCATION_PROVISION
+            ) =>
+        {
+            Some(runtime.handle_request(frame).await)
+        }
+        _ => None,
+    }
+}
+
 pub async fn next_daemon_request(
     socket: &mut ClientSocket,
     expected_method: &str,

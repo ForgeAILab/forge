@@ -1334,7 +1334,12 @@ workspace:
     allow: [ci_step, hook, environment_setup]
 ```
 
-Keep only the purposes you want to permit; `allow: []` disables all three.
+For readiness probes before cloning, also opt in to `environment_probe` and
+`repo_provision` in this same allow list. The daemon advertises
+`machine_probe.v1` and `repo_provision.v1` at protocol revision 3. These purposes
+are accepted only by their dedicated RPCs; `workspace.run` keeps its three
+existing purposes. The default remains `[ci_step]`. Keep only the purposes you
+want to permit; `allow: []` denies every purpose.
 Restart the daemon after editing the file. It advertises the effective policy,
 and claim rejects a daemon with `run_purpose_denied` if the Task's review, hooks,
 or environment needs a disallowed purpose. A refused command returns
