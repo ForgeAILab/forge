@@ -1,6 +1,7 @@
 import { Link } from '@tanstack/react-router'
 import { cn } from '@/lib/cn'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
+import { TaskInteractiveLaunch } from './task-interactive-launch'
 import { TaskActionButtons } from './task-action-buttons'
 import type { Task, WorkflowExceptionSummary } from '@/types/generated'
 import type { ReviewAssessment } from '@/types/generated/bindings/ReviewAssessment'
@@ -19,9 +20,7 @@ function FailingStepDetails({
     <div
       className={cn(
         'space-y-2 rounded-md border bg-white/70 p-3 text-xs dark:bg-black/20',
-        failure
-          ? 'border-red-200 dark:border-red-800'
-          : 'border-amber-200 dark:border-amber-800',
+        failure ? 'border-red-200 dark:border-red-800' : 'border-amber-200 dark:border-amber-800',
       )}
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -33,9 +32,7 @@ function FailingStepDetails({
         <p
           className={cn(
             'break-words font-mono',
-            failure
-              ? 'text-red-950 dark:text-red-100'
-              : 'text-amber-950 dark:text-amber-100',
+            failure ? 'text-red-950 dark:text-red-100' : 'text-amber-950 dark:text-amber-100',
           )}
         >
           {step.command}
@@ -62,17 +59,46 @@ function FailingStepDetails({
   )
 }
 
-export function WorkflowExceptionPanel({ task, assessment }: { task: Task; assessment?: ReviewAssessment | null }) {
+export function WorkflowExceptionPanel({
+  task,
+  assessment,
+}: {
+  task: Task
+  assessment?: ReviewAssessment | null
+}) {
   const exception = task.workflow_exception
   if (!exception) return null
   const failure = task.failed != null
-  return <section className="space-y-3 rounded-lg border border-warning/40 bg-warning/10 p-4">
-    <h3 className="text-sm font-semibold">{workflowLabelFromKind(exception.type)}</h3>
-    <p className="text-sm">{exception.message}</p>
-    {exception.type === 'review_needs_owner' ? <div className="text-xs text-muted-foreground">{assessment?.fixable_by === 'owner' ? <span>fixable by owner</span> : assessment?.repeat ? <span>repeated finding</span> : null}</div> : null}
-    {exception.execution_id ? <Link to="/tasks/$taskId/executions/$executionId" params={{ taskId: task.id, executionId: exception.execution_id }} className="text-xs text-primary hover:underline">View execution</Link> : null}
-    <FailingStepDetails exception={exception} failure={failure} />
-    {exception.related_evidence.map((evidence, index) => <p key={index} className="text-xs">{evidence.message}</p>)}
-    <TaskActionButtons taskId={task.id} version={task.version} offers={exception.actions} />
-  </section>
+  return (
+    <section className="space-y-3 rounded-lg border border-warning/40 bg-warning/10 p-4">
+      <h3 className="text-sm font-semibold">{workflowLabelFromKind(exception.type)}</h3>
+      <p className="text-sm">{exception.message}</p>
+      {exception.type === 'review_needs_owner' ? (
+        <div className="text-xs text-muted-foreground">
+          {assessment?.fixable_by === 'owner' ? (
+            <span>fixable by owner</span>
+          ) : assessment?.repeat ? (
+            <span>repeated finding</span>
+          ) : null}
+        </div>
+      ) : null}
+      {exception.execution_id ? (
+        <Link
+          to="/tasks/$taskId/executions/$executionId"
+          params={{ taskId: task.id, executionId: exception.execution_id }}
+          className="text-xs text-primary hover:underline"
+        >
+          View execution
+        </Link>
+      ) : null}
+      <FailingStepDetails exception={exception} failure={failure} />
+      {exception.related_evidence.map((evidence, index) => (
+        <p key={index} className="text-xs">
+          {evidence.message}
+        </p>
+      ))}
+      <TaskActionButtons taskId={task.id} version={task.version} offers={exception.actions} />
+      <TaskInteractiveLaunch taskId={task.id} />
+    </section>
+  )
 }

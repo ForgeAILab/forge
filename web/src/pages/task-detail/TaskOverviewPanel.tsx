@@ -69,6 +69,7 @@ interface TaskOverviewPanelProps {
   onUpdatePriority: (priority: number) => void
   onStatusChange: (status: string) => void
   onAssigneeChange: (roleName: string, selection: AssigneeSelection) => void
+  onOpenLaunchDialog?: () => void
   onDuplicateTask: () => void
   onSaveRetryBudgets: (
     review: number | undefined,
@@ -103,6 +104,7 @@ export function TaskOverviewPanel({
   onStatusChange,
   onAssigneeChange,
   onDuplicateTask,
+  onOpenLaunchDialog,
   onSaveRetryBudgets,
 }: TaskOverviewPanelProps) {
   const [editingTitle, setEditingTitle] = useState(false)
@@ -320,6 +322,7 @@ export function TaskOverviewPanel({
             ) : null}
 
             <WorkflowExceptionPanel task={task} />
+            {onOpenLaunchDialog ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={onOpenLaunchDialog}>Launch run</Button></div> : null}
             {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
             {task.plan_progress || task.plan_artifact ? (

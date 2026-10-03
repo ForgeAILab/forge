@@ -3872,7 +3872,7 @@ actions are offered. The web UI renders one actionable recovery surface,
 without recovery actions. Generic execution follow-ups remain non-propagating
 side sessions: they can preserve an agent conversation, but they cannot settle
 a Review or advance Task state and are not shown beside an active workflow
-exception. Review guidance is submitted through the exception's `reexecute`
+exception. Review guidance is submitted through the exception's offered `retry {guidance}`
 action so the replacement reviewer execution is bound to the authoritative
 Review attempt and may propagate its result.
 
@@ -4224,7 +4224,7 @@ coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
 with a `review_blocked` blocking annotation for its owner, because neither the
 coder nor another reviewer can install a missing toolchain. The owner can retry
-the authoritative reviewer with required guidance (`reexecute` plus `context`),
+the authoritative reviewer with optional guidance (`retry` with `guidance`),
 or manually pass with a required reason. A manual pass appends a new passed
 Review attempt with user provenance; it never rewrites the failed attempt.
 A reply with no readable result block, or a review whose context or commit

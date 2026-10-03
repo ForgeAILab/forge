@@ -100,7 +100,11 @@ async function cleanupTask(request: APIRequestContext, taskId: string): Promise<
   if (!res.ok()) return
   const task = (await res.json()) as TaskResponse
   if (!['done', 'cancelled'].includes(task.status)) {
-    await request.post(`/api/v1/tasks/${taskId}/cancel`, { failOnStatusCode: false })
+    await request.get(`/api/v1/tasks/${taskId}/actions`).then(async (response) => {
+      const current = await response.json()
+      const offer = current.available_actions?.find((item: { action: { verb: string } }) => item.action.verb === 'cancel')
+      if (offer) await request.post(`/api/v1/tasks/${taskId}/actions`, { data: { action: offer.action, version: current.version }, failOnStatusCode: false })
+    })
     await waitForStatus(request, taskId, ['done', 'cancelled'], 120_000).catch(() => {})
   }
   await request.delete(`/api/v1/tasks/${taskId}`, { failOnStatusCode: false })

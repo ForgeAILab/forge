@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { ArrowClockwise, CaretRight, Play, Spinner, StopCircle } from '@phosphor-icons/react'
+import { CaretRight, Play, Spinner, StopCircle } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { apiFetch } from '@/api/client'
 import { qk } from '@/api/query-keys'
@@ -12,7 +12,8 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { buildExecutionChains, roleDisplayName, turnLabel } from '@/lib/execution-utils'
 import { productTerm } from '@/lib/i18n'
-import type { Execution, LaunchExecutionResponse } from '@/types/generated'
+import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
+import type { Execution, LaunchExecutionResponse, Offer } from '@/types/generated'
 
 const statusColors: Record<Execution['status'], string> = {
   running: 'bg-sky-100 text-sky-900 dark:bg-sky-950 dark:text-sky-300',
@@ -23,22 +24,36 @@ const statusColors: Record<Execution['status'], string> = {
 
 type Props = {
   taskId: string
+  version: number
+  offers: Offer[]
   executions: Execution[]
   isLoading: boolean
   agentName: (agentId?: string | null) => string | undefined | null
   formatDate: (value?: string | null) => string
 }
 
-export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, formatDate }: Props) {
+export function TaskExecutionsTab({
+  taskId,
+  version,
+  offers,
+  executions,
+  isLoading,
+  agentName,
+  formatDate,
+}: Props) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
-  const cancelMutation = useMutation({
+  const stopMutation = useMutation({
     mutationFn: (executionId: string) =>
-      apiFetch<Execution>(`/executions/${executionId}/cancel`, { method: 'POST' }),
+      apiFetch<Execution>(`/executions/${executionId}/stop`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
       toast.success(`${productTerm('run')} stopped`)
     },
     onError: (error) => toast.error(getApiErrorMessage(error, 'Stop failed')),
@@ -53,6 +68,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
     onSuccess: (response) => {
       void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId) })
       void navigate({
         to: '/tasks/$taskId/executions/$executionId',
         params: { taskId, executionId: response.data.execution.id },
@@ -61,24 +77,19 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
     onError: (error) => toast.error(getApiErrorMessage(error, 'Follow-up failed')),
   })
 
-  const reExecuteMutation = useMutation({
-    mutationFn: (executionId: string) =>
-      apiFetch<LaunchExecutionResponse>(`/executions/${executionId}/re-execute`, {
-        method: 'POST',
-      }),
-    onSuccess: (response) => {
-      void queryClient.invalidateQueries({ queryKey: qk.executions(taskId) })
-      void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: { taskId, executionId: response.data.execution.id },
-      })
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, 'Re-execute failed')),
-  })
-
-  const anyPending =
-    cancelMutation.isPending || followUpMutation.isPending || reExecuteMutation.isPending
+  const anyPending = stopMutation.isPending || followUpMutation.isPending
+  const freshRetries = offers
+    .filter(
+      (offer) =>
+        offer.action.verb === 'retry' &&
+        offer.parameters.some(
+          (spec) => spec.name === 'fresh_session' && spec.boolean_values?.includes(true),
+        ),
+    )
+    .map((offer) => ({
+      ...offer,
+      action: { ...offer.action, fresh_session: true } as Offer['action'],
+    }))
 
   if (isLoading) {
     return (
@@ -91,8 +102,11 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
 
   if (executions.length === 0) {
     return (
-      <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-        No {productTerm('run', 0).toLowerCase()} yet
+      <div className="space-y-3">
+        <TaskActionButtons taskId={taskId} version={version} offers={freshRetries} />
+        <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
+          No {productTerm('run', 0).toLowerCase()} yet
+        </div>
       </div>
     )
   }
@@ -101,12 +115,17 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
 
   return (
     <div className="space-y-3">
+      <TaskActionButtons taskId={taskId} version={version} offers={freshRetries} />
       {chains.map((chain) => {
         const totalTurns = chain.turns.length
         const lastTurn = chain.turns[totalTurns - 1]
         const sessionAgent = agentName(chain.root.agent_id)
-        const isRunning = lastTurn.status === 'running'
-        const isTerminal = lastTurn.status !== 'running'
+        const runningTurns = chain.turns
+          .map((execution, index) => ({ execution, turn: index + 1 }))
+          .filter(({ execution }) => execution.status === 'running')
+        const isRunning = runningTurns.length > 0
+        const isTerminal = !isRunning
+        const sessionStatus = isRunning ? 'running' : lastTurn.status
         const hasSession = Boolean(lastTurn.agent_session_id)
         const reversedTurns = [...chain.turns].reverse()
 
@@ -126,9 +145,7 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
               )}
             >
               <div className="flex items-center gap-2.5 min-w-0">
-                <p className="text-sm font-semibold">
-                  {roleDisplayName(chain.root.role)} Session
-                </p>
+                <p className="text-sm font-semibold">{roleDisplayName(chain.root.role)} Session</p>
                 {totalTurns > 1 && (
                   <span className="text-xs text-muted-foreground">{totalTurns} turns</span>
                 )}
@@ -138,26 +155,28 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2 shrink-0">
+              <div className="flex flex-wrap items-center gap-2">
                 {/* Action buttons on the session header */}
-                {isRunning && (
-                  <Tooltip content={`Stop this ${productTerm('run').toLowerCase()}`}>
+                {runningTurns.map(({ execution, turn }) => (
+                  <Tooltip key={execution.id} content={execution.summary || `Stop turn ${turn}`}>
                     <Button
                       size="sm"
                       variant="outline"
                       className="h-7 gap-1.5 px-2.5 text-red-600 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/30"
                       disabled={anyPending}
-                      onClick={() => cancelMutation.mutate(lastTurn.id)}
+                      onClick={() => stopMutation.mutate(execution.id)}
                     >
-                      {cancelMutation.isPending ? (
+                      {stopMutation.isPending && stopMutation.variables === execution.id ? (
                         <Spinner className="h-3.5 w-3.5 animate-spin" />
                       ) : (
                         <StopCircle className="h-3.5 w-3.5" />
                       )}
-                      <span className="text-xs">Stop</span>
+                      <span className="text-xs">
+                        {runningTurns.length === 1 ? 'Stop' : `Stop turn ${turn}`}
+                      </span>
                     </Button>
                   </Tooltip>
-                )}
+                ))}
                 {isTerminal && hasSession && (
                   <Tooltip content="Resume with the same agent session">
                     <Button
@@ -176,28 +195,8 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
                     </Button>
                   </Tooltip>
                 )}
-                {isTerminal && !hasSession && (
-                  <Tooltip content={`Start a new ${productTerm('run').toLowerCase()} with the same role`}>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 gap-1.5 px-2.5"
-                      disabled={anyPending}
-                      onClick={() => reExecuteMutation.mutate(lastTurn.id)}
-                    >
-                      {reExecuteMutation.isPending ? (
-                        <Spinner className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <ArrowClockwise className="h-3.5 w-3.5" />
-                      )}
-                      <span className="text-xs">Re-execute</span>
-                    </Button>
-                  </Tooltip>
-                )}
-                <Badge
-                  className={cn('border-transparent', statusColors[lastTurn.status])}
-                >
-                  {lastTurn.status}
+                <Badge className={cn('border-transparent', statusColors[sessionStatus])}>
+                  {sessionStatus}
                 </Badge>
               </div>
             </div>
@@ -226,7 +225,12 @@ export function TaskExecutionsTab({ taskId, executions, isLoading, agentName, fo
                           {totalTurns > 1 && (
                             <span className="text-sm font-semibold">Turn {originalIndex + 1}</span>
                           )}
-                          <span className={cn('text-sm', totalTurns > 1 ? 'text-muted-foreground' : 'font-semibold')}>
+                          <span
+                            className={cn(
+                              'text-sm',
+                              totalTurns > 1 ? 'text-muted-foreground' : 'font-semibold',
+                            )}
+                          >
                             {turnLabel(originalIndex, execution)}
                           </span>
                           <Badge

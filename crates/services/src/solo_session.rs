@@ -1065,16 +1065,7 @@ impl SoloSessionService {
                 "expected_task_version must be positive",
             ));
         }
-        let reason = input.reason.and_then(|reason| safe_diagnostic(&reason));
-        let action = match input.decision {
-            SoloReviewDecision::Accept => api_types::TaskAction::Approve {
-                reason: None,
-                override_checks: false,
-            },
-            SoloReviewDecision::RequestChanges => api_types::TaskAction::SendBack {
-                guidance: reason.clone().unwrap_or_default(),
-            },
-        };
+        let action = solo_review_action(input.decision, input.reason)?;
         let result = self
             .task_service
             .perform_task_action(task.id.clone(), action, input.expected_task_version)
@@ -2603,9 +2594,56 @@ fn bounded_limit(name: &str, value: i64, max: i64) -> Result<i64> {
     Ok(value)
 }
 
+fn solo_review_action(
+    decision: SoloReviewDecision,
+    reason: Option<String>,
+) -> Result<api_types::TaskAction> {
+    let reason = reason.and_then(|reason| safe_diagnostic(&reason));
+    match decision {
+        SoloReviewDecision::Accept => Ok(api_types::TaskAction::Approve {
+            reason,
+            override_checks: false,
+        }),
+        SoloReviewDecision::RequestChanges => {
+            let guidance = reason
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("send_back requires nonblank guidance")
+                })?;
+            Ok(api_types::TaskAction::SendBack { guidance })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_decisions_preserve_typed_guidance_and_reason() {
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, None).is_err());
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, Some("  ".into())).is_err());
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::RequestChanges,
+                Some("Fix the missing coverage".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::SendBack {
+                guidance: "Fix the missing coverage".into()
+            }
+        );
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::Accept,
+                Some("Track in follow-up".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::Approve {
+                override_checks: false,
+                reason: Some("Track in follow-up".into())
+            }
+        );
+    }
 
     #[test]
     fn finite_turn_states_keep_terminal_and_waiting_distinct() {

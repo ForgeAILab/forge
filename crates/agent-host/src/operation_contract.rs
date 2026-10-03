@@ -990,14 +990,6 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
                 "type": ["string", "null"],
                 "description": "task.action/task.dependency: required Task id in this Project."
             },
-            "reason": {
-                "type": ["string", "null"],
-                "description": "Audit reason for operations that declare an envelope reason. task.action uses action.reason for approve/cancel/retry, and action.guidance for send_back."
-            },
-            "decision": {
-                "type": ["string", "null"],
-                "description": "Decision for operations that declare this envelope field. task.action requires the offered action object; send_back carries typed guidance and approve carries override and reason."
-            },
             "action": {
                 "type": ["string", "object", "null"],
                 "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
@@ -1677,10 +1669,17 @@ mod tests {
                 crate::operation_catalog::is_coordination_generic_proposal(operation)
             })
             .collect();
-        assert!(
-            coordination.len() >= 6,
-            "the coordination envelope should carry the task command family: {coordination:?}"
-        );
+        for required in [
+            TASK_PROPOSE_OPERATION,
+            TASK_ADAPTIVE_OPERATION,
+            TASK_DEPENDENCY_OPERATION,
+            TASK_ACTION_OPERATION,
+        ] {
+            assert!(
+                coordination.contains(&required),
+                "the coordination envelope must carry {required}: {coordination:?}"
+            );
+        }
 
         for operation in coordination {
             let alone: BTreeSet<String> = [operation.to_owned()].into_iter().collect();
@@ -1914,6 +1913,17 @@ mod tests {
                 action_description.contains(discriminator),
                 "combined action guidance must name {discriminator}: {action_description}"
             );
+        }
+    }
+    #[test]
+    fn task_action_flat_payload_has_version_and_no_retired_envelope_fields() {
+        let operations = [TASK_ACTION_OPERATION.to_owned()].into_iter().collect();
+        let properties = coordination_payload_properties(&operations).unwrap();
+        for required in ["task_id", "action", "version"] {
+            assert!(properties.get(required).is_some());
+        }
+        for retired in ["reason", "decision", "expected_task_version"] {
+            assert!(properties.get(retired).is_none());
         }
     }
 }

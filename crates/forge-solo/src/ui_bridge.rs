@@ -567,6 +567,7 @@ impl AppReducer {
             }
             CommandRequest::Review {
                 review_id: _,
+                guidance,
                 task_id,
                 action,
                 expected_version,
@@ -585,6 +586,7 @@ impl AppReducer {
                     // it at this boundary without changing AppState.
                     target_digest: String::new(),
                     decision,
+                    guidance,
                     idempotency_key: key.clone().into(),
                 });
                 self.pending_backend_commands.insert(key, command_id);
@@ -1155,6 +1157,30 @@ pub fn to_task_summary(task: &TaskSnapshot) -> TaskSummary {
         to_app_task_state(task.state),
     );
     result.version = nonnegative_u64(task.version);
+    result.review_actions = task
+        .review_actions
+        .iter()
+        .filter_map(|offer| match offer.action {
+            api_types::TaskAction::Approve {
+                override_checks: false,
+                ..
+            } => Some(AppApprovalAction::Accept),
+            api_types::TaskAction::SendBack { .. } => Some(AppApprovalAction::RequestChanges),
+            _ => None,
+        })
+        .collect();
+    result.review_reason_required = task.review_actions.iter().any(|offer| {
+        matches!(
+            offer.action,
+            api_types::TaskAction::Approve {
+                override_checks: false,
+                ..
+            }
+        ) && offer
+            .parameters
+            .iter()
+            .any(|spec| spec.name == "reason" && spec.required)
+    });
     result.worker = task.worker.as_ref().map_or_else(String::new, agent_label);
     result.reviewer = task.reviewer.as_ref().map_or_else(String::new, agent_label);
     result.checks = task.checks.iter().map(to_check_summary).collect();
@@ -1234,7 +1260,10 @@ pub fn to_review_card(task: &TaskSnapshot) -> ReviewCard {
         worker: summary.worker,
         reviewer: summary.reviewer,
         expected_version: summary.version,
-        permitted_actions: vec![AppApprovalAction::Accept, AppApprovalAction::RequestChanges],
+        permitted_actions: summary.review_actions,
+        guidance: String::new(),
+        editing_guidance: false,
+        requires_reason: summary.review_reason_required,
         selected_action: 0,
         visibility: ContentVisibility::Public,
     }
@@ -1641,6 +1670,18 @@ mod tests {
                 cursor: ActivityCursor::beginning(&target),
             }],
             tasks: vec![TaskSnapshot {
+                review_actions: vec![api_types::Offer {
+                    action: api_types::TaskAction::Approve {
+                        override_checks: false,
+                        reason: None,
+                    },
+                    parameters: Vec::new(),
+                    authority: vec![api_types::ActionAuthority::Owner],
+                    reason: "human_review".into(),
+                    label: "Accept".into(),
+                    target_execution_id: None,
+                    propagates: false,
+                }],
                 id: "task".into(),
                 title: "Review me".into(),
                 state: BackendTaskState::Review,
@@ -2180,5 +2221,61 @@ mod tests {
             ControllerEffect::ReadActivity(request)
                 if request.limit == DEFAULT_ACTIVITY_PAGE && request.cursor.next_sequence == 0
         )));
+    }
+    #[test]
+    fn review_card_uses_only_offered_decisions() {
+        let mut task = snapshot().tasks[0].clone();
+        task.review_actions.clear();
+        assert!(to_review_card(&task).permitted_actions.is_empty());
+        task.review_actions.push(api_types::Offer {
+            action: api_types::TaskAction::SendBack {
+                guidance: String::new(),
+            },
+            parameters: Vec::new(),
+            authority: vec![api_types::ActionAuthority::Owner],
+            reason: "review_failed".into(),
+            label: "Request changes".into(),
+            target_execution_id: None,
+            propagates: false,
+        });
+        assert_eq!(
+            to_review_card(&task).permitted_actions,
+            vec![AppApprovalAction::RequestChanges]
+        );
+    }
+    #[test]
+    fn physical_review_keys_collect_guidance_and_forward_it_to_backend() {
+        let mut snapshot = snapshot();
+        snapshot.project.readiness = BackendProjectReadiness::Operational;
+        snapshot.chat.interactions.clear();
+        snapshot.tasks[0].review_actions = vec![api_types::Offer {
+            action: api_types::TaskAction::SendBack {
+                guidance: String::new(),
+            },
+            parameters: Vec::new(),
+            authority: vec![api_types::ActionAuthority::Owner],
+            reason: "human_review".into(),
+            label: "Request changes".into(),
+            target_execution_id: None,
+            propagates: false,
+        }];
+        let mut reducer = AppReducer::new(AppState::new());
+        reducer.reduce(ControllerEvent::SnapshotUpdated {
+            request: SnapshotRequest::default(),
+            result: Ok(snapshot),
+        });
+        reducer.state_mut().focus = crate::app::FocusTarget::ProjectRail;
+        reducer.state_mut().rail.tab = crate::app::ProjectTab::Tasks;
+        let input = |code| ControllerEvent::Input(InputEvent::Key(ControllerKeyEvent::new(code)));
+        assert!(reducer.reduce(input(ControllerKeyCode::Enter)).is_empty());
+        assert!(reducer.reduce(input(ControllerKeyCode::Enter)).is_empty());
+        let guidance = "Add coverage for retry? yes.";
+        for character in guidance.chars() {
+            assert!(reducer
+                .reduce(input(ControllerKeyCode::Char(character)))
+                .is_empty());
+        }
+        let effects = reducer.reduce(input(ControllerKeyCode::Enter));
+        assert!(effects.iter().any(|effect| matches!(effect, ControllerEffect::Command(BackendCommand::DecideReview(request)) if request.guidance.as_deref() == Some(guidance) && request.expected_version == 4 && request.decision == crate::backend::ReviewDecision::Reject)));
     }
 }

@@ -566,7 +566,7 @@ impl SoloBackend for RuntimeBackend {
                             task_id: request.task_id.clone(),
                             expected_task_version: request.expected_version,
                             decision,
-                            reason: None,
+                            reason: request.guidance,
                         })
                         .await
                         .map_err(map_service_error)?;
@@ -1131,6 +1131,7 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
         })
     });
     TaskSnapshot {
+        review_actions: task.available_actions.clone(),
         id: task.id.clone(),
         title: task.title.clone(),
         state: task_state(&task.status),

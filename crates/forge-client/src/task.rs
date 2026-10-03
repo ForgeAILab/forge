@@ -64,16 +64,18 @@ pub enum TaskCmd {
         verb: String,
         #[arg(long)]
         version: Option<i64>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         fresh_session: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         refresh_workspace: Option<bool>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         reset_budget: Option<bool>,
         #[arg(long)]
         guidance: Option<String>,
-        #[arg(long = "override")]
-        override_checks: bool,
+        #[arg(long = "override", num_args = 0..=1, default_missing_value = "true")]
+        override_checks: Option<bool>,
+        #[arg(long)]
+        reason: Option<String>,
     },
     PromptPreview {
         task_id: String,
@@ -187,7 +189,16 @@ impl TaskArgs {
             TaskCmd::Actions { id } => {
                 let response: api_types::TaskActionsResponse =
                     client.get(&format!("/api/v1/tasks/{id}/actions")).await?;
-                print_json(&response)
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        println!("Version: {}", response.version);
+                        for offer in response.available_actions {
+                            println!("{}: {}", offer.action.verb(), offer.label);
+                        }
+                        Ok(())
+                    }
+                }
             }
             TaskCmd::Action {
                 id,
@@ -198,29 +209,17 @@ impl TaskArgs {
                 reset_budget,
                 guidance,
                 override_checks,
+                reason,
             } => {
-                let mut action = json!({ "verb": verb });
-                if verb == "retry" {
-                    for (name, value) in [
-                        ("fresh_session", fresh_session),
-                        ("refresh_workspace", refresh_workspace),
-                        ("reset_budget", reset_budget),
-                    ] {
-                        if let Some(value) = value {
-                            action[name] = json!(value);
-                        }
-                    }
-                    if let Some(guidance) = guidance {
-                        action["guidance"] = json!(guidance);
-                    }
-                }
-                if verb == "send_back" {
-                    action["guidance"] = json!(guidance.as_deref().unwrap_or(""));
-                }
-                if verb == "approve" {
-                    action["override"] = json!(override_checks);
-                }
-                let action: api_types::TaskAction = serde_json::from_value(action)?;
+                let action = build_action(
+                    verb,
+                    *fresh_session,
+                    *refresh_workspace,
+                    *reset_budget,
+                    guidance.as_deref(),
+                    *override_checks,
+                    reason.as_deref(),
+                )?;
                 let version = match version {
                     Some(version) => *version,
                     None => {
@@ -232,13 +231,47 @@ impl TaskArgs {
                             .version
                     }
                 };
-                let task: TaskResponse = client
+                let task: Result<TaskResponse> = client
                     .post(
                         &format!("/api/v1/tasks/{id}/actions"),
                         &api_types::TaskActionRequest { action, version },
                     )
-                    .await?;
-                print_task(output, &task)
+                    .await;
+                match task {
+                    Ok(task) => print_task(output, &task),
+                    Err(error) => {
+                        if let Some(unavailable) =
+                            error.downcast_ref::<crate::client::ActionUnavailable>()
+                        {
+                            match output {
+                                OutputFormat::Json => print_json(&unavailable.response)?,
+                                OutputFormat::Table => {
+                                    eprintln!("Action unavailable. Available now:");
+                                    if let Some(offers) = unavailable
+                                        .response
+                                        .pointer("/details/available_actions")
+                                        .and_then(serde_json::Value::as_array)
+                                    {
+                                        for offer in offers {
+                                            eprintln!(
+                                                "{}: {}",
+                                                offer
+                                                    .pointer("/action/verb")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("?"),
+                                                offer
+                                                    .get("label")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error)
+                    }
+                }
             }
             TaskCmd::PromptPreview {
                 task_id,
@@ -443,4 +476,134 @@ fn html_attr_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn build_action(
+    verb: &str,
+    fresh: Option<bool>,
+    refresh: Option<bool>,
+    reset: Option<bool>,
+    guidance: Option<&str>,
+    override_checks: Option<bool>,
+    reason: Option<&str>,
+) -> Result<api_types::TaskAction> {
+    for (name, supplied, allowed) in [
+        ("--fresh-session", fresh.is_some(), verb == "retry"),
+        ("--refresh-workspace", refresh.is_some(), verb == "retry"),
+        ("--reset-budget", reset.is_some(), verb == "retry"),
+        (
+            "--guidance",
+            guidance.is_some(),
+            matches!(verb, "retry" | "send_back"),
+        ),
+        ("--override", override_checks.is_some(), verb == "approve"),
+        (
+            "--reason",
+            reason.is_some(),
+            !matches!(verb, "start" | "send_back"),
+        ),
+    ] {
+        anyhow::ensure!(!supplied || allowed, "{name} does not belong to {verb}");
+    }
+    if verb == "send_back" {
+        anyhow::ensure!(
+            guidance.is_some_and(|value| !value.trim().is_empty()),
+            "send_back requires nonblank --guidance"
+        );
+    }
+    if override_checks == Some(true) || reset == Some(false) {
+        anyhow::ensure!(
+            reason.is_some_and(|value| !value.trim().is_empty()),
+            "this action requires nonblank --reason"
+        );
+    }
+    let mut action = json!({"verb": verb});
+    for (name, value) in [
+        ("fresh_session", fresh),
+        ("refresh_workspace", refresh),
+        ("reset_budget", reset),
+    ] {
+        if let Some(value) = value {
+            action[name] = json!(value);
+        }
+    }
+    if let Some(value) = guidance {
+        action["guidance"] = json!(value);
+    }
+    if let Some(value) = reason {
+        action["reason"] = json!(value);
+    }
+    if verb == "approve" {
+        action["override"] = json!(override_checks.unwrap_or(false));
+    }
+    Ok(serde_json::from_value(action)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        task: TaskArgs,
+    }
+    #[test]
+    fn actions_and_action_commands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["ctl", "actions", "t"])
+                .unwrap()
+                .task
+                .cmd,
+            TaskCmd::Actions { .. }
+        ));
+        let parsed = Cli::try_parse_from([
+            "ctl",
+            "action",
+            "t",
+            "retry",
+            "--fresh-session",
+            "--reset-budget",
+            "false",
+            "--reason",
+            "inspect first",
+            "--guidance",
+            "fix check",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.task.cmd,
+            TaskCmd::Action {
+                fresh_session: Some(true),
+                reset_budget: Some(false),
+                reason: Some(_),
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn action_parameters_are_validated_locally() {
+        assert!(build_action("send_back", None, None, None, None, None, None).is_err());
+        assert!(build_action("send_back", None, None, None, Some("  "), None, None).is_err());
+        assert!(build_action("cancel", Some(false), None, None, None, None, None).is_err());
+        assert!(build_action("hold", None, None, None, None, Some(false), None).is_err());
+        assert!(build_action("start", None, None, None, None, None, Some("why")).is_err());
+        assert!(build_action("approve", None, None, None, None, Some(true), None).is_err());
+        assert_eq!(
+            serde_json::to_value(
+                build_action(
+                    "send_back",
+                    None,
+                    None,
+                    None,
+                    Some("Fix the failing check"),
+                    None,
+                    None
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            json!({"verb":"send_back","guidance":"Fix the failing check"})
+        );
+    }
 }

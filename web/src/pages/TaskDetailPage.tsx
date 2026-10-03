@@ -338,6 +338,7 @@ export function TaskDetailPage({
       },
       {
         onSuccess: () => {
+          void taskDetailQuery.refetch()
           saveRecentExecutionSelection(
             config.agentId,
             config.selection ?? {
@@ -426,6 +427,7 @@ export function TaskDetailPage({
               onStatusChange={onStatusChange}
               onAssigneeChange={onAssigneeChange}
               onDuplicateTask={onDuplicateTask}
+              onOpenLaunchDialog={() => setLaunchDialogOpen(true)}
 
               onSaveRetryBudgets={onSaveRetryBudgets}
             />
@@ -434,6 +436,8 @@ export function TaskDetailPage({
           {initialTab === 'executions' && !(taskDetailQuery.isError && !taskDetailQuery.data) && (
             <div className="p-6">
               <TaskExecutionsTab
+                version={task?.version ?? 0}
+                offers={task?.available_actions ?? []}
                 executions={executions}
                 taskId={taskId}
                 isLoading={taskDetailQuery.isLoading}

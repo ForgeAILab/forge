@@ -4,13 +4,13 @@ import {
   useAgentsQuery,
   useArchiveTask,
   useAssignRole,
-  useTaskAction,
   useMembersQuery,
   useProjectAgentsQuery,
   useRemoveRole,
   useTasksQuery,
   useTransitionTask,
 } from '@/api/hooks'
+import { BulkCancelTasks, TaskRowActions } from '@/components/task-detail/task-list-actions'
 import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -33,14 +33,6 @@ import type { TaskListItem as Task } from '@/types/generated'
 
 export type TaskListSortBy = 'title' | 'status' | 'agent' | 'priority' | 'task_type' | 'updated_at'
 export type TaskListSortOrder = 'asc' | 'desc'
-
-const cancellableStatuses = new Set<TaskStatus>([
-  'todo',
-  'in_progress',
-  'review',
-  'merge_failed',
-  'blocked',
-])
 
 const tableColumns: Array<{ key: TaskListSortBy; label: string }> = [
   { key: 'title', label: 'Title' },
@@ -97,7 +89,6 @@ export function TaskListPage({
   const agentsQuery = useAgentsQuery()
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
-  const cancelTask = useTaskAction()
   const archiveTask = useArchiveTask()
   const assignRole = useAssignRole()
   const removeRole = useRemoveRole()
@@ -137,7 +128,6 @@ export function TaskListPage({
     () => visibleTasks.filter((task) => selectedIds.has(task.id)),
     [selectedIds, visibleTasks],
   )
-  const cancellableSelected = selectedTasks.filter((task) => cancellableStatuses.has(task.status))
   const assignableSelected = selectedTasks.filter(
     (task) => task.status !== 'done' && task.status !== 'cancelled',
   )
@@ -182,15 +172,6 @@ export function TaskListPage({
       }
       return next
     })
-  }
-
-  const cancelSelected = () => {
-    for (const task of cancellableSelected) {
-      cancelTask.mutate({ taskId: task.id, version: task.version, action: { verb: 'cancel' } }, {
-        onError: (error) => toastApiError(error, 'Task cancellation failed'),
-      })
-    }
-    setSelectedIds(new Set())
   }
 
   const archiveSelected = () => {
@@ -279,14 +260,7 @@ export function TaskListPage({
       {selectedTasks.length > 0 ? (
         <div className="flex flex-wrap items-center gap-2 rounded-md border bg-background p-3 shadow-soft">
           <span className="text-sm font-medium">{selectedTasks.length} selected</span>
-          <Button
-            disabled={cancellableSelected.length === 0 || cancelTask.isPending}
-            size="sm"
-            variant="outline"
-            onClick={cancelSelected}
-          >
-            Cancel selected
-          </Button>
+          <BulkCancelTasks tasks={selectedTasks} onComplete={() => setSelectedIds(new Set())} />
           <Button
             disabled={archiveTask.isPending}
             size="sm"
@@ -533,6 +507,7 @@ export function TaskListPage({
                         >
                           {task.title}
                         </button>
+                        <TaskRowActions taskId={task.id} />
                       </td>
                       {/* Pri */}
                       <td className="w-14 px-3 py-[10px]">

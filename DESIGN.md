@@ -634,3 +634,7 @@ New surfaces must reuse these levels. The current code contains a few legacy lit
 ### Task action offers
 
 Task action buttons render server labels and meaningful parameters. Use the existing small outline Button, Dialog, Label and Textarea primitives; pending disables submission, errors refresh the Task projection, and an empty offer set renders no controls. Parameter inputs keep visible labels, keyboard focus and the semantic foreground, border and ring tokens.
+
+### Task action forms
+
+Use existing outline buttons, Dialog, Label and Textarea primitives. Offers supply labels and fields; required text is labelled and blocks Apply while blank. Boolean selects show only offered choices. Cancellation copy states subtask propagation. Changed-action notices use a polite status region. Dialog content scrolls within the viewport, keeping all inputs reachable.

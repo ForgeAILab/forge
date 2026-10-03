@@ -860,14 +860,13 @@ version:
     "source": "blocked",
     "kind": "executor_failed",
     "reason": "Executor stopped before completing the Task",
-    "execution_id": "execution-uuid",
-    "recovery_actions": ["reexecute", "cancel_task"]
+    "execution_id": "execution-uuid"
   }
 }
 ```
 
-`interruption` is `null` when the interruption is cleared. Its recovery list
-is a snapshot of typed Task annotation data, not an authorization grant;
+`interruption` is `null` when cleared. It contains condition evidence only;
+fetch current action offers separately before acting;
 consumers must refresh the current Task and use only actions it still
 advertises.
 
@@ -992,7 +991,7 @@ the dependency block it caused.
 Without this, `depends_on_task_ids` was settable only at `task.propose` and an
 Agent re-planning a graph had to cancel and recreate every downstream Task —
 each with a new id — because a dependent of a cancelled Task is blocked with
-`cancel_task` as its only advertised recovery, and a cancelled Task cannot be
+`cancel` as its only advertised recovery, and a cancelled Task cannot be
 recovered at all. The existing `POST`/`DELETE /api/v1/tasks/{id}/dependencies`
 endpoints remain the human/API surface and are unchanged.
 
@@ -2590,7 +2589,7 @@ unfinished dependents until the cancelled link is removed or otherwise
 resolved.
 
 The current Project Agent operating skill is
-`forge.project.orchestration/v1@16` (activated by V137). Its task-coordination
+`forge.project.orchestration/v1@19` (activated by V202610020500). Its task-coordination
 doctrine uses the same distinction: `parent_task_id` selects the shared root
 workspace, while dependency IDs only gate execution.
 
@@ -2598,8 +2597,8 @@ Built-in workflow templates expose four review choices: `default` (Agent
 review), `no-review`, `human-required`, and the `autonomous_v1` compatibility
 preset. A Task may override the Project default. In `human-required`, either the
 interactive user or the bound Project Agent may accept or reject through the
-normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
-operation, which validates the exact binding, Project, Task version, CI, and
+normal Task workflow; the Project Agent uses the native `task.action`
+operation with `approve {override:false, reason?}` or `send_back {guidance}`, which validates the exact binding, Project, Task version, CI, and
 evidence before transition.
 
 ## Execution status and liveness
@@ -2777,13 +2776,13 @@ relaunch a non-reviewer role while that human decision is outstanding.
 
 The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval requires `override` and accepts an optional reason; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status.
 
-Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Unknown verbs and malformed payloads are schema errors.
+Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Missing `version` yields 422; unknown fields and malformed payloads are refused. Blank required reason/guidance yields 400. Corrupt persisted Review details yield 500 before mutation. MCP unavailable errors use -32010.
 
 Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
-MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Single-Task reads include caller-filtered offers; Task lists omit offers and MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
+MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; Task lists omit offers and MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
 
 Machine run caps use the same durable Task-action queue. A full machine records a `machine_capacity` dispatch disposition, parks the Task for its Project, and waits without a failure annotation, Attention item or retry-budget charge. Repeated dispatcher ticks preserve the accepted marker, Task version and event history, including an admission race after the read-only precheck. Environment readiness/probe refusals retain an `environment_wait` marker; a Project paused for its environment waits rather than becoming `dispatch_failed`. Permanent replay refusals restore the saved condition with the refusal error and remove the matching intent.
 
@@ -4049,8 +4048,10 @@ stderr, error messages, and terminal output text, preserving IDs and exit codes.
 Undecodable entry files are quarantined as `corrupt-<original name>` with a warning
 and do not stop journal initialization.
 
-When a follow-up, re-execute, or launch collides with an already-running
+When an interactive follow-up or launch collides with an already-running
 execution, REST returns HTTP `409` with code `execution.already_running`.
+Task retry uses the offered Task action contract: an unavailable offer returns
+`action_unavailable`, and a stale Task version returns a version conflict.
 `details.scope` is `repository` for a shared Workspace slot or `interactive`
 for the Task's interactive slot, and
 `details.execution_id` is the opaque id of the execution currently occupying
@@ -4327,7 +4328,7 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_memory_search` | Search project memory with an injection-guard wrapper |
 | `forge_memory_get` | Get one memory item with an injection-guard wrapper |
 | `forge_assign_agent` | Assign the effective implementation role without starting execution; valid while paused |
-| `forge_cancel_task` | Cancel task |
+| `forge_task_action` | Apply an offered Task action with the current version |
 | `forge_get_task_diff` | Get code diff |
 | `forge_list_executions` | List executions |
 | `forge_follow_up_execution` | Resume a completed or failed execution with a child execution |
@@ -4735,3 +4736,11 @@ before the script. No default shell PASS is generated. Model-backed native/CLI
 reviewers receive one copy of the equivalent frozen contract in their final
 assembled prompt. Native reviewer attempts do not reuse Task conversation history,
 checkpoints, or LCM state.
+
+### Client action controls
+
+The web renders Task controls from live offers, including placement waits (`hold` and `cancel`) and recorded placement refusals (`retry`). Row menus and bulk cancellation fetch offers when opened; bulk cancellation skips Tasks without a cancel offer. Forms copy offered defaults, expose only descriptor boolean choices, enforce `required` and `required_when`, and explain subtask propagation. HTTP 409 action-unavailable and version conflicts refresh the choices and display the actions available now. Task Overview retains Launch run and Open interactive; review retry offers provide Re-run review. Each running role execution or side session has its own Stop control. Fresh execution retries use the Task's offered `retry {fresh_session:true}`.
+
+Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
+
+Project doctrine @19 names the live `task.action` contract and required inputs. Migration V202610020500 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.

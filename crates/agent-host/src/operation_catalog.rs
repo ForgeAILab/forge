@@ -767,7 +767,7 @@ pub fn operation_permission(
 /// directly under `requested_permission`.
 ///
 /// This used to be a hand-written list of operation names in the policy
-/// layer, and its own comment recorded the cost: `task.action` was declared,
+/// layer, and its own comment recorded the cost: `task.recover` was declared,
 /// implemented end to end, and omitted from that list, so it was refused at
 /// runtime with a message that named nothing. The catalog row already carries
 /// every fact the decision needs — a coordination surface, the generic
