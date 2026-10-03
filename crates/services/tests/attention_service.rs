@@ -206,7 +206,7 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
                 .unwrap();
         } else {
             tasks
-                .cancel_execution(&execution.id, "Stop this work".to_owned())
+                .stop_execution(&execution.id, "Stop this work".to_owned())
                 .await
                 .unwrap();
         }
@@ -217,10 +217,18 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
         let annotation: serde_json::Value =
             serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
         assert_eq!(annotation["type"], "manual_stop");
-        assert!(!annotation["recovery_actions"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(annotation.get("recovery_actions").is_none());
+        let offers = tasks
+            .task_action_offers(
+                &task.id,
+                &api_types::Actor::user(api_types::UserActionSource::Test),
+            )
+            .await
+            .unwrap();
+        assert!(offers
+            .available_actions
+            .iter()
+            .any(|offer| offer.action.verb() == "cancel"));
         let run = attention.project_once(100).await.unwrap();
         assert_eq!(
             run.processed_events, run.claimed_events,
@@ -1856,10 +1864,28 @@ async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention
     assert_eq!(attention.0, "execution_failed");
     assert_eq!(attention.1, "open");
     let details: serde_json::Value = serde_json::from_str(&attention.2).unwrap();
+    let task_service =
+        services::TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(32)));
+    let expected = task_service
+        .task_action_offers(&task.id, &api_types::Actor::agent(&identity_id))
+        .await
+        .unwrap()
+        .available_actions;
     assert_eq!(
         details["recovery"]["actions"],
-        serde_json::json!(["reexecute", "cancel_task"])
+        serde_json::to_value(&expected).unwrap()
     );
+    assert_eq!(
+        expected
+            .iter()
+            .map(|offer| offer.action.verb())
+            .collect::<Vec<_>>(),
+        vec!["cancel", "restart"]
+    );
+    assert!(expected.iter().all(|offer| offer
+        .parameters
+        .iter()
+        .any(|parameter| parameter.name == "reason" && parameter.required)));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM domain_event

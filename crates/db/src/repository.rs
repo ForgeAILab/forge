@@ -937,30 +937,17 @@ impl CreateDomainEvent {
             .as_deref()
             .map(parse_event_json_object)
             .unwrap_or_default();
-        let recovery_actions = event_recovery_actions(&annotation);
         let requires_intervention = task_interruption_requires_intervention(
             task.error_annotation.as_deref(),
             task.blocked_json.as_deref(),
             task.failed_json.as_deref(),
         );
         let interruption = if task.failed_json.is_some() {
-            Some(event_interruption_details(
-                "failed",
-                &failed,
-                &recovery_actions,
-            ))
+            Some(event_interruption_details("failed", &failed))
         } else if task.blocked_json.is_some() {
-            Some(event_interruption_details(
-                "blocked",
-                &blocked,
-                &recovery_actions,
-            ))
-        } else if !recovery_actions.is_empty() {
-            Some(event_interruption_details(
-                "annotation",
-                &annotation,
-                &recovery_actions,
-            ))
+            Some(event_interruption_details("blocked", &blocked))
+        } else if task.error_annotation.is_some() {
+            Some(event_interruption_details("annotation", &annotation))
         } else {
             None
         };
@@ -1057,11 +1044,7 @@ impl CreateDomainEvent {
     }
 }
 
-fn event_interruption_details(
-    source: &str,
-    value: &serde_json::Value,
-    recovery_actions: &[String],
-) -> serde_json::Value {
+fn event_interruption_details(source: &str, value: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "source": source,
         "kind": value
@@ -1080,7 +1063,6 @@ fn event_interruption_details(
             .or_else(|| value.get("blocked_execution_id"))
             .and_then(serde_json::Value::as_str)
             .map(|text| interruption_bounded_text(text, 128)),
-        "recovery_actions": recovery_actions,
     })
 }
 
@@ -1099,8 +1081,16 @@ pub fn task_interruption_requires_intervention(
     let annotation = error_annotation
         .map(parse_event_json_object)
         .unwrap_or_default();
-    annotation.get("type").and_then(serde_json::Value::as_str) != Some("manual_stop")
-        && !event_recovery_actions(&annotation).is_empty()
+    annotation
+        .get("type")
+        .cloned()
+        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
+        .is_some_and(|kind| {
+            !matches!(
+                kind,
+                api_types::FailureKind::ManualStop | api_types::FailureKind::Unknown
+            )
+        })
 }
 
 fn parse_event_json_object(raw: &str) -> serde_json::Value {
@@ -1108,18 +1098,6 @@ fn parse_event_json_object(raw: &str) -> serde_json::Value {
         .ok()
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
-}
-
-fn event_recovery_actions(value: &serde_json::Value) -> Vec<String> {
-    value
-        .get("recovery_actions")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .take(16)
-        .map(|text| interruption_bounded_text(text, 128))
-        .collect()
 }
 
 fn interruption_bounded_text(value: &str, max_chars: usize) -> String {
@@ -3100,6 +3078,7 @@ pub struct RestoreQueuedRecovery {
     pub task_id: String,
     pub expected_version: i64,
     pub queued_recovery_id: String,
+    pub failed_json: Option<String>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub updated_at: String,

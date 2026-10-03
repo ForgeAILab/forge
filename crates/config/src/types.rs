@@ -111,6 +111,9 @@ pub struct ForgePaths {
 pub struct ServerConfig {
     #[serde(default)]
     pub max_concurrent_runs: Option<u32>,
+    /// Observation index budget in MiB; unset uses 128, zero disables indexing.
+    #[serde(default)]
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -242,6 +245,7 @@ pub struct ProjectSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
     pub server_max_concurrent_runs: Option<u32>,
+    pub server_usage_index_budget_mb: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -381,6 +385,7 @@ impl ForgeConfig {
             forge: ForgePaths { data_dir },
             server: ServerConfig {
                 max_concurrent_runs: None,
+                usage_index_budget_mb: None,
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,

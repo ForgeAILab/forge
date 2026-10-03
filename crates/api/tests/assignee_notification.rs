@@ -52,8 +52,8 @@ async fn review_rejection_notifies_role_holder_via_event_bus() {
     let rejected: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/reject", task.id),
-        json!({ "version": task.version, "reason": "please revise" }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "action": {"verb":"send_back","guidance":"please revise"},  "version": task.version}),
         StatusCode::OK,
     )
     .await;

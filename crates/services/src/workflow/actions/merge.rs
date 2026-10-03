@@ -359,11 +359,6 @@ fn merge_budget_annotation(reason: &str) -> String {
         "blocking_reason": reason,
         "message": reason,
         "detected_at": db::now_rfc3339(),
-        "recovery_actions": [
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ],
     })
     .to_string()
 }
@@ -793,10 +788,6 @@ fn manual_merge_recovery_annotation(
         artifact: None,
         message: Some(reason.to_owned()),
         hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask,
-        ],
     });
     serde_json::to_string(&annotation).expect("a blocking annotation always serializes")
 }

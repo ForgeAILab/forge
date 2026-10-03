@@ -2329,18 +2329,25 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
         fixture
             .dispatcher
             .task_service
-            .available_recovery_actions(&parked.id)
+            .test_action_values(&parked.id)
             .await
             .unwrap(),
-        vec![api_types::RecoveryAction::RetryHook]
+        vec![
+            api_types::TaskAction::Cancel { reason: None },
+            api_types::TaskAction::retry(),
+            api_types::TaskAction::Approve {
+                override_checks: Some(true),
+                reason: None
+            }
+        ]
     );
 
     let merged = fixture
         .dispatcher
         .task_service
-        .recover_task(
+        .test_apply_action(
             &parked.id,
-            api_types::RecoveryAction::RetryHook,
+            api_types::TaskAction::retry(),
             Some("operator approved direct merge".to_owned()),
             None,
         )
@@ -3146,10 +3153,36 @@ async fn dispatcher_skips_task_when_agent_offline() {
 #[tokio::test]
 async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
     for (action, bind_execution) in [
-        (api_types::RecoveryAction::Reexecute, false),
-        (api_types::RecoveryAction::Reexecute, true),
-        (api_types::RecoveryAction::ResumeSession, true),
-        (api_types::RecoveryAction::OpenInteractive, true),
+        (
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            false,
+        ),
+        (
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            true,
+        ),
+        (
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            true,
+        ),
     ] {
         let db = Arc::new(sqlite_db().await);
         let repo_dir = TempDir::new().expect("repo dir creates");
@@ -3216,9 +3249,9 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let queued = dispatcher
             .task_service
-            .recover_task(
+            .test_apply_action(
                 &task.id,
-                action,
+                action.clone(),
                 Some("operator retry".to_owned()),
                 Some("keep this recovery guidance".to_owned()),
             )
@@ -3228,14 +3261,18 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         assert!(queued.error_annotation.is_none());
         assert!(queued.blocked_json.is_none());
         let intent = deferred_dispatch::queued_recovery(&queued).expect("intent persists");
-        let deferred_dispatch::QueuedRecoveryRequest::Recover(request) = &intent.request else {
-            panic!("recovery request expected")
-        };
-        assert_eq!(request.action, action);
-        assert_eq!(request.reason.as_deref(), Some("operator retry"));
-        assert_eq!(
-            request.context.as_deref(),
-            Some("keep this recovery guidance")
+        let request = &intent.request;
+        let mut expected = action.clone();
+        if let api_types::TaskAction::Retry {
+            reason, guidance, ..
+        } = &mut expected
+        {
+            *reason = Some("operator retry".to_owned());
+            *guidance = Some("keep this recovery guidance".to_owned());
+        }
+        assert_eq!(request.action, expected);
+        assert!(
+            matches!(&request.action, api_types::TaskAction::Retry { guidance: Some(guidance), .. } if guidance == "keep this recovery guidance")
         );
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
             .await
@@ -3284,7 +3321,15 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
             .as_deref()
             .unwrap_or_default()
             .contains("keep this recovery guidance"));
-        if action == api_types::RecoveryAction::ResumeSession {
+        if action
+            == (api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            })
+        {
             assert_eq!(
                 execution.agent_session_id.as_deref(),
                 Some("recovery-session")
@@ -3309,7 +3354,7 @@ async fn seed_capacity_recovery(
     db: &Arc<db::SqliteDb>,
     dispatcher: &TaskDispatcher,
     project_id: &str,
-    action: api_types::RecoveryAction,
+    action: api_types::TaskAction,
 ) -> (db::Task, String, String) {
     let agent_id = seed_agent(db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let busy = seed_task(db, project_id, "occupies capacity", "in_progress", 0).await;
@@ -3317,7 +3362,14 @@ async fn seed_capacity_recovery(
     crate::test_support::set_test_agent_capacity(db, &agent_id, 1).await;
     let task = seed_task(db, project_id, "recover", "in_progress", 0).await;
     assign_role(db, &task.id, "coder", &agent_id).await;
-    let blocked_execution_id = if action == api_types::RecoveryAction::ResumeSession {
+    let blocked_execution_id = if action
+        == (api_types::TaskAction::Retry {
+            reason: None,
+            fresh_session: Some(false),
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+        }) {
         let stopped = seed_cancelled_execution(
             db,
             &task.id,
@@ -3345,7 +3397,7 @@ async fn seed_capacity_recovery(
         .bind(&task.id).execute(db.pool()).await.unwrap();
     let queued = dispatcher
         .task_service
-        .recover_task(&task.id, action, None, None)
+        .test_apply_action(&task.id, action, None, None)
         .await
         .expect("recovery queues");
     (queued, agent_id, busy.id)
@@ -3370,12 +3422,30 @@ async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
         let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let action = match failure {
-            "interactive" => api_types::RecoveryAction::OpenInteractive,
-            "session" | "unassigned_session" => api_types::RecoveryAction::ResumeSession,
-            _ => api_types::RecoveryAction::Reexecute,
+            "interactive" => api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            "session" | "unassigned_session" => api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            _ => api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
         };
         let (queued, agent_id, busy_id) =
-            seed_capacity_recovery(&db, &dispatcher, &project_id, action).await;
+            seed_capacity_recovery(&db, &dispatcher, &project_id, action.clone()).await;
         match failure {
             "deleted" => {
                 AgentRepo::archive(&*db, &agent_id, &now_rfc3339())
@@ -3445,6 +3515,24 @@ async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
             .await
             .unwrap()
             .unwrap();
+        if matches!(failure, "paused" | "offline") {
+            assert!(!dispatcher
+                .task_service
+                .dispatch_queued_recovery(&latest)
+                .await
+                .unwrap());
+            let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                waiting.version, latest.version,
+                "transient waits do not rewrite the Task"
+            );
+            assert!(deferred_dispatch::queued_recovery(&waiting).is_some());
+            assert!(rx.try_recv().is_err());
+            continue;
+        }
         let error = dispatcher
             .task_service
             .dispatch_queued_recovery(&latest)
@@ -3468,12 +3556,24 @@ async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
             serde_json::from_str(restored.blocked_json.as_deref().unwrap()).unwrap();
         assert_eq!(blocked["blocked_by"], "original-owner");
         assert_eq!(blocked["reason"], error.to_string());
-        assert!(dispatcher
+        let offers = dispatcher
             .task_service
-            .available_recovery_actions(&queued.id)
+            .task_action_offers(
+                &queued.id,
+                &api_types::Actor::user(api_types::UserActionSource::Test),
+            )
             .await
-            .unwrap()
-            .contains(&action));
+            .unwrap();
+        assert!(offers
+            .available_actions
+            .iter()
+            .any(|offer| offer.action.verb() != "cancel"));
+        if failure == "deleted" {
+            assert!(!offers
+                .available_actions
+                .iter()
+                .any(|offer| offer.action.verb() == "retry"));
+        }
         assert!(!dispatcher
             .task_service
             .dispatch_queued_recovery(&restored)
@@ -3484,7 +3584,7 @@ async fn recovery_on_full_agent_restores_blocker_on_permanent_replay_error() {
             assign_role(&db, &queued.id, "coder", &agent_id).await;
             let requeued = dispatcher
                 .task_service
-                .recover_task(&queued.id, action, None, None)
+                .test_apply_action(&queued.id, action, None, None)
                 .await
                 .expect("restored blocker can be recovered after reassignment");
             assert!(deferred_dispatch::queued_recovery(&requeued).is_some());
@@ -3538,9 +3638,15 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
         let queued = dispatcher
             .task_service
-            .perform_task_action(
+            .test_apply_intent(
                 &task.id,
-                api_types::TaskAction::Resume,
+                api_types::TaskAction::Retry {
+                    reason: Some("resume guidance".to_owned()),
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: Some("resume guidance".to_owned()),
+                },
                 Some("resume guidance".to_owned()),
                 Some(current.version),
             )
@@ -3555,18 +3661,26 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
             .await
             .unwrap()
             .unwrap();
-        let repeated = dispatcher
+        let error = dispatcher
             .task_service
             .perform_task_action(
                 &task.id,
-                api_types::TaskAction::Resume,
-                Some("resume guidance".to_owned()),
-                Some(paused_task.version),
+                api_types::TaskAction::retry(),
+                paused_task.version,
             )
             .await
-            .expect("repeating a queued Resume is a no-op while the Project is paused")
-            .task;
-        assert_eq!(repeated, paused_task);
+            .expect_err("the pending intent is not replaced by a second command");
+        assert!(matches!(
+            error,
+            crate::ServiceError::TaskActionUnavailable { .. }
+        ));
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap(),
+            paused_task
+        );
         ProjectRepo::set_paused_at(&*db, &project_id, None)
             .await
             .unwrap();
@@ -3679,21 +3793,37 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
     .await
     .expect("interruption persists");
     let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    for (action, message) in [
+    for (action, _message) in [
         (
-            api_types::RecoveryAction::ResumeSession,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             "no resumable session",
         ),
-        (api_types::RecoveryAction::RetryHook, "not allowed"),
+        (
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
+            "not offered",
+        ),
     ] {
         let error = dispatcher
             .task_service
-            .recover_task(&task.id, action, None, None)
+            .test_apply_action(&task.id, action, None, None)
             .await
             .expect_err("invalid recovery is refused even at capacity");
-        assert!(
-            matches!(error, crate::ServiceError::InvalidOperation { message: ref actual } if actual.contains(message))
-        );
+        assert!(matches!(
+            error,
+            crate::ServiceError::TaskActionUnavailable { .. }
+        ));
         let current = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -3709,10 +3839,24 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
         .expect("agent pauses");
     let error = dispatcher
         .task_service
-        .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+        .test_apply_action(
+            &task.id,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            None,
+            None,
+        )
         .await
         .expect_err("paused agent is refused even at capacity");
-    assert!(matches!(error, crate::ServiceError::AgentPaused { .. }));
+    assert!(matches!(
+        error,
+        crate::ServiceError::TaskActionUnavailable { .. }
+    ));
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -3735,12 +3879,24 @@ async fn recovery_on_full_agent_keeps_non_capacity_refusals() {
         .unwrap();
     let error = dispatcher
         .task_service
-        .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+        .test_apply_action(
+            &task.id,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            None,
+            None,
+        )
         .await
         .expect_err("offline agent is refused even at capacity");
-    assert!(
-        matches!(error, crate::ServiceError::InvalidOperation { ref message } if message.contains("offline"))
-    );
+    assert!(matches!(
+        error,
+        crate::ServiceError::TaskActionUnavailable { .. }
+    ));
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .unwrap()
@@ -5836,11 +5992,18 @@ async fn dispatcher_blocks_task_whose_failed_execution_was_never_recorded() {
                 .expect("annotation parses");
         assert_eq!(annotation["type"], "executor_failed", "{status}");
         assert_eq!(annotation["blocked_execution_id"], execution_id.as_str());
-        assert!(annotation["recovery_actions"]
-            .as_array()
-            .expect("recovery actions")
+        assert!(annotation.get("recovery_actions").is_none());
+        assert!(dispatcher
+            .task_service
+            .task_action_offers(
+                &healed.id,
+                &api_types::Actor::user(api_types::UserActionSource::Test)
+            )
+            .await
+            .unwrap()
+            .available_actions
             .iter()
-            .any(|action| action == "reexecute"));
+            .any(|offer| offer.action.verb() == "retry"));
         assert!(healed.blocked_json.is_some());
         assert_eq!(healed.status, status);
         assert!(rx.try_recv().is_err(), "no replacement run is launched");
@@ -7264,9 +7427,15 @@ async fn dispatcher_owner_reexecute_resumes_over_project_limit() {
 
     let recovered = dispatcher
         .task_service
-        .recover_task(
+        .test_apply_action(
             &parked.id,
-            api_types::RecoveryAction::Reexecute,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(true),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
             Some("host is ready".to_owned()),
             None,
         )
@@ -7937,7 +8106,13 @@ async fn machine_capacity_active_waiter_is_parked_at_final_version() {
 }
 #[tokio::test]
 async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
-    let action = api_types::RecoveryAction::Reexecute;
+    let action = api_types::TaskAction::Retry {
+        reason: Some("operator retry".to_owned()),
+        fresh_session: Some(true),
+        refresh_workspace: None,
+        reset_budget: None,
+        guidance: None,
+    };
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
@@ -7965,7 +8140,7 @@ async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
         "type": "recovery_required",
         "blocking_reason": "crash_recovery",
         "blocked_execution_id": serde_json::Value::Null,
-        "recovery_actions": [action],
+        "recovery_actions": ["reexecute"],
     });
     let _ = stopped;
     let task = TaskRepo::update(
@@ -7996,9 +8171,10 @@ async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
     let mut events = dispatcher.event_bus.subscribe();
     let queued = dispatcher
         .task_service
-        .recover_task(&task.id, action, Some("operator retry".to_owned()), None)
+        .perform_task_action(&task.id, action, task.version)
         .await
-        .unwrap();
+        .unwrap()
+        .task;
     let marker = deferred_dispatch::queued_recovery(&queued).unwrap();
     while events.try_recv().is_ok() {}
     for _ in 0..4 {
@@ -8059,7 +8235,7 @@ async fn machine_capacity_interrupted_task(
         "type": "recovery_required",
         "blocking_reason": "crash_recovery",
         "blocked_execution_id": serde_json::Value::Null,
-        "recovery_actions": [api_types::RecoveryAction::Reexecute],
+        "recovery_actions": ["reexecute"],
     });
     TaskRepo::update(
         db,
@@ -8095,7 +8271,13 @@ async fn machine_capacity_task(db: &db::SqliteDb, task_id: &str) -> Task {
 
 #[tokio::test]
 async fn machine_capacity_queued_recovery_lost_race_is_quiet() {
-    let action = api_types::RecoveryAction::Reexecute;
+    let action = api_types::TaskAction::Retry {
+        reason: Some("operator retry".to_owned()),
+        fresh_session: Some(true),
+        refresh_workspace: None,
+        reset_budget: None,
+        guidance: None,
+    };
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().unwrap();
     let workspace_dir = TempDir::new().unwrap();
@@ -8113,9 +8295,10 @@ async fn machine_capacity_queued_recovery_lost_race_is_quiet() {
     let mut events = dispatcher.event_bus.subscribe();
     let queued = dispatcher
         .task_service
-        .recover_task(&task.id, action, Some("operator retry".to_owned()), None)
+        .perform_task_action(&task.id, action, task.version)
         .await
-        .unwrap();
+        .unwrap()
+        .task;
     let marker = deferred_dispatch::queued_recovery(&queued).unwrap();
 
     while events.try_recv().is_ok() {}

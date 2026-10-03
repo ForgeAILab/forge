@@ -351,7 +351,7 @@ impl TaskService {
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
         self.workflow_engine()
-            .reset_to_initial_with_authority(
+            .restart_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,
@@ -463,7 +463,7 @@ impl TaskService {
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
         self.workflow_engine()
-            .reset_to_initial_with_authority(
+            .restart_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,

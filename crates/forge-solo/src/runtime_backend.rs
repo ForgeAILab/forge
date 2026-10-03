@@ -566,7 +566,7 @@ impl SoloBackend for RuntimeBackend {
                             task_id: request.task_id.clone(),
                             expected_task_version: request.expected_version,
                             decision,
-                            reason: None,
+                            reason: request.guidance,
                         })
                         .await
                         .map_err(map_service_error)?;
@@ -1124,10 +1124,14 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
                 .unwrap_or_else(|| "blocked".to_owned()),
             headline: "Task blocked".to_owned(),
             detail,
-            retryable: !interruption.recovery_actions.is_empty(),
+            retryable: task
+                .available_actions
+                .iter()
+                .any(|offer| matches!(offer.action.verb(), "retry" | "restart" | "send_back")),
         })
     });
     TaskSnapshot {
+        review_actions: task.available_actions.clone(),
         id: task.id.clone(),
         title: task.title.clone(),
         state: task_state(&task.status),
@@ -1137,12 +1141,10 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
         checks,
         commit,
         blocker,
-        retryable: task.available_actions.iter().any(|action| {
-            matches!(
-                action,
-                services::solo_session::SoloTaskAction::RequestChanges
-            )
-        }),
+        retryable: task
+            .available_actions
+            .iter()
+            .any(|action| matches!(action.action, api_types::TaskAction::SendBack { .. })),
     }
 }
 

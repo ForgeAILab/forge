@@ -47,6 +47,10 @@ pub struct DaemonWorkspaceClient {
 }
 
 impl DaemonWorkspaceClient {
+    pub(crate) fn registry(&self) -> &DaemonConnectionRegistry {
+        &self.registry
+    }
+
     pub async fn machine_probe(
         &self,
         daemon_id: &str,

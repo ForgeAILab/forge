@@ -43,9 +43,9 @@ use forge_agent_host::{
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
     TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -113,32 +113,6 @@ struct AdaptiveTaskChildPayload {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TaskReviewPayload {
-    task_id: String,
-    decision: TaskReviewDecision,
-    expected_task_version: i64,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TaskReviewDecision {
-    Accept,
-    Reject,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-enum TaskCancelPayload {
-    Cancel {
-        task_id: String,
-        expected_task_version: i64,
-        reason: String,
-    },
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum TaskDependencyPayload {
     Add {
@@ -176,18 +150,6 @@ impl TaskDependencyPayload {
                 TaskDependencyAction::Remove,
                 rationale,
             ),
-        }
-    }
-}
-
-impl TaskCancelPayload {
-    fn into_parts(self) -> (String, i64, String) {
-        match self {
-            Self::Cancel {
-                task_id,
-                expected_task_version,
-                reason,
-            } => (task_id, expected_task_version, reason),
         }
     }
 }
@@ -355,7 +317,7 @@ impl CoordinationToolProvider {
             let mut cause = row.denied_by.parse::<DeniedBy>().ok();
             let holds = match cause.as_ref() {
                 Some(DeniedBy::OperationNotInScope) => true,
-                Some(DeniedBy::ProjectPaused(_)) if row.operation != TASK_RECOVER_OPERATION => {
+                Some(DeniedBy::ProjectPaused(_)) => {
                     let scope = CanonicalScope {
                         scope_type: CanonicalScopeType::AgentChat,
                         scope_id: chat_id.to_owned(),
@@ -540,6 +502,22 @@ impl CoordinationToolProvider {
                 result.insert(column.to_owned(), Value::String(value));
             } else if let Ok(value) = row.try_get::<i64, _>(column) {
                 result.insert(column.to_owned(), Value::Number(value.into()));
+            }
+        }
+        if scope.scope_type == CanonicalScopeType::Task {
+            if let Some(service) = self.task_service_handle() {
+                let offers = service
+                    .task_action_offers(
+                        &scope.scope_id,
+                        &api_types::Actor::agent(actor_identity_id),
+                    )
+                    .await
+                    .map_err(service_error)?;
+                result.insert(
+                    "available_actions".to_owned(),
+                    json!(offers.available_actions),
+                );
+                result.insert("version".to_owned(), json!(offers.version));
             }
         }
         result.insert(
@@ -2474,6 +2452,16 @@ impl CoordinationToolProvider {
                 );
             }
         }
+        let mut offers_by_task = std::collections::HashMap::new();
+        if let Some(service) = self.task_service_handle() {
+            for id in &ids {
+                let offers = service
+                    .task_action_offers(id, &api_types::Actor::agent(actor_identity_id))
+                    .await
+                    .map_err(service_error)?;
+                offers_by_task.insert(id.clone(), offers.available_actions);
+            }
+        }
         let items = rows
             .into_iter()
             .map(|row| {
@@ -2508,6 +2496,7 @@ impl CoordinationToolProvider {
                     "error": error,
                     "failed": failed,
                     "depends_on": depends_on,
+                    "available_actions": offers_by_task.remove(&id).unwrap_or_default(),
                     "latest_execution": latest_executions.remove(&id).unwrap_or(Value::Null),
                 })
             })
@@ -3048,135 +3037,29 @@ impl CoordinationToolProvider {
         causation_id: Option<String>,
         causation_depth: i64,
     ) -> Result<Value, AgentHostError> {
-        if operation == TASK_REVIEW_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Task review execution is not wired to a TaskService".to_owned(),
-                ));
-            };
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "Task review command has no server-derived Project target".to_owned(),
-                )
+        if operation == TASK_ACTION_OPERATION {
+            let task_service = self.task_service_handle().ok_or_else(|| {
+                AgentHostError::Configuration("Task actions are not wired".to_owned())
             })?;
-            let payload: TaskReviewPayload =
-                typed_command_payload(operation, scope, &correlation_id, payload)?;
-            let (policy_result, policy_reason) = self
-                .actions
-                .evaluate_direct_command_policy(
-                    actor_identity_id,
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    requested_permission,
-                    operation,
-                    None,
-                )
-                .await
-                .map_err(service_error)?;
-            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
-                // The evaluator's reason is the only thing that says which
-                // ceiling refused this. Dropping it left an opaque
-                // `policy_denied` that no operator or Agent could act on.
-                tracing::warn!(
-                    operation,
-                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
-                    "task review command policy denied"
-                );
-                return Err(AgentHostError::Authority(
-                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
-                ));
-            }
-            let result = task_service
-                .perform_project_agent_review(
-                    &project_id,
-                    payload.task_id,
-                    matches!(payload.decision, TaskReviewDecision::Accept),
-                    payload.reason,
-                    payload.expected_task_version,
-                    actor_identity_id,
-                )
-                .await
-                .map_err(service_error)?;
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": false,
-                "materialized": true,
-                "domain_committed": true,
-                "correlation_id": correlation_id,
-                "task_id": result.task.id,
-                "task_status": result.task.status,
-                "decision": match result.action {
-                    api_types::TaskAction::Approve => "accept",
-                    _ => "reject",
-                },
-                "requires_user_authorization": false,
-            }));
-        }
-
-        if operation == TASK_RECOVER_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Task recovery execution is not wired to a TaskService".to_owned(),
-                ));
-            };
             let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "Task recovery command has no server-derived Project target".to_owned(),
-                )
+                AgentHostError::Authority("Task action has no canonical Project".to_owned())
             })?;
             let task_id = payload
                 .get("task_id")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
                 .ok_or_else(|| invalid_arguments("task_id is required".to_owned()))?;
-            let reason = payload
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+            let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
+                .await
+                .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+                .filter(|task| task.project_id == project_id)
                 .ok_or_else(|| {
-                    invalid_arguments(
-                        "state what stopped this Task before recovering it".to_owned(),
-                    )
-                })?
-                .to_owned();
-            let action = match payload.get("action").and_then(Value::as_str) {
-                Some("resume_session") => api_types::RecoveryAction::ResumeSession,
-                Some("reexecute") => api_types::RecoveryAction::Reexecute,
-                Some("reset_to_initial") => api_types::RecoveryAction::ResetToInitial,
-                Some("reset_retry_window") => api_types::RecoveryAction::ResetRetryWindow,
-                Some("cancel_task") => api_types::RecoveryAction::CancelTask,
-                _ => {
-                    return Err(invalid_arguments(
-                        "action must be resume_session, reexecute, reset_to_initial, \
-                         reset_retry_window, or cancel_task"
-                            .to_owned(),
-                    ));
-                }
-            };
-            // The Task must belong to the bound Project: recovery is repair
-            // authority over this Project's work, never a handle on another's.
-            let owns_task: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM task WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+                    invalid_arguments("task_id must name a Task in this Project".to_owned())
+                })?;
+            let request: api_types::TaskActionRequest = serde_json::from_value(
+                json!({ "action": payload.get("action"), "version": payload.get("version") }),
             )
-            .bind(&task_id)
-            .bind(&project_id)
-            .fetch_optional(self.db.pool())
-            .await
-            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-            if owns_task.is_none() {
-                // A task_id that resolves to nothing in this Project is a
-                // mistyped or stale argument, not a refused authority. Raising
-                // it as Authority rendered a non-retryable `policy_denied`
-                // telling the Agent to seek reauthorization, so a single
-                // transposed character in a UUID read as "recovery is denied
-                // to your scope" and stalled the Project on a false blocker.
-                return Err(invalid_arguments(
-                    "task_id must name a Task in this Project".to_owned(),
-                ));
-            }
-            let (policy_result, policy_reason) = self
+            .map_err(|error| invalid_arguments(error.to_string()))?;
+            let (policy, reason) = self
                 .actions
                 .evaluate_direct_command_policy(
                     actor_identity_id,
@@ -3188,94 +3071,27 @@ impl CoordinationToolProvider {
                 )
                 .await
                 .map_err(service_error)?;
-            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
-                // The evaluator's reason is the only thing that says which
-                // ceiling refused this. Dropping it left an opaque
-                // `policy_denied` that no operator or Agent could act on.
-                tracing::warn!(
-                    operation,
-                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
-                    "task recovery command policy denied"
-                );
+            if !matches!(policy, AgentActionPolicyResult::Allowed) {
                 return Err(AgentHostError::Authority(
-                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
-                ));
-            }
-            let task = task_service
-                .recover_task(task_id, action, Some(reason), None)
-                .await
-                .map_err(service_error)?;
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": false,
-                "materialized": true,
-                "domain_committed": true,
-                "correlation_id": correlation_id,
-                "task_id": task.id,
-                "task_status": task.status,
-                "requires_user_authorization": false,
-            }));
-        }
-
-        if operation == TASK_CANCEL_OPERATION {
-            let Some(task_service) = self.task_service_handle() else {
-                return Err(AgentHostError::Configuration(
-                    "Task cancellation execution is not wired to a TaskService".to_owned(),
-                ));
-            };
-            let project_id = target_id.ok_or_else(|| {
-                AgentHostError::Authority(
-                    "Task cancellation command has no server-derived Project target".to_owned(),
-                )
-            })?;
-            let payload: TaskCancelPayload =
-                typed_command_payload(operation, scope, &correlation_id, payload)?;
-            let (task_id, expected_task_version, reason) = payload.into_parts();
-            let (policy_result, policy_reason) = self
-                .actions
-                .evaluate_direct_command_policy(
-                    actor_identity_id,
-                    scope_type_name(scope.scope_type),
-                    &scope.scope_id,
-                    requested_permission,
-                    operation,
-                    None,
-                )
-                .await
-                .map_err(service_error)?;
-            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
-                tracing::warn!(
-                    operation,
-                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
-                    "Task cancellation command policy denied"
-                );
-                return Err(AgentHostError::Authority(
-                    policy_reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
+                    reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
             let result = task_service
-                .perform_project_agent_cancel(
-                    &project_id,
-                    task_id,
-                    reason,
-                    expected_task_version,
-                    actor_identity_id,
+                .perform_task_action_as(
+                    task.id,
+                    request.action,
+                    request.version,
+                    api_types::Actor::agent(actor_identity_id),
                 )
                 .await
                 .map_err(service_error)?;
-            return Ok(json!({
-                "operation": operation,
-                "status": "succeeded",
-                "replayed": false,
-                "materialized": true,
-                "domain_committed": true,
-                "correlation_id": correlation_id,
-                "task_id": result.task.id,
-                "task_status": result.task.status,
-                "task_version": result.task.version,
-                "requires_user_authorization": false,
-            }));
+            let offers = task_service
+                .task_action_offers(&result.task.id, &api_types::Actor::agent(actor_identity_id))
+                .await
+                .map_err(service_error)?;
+            return Ok(
+                json!({ "operation": operation, "status": "succeeded", "replayed": false, "materialized": true, "domain_committed": true, "correlation_id": correlation_id, "task_id": result.task.id, "task_status": result.task.status, "task_version": result.task.version, "available_actions": offers.available_actions, "requires_user_authorization": false }),
+            );
         }
 
         if operation == TASK_DEPENDENCY_OPERATION {
@@ -4873,7 +4689,8 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
     if let Some(version) = current.version {
         let field = match operation {
             _ if current.resource_type == "project" => "expected_project_version",
-            TASK_CANCEL_OPERATION | TASK_ADAPTIVE_OPERATION => "expected_task_version",
+            TASK_ADAPTIVE_OPERATION => "expected_task_version",
+            TASK_ACTION_OPERATION => "version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
@@ -5168,20 +4985,12 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
             )
         })?;
     }
-    if operation == TASK_REVIEW_OPERATION {
-        serde_json::from_value::<TaskReviewPayload>(payload.clone()).map_err(|_| {
-            AgentHostError::Authority(
-                "Task review payload must contain an exact task, version, and accept/reject decision"
-                    .to_owned(),
-            )
-        })?;
-    }
-    if operation == TASK_CANCEL_OPERATION {
-        serde_json::from_value::<TaskCancelPayload>(payload.clone()).map_err(|_| {
-            AgentHostError::Authority(
-                "Task cancellation payload must contain cancel, an exact Task version, and a non-empty reason"
-                    .to_owned(),
-            )
+    if operation == TASK_ACTION_OPERATION {
+        serde_json::from_value::<api_types::TaskActionRequest>(
+            json!({ "action": payload.get("action"), "version": payload.get("version") }),
+        )
+        .map_err(|_| {
+            invalid_arguments("Task action requires a closed verb and exact version".to_owned())
         })?;
     }
     if operation == TASK_DEPENDENCY_OPERATION {
@@ -5356,6 +5165,34 @@ fn invalid_arguments(message: String) -> AgentHostError {
 fn service_error(error: crate::ServiceError) -> AgentHostError {
     if let crate::ServiceError::TurnFailure { error, .. } = error {
         return service_error(*error);
+    }
+    if let crate::ServiceError::TaskActionUnavailable {
+        available_actions,
+        reason,
+        wait_cause,
+    } = &error
+    {
+        let mut outcome = if let Some(cause) = wait_cause {
+            OrchestrationOutcome::terminal_denial(
+                "task.action",
+                OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+                "",
+                cause.clone(),
+            )
+        } else {
+            OrchestrationOutcome::failed(
+                OutcomeCode::ActionUnavailable,
+                "task.action",
+                OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+                "",
+                reason.clone(),
+            )
+        };
+        outcome.details = Some(json!({ "available_actions": available_actions }));
+        if wait_cause.is_none() {
+            outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        }
+        return AgentHostError::StructuredOutcome(Box::new(outcome));
     }
     let target_refusal = match &error {
         crate::ServiceError::PlacementUnavailable(error) if error.needs_daemon_upgrade() => {
@@ -6921,7 +6758,7 @@ mod tests {
             .structured_boundary_error(
                 "own-identity",
                 &scope,
-                TASK_RECOVER_OPERATION,
+                TASK_ACTION_OPERATION,
                 &json!({}),
                 service_error(crate::ServiceError::AuthorizationDenied {
                     message: reason.to_owned(),
@@ -7040,14 +6877,14 @@ mod tests {
         // change cannot silently turn a capability denial into an unknown one.
         for (operation, permission, paused, permissions, expected) in [
             (
-                "task.recover",
+                "task.action",
                 "propose_task",
                 false,
                 r#"{"permissions":[]}"#,
                 DeniedBy::PermissionMissing("propose_task".to_owned()),
             ),
             (
-                "task.recover",
+                "task.action",
                 "propose_task",
                 true,
                 r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
@@ -7082,7 +6919,7 @@ mod tests {
                 DeniedBy::ReadBoundaryRequired,
             ),
             (
-                "task.recover",
+                "task.action",
                 "read_project",
                 false,
                 r#"{"permissions":["read_project","propose_task","propose_project"]}"#,
@@ -7367,7 +7204,7 @@ mod tests {
             .structured_boundary_error(
                 &fixture.agent_id,
                 &scope,
-                TASK_RECOVER_OPERATION,
+                TASK_ACTION_OPERATION,
                 &json!({}),
                 service_error(refusal),
             )
@@ -7473,21 +7310,17 @@ mod tests {
 
     #[test]
     fn argument_shape_rejections_are_correctable_validation_outcomes() {
-        // A Project Agent that sends `task.recover` with an unknown action
+        // A Project Agent that sends `task.action` with an unknown action
         // must learn which field to fix; an opaque internal failure leaves it
         // retrying the same shape or abandoning a repair its doctrine requires.
-        let error = invalid_arguments(
-            "action must be resume_session, reexecute, reset_to_initial, reset_retry_window, \
-             or cancel_task"
-                .to_owned(),
-        );
+        let error = invalid_arguments("action must use a current closed Task verb".to_owned());
         match error {
             AgentHostError::StructuredOutcome(outcome) => {
                 assert_eq!(outcome.code, OutcomeCode::ValidationError);
                 assert_eq!(outcome.status, OutcomeStatus::Failed);
                 assert!(outcome
                     .safe_message
-                    .contains("action must be resume_session"));
+                    .contains("action must use a current closed Task verb"));
                 assert_eq!(
                     outcome.retry.as_ref().map(|retry| retry.action),
                     Some(RetryAction::CorrectInput)

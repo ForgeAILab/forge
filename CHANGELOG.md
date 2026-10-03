@@ -8,6 +8,86 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Task actions are now eight verbs served from server offers.** Every Task
+  mutation that recovers, pauses, resumes, approves or cancels work goes
+  through `GET /api/v1/tasks/{id}/actions`, which returns
+  `{available_actions: Offer[], version}`, and `POST /api/v1/tasks/{id}/actions`
+  with `{action, version}`, which returns `TaskResponse`. The verbs are
+  `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart` and
+  `cancel`. Only offered actions are accepted: anything else returns HTTP 409
+  `action_unavailable` with the current offers; a stale `version` is still a
+  version conflict, a missing `version` is 422, unknown fields are rejected,
+  and blank required input is 400.
+  - Each offer carries its `authority`, a stable `reason`, a `label`, an
+    optional `target_execution_id`, `propagates` (cancellation reaches
+    subtasks), and parameter descriptors (`required`, accepted
+    `boolean_values`, optional `required_when`). Parameters an offer fixes are
+    filled in when omitted and refused when contradicted; in particular an
+    omitted `override` on `approve` takes the offer's value, which can be
+    `true`.
+  - Override approvals and one-shot retries need a typed `reason`; Project
+    Agent recovery and cancellation need one too. `send_back` needs nonblank
+    `guidance` and supplies no default.
+  - A refused `start`, `retry` or `release` caused by a paused Agent or a
+    paused Project returns 409 `action_unavailable` (MCP `-32010`) with the
+    cause in `details.denied_by` (`target_agent_paused` or
+    `project_paused(<reason>)`) and `details.retry.scope: "turn"`; native
+    tools return the same cause as a policy denial.
+  - Single-Task responses carry the caller's offers in `available_actions`
+    and `workflow_exception.actions`. REST and MCP list rows carry no offers;
+    load them per Task. `TaskResponse.execution_actions`, `recovery_actions`
+    in error annotations and `task.interruption_changed` events, and
+    `disabled_reason` are removed. Attention `recovery.actions` holds offers.
+  - Error codes: `task_action.unavailable` becomes `action_unavailable`;
+    `task.actions_changed` is removed, and Task actions no longer return
+    `task.terminal` (launch and follow-up still can). Stored actor sources
+    change from `user:recovery:*` to `user:action:*`, and transition triggers
+    gain `restart` and `retry`. Stored historical payloads are kept as
+    evidence; no user data is rewritten.
+
+  | Old operation | New action |
+  | --- | --- |
+  | `resume_session` | `retry {fresh_session:false, guidance?, reason?}` |
+  | `reexecute` | `retry {fresh_session:true, guidance?, reason?}` |
+  | `reset_to_initial` | `restart {reason?}` |
+  | `cancel_task` | `cancel {reason?}` |
+  | `mark_reviewed` | `approve {override:true, reason}` |
+  | `defer_to_follow_up` | `approve {override:false, reason}` on the owner-finding offer |
+  | `retry_hook` | the offered `retry` (check, review or merge) |
+  | `resume_process` | review `send_back {guidance}` or the offered merge `retry` |
+  | `update_workspace_and_retry_hook` | `retry {refresh_workspace:true}` |
+  | `skip_hook_once` | entry-check `approve {override:true, reason}` |
+  | `reset_retry_window` | `retry {reset_budget:true, reason?}` |
+  | `proceed_once` | `retry {reset_budget:false, reason}` |
+  | Task `pause` / `resume` | `hold {reason?}` / `release {reason?}` or the offered `retry` |
+  | Task `submit`, `approve` | `approve {override:false, reason?}` |
+  | Task `request_changes` | `send_back {guidance}` |
+  | Execution `re_execute` | Task `retry {fresh_session:true}` |
+  | Execution `stop_execution` | `POST /api/v1/executions/{id}/stop` |
+
+  | Removed route (`T` = `/api/v1/tasks/{id}`, `E` = `/api/v1/executions/{id}`) | Use |
+  | --- | --- |
+  | `T/start`, `T/pause`, `T/resume`, `T/submit`, `T/request-changes`, `T/approve`, `T/cancel`, `T/recover` | `T/actions` with the matching offer |
+  | `T/advance` | owner `approve {override:true, reason}` next-state offer |
+  | `T/gates/{state}/approve`, `T/gates/{state}/reject` | offered `approve` / `send_back {guidance}` |
+  | `T/review`, `T/review/approve`, `T/review/reject` | review `retry` / `approve` / `send_back {guidance}` |
+  | `E/re-execute` | Task `retry {fresh_session:true}` |
+  | `E/cancel` | `E/stop` for one execution or side session (returns `ExecutionResponse`); Task `hold` for workflow work |
+
+  `T/launch` and `E/follow-up` remain.
+- MCP `forge_cancel_task` becomes `forge_task_action`. Native
+  `task.recover`, `task.cancel` and `task.review` become `task.action`, which
+  takes `task_id`, an action object and `version` (reasons and guidance live
+  in the action object); the native envelope's `reason` / `decision` fields
+  are removed. MCP Task pages use `items`.
+- `forge-ctl task cancel` is removed; use `forge-ctl task actions <id>` and
+  `forge-ctl task action <id> <verb> [flags]`. An `action_unavailable`
+  refusal prints the current offers and exits with code 3.
+- The Project Agent's operating doctrine moves to
+  `forge.project.orchestration/v1@19` (migration V202610030100), which
+  describes the action contract and reads live offers through
+  `forge_scope_read` `work.read`. Earlier revisions and frozen admissions are
+  unchanged.
 - `POST /api/v1/projects/{id}/environment/recheck` accepts an optional
   `machine` (`server` or a daemon runtime id) and returns
   `{ machines: [{ machine, checks, error }], project }`; it used to return
@@ -198,6 +278,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   every other hook.
 
 ### Changed
+
+- The web app renders every Task action from server offers: forms show
+  required reasons and guidance, explain fixed parameters and subtask
+  cancellation, and refresh after a conflict. Row and bulk actions load
+  offers on demand, and bulk cancel skips children a root cancellation
+  already covers. Each running role execution and side session has its own
+  Stop control. Solo collects typed review guidance and required reasons.
+- Hold is offered while work waits to be dispatched (a queued action, or a
+  wait such as a paused Agent or Project). Releasing a Task that no Agent can
+  take yet returns it to the dispatch queue instead of launching it.
 
 - An administrator can clear an Agent's machine pin by sending
   `daemon_id: null` in the Agent update, or with "Clear pin" on the Agent
@@ -410,9 +500,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   rows added or changed since the previous read, so warm reads no longer grow
   with the size of the ledger. A page of Agents loads usage, execution
   statistics, assignments and effective status in a few batched queries
-  instead of several per Agent. The index keeps up to about 41,000 usage
-  events (128 MiB) per server process; a larger ledger falls back to a
-  memoized full read. A new migration adds change markers for the index
+  instead of several per Agent. By default the index keeps up to about
+  41,000 usage events (128 MiB) per server process; a larger ledger falls
+  back to a memoized full read. The budget is `server.usage_index_budget_mb`
+  (config file, `FORGE_SERVER_USAGE_INDEX_BUDGET_MB`,
+  `forge --usage-index-budget-mb N`, the Settings API and the Forge Settings
+  page; `0` turns the index off). A change applies on the next usage read,
+  and the Operations page shows the index size, the budget and whether reads
+  use the fallback. A new migration adds change markers for the index
   (`usage_ledger_revision` and changed-row tables); ledger rows are unchanged.
 - A paused Agent reports no runnable machines (`runnable_on.count` 0) and no
   longer runs a CLI availability probe when an Agent list is loaded.

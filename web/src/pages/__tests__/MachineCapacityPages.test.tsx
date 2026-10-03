@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({ saveSettings: vi.fn(), saveLimit: vi.fn(), adm
 vi.mock('@/api/hooks', () => ({
   useSettingsQuery: vi.fn().mockReturnValue({ data: { config_path: '/forge.yaml', restart_required: false, settings: [
     { key: 'server.bind', value: '127.0.0.1:8080', effective_value: '127.0.0.1:8080', restart_required: false },
+    { key: 'server.usage_index_budget_mb', value: null, effective_value: 128, restart_required: false },
     { key: 'server.max_concurrent_runs', value: null, effective_value: 4, restart_required: false },
   ] }, isLoading: false }),
   useUpdateSettings: () => ({ mutate: mocks.saveSettings, isPending: false }),
@@ -57,5 +58,26 @@ describe('machine capacity settings', () => {
     render(<MachineRunCapacity daemon={daemon} />)
     expect(screen.getByText('Admin limit: 2')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Save limit' })).toBeNull()
+  })
+})
+
+describe('usage index budget setting', () => {
+  it('saves an explicit MiB budget, zero, and a default reset', () => {
+    render(<ForgeSettingsPage />)
+    expect(screen.getByText('In effect: 128 MiB')).toBeTruthy()
+    const input = screen.getByLabelText('Usage index memory budget')
+    for (const value of ['64', '0', '']) {
+      fireEvent.change(input, { target: { value } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      expect(mocks.saveSettings.mock.calls.at(-1)?.[0].server.usage_index_budget_mb).toBe(value === '' ? null : Number(value))
+    }
+  })
+  it('rejects invalid budgets without saving', () => {
+    render(<ForgeSettingsPage />)
+    for (const value of ['-1', '1.5', '4294967296']) {
+      fireEvent.change(screen.getByLabelText('Usage index memory budget'), { target: { value } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    }
+    expect(mocks.saveSettings).not.toHaveBeenCalled()
   })
 })

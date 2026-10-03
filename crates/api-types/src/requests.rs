@@ -7,8 +7,7 @@ use crate::{
     LifecycleEvent,
 };
 use crate::{
-    InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
-    TaskType,
+    InitialRoleAssignment, ReviewConfig, TaskAction, TaskGovernanceRequest, TaskStatus, TaskType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,32 +117,11 @@ pub enum TransitionSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct RecoverTaskRequest {
-    /// Applied immediately, or queued for dispatch when agent capacity is full.
-    pub action: RecoveryAction,
-    pub reason: Option<String>,
-    pub context: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct TaskActionRequest {
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub version: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApproveGateRequest {
-    pub reason: Option<String>,
-    pub version: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectGateRequest {
-    pub reason: String,
+    pub action: TaskAction,
+    #[ts(type = "number")]
     pub version: i64,
 }
 
@@ -238,4 +216,14 @@ where
     parse_project_hooks_json(&json)
         .map(Some)
         .map_err(serde::de::Error::custom)
+}
+
+/// Stop exactly one execution, including an interactive side session.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct StopExecutionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reason: Option<String>,
 }

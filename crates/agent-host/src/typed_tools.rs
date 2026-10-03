@@ -3556,7 +3556,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_recovery_lifts_flat_provider_fields_into_payload() {
-        let operation = crate::operation_catalog::TASK_RECOVER_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3574,8 +3574,8 @@ mod tests {
             "parameters": {
                 "operation": operation,
                 "task_id": "task-1",
-                "reason": "the executor stopped",
-                "action": "reexecute"
+                "version": 1,
+                "action": {"verb":"retry","fresh_session":true,"guidance":"the executor stopped"}
             }
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
@@ -3593,10 +3593,10 @@ mod tests {
         assert_eq!(prepared.arguments()["operation"], operation);
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
         assert_eq!(
-            prepared.arguments()["payload"]["reason"],
+            prepared.arguments()["payload"]["action"]["guidance"],
             "the executor stopped"
         );
-        assert_eq!(prepared.arguments()["payload"]["action"], "reexecute");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "retry");
         assert!(prepared.arguments().get("parameters").is_none());
         assert!(prepared.arguments().get("task_id").is_none());
 
@@ -3606,10 +3606,10 @@ mod tests {
                     "operation": operation,
                     "payload": {
                         "task_id": "task-1",
-                        "reason": "the executor stopped",
-                        "action": "cancel_task"
+                        "version": 1,
+                        "action": {"verb":"cancel"}
                     },
-                    "action": "reexecute",
+                    "action": {"verb":"retry","fresh_session":true},
                     "dedupe_key": "recover-task-1-conflict",
                     "correlation_id": "recover-task-1-conflict"
                 }),
@@ -3622,7 +3622,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_cancellation_lifts_the_versioned_payload_fields() {
-        let operation = crate::operation_catalog::TASK_CANCEL_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3635,10 +3635,9 @@ mod tests {
         );
         let flat = json!({
             "operation": operation,
-            "action": "cancel",
+            "action": {"verb":"cancel"},
             "task_id": "task-1",
-            "expected_task_version": 7,
-            "reason": "Duplicate Task",
+            "version": 7,
             "dedupe_key": "cancel-task-1",
             "correlation_id": "cancel-task-1"
         });
@@ -3654,10 +3653,9 @@ mod tests {
             .prepare(flat, &command_preparation_context(workspace))
             .await
             .expect("flat cancellation call prepares");
-        assert_eq!(prepared.arguments()["payload"]["action"], "cancel");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "cancel");
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
-        assert_eq!(prepared.arguments()["payload"]["expected_task_version"], 7);
-        assert_eq!(prepared.arguments()["payload"]["reason"], "Duplicate Task");
+        assert_eq!(prepared.arguments()["payload"]["version"], 7);
     }
 
     #[tokio::test]

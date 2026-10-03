@@ -179,7 +179,7 @@ async fn cancel_execution_invokes_task_executor_cancel() {
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     service
-        .cancel_execution(execution.id.clone(), "cancelled by test".to_owned())
+        .stop_execution(execution.id.clone(), "cancelled by test".to_owned())
         .await
         .expect("execution cancels");
 

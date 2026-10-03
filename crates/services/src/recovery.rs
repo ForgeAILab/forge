@@ -1299,7 +1299,6 @@ async fn recover_task(
         "blocked_execution_id": blocked_execution_id,
         "artifact": artifact,
         "message": message,
-        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string();
     let task = TaskRepo::update_status(
@@ -2419,10 +2418,10 @@ async fn annotate_owner_recovery(
                 Some("owner_disconnected_timeout" | "owner_lost_execution")
             ));
     let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
-        "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
-        "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
-        "message": format!("Workspace owner recovery required: {cause}"),
-        "recovery_actions": ["reexecute", "cancel_task"]});
+            "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
+            "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
+            "message": format!("Workspace owner recovery required: {cause}"),
+    });
     if can_annotate {
         let updated = sqlx::query("UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
             .bind(annotation.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version)
@@ -2529,7 +2528,7 @@ async fn annotate_owner_workspace_reset(
     }
     let annotation = json!({"type": api_types::FailureKind::WorkspaceResetRequired,
         "blocking_reason": "owner_workspace_reset_required", "blocked_by": actor.display(),
-        "blocked_at": now_rfc3339(), "message": message, "recovery_actions": ["reset_to_initial", "cancel_task"]});
+        "blocked_at": now_rfc3339(), "message": message});
     TaskRepo::update_status(
         db,
         UpdateTaskStatus {
@@ -3915,10 +3914,7 @@ pub(crate) mod tests {
             annotation["message"],
             "Recovered after agent heartbeat timeout"
         );
-        assert_eq!(
-            annotation["recovery_actions"],
-            json!(["reexecute", "reset_to_initial", "cancel_task"])
-        );
+        assert!(annotation.get("recovery_actions").is_none());
 
         let mut event_types = Vec::new();
         let mut recovered_event_id = None;
@@ -4831,7 +4827,6 @@ pub(crate) mod tests {
                 "log_path": null,
             })),
             "message": "Recovered after server restart",
-            "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
         })
         .to_string();
         TaskRepo::update_status(
@@ -6198,9 +6193,15 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_daemon_connections(monitor.daemon_connections.as_ref().unwrap().clone());
         let error = service
-            .recover_task(
+            .test_apply_action(
                 ready.task_id,
-                api_types::RecoveryAction::Reexecute,
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
                 None,
                 None,
             )
@@ -6954,6 +6955,12 @@ pub(crate) mod tests {
     async fn daemon_owned_workspace_resume_requires_current_online_owner_capability() {
         let db = Arc::new(sqlite_db().await);
         let (_, placement, execution) = daemon_owned_fixture(&db).await;
+        sqlx::query("UPDATE daemon SET detected_clis_json = ? WHERE id = ?")
+            .bind(json!([{"kind":"shell","availability":"authenticated"}]).to_string())
+            .bind(placement.daemon_id.as_deref().unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
         let bus = Arc::new(EventBus::new(16));
         fail_owned_execution(
@@ -7000,24 +7007,42 @@ pub(crate) mod tests {
         .unwrap();
         let service = TaskService::new(db.clone(), bus).with_daemon_connections(registry.clone());
         assert!(!service
-            .available_recovery_actions(&task.id)
+            .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::RecoveryAction::ResumeSession));
+            .contains(&api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         let (_, _first) =
             owner_connection(&registry, placement.daemon_id.as_deref().unwrap(), false);
         assert!(!service
-            .available_recovery_actions(&task.id)
+            .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::RecoveryAction::ResumeSession));
+            .contains(&api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         let (_, _second) =
             owner_connection(&registry, placement.daemon_id.as_deref().unwrap(), true);
         assert!(service
-            .available_recovery_actions(&task.id)
+            .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::RecoveryAction::ResumeSession));
+            .contains(&api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
         DaemonRepo::mark_offline(
             &*db,
             placement.daemon_id.as_deref().unwrap(),
@@ -7026,10 +7051,16 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert!(!service
-            .available_recovery_actions(&task.id)
+            .test_action_values(&task.id)
             .await
             .unwrap()
-            .contains(&api_types::RecoveryAction::ResumeSession));
+            .contains(&api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: Some(false),
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None
+            }));
     }
 
     #[tokio::test]
@@ -7077,7 +7108,18 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)))
             .with_daemon_connections(registry);
         service
-            .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
         responder.await.unwrap();
@@ -8263,9 +8305,9 @@ pub(crate) mod tests {
         };
         if task_reset {
             let recovered = service
-                .recover_task(
+                .test_apply_action(
                     &task.id,
-                    api_types::RecoveryAction::ResetToInitial,
+                    api_types::TaskAction::Restart { reason: None },
                     None,
                     None,
                 )
@@ -8382,9 +8424,9 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             service
-                .recover_task(
+                .test_apply_action(
                     &task.id,
-                    api_types::RecoveryAction::ResetToInitial,
+                    api_types::TaskAction::Restart { reason: None },
                     None,
                     None
                 )
@@ -8401,9 +8443,9 @@ pub(crate) mod tests {
             1
         );
         let recovered = service
-            .recover_task(
+            .test_apply_action(
                 &task.id,
-                api_types::RecoveryAction::ResetToInitial,
+                api_types::TaskAction::Restart { reason: None },
                 None,
                 None,
             )
@@ -8452,7 +8494,7 @@ pub(crate) mod tests {
         sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
             .bind(json!({"type":"manual_stop", "blocking_reason":"manual_stop", "blocked_by":"user",
                 "blocked_at":now_rfc3339(), "blocked_execution_id":execution.id, "message":"retry on same owner",
-                "recovery_actions":["reexecute", "cancel_task"]}).to_string())
+}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
         DaemonRepo::mark_offline(&*db, ready.daemon_id.as_deref().unwrap(), &now_rfc3339())
             .await
@@ -8463,11 +8505,22 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         let error = service
-            .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .expect_err("explicit recovery preserves the base offline-agent refusal");
         assert!(
-            matches!(error, ServiceError::InvalidOperation { ref message } if message.contains("offline")),
+            matches!(error, ServiceError::TaskActionUnavailable { ref available_actions, .. } if available_actions.iter().all(|offer| offer.action.verb() != "retry")),
             "{error:?}"
         );
         let current = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -8487,16 +8540,33 @@ pub(crate) mod tests {
         let db = Arc::new(sqlite_db().await);
         let (task, placement, execution) = daemon_owned_fixture(&db).await;
         let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)));
-        let actions = service.available_recovery_actions(&task.id).await.unwrap();
+        let actions = service.test_action_values(&task.id).await.unwrap();
         assert_eq!(
             actions,
             vec![
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::CancelTask
+                api_types::TaskAction::Cancel { reason: None },
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None
+                },
             ]
         );
         let retried = service
-            .recover_task(&task.id, api_types::RecoveryAction::Reexecute, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(retried.status, task.status);
@@ -8514,7 +8584,12 @@ pub(crate) mod tests {
             1
         );
         let cancelled = service
-            .recover_task(&task.id, api_types::RecoveryAction::CancelTask, None, None)
+            .test_apply_action(
+                &task.id,
+                api_types::TaskAction::Cancel { reason: None },
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(cancelled.status, "cancelled");

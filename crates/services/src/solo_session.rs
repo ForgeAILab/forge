@@ -406,25 +406,12 @@ pub struct SoloTurnSnapshot {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SoloTaskAction {
-    Start,
-    Pause,
-    Resume,
-    Submit,
-    RequestChanges,
-    Approve,
-    Cancel,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoloTaskInterruption {
     pub failure_kind: Option<api_types::FailureKind>,
     pub reason: Option<String>,
     pub source: Option<String>,
     pub execution_id: Option<String>,
-    pub recovery_actions: Vec<api_types::RecoveryAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,7 +483,7 @@ pub struct SoloTaskSnapshot {
     pub assignee_id: Option<String>,
     pub priority: i64,
     pub interruption: Option<SoloTaskInterruption>,
-    pub available_actions: Vec<SoloTaskAction>,
+    pub available_actions: Vec<api_types::Offer>,
     pub roles: Vec<SoloTaskRoleSnapshot>,
     pub executions: Vec<SoloTaskExecutionSnapshot>,
     pub latest_review: Option<SoloReviewSnapshot>,
@@ -1078,19 +1065,10 @@ impl SoloSessionService {
                 "expected_task_version must be positive",
             ));
         }
-        let reason = input.reason.and_then(|reason| safe_diagnostic(&reason));
-        let action = match input.decision {
-            SoloReviewDecision::Accept => api_types::TaskAction::Approve,
-            SoloReviewDecision::RequestChanges => api_types::TaskAction::RequestChanges,
-        };
+        let action = solo_review_action(input.decision, input.reason)?;
         let result = self
             .task_service
-            .perform_task_action(
-                task.id.clone(),
-                action,
-                reason,
-                Some(input.expected_task_version),
-            )
+            .perform_task_action(task.id.clone(), action, input.expected_task_version)
             .await?;
         Ok(SoloReviewDecisionResult {
             task_id: result.task.id,
@@ -1373,15 +1351,14 @@ impl SoloSessionService {
                     .then_with(|| left.created_at.cmp(&right.created_at))
                     .then_with(|| left.id.cmp(&right.id))
             });
-        let available_actions = match self
+        let available_actions = self
             .task_service
-            .available_task_actions(task_id.clone())
-            .await
-        {
-            Ok(actions) => actions.into_iter().map(task_action).collect(),
-            Err(ServiceError::InvalidOperation { .. }) => Vec::new(),
-            Err(error) => return Err(error),
-        };
+            .task_action_offers(
+                &task_id,
+                &api_types::Actor::user(api_types::UserActionSource::Api),
+            )
+            .await?
+            .available_actions;
         Ok(SoloTaskSnapshot {
             id: safe_identifier(&task.id),
             project_id: safe_identifier(&task.project_id),
@@ -1812,18 +1789,6 @@ fn turn_snapshot(job: &AgentChatTurnJob) -> SoloTurnSnapshot {
     }
 }
 
-fn task_action(action: api_types::TaskAction) -> SoloTaskAction {
-    match action {
-        api_types::TaskAction::Start => SoloTaskAction::Start,
-        api_types::TaskAction::Pause => SoloTaskAction::Pause,
-        api_types::TaskAction::Resume => SoloTaskAction::Resume,
-        api_types::TaskAction::Submit => SoloTaskAction::Submit,
-        api_types::TaskAction::RequestChanges => SoloTaskAction::RequestChanges,
-        api_types::TaskAction::Approve => SoloTaskAction::Approve,
-        api_types::TaskAction::Cancel => SoloTaskAction::Cancel,
-    }
-}
-
 fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
     if let Some(raw) = task.error_annotation.as_deref() {
         if raw.chars().count() <= SOLO_MAX_JSON_CHARS {
@@ -1843,11 +1808,6 @@ fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
                         .blocked_execution_id
                         .as_deref()
                         .map(safe_identifier),
-                    recovery_actions: annotation
-                        .recovery_actions
-                        .into_iter()
-                        .take(SOLO_MAX_ROLES_PER_TASK as usize)
-                        .collect(),
                 });
             }
         }
@@ -1862,7 +1822,6 @@ fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
             reason: safe_optional_diagnostic(Some(metadata.reason.as_str())),
             source: metadata.source.and_then(|source| safe_diagnostic(&source)),
             execution_id: metadata.execution_id.as_deref().map(safe_identifier),
-            recovery_actions: Vec::new(),
         })
 }
 
@@ -2635,9 +2594,56 @@ fn bounded_limit(name: &str, value: i64, max: i64) -> Result<i64> {
     Ok(value)
 }
 
+fn solo_review_action(
+    decision: SoloReviewDecision,
+    reason: Option<String>,
+) -> Result<api_types::TaskAction> {
+    let reason = reason.and_then(|reason| safe_diagnostic(&reason));
+    match decision {
+        SoloReviewDecision::Accept => Ok(api_types::TaskAction::Approve {
+            reason,
+            override_checks: Some(false),
+        }),
+        SoloReviewDecision::RequestChanges => {
+            let guidance = reason
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("send_back requires nonblank guidance")
+                })?;
+            Ok(api_types::TaskAction::SendBack { guidance })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn review_decisions_preserve_typed_guidance_and_reason() {
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, None).is_err());
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, Some("  ".into())).is_err());
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::RequestChanges,
+                Some("Fix the missing coverage".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::SendBack {
+                guidance: "Fix the missing coverage".into()
+            }
+        );
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::Accept,
+                Some("Track in follow-up".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::Approve {
+                override_checks: Some(false),
+                reason: Some("Track in follow-up".into())
+            }
+        );
+    }
 
     #[test]
     fn finite_turn_states_keep_terminal_and_waiting_distinct() {
