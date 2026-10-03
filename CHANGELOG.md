@@ -281,6 +281,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Agents that shape a managed project or split its work get one
+  merge-friendly layout rule: small modules with clear ownership so parallel
+  Tasks edit disjoint files, no hub files every feature must edit (central
+  registries, route tables, export lists, one large shared library),
+  per-feature registration or one owning Task for an unavoidable shared edit,
+  and each Task names the modules it owns. It is in the Genesis skill (new
+  revision `forge.main.project-discovery/v2@7`), the Project skill
+  (`forge.project.orchestration/v1@20`), the Document and Task doctrine
+  sections, the planner prompt and the scaffolded `AGENTS.md`; native Task
+  guidance and the two MCP task-creation tools carry a one-sentence form.
+  About +37 tokens per Genesis turn, +66 per Project Agent request and +106
+  per planner run; Main Agent requests outside Genesis are unchanged.
+  Migration V202610031431 adds the revisions; older revisions stay resolvable
+  for turns that reference them.
 - Forge uses agent-runtime `fec6dc2` (was `ca6c17e`): runtime failure
   classes, a bounded window of turn manifests, cache diagnostics and cheaper
   history and LCM accounting per provider call. A turn that fails before
