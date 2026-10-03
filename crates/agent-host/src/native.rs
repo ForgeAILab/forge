@@ -1701,7 +1701,7 @@ mod tool_result_summary_tests {
     }
 }
 
-// ProviderAttemptFinished retains fields that RuntimeError conversion drops.
+// Prefer the original attempt evidence when it is available.
 pub(crate) fn provider_turn_failure(
     error: &agent_runtime::core::provider::ProviderError,
 ) -> api_types::TurnFailure {
@@ -1732,12 +1732,52 @@ pub(crate) fn provider_turn_failure(
 }
 
 fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
-    use agent_runtime::core::error::ErrorKind;
+    use agent_runtime::core::error::{ErrorKind, FailureClass, FailureStage};
     use api_types::TurnFailure;
+    match &error.class {
+        FailureClass::PolicyDenied { .. } => return TurnFailure::Authority,
+        FailureClass::ContextOverflow { .. } => return TurnFailure::ContextOverflow,
+        FailureClass::Auth { .. } => return TurnFailure::Configuration,
+        FailureClass::QuotaExhausted { .. } => {
+            return TurnFailure::UsageLimit {
+                resets_at: error.limit_resets_at_ms,
+            };
+        }
+        FailureClass::RequestRejected {
+            stage: FailureStage::Provider,
+        } => {
+            return TurnFailure::ProviderRejected {
+                retryable: error.retryable,
+                retry_after: error.retry_after_ms,
+            };
+        }
+        FailureClass::TurnLimit { limit, .. } => {
+            return AgentHostError::TurnLimitReached {
+                limit: (*limit).into(),
+            }
+            .turn_failure();
+        }
+        // Classification alone cannot admit retries. In particular, a local
+        // Config/nonretryable error may retain Transient provider evidence.
+        FailureClass::Transient { .. } | FailureClass::RateLimited { .. } => {}
+        // Forge has no dedicated projection for component/state failures or
+        // cancellation here. Keep the coarse kind/retryability policy below;
+        // a conflict must not be promoted into a transient provider failure.
+        FailureClass::RequestRejected { .. }
+        | FailureClass::StateConflict { .. }
+        | FailureClass::HostComponent { .. }
+        | FailureClass::Cancelled { .. }
+        | FailureClass::Internal { .. }
+        | FailureClass::Unclassified => {}
+        // Future classes retain the existing conservative coarse projection.
+        _ => {}
+    }
     match error.kind {
         ErrorKind::Config => TurnFailure::Unclassified,
         ErrorKind::Approval | ErrorKind::Workspace => TurnFailure::Authority,
-        _ if error.retryable => TurnFailure::Transient { retry_after: None },
+        _ if error.retryable => TurnFailure::Transient {
+            retry_after: error.retry_after_ms,
+        },
         _ => TurnFailure::Unclassified,
     }
 }
@@ -1787,6 +1827,112 @@ mod turn_failure_tests {
             runtime_turn_failure(&RuntimeError::new(ErrorKind::Approval, "paused")),
             TurnFailure::Authority
         );
+    }
+
+    #[test]
+    fn runtime_failure_classes_use_existing_projections_without_granting_retries() {
+        use agent_runtime::core::{
+            error::{ErrorKind, FailureClass, FailureComponent, FailureStage},
+            event::LimitKind,
+        };
+        let stage = FailureStage::PreProvider;
+        let component = FailureComponent::Lcm;
+        let cases = [
+            (FailureClass::PolicyDenied { stage }, TurnFailure::Authority),
+            (
+                FailureClass::ContextOverflow {
+                    stage,
+                    required_tokens: Some(100),
+                    available_tokens: Some(50),
+                },
+                TurnFailure::ContextOverflow,
+            ),
+            (FailureClass::Auth { stage }, TurnFailure::Configuration),
+            (
+                FailureClass::QuotaExhausted { stage },
+                TurnFailure::UsageLimit { resets_at: Some(0) },
+            ),
+            (
+                FailureClass::RequestRejected {
+                    stage: FailureStage::Provider,
+                },
+                TurnFailure::ProviderRejected {
+                    retryable: false,
+                    retry_after: Some(0),
+                },
+            ),
+            (
+                FailureClass::TurnLimit {
+                    stage,
+                    limit: LimitKind::ToolSteps,
+                },
+                TurnFailure::TurnLimit {
+                    cause: api_types::TurnLimitCause::ToolSteps,
+                },
+            ),
+            (FailureClass::Transient { stage }, TurnFailure::Unclassified),
+            (
+                FailureClass::RateLimited { stage },
+                TurnFailure::Unclassified,
+            ),
+            (
+                FailureClass::RequestRejected { stage },
+                TurnFailure::Unclassified,
+            ),
+            (
+                FailureClass::StateConflict { stage, component },
+                TurnFailure::Unclassified,
+            ),
+            (
+                FailureClass::HostComponent { stage, component },
+                TurnFailure::Unclassified,
+            ),
+            (FailureClass::Cancelled { stage }, TurnFailure::Unclassified),
+            (FailureClass::Internal { stage }, TurnFailure::Unclassified),
+            (FailureClass::Unclassified, TurnFailure::Unclassified),
+        ];
+        for (class, expected) in cases {
+            let mut error =
+                RuntimeError::new(ErrorKind::Config, "SECRET_TOKEN=opaque").with_class(class);
+            error.retry_after_ms = Some(0);
+            error.limit_resets_at_ms = Some(0);
+            let failure = runtime_turn_failure(&error);
+            assert_eq!(failure, expected, "{:?}", error.class);
+            assert!(
+                !serde_json::to_string(&failure)
+                    .unwrap()
+                    .contains("SECRET_TOKEN")
+            );
+        }
+        // Typed transience does not override the runtime's local admission
+        // outcome, even if retryability is present in diagnostic evidence.
+        let mut local = RuntimeError::new(ErrorKind::Config, "local failure")
+            .with_class(FailureClass::Transient { stage });
+        local.retryable = true;
+        assert_eq!(runtime_turn_failure(&local), TurnFailure::Unclassified);
+        for class in [
+            FailureClass::Transient { stage },
+            FailureClass::RateLimited { stage },
+        ] {
+            let mut error =
+                RuntimeError::new(ErrorKind::Provider, "provider failure").with_class(class);
+            assert_eq!(runtime_turn_failure(&error), TurnFailure::Unclassified);
+            error.retryable = true;
+            error.retry_after_ms = Some(1200);
+            assert_eq!(
+                runtime_turn_failure(&error),
+                TurnFailure::Transient {
+                    retry_after: Some(1200)
+                }
+            );
+        }
+        // Future wire reasons become unclassified and keep the coarse policy.
+        let future: RuntimeError = serde_json::from_value(serde_json::json!({
+            "kind": "conflict", "message": "opaque", "retryable": false,
+            "class": {"reason": "future_reason", "stage": "future_stage"},
+        }))
+        .unwrap();
+        assert_eq!(runtime_turn_failure(&future), TurnFailure::Unclassified);
     }
 
     #[test]
