@@ -59,6 +59,10 @@ impl ForgeConfig {
 
         if let Some(server) = file.server {
             self.server.max_concurrent_runs = server.max_concurrent_runs;
+            self.server.build_jobs_per_run = server.build_jobs_per_run;
+            if let Some(nice) = server.run_nice {
+                self.server.run_nice = nice;
+            }
             self.server.usage_index_budget_mb = server.usage_index_budget_mb;
             if let Some(bind) = server.bind {
                 self.server.bind = bind;
@@ -203,6 +207,13 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_BUILD_JOBS_PER_RUN") {
+            self.server.build_jobs_per_run =
+                Some(parse_env_u32("FORGE_SERVER_BUILD_JOBS_PER_RUN", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_SERVER_RUN_NICE") {
+            self.server.run_nice = parse_env_u32("FORGE_SERVER_RUN_NICE", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
             self.server.usage_index_budget_mb =
                 Some(parse_env_u32("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", &value)?);
@@ -282,6 +293,12 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(jobs) = overrides.server_build_jobs_per_run {
+            self.server.build_jobs_per_run = Some(jobs);
+        }
+        if let Some(nice) = overrides.server_run_nice {
+            self.server.run_nice = nice;
+        }
         if let Some(budget) = overrides.server_usage_index_budget_mb {
             self.server.usage_index_budget_mb = Some(budget);
         }

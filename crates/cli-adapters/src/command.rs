@@ -117,7 +117,9 @@ impl CommandBuilder {
 pub fn run_in_task_worktree(command: &mut Command, ctx: &executors::ExecutionContext) {
     // The Project environment goes first so Forge's own variables below
     // always win.
-    command.envs(executors::environment::task_environment(&ctx.agent_config));
+    let environment = executors::environment::task_environment(&ctx.agent_config);
+    command.envs(&environment);
+    executors::run_process::apply(command, &environment);
     command
         .current_dir(&ctx.worktree_path)
         .env("PWD", &ctx.worktree_path)
@@ -295,5 +297,52 @@ mod worktree_tests {
                 .get_envs()
                 .all(|(key, _)| key != OsStr::new(executors::FORGE_PLAN_PATH_ENV))
         );
+    }
+}
+
+#[cfg(test)]
+mod run_budget_tests {
+    use super::*;
+    #[test]
+    fn launch_environment_preserves_project_and_fills_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let env =
+            std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project-value".into())]);
+        let mut config = serde_json::json!({});
+        executors::environment::mark_task_environment(&mut config, &env);
+        let ctx = executors::ExecutionContext {
+            task_id: "task".into(),
+            execution_id: "exec".into(),
+            worktree_path: temp.path().to_string_lossy().into_owned(),
+            description: String::new(),
+            agent_config: config,
+            logs_path: String::new(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
+        let mut command = CommandBuilder::new("codex").build();
+        run_in_task_worktree(&mut command, &ctx);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_BUILD_JOBS")).unwrap(),
+            "project-value"
+        );
+        let jobs = executors::run_process::machine_policy().get().build_jobs();
+        for (key, default) in [
+            ("RUST_TEST_THREADS", jobs.to_string()),
+            ("MAKEFLAGS", format!("-j{jobs}")),
+            ("CMAKE_BUILD_PARALLEL_LEVEL", jobs.to_string()),
+            ("GOFLAGS", format!("-p={jobs}")),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&std::env::var_os(key).unwrap_or(default.into()))
+            );
+        }
     }
 }

@@ -974,8 +974,6 @@ export interface UpdateTaskRequest {
   version: number
 }
 
-
-
 export type AssigneeKind = 'agent' | 'user'
 
 export type AuthorType = 'user' | 'agent' | 'system'
@@ -1627,6 +1625,9 @@ export interface ActiveExecutionSummary {
 }
 
 export interface DaemonPressureSummary {
+  logical_cores: number | null
+  build_jobs_per_run: number | null
+  run_nice: number | null
   daemon_id: string
   hostname: string | null
   active_runs: number
@@ -1761,6 +1762,8 @@ export interface UpdateForgePathsRequest {
 }
 
 export interface UpdateServerSettingsRequest {
+  build_jobs_per_run?: number | null
+  run_nice?: number | null
   usage_index_budget_mb?: number | null
   max_concurrent_runs?: number | null
   bind?: string | null

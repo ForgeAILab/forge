@@ -274,3 +274,175 @@ async fn usage_index_budget_settings_apply_live_and_persist_default_reset() {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
+
+#[tokio::test]
+async fn run_budget_settings_roundtrip_live_and_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("forge.yaml");
+    let app = test_app(root.path(), path.clone()).await;
+    let token = common::admin_jwt();
+    for (jobs, nice) in [(json!(3), 7), (json!(0), 0), (json!(null), 10)] {
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":{"max_concurrent_runs":2,"build_jobs_per_run":jobs,"run_nice":nice}}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&response, "server.build_jobs_per_run").value, jobs);
+        let expected = if jobs.is_null() {
+            config::resolved_build_jobs_for_cores(None, Some(2), config::logical_cores())
+        } else {
+            jobs.as_u64().unwrap() as u32
+        };
+        assert_eq!(
+            setting(&response, "server.build_jobs_per_run").effective_value,
+            json!(expected)
+        );
+        assert_eq!(
+            setting(&response, "server.run_nice").effective_value,
+            json!(nice)
+        );
+        assert!(!setting(&response, "server.build_jobs_per_run").restart_required);
+        assert!(!setting(&response, "server.run_nice").restart_required);
+        let read: SettingsResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/settings",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&read, "server.build_jobs_per_run").value, jobs);
+        assert_eq!(setting(&read, "server.run_nice").value, json!(nice));
+        assert_eq!(
+            setting(&read, "server.logical_cores").effective_value,
+            json!(config::logical_cores())
+        );
+        let operations: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let host = operations
+            .daemon_pressure
+            .iter()
+            .find(|machine| machine.daemon_id == "server_host")
+            .unwrap();
+        assert_eq!(host.build_jobs_per_run, Some(expected));
+        assert_eq!(host.run_nice, Some(nice as u32));
+        let saved: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved["server"]["build_jobs_per_run"]).unwrap(),
+            jobs
+        );
+        assert_eq!(saved["server"]["run_nice"].as_u64(), Some(nice));
+    }
+    let _: serde_json::Value = common::json_request_with_bearer(
+        &app,
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"server":{"run_nice":20}}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Omitted fields preserve the live policy.
+    let response: SettingsResponse = common::json_request_with_bearer(
+        &app,
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"server":{"max_concurrent_runs":0}}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        setting(&response, "server.build_jobs_per_run").effective_value,
+        json!(config::resolved_build_jobs_for_cores(
+            None,
+            Some(0),
+            config::logical_cores()
+        ))
+    );
+    assert_eq!(setting(&response, "server.run_nice").value, json!(10));
+}
+
+#[tokio::test]
+async fn server_resource_settings_coexist_and_update_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("forge.yaml");
+    let app = test_app(root.path(), path.clone()).await;
+    let token = common::admin_jwt();
+    for (update, jobs, nice, usage) in [
+        (
+            json!({"max_concurrent_runs":2,"build_jobs_per_run":3,"run_nice":0,"usage_index_budget_mb":0}),
+            json!(3),
+            0,
+            0u32,
+        ),
+        (json!({"usage_index_budget_mb":64}), json!(3), 0, 64u32),
+        (
+            json!({"build_jobs_per_run":null,"run_nice":7}),
+            json!(null),
+            7,
+            64u32,
+        ),
+    ] {
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":update}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&response, "server.build_jobs_per_run").value, jobs);
+        assert_eq!(setting(&response, "server.run_nice").value, json!(nice));
+        assert_eq!(
+            setting(&response, "server.usage_index_budget_mb").value,
+            json!(usage)
+        );
+        for key in [
+            "server.build_jobs_per_run",
+            "server.run_nice",
+            "server.usage_index_budget_mb",
+        ] {
+            assert!(!setting(&response, key).restart_required);
+        }
+        let status: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let host = status
+            .daemon_pressure
+            .iter()
+            .find(|machine| machine.daemon_id == "server_host")
+            .unwrap();
+        let expected_jobs = jobs.as_u64().map(|value| value as u32).unwrap_or_else(|| {
+            config::resolved_build_jobs_for_cores(None, Some(2), config::logical_cores())
+        });
+        assert_eq!(host.build_jobs_per_run, Some(expected_jobs));
+        assert_eq!(host.run_nice, Some(nice));
+        assert_eq!(
+            status.usage_index.budget_bytes,
+            u64::from(usage) * 1024 * 1024
+        );
+    }
+    let saved: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(saved["server"]["build_jobs_per_run"].is_null());
+    assert_eq!(saved["server"]["run_nice"].as_u64(), Some(7));
+    assert_eq!(saved["server"]["usage_index_budget_mb"].as_u64(), Some(64));
+}

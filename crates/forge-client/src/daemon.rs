@@ -45,6 +45,12 @@ enum DaemonCmd {
         /// Maximum concurrent runs (default: automatic; 0: unlimited).
         #[arg(long)]
         max_concurrent_runs: Option<u32>,
+        /// Build jobs per run (unset: automatic; 0: disabled).
+        #[arg(long)]
+        build_jobs_per_run: Option<u32>,
+        /// Unix niceness increment for run children (0: off).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+        run_nice: Option<u32>,
         /// Stable daemon machine id. Defaults to the local machine id when available.
         #[arg(long)]
         machine_id: Option<String>,
@@ -75,6 +81,12 @@ enum DaemonCmd {
         /// Maximum concurrent runs (default: automatic; 0: unlimited).
         #[arg(long)]
         max_concurrent_runs: Option<u32>,
+        /// Build jobs per run (unset: automatic; 0: disabled).
+        #[arg(long)]
+        build_jobs_per_run: Option<u32>,
+        /// Unix niceness increment for run children (0: off).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+        run_nice: Option<u32>,
         /// Credentials file created by daemon link.
         #[arg(long)]
         credentials: Option<PathBuf>,
@@ -114,6 +126,8 @@ impl DaemonArgs {
             DaemonCmd::Link {
                 workspace_root,
                 max_concurrent_runs,
+                build_jobs_per_run,
+                run_nice,
                 machine_id,
                 hostname,
                 credentials,
@@ -124,9 +138,16 @@ impl DaemonArgs {
             } => {
                 let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
-                let max_concurrent_runs =
-                    crate::daemon_config::DaemonConfig::load(&credentials_path)?
-                        .run_cap(*max_concurrent_runs);
+                let daemon_config = crate::daemon_config::DaemonConfig::load(&credentials_path)?;
+                let budget = daemon_config.run_budget(
+                    *max_concurrent_runs,
+                    *build_jobs_per_run,
+                    *run_nice,
+                )?;
+                executors::run_process::install_machine_policy(Arc::new(
+                    executors::run_process::MachineRunPolicy::new(budget),
+                ));
+                let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let hostname = hostname
                     .clone()
                     .filter(|value| !value.trim().is_empty())
@@ -191,15 +212,24 @@ impl DaemonArgs {
             DaemonCmd::Start {
                 workspace_root,
                 max_concurrent_runs,
+                build_jobs_per_run,
+                run_nice,
                 credentials,
                 labels,
                 interval_seconds,
             } => {
                 let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
-                let max_concurrent_runs =
-                    crate::daemon_config::DaemonConfig::load(&credentials_path)?
-                        .run_cap(*max_concurrent_runs);
+                let daemon_config = crate::daemon_config::DaemonConfig::load(&credentials_path)?;
+                let budget = daemon_config.run_budget(
+                    *max_concurrent_runs,
+                    *build_jobs_per_run,
+                    *run_nice,
+                )?;
+                executors::run_process::install_machine_policy(Arc::new(
+                    executors::run_process::MachineRunPolicy::new(budget),
+                ));
+                let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
                         "missing daemon credentials at {}; run `forge-ctl daemon link` first",

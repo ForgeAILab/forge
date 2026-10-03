@@ -150,6 +150,9 @@ pub struct DaemonPressureSummary {
     pub active_runs: u32,
     #[ts(type = "number | null")]
     pub max_concurrent_runs: Option<i64>,
+    pub logical_cores: Option<u32>,
+    pub build_jobs_per_run: Option<u32>,
+    pub run_nice: Option<u32>,
     pub at_capacity: bool,
 }
 

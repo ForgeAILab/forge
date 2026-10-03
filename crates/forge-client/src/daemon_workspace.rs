@@ -714,6 +714,7 @@ impl DaemonWorkspaceBackend {
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE");
+            executors::run_process::apply(&mut command, &params.env);
             let output =
                 bounded_command_inner(command, check.timeout_seconds, 4096, true, true).await?;
             let raw = [output.stdout, output.stderr].concat();
@@ -1249,6 +1250,7 @@ impl DaemonWorkspaceBackend {
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
+        executors::run_process::apply(&mut command, &params.env.iter().cloned().collect());
         // Persist the version before launching; journal pressure after the
         // command exits must never discard its exit result.
         owned.version += 1;

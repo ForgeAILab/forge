@@ -295,6 +295,7 @@ pub struct ProjectChatToolContext {
 pub struct ScopeToolRuntime {
     /// Programs workspace commands may spawn. `None` uses the built-in set.
     pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    pub environment: std::collections::BTreeMap<String, String>,
     /// Outbound transport for the runtime's web fetch tool. `None` leaves
     /// `fetch` out of the catalog entirely, which is what an inspection-only
     /// composition wants.
@@ -486,6 +487,7 @@ impl ScopeToolComposition {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
                             tools.push(Arc::new(TaskCommandTool {
+                                environment: runtime.environment.clone(),
                                 allowlist: Arc::clone(&command_allowlist),
                                 observer: None,
                                 command_dir: None,
@@ -496,7 +498,9 @@ impl ScopeToolComposition {
                     }
                     TaskToolRole::Reviewer => {
                         if task_read_allowed {
-                            tools.push(Arc::new(TaskValidateTool));
+                            tools.push(Arc::new(TaskValidateTool {
+                                environment: runtime.environment.clone(),
+                            }));
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
                     }
@@ -558,6 +562,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskReadTool));
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: provider.clone().map(|provider| CommandObserver {
                             actor_identity_id: actor_identity_id.clone(),
@@ -581,6 +586,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskWriteTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: None,
                         command_dir: None,
@@ -2370,6 +2376,7 @@ struct CommandObserver {
 
 #[derive(Debug)]
 struct TaskCommandTool {
+    environment: std::collections::BTreeMap<String, String>,
     /// Programs this composition may spawn. Resolved by the host from owner
     /// configuration and the owning Project, never from model input.
     allowlist: Arc<CommandAllowlist>,
@@ -2451,7 +2458,9 @@ impl Tool for TaskCommandTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let program = required_string(prepared.arguments(), "program")?;
         let args = string_array(prepared.arguments(), "args")?;
-        let run = execute_workspace_command(program, &args, self.command_dir, ctx).await?;
+        let run =
+            execute_workspace_command(program, &args, self.command_dir, &self.environment, ctx)
+                .await?;
         let Some(observer) = &self.observer else {
             return Ok(command_outcome(&run, None));
         };
@@ -2495,7 +2504,9 @@ impl Tool for TaskCommandTool {
 }
 
 #[derive(Debug)]
-struct TaskValidateTool;
+struct TaskValidateTool {
+    environment: std::collections::BTreeMap<String, String>,
+}
 
 #[async_trait]
 impl Tool for TaskValidateTool {
@@ -2537,9 +2548,14 @@ impl Tool for TaskValidateTool {
         _prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        let run =
-            execute_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx)
-                .await?;
+        let run = execute_workspace_command(
+            "git",
+            &["diff".to_owned(), "--check".to_owned()],
+            None,
+            &self.environment,
+            ctx,
+        )
+        .await?;
         Ok(command_outcome(&run, None))
     }
 }
@@ -2573,6 +2589,7 @@ async fn execute_workspace_command(
     program: &str,
     args: &[String],
     command_dir: Option<&str>,
+    environment: &std::collections::BTreeMap<String, String>,
     ctx: &InvocationContext,
 ) -> Result<ExecutedCommand, RuntimeError> {
     if ctx.should_stop() {
@@ -2589,6 +2606,7 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
+    executors::run_process::apply(&mut command, environment);
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
@@ -3320,6 +3338,40 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_commands_receive_project_and_machine_build_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let env = std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project".into())]);
+        let ctx = command_invocation_context(workspace);
+        let output = super::execute_workspace_command(
+            "sh",
+            &[
+                "-c".into(),
+                "printf '%s\\n' \"$CARGO_BUILD_JOBS\" \"$MAKEFLAGS\"".into(),
+            ],
+            None,
+            &env,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "project");
+        let expected = std::env::var("MAKEFLAGS").unwrap_or_else(|_| {
+            format!(
+                "-j{}",
+                executors::run_process::machine_policy().get().build_jobs()
+            )
+        });
+        assert_eq!(lines[1], expected);
+    }
+
     #[tokio::test]
     async fn verification_commands_run_inside_the_checkout_never_at_the_workspace_root() {
         // The verification workspace root is the parent of the checkout. A
@@ -3342,6 +3394,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
         });
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: None,
             command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
@@ -3676,6 +3729,7 @@ mod tests {
         });
         let provider = Arc::new(TestProvider::default());
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: Some(CommandObserver {
                 actor_identity_id: "agent-1".to_owned(),

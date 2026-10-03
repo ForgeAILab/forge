@@ -2048,6 +2048,46 @@ canonical Charter, Document, milestone, Project, and binding
 revisions and reports stale references as a read-time overlay; it never rewrites
 the immutable manifest or LCM history.
 
+### Per-run build budget and CPU priority
+
+Every CLI agent process (and its children), native tool command, review CI
+step, Project hook and environment check/setup command uses the executing
+machine's build budget. Unset `build_jobs_per_run` computes
+`max(1, logical_cores / run_cap)`: use the configured positive machine cap, or
+the automatic cap `max(2, logical_cores / 2)` when the cap is unset or `0`.
+`build_jobs_per_run: 0` disables Forge's defaults; a positive value is exact.
+Forge supplies `CARGO_BUILD_JOBS=k`, `RUST_TEST_THREADS=k`, `MAKEFLAGS=-j<k>`,
+`CMAKE_BUILD_PARALLEL_LEVEL=k` and `GOFLAGS=-p=<k>`. Each Project's
+`environment.env` takes precedence, then the Forge/daemon process environment,
+then these defaults. These are cooperative tool limits, not a hard CPU quota.
+
+On Unix, run children start with a niceness increment of `run_nice` (default
+`10`, range `0`–`19`; `0` disables it, resulting niceness capped at `19`). Their
+children inherit that priority; Forge's own priority stays unchanged. Failure
+to lower priority logs once and does not fail work. On Windows niceness is a
+no-op. Updates affect newly spawned processes; existing children keep their
+launch environment and priority.
+
+Server controls are `server.build_jobs_per_run` and `server.run_nice` in YAML,
+`FORGE_SERVER_BUILD_JOBS_PER_RUN` and `FORGE_SERVER_RUN_NICE` in the operator
+environment, and `forge --build-jobs-per-run N --run-nice N`. Precedence is file,
+then environment, then flag. Forge Settings changes these values live, with
+cores, effective cap and budget shown beside the machine cap; launch overrides
+apply again after a restart. Operations includes the available server facts.
+
+Daemons use top-level `build_jobs_per_run` and `run_nice` in `daemon.yaml` beside
+their credentials. `forge-daemon`, `forge-ctl daemon link` and
+`forge-ctl daemon start` accept `--build-jobs-per-run N` and `--run-nice N` to
+override the file. This is daemon-local policy, with no transport override and
+no daemon protocol change. Remote policy facts are not reported.
+
+The runtime owns one shared machine process-policy handle. Settings updates
+and Operations read that handle; the server entrypoint installs it for the
+common process launch helpers. Commands take a policy snapshot at launch.
+The Unix pre-exec callback uses only OS syscalls; a parent-side receiver logs
+priority failure once so logging cannot lock in the forked child.
+
+
 ### One capability, one declaration
 
 A native agent operation is declared once, as an `OperationContract` row in
