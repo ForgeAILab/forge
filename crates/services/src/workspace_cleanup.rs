@@ -165,8 +165,8 @@ impl WorkspaceCleanupScheduler {
                     sweeper.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     loop {
                         tokio::select! {
-                            _ = ticker.tick() => { let _ = worker.tick(scheduler.tick()).await; }
-                            _ = sweeper.tick() => { let _ = worker.tick(scheduler.sweep()).await; }
+                            _ = ticker.tick() => { if let Err(error) = worker.tick(scheduler.tick()).await { tracing::warn!(worker = worker.name(), %error, "workspace cleanup tick failed"); } }
+                            _ = sweeper.tick() => { if let Err(error) = worker.tick(scheduler.sweep()).await { tracing::warn!(worker = worker.name(), %error, "terminal Task workspace sweep failed"); } }
                             result = shutdown_rx.changed() => {
                                 if result.is_err() || *shutdown_rx.borrow() { return Ok(()); }
                             }

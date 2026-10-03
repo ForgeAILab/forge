@@ -97,6 +97,7 @@ impl EmbeddedDaemon {
                     worker
                         .run(
                             || monitor.stop_requested.load(Ordering::SeqCst),
+                            "embedded daemon report failed",
                             || monitor.scan_and_report(),
                             || async {
                                 tokio::select! {

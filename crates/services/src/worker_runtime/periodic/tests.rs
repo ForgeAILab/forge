@@ -225,3 +225,78 @@ async fn shutdown_finishes_in_flight_tick_and_aborting_owner_drops_child() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn successful_ticks_skip_health_io_and_only_clear_after_an_error() {
+    let workers = registry().await;
+    sqlx::query("CREATE TABLE health_writes (kind TEXT)")
+        .execute(workers.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER count_health_insert AFTER INSERT ON worker_health BEGIN INSERT INTO health_writes VALUES ('insert'); END").execute(workers.db.pool()).await.unwrap();
+    sqlx::query("CREATE TRIGGER count_health_update AFTER UPDATE ON worker_health BEGIN INSERT INTO health_writes VALUES ('update'); END").execute(workers.db.pool()).await.unwrap();
+    let worker = workers.worker("health-io");
+    worker.tick(async { Ok(()) }).await.unwrap();
+    assert_eq!(
+        worker.state.lock().unwrap().health_clear_checks,
+        2,
+        "one startup check per error scope"
+    );
+    for _ in 0..50 {
+        worker.tick(async { Ok(()) }).await.unwrap();
+    }
+    assert_eq!(
+        worker.state.lock().unwrap().health_clear_checks,
+        2,
+        "no steady-state health reads"
+    );
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM health_writes")
+        .fetch_one(workers.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(writes, 0);
+    let _ = worker
+        .tick(async { Err::<(), _>(ServiceError::invalid_operation("fixture failure")) })
+        .await;
+    let _ = worker
+        .tick(async { Err::<(), _>(ServiceError::invalid_operation("fixture failure")) })
+        .await;
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM health_writes")
+        .fetch_one(workers.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        writes, 2,
+        "one insert and one error update; identical failures are deduplicated"
+    );
+    worker.tick(async { Ok(()) }).await.unwrap();
+    let writes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM health_writes")
+        .fetch_one(workers.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(writes, 3, "one error-to-ok update");
+    assert_eq!(worker.state.lock().unwrap().health_clear_checks, 4);
+    for _ in 0..50 {
+        worker.tick(async { Ok(()) }).await.unwrap();
+    }
+    assert_eq!(worker.state.lock().unwrap().health_clear_checks, 4);
+    assert!(workers.status().await.unwrap()[0].last_error.is_none());
+}
+
+#[tokio::test]
+async fn first_success_clears_stale_tick_and_runtime_errors_once() {
+    let workers = registry().await;
+    let health = WorkerHealth::new(Arc::clone(&workers.db), "stale-health");
+    health
+        .report_error_kind(HealthErrorKind::Tick, "previous tick")
+        .await
+        .unwrap();
+    health.record_restart("previous runtime").await.unwrap();
+    let worker = workers.worker("stale-health");
+    worker.tick(async { Ok(()) }).await.unwrap();
+    worker.tick(async { Ok(()) }).await.unwrap();
+    assert_eq!(worker.state.lock().unwrap().health_clear_checks, 2);
+    let row = workers.status().await.unwrap().remove(0);
+    assert!(row.last_error.is_none());
+    assert_eq!(row.restart_count, 1);
+}

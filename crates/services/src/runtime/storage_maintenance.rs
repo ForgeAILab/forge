@@ -35,7 +35,7 @@ impl StorageMaintenanceWorker {
                             if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
                         }
                         _ = tick.tick() => {
-                            let _ = worker.tick(maintenance.maintain_once(&shutdown)).await;
+                            if let Err(error) = worker.tick(maintenance.maintain_once(&shutdown)).await { tracing::warn!(worker = worker.name(), %error, "storage maintenance tick failed"); }
                         }
                     }
                 }

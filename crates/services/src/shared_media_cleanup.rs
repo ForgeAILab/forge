@@ -57,13 +57,13 @@ impl SharedMediaCleanupScheduler {
         workers.worker("shared-media-cleanup").start(shutdown, || false, move |worker, mut shutdown_rx| {
             let scheduler = Arc::clone(&self);
             async move {
-                let _ = worker.tick(scheduler.cleanup_now()).await;
+                if let Err(error) = worker.tick(scheduler.cleanup_now()).await { warn!(worker = worker.name(), %error, "shared media startup reconciliation failed"); }
                 let mut ticker = interval(TICK_INTERVAL);
                 // Start the original Burst interval AFTER startup reconciliation.
                 ticker.tick().await;
                 loop {
                     tokio::select! {
-                        _ = ticker.tick() => { let _ = worker.tick(scheduler.cleanup_now()).await; }
+                        _ = ticker.tick() => { if let Err(error) = worker.tick(scheduler.cleanup_now()).await { warn!(worker = worker.name(), %error, "shared media cleanup tick failed"); } }
                         result = shutdown_rx.changed() => {
                             if result.is_err() || *shutdown_rx.borrow() { return Ok(()); }
                         }

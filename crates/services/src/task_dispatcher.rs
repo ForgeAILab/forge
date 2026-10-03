@@ -104,7 +104,7 @@ impl TaskDispatcher {
         let stop = Arc::clone(&self);
         self.periodic_workers
             .worker("task-dispatcher")
-            .with_tick_timeout(timeout)
+            .with_stall_budget(timeout)
             .start_stoppable(
                 move || stop.is_stopped(),
                 move |worker| {
@@ -118,6 +118,7 @@ impl TaskDispatcher {
                         let result = worker
                             .run(
                                 || dispatcher.is_stopped(),
+                                "task dispatcher check failed",
                                 || check(Arc::clone(&dispatcher)),
                                 || async {
                                     tokio::select! {

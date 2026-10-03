@@ -44,7 +44,7 @@ impl ExternalSyncService {
         let stop = Arc::clone(&self);
         workers
             .worker("external-sync")
-            .with_tick_timeout(Duration::from_secs(3600))
+            .with_stall_budget(Duration::from_secs(3600))
             .start_stoppable(
                 move || stop.is_stopped(),
                 move |worker| {
@@ -53,6 +53,7 @@ impl ExternalSyncService {
                         worker
                             .run(
                                 || monitor.is_stopped(),
+                                "periodic worker tick failed",
                                 || async {
                                     monitor.tick().await;
                                     Ok(())

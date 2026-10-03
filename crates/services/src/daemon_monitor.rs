@@ -61,6 +61,7 @@ impl DaemonMonitor {
                     worker
                         .run(
                             || monitor.is_stopped(),
+                            "daemon monitor check failed",
                             || monitor.check_once(),
                             || async {
                                 tokio::select! {

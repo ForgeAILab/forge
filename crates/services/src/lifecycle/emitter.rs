@@ -134,12 +134,15 @@ impl LifecycleEventEmitter {
                 result = rx.recv() => {
                     match result {
                         Ok(event) => {
+                            if !handles_event(&event) { continue; }
                             if let Some(worker) = &worker {
-                                let _ = worker.tick(async {
+                                if let Err(error) = worker.tick(async {
                                     self.handle_event(event).await.map_err(crate::ServiceError::invalid_operation)
-                                }).await;
+                                }).await {
+                                    warn!(worker = worker.name(), %error, "lifecycle event emitter failed");
+                                }
                             } else if let Err(error) = self.handle_event(event).await {
-                                warn!(%error, "lifecycle event emitter failed");
+                                warn!(worker = "lifecycle-projection", %error, "lifecycle event emitter failed");
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -537,6 +540,19 @@ async fn wait_for_shutdown(mut shutdown: Option<watch::Receiver<bool>>) {
     }
 }
 
+// Match the handler's existing context/type gates before allocating tick health.
+fn handles_event(event: &ForgeEvent) -> bool {
+    match &event.context {
+        EventContext::TaskStatusChanged { .. } => event.event_type == "task.status_changed",
+        EventContext::TaskMoved(payload) => {
+            event.event_type == events::TASK_MOVED_EVENT && payload.old_status != payload.new_status
+        }
+        EventContext::TaskAssigned { .. } => event.event_type == "task.execution_launched",
+        EventContext::ExecutionStarted { .. } => true,
+        _ => false,
+    }
+}
+
 fn lifecycle_hooks_for(
     hooks: &LifecycleHooks,
     event: api_types::LifecycleEvent,
@@ -583,6 +599,39 @@ mod tests {
     use db::{create_sqlite_pool, SqliteDb};
     use events::EventBus;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn ignored_streaming_events_do_not_tick_or_touch_health() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let emitter = LifecycleEventEmitter::new_for_test(db, Arc::new(PluginRegistry::default()));
+        let bus = EventBus::new(1024);
+        let rx = bus.subscribe();
+        for _ in 0..512 {
+            bus.publish(ForgeEvent {
+                event_type: "execution.log".to_owned(),
+                entity_id: "execution".to_owned(),
+                timestamp: events::event_timestamp(),
+                context: EventContext::ReconciliationEvent {
+                    task_id: None,
+                    execution_id: None,
+                    reason: "stream".to_owned(),
+                },
+            });
+        }
+        // A closed bus drains its queued events before Closed: the loop must
+        // process all 512 hints without creating even its first health tick.
+        drop(bus);
+        timeout(
+            Duration::from_secs(5),
+            emitter.run_until_shutdown(rx, None, Some(workers.worker("lifecycle-projection"))),
+        )
+        .await
+        .unwrap();
+        assert!(workers.status().await.unwrap()[0].last_tick_at.is_none());
+    }
 
     #[tokio::test]
     async fn run_with_shutdown_stops_the_receiver_loop() {
