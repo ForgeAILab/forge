@@ -59,6 +59,7 @@ impl ForgeConfig {
 
         if let Some(server) = file.server {
             self.server.max_concurrent_runs = server.max_concurrent_runs;
+            self.server.usage_index_budget_mb = server.usage_index_budget_mb;
             if let Some(bind) = server.bind {
                 self.server.bind = bind;
             }
@@ -202,6 +203,10 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
+            self.server.usage_index_budget_mb =
+                Some(parse_env_u32("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", &value)?);
+        }
         if let Some(value) = env_value("FORGE_SERVER_MAX_CONCURRENT_RUNS") {
             self.server.max_concurrent_runs =
                 Some(parse_env_u32("FORGE_SERVER_MAX_CONCURRENT_RUNS", &value)?);
@@ -277,6 +282,9 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(budget) = overrides.server_usage_index_budget_mb {
+            self.server.usage_index_budget_mb = Some(budget);
+        }
         if let Some(cap) = overrides.server_max_concurrent_runs {
             self.server.max_concurrent_runs = Some(cap);
         }

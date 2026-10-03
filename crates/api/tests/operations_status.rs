@@ -28,6 +28,8 @@ async fn operations_status_empty_db_is_healthy() {
     assert!(status.workspace_cleanup.is_empty());
     assert!(status.retry_pressure.is_empty());
     assert!(status.recent_errors.is_empty());
+    assert_eq!(status.usage_index.budget_bytes, 128 * 1024 * 1024);
+    assert!(!status.usage_index.fallback);
 }
 
 #[tokio::test]
@@ -75,6 +77,9 @@ async fn operations_status_response_has_expected_structure() {
     assert!(status.get("workspace_cleanup").is_some());
     assert!(status.get("retry_pressure").is_some());
     assert!(status.get("usage_summary").is_some());
+    assert!(status["usage_index"]["current_size_bytes"].is_number());
+    assert!(status["usage_index"]["budget_bytes"].is_number());
+    assert!(status["usage_index"]["fallback"].is_boolean());
     assert!(status.get("recent_errors").is_some());
     assert!(status["event_consumers"].is_array());
     assert!(status["database"]["incremental_vacuum"].is_boolean());
@@ -202,4 +207,34 @@ async fn operations_status_reports_stalled_consumer_and_database_storage() {
         && alert.severity == OperatorSeverity::Attention));
     assert!(status.database.incremental_vacuum);
     assert!(status.database.free_pages >= 0);
+}
+
+#[tokio::test]
+async fn operations_status_uses_startup_budget_and_effective_config() {
+    let workspace = common::TestDir::new("usage-budget-startup");
+    let harness = common::test_app(workspace.path(), "usage-budget-startup").await;
+    let mut config = (*harness.state.effective_config).clone();
+    config.server.usage_index_budget_mb = Some(0);
+    let runtime = services::ForgeRuntimeBuilder::from_config(
+        harness.state.db.clone(),
+        harness.state.event_bus.clone(),
+        config.clone(),
+    )
+    .build();
+    let state = api::AppState::from_runtime(runtime, true);
+    assert_eq!(state.usage_ledger_index.configured_budget_mb(), Some(0));
+    config.server.usage_index_budget_mb = Some(64);
+    let state = state.with_effective_config(config);
+    assert_eq!(state.usage_ledger_index.configured_budget_mb(), Some(64));
+    let app = api::build_router(state, workspace.path().to_path_buf());
+    let status: OperatorStatusResponse = common::empty_request_with_bearer(
+        &app,
+        Method::GET,
+        "/api/v1/operations/status",
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(status.usage_index.budget_bytes, 64 * 1024 * 1024);
+    assert!(!status.usage_index.fallback);
 }

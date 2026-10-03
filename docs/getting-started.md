@@ -344,6 +344,28 @@ Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_EVENT_CONSUMER_STALL_SECONDS`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
 
+### Usage index memory budget
+
+The usage observation index defaults to a **128 MiB** memory budget. Set
+`server.usage_index_budget_mb` in `forge.yaml`,
+`FORGE_SERVER_USAGE_INDEX_BUDGET_MB`, or `forge --usage-index-budget-mb N`.
+Launch precedence is CLI > environment > config file > the 128 MiB default.
+Values are non-negative integers in MiB; `0` disables the index and uses
+memoized full reads. For example:
+
+```yaml
+server:
+  usage_index_budget_mb: 64
+```
+
+In **Forge Settings → Server**, edit **Usage index memory budget**; leave it
+blank to restore 128 MiB. The saved budget applies without a restart: on the
+next usage read, a fitting index remains warm, an oversized index is discarded,
+and a changed budget retries a previously discarded index from the ledger.
+Raising the budget can therefore rebuild the index on the next read. A live
+setting supersedes launch overrides until the next restart. **Operations** shows
+the estimated index charge, budget, and incremental or memoized read path.
+
 ### Limit concurrent machine runs
 
 Forge defaults to half the host's logical cores, with a minimum of two runs.

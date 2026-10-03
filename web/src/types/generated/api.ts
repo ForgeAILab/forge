@@ -1633,7 +1633,14 @@ export interface DatabaseStorageStatus {
   free_pages: number
 }
 
+export interface UsageIndexStatus {
+  current_size_bytes: number
+  budget_bytes: number
+  fallback: boolean
+}
+
 export interface OperatorStatusResponse {
+  usage_index: UsageIndexStatus
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
   database: DatabaseStorageStatus
@@ -1809,6 +1816,7 @@ export interface UpdateForgePathsRequest {
 }
 
 export interface UpdateServerSettingsRequest {
+  usage_index_budget_mb?: number | null
   max_concurrent_runs?: number | null
   bind?: string | null
   mcp_enabled?: boolean | null

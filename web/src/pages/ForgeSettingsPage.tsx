@@ -62,6 +62,7 @@ export function ForgeSettingsPage({
   const [bind, setBind] = useState('')
   const [mcpEnabled, setMcpEnabled] = useState(true)
   const [serverRunCap, setServerRunCap] = useState('')
+  const [usageIndexBudget, setUsageIndexBudget] = useState('')
   const [maxConcurrent, setMaxConcurrent] = useState('')
   const [heartbeatInterval, setHeartbeatInterval] = useState('')
   const [maxMissedHeartbeats, setMaxMissedHeartbeats] = useState('')
@@ -76,6 +77,7 @@ export function ForgeSettingsPage({
     setBind(String(get('server.bind') ?? ''))
     setMcpEnabled(get('server.mcp_enabled') !== false)
     setServerRunCap(String(get('server.max_concurrent_runs') ?? ''))
+    setUsageIndexBudget(String(get('server.usage_index_budget_mb') ?? ''))
     setMaxConcurrent(String(get('agent.max_concurrent_tasks') ?? ''))
     setHeartbeatInterval(String(get('agent.heartbeat_interval_seconds') ?? ''))
     setMaxMissedHeartbeats(String(get('agent.max_missed_heartbeats') ?? ''))
@@ -85,6 +87,14 @@ export function ForgeSettingsPage({
   const isSaving = updateSettings.isPending
 
   function saveServer() {
+    const budget = Number(usageIndexBudget)
+    if (
+      usageIndexBudget.trim() &&
+      (!Number.isInteger(budget) || budget < 0 || budget > 4294967295)
+    ) {
+      toast.error('Usage index budget must be a non-negative integer in MiB')
+      return
+    }
     const cap = Number(serverRunCap)
     if (serverRunCap.trim() && (!Number.isInteger(cap) || cap < 0 || cap > 4294967295)) {
       toast.error('Max concurrent runs must be a non-negative integer')
@@ -95,7 +105,14 @@ export function ForgeSettingsPage({
       return
     }
     updateSettings.mutate(
-      { server: { bind: bind.trim(), mcp_enabled: mcpEnabled, max_concurrent_runs: serverRunCap.trim() ? cap : null } },
+      {
+        server: {
+          bind: bind.trim(),
+          mcp_enabled: mcpEnabled,
+          max_concurrent_runs: serverRunCap.trim() ? cap : null,
+          usage_index_budget_mb: usageIndexBudget.trim() ? budget : null,
+        },
+      },
       {
         onSuccess: () => toast.success('Server settings saved'),
         onError: (err) => toast.error(getApiErrorMessage(err, 'Failed to save server settings')),
@@ -213,6 +230,9 @@ export function ForgeSettingsPage({
                 <ServerTab
                   bind={bind}
                   serverRunCap={serverRunCap}
+                  usageIndexBudget={usageIndexBudget}
+                  budgetSetting={getSetting('server.usage_index_budget_mb')}
+                  onBudgetChange={setUsageIndexBudget}
                   runCapSetting={getSetting('server.max_concurrent_runs')}
                   onRunCapChange={setServerRunCap}
                   mcpEnabled={mcpEnabled}
@@ -257,7 +277,12 @@ export function ForgeSettingsPage({
 }
 
 function ServerTab({
-  serverRunCap, runCapSetting, onRunCapChange,
+  usageIndexBudget,
+  budgetSetting,
+  onBudgetChange,
+  serverRunCap,
+  runCapSetting,
+  onRunCapChange,
   bind,
   mcpEnabled,
   isSaving,
@@ -267,6 +292,9 @@ function ServerTab({
   onMcpEnabledChange,
   onSave,
 }: {
+  usageIndexBudget: string
+  budgetSetting: ForgeSettingResponse | undefined
+  onBudgetChange: (v: string) => void
   serverRunCap: string
   runCapSetting: ForgeSettingResponse | undefined
   onRunCapChange: (v: string) => void
@@ -296,6 +324,33 @@ function ServerTab({
           placeholder="Auto" value={serverRunCap} onChange={(e) => onRunCapChange(e.target.value)} />
         <p className="mt-1 text-xs text-muted-foreground">
           {runCapSetting?.value == null ? `Automatic (${runCapSetting?.effective_value ?? '—'})` : runCapSetting.effective_value == null ? 'Unlimited' : `In effect: ${runCapSetting.effective_value}`}
+        </p>
+      </SettingsSection>
+      <SettingsSection
+        title="Usage index memory budget"
+        description="Blank uses 128 MiB; 0 uses memoized full reads. On the next usage read, an oversized index is discarded; increasing the budget retries a rebuild. CLI or environment overrides take effect again after a restart."
+      >
+        <Label htmlFor="usage-index-budget" className="sr-only">
+          Usage index memory budget
+        </Label>
+        <div className="flex items-center gap-2">
+          <Input
+            id="usage-index-budget"
+            type="number"
+            min={0}
+            max={4294967295}
+            step={1}
+            className="w-24"
+            placeholder="128"
+            value={usageIndexBudget}
+            onChange={(e) => onBudgetChange(e.target.value)}
+          />
+          <span className="text-sm text-muted-foreground">MiB</span>
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {budgetSetting?.effective_value === 0
+            ? 'In effect: memoized full reads'
+            : `In effect: ${budgetSetting?.effective_value ?? 128} MiB`}
         </p>
       </SettingsSection>
       <SettingsSection

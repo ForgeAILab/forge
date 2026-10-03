@@ -216,7 +216,7 @@ credential health), so it may be `active` below the concurrency cap while
 `status` is `busy`. A full machine does not make `effective_status` busy: machine
 capacity is a placement wait, independent of Agent availability.
 
-| GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap applies live |
+| GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
@@ -2063,6 +2063,7 @@ Other keys retain their startup value until restart.
 | `forge.data_dir` | Data-directory path | Restart |
 | `server.bind` | HTTP bind address | Restart |
 | `server.mcp_enabled` | Boolean | Restart |
+| `server.usage_index_budget_mb` | `null`: 128 MiB default; `0`: disable index; positive integer: MiB budget | Live, reconciled on next usage read |
 | `server.max_concurrent_runs` | `null`: automatic; `0`: unlimited; positive integer: ceiling | Live |
 | `workspace.root` | Workspace-directory path | Restart |
 | `workspace.cleanup_delay_seconds` | Positive seconds | Restart |
@@ -2076,6 +2077,17 @@ unlimited, and positive values set a ceiling. Omit the field to leave it alone.
 The response setting has `value` for the configured value and `effective_value`
 for the cap in effect (`null` when unlimited), with `restart_required: false`.
 Updates apply to the next placement admission after the YAML write succeeds.
+
+`server.usage_index_budget_mb` accepts an unsigned 32-bit integer or `null`.
+For example, `PUT /api/v1/settings` with
+`{"server":{"usage_index_budget_mb":64}}` selects 64 MiB. Omission preserves
+the current setting; `null` restores the 128 MiB default; `0` always uses
+memoized full reads. Its response `value` is the configured value (including
+`null`), `effective_value` is the resolved MiB budget, and
+`restart_required` is always `false`. After the YAML write succeeds, the next
+usage read keeps a fitting warm index, discards an oversized one, or rebuilds
+a previously discarded index when its budget has changed. Ledger data and
+usage results are unchanged.
 
 A live update supersedes a CLI or environment override for the running process;
 that override takes effect again at the next restart under the usual precedence.
@@ -3259,6 +3271,13 @@ Operations `daemon_pressure` lists one entry per execution machine, including
 Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
 `null` for unlimited), and `at_capacity`. `agent_pressure` uses
 `active_tasks` and `max_concurrent_tasks` fields for its per-Agent Task cap.
+
+Operations also returns `usage_index` with additive fields:
+`current_size_bytes` (conservative retained index charge, including allocator
+and read reserves, not process RSS; zero after discard), `budget_bytes` (the
+resolved budget), and `fallback` (whether reads use the memoized full-read path,
+including an explicitly disabled index). The Operations page displays these
+values. This is process-local diagnostic state, not stored accounting data.
 
 ## Notifications
 
