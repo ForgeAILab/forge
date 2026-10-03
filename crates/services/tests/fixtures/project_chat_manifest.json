@@ -12,8 +12,8 @@
       "ordinal": 0,
       "source_type": "server_operating_skill",
       "source_id": "operating_skill:forge.project.orchestration/v1",
-      "source_revision": "forge.project.orchestration/v1@19",
-      "fragment_fingerprint": "b13e9a4a0e64b26659d2d5f22e7e5aa345d0938943faa77db0475befb9906de7",
+      "source_revision": "forge.project.orchestration/v1@20",
+      "fragment_fingerprint": "fdf2aae9169e70fd2c0c48fad30afc38eb1d90ecb951237ff64385d7f2fc40ca",
       "selection_reason": "server_owned_project_operating_skill",
       "disposition": "included",
       "retention_priority": 100

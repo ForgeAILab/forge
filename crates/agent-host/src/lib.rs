@@ -19,6 +19,24 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// Compose the shared layout rule into immutable prompt constants without runtime assembly.
+#[macro_export]
+macro_rules! merge_friendly_guidance {
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            "Use small modules with clear ownership so parallel Tasks edit disjoint files. Avoid hub files (central registries, route tables, export/barrel lists, large shared libraries). Prefer per-feature files discovered/registered without shared-list edits; otherwise give one Task ownership of shared edits and make others depend on it. Split along module boundaries; name owned modules/files in each Task.",
+            $after
+        )
+    };
+}
+
+/// One shared rule for agents shaping managed code and Tasks.
+pub const MERGE_FRIENDLY_LAYOUT_GUIDANCE: &str = merge_friendly_guidance!("", "");
+
+/// Short reminder shared by native Task guidance and MCP tool descriptions.
+pub const MERGE_FRIENDLY_TASK_GUIDANCE: &str = "Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.";
+
 pub use agent_runtime::context::Sensitivity;
 pub use agent_runtime::core::clock::Deadline;
 pub use agent_runtime::core::content::{Message, Role};

@@ -870,6 +870,9 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "supply exactly one of workspace-relative path or inline content; filename is optional."
         ));
     }
+    if operations.contains("task.propose") || operations.contains(TASK_ADAPTIVE_OPERATION) {
+        lines.push(crate::MERGE_FRIENDLY_TASK_GUIDANCE);
+    }
     if operations.contains("task.propose") {
         lines.push(concat!(
             "task.propose — create a Task in the bound Project. Fields: ",
@@ -1565,6 +1568,32 @@ mod tests {
         );
         assert!(payload.get("properties").is_none());
         assert!(payload.get("required").is_none());
+    }
+
+    #[test]
+    fn task_shaping_guidance_is_shared_once_for_each_admitted_surface() {
+        let rule = crate::MERGE_FRIENDLY_TASK_GUIDANCE;
+        assert_eq!(
+            rule,
+            "Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file."
+        );
+        assert!(rule.split_whitespace().count() <= 25);
+        for operations in [
+            BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]),
+            BTreeSet::from([TASK_ADAPTIVE_OPERATION.to_owned()]),
+            BTreeSet::from([
+                TASK_PROPOSE_OPERATION.to_owned(),
+                TASK_ADAPTIVE_OPERATION.to_owned(),
+            ]),
+        ] {
+            let guidance = coordination_payload_guidance(&operations);
+            assert_eq!(guidance.matches(rule).count(), 1);
+            assert!(!guidance.contains(crate::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+        }
+        assert!(
+            !coordination_payload_guidance(&BTreeSet::from([TASK_WORKLOG_OPERATION.to_owned()]))
+                .contains(rule)
+        );
     }
 
     #[test]

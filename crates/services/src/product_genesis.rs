@@ -1071,7 +1071,8 @@ mod tests {
             assert!(rendered
                 .starts_with("Forge Main Agent — Project Discovery and Portfolio Protocol v2\n"));
             assert!(rendered.contains("small modules with clear ownership"));
-            assert!(rendered.contains("per-feature files and a thin, mechanical composition point"));
+            assert!(rendered
+                .contains("per-feature files discovered/registered without shared-list edits"));
             assert!(rendered.contains("Current understanding:"));
             assert!(rendered.contains("### Assumptions"));
             assert!(rendered.contains("### Decisions still required"));
