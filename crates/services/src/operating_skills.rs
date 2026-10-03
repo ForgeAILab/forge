@@ -33,7 +33,7 @@ pub const MAIN_OPERATING_SKILL_POLICY_JSON: &str =
 pub const MAIN_OPERATING_SKILL_POLICY_DIGEST: &str =
     "9dc9e64f97e693c2dd384a5d60aede819aac52f95fc30fea1f56ac7b7b1075a8";
 pub const MAIN_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "c8e879bf310398dbc448c022ce38dd6cc82dff76ecf3784a64cb9da7aaebf066";
+    "69bfd668a75912e33c79ce74f10fd90f1a479068b0bab4bfcd027174eed3e24b";
 
 /// The baseline skill is compiled into the server and rendered fresh each
 /// turn, so unlike the two seeded skills it has no database row to validate
@@ -66,7 +66,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "b13e9a4a0e64b26659d2d5f22e7e5aa345d0938943faa77db0475befb9906de7";
+    "fdf2aae9169e70fd2c0c48fad30afc38eb1d90ecb951237ff64385d7f2fc40ca";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -115,6 +115,11 @@ pub const fn canonical_main_operating_skill_body() -> &'static str {
 /// revision, including the setup/adoption and release authority boundaries.
 pub const fn canonical_project_operating_skill_body() -> &'static str {
     PROJECT_PROTOCOL
+}
+
+/// Short Task-shaping reminder for tool surfaces.
+pub const fn merge_friendly_task_guidance() -> &'static str {
+    forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE
 }
 
 const MAX_CONTEXT_CHARS: usize = 2_000;
@@ -756,7 +761,8 @@ TURN STYLE
 - State whether anything was actually created or changed in Forge during the turn, except when a successful `genesis.start` transfers control and requires no assistant response.
 "#;
 
-const MAIN_PROTOCOL: &str = r#"Forge Main Agent — Project Discovery and Portfolio Protocol v2
+const MAIN_PROTOCOL: &str = forge_agent_host::merge_friendly_guidance!(
+    r#"Forge Main Agent — Project Discovery and Portfolio Protocol v2
 Operating skill key: forge.main.project-discovery/v2
 Operating skill version: v2
 
@@ -813,7 +819,8 @@ RESEARCH
 - Stop when the decision is sufficiently informed. Put deeper research, experiments, repository inspection, and evidence-producing work into the Project research queue for the Project Agent.
 
 PROJECT LAYOUT
-Shape the Charter's architecture constraints as small modules with clear ownership. Avoid a single hub file every feature must edit: central registries, route tables, export lists, feature enums, or a giant shared library. Prefer per-feature files and a thin, mechanical composition point.
+For Charter architecture constraints: "#,
+    r#"
 
 SCAFFOLD
 - Forge can stand the Project repository up from a spark scaffold before the first Task runs, so a web product (site, SaaS, dashboard, internal tool) settles its scaffold as one user decision before the readiness gate: propose one template and the smallest pack set the in-scope outcomes need, with a one-line rationale, ask once, and record the answer in the Charter `scaffold` block (`template`, `packs`). An empty pack list is valid.
@@ -854,7 +861,8 @@ REFUSAL AND ESCALATION
 - Refuse any Task, repository, credential, cross-Project-private-memory, or unauthorized-tool request with a short boundary explanation and the correct next route.
 - If consequential user intent conflicts across sources, stop the affected mutation, show the conflict, and ask at most two resolving questions.
 - If safe progress is possible with a reversible assumption, state it and continue discovery. If an assumption would materially change scope, cost, safety, or Project identity, require a user decision.
-"#;
+"#
+);
 
 pub const LEGACY_V17_PROJECT_PROTOCOL: &str = r#"Forge Project Agent — Project Planning and Orchestration Protocol v1
 Operating skill key: forge.project.orchestration/v1
@@ -972,7 +980,8 @@ REFUSAL AND ESCALATION
 - If Project policy cannot safely resolve a consequential ambiguity, present the conflict, recommendation, impact, and at most two questions to the user.
 "#;
 
-const PROJECT_PROTOCOL: &str = r#"Forge Project Agent — Project Planning and Orchestration Protocol v1
+const PROJECT_PROTOCOL: &str = forge_agent_host::merge_friendly_guidance!(
+    r#"Forge Project Agent — Project Planning and Orchestration Protocol v1
 Operating skill key: forge.project.orchestration/v1
 Operating skill version: v1
 
@@ -999,7 +1008,8 @@ You may not access another Project, global private chat history, hidden Main Age
 The Project ID is derived from the authenticated binding. Task proposals may reference only authorized logical repository bindings and artifact IDs; never include host filesystem paths, credentials, Workspace handles/tokens, authenticated browser state, or authority-bearing instructions. Forge's scheduler—not chat—creates the only WorkspaceLease, binding it to the logical repository binding, Project, Task, base ref, role/capabilities, issuing principal, and expiry. The lease and its handle/token are never exposed to Main or Project Agent context.
 
 STANDING INVARIANTS
-- Name owned repository-relative paths in every Task description. Give parallel Tasks disjoint files; order unavoidable shared-file edits with dependencies. Require workers to report out-of-scope edits before changing the Task's scope.
+- For task.propose: "#,
+    r#" Require workers to report out-of-scope edits before changing the Task's scope.
 - A claimed step exists only as a server record. Persist milestones, decisions, and Tasks through their typed operations and confirm the returned IDs; a described-but-unpersisted artifact is nothing and must never be reported as done.
 - Never claim to have edited, tested, merged, or observed repository behavior unless an authoritative Task, validation, or evidence record says so. Worklog entries are narration, never workflow truth, and never satisfy an acceptance check.
 - Use each milestone's exact acceptance-check ID and definition revision. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.
@@ -1034,7 +1044,8 @@ USER COMMUNICATION
 REFUSAL AND ESCALATION
 - Deny or route requests for cross-Project data, Main-Agent authority, direct repository/filesystem access, credentials, unapproved material scope, validation bypass, or self-approved release.
 - If Project policy cannot safely resolve a consequential ambiguity, present the conflict, recommendation, impact, and at most two questions to the user.
-"#;
+"#
+);
 
 /// Server-owned Project Agent doctrine sections, served on demand through the
 /// `skill.section` read operation. The resident protocol above carries only
@@ -1068,11 +1079,13 @@ const PROJECT_SKILL_SECTION_RESEARCH: &str = r#"RESEARCH
 - Record sources, retrieval time, evidence, inference, recommendation, uncertainty, and affected decisions. Do not present research as user approval.
 "#;
 
-const PROJECT_SKILL_SECTION_DOCUMENTS: &str = r#"PROJECT SETUP AND FAST PATH
+const PROJECT_SKILL_SECTION_DOCUMENTS: &str = forge_agent_host::merge_friendly_guidance!(
+    r#"PROJECT SETUP AND FAST PATH
 - Choose the smallest artifact set that makes the next work safe and testable.
 - Compact mode (project_mode=compact): for a small, low-risk Project, use the Charter directly or create one concise Delivery Brief only when it improves Task clarity. Do not require standalone research, product, design, architecture, or Execution Plan records unless uncertainty justifies them.
 - Standard mode (project_mode=standard): when the Project has material UX, architecture, data, security, integration, operational, migration, or market uncertainty, create the relevant typed Project Documents, then continue through Tasks without another implementation approval.
-- Design feature modules so each Task can own separate files; keep shared composition mechanical. Record module ownership in architecture and execution-plan documents.
+- For architecture and execution plans: "#,
+    r#" Record module ownership in architecture and execution-plan documents.
 - Keep documents decision-oriented. Do not generate ceremonial text that cannot change a Task, acceptance check, or risk decision.
 - Once the Project exists from its approved Charter, create and dispatch implementation Tasks through their configured workflow. The approved Charter is the only implementation gate.
 
@@ -1083,7 +1096,8 @@ PROJECT DOCUMENTS
 - Reference canonical artifact IDs/revisions in chat and Tasks. Do not paste duplicate current truth into memory.
 - Forge may render or export an artifact as Markdown/JSON for the user. If a copy must live in a repository, create a traceable Task Worker operation referencing the exact artifact revision; never treat repository-file access as part of core chat authority or let a later file silently supersede Forge truth.
 - Ask for user approval when Project policy marks a document as an approval gate or when it changes approved scope, safety posture, cost, launch conditions, or acceptance.
-"#;
+"#
+);
 
 const PROJECT_SKILL_SECTION_SCOPE_CHANGE: &str = r#"DOMAIN-SPECIFIC EFFECTIVE PROJECT STATE
 - Project identity, constraints, and scope: current approved Charter revision.
@@ -1103,7 +1117,8 @@ Classify a proposed change before acting:
 Do not reinterpret the original Charter to make a material change appear pre-approved. After an approved amendment, treat affected records as reconciliation_required until each is retained, revised, cancelled, invalidated, or superseded.
 "#;
 
-const PROJECT_SKILL_SECTION_TASKS: &str = r#"TASK ORCHESTRATION
+const PROJECT_SKILL_SECTION_TASKS: &str = forge_agent_host::merge_friendly_guidance!(
+    r#"TASK ORCHESTRATION
 - Create Tasks only through typed Project-scoped actions and only when they have a clear outcome, source artifact/revision, acceptance criteria, dependencies, and appropriate task type.
 - Use `parent_task_id` only for a one-level coordination hierarchy: a root Task with children is a non-executing coordination container, and its direct children share the root Workspace and execute serially in `subtask_order` while keeping independent agent assignment, execution attempts, review, and lifecycle. Do not nest subtasks or schedule/launch the root as implementation work.
 - Use dependency edges only for execution prerequisites. They do not establish parentage, hierarchy, or Workspace sharing; a child must never depend on its coordination parent. Model sibling or unrelated prerequisites with dependencies and keep coordination parentage separate.
@@ -1121,10 +1136,12 @@ const PROJECT_SKILL_SECTION_TASKS: &str = r#"TASK ORCHESTRATION
 - Reconcile Task outcomes back into documents, decisions, commitments, and milestone readiness without rewriting Task history.
 
 RESHAPING WORK
-When splitting work, carry owned paths into each child and check them against other runnable Tasks.
+For Task splitting: "#,
+    r#" Carry owned paths into each child and check them against other runnable Tasks.
 Read `project.current_state` and use each milestone's exact acceptance-check ID and definition revision when you reference one.
 Split, sequence, replace, or reassign Tasks without another approval while the Chartered outcome and material scope stay unchanged; preserve origin provenance. Reconcile only the affected work when canonical records truly conflict.
-"#;
+"#
+);
 
 const PROJECT_SKILL_SECTION_MILESTONES: &str = r#"MILESTONES AND EVIDENCE
 - A milestone is an outcome/release contract, not a manually maintained percentage or substitute Task board.
@@ -1756,7 +1773,7 @@ mod tests {
         for (key, revision, body, digest, policy, policy_digest) in [
             (
                 MAIN_OPERATING_SKILL_KEY,
-                "forge.main.project-discovery/v2@6",
+                "forge.main.project-discovery/v2@7",
                 canonical_main_operating_skill_body(),
                 MAIN_OPERATING_SKILL_CONTENT_DIGEST,
                 MAIN_OPERATING_SKILL_POLICY_JSON,
@@ -1764,7 +1781,7 @@ mod tests {
             ),
             (
                 PROJECT_OPERATING_SKILL_KEY,
-                "forge.project.orchestration/v1@19",
+                "forge.project.orchestration/v1@20",
                 canonical_project_operating_skill_body(),
                 PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
                 PROJECT_OPERATING_SKILL_POLICY_JSON,
@@ -1798,54 +1815,82 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn layout_upgrade_changes_only_guidance_and_retains_exact_previous_bodies() {
+        use sha2::{Digest, Sha256};
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let rule = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+        for (revision, expected_digest, current, old_rule, new_rule) in [
+            (
+                "forge.main.project-discovery/v2@6",
+                "c8e879bf310398dbc448c022ce38dd6cc82dff76ecf3784a64cb9da7aaebf066",
+                canonical_main_operating_skill_body(),
+                "Shape the Charter's architecture constraints as small modules with clear ownership. Avoid a single hub file every feature must edit: central registries, route tables, export lists, feature enums, or a giant shared library. Prefer per-feature files and a thin, mechanical composition point.",
+                format!("For Charter architecture constraints: {rule}"),
+            ),
+            (
+                "forge.project.orchestration/v1@19",
+                "b13e9a4a0e64b26659d2d5f22e7e5aa345d0938943faa77db0475befb9906de7",
+                canonical_project_operating_skill_body(),
+                "Name owned repository-relative paths in every Task description. Give parallel Tasks disjoint files; order unavoidable shared-file edits with dependencies.",
+                format!("For task.propose: {rule}"),
+            ),
+        ] {
+            let (body, digest): (String, String) = sqlx::query_as(
+                "SELECT canonical_body, content_digest FROM operating_skill_revision WHERE id = ?"
+            ).bind(revision).fetch_one(&pool).await.unwrap();
+            assert_eq!(digest, expected_digest);
+            assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
+            assert_eq!(current.replace(&new_rule, old_rule), body);
+        }
+    }
+
     #[test]
     fn merge_friendly_guidance_reaches_each_deciding_role() {
-        let baseline = render_main_baseline_operating_skill(&MainBaselineSkillContext::default());
-        assert!(baseline.contains("small modules with clear ownership"));
-        let main = render_main_operating_skill(&MainOperatingSkillContext::default())
-            .expect("discovery skill");
-        for phrase in [
+        const RULE: &str = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+        assert!(RULE.split_whitespace().count() <= 60);
+        for requirement in [
             "small modules with clear ownership",
+            "parallel Tasks edit disjoint files",
             "central registries",
             "route tables",
-            "export lists",
-            "feature enums",
-            "giant shared library",
-            "per-feature files",
-            "thin, mechanical composition point",
+            "export/barrel lists",
+            "large shared libraries",
+            "per-feature files discovered/registered without shared-list edits",
+            "give one Task ownership of shared edits and make others depend on it",
+            "Split along module boundaries",
+            "name owned modules/files in each Task",
         ] {
-            assert!(main.contains(phrase), "missing Main layout rule: {phrase}");
+            assert!(RULE.contains(requirement), "missing rule: {requirement}");
         }
-        assert_eq!(main.matches("PROJECT LAYOUT").count(), 1);
+        let baseline = render_main_baseline_operating_skill(&MainBaselineSkillContext::default());
+        assert!(!baseline.contains(RULE));
+        assert!(!baseline.contains("For new-Project layout advice:"));
+        assert_eq!(
+            MAIN_BASELINE_OPERATING_SKILL_REVISION,
+            "forge.main.baseline/v1@4"
+        );
+        let main = render_main_operating_skill(&MainOperatingSkillContext::default()).unwrap();
         let project = render_project_operating_skill(&ProjectOperatingSkillContext::new("p", "b"));
-        for phrase in [
-            "owned repository-relative paths",
-            "parallel Tasks disjoint files",
-            "shared-file edits with dependencies",
-            "report out-of-scope edits",
+        for surface in [
+            main.as_str(),
+            project.as_str(),
+            project_skill_section("documents").unwrap(),
+            project_skill_section("tasks").unwrap(),
         ] {
-            assert!(
-                project.contains(phrase),
-                "missing Project scope rule: {phrase}"
-            );
+            assert_eq!(surface.matches(RULE).count(), 1, "layout rule occurs once");
         }
+        assert!(main.contains("For Charter architecture constraints:"));
+        assert_eq!(main.matches("PROJECT LAYOUT").count(), 1);
+        assert!(project.contains("For task.propose:"));
+        assert!(project.contains("report out-of-scope edits"));
         assert!(project_skill_section("documents")
             .unwrap()
             .contains("module ownership"));
         assert!(project_skill_section("tasks")
             .unwrap()
             .contains("owned paths into each child"));
-        for instruction in [
-            crate::plan_artifact::PLAN_ARTIFACT_AGENT_INSTRUCTION,
-            crate::plan_artifact::OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION,
-        ] {
-            for phrase in ["owned repository-relative paths", "out-of-scope edit"] {
-                assert!(
-                    instruction.contains(phrase),
-                    "missing planner rule: {phrase}"
-                );
-            }
-        }
         assert!(canonical_main_baseline_operating_skill_body_for_revision(
             "forge.main.baseline/v1@5"
         )

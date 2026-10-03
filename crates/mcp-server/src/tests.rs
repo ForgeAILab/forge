@@ -1039,6 +1039,20 @@ fn tools_list_returns_descriptors() {
                 .contains(phrase));
         }
 
+        assert_eq!(
+            create_task["description"]
+                .as_str()
+                .unwrap()
+                .matches(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE)
+                .count(),
+            1
+        );
+
+        assert!(!create_task["description"]
+            .as_str()
+            .unwrap()
+            .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+
         let create_subtasks = tools
             .iter()
             .find(|tool| tool["name"] == "forge_create_sub_tasks")
@@ -1047,6 +1061,18 @@ fn tools_list_returns_descriptors() {
             .as_str()
             .expect("create subtasks description")
             .contains("non-executing coordination container"));
+        assert_eq!(
+            create_subtasks["description"]
+                .as_str()
+                .unwrap()
+                .matches(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE)
+                .count(),
+            1
+        );
+        assert!(!create_subtasks["description"]
+            .as_str()
+            .unwrap()
+            .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
     });
 }
 

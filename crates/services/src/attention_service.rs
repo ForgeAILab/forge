@@ -1636,7 +1636,7 @@ impl AttentionService {
         let mut last_error_code: Option<String> = row.try_get("last_error_kind")?;
         let mut last_error_message: Option<String> = row.try_get("last_error")?;
         if last_error_message.is_none() {
-            let recent: Option<(String, String)> = sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
+            let recent: Option<(String, String)> = sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
                 .bind(CONSUMER_NAME).bind((Utc::now() - Duration::hours(1)).to_rfc3339()).fetch_optional(self.db.pool()).await?;
             if let Some((kind, message)) = recent {
                 last_error_code = Some(kind);
@@ -4029,6 +4029,52 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(sources, vec![good.id]);
+    }
+
+    #[tokio::test]
+    async fn consumer_health_ignores_resolved_quarantines() {
+        let service = health_service().await;
+        service.project_once(1).await.unwrap();
+        let mut tx = db::begin_immediate(service.db.pool()).await.unwrap();
+        db::WorkerHealth::new(service.db.clone(), CONSUMER_NAME)
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "12",
+                    item_type: "validation.failed",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: &now_rfc3339(),
+                },
+                "projection rejection",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let health = service.consumer_health().await.unwrap().unwrap();
+        assert_eq!(
+            health.last_error_message.as_deref(),
+            Some("projection rejection")
+        );
+        let id: String = sqlx::query_scalar("SELECT id FROM worker_dead_letter")
+            .fetch_one(service.db.pool())
+            .await
+            .unwrap();
+        crate::dead_letter_service::DeadLetterService::new(service.db.clone())
+            .dismiss(
+                crate::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true,
+                },
+                &id,
+                None,
+            )
+            .await
+            .unwrap();
+        let health = service.consumer_health().await.unwrap().unwrap();
+        assert!(health.last_error_code.is_none());
+        assert!(health.last_error_message.is_none());
     }
 
     fn event(event_type: &str, payload_json: &str) -> DomainEvent {

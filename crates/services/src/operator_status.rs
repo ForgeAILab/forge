@@ -11,7 +11,7 @@ use api_types::{
     DaemonPressureSummary, DatabaseStorageStatus, EffectiveExecutionPolicy, EventConsumerStatus,
     EventRelayStatus, OperatorSeverity, OperatorStatusResponse, PlanProgressSummary,
     RecentErrorSummary, RetryPressureSummary, TokenTotalsSummary, UsageSummary,
-    WorkerDeadLetterSummary, WorkspaceCleanupSummary,
+    WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{SqliteDb, WorkspaceRepo};
@@ -32,6 +32,7 @@ use log_snapshot::ExecutionLogSnapshots;
 pub struct OperatorStatusService {
     run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
     db: Arc<SqliteDb>,
+    periodic_workers: Arc<crate::worker_runtime::PeriodicWorkers>,
     log_snapshots: ExecutionLogSnapshots,
     usage_cache: Arc<UsageLedgerIndex>,
     consumer_stall_seconds: u32,
@@ -48,6 +49,9 @@ impl OperatorStatusService {
         workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     ) -> Self {
         Self {
+            periodic_workers: Arc::new(crate::worker_runtime::PeriodicWorkers::new(Arc::clone(
+                &db,
+            ))),
             db: Arc::clone(&db),
             run_process_policy: Arc::new(executors::run_process::MachineRunPolicy::default()),
             log_snapshots: ExecutionLogSnapshots::default(),
@@ -72,6 +76,9 @@ impl OperatorStatusService {
             .initialize_identity(&config::embedded_machine_id());
         Self {
             workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
+            periodic_workers: Arc::new(crate::worker_runtime::PeriodicWorkers::new(Arc::clone(
+                &db,
+            ))),
             db: Arc::clone(&db),
             run_process_policy: Arc::new(executors::run_process::MachineRunPolicy::default()),
             log_snapshots: ExecutionLogSnapshots::default(),
@@ -90,6 +97,10 @@ impl OperatorStatusService {
     ) -> Self {
         self.run_process_policy = policy;
         self
+    }
+
+    pub fn periodic_workers(&self) -> Arc<crate::worker_runtime::PeriodicWorkers> {
+        Arc::clone(&self.periodic_workers)
     }
 
     pub fn usage_ledger_index(&self) -> Arc<UsageLedgerIndex> {
@@ -176,12 +187,24 @@ impl OperatorStatusService {
             .map_err(|_| ServiceError::Db(db::DbError::InvalidTransition))?;
         let usage_summary = Some(self.usage_summary(active_execution_count).await?);
         let event_consumers = self.event_consumers(now).await?;
+        let periodic_workers = self.periodic_workers.status().await?;
         let storage = db::sqlite_storage_status(self.db.pool()).await?;
         let database = DatabaseStorageStatus {
             incremental_vacuum: storage.incremental_vacuum,
             free_pages: storage.free_pages,
         };
         let mut recent_errors = self.recent_errors(now).await?;
+        for worker in &periodic_workers {
+            if let (Some(error), Some(occurred_at)) = (&worker.last_error, &worker.last_error_at) {
+                recent_errors.push(RecentErrorSummary {
+                    entity_type: "periodic_worker".to_owned(),
+                    entity_id: worker.worker_name.clone(),
+                    error: error.clone(),
+                    occurred_at: occurred_at.clone(),
+                    severity: OperatorSeverity::Attention,
+                });
+            }
+        }
         let names: Vec<&str> = event_consumers
             .iter()
             .map(|consumer| consumer.consumer_name.as_str())
@@ -309,6 +332,7 @@ impl OperatorStatusService {
             usage_index: self.usage_cache.status().await,
             recent_errors,
             event_consumers,
+            periodic_workers,
             event_relay,
             database,
             computed_at,
@@ -333,23 +357,7 @@ impl OperatorStatusService {
                 .await?;
             let recent_dead_letters = recent_dead_letters
                 .into_iter()
-                .map(|dead| {
-                    let event_sequence = dead.source_key.parse().ok().or_else(|| {
-                        dead.source_key
-                            .strip_prefix("event:")?
-                            .split(':')
-                            .next()?
-                            .parse()
-                            .ok()
-                    });
-                    WorkerDeadLetterSummary {
-                        id: dead.id,
-                        item_key: dead.source_key,
-                        event_sequence,
-                        reason: dead.reason,
-                        occurred_at: dead.occurred_at,
-                    }
-                })
+                .map(|dead| crate::dead_letter_service::summary(&dead))
                 .collect();
             let stalled = consumer.stalled(now, i64::from(self.consumer_stall_seconds));
             statuses.push(EventConsumerStatus {
@@ -994,6 +1002,51 @@ mod tests {
         let service = OperatorStatusService::new(Arc::clone(&db));
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
+    }
+
+    #[tokio::test]
+    async fn periodic_workers_are_listed_with_running_tick_error_and_restart_health() {
+        let (db, service) = test_service().await;
+        let registry = service.periodic_workers();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handle = registry.worker("daemon-monitor").start(rx, || false, {
+            let entered = Arc::clone(&entered);
+            move |worker, _| {
+                let entered = Arc::clone(&entered);
+                async move {
+                    let _ = worker
+                        .tick(async {
+                            Err::<(), _>(ServiceError::invalid_operation("fixture tick failure"))
+                        })
+                        .await;
+                    entered.notify_one();
+                    std::future::pending::<crate::Result<()>>().await
+                }
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        db::WorkerHealth::new(db, "daemon-monitor")
+            .record_restart("fixture restart")
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.overall_severity, OperatorSeverity::Attention);
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|error| error.entity_id == "daemon-monitor"));
+        let row = &status.periodic_workers[0];
+        assert_eq!(row.worker_name, "daemon-monitor");
+        assert!(row.running);
+        assert!(row.last_tick_at.is_some());
+        assert!(row.last_error.is_some());
+        assert!(row.last_error_at.is_some());
+        assert_eq!(row.restart_count, 1);
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -1940,5 +1993,56 @@ mod tests {
         );
         assert!(status.recent_errors.is_empty());
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    }
+    #[tokio::test]
+    async fn resolved_dead_letters_are_excluded_from_counts_recent_history_and_alerts() {
+        let (db, service) = test_service().await;
+        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        let name = crate::coordination_consumer_name();
+        let health = db::WorkerHealth::new(Arc::clone(&db), name);
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        health.ensure_in_tx(&mut tx).await.unwrap();
+        health
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "12",
+                    item_type: "task.done",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: &db::now_rfc3339(),
+                },
+                "old failure",
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers[0].dead_letter_count, 1);
+        assert_eq!(status.event_consumers[0].recent_dead_letters[0].attempts, 8);
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|error| error.entity_type == "worker_dead_letter"));
+        let id = status.event_consumers[0].recent_dead_letters[0].id.clone();
+        crate::dead_letter_service::DeadLetterService::new(db.clone())
+            .dismiss(
+                crate::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true,
+                },
+                &id,
+                None,
+            )
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.event_consumers[0].dead_letter_count, 0);
+        assert!(status.event_consumers[0].recent_dead_letters.is_empty());
+        assert!(!status
+            .recent_errors
+            .iter()
+            .any(|error| error.entity_type == "worker_dead_letter"));
     }
 }

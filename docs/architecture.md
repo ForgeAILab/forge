@@ -451,7 +451,7 @@ Charter amendment rotates current binding/approval pointers while retaining the
 same receipt. Already admitted retrying turns continue to use their frozen
 binding/Profile/skill provenance.
 
-The Project operating skill (`forge.project.orchestration/v1@18`) is a
+The Project operating skill (`forge.project.orchestration/v1@20`) is a
 doctrine index, not a doctrine dump: the resident prompt carries the mission,
 authority boundaries, standing invariants, and autonomous-drive rules, plus an
 index of server-owned doctrine sections (`research`, `documents`,
@@ -463,23 +463,41 @@ identity and digests, and the Agent reads the full rendered text with the
 Project Chat turn's fixed prompt cost small enough that LCM compaction has a
 real conversation budget to work with on small provider profiles.
 
-Merge-friendly doctrine is delivered where layout and scope are decided: Main
-Genesis (`forge.main.project-discovery/v2@6`) calls for small modules with clear
-ownership, per-feature files, and thin mechanical composition instead of shared
-hub files. The account baseline (`forge.main.baseline/v1@4`) carries that advice
-into discovery. Project standing invariants require owned repository-relative
-paths in Task descriptions, disjoint files for parallel Tasks, and dependency
-ordering for shared-file edits. On-demand document and Task sections apply this
-to architecture and splitting; planning prompts carry the same constraints in
-both native and outbox delivery. Scaffolded `AGENTS.md` tells Task Workers to
-stay in owned paths, add feature files, and report scope discoveries.
+Merge-friendly doctrine is delivered where layout and scope are decided. The
+shared compile-time rule recommends small modules with clear ownership and
+disjoint files for parallel Tasks; avoids central registries, route tables,
+export/barrel lists and large shared libraries; and favors per-feature files
+that are discovered or registered without editing a shared list. If a shared
+edit is unavoidable, one Task owns it and other Tasks depend on that Task.
+Work splits follow module boundaries, with owned modules/files named in each
+Task. Main applies this to Charter architecture constraints during Genesis
+(`forge.main.project-discovery/v2@7`). Its account baseline remains at @4,
+with no additional resident layout rule. Project
+standing invariants apply it to `task.propose`
+(`forge.project.orchestration/v1@20`); the on-demand document and Task sections
+apply it to architecture/execution plans and adaptive splitting. Planner runs
+receive it once in their system prompt for both native and outbox delivery;
+plan-artifact delivery instructions still require owned repository-relative
+paths and scope reporting. Scaffolded `AGENTS.md` carries it for implementation
+and follow-up proposals, retaining the worker's existing scope discipline.
+Native Task proposal/adaptive payload guidance carries one short reminder when
+either operation is admitted. MCP Task creation and sub-task descriptors share
+that same reminder: split along module boundaries, name each Task's owned files,
+and avoid Tasks that all edit one shared file. The full doctrine stays at the
+layout/planning surfaces above. Transport-only plan
+artifact instructions and argument field help retain their existing ownership
+requirements without another copy of the rule.
 
-Migration `V202610010500__merge_friendly_doctrine.sql` inserts new digest-pinned
-Main/Project revisions and advances current skill pointers and Project bindings.
-It retains previous revision rows, session prompts, and frozen turn admissions.
-The compiled baseline retains exact bodies for revisions @1–@3; unknown
-revisions still fail closed. These instructions guide agents; they do not
-change merge, rebase, review, or enforce file ownership as a capability grant.
+Migration `V202610031431__merge_friendly_layout_guidance.sql` inserts new
+digest-pinned Main/Project revisions, advances current skill pointers, and
+moves Project bindings from @19 to @20. Previous revision rows, Genesis session
+prompts, and frozen turn admissions stay unchanged. The compiled baseline
+stays at @4 and retains exact bodies/digests for @1–@3; unknown revisions fail
+closed. On-demand
+doctrine, planner constants and scaffold exports have no persisted body
+revision mechanism; their text follows the server build. These instructions
+guide agents; they do not change merge/rebase/review behavior or enforce file
+ownership as a capability grant.
 
 Migration `V202610010550__chat_session_denied_operations.sql` derives Project
 revision @18 by replacing the attention-wake rule in the immutable @17 body.
@@ -1031,7 +1049,7 @@ Attention or wake an Agent.
 
 Every Main Agent Chat turn carries a server-owned operating instruction.
 Outside an active Product Genesis session, the account baseline skill
-`forge.main.baseline/v1` Revision `@2` is in force: it tells the model it is
+`forge.main.baseline/v1` Revision `@4` is in force: it tells the model it is
 Forge's Main Agent, hands it the bounded portfolio projection, and restates the
 no-Task/no-repository/no-credential boundary. It also routes clear
 natural-language new-Project intent through the Main-only typed
@@ -1040,8 +1058,8 @@ new-versus-existing Project intent, and keeps non-Project or existing-Project
 requests in baseline scope. The browser does not own semantic classification.
 The baseline is compiled into the server (each revision's content digest is
 pinned by a test, not a seeded row) and the exact revision/digest is frozen in
-the turn's context manifest. Historical `@1` turns remain reproducible from
-their frozen body and digest.
+the turn's context manifest. Historical `@1`–`@3` turns remain reproducible from
+their frozen bodies and digests.
 
 `genesis.start` is implemented by one receipt-backed command shared with the
 REST start route. Account, Main Chat, and native source-turn authority are
@@ -2249,10 +2267,56 @@ subscription, without scanning ignored event rows through `json_each`. Existing
 `recent_errors` entries carry bounded worker causes and deferral reason/since;
 readiness alone is informational, while errors and stalls raise attention.
 Dead letters degrade health for the same one-hour window as ordinary errors.
-Each worker also exposes its retained total and five most recent quarantines with
-stable IDs, item keys/sequence, reason and time, without expiry. The table retains
-worker/source identity for later replay/dismiss actions; those actions are outside
-this slice. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+Each worker also exposes its open total and five most recent open quarantines
+with stable IDs, item keys/sequence, event type, consumer, attempts, reason and time,
+without expiry. Resolved rows and their action audit are retained; there is no
+retention/pruning job for either. A future retention job must delete
+`worker_dead_letter_action` rows before their parent `worker_dead_letter` rows
+to satisfy the foreign key.
+
+`DeadLetterService` checks admin authority and maps the stable consumer name to
+that runtime's existing worker instance. Only canonical positive bare sequence
+keys are replayable. Coordination's `event:N:commitment:C` and `event:N:inbox:…`
+quarantines, and Wake's `wake-retry:…` rows, are dismiss-only; replay rejects them
+with `DeadLetterNotReplayable`/409 before any write or handler call. Manual replay
+shares `WorkerRuntime`'s
+bounded preparation, panic handling, transactional commit and after-commit path.
+Preparation runs before the writer transaction; a compare-and-swap on the open
+row's version fences the commit. Effects, health success, resolution principal/time
+and an action audit entry commit together under `BEGIN IMMEDIATE`. Replay reads
+the consumer cursor for display context, leaves it unchanged, and delivers the
+original event only to its owning consumer.
+Consumer-emitted domain events retain normal downstream semantics. Skip resolves
+without effects. Commit errors roll back all effects, then a separate fenced
+transaction records a failed attempt/error. A repeat quarantine upsert reopens
+the stable row, clears resolution, stores the new error/attempt, and increments
+its version. Replay checks the row after the consumer commit; a version beyond
+the fence means commit re-quarantined it, so effects roll back and the action
+records `replay_failed` with the new error. A consumer that isolates one item of
+the replayed event inside its own commit (coordination quarantining a single
+commitment or inbox item) is not a failed replay: the other items' effects stay,
+as in normal delivery, and the item becomes a new open, dismiss-only row. Errors and deferrals never schedule
+a retry. A terminal commit gets the same one fresh preparation as ordinary delivery.
+Dismiss uses the same version fence and audit transaction without invoking the
+worker. Competing actions using the same open version have exactly one winner;
+the loser receives `DbError::VersionConflict` through the service/API boundaries.
+No durable in-progress lease can strand a row after a crash. Post-commit hooks
+retain normal worker semantics: their errors report health without reopening the
+resolved event. The SSE tail has its own `event_relay` object rather than an event-consumer entry.
+
+Replay deliberately breaks original event ordering: it applies event N after
+newer acknowledged events, using current consumer state. An old `task.blocked`
+coordination outcome can block a commitment that returned to `in_progress` and
+send an old “Task delivery blocked” inbox item. Consumer idempotency does not
+restore the original state timeline. The API/status summary exposes replayability,
+source `event_created_at`, and `events_since` (later retained subscribed events
+through the current checkpoint, including handler skips), so operators can assess
+that context. Subscription changes mean this is not a historical receipt count.
+
+The REST route spawns and awaits the service operation. Dropping the requesting
+client's future detaches that task, preserving `after_commit` work such as Project
+hook external Agent launch after a committed replay. A process crash retains
+normal worker recovery behavior.
 
 Each standard SQLite pool connection has an insert hook, commit marker and
 rollback handling. Pool-scoped `Notify` is delivered on connection release
@@ -2276,6 +2340,78 @@ rows are recreated. The consumer placements are:
 | `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
 | `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | Settle stale started runs from execution evidence | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
+
+
+#### Periodic and event-triggered process workers
+
+`worker_runtime::PeriodicWorkers` supplies source-free `PeriodicWorker` tick
+contexts backed by the same `WorkerSupervisor` and `db::WorkerHealth` as the
+durable workers. The runtime and server-only startup share one registry exposed
+by `OperatorStatusService`; no event subscription, cursor, poison strike or
+quarantine is created. Operator status adds `periodic_workers` with the worker
+identity, live `running`, process-local `last_tick_at` (tick start, sampled at
+most once per 30 seconds and never written to SQLite), independently
+retained error/time and persisted restart count. Stopped workers remain visible;
+persisted health from an unstarted worker never implies a live process. Periodic
+faults also enter `recent_errors` and raise Operations severity to `attention`.
+
+| Worker | Original schedule and wake signals | Tick budget / policy |
+| --- | --- | --- |
+| `task-dispatcher` | Immediate scan, then 10 seconds after each pass; existing dispatch completion/probe Notify and dispatch_wake; atomic stop | 1 hour / warn, continue awaiting |
+| `agent-chat-turns` | Existing immediate 250 ms Skip poll, gated by active-turn capacity; active JoinSet completion and shutdown watch | 5 minutes / warn, continue admission |
+| `heartbeat-monitor` | Immediate check, then 10 seconds after each pass; existing stop and daemon reconciliation Notify | 5 minutes / warn, continue awaiting |
+| `operator-status-emitter` | EventBus hints, existing 500 ms Skip coalescer (initial tick consumed); activity refresh after 5 seconds | 5 minutes / cancel |
+| `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
+| `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
+| `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum | 5 minutes / cancel |
+| `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
+| `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
+| `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
+| `external-sync` | Immediate due-integration pass, then 60 seconds after each pass; stop Notify | 1 hour / warn, cancel safety unverified |
+| `environment-settings-observer` | Existing Project update/resume EventBus hints, lag ignored; weak service ownership; stops with dispatcher | 5 minutes / cancel |
+
+Simple immediate-pass/wait-after-pass workers use the shared tick driver.
+Specialized interval/select state stays with the domain worker to preserve
+missed-tick policy, startup timing and in-process wake behavior. Wait/receive
+futures are outside the tick budget. Cancel-safe workers cancel an over-budget
+future and record `periodic worker tick timed out after {budget}`. Dispatcher,
+heartbeat, Agent Chat admission and external sync use a non-cancelling watchdog:
+after the
+budget they report `tick running longer than {budget}` once and continue polling
+the same future, including while the health write waits for a database lock.
+This preserves inline workflow barriers, unbounded CI and committed claim
+batches. External sync also warns because import cancellation safety is unverified.
+Completion clears the warning; an actual failure replaces it with the
+failure cause. Recoverable failures retain the original cadence.
+
+Successful ticks check SQLite health only once after child startup (to clear
+stale persisted causes) and on a reported error-to-success transition. Repeated
+identical tick faults are deduplicated in memory; steady successful ticks perform
+no health reads or writes. `last_tick_at` is sampled in memory at most once per
+30 seconds, with no SQLite heartbeat flush. Loop-specific warning messages are
+retained with the `worker` field; Agent Chat logs an admission failure once.
+
+A panic escapes the tick to the supervisor; unexpected return,
+error or cancellation also restarts after 250 ms, doubling to a 5-second cap,
+reset after 60 healthy seconds. Atomic stop is an intentional exit, not a restart.
+Workers with a shutdown watch let the in-flight pass finish under the existing
+runtime's 10-second shutdown deadline, then abort and join if needed. Workers
+with atomic stop/Notify keep those stop APIs and their wait-after-pass behavior.
+Aborting an owning supervisor also aborts its child, preventing detached loops.
+
+Agent Chat keeps its existing 250 ms capacity-gated poller and active-turn
+JoinSet. Only admission polling has a warning budget; individual turn execution
+is outside it. The set is outside the poller's unwind boundary: a panic cancels
+and drains the old turns before it is rethrown to the supervisor for restart.
+Panic cleanup waits 15 seconds (the CLI executor's 10-second SIGTERM grace
+before SIGKILL, plus 5), so a CLI turn's process group is killed before any
+abort, then aborts and joins non-cooperative turns before restarting. Cooperative shutdown uses the same
+cancel-and-drain path under the existing runtime shutdown deadline. Turn-lifetime drop guards cancel both the provider
+signal and lease-renewal token on every exit, including panic and hard abort,
+so an unfinished lease can expire rather than being renewed indefinitely.
+Per-execution/per-probe/per-terminal tasks, request-bound provider-health CAS retries and usage/log scans, daemon WebSocket transport and
+the Axum listener retain their current owners. The read-only domain-event relay
+already uses `WorkerSupervisor` and retains its separate `event_relay` status.
 
 
 Project hooks and notifications cut over in migration `V202610030200`.

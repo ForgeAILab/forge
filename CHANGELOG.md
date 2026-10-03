@@ -281,6 +281,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Agents that shape a managed project or split its work get one
+  merge-friendly layout rule: small modules with clear ownership so parallel
+  Tasks edit disjoint files, no hub files every feature must edit (central
+  registries, route tables, export lists, one large shared library),
+  per-feature registration or one owning Task for an unavoidable shared edit,
+  and each Task names the modules it owns. It is in the Genesis skill (new
+  revision `forge.main.project-discovery/v2@7`), the Project skill
+  (`forge.project.orchestration/v1@20`), the Document and Task doctrine
+  sections, the planner prompt and the scaffolded `AGENTS.md`; native Task
+  guidance and the two MCP task-creation tools carry a one-sentence form.
+  About +37 tokens per Genesis turn, +66 per Project Agent request and +106
+  per planner run; Main Agent requests outside Genesis are unchanged.
+  Migration V202610031431 adds the revisions; older revisions stay resolvable
+  for turns that reference them.
 - Forge uses agent-runtime `fec6dc2` (was `ca6c17e`): runtime failure
   classes, a bounded window of turn manifests, cache diagnostics and cheaper
   history and LCM accounting per provider call. A turn that fails before
@@ -394,6 +408,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer stops the other rules for the same event. Owner Hold, review-CI
   infrastructure blocks, restoring a queued action and human review decisions
   stay silent, as before.
+- The server's long-lived background loops (task dispatcher, heartbeat
+  monitor, Agent Chat turn poller, workspace cleanup, storage maintenance,
+  operator status emitter, lifecycle hooks, daemon monitor, embedded daemon,
+  shared media cleanup, external sync, environment settings observer) run
+  under the worker-runtime supervisor. A loop that panics or returns is
+  restarted with back-off (250 ms to 5 s) instead of staying dead until the
+  server restarts. Each pass has a budget: loops whose pass is safe to
+  interrupt are cancelled past it; the task dispatcher, heartbeat monitor,
+  Agent Chat admission and external sync run workflow transitions or CI
+  inline, so past their budget they keep running and report "running longer
+  than" instead. A poller panic cancels and drains in-flight Agent Chat turns
+  (up to 15 s) before restarting. Intervals, wake-ups and log messages are
+  unchanged; warnings gain a `worker` field.
 - The SSE relay is the only publisher of durable event frames. Services no
   longer publish a durable event directly after their own commit; the relay
   reads the ledger in order and is woken by the commit hook (measured: 72 µs
@@ -558,6 +585,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- Admins can replay or dismiss a dead-lettered event (an event a durable
+  worker gave up on after its retries). `GET /api/v1/operations/dead-letters`
+  lists them (open or resolved, by consumer, keyset pages);
+  `POST …/{id}/replay` re-delivers that one event to its own consumer
+  through the normal commit path (the cursor never moves, no other consumer
+  sees it) and `POST …/{id}/dismiss` resolves it with an optional reason.
+  Only whole-event rows can be replayed (`replayable`); per-item rows
+  (one commitment or inbox item, wake retries) can only be dismissed. Replay
+  finishes even if the client disconnects; a repeat failure reopens the row.
+  Replay applies an old event on top of newer ones, so the list shows its age
+  and how many later events the consumer has processed. Resolved rows stay
+  for audit and leave the open counts. Also `forge-ctl operations
+  dead-letters list|replay|dismiss` and Replay/Dismiss on the Operations page.
+  Migration V202610030300.
+
+- Operator status `periodic_workers` lists each supervised background loop
+  with running state, last tick, last error, restart count and an over-budget
+  warning. A failing or over-budget loop adds a `recent_errors` entry with
+  `entity_type: "periodic_worker"` and raises `overall_severity` to Attention
+  until it recovers.
 
 - Per-machine environment readiness is visible.
   - Project responses carry `environment_readiness`: one entry per machine

@@ -150,33 +150,30 @@ impl WorkspaceCleanupScheduler {
             .await
     }
 
-    pub fn spawn(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut ticker = interval(TICK_INTERVAL);
-            let mut sweeper = interval(SWEEP_INTERVAL);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            sweeper.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(error) = self.tick().await {
-                            tracing::warn!(%error, "workspace cleanup tick failed");
-                        }
-                    }
-                    _ = sweeper.tick() => {
-                        if let Err(error) = self.sweep().await {
-                            tracing::warn!(%error, "terminal Task workspace sweep failed");
-                        }
-                    }
-                    result = shutdown_rx.changed() => {
-                        if result.is_err() || *shutdown_rx.borrow() {
-                            break;
+    pub fn spawn(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        workers.worker("workspace-cleanup").with_tick_timeout(Duration::from_secs(3600))
+            .start(shutdown, || false, move |worker, mut shutdown_rx| {
+                let scheduler = Arc::clone(&self);
+                async move {
+                    let mut ticker = interval(TICK_INTERVAL);
+                    let mut sweeper = interval(SWEEP_INTERVAL);
+                    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    sweeper.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            _ = ticker.tick() => { if let Err(error) = worker.tick(scheduler.tick()).await { tracing::warn!(worker = worker.name(), %error, "workspace cleanup tick failed"); } }
+                            _ = sweeper.tick() => { if let Err(error) = worker.tick(scheduler.sweep()).await { tracing::warn!(worker = worker.name(), %error, "terminal Task workspace sweep failed"); } }
+                            result = shutdown_rx.changed() => {
+                                if result.is_err() || *shutdown_rx.borrow() { return Ok(()); }
+                            }
                         }
                     }
                 }
-            }
-        })
+            })
     }
 
     pub async fn cleanup_now(&self, workspace_id: impl Into<String>) -> Result<()> {

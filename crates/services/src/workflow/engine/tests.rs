@@ -4633,3 +4633,107 @@ async fn declared_pure_cascade_enqueue_failure_rolls_back_producing_transition()
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn periodic_warning_budgets_finish_inline_ci_and_clear_entry_barriers() {
+    for (name, component) in [
+        (
+            "task-dispatcher",
+            api_types::SystemComponent::TaskDispatcher,
+        ),
+        (
+            "heartbeat-monitor",
+            api_types::SystemComponent::HeartbeatMonitor,
+        ),
+    ] {
+        let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+        let gate = TempDir::new().unwrap();
+        let started = gate.path().join("started");
+        let release = gate.path().join("release");
+        let finished = gate.path().join("finished");
+        let quote = |path: &std::path::Path| {
+            format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"))
+        };
+        let step = format!(
+            "touch {}; while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done; touch {}",
+            quote(&started),
+            quote(&release),
+            quote(gate.path()),
+            quote(&finished)
+        );
+        sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+            .bind(json!({"retry_budgets":{"review":3}, "review":{"ci_steps":[step]}}).to_string())
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let authority = fixture.workflow_authority().await;
+        let db = Arc::clone(&fixture.db);
+        let id = task.id.clone();
+        let registry = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let worker = registry
+            .worker(name)
+            .with_stall_budget(std::time::Duration::from_millis(100));
+        let handle = tokio::spawn(async move {
+            let _fixture_roots = (&fixture._repo_dir, &fixture._workspace_root);
+            worker
+                .tick(fixture.engine.transition_with_authority(
+                    &task.id,
+                    "review",
+                    task.version,
+                    &fixture.workflow,
+                    &api_types::Actor::system(component),
+                    "periodic warning budget regression",
+                    false,
+                    authority,
+                ))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = TaskRepo::get_by_id(&*db, &id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let health = registry.status().await.unwrap();
+                if started.exists()
+                    && state.entry_barrier_is_running()
+                    && health[0]
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("tick running longer than 100ms"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !handle.is_finished(),
+            "an over-budget transition is still awaited"
+        );
+        std::fs::write(&release, "release").unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(completed.task.entry_barrier_json.is_none());
+        assert!(
+            finished.exists(),
+            "CI completed before the transition returned"
+        );
+        assert!(registry.status().await.unwrap()[0].last_error.is_none());
+        let persisted = TaskRepo::get_by_id(&*db, &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!persisted.entry_barrier_is_running());
+    }
+}

@@ -18,21 +18,24 @@ impl StorageMaintenanceWorker {
         Self { db }
     }
 
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            if *shutdown.borrow_and_update() {
-                return;
-            }
-            let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() { break; }
-                    }
-                    _ = tick.tick() => {
-                        if let Err(error) = self.maintain_once(&shutdown).await {
-                            tracing::warn!(%error, "storage maintenance tick failed");
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        workers.worker("storage-maintenance").start(shutdown, || false, move |worker, mut shutdown| {
+            let maintenance = Arc::clone(&self);
+            async move {
+                if *shutdown.borrow_and_update() { return Ok(()); }
+                let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
+                        }
+                        _ = tick.tick() => {
+                            if let Err(error) = worker.tick(maintenance.maintain_once(&shutdown)).await { tracing::warn!(worker = worker.name(), %error, "storage maintenance tick failed"); }
                         }
                     }
                 }
@@ -99,7 +102,13 @@ mod tests {
         let (_tx, rx) = watch::channel(true);
         let before = db::sqlite_storage_status(db.pool()).await.unwrap();
         worker.maintain_once(&rx).await.unwrap();
-        Arc::clone(&worker).start(rx).await.unwrap();
+        Arc::clone(&worker)
+            .start(
+                &crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db)),
+                rx,
+            )
+            .await
+            .unwrap();
         assert_eq!(db::sqlite_storage_status(db.pool()).await.unwrap(), before);
     }
 

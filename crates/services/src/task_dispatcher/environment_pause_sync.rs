@@ -277,32 +277,50 @@ impl TaskDispatcher {
     /// can start a probe in this build step, independently of queued Tasks.
     pub(super) fn observe_environment_settings(&self) {
         self.environment_settings_observer.get_or_init(|| {
-            let mut events = self.event_bus.subscribe();
+            let initial = std::sync::Mutex::new(Some(self.event_bus.subscribe()));
             let event_bus = self.event_bus.clone();
             let service = std::sync::Arc::downgrade(&self.task_service);
             let db = std::sync::Arc::downgrade(&self.db);
-            tokio::spawn(async move {
-                loop {
-                    let event = match events.recv().await {
-                        Ok(event) => event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(false),
-                    };
-                    if event.event_type != "project.updated" && event.event_type != "project.resumed" {
-                        continue;
-                    }
-                    let (Some(service), Some(db)) = (service.upgrade(), db.upgrade()) else {
-                        return Ok(false);
-                    };
-                    if let Some(project) = ProjectRepo::get_by_id(&*db, &event.entity_id).await? {
-                        if let Err(error) = environment::schedule_project_probes(
-                            &db, &project, service.dispatch_notify(), event_bus.clone(), service.environment_daemon_connections()).await {
-                            tracing::warn!(project_id = %project.id, %error, "settings environment probe could not start");
+            let stop = service.clone();
+            self.periodic_workers.worker("environment-settings-observer")
+                .start(self.observer_shutdown.subscribe(), move || stop.upgrade().is_none(), move |worker, mut shutdown| {
+                    let mut events = initial.lock().expect("environment receiver").take()
+                        .unwrap_or_else(|| event_bus.subscribe());
+                    let service = service.clone();
+                    let db = db.clone();
+                    let event_bus = event_bus.clone();
+                    async move {
+                        loop {
+                            let event = tokio::select! {
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
+                                    continue;
+                                }
+                                event = events.recv() => match event {
+                                    Ok(event) => event,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                                }
+                            };
+                            if event.event_type != "project.updated" && event.event_type != "project.resumed" {
+                                continue;
+                            }
+                            let (Some(service), Some(db)) = (service.upgrade(), db.upgrade()) else {
+                                return Ok(());
+                            };
+                            worker.tick(async {
+                                if let Some(project) = ProjectRepo::get_by_id(&*db, &event.entity_id).await? {
+                                    if let Err(error) = environment::schedule_project_probes(
+                                        &db, &project, service.dispatch_notify(), event_bus.clone(), service.environment_daemon_connections()).await {
+                                        tracing::warn!(project_id = %project.id, %error, "settings environment probe could not start");
+                                    }
+                                    service.dispatch_notify().notify_one();
+                                }
+                                Ok(())
+                            }).await?;
                         }
-                        service.dispatch_notify().notify_one();
                     }
-                }
-            })
+                })
         });
     }
 }

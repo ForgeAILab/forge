@@ -765,6 +765,123 @@ async fn stable_prefix_main_genesis_preview_moves_evolving_instruction_state_to_
 }
 
 #[tokio::test]
+async fn layout_guidance_upgrade_preserves_frozen_turns_sessions_and_binding() {
+    use db::AgentChatTurnJobRepo;
+    use services::AgentChatTurnRunner;
+    use std::sync::Arc;
+
+    let workspace = common::TestDir::new("layout-guidance-upgrade");
+    let harness = common::test_app(workspace.path(), "layout-guidance-upgrade").await;
+    for (key, revision) in [
+        (
+            "forge.main.project-discovery/v2",
+            "forge.main.project-discovery/v2@6",
+        ),
+        (
+            "forge.project.orchestration/v1",
+            "forge.project.orchestration/v1@19",
+        ),
+    ] {
+        sqlx::query("UPDATE operating_skill SET current_revision_id = ? WHERE skill_key = ?")
+            .bind(revision)
+            .bind(key)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+    }
+    let genesis = create_genesis_project(&harness.app, &common::test_jwt(), "layout-upgrade").await;
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    let mut frozen = Vec::new();
+    for chat in [&genesis.main_chat_id, &genesis.project_chat_id] {
+        let jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*harness.state.db, chat)
+            .await
+            .unwrap();
+        for job in jobs {
+            let preview = runner.preview_prompt(&job).await.unwrap();
+            frozen.push((job, preview.system_prompt));
+        }
+    }
+    let session_before: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    let migration =
+        include_str!("../../db/migrations/V202610031431__merge_friendly_layout_guidance.sql")
+            .replace(
+                "INSERT INTO operating_skill_revision",
+                "INSERT OR IGNORE INTO operating_skill_revision",
+            );
+    sqlx::raw_sql(&migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@20");
+    let session_after: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(session_before, session_after);
+    assert!(!frozen.is_empty());
+    for (job, prompt) in frozen {
+        let retained = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, job);
+        assert_eq!(
+            runner
+                .preview_prompt(&retained)
+                .await
+                .unwrap()
+                .system_prompt,
+            prompt
+        );
+        runner
+            .validate_admission_authority(&retained)
+            .await
+            .unwrap();
+    }
+    let turn = admit_preview_turn(&harness, &genesis.project_chat_id, "Plan the next module").await;
+    let current = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.operating_skill_revision_id.as_deref(),
+        Some("forge.project.orchestration/v1@20")
+    );
+    assert!(runner
+        .preview_prompt(&current)
+        .await
+        .unwrap()
+        .system_prompt
+        .unwrap()
+        .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+    runner.validate_admission_authority(&current).await.unwrap();
+}
+
+#[tokio::test]
 async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions() {
     use db::AgentChatTurnJobRepo;
     use services::AgentChatTurnRunner;
@@ -955,13 +1072,23 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
         previous_preview.system_prompt,
         retained_preview.system_prompt
     );
-    // Replaying the historical @18 migration must not make it the current @19 contract.
+    // Replay successors after the historical @18 migration, retaining frozen admissions.
     let action_migration =
         include_str!("../../db/migrations/V202610030100__task_action_doctrine.sql").replace(
             "INSERT INTO operating_skill_revision",
             "INSERT OR IGNORE INTO operating_skill_revision",
         );
     sqlx::raw_sql(&action_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let layout_migration =
+        include_str!("../../db/migrations/V202610031431__merge_friendly_layout_guidance.sql")
+            .replace(
+                "INSERT INTO operating_skill_revision",
+                "INSERT OR IGNORE INTO operating_skill_revision",
+            );
+    sqlx::raw_sql(&layout_migration)
         .execute(harness.state.db.pool())
         .await
         .unwrap();
@@ -978,7 +1105,7 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
             .unwrap();
     assert_eq!(
         current_job.operating_skill_revision_id.as_deref(),
-        Some("forge.project.orchestration/v1@19")
+        Some("forge.project.orchestration/v1@20")
     );
     let current_preview = runner.preview_prompt(&current_job).await.unwrap();
     assert!(current_preview

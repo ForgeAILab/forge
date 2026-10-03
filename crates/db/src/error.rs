@@ -20,6 +20,9 @@ pub enum DbError {
     #[error("another Agent Chat turn is live")]
     ChatTurnLive,
 
+    #[error("dead letter is not a whole event and cannot be replayed")]
+    DeadLetterNotReplayable,
+
     #[error("version conflict")]
     VersionConflict,
 

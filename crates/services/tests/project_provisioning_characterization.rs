@@ -1103,7 +1103,8 @@ async fn charter_scaffold_runs_the_command_and_commits_the_exported_charter() {
     assert!(agents.contains("`worker-guidelines` lens is in force"));
     for phrase in [
         "small modules with clear ownership",
-        "thin, mechanical composition",
+        "per-feature files discovered/registered without shared-list edits",
+        "give one Task ownership of shared edits and make others depend on it",
         "owned repository-relative paths",
         "new feature file instead of growing a shared one",
         "Report a required out-of-scope edit",

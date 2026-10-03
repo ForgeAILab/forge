@@ -950,10 +950,9 @@ async fn audit_two_runtimes_race_coordination_outcomes_on_file_database() {
 }
 
 /// Second-round audit: one commitment that rejects completion (blocked)
-/// quarantines the whole outcome event. What happens to the *other*
-/// commitment on the same Task and to the outcome inbox items?
-#[tokio::test]
-async fn audit2_blocked_commitment_failure_preserves_sibling_commitment_and_inbox() {
+/// quarantines one item. Item replay must leave the sibling commitment and
+/// inbox effects untouched, before and after repairing the original cause.
+async fn item_replay_refusal_preserves_siblings(fix_cause: bool) {
     let db = database().await;
     seed_identity(&db, "identity-a").await;
     sqlx::query("UPDATE agent_identity SET name = 'owner-a' WHERE id = 'identity-a'")
@@ -1112,4 +1111,81 @@ async fn audit2_blocked_commitment_failure_preserves_sibling_commitment_and_inbo
     assert!(status.event_consumers[0].recent_dead_letters[0]
         .item_key
         .contains(&created[0].id));
+    // Preserve both scenarios from the independent audit's real-consumer probe.
+    let dead_id: String = sqlx::query_scalar("SELECT id FROM worker_dead_letter")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let before = db.get_dead_letter(&dead_id).await.unwrap();
+    assert!(!before.replayable());
+    if fix_cause {
+        sqlx::query("UPDATE agent_commitment SET status = 'in_progress', version = version + 1 WHERE id = ?").bind(&created[0].id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    let mut service = services::dead_letter_service::DeadLetterService::new(db.clone());
+    service.register(Arc::new(consumer));
+    assert!(matches!(
+        service
+            .replay(
+                services::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true
+                },
+                &dead_id
+            )
+            .await,
+        Err(services::ServiceError::Db(
+            db::DbError::DeadLetterNotReplayable
+        ))
+    ));
+    let after = db.get_dead_letter(&dead_id).await.unwrap();
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.last_error, before.last_error);
+    assert!(after.resolved_at.is_none());
+    let a = db
+        .get_commitment(&created[0].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    assert_eq!(
+        a,
+        if fix_cause {
+            db::AgentCommitmentStatus::InProgress
+        } else {
+            db::AgentCommitmentStatus::Blocked
+        }
+    );
+    assert_eq!(
+        db.get_commitment(&created[1].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        db::AgentCommitmentStatus::Completed
+    );
+    let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM worker_dead_letter WHERE resolved_at IS NULL), (SELECT COUNT(*) FROM worker_dead_letter_action), (SELECT COUNT(*) FROM agent_inbox_item WHERE source_type = 'task_outcome' AND source_id = ?)").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(counts, (1, 0, 2));
+    assert_eq!(
+        db.get_consumer_cursor(coordination_consumer_name())
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        cursor
+    );
+}
+
+#[tokio::test]
+async fn audit2_blocked_commitment_failure_preserves_sibling_commitment_and_inbox() {
+    item_replay_refusal_preserves_siblings(false).await;
+}
+#[tokio::test]
+async fn item_replay_refusal_after_repair_and_task_write_preserves_successful_siblings() {
+    item_replay_refusal_preserves_siblings(true).await;
 }

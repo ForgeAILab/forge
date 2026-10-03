@@ -1,12 +1,18 @@
 import { Link } from '@tanstack/react-router'
 import { ArrowClockwise, CheckCircle, Pulse, WarningCircle } from '@phosphor-icons/react'
-import type { ReactNode } from 'react'
-import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/hooks'
+import { useState, type ReactNode } from 'react'
+import {
+  useDeadLetterActionMutation,
+  useOperationsStatusQuery,
+  useRefreshOperationsMutation,
+} from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanChecklist } from '@/components/plan-checklist'
 import { PolicyBadge } from '@/components/policy-badge'
 import { CostSummaryView } from '@/components/analytics/CostSummary'
 import { formatRuntimeSeconds, formatTokenCount } from '@/components/task-execution-observability'
+import { Input } from '@/components/ui/input'
+import { getApiErrorCode, getApiErrorMessage } from '@/lib/api-error'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
@@ -18,6 +24,8 @@ import type {
   DaemonIssueSummary,
   DaemonPressureSummary,
   EventConsumerStatus,
+  WorkerDeadLetterSummary,
+  DeadLetterActionResponse,
   OperatorSeverity,
   RecentErrorSummary,
   RetryPressureSummary,
@@ -469,7 +477,135 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
   )
 }
 
+function DeadLetterRow({
+  dead,
+  receipt,
+  onResolved,
+}: {
+  dead: WorkerDeadLetterSummary
+  receipt?: DeadLetterActionResponse
+  onResolved: (result: DeadLetterActionResponse) => void
+}) {
+  const action = useDeadLetterActionMutation()
+  const [reason, setReason] = useState('')
+  const [result, setResult] = useState<DeadLetterActionResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [pending, setPending] = useState<'replay' | 'dismiss' | null>(null)
+  const actionResult = result ?? receipt
+  const summary =
+    actionResult && actionResult.dead_letter.summary.attempts > dead.attempts
+      ? actionResult.dead_letter.summary
+      : dead
+  const resolved = actionResult?.dead_letter.state === 'resolved'
+  async function apply(kind: 'replay' | 'dismiss') {
+    setPending(kind)
+    setError(null)
+    try {
+      const response = await action.mutateAsync({
+        id: dead.id,
+        action: kind,
+        reason: kind === 'dismiss' && reason.trim() ? reason.trim() : undefined,
+      })
+      setResult(response)
+      if (response.dead_letter.state === 'resolved') onResolved(response)
+    } catch (error) {
+      setError(
+        getApiErrorCode(error) === 'version_conflict'
+          ? 'Dead letter already resolved or changed. Refresh status.'
+          : getApiErrorMessage(error, 'Action failed. Try again.'),
+      )
+    } finally {
+      setPending(null)
+    }
+  }
+  return (
+    <div
+      className="mt-3 min-w-0 rounded-md border border-border-subtle p-3"
+      role="group"
+      aria-label={`Dead letter ${dead.id}`}
+    >
+      <p className="break-all font-mono text-xs">
+        {summary.event_type} · {summary.consumer_name}
+      </p>
+      <p className="mt-1 break-words text-xs text-muted-foreground">
+        {summary.item_key} · {summary.attempts} attempts · {formatDate(summary.occurred_at)}
+      </p>
+      <p className="mt-1 break-words text-xs text-destructive">{summary.reason}</p>
+      {!resolved && (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          {summary.replayable && (
+            <div className="flex max-w-full flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pending !== null}
+                onClick={() => void apply('replay')}
+              >
+                {pending === 'replay' ? 'Replaying…' : 'Replay'}
+              </Button>
+              <span
+                className="text-xs text-muted-foreground"
+                title={summary.event_created_at ?? undefined}
+              >
+                {summary.event_created_at
+                  ? `Event ${formatRuntimeSeconds(Math.max(0, (Date.now() - Date.parse(summary.event_created_at)) / 1000))} old`
+                  : 'Event age unavailable'}{' '}
+                · {summary.events_since} later events processed
+              </span>
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <label className="text-xs text-muted-foreground" htmlFor={`dismiss-reason-${dead.id}`}>
+              Dismiss reason (optional)
+            </label>
+            <Input
+              id={`dismiss-reason-${dead.id}`}
+              value={reason}
+              maxLength={1024}
+              disabled={pending !== null}
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={pending !== null}
+            onClick={() => void apply('dismiss')}
+          >
+            {pending === 'dismiss' ? 'Dismissing…' : 'Dismiss'}
+          </Button>
+        </div>
+      )}
+      {actionResult && (
+        <p role="status" className="mt-2 text-xs text-muted-foreground">
+          {actionResult.outcome === 'replay_failed'
+            ? 'Replay failed; remains open. Retry after fixing the cause.'
+            : actionResult.outcome === 'skipped'
+              ? 'Replay completed; consumer skipped this event.'
+              : actionResult.outcome === 'dismissed'
+                ? 'Dismissed without delivery.'
+                : 'Replayed successfully.'}
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="mt-2 break-words text-xs text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
+  const [receipts, setReceipts] = useState<DeadLetterActionResponse[]>([])
+  function resolved(receipt: DeadLetterActionResponse) {
+    setReceipts((current) =>
+      [
+        receipt,
+        ...current.filter((row) => row.dead_letter.summary.id !== receipt.dead_letter.summary.id),
+      ].slice(0, 5),
+    )
+  }
   return (
     <Section title="Event Consumers" count={items.length}>
       <div className="divide-y">
@@ -491,10 +627,22 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
                   </span>
                 ) : null}
               </div>
-              {item.recent_dead_letters.map((dead) => (
-                <p key={dead.id} className="mt-1 break-words text-xs text-muted-foreground">
-                  {dead.item_key}: {dead.reason} · {formatDate(dead.occurred_at)}
-                </p>
+              {[
+                ...item.recent_dead_letters,
+                ...receipts
+                  .map((row) => row.dead_letter.summary)
+                  .filter(
+                    (row) =>
+                      row.consumer_name === item.consumer_name &&
+                      !item.recent_dead_letters.some((dead) => dead.id === row.id),
+                  ),
+              ].map((dead) => (
+                <DeadLetterRow
+                  key={dead.id}
+                  dead={dead}
+                  receipt={receipts.find((row) => row.dead_letter.summary.id === dead.id)}
+                  onResolved={resolved}
+                />
               ))}
             </div>
             <div className="flex items-center gap-2 text-xs">

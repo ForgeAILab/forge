@@ -38,6 +38,8 @@ import {
   applyTaskAction,
   recheckProjectEnvironment,
   refreshOperations,
+  replayDeadLetter,
+  dismissDeadLetter,
   removeDependency,
   removeMember,
   saveWorkflowTemplate,
@@ -1181,6 +1183,24 @@ export function useRefreshOperationsMutation() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: refreshOperations,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
+  })
+}
+
+export function useDeadLetterActionMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      action,
+      reason,
+    }: {
+      id: string
+      action: 'replay' | 'dismiss'
+      reason?: string
+    }) => (action === 'replay' ? replayDeadLetter(id) : dismissDeadLetter(id, reason)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
     },

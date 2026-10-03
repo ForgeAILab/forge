@@ -376,3 +376,11 @@ export type { RetryTurnActionKind } from './bindings/RetryTurnActionKind'
 export type { TurnFailure } from './bindings/TurnFailure'
 export type { TurnLimitCause } from './bindings/TurnLimitCause'
 export type { TurnRetryDecision } from './bindings/TurnRetryDecision'
+
+export type { DeadLetterState } from './bindings/DeadLetterState'
+export type { DeadLetterResponse } from './bindings/DeadLetterResponse'
+export type { DeadLetterListResponse } from './bindings/DeadLetterListResponse'
+export type { DeadLetterActionResponse } from './bindings/DeadLetterActionResponse'
+export type { DismissDeadLetterRequest } from './bindings/DismissDeadLetterRequest'
+
+export type { DeadLetterOutcome } from './bindings/DeadLetterOutcome'

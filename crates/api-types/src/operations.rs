@@ -80,9 +80,24 @@ pub struct OperatorStatusResponse {
     pub usage_index: UsageIndexStatus,
     pub recent_errors: Vec<RecentErrorSummary>,
     pub event_consumers: Vec<EventConsumerStatus>,
+    pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// Source-free workers use the same health identity, bounded errors and
+/// persisted restart count as durable workers, without a cursor or quarantine.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PeriodicWorkerStatus {
+    pub worker_name: String,
+    pub running: bool,
+    pub last_tick_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -288,8 +303,18 @@ pub struct EventConsumerStatus {
 pub struct WorkerDeadLetterSummary {
     pub id: String,
     pub item_key: String,
+    pub consumer_name: String,
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub attempts: i64,
     #[ts(type = "number | null")]
     pub event_sequence: Option<i64>,
+    // Only canonical bare event sequence keys may be replayed.
+    pub replayable: bool,
+    pub event_created_at: Option<String>,
+    // Later subscribed ledger events acknowledged by the current checkpoint.
+    #[ts(type = "number")]
+    pub events_since: i64,
     pub reason: String,
     pub occurred_at: String,
 }
@@ -312,4 +337,82 @@ pub struct DatabaseStorageStatus {
     pub incremental_vacuum: bool,
     #[ts(type = "number")]
     pub free_pages: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterResponse {
+    pub summary: WorkerDeadLetterSummary,
+    pub state: DeadLetterState,
+    pub error_kind: String,
+    pub first_failed_at: String,
+    pub last_failed_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterListResponse {
+    pub items: Vec<DeadLetterResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterActionResponse {
+    pub dead_letter: DeadLetterResponse,
+    /// replayed, skipped, replay_failed, or dismissed. Failure is an audited
+    /// action result, with the dead letter still open; it is never auto-retried.
+    pub outcome: DeadLetterOutcome,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DismissDeadLetterRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterOutcome {
+    Replayed,
+    Skipped,
+    ReplayFailed,
+    Dismissed,
+}
+impl DeadLetterOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replayed => "replayed",
+            Self::Skipped => "skipped",
+            Self::ReplayFailed => "replay_failed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+impl std::fmt::Display for DeadLetterOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::fmt::Display for DeadLetterState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        })
+    }
 }

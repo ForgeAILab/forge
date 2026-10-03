@@ -37,7 +37,9 @@ pub struct TaskDispatcher {
     /// `sync_repository_pause`.
     ready_repositories: Mutex<HashSet<String>>,
     environment_rechecks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<bool>>>>,
-    environment_settings_observer: std::sync::OnceLock<tokio::task::JoinHandle<Result<bool>>>,
+    environment_settings_observer: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
+    periodic_workers: Arc<crate::worker_runtime::PeriodicWorkers>,
+    observer_shutdown: crate::runtime::ShutdownSignal,
 }
 
 impl TaskDispatcher {
@@ -58,6 +60,9 @@ impl TaskDispatcher {
         check_interval: Duration,
     ) -> Self {
         Self {
+            periodic_workers: Arc::new(crate::worker_runtime::PeriodicWorkers::new(Arc::clone(
+                &db,
+            ))),
             db,
             event_bus,
             task_service: Arc::clone(&task_service),
@@ -67,38 +72,77 @@ impl TaskDispatcher {
             ready_repositories: Mutex::new(HashSet::new()),
             environment_rechecks: Mutex::new(HashMap::new()),
             environment_settings_observer: std::sync::OnceLock::new(),
+            observer_shutdown: crate::runtime::ShutdownSignal::new(),
         }
     }
 
+    pub fn with_periodic_workers(
+        mut self,
+        workers: Arc<crate::worker_runtime::PeriodicWorkers>,
+    ) -> Self {
+        self.periodic_workers = workers;
+        self
+    }
+
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.start_with_check(Duration::from_secs(3600), |dispatcher| async move {
+            dispatcher.check_once().await
+        })
+    }
+
+    fn start_with_check<F, Fut>(
+        self: Arc<Self>,
+        timeout: Duration,
+        check: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(Arc<Self>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<u64>> + Send + 'static,
+    {
+        let check = Arc::new(check);
         let event_bus_strong_count = Arc::strong_count(&self.event_bus);
-        tokio::spawn(
-            async move {
-                tracing::info!(
-                    check_interval_seconds = self.check_interval.as_secs(),
-                    "task dispatcher started"
-                );
-                while !self.is_stopped() {
-                    if let Err(error) = self.check_once().await {
-                        tracing::warn!(%error, "task dispatcher check failed");
+        let stop = Arc::clone(&self);
+        self.periodic_workers
+            .worker("task-dispatcher")
+            .with_stall_budget(timeout)
+            .start_stoppable(
+                move || stop.is_stopped(),
+                move |worker| {
+                    let dispatcher = Arc::clone(&self);
+                    let check = Arc::clone(&check);
+                    async move {
+                        tracing::info!(
+                            check_interval_seconds = dispatcher.check_interval.as_secs(),
+                            "task dispatcher started"
+                        );
+                        let result = worker
+                            .run(
+                                || dispatcher.is_stopped(),
+                                "task dispatcher check failed",
+                                || check(Arc::clone(&dispatcher)),
+                                || async {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(dispatcher.check_interval) => {}
+                                        _ = dispatcher.stop_notify.notified() => {}
+                                        _ = dispatcher.task_service.dispatch_wake.notified() => {}
+                                    }
+                                },
+                            )
+                            .await;
+                        tracing::info!("task dispatcher stopped");
+                        result
                     }
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.check_interval) => {}
-                        _ = self.stop_notify.notified() => {}
-                        _ = self.task_service.dispatch_wake.notified() => {}
-                    }
-                }
-                tracing::info!("task dispatcher stopped");
-            }
-            .instrument(tracing::info_span!(
-                "task.dispatcher",
-                event_bus_strong_count = event_bus_strong_count
-            )),
-        )
+                    .instrument(tracing::info_span!(
+                        "task.dispatcher",
+                        event_bus_strong_count
+                    ))
+                },
+            )
     }
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+        self.observer_shutdown.request();
         self.stop_notify.notify_one();
     }
 
