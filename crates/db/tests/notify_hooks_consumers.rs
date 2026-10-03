@@ -53,3 +53,32 @@ async fn upgrade_seeds_notify_hook_cursors_at_head_and_preserves_history() {
     assert_eq!(retained_cursor, head + 1);
     pool.close().await;
 }
+
+#[tokio::test]
+async fn bundled_schema_keeps_all_six_notification_and_hook_task_triggers() {
+    let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let actual: std::collections::BTreeSet<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'task'
+         AND name IN ('project_hooks_task_created', 'project_hooks_task_archived',
+            'notifications_blocked_json', 'notifications_failed_json',
+            'notifications_task_recovered', 'notifications_merge_failed')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let expected = [
+        "project_hooks_task_created",
+        "project_hooks_task_archived",
+        "notifications_blocked_json",
+        "notifications_failed_json",
+        "notifications_task_recovered",
+        "notifications_merge_failed",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(actual, expected);
+}

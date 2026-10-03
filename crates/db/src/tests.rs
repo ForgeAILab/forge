@@ -8646,6 +8646,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         task.version + 1,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await;
     assert!(matches!(stale, Err(DbError::VersionConflict)));
@@ -8678,6 +8679,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         task.version,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await
     .expect("review and task authority settle together");
@@ -8694,6 +8696,7 @@ async fn review_task_authority_settlement_is_atomic_with_task_cas() {
         &now,
         settled_task.version,
         Some(now.clone()),
+        crate::ReviewEventOrigin::Runner,
     )
     .await;
     assert!(matches!(replay, Err(DbError::InvalidTransition)));

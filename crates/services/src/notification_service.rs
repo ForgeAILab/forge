@@ -102,7 +102,9 @@ impl NotificationService {
                 ("task.done", event.entity_id.as_str(), None)
             }
             "review.status_changed"
-                if payload["finished"] == true
+                if event.actor_type == "review_runner"
+                    && payload["manual_override"] != true
+                    && payload["finished"] == true
                     && (payload["status"] == "passed" || payload["status"] == "failed") =>
             {
                 let Some(task_id) = payload["task_id"].as_str() else {
@@ -558,3 +560,6 @@ mod tests {
         assert_eq!(quarantines, 0);
     }
 }
+
+#[cfg(test)]
+mod parity_tests;

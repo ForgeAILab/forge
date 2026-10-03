@@ -1,3 +1,5 @@
+use std::{future::Future, time::Duration};
+
 use api_types::{ProjectHookAction, ProjectHookRule};
 use chrono::{DateTime, Utc};
 use db::{
@@ -19,8 +21,12 @@ use crate::{
     },
     task_service::PreparedProjectHookTask,
     worker_runtime::{consumer_error_kind, WorkerErrorKind},
-    Result,
+    Result, ServiceError,
 };
+
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(300);
+const STARTED_GRACE_SECONDS: i64 = 600;
+const RECONCILE_LIMIT: i64 = 100;
 
 pub struct ProjectHookEngine<'a> {
     service: &'a ProjectHookService,
@@ -57,6 +63,63 @@ impl<'a> ProjectHookEngine<'a> {
         Self { service }
     }
 
+    pub async fn tick(&self) -> Result<()> {
+        let now = Utc::now();
+        let cutoff = now
+            .checked_sub_signed(chrono::Duration::seconds(STARTED_GRACE_SECONDS))
+            .ok_or_else(|| ServiceError::invalid_operation("hook reconciliation time overflow"))?;
+        for run in self
+            .service
+            .db
+            .reconcile_started_project_hook_runs(
+                &cutoff.to_rfc3339(),
+                &now.to_rfc3339(),
+                RECONCILE_LIMIT,
+            )
+            .await?
+        {
+            self.publish_run_changed(&run);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_failed(
+        &self,
+        project: &Project,
+        rule: ProjectHookRule,
+        source_key: &str,
+        cause: &super::EvaluationCause,
+        reason: String,
+    ) -> PreparedHook {
+        let now = now_rfc3339();
+        PreparedHook {
+            project: project.clone(),
+            input: CreateProjectHookRun {
+                id: new_uuid_v4(),
+                project_id: project.id.clone(),
+                rule_id: rule.id.clone(),
+                trigger_type: super::triggers::all_work_completed::ALL_WORK_COMPLETED_TRIGGER_TYPE
+                    .to_owned(),
+                // An unread trigger is not a matched work epoch. Its diagnostic
+                // must not consume the epoch's successful-action dedupe key.
+                dedupe_key: format!("preparation-failed:{source_key}"),
+                status: ProjectHookRunStatus::Failed,
+                source_task_id: cause.source_task_id().map(str::to_owned),
+                source_execution_id: None,
+                automation_task_id: None,
+                execution_id: None,
+                agent_id: None,
+                reason: Some(reason.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                completed_at: Some(now),
+            },
+            rule,
+            action: PreparedAction::Failed(reason),
+        }
+    }
+
+    #[cfg(test)]
     pub async fn run(
         &self,
         project: &Project,
@@ -262,6 +325,9 @@ impl<'a> ProjectHookEngine<'a> {
         if version != Some(prepared.project.version) {
             return Err(db::DbError::VersionConflict.into());
         }
+        if matches!(prepared.action, PreparedAction::Failed(_)) {
+            return Ok(true);
+        }
         super::triggers::all_work_completed::all_work_completed_in_tx(tx, &prepared.project).await
     }
 
@@ -270,6 +336,24 @@ impl<'a> ProjectHookEngine<'a> {
         tx: &mut Transaction<'_, Sqlite>,
         prepared: &PreparedHook,
     ) -> Result<Option<CommittedHook>> {
+        if let PreparedAction::Failed(reason) = &prepared.action {
+            let mut input = prepared.input.clone();
+            input.status = ProjectHookRunStatus::Failed;
+            input.reason = Some(reason.clone());
+            input.completed_at = Some(now_rfc3339());
+            return Ok(self
+                .service
+                .db
+                .claim_project_hook_run_in_tx(tx, input, i64::MAX, "")
+                .await?
+                .map(|run| CommittedHook {
+                    run,
+                    notification: None,
+                    comment: None,
+                    task: None,
+                    external: false,
+                }));
+        }
         let Some(run) = self
             .service
             .db
@@ -427,41 +511,75 @@ impl<'a> ProjectHookEngine<'a> {
                 .automation_task_id
                 .clone()
                 .expect("dispatch task committed");
-            let launch = self
-                .service
-                .task_service
-                .launch_execution(
-                    task_id.clone(),
-                    agent_id.clone(),
-                    Some(prompt.clone()),
-                    None,
-                )
-                .await;
-            let outcome = match launch {
-                Ok(result) => ActionOutcome {
-                    status: ProjectHookRunStatus::Dispatched,
-                    automation_task_id: Some(task_id),
-                    execution_id: Some(result.execution.id),
-                    agent_id: Some(agent_id.clone()),
-                    reason: Some("agent dispatched".to_owned()),
-                },
-                Err(error) => ActionOutcome {
-                    status: ProjectHookRunStatus::Failed,
-                    automation_task_id: Some(task_id),
-                    execution_id: None,
-                    agent_id: Some(agent_id.clone()),
-                    reason: Some(format!(
-                        "automation task created but execution launch failed: {error}"
-                    )),
-                },
+            let launch = async {
+                self.service
+                    .task_service
+                    .launch_execution(task_id, agent_id.clone(), Some(prompt.clone()), None)
+                    .await
+                    .map(|result| result.execution.id)
             };
-            let run = ProjectHookRunRepo::update_status(
-                &*self.service.db,
-                status_update(&committed.run.id, outcome),
-            )
-            .await?;
-            self.publish_run_changed(&run);
+            self.finish_external_launch(committed, launch, LAUNCH_TIMEOUT)
+                .await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_external_launch<F>(
+        &self,
+        committed: &CommittedHook,
+        launch: F,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<String>>,
+    {
+        let result = tokio::time::timeout(timeout, launch).await;
+        let task_id = committed.run.automation_task_id.clone();
+        let outcome = match result {
+            Ok(Ok(execution_id)) => ActionOutcome {
+                status: ProjectHookRunStatus::Dispatched,
+                automation_task_id: task_id,
+                execution_id: Some(execution_id),
+                agent_id: committed.run.agent_id.clone(),
+                reason: Some("agent dispatched".to_owned()),
+            },
+            Ok(Err(error)) => ActionOutcome {
+                status: ProjectHookRunStatus::Failed,
+                automation_task_id: task_id,
+                execution_id: None,
+                agent_id: committed.run.agent_id.clone(),
+                reason: Some(format!(
+                    "automation task created but execution launch failed: {error}"
+                )),
+            },
+            Err(_) => {
+                let reason = format!("Hook dispatch launch timed out after {} seconds; started marker retained for reconciliation, launch will not be replayed", timeout.as_secs());
+                let run = ProjectHookRunRepo::update_status(
+                    &*self.service.db,
+                    UpdateProjectHookRun {
+                        id: committed.run.id.clone(),
+                        status: ProjectHookRunStatus::Running,
+                        automation_task_id: None,
+                        execution_id: None,
+                        agent_id: None,
+                        reason: Some(Some(reason.clone())),
+                        updated_at: now_rfc3339(),
+                        completed_at: None,
+                    },
+                )
+                .await?;
+                self.publish_run_changed(&run);
+                return Err(ServiceError::invalid_operation(reason));
+            }
+        };
+        // If this write fails after launch, tick discovers the execution and
+        // repairs the run history without another launch.
+        let run = ProjectHookRunRepo::update_status(
+            &*self.service.db,
+            status_update(&committed.run.id, outcome),
+        )
+        .await?;
+        self.publish_run_changed(&run);
         Ok(())
     }
 

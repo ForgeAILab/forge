@@ -2207,7 +2207,7 @@ rows are recreated. The consumer placements are:
 | `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
 | `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
 | `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
-| `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | None | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
+| `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | Settle stale started runs from execution evidence | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
 
 
@@ -2223,7 +2223,11 @@ hints. The migration adds writer-transaction triggers for `project_hook.task_cre
 Project/Task, title, event kind and full body for `task.blocked`, `task.failed`,
 manual `task.recovery_required` (crash/heartbeat, excluding shutdown), and
 `merge.failed` (detected merge conflict/dirty target). Review completion uses
-`review.status_changed`; automatic and manual board transitions share
+runner-origin `review.status_changed` (including workflow CI results); human
+approval/rejection, manual passes and mechanical authority carry do not notify.
+Task delivery triggers exclude owner Hold, review-CI infrastructure/reset
+annotations and queued-action restoration, including restored hard failures.
+Automatic and manual board transitions share
 `task.transitioned`. Direct status mutations use `task.status_changed`.
 Attention records a zero-budget Project autonomy stall's `notification.requested`
 in the same wake-decision transaction, including the open-incident count.
@@ -2240,6 +2244,16 @@ never launches that run again, even if it crashed after the launch or just befor
 it. Exactly-once external execution is impossible without cooperation from the
 external runner. A crash between commit and launch may therefore leave a running
 run with an automation Task but no execution; it is deliberately not retried.
+The worker tick inspects at most 100 `running` runs older than ten minutes,
+using an active-run index. It marks a run `failed` with a visible expiration
+reason when no execution exists, or `dispatched` with the execution ID when
+launch succeeded but its status write did not. Both settlements complete the
+run and release its concurrency slot, publish the existing run-history hint,
+and never launch again. Launch itself has a five-minute timeout; a timeout
+retains the started marker for this reconciliation and reports worker health.
+Per-rule trigger/preparation errors record a failed run and allow later rules
+to continue. An unread trigger gets an event-specific diagnostic dedupe key,
+so it cannot consume a future successfully matched work epoch.
 Live SSE hints and derived comment-memory indexing are best effort after commit;
 the authoritative rows remain queryable after a crash before publication.
 

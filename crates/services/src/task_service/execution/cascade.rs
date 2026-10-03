@@ -2004,6 +2004,7 @@ impl TaskService {
                 &finished_at,
                 task.version,
                 review_passed_at,
+                db::ReviewEventOrigin::Runner,
             )
             .await?;
             (updated_review, task)
@@ -2403,6 +2404,7 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
+            db::ReviewEventOrigin::Runner,
         )
         .await?;
 

@@ -74,6 +74,12 @@ impl Worker<Vec<Option<engine::CommittedHook>>> for ProjectHookService {
             "project_hook.task_archived".into(),
         ])
     }
+    async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        engine::ProjectHookEngine::new(self)
+            .tick()
+            .await
+            .map_err(consumer_error)
+    }
     async fn handle(
         &self,
         event: &DomainEvent,
@@ -114,7 +120,7 @@ impl Worker<Vec<Option<engine::CommittedHook>>> for ProjectHookService {
         else {
             return Ok(Outcome::Skip);
         };
-        let prepared = evaluator::prepare_for_project(self, &project, &cause)
+        let prepared = evaluator::prepare_for_project(self, &project, &cause, &event.id)
             .await
             .map_err(consumer_error)?;
         if prepared.is_empty() {

@@ -3017,7 +3017,11 @@ deferred to a future stuck-signal change. Run history is available at
 pagination. The `project-hooks` runtime consumer evaluates committed Task events;
 its DB actions commit with its cursor. External dispatch uses a durable started
 run and is at most once: a crash before launch may leave a `running` hook run
-without an execution, and restart does not launch it again.
+without an execution, and restart does not launch it again. Launch is bounded
+to five minutes. After a ten-minute grace period, the worker settles stale
+`running` history as `failed` if no execution exists or `dispatched` with the
+existing execution ID. This releases concurrency capacity without replaying
+the external side effect.
 
 ## Prompt preview
 
@@ -3225,6 +3229,10 @@ notification sources: they are durable per-attempt audit/progress-warning
 resolution events. Human `task.blocked` and `task.failed` notifications are
 emitted only from the committed Task outcome after disposition, never from an
 individual attempt failure.
+Owner Hold, review-CI infrastructure/reset annotations, queued-recovery
+restoration, human review approval/rejection, manual review pass and mechanical
+review carry are silent. Review notifications require runner-origin completion;
+committed events retain the real human or workflow origin for other consumers.
 
 ## Task detail bootstrap
 

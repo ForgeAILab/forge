@@ -306,3 +306,68 @@ impl SqliteDb {
         Ok(Some(run))
     }
 }
+
+impl SqliteDb {
+    /// Settle abandoned started markers without ever admitting another launch.
+    /// The short writer transaction also protects against a normal finisher.
+    pub async fn reconcile_started_project_hook_runs(
+        &self,
+        cutoff: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<ProjectHookRun>> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let sql = format!(
+            "SELECT {PROJECT_HOOK_RUN_COLUMNS} FROM project_hook_run
+            WHERE status = 'running' AND completed_at IS NULL
+              AND COALESCE(julianday(updated_at), 0) <= julianday(?)
+            ORDER BY updated_at, id LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(cutoff)
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&mut *transaction)
+            .await?;
+        let mut settled = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run = map_project_hook_run(row)?;
+            let execution: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT id, agent_id FROM execution
+                 WHERE task_id = ? OR id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&run.automation_task_id)
+            .bind(&run.execution_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let (status, execution_id, agent_id, reason) = match execution {
+                Some((id, agent)) => (ProjectHookRunStatus::Dispatched, Some(id), agent.or(run.agent_id.clone()),
+                    "Recovered started hook dispatch from its execution record; launch was not replayed"),
+                None => (ProjectHookRunStatus::Failed, None, run.agent_id.clone(),
+                    "Started hook dispatch expired without an execution record; launch was not replayed"),
+            };
+            let sql = format!(
+                "UPDATE project_hook_run SET status = ?, execution_id = ?, agent_id = ?,
+                reason = ?, updated_at = ?, completed_at = ?
+                WHERE id = ? AND status = 'running' AND completed_at IS NULL AND updated_at = ?
+                RETURNING {PROJECT_HOOK_RUN_COLUMNS}"
+            );
+            if let Some(row) = sqlx::query(&sql)
+                .bind(status.to_string())
+                .bind(execution_id)
+                .bind(agent_id)
+                .bind(reason)
+                .bind(now)
+                .bind(now)
+                .bind(&run.id)
+                .bind(&run.updated_at)
+                .fetch_optional(&mut *transaction)
+                .await?
+            {
+                settled.push(map_project_hook_run(row)?);
+            }
+        }
+        transaction.commit().await?;
+        Ok(settled)
+    }
+}

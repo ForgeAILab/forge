@@ -1809,6 +1809,23 @@ pub trait ScopedMemoryRepository: Send + Sync {
     ) -> std::result::Result<Vec<ContextManifestSource>, DbError>;
 }
 
+/// Producer of a terminal review mutation; human decisions never impersonate
+/// the runner's completion notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewEventOrigin {
+    Runner,
+    User,
+}
+
+impl ReviewEventOrigin {
+    pub(crate) fn actor_type(self) -> &'static str {
+        match self {
+            Self::Runner => "review_runner",
+            Self::User => "user",
+        }
+    }
+}
+
 #[async_trait]
 pub trait ReviewRepo: Send + Sync {
     async fn create(&self, input: CreateReview) -> Result<Review>;
@@ -1890,6 +1907,7 @@ pub trait ReviewRepo: Send + Sync {
         updated_at: &str,
         expected_task_version: i64,
         review_passed_at: Option<String>,
+        origin: ReviewEventOrigin,
     ) -> Result<(Review, Task)>;
     /// Terminal Review settlement variant that also binds the result to the
     /// exact implementation execution currently selected for the Task.
