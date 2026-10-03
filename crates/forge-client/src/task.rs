@@ -58,22 +58,31 @@ pub enum TaskCmd {
     Actions {
         id: String,
     },
+    /// Apply an offered action. Exit code 3 means action_unavailable; refresh with task actions.
     Action {
+        /// Task ID.
         id: String,
         #[arg(value_parser = ["start", "hold", "release", "retry", "send_back", "approve", "restart", "cancel"])]
         verb: String,
+        /// Task version from task actions; omitted fetches the current version.
         #[arg(long)]
         version: Option<i64>,
+        /// retry: start a new session instead of continuing the offered thread.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         fresh_session: Option<bool>,
+        /// retry: refresh the workspace before retrying checks when offered.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         refresh_workspace: Option<bool>,
+        /// retry: reset the retry window; false requests one attempt and requires --reason.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         reset_budget: Option<bool>,
+        /// send_back: required revision guidance; retry: optional follow-up guidance.
         #[arg(long)]
         guidance: Option<String>,
+        /// approve: override failed checks when offered; true requires --reason.
         #[arg(long = "override", num_args = 0..=1, default_missing_value = "true")]
         override_checks: Option<bool>,
+        /// approve/hold/release/retry/restart/cancel: audit reason; required when the offer says so.
         #[arg(long)]
         reason: Option<String>,
     },
@@ -113,6 +122,42 @@ pub enum MediaCmd {
         #[arg(long)]
         media_url: Vec<String>,
     },
+}
+
+fn format_offer(offer: &api_types::Offer) -> String {
+    let parameters = offer
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let mut text = parameter.name.clone();
+            if parameter.required {
+                text.push_str(" (required)");
+            }
+            if let Some(condition) = &parameter.required_when {
+                text.push_str(&format!(
+                    " (required when {}={})",
+                    condition.parameter, condition.value
+                ));
+            }
+            if let Some(values) = &parameter.boolean_values {
+                text.push_str(&format!("={values:?}"));
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}: {} | inputs: {} | presets: {} | propagates: {}",
+        offer.action.verb(),
+        offer.label,
+        if parameters.is_empty() {
+            "none"
+        } else {
+            &parameters
+        },
+        serde_json::to_string(&offer.action).expect("action serializes"),
+        offer.propagates
+    )
 }
 
 impl TaskArgs {
@@ -194,7 +239,7 @@ impl TaskArgs {
                     OutputFormat::Table => {
                         println!("Version: {}", response.version);
                         for offer in response.available_actions {
-                            println!("{}: {}", offer.action.verb(), offer.label);
+                            println!("{}", format_offer(&offer));
                         }
                         Ok(())
                     }
@@ -534,7 +579,9 @@ fn build_action(
         action["reason"] = json!(value);
     }
     if verb == "approve" {
-        action["override"] = json!(override_checks.unwrap_or(false));
+        if let Some(value) = override_checks {
+            action["override"] = json!(value);
+        }
     }
     Ok(serde_json::from_value(action)?)
 }
@@ -604,6 +651,43 @@ mod tests {
             )
             .unwrap(),
             json!({"verb":"send_back","guidance":"Fix the failing check"})
+        );
+    }
+    #[test]
+    fn action_help_describes_task_version_verb_flags_and_unavailable_exit() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let action = command.find_subcommand_mut("action").unwrap();
+        let help = action.render_long_help().to_string();
+        for expected in [
+            "Task version",
+            "retry:",
+            "send_back:",
+            "approve:",
+            "Exit code 3",
+            "action_unavailable",
+        ] {
+            assert!(help.contains(expected), "missing {expected}: {help}");
+        }
+    }
+    #[test]
+    fn offer_table_prints_required_fixed_presets_and_propagation() {
+        let offer = serde_json::from_value(json!({"action":{"verb":"retry","refresh_workspace":true},"parameters":[{"name":"reason","required":true,"boolean_values":null},{"name":"reset_budget","required":false,"boolean_values":[true]}],"authority":["owner"],"reason":"test","label":"Retry","propagates":true,"target_execution_id":null})).unwrap();
+        let row = format_offer(&offer);
+        for expected in [
+            "reason (required)",
+            "reset_budget=[true]",
+            "refresh_workspace",
+            "propagates: true",
+        ] {
+            assert!(row.contains(expected), "{row}");
+        }
+        assert_eq!(
+            serde_json::to_value(
+                build_action("approve", None, None, None, None, None, None).unwrap()
+            )
+            .unwrap(),
+            json!({"verb":"approve"})
         );
     }
 }

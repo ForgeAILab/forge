@@ -17,6 +17,7 @@ pub async fn apply_task_action(
     Path(id): Path<String>,
     Json(request): Json<TaskActionRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    // The command resolves omitted fixed parameters from the live caller offer.
     let result = state
         .task_service
         .perform_task_action(id, request.action, request.version)

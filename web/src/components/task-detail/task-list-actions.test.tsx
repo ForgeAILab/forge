@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '@/api/client'
 import { BulkCancelTasks, TaskRowActions } from './task-list-actions'
 const { apiFetch, mutateAsync } = vi.hoisted(() => ({ apiFetch: vi.fn(), mutateAsync: vi.fn() }))
 vi.mock('@/api/client', async (original) => ({ ...(await original<object>()), apiFetch }))
@@ -68,6 +69,39 @@ describe('list offers on demand', () => {
     await screen.findByRole('button', { name: 'Cancel 1 Tasks' })
     fireEvent.click(screen.getByRole('button', { name: 'Cancel 1 Tasks' }))
     await screen.findByText('Available now: Task A: Hold')
+    expect(apiFetch).toHaveBeenCalledTimes(2)
+  })
+  it('skips selected children covered by root cancellation', async () => {
+    apiFetch.mockResolvedValue({ version: 1, available_actions: [cancel] })
+    const completed = vi.fn()
+    render(
+      <BulkCancelTasks
+        tasks={[
+          { id: 'child', title: 'Child', parent_task_id: 'root' },
+          { id: 'root', title: 'Root' },
+        ]}
+        onComplete={completed}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel selected' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel 1 Tasks' }))
+    await waitFor(() => expect(completed).toHaveBeenCalled())
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({
+      taskId: 'root',
+      version: 1,
+      action: { verb: 'cancel' },
+    })
+  })
+  it('accepts a cancellation conflict already settled by propagation', async () => {
+    apiFetch
+      .mockResolvedValueOnce({ version: 1, available_actions: [cancel] })
+      .mockResolvedValueOnce({ version: 2, available_actions: [] })
+    mutateAsync.mockRejectedValueOnce(new ApiError('changed', 409, ''))
+    const completed = vi.fn()
+    render(<BulkCancelTasks tasks={[{ id: 'child', title: 'Child' }]} onComplete={completed} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel selected' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel 1 Tasks' }))
+    await waitFor(() => expect(completed).toHaveBeenCalled())
     expect(apiFetch).toHaveBeenCalledTimes(2)
   })
 })

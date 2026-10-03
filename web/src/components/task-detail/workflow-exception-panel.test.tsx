@@ -119,9 +119,8 @@ describe('WorkflowExceptionPanel offers', () => {
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))
-    const budget = screen.getByLabelText(/reset budget/i) as HTMLSelectElement
-    expect(budget.value).toBe('true')
-    expect(budget.disabled).toBe(true)
+    expect(screen.getByText('Resets the retry budget')).toBeTruthy()
+    expect(screen.queryByRole('combobox')).toBeNull()
     expect(screen.queryByLabelText('fresh session')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'retry', reset_budget: true })
@@ -133,17 +132,26 @@ describe('WorkflowExceptionPanel offers', () => {
           {
             ...retry,
             action: { verb: 'approve', override: true },
-            parameters: [{ name: 'override', required: false, boolean_values: [true] }],
+            parameters: [
+              { name: 'override', required: false, boolean_values: [true] },
+              { name: 'reason', required: true, boolean_values: null },
+            ],
             label: 'Pass Review Manually',
           },
         ])}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Pass Review Manually' }))
-    const override = screen.getByLabelText(/override checks/i) as HTMLSelectElement
-    expect(override.value).toBe('true')
-    expect(override.disabled).toBe(true)
+    expect(screen.getByText('Overrides the failed checks')).toBeTruthy()
+    expect(screen.queryByRole('combobox')).toBeNull()
+    fireEvent.change(screen.getByLabelText(/reason/i), {
+      target: { value: 'Verified independently' },
+    })
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
-    expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'approve', override: true })
+    expect(mutate.mock.calls[0][0].action).toEqual({
+      verb: 'approve',
+      override: true,
+      reason: 'Verified independently',
+    })
   })
 })

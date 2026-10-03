@@ -317,7 +317,7 @@ impl CoordinationToolProvider {
             let mut cause = row.denied_by.parse::<DeniedBy>().ok();
             let holds = match cause.as_ref() {
                 Some(DeniedBy::OperationNotInScope) => true,
-                Some(DeniedBy::ProjectPaused(_)) if row.operation != TASK_ACTION_OPERATION => {
+                Some(DeniedBy::ProjectPaused(_)) => {
                     let scope = CanonicalScope {
                         scope_type: CanonicalScopeType::AgentChat,
                         scope_id: chat_id.to_owned(),
@@ -5169,17 +5169,29 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
     if let crate::ServiceError::TaskActionUnavailable {
         available_actions,
         reason,
+        wait_cause,
     } = &error
     {
-        let mut outcome = OrchestrationOutcome::failed(
-            OutcomeCode::ActionUnavailable,
-            "task.action",
-            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
-            "",
-            reason.clone(),
-        );
+        let mut outcome = if let Some(cause) = wait_cause {
+            OrchestrationOutcome::terminal_denial(
+                "task.action",
+                OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+                "",
+                cause.clone(),
+            )
+        } else {
+            OrchestrationOutcome::failed(
+                OutcomeCode::ActionUnavailable,
+                "task.action",
+                OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+                "",
+                reason.clone(),
+            )
+        };
         outcome.details = Some(json!({ "available_actions": available_actions }));
-        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        if wait_cause.is_none() {
+            outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        }
         return AgentHostError::StructuredOutcome(Box::new(outcome));
     }
     let target_refusal = match &error {

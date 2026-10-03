@@ -77,11 +77,11 @@ impl TaskService {
             }),
             "mark_reviewed" | "skip_hook_once" => Some(api_types::TaskAction::Approve {
                 reason: saved_reason.clone(),
-                override_checks: true,
+                override_checks: Some(true),
             }),
             "defer_to_follow_up" => Some(api_types::TaskAction::Approve {
                 reason: saved_reason.clone(),
-                override_checks: false,
+                override_checks: Some(false),
             }),
             "resume_process" if snapshot.task.status == "review" => {
                 Some(api_types::TaskAction::SendBack {
@@ -281,11 +281,10 @@ impl TaskService {
             let actor = TaskService::task_action_actor(Actor::user(UserActionSource::Api));
             let mut snapshot = self.task_action_snapshot(&task.id, &actor).await?;
             snapshot.owner_disconnected = false;
-            if let Some(mut offer) = crate::available_actions(&snapshot)
+            if let Some(offer) = crate::available_actions(&snapshot)
                 .into_iter()
                 .find(|offer| offer.action.verb() == "retry")
             {
-                offer.reason = "role_retry".to_owned();
                 return self
                     .queue_task_action(&snapshot, offer, action, actor)
                     .await;
@@ -989,9 +988,6 @@ impl TaskService {
                         self.reset_task_retry_budget(evidence, reason.clone()).await
                     }
                 }
-                "retry_budget_one_attempt" => {
-                    self.permit_one_task_retry(task, reason.clone(), None).await
-                }
                 "review_checks_retry" => {
                     self.apply_review_check_retry(
                         &task,
@@ -1023,7 +1019,7 @@ impl TaskService {
                         && matches!(
                             request.action,
                             api_types::TaskAction::Approve {
-                                override_checks: false,
+                                override_checks: Some(false),
                                 ..
                             }
                         ))
@@ -1514,7 +1510,7 @@ impl TaskService {
                     triggered_by: TaskService::task_action_actor(api_types::Actor::user(
                         api_types::UserActionSource::Action(api_types::TaskAction::Approve {
                             reason: None,
-                            override_checks: true,
+                            override_checks: Some(true),
                         }),
                     )),
                     rejection: true,
@@ -2578,7 +2574,7 @@ impl TaskService {
                 &TaskService::task_action_actor(api_types::Actor::user(
                     api_types::UserActionSource::Action(api_types::TaskAction::Approve {
                         reason: None,
-                        override_checks: true,
+                        override_checks: Some(true),
                     }),
                 )),
             );
@@ -2653,7 +2649,7 @@ impl TaskService {
                     &TaskService::task_action_actor(api_types::Actor::user(
                         api_types::UserActionSource::Action(api_types::TaskAction::Approve {
                             reason: None,
-                            override_checks: true,
+                            override_checks: Some(true),
                         }),
                     )),
                     reason.as_deref().unwrap_or("approve"),

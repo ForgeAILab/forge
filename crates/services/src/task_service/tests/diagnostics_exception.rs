@@ -152,7 +152,7 @@ async fn stored_action_lists_do_not_control_projection() {
 #[tokio::test]
 async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
     let snapshot = check_projection("merging", Some(FailureKind::TargetRepoDirty), false).await;
-    assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
+    assert_action_set(&snapshot, &["cancel", "retry", "approve"]);
     assert!(crate::available_actions(&snapshot)
         .iter()
         .any(|offer| offer.reason == "merge_gate_retry"));
@@ -176,7 +176,7 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
     assert!(matches!(
         manual_pass.action,
         TaskAction::Approve {
-            override_checks: true,
+            override_checks: Some(true),
             ..
         }
     ));
@@ -430,7 +430,7 @@ async fn decisions_require_operator_reason_and_guidance_and_reject_other_states(
             .perform_task_action(
                 &task.id,
                 TaskAction::Approve {
-                    override_checks: true,
+                    override_checks: Some(true),
                     reason,
                 },
                 task.version,
@@ -479,7 +479,7 @@ async fn decisions_require_operator_reason_and_guidance_and_reject_other_states(
             || matches!(
                 offer.action,
                 TaskAction::Approve {
-                    override_checks: false,
+                    override_checks: Some(false),
                     ..
                 }
             )));
@@ -488,7 +488,7 @@ async fn decisions_require_operator_reason_and_guidance_and_reject_other_states(
             .perform_task_action(
                 &other.id,
                 TaskAction::Approve {
-                    override_checks: false,
+                    override_checks: Some(false),
                     reason: Some("owner decision".to_owned())
                 },
                 other.version

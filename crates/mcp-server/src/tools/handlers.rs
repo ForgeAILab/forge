@@ -181,7 +181,7 @@ async fn tasks_with_role_assignments(
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
-        let mut value = task_with_offers(state, task).await?;
+        let mut value = task_value(task);
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "role_assignments".to_owned(),

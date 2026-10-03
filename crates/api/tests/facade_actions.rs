@@ -524,6 +524,31 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
         .await;
 
         set_status(&harness, &gate_task.id, gate_state).await;
+        seed_completed_role_execution(&harness, &gate_task.id, active_state).await;
+        let candidate: String = sqlx::query_scalar(
+            "SELECT id FROM execution WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&gate_task.id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+        let now = db::now_rfc3339();
+        db::ReviewRepo::create(
+            &*harness.state.db,
+            db::CreateReview {
+                id: db::new_uuid_v4(),
+                task_id: gate_task.id.clone(),
+                execution_id: candidate,
+                attempt_number: 1,
+                status: db::ReviewStatus::AwaitingHuman,
+                step_results_json: json!({"ci_steps":[]}).to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
         let _approved: TaskResponse = common::json_request(
             &harness.app,
             Method::POST,
@@ -885,4 +910,71 @@ async fn action_requests_require_an_explicit_version() {
         .unwrap();
     assert_eq!(current.version, task.version);
     assert_ne!(current.status, "cancelled");
+}
+
+#[tokio::test]
+async fn paused_task_action_refusals_keep_wait_cause_and_hold_offer() {
+    let workspace = common::TestDir::new("action-pause-causes");
+    let repo = common::TestDir::new("action-pause-repo");
+    let path = common::setup_git_repo(repo.path());
+    let harness = common::test_app(workspace.path(), "action-pause-causes").await;
+    let (project, _) = common::create_project_and_repo(&harness.app, "Pause causes", &path).await;
+    let task = create_task(&harness.app, &project, "Wait for dispatch").await;
+    let (agent, _) =
+        common::create_shell_agents(&harness.app, workspace.path(), "pause-causes").await;
+    db::TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent.clone()),
+            created_at: db::now_rfc3339(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET status = 'in_progress', error_annotation = ? WHERE id = ?")
+        .bind(json!({"type":"executor_failed","blocking_reason":"fixture"}).to_string())
+        .bind(&task.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    for cause in [
+        "target_agent_paused",
+        "project_paused(environment_not_ready)",
+    ] {
+        sqlx::query("UPDATE agent_identity SET paused = ? WHERE id = ?")
+            .bind(cause == "target_agent_paused")
+            .bind(&agent)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE project SET paused_at = ?, system_pause_reason = ? WHERE id = ?")
+            .bind((cause != "target_agent_paused").then_some("now"))
+            .bind((cause != "target_agent_paused").then_some("environment_not_ready"))
+            .bind(&project)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let error: ErrorResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/actions", task.id),
+            json!({"version":task.version,"action":{"verb":"retry"}}),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(error.code, "action_unavailable");
+        let details = error.details.unwrap();
+        assert_eq!(details["denied_by"], cause);
+        assert_eq!(details["retry"]["scope"], "turn");
+        assert!(details["available_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|offer| offer["action"]["verb"] == "hold"));
+    }
 }

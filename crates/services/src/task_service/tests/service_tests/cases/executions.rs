@@ -3171,7 +3171,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: true,
+                override_checks: Some(true),
             },
             Some("Skip the known fixture hook once".to_owned()),
             None,
@@ -4486,7 +4486,7 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: true,
+                override_checks: Some(true),
             },
             None,
             None,
@@ -4500,7 +4500,7 @@ async fn a_blocked_review_parks_the_task_for_its_owner_without_the_coder() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: true,
+                override_checks: Some(true),
             },
             Some("Provider check was verified manually".to_owned()),
             None,
@@ -4921,7 +4921,7 @@ async fn review_finding_routing_owner_manual_pass_clears_the_park() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             Some("Owner verified the hardware measurements".to_owned()),
             None,
@@ -5001,7 +5001,7 @@ async fn review_finding_routing_defer_follow_up_is_charter_dispatchable() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             Some("Schedule the measurements separately".to_owned()),
             None,
@@ -5049,7 +5049,7 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
                 task.id.clone(),
                 api_types::TaskAction::Approve {
                     reason: None,
-                    override_checks: false,
+                    override_checks: Some(false),
                 },
                 reason,
                 None,
@@ -5064,7 +5064,7 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             Some("macOS/Windows runs need a human".to_owned()),
             None,
@@ -5134,7 +5134,7 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false
+                override_checks: Some(false)
             },
             Some("duplicate defer".to_owned()),
             None
@@ -5191,7 +5191,7 @@ async fn review_finding_routing_defer_uses_workflow_backlog_and_bounds_unicode_t
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             Some("Collect hardware evidence separately".to_owned()),
             None,
@@ -5244,7 +5244,7 @@ async fn review_finding_routing_defer_rolls_back_follow_up_when_manual_pass_fail
             "human follow-up required".to_owned(),
             Some(&annotation),
             api_types::TaskAction::Approve {
-                override_checks: false,
+                override_checks: Some(false),
                 reason: Some("human follow-up required".to_owned()),
             },
         )
@@ -5258,7 +5258,7 @@ async fn review_finding_routing_defer_rolls_back_follow_up_when_manual_pass_fail
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             Some("human follow-up required".to_owned()),
             None,
@@ -7067,7 +7067,7 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
             },
             api_types::TaskAction::Restart { reason: None },
             api_types::TaskAction::Approve {
-                override_checks: true,
+                override_checks: Some(true),
                 reason: None
             },
         ]
@@ -7186,7 +7186,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
     assert!(
         !never_run_actions.contains(&api_types::TaskAction::Approve {
             reason: None,
-            override_checks: false
+            override_checks: Some(false)
         }),
         "an assigned Task must not skip its first coder execution"
     );
@@ -7198,7 +7198,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
         .expect("actions resolve");
     assert!(!actions.contains(&api_types::TaskAction::Approve {
         reason: None,
-        override_checks: false
+        override_checks: Some(false)
     }));
 
     let error = service
@@ -7206,7 +7206,7 @@ async fn submit_is_not_available_while_agent_work_has_not_completed() {
             task.id.clone(),
             api_types::TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             None,
             Some(task.version),
@@ -7260,7 +7260,7 @@ async fn submit_does_not_reuse_a_completed_attempt_from_before_review_remediatio
         .expect("actions resolve");
     assert!(!actions.contains(&api_types::TaskAction::Approve {
         reason: None,
-        override_checks: false
+        override_checks: Some(false)
     }));
 }
 
@@ -7343,7 +7343,7 @@ async fn submit_uses_latest_current_role_execution_not_later_interactive_history
         .expect("actions resolve");
     assert!(actions.contains(&api_types::TaskAction::Approve {
         reason: None,
-        override_checks: false
+        override_checks: Some(false)
     }));
 }
 
@@ -7596,13 +7596,13 @@ async fn hard_failed_active_task_cannot_resume_or_submit() {
     assert!(!actions.contains(&api_types::TaskAction::Release { reason: None }));
     assert!(!actions.contains(&api_types::TaskAction::Approve {
         reason: None,
-        override_checks: false
+        override_checks: Some(false)
     }));
     for action in [
         api_types::TaskAction::Release { reason: None },
         api_types::TaskAction::Approve {
             reason: None,
-            override_checks: false,
+            override_checks: Some(false),
         },
     ] {
         let error = service

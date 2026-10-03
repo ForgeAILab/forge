@@ -132,7 +132,6 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/dependencies` | Add one prerequisite dependency edge |
 | DELETE | `/api/v1/tasks/{id}/dependencies/{dep_id}` | Remove one prerequisite dependency edge |
 | GET    | `/api/v1/tasks/{id}/dependents` | List Tasks that depend on this prerequisite |
-| POST   | `/api/v1/tasks/{id}/review` | Re-run the configured review and apply its workflow outcome |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
 | GET    | `/api/v1/tasks/{id}/roles` | List explicit Task role assignments |
@@ -309,6 +308,7 @@ succeeds. The connection test itself updates the health row.
 | POST   | `/api/v1/actions/{id}/execute-orchestration` | Materialize a Main Charter/Project orchestration proposal through its typed domain executor; generic execution rejects these operations |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
+| POST   | `/api/v1/executions/{id}/stop` | Stop one running execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
 | GET    | `/api/v1/workspaces/{id}/diff` | Get workspace diff |
 | GET    | `/api/v1/notifications` | List notifications (paginated, filterable by `project_id`, `read`) |
@@ -2592,7 +2592,7 @@ unfinished dependents until the cancelled link is removed or otherwise
 resolved.
 
 The current Project Agent operating skill is
-`forge.project.orchestration/v1@19` (activated by V202610020500). Its task-coordination
+`forge.project.orchestration/v1@19` (activated by V202610030100). Its task-coordination
 doctrine uses the same distinction: `parent_task_id` selects the shared root
 workspace, while dependency IDs only gate execution.
 
@@ -2777,15 +2777,15 @@ relaunch a non-reviewer role while that human decision is outstanding.
 {"action":{"verb":"retry","fresh_session":true,"guidance":"The environment is repaired."},"version":7}
 ```
 
-The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval requires `override` and accepts an optional reason; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status.
+The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Resetting the budget while a Review awaits a human preserves that decision and does not re-execute its reviewer. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval accepts `override` and an optional reason; omitted booleans use the selected offer's value; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status.
 
-Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. Optimistic version conflicts remain 409. Missing `version` yields 422; unknown fields and malformed payloads are refused. Blank required reason/guidance yields 400. Corrupt persisted Review details yield 500 before mutation. MCP unavailable errors use -32010.
+Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. When a worker or Project pause prevents dispatch, refusals also carry `denied_by` (`target_agent_paused` or `project_paused(<pause reason>)`) and `retry.scope:"turn"`; native denials retain the same cause and turn scope. Hold remains offered while waiting. A descriptor with one accepted boolean value is fixed; an omitted parameter uses that value. Other omitted preset parameters use the offer's action value. A contradictory fixed/preset value returns 409 `action_unavailable`. Optimistic version conflicts remain 409. Missing `version` yields 422; unknown fields and malformed payloads are refused. Blank required reason/guidance yields 400. Corrupt persisted Review details yield 500 before mutation. MCP unavailable errors use -32010.
 
 Recovery commits a condition change and queues work for the existing dispatcher; Agent capacity never makes the command launch a worker or refuse with `agent_at_capacity`. Gate decisions commit their workflow transition immediately while worker dispatch is deferred. Session launches and side-session follow-ups stay separate. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
 The old Task start/pause/resume/submit/request-changes/approve/cancel/advance/recover, gate approve/reject, and review rerun/approve/reject routes are removed. Claim, graph transition and board move, roles, definition edits, comments, dependencies, archiving, duplication, and workspace/session operations remain distinct resources.
 
-MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; Task lists omit offers and MCP Task pages use `items`. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
+MCP uses `forge_task_action`; native coordination uses `task.action`. Both take `task_id`, the action object, and `version`. Native action reasons/guidance live inside that object; the retired generic envelope `reason`/`decision` properties are removed. Single-Task reads include caller-filtered offers; REST and MCP Task lists omit offers and MCP Task pages use `items`. The Project Agent's admitted native `work.read` projection carries live per-Task offers and versions. `forge_cancel_task`, `task.recover`, `task.cancel`, and `task.review` are removed. Structured refusals carry `action_unavailable` and current offers.
 
 Machine run caps use the same durable Task-action queue. A full machine records a `machine_capacity` dispatch disposition, parks the Task for its Project, and waits without a failure annotation, Attention item or retry-budget charge. Repeated dispatcher ticks preserve the accepted marker, Task version and event history, including an admission race after the read-only precheck. Environment readiness/probe refusals retain an `environment_wait` marker; a Project paused for its environment waits rather than becoming `dispatch_failed`. Permanent replay refusals restore the saved condition with the refusal error and remove the matching intent.
 
@@ -4659,12 +4659,12 @@ the Task with `review_blocked` rather than dispatching another reviewer. Read-on
 suppress both lists. A Project Agent sets them through `project.review_config`;
 this keeps repository-specific preparation and check selection at Project scope.
 
-`POST /api/v1/tasks/{id}/review` synchronously re-runs the configured CI and
-auditor review, then routes the result through the normal workflow. A pass enters
+An offered `retry` through `POST /api/v1/tasks/{id}/actions` queues a re-run of
+the configured CI and auditor review, then routes its result through the normal workflow. A pass enters
 merging, a failure returns to remediation or records the exhausted-budget blocker,
 and a passing gate configured for user approval remains in review with an
-`awaiting_human` review. The response contains the settled Task snapshot and the
-new review attempt. Attempt allocation and the Running reviewer execution/lease
+`awaiting_human` review. The action response contains the Task snapshot with the queued action;
+read the Task and Review resources for the settled outcome. Attempt allocation and the Running reviewer execution/lease
 are one database admission boundary; the selected Task role assignment, Agent
 identity, workflow snapshot, and current candidate execution must still match
 when that boundary commits. Reviewer capacity counts live Running executions,
@@ -4746,4 +4746,4 @@ The web renders Task controls from live offers, including placement waits (`hold
 
 Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
 
-Project doctrine @19 names the live `task.action` contract and required inputs. Migration V202610020500 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
+Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.

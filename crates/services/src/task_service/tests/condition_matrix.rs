@@ -257,7 +257,7 @@ async fn condition_offer_apply_dispatch_matrix() {
         },
         TaskAction::Approve {
             reason: None,
-            override_checks: false,
+            override_checks: Some(false),
         },
         TaskAction::Restart { reason: None },
         TaskAction::Cancel { reason: None },
@@ -519,11 +519,11 @@ async fn condition_offer_apply_dispatch_matrix() {
                                 .and_then(|parameter| parameter.boolean_values.clone())
                                 .unwrap_or_default()
                             {
-                                if value != *override_checks {
+                                if Some(value) != *override_checks {
                                     attempts.push((
                                         format!("approve[{}]+override={value}", offer.reason),
                                         TaskAction::Approve {
-                                            override_checks: value,
+                                            override_checks: Some(value),
                                             reason: None,
                                         },
                                     ));

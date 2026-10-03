@@ -283,12 +283,15 @@ impl From<ServiceError> for ApiError {
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
+                wait_cause,
             } => Self::conflict_with_code_and_details(
                 "action_unavailable",
                 reason.clone(),
                 json!({
                     "available_actions": available_actions,
                     "reason": reason,
+                    "denied_by": wait_cause.as_ref().map(ToString::to_string),
+                    "retry": wait_cause.map(|_| json!({"action":"none", "scope":"turn", "retryable":false})),
                 }),
             ),
             ServiceError::TurnFailure { error, .. } => Self::from(*error),

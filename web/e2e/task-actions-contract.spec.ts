@@ -18,20 +18,34 @@ const offer = (
   action,
   label,
   parameters,
-  reason: 'review_failed',
+  reason:
+    action.verb === 'retry'
+      ? action.reset_budget
+        ? 'retry_budget_exhausted'
+        : 'role_retry'
+      : action.verb === 'approve'
+        ? 'failed_review_override'
+        : action.verb === 'cancel'
+          ? 'cancellable'
+          : 'gate_can_reject',
   authority: ['owner'],
   target_execution_id: null,
   propagates,
 })
 const offers = [
-  offer({ verb: 'retry', fresh_session: true }, 'Re-run review', [
-    { name: 'fresh_session', required: false, boolean_values: [true] },
+  offer({ verb: 'retry', fresh_session: false }, 'Re-run review', [
+    { name: 'fresh_session', required: false, boolean_values: [false, true] },
     text('guidance', false),
+    text('reason', false),
   ]),
   offer({ verb: 'send_back', guidance: '' }, 'Send back', [text('guidance', true)]),
-  offer({ verb: 'approve', override: false }, 'Approve', [
-    { name: 'override', required: true, boolean_values: [false, true] },
-    text('reason', false, { parameter: 'override', value: true }),
+  offer({ verb: 'approve', override: true }, 'Override failed review', [
+    { name: 'override', required: false, boolean_values: [true] },
+    text('reason', true),
+  ]),
+  offer({ verb: 'retry', reset_budget: true }, 'Reset Budget and Retry', [
+    { name: 'reset_budget', required: false, boolean_values: [true] },
+    text('reason', false),
   ]),
   offer({ verb: 'cancel' }, 'Cancel Task', [text('reason', false)], true),
 ]
@@ -51,7 +65,7 @@ const workflow = {
   roles: [{ name: 'coder', display_name: 'Worker', description: '' }],
   cancellation_state: 'cancelled',
 }
-async function setup(page: Page, running = false) {
+async function setup(page: Page, running = false, board = false) {
   await page.addInitScript(() =>
     localStorage.setItem(
       'forge-auth',
@@ -139,6 +153,7 @@ async function setup(page: Page, running = false) {
     name: 'Task actions',
     settings: {},
     paused: false,
+    slots: { active: 0, parked: 1, queued: 0, limit: 4 },
     version: 1,
     default_review_config: { ci_steps: [] },
     project_hooks: [],
@@ -183,6 +198,39 @@ async function setup(page: Page, running = false) {
     else if (path === `/tasks/${taskId}/relations`)
       json = { dependencies: [], subtasks: [], parent: null }
     else if (path === `/projects/${projectId}`) json = project
+    else if (path === `/projects/${projectId}/overview`)
+      json = {
+        project_id: projectId,
+        project_name: project.name,
+        vision: '',
+        charter_state: 'approved',
+        current_charter: null,
+        primary_milestone_id: null,
+        active_milestones: [],
+        task_counts: { total: 1, backlog: 0, active: 0, review: 1, terminal: 0, blocked: 0 },
+        check_summary: {
+          required_total: 0,
+          passed: 0,
+          failed: 0,
+          missing: 0,
+          stale: 0,
+          waived: 0,
+          unavailable: 0,
+        },
+        pending_decisions: [],
+        decisions: [],
+        risks: [],
+        document_freshness: [],
+        evidence: [],
+        releases: [],
+        next_action: null,
+        projection_state: 'current',
+        source_event_watermark: 'mock',
+        generated_at: task.created_at,
+        execution_setup: null,
+      }
+    else if (path === `/projects/${projectId}/tasks`)
+      json = { ...empty, items: [task], board_revision: 1 }
     else if (path === '/projects') json = { ...empty, items: [project] }
     else if (path.endsWith('/workflow')) json = workflow
     else if (path === '/auth/me')
@@ -208,9 +256,14 @@ async function setup(page: Page, running = false) {
       }
     return route.fulfill({ json })
   })
-  await page.goto(`/tasks/${taskId}${running ? '/executions' : ''}`, {
-    waitUntil: 'domcontentloaded',
-  })
+  await page.goto(
+    board
+      ? `/projects/${projectId}/board?task=${taskId}`
+      : `/tasks/${taskId}${running ? '/executions' : ''}`,
+    {
+      waitUntil: 'domcontentloaded',
+    },
+  )
   await page.waitForTimeout(500)
   return posts
 }
@@ -251,11 +304,12 @@ test('send-back requires typed guidance', async ({ page }) => {
 })
 test('approve override requires its conditional reason', async ({ page }) => {
   await setup(page)
-  await page.getByRole('button', { name: 'Approve', exact: true }).click()
-  await page.getByLabel('Override checks (required)', { exact: true }).selectOption('true')
+  await page.getByRole('button', { name: 'Override failed review', exact: true }).click()
+  await expect(page.getByText('Overrides the failed checks')).toBeVisible()
+  await expect(page.getByRole('combobox')).toHaveCount(0)
   await expect(page.getByLabel('reason (required)', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Apply', exact: true })).toBeDisabled()
-  await shot(page, 'approve-override-reason')
+  await shot(page, 'S4-fixed-override')
 })
 test('cancel confirms subtask propagation', async ({ page }) => {
   await setup(page)
@@ -277,4 +331,24 @@ test('role run and side session stop independently', async ({ page }) => {
   expect(new Set(posts.map((post) => post.path))).toEqual(
     new Set(['/executions/role-run/stop', '/executions/side-session/stop']),
   )
+})
+
+test('board exception offers appear once and sidebar hides duplicates', async ({ page }) => {
+  await setup(page, false, true)
+  await expect(page.getByRole('button', { name: 'Send back', exact: true })).toHaveCount(1)
+  await expect(page.getByRole('button', { name: 'Cancel Task', exact: true })).toHaveCount(1)
+  await shot(page, 'S6-board-exception')
+})
+test('Executions tab preserves fresh retries after refreshed Task offers', async ({ page }) => {
+  const posts = await setup(page)
+  await page.goto(`/tasks/${taskId}/executions`)
+  await expect(page.getByRole('button', { name: 'Re-run review', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Re-run review', exact: true }).click()
+  await page.getByRole('button', { name: 'Apply', exact: true }).click()
+  await expect.poll(() => posts.length).toBe(1)
+  await expect(page.getByRole('button', { name: 'Cancel Task', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Send back', exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: 'Re-run review', exact: true }).click()
+  await expect(page.getByText('Starts a fresh session')).toBeVisible()
+  await shot(page, 'S3-executions-refreshed')
 })

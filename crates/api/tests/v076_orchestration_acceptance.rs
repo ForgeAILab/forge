@@ -955,6 +955,16 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
         previous_preview.system_prompt,
         retained_preview.system_prompt
     );
+    // Replaying the historical @18 migration must not make it the current @19 contract.
+    let action_migration =
+        include_str!("../../db/migrations/V202610030100__task_action_doctrine.sql").replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&action_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let current_turn = admit_preview_turn(
         &harness,
         &genesis.project_chat_id,
@@ -968,7 +978,7 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
             .unwrap();
     assert_eq!(
         current_job.operating_skill_revision_id.as_deref(),
-        Some("forge.project.orchestration/v1@18")
+        Some("forge.project.orchestration/v1@19")
     );
     let current_preview = runner.preview_prompt(&current_job).await.unwrap();
     assert!(current_preview

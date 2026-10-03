@@ -3259,13 +3259,23 @@ repaired result through fresh checks and review before merge.
 
 ### Task condition actions
 
-`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. List projections carry no actions and obtain offers on demand. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
+`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 
 The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only.
 
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Annotation, blocked, failed and entry-barrier columns remain separate.
 
 Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
+
+Task action conditions precede generic review decisions. In `review`, ordinary
+approval requires an awaiting-human Review and no condition. Re-running review requires
+a completed implementation candidate; entry-check retries and budget resets remain
+independent controls. Dependency cancellation uses the writer's
+`workflow_guard_rejected` annotation with `blocking_reason:"dependency_cancelled"`
+and offers cancellation only. A queued action always offers Hold alongside cancel,
+even when a newer condition appears. Restart follows the resolver's explicit set
+of resettable condition kinds. Pause refusals preserve the typed wait cause and
+turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks
 

@@ -588,7 +588,7 @@ fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -
     json!({
         "operation": TASK_ACTION_OPERATION,
         "payload": {
-            "action": {"verb":"cancel"},
+            "action": {"verb":"cancel", "reason":"Cancel obsolete work"},
             "task_id": task_id,
             "version": expected_task_version
         },
@@ -1587,7 +1587,7 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
         current_version
     );
     assert_eq!(
-        stale.value["retry"]["arguments"]["expected_task_version"],
+        stale.value["retry"]["arguments"]["version"],
         current_version
     );
 
@@ -1630,7 +1630,7 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     )
     .await
     .expect("cross-Project cancellation is structured");
-    assert_structured_error(&cross_project, TASK_ACTION_OPERATION, "not_found");
+    assert_structured_error(&cross_project, TASK_ACTION_OPERATION, "validation_error");
 
     let cancelled = invoke_tool(
         &project,
@@ -1651,8 +1651,31 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     )
     .await
     .expect("response-loss retry");
-    assert!(!retry.is_error, "cancellation retry: {}", retry.value);
-    assert_eq!(retry.value["result"]["task_status"], "cancelled");
+    // An exact Task action version is still required after response loss. The
+    // cancelled outcome remains unchanged, and its fresh offer set is empty.
+    assert_structured_error(&retry, TASK_ACTION_OPERATION, "version_conflict");
+    let cancelled_task = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled_task.status, "cancelled");
+    assert_eq!(cancelled_task.version, current_version + 1);
+    let terminal = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-terminal", &task_id, cancelled_task.version),
+        TASK_ACTION_OPERATION,
+    )
+    .await
+    .unwrap();
+    assert_structured_error(&terminal, TASK_ACTION_OPERATION, "action_unavailable");
+    assert_eq!(terminal.value["details"]["available_actions"], json!([]));
+    let unchanged = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.version, cancelled_task.version);
+    assert_eq!(unchanged.updated_at, cancelled_task.updated_at);
 }
 
 #[tokio::test]

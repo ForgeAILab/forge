@@ -1001,6 +1001,7 @@ async fn versioned_task_request<T>(app: &Router, uri: &str, task_id: &str, mut b
 where
     T: DeserializeOwned,
 {
+    let mut last_snapshot = None;
     for _ in 0..40 {
         let response = raw_json_request(app, Method::POST, uri, body.clone()).await;
         if response.status() != StatusCode::CONFLICT {
@@ -1014,9 +1015,12 @@ where
         )
         .await;
         body["version"] = json!(current.version);
+        last_snapshot = Some(current);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("versioned request to {uri} never won the version race");
+    panic!(
+        "versioned request to {uri} never won the version race; last snapshot: {last_snapshot:?}"
+    );
 }
 
 async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T

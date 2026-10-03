@@ -2602,7 +2602,7 @@ fn solo_review_action(
     match decision {
         SoloReviewDecision::Accept => Ok(api_types::TaskAction::Approve {
             reason,
-            override_checks: false,
+            override_checks: Some(false),
         }),
         SoloReviewDecision::RequestChanges => {
             let guidance = reason
@@ -2639,7 +2639,7 @@ mod tests {
             )
             .unwrap(),
             api_types::TaskAction::Approve {
-                override_checks: false,
+                override_checks: Some(false),
                 reason: Some("Track in follow-up".into())
             }
         );

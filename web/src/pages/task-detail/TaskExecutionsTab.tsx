@@ -78,18 +78,23 @@ export function TaskExecutionsTab({
   })
 
   const anyPending = stopMutation.isPending || followUpMutation.isPending
-  const freshRetries = offers
-    .filter(
-      (offer) =>
-        offer.action.verb === 'retry' &&
-        offer.parameters.some(
-          (spec) => spec.name === 'fresh_session' && spec.boolean_values?.includes(true),
+  const freshRetries = (next: Offer[]) =>
+    next
+      .filter(
+        (offer) =>
+          offer.action.verb === 'retry' &&
+          (offer.action.fresh_session === true ||
+            offer.parameters.some(
+              (spec) => spec.name === 'fresh_session' && spec.boolean_values?.includes(true),
+            )),
+      )
+      .map((offer) => ({
+        ...offer,
+        action: { ...offer.action, fresh_session: true } as Offer['action'],
+        parameters: offer.parameters.map((spec) =>
+          spec.name === 'fresh_session' ? { ...spec, boolean_values: [true] } : spec,
         ),
-    )
-    .map((offer) => ({
-      ...offer,
-      action: { ...offer.action, fresh_session: true } as Offer['action'],
-    }))
+      }))
 
   if (isLoading) {
     return (
@@ -103,7 +108,12 @@ export function TaskExecutionsTab({
   if (executions.length === 0) {
     return (
       <div className="space-y-3">
-        <TaskActionButtons taskId={taskId} version={version} offers={freshRetries} />
+        <TaskActionButtons
+          taskId={taskId}
+          version={version}
+          offers={offers}
+          transformOffers={freshRetries}
+        />
         <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
           No {productTerm('run', 0).toLowerCase()} yet
         </div>
@@ -115,7 +125,12 @@ export function TaskExecutionsTab({
 
   return (
     <div className="space-y-3">
-      <TaskActionButtons taskId={taskId} version={version} offers={freshRetries} />
+      <TaskActionButtons
+        taskId={taskId}
+        version={version}
+        offers={offers}
+        transformOffers={freshRetries}
+      />
       {chains.map((chain) => {
         const totalTurns = chain.turns.length
         const lastTurn = chain.turns[totalTurns - 1]

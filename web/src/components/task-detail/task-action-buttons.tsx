@@ -38,6 +38,21 @@ export function actionInputValid(offer: Offer, action: TaskAction) {
     )
   })
 }
+export function actionForPost(offer: Offer, action: TaskAction): TaskAction {
+  const draft = { ...action } as TaskAction
+  for (const spec of offer.parameters) {
+    if (spec.boolean_values?.length === 1)
+      Object.assign(draft, { [spec.name]: spec.boolean_values[0] })
+    if (
+      !parameterRequired(spec, draft) &&
+      typeof values(draft)[spec.name] === 'string' &&
+      !(values(draft)[spec.name] as string).trim()
+    )
+      delete (draft as unknown as Record<string, unknown>)[spec.name]
+  }
+  return draft
+}
+
 export function TaskActionFields({
   offer,
   action,
@@ -62,6 +77,24 @@ export function TaskActionFields({
         const label = spec.name === 'override' ? 'Override checks' : spec.name.replaceAll('_', ' ')
         const fieldId = `${id}-${spec.name}`
         const value = values(action)[spec.name]
+        if (spec.boolean_values?.length === 1) {
+          const enabled = spec.boolean_values[0]
+          const explanations: Record<string, string> = {
+            override: enabled ? 'Overrides the failed checks' : 'Uses the current checks',
+            reset_budget: enabled
+              ? 'Resets the retry budget'
+              : 'Permits one retry without resetting the budget',
+            refresh_workspace: enabled
+              ? 'Refreshes the workspace before retrying'
+              : 'Keeps the current workspace',
+            fresh_session: enabled ? 'Starts a fresh session' : 'Continues the existing session',
+          }
+          return (
+            <p key={spec.name} className="text-sm text-muted-foreground">
+              {explanations[spec.name] ?? `${label}: ${enabled ? 'Yes' : 'No'}`}
+            </p>
+          )
+        }
         return (
           <div className="space-y-2" key={spec.name}>
             <Label htmlFor={fieldId} className="capitalize">
@@ -73,7 +106,6 @@ export function TaskActionFields({
                 id={fieldId}
                 className="w-full rounded-md border bg-background p-2 text-sm"
                 value={String(value)}
-                disabled={spec.boolean_values.length === 1}
                 onChange={(event) =>
                   onChange({ ...action, [spec.name]: event.target.value === 'true' } as TaskAction)
                 }
@@ -106,10 +138,12 @@ export function TaskActionButtons({
   taskId,
   version,
   offers,
+  transformOffers = (next) => next,
 }: {
   taskId: string
   version: number
   offers: Offer[]
+  transformOffers?: (offers: Offer[]) => Offer[]
 }) {
   const command = useTaskAction()
   const [refreshed, setRefreshed] = useState<TaskActionsResponse | null>(null)
@@ -117,10 +151,16 @@ export function TaskActionButtons({
   const [action, setAction] = useState<TaskAction | null>(null)
   const [notice, setNotice] = useState('')
   const current =
-    refreshed && refreshed.version >= version ? refreshed : { available_actions: offers, version }
+    refreshed && refreshed.version >= version
+      ? { ...refreshed, available_actions: transformOffers(refreshed.available_actions) }
+      : { available_actions: transformOffers(offers), version }
   const apply = (value: TaskAction) =>
     command.mutate(
-      { taskId, version: current.version, action: value },
+      {
+        taskId,
+        version: current.version,
+        action: selected ? actionForPost(selected, value) : value,
+      },
       {
         onSuccess: (task) => {
           setSelected(null)
@@ -136,7 +176,11 @@ export function TaskActionButtons({
               .then((next) => {
                 setRefreshed(next)
                 setNotice(
-                  `Actions changed. Available now: ${next.available_actions.map((offer) => offer.label).join(', ') || 'none'}.`,
+                  `Actions changed. Available now: ${
+                    transformOffers(next.available_actions)
+                      .map((offer) => offer.label)
+                      .join(', ') || 'none'
+                  }.`,
                 )
               })
               .catch((refreshError: unknown) =>

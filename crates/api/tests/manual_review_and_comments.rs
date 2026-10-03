@@ -242,6 +242,13 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
         1,
         "the rejection after an explicit reset consumes only the fresh window"
     );
+    // Task actions commit dispatch intent; this fixture has no background dispatcher.
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .expect("the accepted human send-back dispatches its fresh follow-up");
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*harness.state.db, &task_id, "coder")
             .await

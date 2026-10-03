@@ -2336,7 +2336,7 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
             api_types::TaskAction::Cancel { reason: None },
             api_types::TaskAction::retry(),
             api_types::TaskAction::Approve {
-                override_checks: true,
+                override_checks: Some(true),
                 reason: None
             }
         ]

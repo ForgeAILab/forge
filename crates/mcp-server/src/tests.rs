@@ -2710,3 +2710,68 @@ fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
         }
     });
 }
+
+#[test]
+fn task_lists_omit_offers_but_single_task_reads_keep_them() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let root = seed_task_in_project(&state, project_id.clone()).await;
+        let listed = call_tool(&state, "forge_list_tasks", json!({"project_id":project_id})).await;
+        for task in listed["items"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let created = call_tool(
+            &state,
+            "forge_create_sub_tasks",
+            json!({"parent_task_id":root.id, "subtasks":[{"title":"Child"}]}),
+        )
+        .await;
+        for task in created["subtasks"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let children = call_tool(
+            &state,
+            "forge_list_sub_tasks",
+            json!({"parent_task_id":root.id}),
+        )
+        .await;
+        for task in children["subtasks"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":root.id})).await;
+        assert!(single["available_actions"].is_array());
+    });
+}
+
+#[test]
+fn paused_task_action_error_preserves_wait_cause_and_turn_scope() {
+    for cause in [
+        api_types::DeniedBy::TargetAgentPaused,
+        api_types::DeniedBy::ProjectPaused("environment_not_ready".to_owned()),
+    ] {
+        let error: crate::error::McpToolError = services::ServiceError::TaskActionUnavailable {
+            available_actions: vec![],
+            reason: "retry unavailable".to_owned(),
+            wait_cause: Some(cause.clone()),
+        }
+        .into();
+        assert_eq!(error.code, -32010);
+        let response = error.into_response(json!(1));
+        let data = response.error.unwrap().data.unwrap();
+        assert_eq!(data["code"], "action_unavailable");
+        assert_eq!(data["denied_by"], cause.to_string());
+        assert_eq!(data["retry"]["scope"], "turn");
+        let response = McpToolError::from(services::ServiceError::TaskActionUnavailable {
+            available_actions: vec![],
+            reason: "retry unavailable".to_owned(),
+            wait_cause: Some(cause.clone()),
+        })
+        .into_tool_response(json!(2));
+        let outcome = &response.result.unwrap()["structuredContent"];
+        assert_eq!(outcome["code"], "action_unavailable");
+        assert_eq!(outcome["denied_by"], cause.to_string());
+        assert_eq!(outcome["retry"]["scope"], "turn");
+        assert_eq!(outcome["retry"]["action"], "none");
+    }
+}

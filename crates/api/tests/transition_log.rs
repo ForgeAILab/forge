@@ -65,7 +65,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 "review".to_owned(),
                 "in_progress".to_owned(),
-                "gate rejected: missing tests".to_owned()
+                "missing tests".to_owned()
             ),
             (
                 "in_progress".to_owned(),

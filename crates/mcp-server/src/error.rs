@@ -197,6 +197,19 @@ impl McpToolError {
                 serde_json::from_value::<Vec<api_types::Offer>>(data["available_actions"].clone())
                     .ok()
             });
+        let wait_cause = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| data["denied_by"].as_str())
+            .and_then(|value| value.parse::<api_types::DeniedBy>().ok())
+            .filter(|cause| {
+                matches!(
+                    cause,
+                    api_types::DeniedBy::TargetAgentPaused | api_types::DeniedBy::ProjectPaused(_)
+                )
+            });
         let (outcome_code, safe_message, retry_action, retryable) =
             if action_unavailable_offers.is_some() {
                 (
@@ -235,6 +248,13 @@ impl McpToolError {
             if let Some(Value::Object(arguments)) = self.details.retry_arguments {
                 retry.arguments = arguments.into_iter().collect();
             }
+            outcome.retry = Some(retry);
+        }
+        if let Some(cause) = wait_cause {
+            outcome.safe_message = format!("Task action is unavailable while {cause}");
+            outcome.denied_by = Some(cause);
+            let mut retry = RetryInstruction::new(RetryAction::None, false);
+            retry.scope = Some(api_types::RetryScope::Turn);
             outcome.retry = Some(retry);
         }
         outcome.details = action_unavailable_offers
@@ -407,10 +427,13 @@ impl From<ServiceError> for McpToolError {
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
+                wait_cause,
             } => Self::new(-32010, reason.clone()).with_data(json!({
                 "code": "action_unavailable",
                 "available_actions": available_actions,
                 "reason": reason,
+                    "denied_by": wait_cause.as_ref().map(ToString::to_string),
+                    "retry": wait_cause.map(|_| json!({"action":"none", "scope":"turn", "retryable":false})),
             })),
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.

@@ -992,6 +992,15 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "action": {
                 "type": ["string", "object", "null"],
+                "properties": {
+                    "verb": {"type":"string", "enum":["start","hold","release","retry","send_back","approve","restart","cancel"]},
+                    "reason": string_or_null_schema(),
+                    "guidance": string_or_null_schema(),
+                    "override": {"type":["boolean","null"]},
+                    "fresh_session": {"type":["boolean","null"]},
+                    "refresh_workspace": {"type":["boolean","null"]},
+                    "reset_budget": {"type":["boolean","null"]}
+                },
                 "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
             },
             "capability_class": {
@@ -1925,5 +1934,143 @@ mod tests {
         for retired in ["reason", "decision", "expected_task_version"] {
             assert!(properties.get(retired).is_none());
         }
+    }
+    #[tokio::test]
+    async fn task_action_flat_schema_survives_gemini_and_openai_conversion() {
+        use agent_runtime::{
+            core::{
+                cancel::Cancellation,
+                clock::Deadline,
+                content::Message,
+                ids::{AttemptId, RequestId, SessionId},
+                provider::{
+                    ModelId, Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderError,
+                    ProviderRequest, ToolSchema,
+                },
+                store::Secret,
+            },
+            provider::{
+                gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider},
+                openai::{OpenAiConfig, OpenAiProvider},
+                transport::{ByteStream, HttpRequest, HttpTransport},
+            },
+        };
+        use futures_util::StreamExt;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Debug, Default)]
+        struct Capture(Arc<Mutex<Vec<Value>>>);
+        #[async_trait::async_trait]
+        impl HttpTransport for Capture {
+            async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&request.body).unwrap());
+                Ok(Box::pin(futures_util::stream::empty()))
+            }
+        }
+        #[derive(Debug)]
+        struct Noop;
+        #[async_trait::async_trait]
+        impl crate::ForgeToolProvider for Noop {
+            async fn read(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+            async fn propose(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+        }
+        let composition = crate::ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "project-agent",
+            crate::CanonicalScope {
+                scope_type: crate::CanonicalScopeType::AgentChat,
+                scope_id: "chat".to_owned(),
+                workspace_access: crate::WorkspaceAccess::Deny,
+            },
+            None,
+            None,
+            &["read_project".to_owned(), "propose_task".to_owned()]
+                .into_iter()
+                .collect(),
+            true,
+            Some(Arc::new(Noop)),
+        )
+        .unwrap();
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_propose")
+            .unwrap();
+        let schema = tool.spec().input_schema.clone();
+        assert_eq!(
+            schema["properties"]["action"]["properties"],
+            schema["properties"]["payload"]["properties"]["action"]["properties"]
+        );
+        let action = &schema["properties"]["payload"]["properties"]["action"];
+        for field in [
+            "verb",
+            "reason",
+            "guidance",
+            "override",
+            "fresh_session",
+            "refresh_workspace",
+            "reset_budget",
+        ] {
+            assert!(action["properties"].get(field).is_some(), "{field}");
+        }
+        let capture = Capture::default();
+        let gemini = GeminiInteractionsProvider::new(
+            capture.clone(),
+            GeminiInteractionsConfig::new("https://example.test/v1beta", "gemini-test")
+                .with_api_key(Secret::new("offline-test")),
+        )
+        .unwrap();
+        let openai = OpenAiProvider::new(
+            capture.clone(),
+            OpenAiConfig::new("https://example.test/v1", "openai-test")
+                .with_api_key(Secret::new("offline-test")),
+        );
+        for (provider, model) in [
+            (&gemini as &dyn Provider, "gemini-test"),
+            (&openai as &dyn Provider, "openai-test"),
+        ] {
+            let mut request = ProviderRequest::new(
+                ModelId::new(model),
+                vec![Message::user("Read the offered action")],
+            );
+            request.tools.push(ToolSchema {
+                name: "forge_scope_propose".to_owned(),
+                description: "Apply offered action".to_owned(),
+                input_schema: schema.clone(),
+            });
+            let context = ProviderCallContext {
+                session: SessionId::new("test"),
+                request_id: RequestId::new("test"),
+                attempt_id: AttemptId::new("test"),
+                cache_identity: None,
+                purpose: ProviderAttemptPurpose::Ordinary,
+                cancel: Cancellation::new(),
+                deadline: Deadline::never(),
+            };
+            let mut stream = provider.stream(request, context).await.unwrap();
+            while stream.next().await.is_some() {}
+        }
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"][0]["parameters"], schema);
+        assert_eq!(requests[1]["tools"][0]["function"]["parameters"], schema);
     }
 }

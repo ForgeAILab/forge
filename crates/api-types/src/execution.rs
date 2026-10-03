@@ -79,8 +79,9 @@ pub enum TaskAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         reason: Option<String>,
-        #[serde(rename = "override")]
-        override_checks: bool,
+        #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, rename = "override")]
+        override_checks: Option<bool>,
     },
     Restart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -624,7 +625,7 @@ pub fn task_action_schema() -> serde_json::Value {
     variants.push(json!({"type":"object", "properties":{"verb":{"const":"cancel"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
     variants.push(json!({"type":"object", "properties":{"verb":{"const":"retry"},"reason":{"type":"string","minLength":1}, "fresh_session":{"type":"boolean"}, "refresh_workspace":{"type":"boolean"}, "reset_budget":{"type":"boolean"}, "guidance":{"type":"string"}}, "required":["verb"], "additionalProperties":false}));
     variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string","minLength":1}}, "required":["verb","guidance"], "additionalProperties":false}));
-    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb","override"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
     json!({"oneOf":variants})
 }
 

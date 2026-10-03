@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { apiFetch } from '@/api/client'
+import { ApiError, apiFetch } from '@/api/client'
 import { useTaskAction } from '@/api/hooks'
 import { toastApiError } from '@/lib/api-error'
 import { Button } from '@/components/ui/button'
@@ -12,9 +12,14 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { TaskActionsResponse, TaskAction, Offer } from '@/types/generated'
-import { TaskActionButtons, TaskActionFields, actionInputValid } from './task-action-buttons'
+import {
+  TaskActionButtons,
+  TaskActionFields,
+  actionInputValid,
+  actionForPost,
+} from './task-action-buttons'
 
-type Row = { id: string; title: string }
+type Row = { id: string; title: string; parent_task_id?: string | null }
 type CancelEntry = { task: Row; version: number; offer: Offer; action: TaskAction }
 export function TaskRowActions({ taskId }: { taskId: string }) {
   const [data, setData] = useState<TaskActionsResponse | null>(null)
@@ -85,7 +90,15 @@ export function BulkCancelTasks({ tasks, onComplete }: { tasks: Row[]; onComplet
           return offer ? { task, offer, version: data.version, action: { ...offer.action } } : null
         }),
       )
-      setEntries(next.filter((entry): entry is CancelEntry => entry !== null))
+      const cancellable = next.filter((entry): entry is CancelEntry => entry !== null)
+      const roots = new Set(
+        cancellable.filter((entry) => entry.offer.propagates).map((entry) => entry.task.id),
+      )
+      setEntries(
+        cancellable.filter(
+          (entry) => !entry.task.parent_task_id || !roots.has(entry.task.parent_task_id),
+        ),
+      )
       setSkipped(next.filter((entry) => entry === null).length)
       setNotice(announce ? `Available now: ${availability.join('; ')}` : '')
     } catch (error) {
@@ -96,12 +109,21 @@ export function BulkCancelTasks({ tasks, onComplete }: { tasks: Row[]; onComplet
   const apply = async () => {
     if (!entries) return
     try {
-      for (const entry of entries)
-        await command.mutateAsync({
-          taskId: entry.task.id,
-          version: entry.version,
-          action: entry.action,
-        })
+      for (const entry of entries) {
+        try {
+          await command.mutateAsync({
+            taskId: entry.task.id,
+            version: entry.version,
+            action: actionForPost(entry.offer, entry.action),
+          })
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            const latest = await apiFetch<TaskActionsResponse>(`/tasks/${entry.task.id}/actions`)
+            if (!latest.available_actions.some((offer) => offer.action.verb === 'cancel')) continue
+          }
+          throw error
+        }
+      }
       setOpen(false)
       onComplete()
     } catch (error) {

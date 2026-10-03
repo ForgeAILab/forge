@@ -400,6 +400,7 @@ pub enum ServiceError {
     TaskActionUnavailable {
         available_actions: Vec<api_types::Offer>,
         reason: String,
+        wait_cause: Option<api_types::DeniedBy>,
     },
 
     #[error("conflict: {0}")]

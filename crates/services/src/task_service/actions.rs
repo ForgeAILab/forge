@@ -6,7 +6,7 @@ tokio::task_local! { pub(crate) static TASK_ACTION_COMMAND: (); pub(crate) stati
 
 /// Whether `task` is parked at a review gate only a user may decide.
 ///
-/// The Project Agent's `task.review` action and the review-ready attention
+/// The Project Agent's review decision offer and the review-ready attention
 /// wake both hinge on this: a review run by the workflow's reviewer Agent
 /// settles itself, so neither a decision nor a wake is anyone's business.
 #[must_use]
@@ -107,7 +107,14 @@ impl TaskService {
             .ok_or_else(|| ServiceError::TaskActionUnavailable {
                 available_actions: offers,
                 reason: format!("action '{}' is unavailable", action.verb()),
+                wait_cause: matches!(
+                    action,
+                    TaskAction::Start | TaskAction::Retry { .. } | TaskAction::Release { .. }
+                )
+                .then(|| snapshot.wait_cause.clone())
+                .flatten(),
             })?;
+        let action = apply_offered_parameters(&offer, action);
         if let TaskAction::SendBack { guidance } = &action {
             validate_required("guidance", guidance)?;
         }
@@ -127,7 +134,7 @@ impl TaskService {
             || matches!(
                 &action,
                 TaskAction::Approve {
-                    override_checks: true,
+                    override_checks: Some(true),
                     ..
                 } | TaskAction::Retry {
                     reset_budget: Some(false),
@@ -256,7 +263,7 @@ impl TaskService {
                         }
                         TaskAction::Approve {
                             reason,
-                            override_checks: true,
+                            override_checks: Some(true),
                         } if matches!(
                             offer.reason.as_str(),
                             "state_advance_override"
@@ -302,7 +309,7 @@ impl TaskService {
                                 && matches!(
                                     action,
                                     TaskAction::Approve {
-                                        override_checks: false,
+                                        override_checks: Some(false),
                                         ..
                                     }
                                 ))
@@ -329,7 +336,7 @@ impl TaskService {
                         }
                         TaskAction::Approve {
                             reason,
-                            override_checks: false,
+                            override_checks: Some(false),
                         } if matches!(
                             offer.reason.as_str(),
                             "gate_waiting_for_decision"
@@ -389,6 +396,14 @@ impl TaskService {
                                     )
                                     .await?
                             };
+                            if reset_budget
+                                && snapshot.task.status == "review"
+                                && snapshot.latest_review.as_ref().is_some_and(|review| {
+                                    review.status == ReviewStatus::AwaitingHuman
+                                })
+                            {
+                                return Ok(updated);
+                            }
                             let staged = self
                                 .queue_deferred_action_role(
                                     updated,
@@ -629,7 +644,7 @@ impl TaskService {
                         WorkflowTrigger::Accept => guidance
                             .clone()
                             .unwrap_or_else(|| "gate approved".to_owned()),
-                        _ => format!("gate rejected: {}", guidance.unwrap_or_default()),
+                        _ => guidance.unwrap_or_default(),
                     }),
                     triggered_by: actor,
                     rejection: trigger == WorkflowTrigger::Reject,
@@ -923,7 +938,7 @@ impl TaskService {
             if accept {
                 TaskAction::Approve {
                     reason,
-                    override_checks: false,
+                    override_checks: Some(false),
                 }
             } else {
                 TaskAction::SendBack {
@@ -964,9 +979,10 @@ fn action_parameters_allowed(offer: &Offer, action: &TaskAction, owner: bool) ->
         TaskAction::Approve {
             override_checks, ..
         } => {
-            (!*override_checks || owner)
+            (override_checks != &Some(true) || owner)
                 && (matches!(&offer.action, TaskAction::Approve { override_checks: offered, .. } if offered == override_checks)
-                    || allows_bool("override", *override_checks))
+                    || override_checks.is_none()
+                    || override_checks.is_some_and(|value| allows_bool("override", value)))
         }
         TaskAction::Retry {
             reason: _,
@@ -984,18 +1000,80 @@ fn action_parameters_allowed(offer: &Offer, action: &TaskAction, owner: bool) ->
             else {
                 return false;
             };
-            (fresh_session.is_none() || fresh_session == offered_fresh || supports("fresh_session"))
-                && (refresh_workspace.is_none()
-                    || refresh_workspace == offered_refresh
-                    || supports("refresh_workspace"))
-                && (reset_budget.is_none()
-                    || reset_budget == offered_reset
-                    || reset_budget.is_some_and(|value| allows_bool("reset_budget", value)))
+            let allowed = |name: &str, supplied: Option<bool>, preset: Option<bool>| {
+                supplied.is_none_or(|value| {
+                    if supports(name) {
+                        allows_bool(name, value)
+                    } else {
+                        preset == Some(value)
+                    }
+                })
+            };
+            allowed("fresh_session", *fresh_session, *offered_fresh)
+                && allowed("refresh_workspace", *refresh_workspace, *offered_refresh)
+                && allowed("reset_budget", *reset_budget, *offered_reset)
                 && (guidance.is_none() || supports("guidance"))
         }
         TaskAction::SendBack { .. } => true,
         _ => true,
     }
+}
+
+fn apply_offered_parameters(offer: &Offer, mut action: TaskAction) -> TaskAction {
+    if let (
+        TaskAction::Approve {
+            override_checks, ..
+        },
+        TaskAction::Approve {
+            override_checks: preset,
+            ..
+        },
+    ) = (&mut action, &offer.action)
+    {
+        if override_checks.is_none() {
+            *override_checks = offer
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "override")
+                .and_then(|parameter| parameter.boolean_values.as_ref())
+                .filter(|values| values.len() == 1)
+                .map(|values| values[0])
+                .or(*preset);
+        }
+    }
+    if let (
+        TaskAction::Retry {
+            fresh_session,
+            refresh_workspace,
+            reset_budget,
+            ..
+        },
+        TaskAction::Retry {
+            fresh_session: offered_fresh,
+            refresh_workspace: offered_refresh,
+            reset_budget: offered_reset,
+            ..
+        },
+    ) = (&mut action, &offer.action)
+    {
+        for (name, requested, preset) in [
+            ("fresh_session", fresh_session, offered_fresh),
+            ("refresh_workspace", refresh_workspace, offered_refresh),
+            ("reset_budget", reset_budget, offered_reset),
+        ] {
+            if requested.is_none() {
+                *requested = offer
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.name == name)
+                    .and_then(|parameter| parameter.boolean_values.as_ref())
+                    .filter(|values| values.len() == 1)
+                    .map(|values| values[0])
+                    .or(*preset);
+            }
+        }
+    }
+    action
 }
 
 // Fixture drivers preserve the tests' synchronous lifecycle assertions while
@@ -1185,5 +1263,50 @@ impl TaskService {
             .into_iter()
             .map(|offer| offer.action)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn fixed_and_preset_parameters_default_and_reject_contradictions() {
+        for (preset, parameters, supplied, normalized, contrary) in [
+            (
+                json!({"verb":"retry","refresh_workspace":true}),
+                json!([]),
+                json!({"verb":"retry"}),
+                json!({"verb":"retry","refresh_workspace":true}),
+                json!({"verb":"retry","refresh_workspace":false}),
+            ),
+            (
+                json!({"verb":"retry","reset_budget":true}),
+                json!([{"name":"reset_budget","required":false,"boolean_values":[true]}]),
+                json!({"verb":"retry"}),
+                json!({"verb":"retry","reset_budget":true}),
+                json!({"verb":"retry","reset_budget":false}),
+            ),
+            (
+                json!({"verb":"approve","override":true}),
+                json!([{"name":"override","required":false,"boolean_values":[true]}]),
+                json!({"verb":"approve"}),
+                json!({"verb":"approve","override":true}),
+                json!({"verb":"approve","override":false}),
+            ),
+        ] {
+            let offer: Offer = serde_json::from_value(json!({"action":preset,"parameters":parameters,"authority":["owner"],"reason":"test","label":"Test","propagates":false,"target_execution_id":null})).unwrap();
+            let supplied = serde_json::from_value::<TaskAction>(supplied).unwrap();
+            assert!(action_parameters_allowed(&offer, &supplied, true));
+            assert_eq!(
+                serde_json::to_value(apply_offered_parameters(&offer, supplied)).unwrap(),
+                normalized
+            );
+            assert!(!action_parameters_allowed(
+                &offer,
+                &serde_json::from_value(contrary).unwrap(),
+                true
+            ));
+        }
     }
 }

@@ -1162,7 +1162,7 @@ pub fn to_task_summary(task: &TaskSnapshot) -> TaskSummary {
         .iter()
         .filter_map(|offer| match offer.action {
             api_types::TaskAction::Approve {
-                override_checks: false,
+                override_checks: Some(false),
                 ..
             } => Some(AppApprovalAction::Accept),
             api_types::TaskAction::SendBack { .. } => Some(AppApprovalAction::RequestChanges),
@@ -1173,7 +1173,7 @@ pub fn to_task_summary(task: &TaskSnapshot) -> TaskSummary {
         matches!(
             offer.action,
             api_types::TaskAction::Approve {
-                override_checks: false,
+                override_checks: Some(false),
                 ..
             }
         ) && offer
@@ -1672,7 +1672,7 @@ mod tests {
             tasks: vec![TaskSnapshot {
                 review_actions: vec![api_types::Offer {
                     action: api_types::TaskAction::Approve {
-                        override_checks: false,
+                        override_checks: Some(false),
                         reason: None,
                     },
                     parameters: Vec::new(),

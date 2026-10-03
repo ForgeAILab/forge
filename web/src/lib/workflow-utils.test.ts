@@ -137,7 +137,6 @@ describe('task interruption annotations', () => {
         blocked_execution_id: blockedExecutionId,
         artifact: null,
         message: 'Previous execution failed',
-        recovery_actions: ['reexecute'],
       },
       execution_observability: {
         counts: {

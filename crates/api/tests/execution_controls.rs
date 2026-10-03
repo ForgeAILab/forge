@@ -58,7 +58,7 @@ async fn cancelled_task_rejects_recover() {
 }
 
 #[tokio::test]
-async fn execution_stop_exposes_recovery_actions() {
+async fn execution_stop_exposes_task_action_offers() {
     let workspace_root = common::TestDir::new("ec-stop-actions");
     let harness = common::test_app(workspace_root.path(), "execution-controls-stop-actions").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
@@ -802,7 +802,7 @@ async fn blocked_metadata_retry_budget_disables_re_execute_action() {
 }
 
 #[tokio::test]
-async fn re_execute_endpoint_launches_replacement_execution() {
+async fn fresh_task_retry_queues_replacement_execution() {
     let workspace_root = common::TestDir::new("ec-reexecute-route");
     let harness = common::test_app(workspace_root.path(), "execution-controls-reexecute").await;
     let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;

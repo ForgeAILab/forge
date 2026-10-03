@@ -160,7 +160,13 @@ export function TaskDetailSidebar({
         ) : task ? (
           <div className="p-5">
             <SidebarField label={productTerm('phase')}>
-              <TaskActionButtons taskId={task.id} version={task.version} offers={task.available_actions ?? []} />
+              {!task.workflow_exception ? (
+                <TaskActionButtons
+                  taskId={task.id}
+                  version={task.version}
+                  offers={task.available_actions ?? []}
+                />
+              ) : null}
               <span className="block">
                 {effectiveAvailableTransitions.length > 0 ? (
                   <TaskStatusDropdown
@@ -309,8 +315,6 @@ export function TaskDetailSidebar({
           </div>
         ) : null}
       </aside>
-
-
 
       <Dialog
         open={Boolean(pendingSelection)}

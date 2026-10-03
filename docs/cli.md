@@ -646,3 +646,11 @@ that JSON.
 Retry flags are `--fresh-session [true|false]`, `--refresh-workspace [true|false]`, `--reset-budget [true|false]`, `--guidance TEXT`, and `--reason TEXT`. Send-back requires nonblank `--guidance TEXT`. Approval uses `--override [true|false]` (default false); true requires `--reason TEXT`. Hold, release, restart and cancel accept `--reason TEXT`. One-shot retry (`--reset-budget false`) also requires a reason. Bare boolean flags mean true. Flags belonging to another verb are rejected locally. Offers define any further required reason and allowed values. `task cancel` is removed; use `task action <id> cancel`.
 
 `--output json` prints the offer/version object or the resulting Task. An HTTP 409 `action_unavailable` prints the current available actions (the structured error object in JSON mode) and exits with code **3**; other failures use the normal nonzero error exit. A stale version remains a version conflict. There is no `execution` command group in forge-ctl; individual execution stop is available through `POST /api/v1/executions/{id}/stop` and the web Stop control.
+
+Task action offer tables include required and conditional inputs, accepted boolean
+values, the action's preset parameters, and `propagates` (subtask cancellation).
+`task action --version` is the Task version, not the CLI version; omit it to fetch
+the current version. The help text names each flag's verb. Exit code 3 means
+`action_unavailable`: read `task actions` again and select a current offer.
+Fixed boolean values and omitted presets are supplied by the server; contradictory
+values are refused.

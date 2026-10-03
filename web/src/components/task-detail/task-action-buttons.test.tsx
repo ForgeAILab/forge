@@ -94,10 +94,10 @@ describe('descriptor action forms', () => {
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'retry' }))
-    const field = screen.getByLabelText(/refresh workspace/i) as HTMLSelectElement
-    expect(field.options.length).toBe(1)
-    expect(field.value).toBe('true')
-    expect(field.disabled).toBe(true)
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.getByText('Refreshes the workspace before retrying')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action.refresh_workspace).toBe(true)
   })
   it.each(['action_unavailable', 'version_conflict'])(
     'refreshes %s and shows the current choices/version',
@@ -174,4 +174,49 @@ describe('descriptor action forms', () => {
     fireEvent.click(screen.getByRole('button', { name: 'hold' }))
     expect(mutate.mock.calls[1][0]).toEqual({ taskId: 't', version: 6, action: { verb: 'hold' } })
   })
+  it('drops a cleared optional reason before posting', () => {
+    mount(offer({ verb: 'cancel' }, [{ name: 'reason', required: false, boolean_values: null }]))
+    fireEvent.click(screen.getByRole('button', { name: 'cancel' }))
+    fireEvent.change(screen.getByLabelText(/reason/i), { target: { value: '  ' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'cancel' })
+  })
+  it.each(['success', 'conflict'])(
+    'keeps the caller filter and fixed fresh session after %s',
+    async (result) => {
+      const retry = offer({ verb: 'retry', fresh_session: false }, [
+        { name: 'fresh_session', required: false, boolean_values: [false, true] },
+      ])
+      const next = { version: 6, available_actions: [retry, offer({ verb: 'cancel' })] }
+      mutate.mockImplementationOnce((_request, callbacks) =>
+        result === 'success'
+          ? callbacks.onSuccess(next)
+          : callbacks.onError(new ApiError('changed', 409, '')),
+      )
+      apiFetch.mockResolvedValue(next)
+      const fresh = (offers: Offer[]) =>
+        offers
+          .filter((item) => item.action.verb === 'retry')
+          .map((item) => ({
+            ...item,
+            action: { ...item.action, fresh_session: true } as Offer['action'],
+            parameters: item.parameters.map((spec) =>
+              spec.name === 'fresh_session' ? { ...spec, boolean_values: [true] } : spec,
+            ),
+          }))
+      render(<TaskActionButtons taskId="t" version={5} offers={[retry]} transformOffers={fresh} />)
+      fireEvent.click(screen.getByRole('button', { name: 'retry' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Apply' })).toBeNull())
+      expect(screen.queryByRole('button', { name: 'cancel' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'retry' }))
+      expect(screen.queryByRole('combobox')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+      expect(mutate.mock.calls[1][0]).toEqual({
+        taskId: 't',
+        version: 6,
+        action: { verb: 'retry', fresh_session: true },
+      })
+    },
+  )
 })

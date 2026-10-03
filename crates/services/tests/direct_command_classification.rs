@@ -1263,9 +1263,8 @@ async fn terminal_native_task_commands_preserve_evaluator_permission_and_identit
     sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
         .bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
     let review = fixture.provider.propose(AGENT_ID, &fixture.project_scope, RUNTIME_SESSION_ID,
-        "task.review", json!({"operation":"task.review", "payload":{
-            "task_id":task.id, "decision":"accept", "expected_task_version":task.version,
-            "reason":"Check refusal"}, "dedupe_key":"denied-review", "correlation_id":"denied-review"})
+        "task.action", json!({"operation":"task.action", "payload":{
+            "task_id":task.id, "action":{"verb":"approve","override":false,"reason":"Check refusal"}, "version":task.version}, "dedupe_key":"denied-review", "correlation_id":"denied-review"})
     ).await.unwrap_err();
     let review = structured_error(review);
     assert_eq!(
@@ -1943,7 +1942,7 @@ async fn recovery_arguments(fixture: &Fixture, task: &str, action: &str, key: &s
         .unwrap()
         .unwrap()
         .version;
-    json!({"operation":"task.action", "payload":{"task_id":task,"action":{"verb":action},"version":version},
+    json!({"operation":"task.action", "payload":{"task_id":task,"action":{"verb":action,"reason":"Repair or cancel this interrupted work"},"version":version},
         "dedupe_key":key,"correlation_id":key})
 }
 
@@ -1964,8 +1963,10 @@ async fn queued_retry_for_paused_worker_does_not_withdraw_cancellation_for_anoth
         "paused-worker",
     )
     .await;
-    assert!(!refused.is_error, "the accepted retry queues: {refused:?}");
-    assert!(refused.value["result"]["available_actions"]
+    assert!(refused.is_error, "paused worker refuses retry: {refused:?}");
+    assert_eq!(refused.value["denied_by"], "target_agent_paused");
+    assert_eq!(refused.value["retry"]["scope"], "turn");
+    assert!(refused.value["details"]["available_actions"]
         .as_array()
         .unwrap()
         .iter()
@@ -1996,9 +1997,14 @@ async fn queued_retry_for_paused_project_does_not_withdraw_cancellation() {
     )
     .await;
     assert!(
-        !refused.is_error,
-        "paused Project retains the queued intent: {refused:?}"
+        refused.is_error,
+        "paused Project refuses retry: {refused:?}"
     );
+    assert_eq!(
+        refused.value["denied_by"],
+        "project_paused(environment_not_ready)"
+    );
+    assert_eq!(refused.value["retry"]["scope"], "turn");
     let recovered = invoke_native(
         &*tool,
         recovery_arguments(&fixture, &task_a, "cancel", "cancel-paused-task").await,

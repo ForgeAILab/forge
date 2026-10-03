@@ -1634,7 +1634,7 @@ impl AttentionService {
 
     /// A Task entering `review` is only attention when a person must decide
     /// the gate. A review run by the workflow's reviewer Agent settles itself;
-    /// waking the Project Agent for it sends the Agent to a `task.review`
+    /// waking the Project Agent for it sends the Agent to a `task.action`
     /// action the gate rejects, which wastes the turn and reports a blocker
     /// that does not exist. A Task that no longer exists is nobody's review.
     async fn review_needs_a_person(&self, event: &DomainEvent) -> Result<bool> {

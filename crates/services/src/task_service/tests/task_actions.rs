@@ -39,7 +39,7 @@ async fn every_offer_applies_and_every_absent_verb_returns_current_offers() {
         },
         TaskAction::Approve {
             reason: None,
-            override_checks: false,
+            override_checks: Some(false),
         },
         TaskAction::Restart { reason: None },
         TaskAction::Cancel { reason: None },
@@ -161,7 +161,7 @@ async fn unauthorized_caller_gets_no_offers_and_one_typed_error_for_each_verb() 
         },
         TaskAction::Approve {
             reason: None,
-            override_checks: true,
+            override_checks: Some(true),
         },
         TaskAction::Restart { reason: None },
         TaskAction::Cancel { reason: None },
@@ -563,7 +563,7 @@ async fn special_snapshot_offers_apply_or_version_conflict_and_absent_verbs_are_
         },
         TaskAction::Approve {
             reason: None,
-            override_checks: false,
+            override_checks: Some(false),
         },
         TaskAction::Restart { reason: None },
         TaskAction::Cancel { reason: None },
@@ -688,7 +688,7 @@ async fn owner_advance_override_stops_the_role_and_dispatches_the_next_without_a
         .perform_task_action(
             &task.id,
             TaskAction::Approve {
-                override_checks: true,
+                override_checks: Some(true),
                 reason: Some("Owner supplies an alternate plan".to_owned()),
             },
             task.version,
@@ -830,4 +830,94 @@ async fn hold_stops_workflow_execution_and_records_operator_reason() {
         .available_actions
         .iter()
         .any(|offer| matches!(offer.action, TaskAction::Release { .. })));
+}
+
+#[tokio::test]
+async fn retry_fixed_presets_are_applied_and_contradictions_refused() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let task = fixture(
+        &db,
+        &project,
+        &agent,
+        "in_progress",
+        Some(FailureKind::ExecutorFailed),
+    )
+    .await;
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
+    let offers = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
+    assert!(offers.available_actions.iter().any(|offer| matches!(
+        offer.action,
+        TaskAction::Retry {
+            fresh_session: Some(true),
+            ..
+        }
+    )));
+    let contrary = TaskAction::Retry {
+        reason: None,
+        fresh_session: Some(false),
+        refresh_workspace: None,
+        reset_budget: None,
+        guidance: None,
+    };
+    assert!(matches!(
+        service
+            .perform_task_action(&task.id, contrary, task.version)
+            .await,
+        Err(ServiceError::TaskActionUnavailable { .. })
+    ));
+    let applied = service
+        .perform_task_action(&task.id, TaskAction::retry(), task.version)
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied.action,
+        TaskAction::Retry {
+            fresh_session: Some(true),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn owner_reconciliation_keeps_the_merge_retry_offer_reason() {
+    let db = Arc::new(sqlite_db().await);
+    let (task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    sqlx::query("UPDATE task SET status = 'merging' WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let daemon_id = placement.daemon_id.clone().unwrap();
+    let (connection_id, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    let responder = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let api_types::DaemonFrame::Request { id, method, params } =
+                outbound.recv().await.unwrap()
+            else {
+                panic!("owner describe request")
+            };
+            assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
+            registry.dispatch_incoming_for_connection(&daemon_id, connection_id, api_types::DaemonFrame::Response {
+                id, result: json!({"workspace_handle":params["workspace_handle"],"generation":1,"exists":true,"head_sha":"base-head","dirty":false,"branch":"task/remote","locked":false,"active_execution_ids":[],"journaled_execution_ids":[]}),
+            });
+        })
+    };
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)))
+        .with_daemon_connections(registry);
+    let result = service
+        .perform_task_action(&task.id, TaskAction::retry(), task.version)
+        .await
+        .unwrap();
+    responder.await.unwrap();
+    let queued = crate::deferred_dispatch::queued_recovery(&result.task)
+        .expect("reconciled merge retry queues");
+    assert_eq!(queued.request.offer.reason, "merge_gate_retry");
 }

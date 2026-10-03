@@ -49,6 +49,7 @@ pub struct TaskSnapshot {
     pub coordination_root: bool,
     pub owner_disconnected: bool,
     pub project_paused: bool,
+    pub wait_cause: Option<api_types::DeniedBy>,
     pub action_agent_id: Option<String>,
     pub planning_approval_ready: bool,
     pub advance_target: Option<String>,
@@ -190,6 +191,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     let queued = metadata
         .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
         .is_some();
+    let implementation_candidate = snapshot.executions.iter().any(|execution| {
+        execution.status == ExecutionStatus::Completed
+            && (execution.task_id == task.id || snapshot.coordination_root)
+            && matches!(execution.role.as_str(), "executor" | "coder" | "worker")
+    });
+    let dependency_cancelled = condition == Some(FailureKind::DependencyCancelled)
+        || (condition == Some(FailureKind::WorkflowGuardRejected)
+            && snapshot
+                .annotation()
+                .is_some_and(|annotation| annotation.blocking_reason == "dependency_cancelled"));
     let manual_review_candidate = snapshot.latest_review.as_ref().is_some_and(|review| {
         review.status == ReviewStatus::Failed
             && snapshot.executions.iter().any(|execution| {
@@ -211,7 +222,20 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             .latest_review
             .as_ref()
             .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            || metadata["awaiting_human"] == true);
+            || (metadata["awaiting_human"] == true
+                && (task.status != "review" || snapshot.latest_review.is_none()))
+            || (task.status == "review"
+                && snapshot.latest_review.is_none()
+                && !running
+                && state.gate_config.as_ref().is_some_and(|gate| {
+                    gate.requires_user_approval()
+                        && (!gate.optional_when_unassigned()
+                            || role.is_some_and(|role| {
+                                snapshot.role_assignments.iter().any(|assignment| {
+                                    assignment.role_name == role && assignment.assignee_id.is_some()
+                                })
+                            }))
+                })));
     let target = |trigger| {
         workflow
             .outgoing_trigger_targets(&task.status)
@@ -226,11 +250,12 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                     .as_ref()
                     .and_then(|config| config.reject_target.as_deref())
                     == Some(task.status.as_str()))
-            && gate
-                .gate_config
-                .as_ref()
-                .and_then(|config| config.max_rejections)
-                .is_some()
+            && (gate.name == "review"
+                || gate
+                    .gate_config
+                    .as_ref()
+                    .and_then(|config| config.max_rejections)
+                    .is_some())
     });
     let gate_budget = |gate: &api_types::StateDefinition| {
         if gate.name == crate::workflow::default_states::REVIEW {
@@ -276,6 +301,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             )
         });
     let one_shot_allowed = snapshot.caller.owner
+        && snapshot.wait_cause.is_none()
         && retry_gate.is_some_and(|gate| {
             gate.name == "review"
                 && (gate_budget(gate).is_some_and(|budget| {
@@ -292,7 +318,26 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                      authority: &[ActionAuthority],
                      reason: &str,
                      label: &str| {
-        if snapshot.caller.permits(authority) {
+        if snapshot.caller.permits(authority)
+            && (snapshot.wait_cause.is_none()
+                || action.verb() != "retry"
+                || matches!(
+                    reason,
+                    "retry_budget_exhausted" | "execution_retry_exhausted"
+                ))
+            && (task.status != "review"
+                || action.verb() != "retry"
+                || implementation_candidate
+                || matches!(
+                    reason,
+                    "entry_barrier_blocked"
+                        | "state_hooks_failed"
+                        | "placement_retry"
+                        | "owner_reconcile"
+                        | "retry_budget_exhausted"
+                        | "execution_retry_exhausted"
+                ))
+        {
             offers.push(Offer {
                 action: action.clone(),
                 parameters: parameters
@@ -320,7 +365,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                                 && (matches!(
                                     action,
                                     TaskAction::Approve {
-                                        override_checks: true,
+                                        override_checks: Some(true),
                                         ..
                                     }
                                 ) || reason == "review_needs_owner"
@@ -333,20 +378,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                                         )))),
                         required_when: (*name == "reason"
                             && reason == "retry_budget_exhausted"
-                            && one_shot_allowed)
+                            && one_shot_allowed
+                            && !awaiting_human)
                             .then(|| api_types::ActionParameterRequirement {
                                 parameter: "reset_budget".to_owned(),
                                 value: false,
                             }),
                         boolean_values: match *name {
                             "guidance" | "reason" => None,
-                            "reset_budget" => {
-                                Some(if reason == "retry_budget_exhausted" && one_shot_allowed {
+                            "reset_budget" => Some(
+                                if reason == "retry_budget_exhausted"
+                                    && one_shot_allowed
+                                    && !awaiting_human
+                                {
                                     vec![false, true]
                                 } else {
                                     vec![true]
-                                })
-                            }
+                                },
+                            ),
                             "override" if reason != "review_needs_owner" => Some(vec![true]),
                             _ => Some(vec![false, true]),
                         },
@@ -386,6 +435,20 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "Cancel Task",
         );
     }
+    if queued
+        || (snapshot.wait_cause.is_some() && !dependency_cancelled && task.failed_json.is_none())
+    {
+        offer(
+            TaskAction::Hold { reason: None },
+            &[],
+            &[Owner],
+            "dispatch_wait",
+            "Hold Task",
+        );
+    }
+    if dependency_cancelled {
+        return offers;
+    }
     if task.failed_json.is_some() {
         if workflow
             .states
@@ -403,13 +466,15 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         return offers;
     }
     if running && !snapshot.owner_disconnected {
-        offer(
-            TaskAction::Hold { reason: None },
-            &[],
-            &[Owner],
-            "execution_running",
-            "Hold Task",
-        );
+        if !queued && snapshot.wait_cause.is_none() {
+            offer(
+                TaskAction::Hold { reason: None },
+                &[],
+                &[Owner],
+                "execution_running",
+                "Hold Task",
+            );
+        }
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
@@ -429,38 +494,43 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         );
         return offers;
     }
-    let decision_ready = awaiting_human
-        || (state.kind == StateKind::Active
-            && latest.is_some_and(|execution| execution.status == ExecutionStatus::Completed))
-        || (task.status == "review"
-            && (manual_review_candidate || target(WorkflowTrigger::Accept).is_some()))
-        || (task.status == "planning" && snapshot.planning_approval_ready);
-    let placement_wait = condition.is_none()
-        && (queued
-            || (snapshot.project_paused && !decision_ready)
-            || metadata.get("environment_wait").is_some()
-            || metadata.get("deferred_dispatch").is_some_and(|deferred| {
-                deferred["kind"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("environment_"))
-            })
-            || crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(
-                |disposition| {
-                    matches!(
-                        disposition.capability.as_str(),
-                        "machine_capacity" | "project_capacity"
-                    )
-                },
-            ));
+    let decision_ready = condition.is_none()
+        && (awaiting_human
+            || (state.kind == StateKind::Active
+                && latest.is_some_and(|execution| execution.status == ExecutionStatus::Completed))
+            || (task.status == "review"
+                && (manual_review_candidate || target(WorkflowTrigger::Accept).is_some()))
+            || (task.status == "planning" && snapshot.planning_approval_ready));
+    let placement_wait = snapshot.wait_cause.is_some() && !decision_ready
+        || condition.is_none()
+            && ((snapshot.project_paused && !decision_ready)
+                || metadata.get("environment_wait").is_some()
+                || metadata.get("deferred_dispatch").is_some_and(|deferred| {
+                    deferred["kind"]
+                        .as_str()
+                        .is_some_and(|kind| kind.starts_with("environment_"))
+                })
+                || crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(
+                    |disposition| {
+                        matches!(
+                            disposition.capability.as_str(),
+                            "machine_capacity" | "project_capacity"
+                        )
+                    },
+                ));
     if placement_wait {
-        offer(
-            TaskAction::Hold { reason: None },
-            &[],
-            &[Owner],
-            "dispatch_wait",
-            "Hold Task",
-        );
-        return offers;
+        if !queued && snapshot.wait_cause.is_none() {
+            offer(
+                TaskAction::Hold { reason: None },
+                &[],
+                &[Owner],
+                "dispatch_wait",
+                "Hold Task",
+            );
+        }
+        if condition.is_none() {
+            return offers;
+        }
     }
     if barrier_running || queued {
         return offers;
@@ -562,7 +632,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         offer(
             TaskAction::Approve {
                 reason: None,
-                override_checks: true,
+                override_checks: Some(true),
             },
             &["override"],
             &[Owner],
@@ -634,7 +704,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             offer(
                 TaskAction::Approve {
                     reason: None,
-                    override_checks: true,
+                    override_checks: Some(true),
                 },
                 &["override"],
                 &[Owner],
@@ -647,7 +717,9 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 .gate_config
                 .as_ref()
                 .is_some_and(|gate| gate.requires_user_approval())
-            && !failed_review)
+            && !failed_review
+            && condition.is_none()
+            && awaiting_human)
         {
             append_owner_advance(snapshot, &mut offers);
             return offers;
@@ -681,7 +753,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             offer(
                 TaskAction::Approve {
                     reason: None,
-                    override_checks: false,
+                    override_checks: Some(false),
                 },
                 &["override"],
                 &[Owner],
@@ -692,7 +764,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             offer(
                 TaskAction::Approve {
                     reason: None,
-                    override_checks: true,
+                    override_checks: Some(true),
                 },
                 &["override"],
                 &[Owner],
@@ -721,15 +793,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry With Guidance",
             );
         }
-    } else if review_wait
-        || ((task.status == "review"
-            || (task.status == "planning" && snapshot.planning_approval_ready))
-            && !failed_review
-            && target(WorkflowTrigger::Accept).is_some())
-        || (state.kind == StateKind::Gate
-            && owner_gate
-            && (task.status != "planning" || snapshot.planning_approval_ready)
-            && target(WorkflowTrigger::Accept).is_some())
+    } else if (task.status != "review" || (awaiting_human && condition.is_none()))
+        && (review_wait
+            || ((task.status == "review"
+                || (task.status == "planning" && snapshot.planning_approval_ready))
+                && !failed_review
+                && target(WorkflowTrigger::Accept).is_some())
+            || (state.kind == StateKind::Gate
+                && owner_gate
+                && (task.status != "planning" || snapshot.planning_approval_ready)
+                && target(WorkflowTrigger::Accept).is_some()))
     {
         let authorities = if task.status == "review" && owner_gate {
             vec![Owner, ProjectAgent]
@@ -739,7 +812,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         offer(
             TaskAction::Approve {
                 reason: None,
-                override_checks: false,
+                override_checks: Some(false),
             },
             &[],
             &authorities,
@@ -760,7 +833,19 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 .and_then(|gate| gate.approve_label.as_deref())
                 .unwrap_or("Approve"),
         );
+        if one_shot_allowed && !exhausted {
+            offer(
+                retry(None, None, Some(true)),
+                &["reset_budget"],
+                &[Owner],
+                "retry_budget_exhausted",
+                "Reset Budget and Retry",
+            );
+        }
         if task.status == "review"
+            && !exhausted
+            && !one_shot_allowed
+            && implementation_candidate
             && snapshot
                 .latest_review
                 .as_ref()
@@ -774,7 +859,11 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Recheck Review",
             );
         }
-    } else if task.status == "review" && state.kind == StateKind::Gate && failed_review {
+    } else if task.status == "review"
+        && state.kind == StateKind::Gate
+        && failed_review
+        && implementation_candidate
+    {
         if condition.is_some() && role.is_some() && (snapshot.has_agent && !snapshot.project_paused)
         {
             offer(
@@ -801,7 +890,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             offer(
                 TaskAction::Approve {
                     reason: None,
-                    override_checks: true,
+                    override_checks: Some(true),
                 },
                 &["override"],
                 &[Owner],
@@ -873,10 +962,11 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry Task",
             );
         }
-        if workflow
-            .states
-            .iter()
-            .any(|state| state.kind == StateKind::Initial)
+        if restart_condition(condition)
+            && workflow
+                .states
+                .iter()
+                .any(|state| state.kind == StateKind::Initial)
         {
             offer(
                 TaskAction::Restart { reason: None },
@@ -927,7 +1017,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             offer(
                 TaskAction::Approve {
                     reason: None,
-                    override_checks: false,
+                    override_checks: Some(false),
                 },
                 &[],
                 &[Owner],
@@ -988,7 +1078,11 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             propagates: false,
         });
     }
-    if task.status == "review" && !offers.iter().any(|offer| offer.action.verb() == "retry") {
+    if task.status == "review"
+        && implementation_candidate
+        && condition.is_none()
+        && !offers.iter().any(|offer| offer.action.verb() == "retry")
+    {
         let mut parameters = vec![api_types::ActionParameter {
             name: "reason".to_owned(),
             required: false,
@@ -1083,7 +1177,7 @@ fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
         if matches!(
             approval.action,
             TaskAction::Approve {
-                override_checks: false,
+                override_checks: Some(false),
                 ..
             }
         ) && approval.reason != "review_needs_owner"
@@ -1109,7 +1203,7 @@ fn append_owner_advance(snapshot: &TaskSnapshot, offers: &mut Vec<Offer>) {
     }
     offers.push(Offer {
         action: TaskAction::Approve {
-            override_checks: true,
+            override_checks: Some(true),
             reason: None,
         },
         parameters: vec![
@@ -1255,6 +1349,18 @@ pub async fn load_snapshot(
             }
         }
     }
+    if task.status == "review" {
+        if let Some(candidate) =
+            crate::task_service::latest_executor_execution_for_task(db, &task).await?
+        {
+            if !executions
+                .iter()
+                .any(|execution| execution.id == candidate.id)
+            {
+                executions.push(candidate);
+            }
+        }
+    }
     let transition_logs = TransitionLogRepo::list_by_task(db, &task.id).await?;
     let dependencies_satisfied = TaskDependencyRepo::unsatisfied_dependencies(db, &task.id)
         .await?
@@ -1274,9 +1380,45 @@ pub async fn load_snapshot(
     });
     let action_agent_id = select_action_agent(db, &task, selected_role, connections).await?;
     let has_agent = action_agent_id.is_some();
-    let project_paused = db::ProjectRepo::get_by_id(db, &task.project_id)
-        .await?
+    let project = db::ProjectRepo::get_by_id(db, &task.project_id).await?;
+    let project_paused = project
+        .as_ref()
         .is_some_and(|project| project.paused_at.is_some());
+    let wait_cause = if project_paused {
+        Some(db::project_pause_denial(
+            project
+                .as_ref()
+                .and_then(|project| project.system_pause_reason.as_deref()),
+        ))
+    } else {
+        let pinned_id = assignments
+            .iter()
+            .find(|assignment| Some(assignment.role_name.as_str()) == selected_role)
+            .and_then(|assignment| assignment.assignee_id.as_deref())
+            .or(task.assignee_id.as_deref());
+        let previous_agent = if pinned_id.is_none() {
+            db::ExecutionRepo::latest_agent_execution_by_task(db, &task.id)
+                .await?
+                .and_then(|execution| execution.agent_id)
+        } else {
+            None
+        };
+        let pinned_id = pinned_id.or(previous_agent.as_deref());
+        if let Some(id) = pinned_id {
+            match db::AgentRepo::get_by_id(db, id).await? {
+                Some(agent)
+                    if crate::agent_service::compute_effective_status(db, &agent, connections)
+                        .await?
+                        == crate::agent_service::EffectiveStatus::Paused =>
+                {
+                    Some(api_types::DeniedBy::TargetAgentPaused)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
     let running = ExecutionRepo::list_running_by_task(db, &task.id).await?;
     for execution in running {
         if !executions.iter().any(|row| row.id == execution.id) {
@@ -1393,6 +1535,7 @@ pub async fn load_snapshot(
         coordination_root,
         owner_disconnected,
         project_paused,
+        wait_cause,
         action_agent_id,
         planning_approval_ready,
         advance_target,
@@ -1639,9 +1782,221 @@ mod tests {
             coordination_root: false,
             owner_disconnected: false,
             project_paused: false,
+            wait_cause: None,
             action_agent_id: None,
             planning_approval_ready: true,
             advance_target: None,
+        }
+    }
+
+    #[test]
+    fn review_condition_wins_over_generic_decision_for_owner_and_project_agent() {
+        for caller in [
+            ActionCaller::owner(),
+            ActionCaller {
+                project_agent: true,
+                ..Default::default()
+            },
+        ] {
+            let mut snapshot = snapshot("review", Some(FailureKind::RecoveryRequired));
+            snapshot.caller = caller;
+            snapshot.executions.push(super::condition_matrix::exec(
+                "candidate",
+                "coder",
+                ExecutionStatus::Completed,
+                false,
+            ));
+            snapshot.task.metadata_json = Some(json!({"awaiting_human":true}).to_string());
+            let offers = available_actions(&snapshot);
+            assert!(!offers.iter().any(|offer| matches!(
+                offer.reason.as_str(),
+                "gate_waiting_for_decision" | "human_review_decision"
+            )));
+            assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
+            assert!(offers.iter().any(|offer| offer.action.verb() == "restart"));
+        }
+    }
+
+    #[test]
+    fn full_human_review_window_offers_only_budget_reset_retry() {
+        let mut snapshot = snapshot("review", None);
+        let gate = snapshot
+            .workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == "review")
+            .unwrap()
+            .gate_config
+            .as_mut()
+            .unwrap();
+        gate.requires_user_approval = Some(true);
+        gate.max_rejections = Some(1);
+        snapshot.transition_logs = vec![super::condition_matrix::rejection(
+            0,
+            "review",
+            "in_progress",
+        )];
+        snapshot.latest_review = Some(super::condition_matrix::review(ReviewStatus::AwaitingHuman));
+        snapshot.executions = vec![super::condition_matrix::exec(
+            "candidate",
+            "coder",
+            ExecutionStatus::Completed,
+            false,
+        )];
+        let offers = available_actions(&snapshot);
+        let retries = offers
+            .iter()
+            .filter(|offer| offer.action.verb() == "retry")
+            .collect::<Vec<_>>();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].reason, "retry_budget_exhausted");
+        assert_eq!(
+            retries[0]
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "reset_budget")
+                .unwrap()
+                .boolean_values,
+            Some(vec![true])
+        );
+        assert!(retries[0]
+            .parameters
+            .iter()
+            .all(|parameter| parameter.required_when.is_none()));
+    }
+
+    #[test]
+    fn implicit_human_review_gate_is_decidable_but_running_or_passed_review_is_not() {
+        let mut snapshot = snapshot("review", None);
+        snapshot
+            .workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == "review")
+            .unwrap()
+            .gate_config
+            .as_mut()
+            .unwrap()
+            .requires_user_approval = Some(true);
+        assert!(available_actions(&snapshot)
+            .iter()
+            .any(|offer| offer.reason == "gate_waiting_for_decision"));
+        snapshot.task.metadata_json = Some(json!({"awaiting_human":true}).to_string());
+        for status in [ReviewStatus::Running, ReviewStatus::Passed] {
+            snapshot.latest_review = Some(super::condition_matrix::review(status));
+            assert!(!available_actions(&snapshot).iter().any(|offer| matches!(
+                offer.reason.as_str(),
+                "human_review_decision" | "gate_waiting_for_decision"
+            )));
+        }
+    }
+
+    #[test]
+    fn dependency_cancelled_writer_shape_offers_only_cancel() {
+        let mut snapshot = snapshot("in_progress", Some(FailureKind::WorkflowGuardRejected));
+        snapshot.task.error_annotation = Some(
+            json!({"type":"workflow_guard_rejected", "blocking_reason":"dependency_cancelled"})
+                .to_string(),
+        );
+        assert_eq!(
+            available_actions(&snapshot)
+                .iter()
+                .map(|offer| offer.action.verb())
+                .collect::<Vec<_>>(),
+            vec!["cancel"]
+        );
+    }
+
+    #[test]
+    fn queued_retry_with_paused_agent_and_new_dependency_blocker_still_offers_hold() {
+        let mut snapshot = snapshot("in_progress", Some(FailureKind::WorkflowGuardRejected));
+        snapshot.has_agent = false;
+        snapshot.wait_cause = Some(api_types::DeniedBy::TargetAgentPaused);
+        snapshot.task.error_annotation = Some(
+            json!({"type":"workflow_guard_rejected", "blocking_reason":"dependency_cancelled"})
+                .to_string(),
+        );
+        snapshot.task.metadata_json = Some(
+            json!({crate::deferred_dispatch::QUEUED_RECOVERY_KEY:{"action":{"verb":"retry"}}})
+                .to_string(),
+        );
+        let offers = available_actions(&snapshot);
+        assert!(offers
+            .iter()
+            .any(|offer| offer.reason == "dispatch_wait" && offer.action.verb() == "hold"));
+        assert!(offers.iter().any(|offer| offer.action.verb() == "cancel"));
+    }
+
+    #[test]
+    fn paused_review_keeps_budget_reset_and_hold_but_withholds_one_shot_retry() {
+        let mut snapshot = snapshot("review", Some(FailureKind::ReviewBudgetExhausted));
+        snapshot.project_paused = true;
+        snapshot.wait_cause = Some(api_types::DeniedBy::ProjectPaused(
+            "environment_not_ready".to_owned(),
+        ));
+        let offers = available_actions(&snapshot);
+        assert!(offers
+            .iter()
+            .any(|offer| offer.reason == "dispatch_wait" && offer.action.verb() == "hold"));
+        let reset = offers
+            .iter()
+            .find(|offer| offer.reason == "retry_budget_exhausted")
+            .unwrap();
+        assert_eq!(
+            reset
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "reset_budget")
+                .unwrap()
+                .boolean_values,
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn review_retry_needs_a_completed_implementation_candidate() {
+        let mut snapshot = snapshot("review", None);
+        assert!(!available_actions(&snapshot)
+            .iter()
+            .any(|offer| offer.action.verb() == "retry"));
+        for role in ["planner", "reviewer", "auditor", "interactive"] {
+            snapshot.executions = vec![super::condition_matrix::exec(
+                "not-candidate",
+                role,
+                ExecutionStatus::Completed,
+                false,
+            )];
+            assert!(
+                !available_actions(&snapshot)
+                    .iter()
+                    .any(|offer| offer.action.verb() == "retry"),
+                "{role}"
+            );
+        }
+        snapshot.executions = vec![super::condition_matrix::exec(
+            "candidate",
+            "coder",
+            ExecutionStatus::Completed,
+            false,
+        )];
+        assert!(available_actions(&snapshot)
+            .iter()
+            .any(|offer| offer.reason == "review_checks_retry"));
+    }
+
+    #[test]
+    fn general_condition_restart_matches_reset_kinds() {
+        for kind in [
+            FailureKind::WorkflowGuardRejected,
+            FailureKind::CiFailed,
+            FailureKind::InternalCommandFailed,
+        ] {
+            assert!(
+                !available_actions(&snapshot("in_progress", Some(kind)))
+                    .iter()
+                    .any(|offer| offer.action.verb() == "restart"),
+                "{kind:?}"
+            );
         }
     }
 
@@ -1754,7 +2109,7 @@ mod tests {
                         offer.action,
                         TaskAction::Approve {
                             reason: None,
-                            override_checks: true
+                            override_checks: Some(true)
                         }
                     ));
                 }
@@ -1869,7 +2224,7 @@ mod condition_matrix {
         }
     }
 
-    fn rejection(index: usize, from: &str, to: &str) -> TransitionLog {
+    pub(super) fn rejection(index: usize, from: &str, to: &str) -> TransitionLog {
         serde_json::from_value(json!({
             "id": format!("log-{index}"), "task_id":"task", "from_state":from, "to_state":to,
             "trigger_name":"reject", "triggered_by":"user", "trigger_reason":"fixture",
@@ -2071,6 +2426,7 @@ mod condition_matrix {
                                         coordination_root: flag == "coordination_root",
                                         owner_disconnected: false,
                                         project_paused: false,
+                                        wait_cause: None,
                                         action_agent_id: None,
                                         planning_approval_ready: true,
                                         advance_target: None,
